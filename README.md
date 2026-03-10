@@ -10,7 +10,7 @@
   [![Git for Data](https://img.shields.io/badge/Git%20for%20Data-Enabled-00A3CC?style=flat-square)](https://github.com/matrixorigin/matrixone)
   [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg?style=flat-square)](LICENSE)
   
-  [Quick Start](#quick-start) · [Architecture](#architecture) · [API Reference](#api-reference) · [Why TrustMem?](#why-trustmem)
+  [See It In Action](#see-it-in-action) · [Quick Start](#quick-start) · [Architecture](#architecture) · [API Reference](#api-reference) · [Why TrustMem?](#why-trustmem)
   
 </div>
 
@@ -63,39 +63,16 @@ graph TD
 ```
 
 **Core Capabilities:**
-- **Semantic Retrieval** — Vector similarity search with configurable embedding providers
-- **Git for Data** — Zero-copy branching, instant snapshots, point-in-time rollback
-- **Audit Trail** — Every memory mutation has a snapshot + provenance chain
-- **Self-Governance** — Automated contradiction detection and confidence scoring
-- **Protocol-Native** — Built on [Model Context Protocol (MCP)](https://modelcontextprotocol.io) standard
+- **Cross-conversation memory** — preferences, facts, and decisions persist across sessions
+- **Semantic search** — retrieves memories by meaning, not just keywords
+- **Git for Data** — zero-copy branching, instant snapshots, point-in-time rollback
+- **Audit trail** — every memory mutation has a snapshot + provenance chain
+- **Self-maintaining** — built-in governance detects contradictions, quarantines low-confidence memories
+- **Private by default** — local embedding model option, no data leaves your machine
 
 **Supported Agents:** [Kiro](https://kiro.dev) · [Cursor](https://cursor.sh) · [Claude Code](https://docs.anthropic.com/en/docs/claude-code) · Any MCP-compatible agent
 
 **Storage Backend:** [MatrixOne](https://github.com/matrixorigin/matrixone) — Distributed database with native vector indexing
-
----
-
-## How It Works
-
-```
-You: "Always use pytest, never unittest"
-AI:  (stores this as a memory)
-
-... days later, new conversation ...
-
-You: "Write tests for this module"
-AI:  (retrieves your preference → uses pytest automatically)
-```
-
-## Features
-
-- **Cross-conversation memory** — preferences, facts, and decisions persist across sessions
-- **Semantic search** — retrieves memories by meaning, not just keywords
-- **Snapshots & rollback** — save memory state before risky changes, restore if things go wrong
-- **Branches** — experiment with different memory states without affecting main (like git branches for memories)
-- **Multi-tool support** — one `trustmem init` configures Kiro, Cursor, and Claude Code simultaneously
-- **Self-maintaining** — built-in governance detects contradictions, quarantines low-confidence memories
-- **Private by default** — local embedding model, no data leaves your machine
 
 ---
 
@@ -112,7 +89,82 @@ AI:  (retrieves your preference → uses pytest automatically)
 
 ---
 
+## See It In Action
+
+Here's a real setup conversation in Cursor — just tell the agent what you want, it handles the rest:
+
+```
+You:     I want to set up TrustMem for persistent memory.
+
+Cursor:  Before I start, a few quick questions:
+
+           1. Which AI tool are you using? (Cursor, Kiro, Claude Code, or multiple?)
+           2. Do you have a MatrixOne database running? If not, I can start one with
+              Docker, or you can use MatrixOne Cloud (free tier, no Docker needed).
+           3. Do you have an embedding service? (OpenAI, SiliconFlow, Ollama, etc.)
+              If not, I'll use a local model — but it downloads ~900MB on first use.
+
+You:     Cursor. No database yet. I have a SiliconFlow API key.
+
+Cursor:  Got it. I'll start MatrixOne with Docker first — running:
+
+           docker compose up -d
+
+You:     [output] Container trustmem-matrixone started
+
+Cursor:  MatrixOne is initializing, takes about 30 seconds on first start.
+         While we wait — what's your SiliconFlow API key and which model do you use?
+         (e.g. BAAI/bge-m3)
+
+You:     key is sk-xxxx, model BAAI/bge-m3
+
+Cursor:  Database is ready. Installing TrustMem now:
+
+           pip install --index-url https://pypi.org/simple/ \
+             --extra-index-url https://test.pypi.org/simple/ \
+             trust-mem-lite
+
+You:     [output] Successfully installed trust-mem-lite-0.2.2
+
+Cursor:  Configuring for Cursor with your SiliconFlow endpoint:
+
+           trustmem init \
+             --embedding-provider openai \
+             --embedding-base-url https://api.siliconflow.cn/v1 \
+             --embedding-api-key sk-xxxx \
+             --embedding-model BAAI/bge-m3 \
+             --embedding-dim 1024
+
+You:     [output]
+         ✓ Created .cursor/mcp.json
+         ✓ Created .cursor/rules/memory.mdc
+
+Cursor:  All set. Please restart Cursor to load the MCP server, then come back.
+
+You:     Restarted. Does it work?
+
+Cursor:  Let me check:
+
+           trustmem status
+
+         TrustMem Status
+           Database:   connected (mysql+pymysql://root:***@localhost:6001/trustmem)
+           Tables:     8 tables OK
+           Embedding:  openai (BAAI/bge-m3, dim=1024) via https://api.siliconflow.cn/v1
+           Cursor:     .cursor/mcp.json ✓  |  .cursor/rules/memory.mdc ✓
+
+         Everything looks good. Try telling me a preference — like your test framework
+         or code style — and I'll remember it across all future conversations.
+```
+
+---
+
 ## Quick Start
+
+### Prerequisites
+
+- Python 3.11+
+- [MatrixOne](https://github.com/matrixorigin/matrixone) database (local Docker or [cloud](https://cloud.matrixorigin.cn))
 
 ### 1. Start MatrixOne (database)
 
@@ -135,11 +187,10 @@ See [docker-compose.yml](docker-compose.yml) for configuration options. Don't wa
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
 
-# Current package is on TestPyPI:
 pip install --index-url https://pypi.org/simple/ --extra-index-url https://test.pypi.org/simple/ 'trust-mem-lite[local-embedding]'
 ```
 
-> `[local-embedding]` installs a local embedding model (~80MB download on first use). If you skip it, memories won't be vectorized and retrieval quality will be significantly worse. See [Embedding providers](#embedding-providers) for alternatives.
+> `[local-embedding]` installs a local embedding model (~900MB download on first use). If you already have an embedding service (OpenAI, SiliconFlow, Ollama), skip this and use `trust-mem-lite` instead — see [Embedding providers](#embedding-providers).
 
 ### 3. Configure your AI tool
 
@@ -165,11 +216,6 @@ TrustMem Status
   Cursor:      not detected
   Claude Code: not detected
 ```
-
-## Prerequisites
-
-- Python 3.11+
-- [MatrixOne](https://github.com/matrixorigin/matrixone) database (local Docker or [cloud](https://cloud.matrixorigin.cn))
 
 ---
 
@@ -233,20 +279,20 @@ TrustMem needs an embedding model to vectorize memories for semantic search.
 
 | Provider | Quality | Cost | First-use latency | Ongoing latency |
 |----------|---------|------|-------------------|-----------------|
-| **Local** (default) | Good | Free, private | ~900MB download (torch + sentence-transformers) + a few seconds to load model into memory on first query | Fast (in-process) |
+| **Local** (default) | Good | Free, private | ~900MB download + a few seconds to load on first query | Fast (in-process) |
 | **OpenAI** | Better | API key required | None | Network round-trip |
 | **Custom service** | Varies | Self-hosted | None | Network round-trip |
 
-**Recommendation**: If you already have an embedding service running (OpenAI, Ollama, or custom endpoint), use it — avoids the local model download and cold-start latency. Otherwise, local embedding works well; the download and model load only happen once.
+**Recommendation**: If you already have an embedding service (OpenAI, Ollama, SiliconFlow), use it — avoids the local model download and cold-start latency. Otherwise, local works well; the download only happens once.
 
 ```bash
 # Local (default) — no extra flags needed
-trustmem init --embedding-provider local
+trustmem init
 
-# OpenAI — better quality, requires API key, no cold-start delay
+# OpenAI
 trustmem init --embedding-provider openai --embedding-api-key sk-...
 
-# Custom endpoint (Ollama, SiliconFlow, etc.) — use an existing embedding service
+# Custom endpoint (Ollama, SiliconFlow, etc.)
 trustmem init \
   --embedding-provider openai \
   --embedding-base-url https://api.siliconflow.cn/v1 \
@@ -255,7 +301,7 @@ trustmem init \
   --embedding-dim 1024
 ```
 
-The `--embedding-api-key`, `--embedding-base-url`, `--embedding-model`, and `--embedding-dim` flags are all written into the `env` block of `mcp.json` automatically, so the MCP server picks them up without any manual editing.
+All flags are written into the `env` block of `mcp.json` automatically — no manual editing needed.
 
 ---
 
@@ -264,7 +310,7 @@ The `--embedding-api-key`, `--embedding-base-url`, `--embedding-model`, and `--e
 ```
 ┌─────────────┐     MCP (stdio)     ┌──────────────────────────────────────┐     SQL      ┌────────────┐
 │  Kiro /      │ ◄─────────────────► │  TrustMem MCP Server               │ ◄──────────► │ MatrixOne  │
-│  Cursor /    │   store / retrieve  │  ├── Canonical Storage              │  vector +    │  Database   │
+│  Cursor /    │   store / retrieve  │  ├── Canonical Storage              │  vector +    │  Database  │
 │  Claude Code │                     │  ├── Retrieval (vector / semantic)  │  fulltext    │            │
 │  Any Agent   │                     │  └── Git-for-Data (snap/branch/merge)│             │            │
 └─────────────┘                      └──────────────────────────────────────┘              └────────────┘
@@ -352,14 +398,6 @@ You: "Actually, I switched to ruff instead of black"
 AI:  → calls memory_correct(memory_id="abc123", new_content="User uses ruff for formatting", reason="switched from black")
 ```
 
-### Forget Memories
-
-```
-You: "Forget everything about the old auth module"
-AI:  → calls memory_purge(topic="old auth module", reason="no longer relevant")
-     ← "Purged 3 memory(ies)."
-```
-
 ### Snapshots: Save and Restore State
 
 ```
@@ -367,7 +405,7 @@ You: "Take a snapshot before we refactor the database layer"
 AI:  → calls memory_snapshot(name="before_db_refactor", description="pre-refactor state")
      ← "Snapshot 'before_db_refactor' created."
 
-... refactoring goes wrong, memories are messed up ...
+... refactoring goes wrong ...
 
 You: "Roll back to before the refactor"
 AI:  → calls memory_rollback(name="before_db_refactor")
@@ -384,49 +422,13 @@ AI:  → calls memory_branch(name="eval_sqlite")
 
 You: "We're now using SQLite instead of PostgreSQL"
 AI:  → calls memory_store("Project uses SQLite for persistence", type="semantic")
-     (stored on the eval_sqlite branch only — main is untouched)
-
-You: "What would change if we merge this branch?"
-AI:  → calls memory_diff(source="eval_sqlite")
-     ← Branch 'eval_sqlite': 3 total changes
-        Summary: 2 new, 1 conflict
+     (stored on eval_sqlite only — main is untouched)
 
 You: "Merge it"
-AI:  → calls memory_merge(source="eval_sqlite", strategy="replace")
+AI:  → calls memory_diff(source="eval_sqlite")   ← preview first
+     → calls memory_merge(source="eval_sqlite", strategy="replace")
      ← "Merged 3 memories from 'eval_sqlite' (skipped 0)."
 ```
-
-### Maintenance
-
-```
-You: "Clean up my memories"
-AI:  → calls memory_governance()
-     ← "Governance done: quarantined=2, cleaned_stale=5, scenes_created=0"
-
-You: "What do you know about me?"
-AI:  → calls memory_profile()
-     ← Profile for default:
-        - Prefers pytest, uses ruff for formatting
-        - Works on Go 1.22 project with MatrixOne backend
-        - Deploys via kubectl, uses make for builds
-```
-
----
-
-## How Your AI Tool Uses It
-
-Once configured, your AI tool will automatically:
-
-1. **Retrieve** — At the start of every conversation, call `memory_retrieve` with your first message to load relevant memories
-2. **Store** — After each response, store new facts, preferences, or decisions you mentioned
-3. **Correct** — When you say a memory is wrong, update it via `memory_correct`
-4. **Forget** — When you say "forget X", remove it via `memory_purge`
-
-You can also ask:
-- "What do you know about me?" → triggers `memory_profile`
-- "Forget everything about X" → bulk delete by topic
-- "Take a snapshot" → saves current state for later rollback
-- "Create a branch for experimenting" → isolated memory sandbox
 
 ---
 
@@ -445,18 +447,10 @@ You can also ask:
 
 ## Manual Tuning & Optimization
 
-**Integration quality depends on your AI agent's capabilities and steering rules.** Out-of-the-box behavior may not be optimal — when/how memory tools are called is determined by:
+Integration quality depends on your AI agent's reasoning ability and steering rules. Out-of-the-box behavior may not be optimal.
 
-1. **Agent reasoning ability** — how well it understands when to retrieve, store, or correct memories
-2. **Steering rules** — the instructions in `.kiro/steering/memory.md`, `.cursor/rules/memory.mdc`, or `CLAUDE.md`
+**If memory usage feels suboptimal**, edit the steering rules in `.kiro/steering/memory.md`, `.cursor/rules/memory.mdc`, or `CLAUDE.md` to be more explicit. For example, if your agent forgets to retrieve memories at conversation start:
 
-**If memory usage feels suboptimal:**
-- Edit the steering rules to be more explicit about when to call `memory_retrieve`, `memory_store`, etc.
-- Add examples of good/bad memory usage patterns
-- Adjust retrieval triggers (e.g., "always retrieve at conversation start" vs. "retrieve only when user asks about past context")
-- Tune memory type selection (semantic vs. profile vs. procedural)
-
-**Example tuning**: If your agent forgets to retrieve memories at conversation start, add to steering rules:
 ```markdown
 CRITICAL: At the start of EVERY conversation, call memory_retrieve with the user's first message.
 ```
@@ -465,13 +459,8 @@ CRITICAL: At the start of EVERY conversation, call memory_retrieve with the user
 
 ## Adapting to Other Agents
 
-TrustMem uses the **Model Context Protocol (MCP)** standard. Any agent system that supports MCP or external tool plugins can integrate TrustMem by:
+TrustMem uses the [Model Context Protocol (MCP)](https://modelcontextprotocol.io) standard. Any MCP-compatible agent can integrate by pointing to the server:
 
-1. **Pointing to the MCP server**: `python -m mo_memory_mcp`
-2. **Providing steering rules**: Adapt the examples in `.kiro/steering/memory.md` to your agent's instruction format
-3. **Configuring database**: Set `TRUSTMEM_DB_URL` environment variable or use `trustmem init`
-
-**Generic integration template:**
 ```json
 {
   "mcpServers": {
@@ -534,7 +523,7 @@ If you're an AI agent helping a user set up TrustMem, **ask before acting**:
 
 1. **Which AI tool?** Kiro / Cursor / Claude Code?
 2. **MatrixOne database?** Already have one → get URL. Local Docker → `docker compose up -d`. [MatrixOne Cloud](https://cloud.matrixorigin.cn) → no Docker needed.
-3. **Embedding?** Already have an embedding service? Use it. Otherwise local is fine.
+3. **Embedding?** Already have a service? Use it. Otherwise local is fine.
 4. **Install**: `pip install --index-url https://pypi.org/simple/ --extra-index-url https://test.pypi.org/simple/ 'trust-mem-lite[local-embedding]'`
 5. **Configure**: `cd <user-project> && trustmem init`
 6. **Verify**: `trustmem status`
