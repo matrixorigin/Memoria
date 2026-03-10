@@ -3,42 +3,45 @@
   
   # TrustMem
   
-  **Persistent Memory Layer for AI Agents**
-  
-  > Semantic memory persistence • Vector-based retrieval • Cross-session context
+  **Secure · Auditable · Programmable Memory for AI Agents**
   
   [![MatrixOne](https://img.shields.io/badge/Powered%20by-MatrixOne-00ADD8?style=flat-square&logo=database)](https://github.com/matrixorigin/matrixone)
   [![MCP](https://img.shields.io/badge/Protocol-MCP-7C3AED?style=flat-square)](https://modelcontextprotocol.io)
+  [![Git for Data](https://img.shields.io/badge/Git%20for%20Data-Enabled-00A3CC?style=flat-square)](https://github.com/matrixorigin/matrixone)
   [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg?style=flat-square)](LICENSE)
   
-  [Quick Start](#quick-start) • [Architecture](#architecture) • [API Reference](#api-reference)
+  [Quick Start](#quick-start) · [Architecture](#architecture) · [API Reference](#api-reference) · [Why TrustMem?](#why-trustmem)
   
 </div>
 
 ---
 
-## 🧠 Overview
+## Overview
 
-TrustMem implements a **persistent memory substrate** for AI coding agents, enabling stateful interactions across conversation boundaries.
+TrustMem is a **persistent memory layer** for AI agents with Git-level version control.
+Every memory change is tracked, auditable, and reversible — snapshots, branches, merges, and time-travel rollback, all powered by MatrixOne's native Copy-on-Write engine.
 
 ```mermaid
-graph LR
-    A[AI Agent] -->|MCP Protocol| B[TrustMem]
-    B -->|Vector Search| C[MatrixOne]
-    B -->|Semantic Embedding| D[Local/OpenAI]
-    C -->|Retrieval| B
-    B -->|Context| A
+graph TD
+    A[AI Agent] -->|MCP Protocol| B[TrustMem Core]
+    B --> C[Canonical Storage]
+    B --> D[Retrieval Strategy<br/>vector · semantic · activation]
+    C --> E[Git-for-Data Engine<br/>Snapshot · Branch · Merge · Rollback]
+    E --> F[MatrixOne]
 ```
 
 **Core Capabilities:**
-- 🔍 **Semantic Retrieval** — Vector similarity search with configurable embedding providers
-- 🔄 **State Management** — Snapshot/rollback and branch-based memory isolation
-- 🛡️ **Self-Governance** — Automated contradiction detection and confidence scoring
-- 🔌 **Protocol-Native** — Built on Model Context Protocol (MCP) standard
+- **Semantic Retrieval** — Vector similarity search with configurable embedding providers
+- **Git for Data** — Zero-copy branching, instant snapshots, point-in-time rollback
+- **Audit Trail** — Every memory mutation has a snapshot + provenance chain
+- **Self-Governance** — Automated contradiction detection and confidence scoring
+- **Protocol-Native** — Built on [Model Context Protocol (MCP)](https://modelcontextprotocol.io) standard
 
-**Supported Agents:** [Kiro](https://kiro.dev) • [Cursor](https://cursor.sh) • [Claude Code](https://docs.anthropic.com/en/docs/claude-code)
+**Supported Agents:** [Kiro](https://kiro.dev) · [Cursor](https://cursor.sh) · [Claude Code](https://docs.anthropic.com/en/docs/claude-code) · Any MCP-compatible agent
 
 **Storage Backend:** [MatrixOne](https://github.com/matrixorigin/matrixone) — Distributed database with native vector indexing
+
+---
 
 ## How It Works
 
@@ -61,6 +64,21 @@ AI:  (retrieves your preference → uses pytest automatically)
 - **Multi-tool support** — one `trustmem init` configures Kiro, Cursor, and Claude Code simultaneously
 - **Self-maintaining** — built-in governance detects contradictions, quarantines low-confidence memories
 - **Private by default** — local embedding model, no data leaves your machine
+
+---
+
+## Why TrustMem?
+
+| Capability | TrustMem | Letta / Mem0 / Traditional RAG |
+|---|---|---|
+| Git-level version control | Native zero-copy snapshots & branches | File-level or none |
+| Isolated experimentation | One-click branch, merge after validation | Manual data duplication |
+| Audit trail | Full snapshot + provenance on every mutation | Limited logging |
+| Semantic retrieval | Vector + full-text hybrid search | Vector only |
+| Multi-agent sharing | Shared trusted memory pool per user | Siloed per agent |
+| Migration cost | Zero — all state in MatrixOne | Export/import required |
+
+---
 
 ## Quick Start
 
@@ -121,6 +139,8 @@ TrustMem Status
 - Python 3.11+
 - [MatrixOne](https://github.com/matrixorigin/matrixone) database (local Docker or [cloud](https://cloud.matrixorigin.cn))
 
+---
+
 ## Setup by Tool
 
 ### Kiro
@@ -165,6 +185,8 @@ Files created:
 
 If your project has `.kiro/`, `.cursor/`, and `CLAUDE.md`, `trustmem init` configures all of them in one go.
 
+---
+
 ## Configuration Options
 
 ### Custom database URL
@@ -187,7 +209,6 @@ TrustMem needs an embedding model to vectorize memories for semantic search.
 
 ```bash
 # Local (default) — free, private, ~80MB model download on first use
-# First query takes a few seconds to load the model into memory; subsequent queries are fast.
 trustmem init --embedding-provider local
 
 # OpenAI — better quality, requires API key, no cold-start delay
@@ -197,75 +218,20 @@ trustmem init --embedding-provider openai --embedding-api-key sk-...
 trustmem init --embedding-provider openai --embedding-base-url http://localhost:11434/v1
 ```
 
-## Manual Tuning & Optimization
+---
 
-**Integration quality depends on your AI agent's capabilities and steering rules.** Out-of-the-box behavior may not be optimal — when/how memory tools are called is determined by:
+## Architecture
 
-1. **Agent reasoning ability** — how well it understands when to retrieve, store, or correct memories
-2. **Steering rules** — the instructions in `.kiro/steering/memory.md`, `.cursor/rules/memory.mdc`, or `CLAUDE.md`
-
-**If memory usage feels suboptimal:**
-- Edit the steering rules to be more explicit about when to call `memory_retrieve`, `memory_store`, etc.
-- Add examples of good/bad memory usage patterns
-- Adjust retrieval triggers (e.g., "always retrieve at conversation start" vs. "retrieve only when user asks about past context")
-- Tune memory type selection (semantic vs. profile vs. procedural)
-
-**Example tuning**: If your agent forgets to retrieve memories at conversation start, add to steering rules:
-```markdown
-CRITICAL: At the start of EVERY conversation, call memory_retrieve with the user's first message.
+```
+┌─────────────┐     MCP (stdio)     ┌──────────────────────────────────────┐     SQL      ┌────────────┐
+│  Kiro /      │ ◄─────────────────► │  TrustMem MCP Server               │ ◄──────────► │ MatrixOne  │
+│  Cursor /    │   store / retrieve  │  ├── Canonical Storage              │  vector +    │  Database   │
+│  Claude Code │                     │  ├── Retrieval (vector / semantic)  │  fulltext    │            │
+│  Any Agent   │                     │  └── Git-for-Data (snap/branch/merge)│             │            │
+└─────────────┘                      └──────────────────────────────────────┘              └────────────┘
 ```
 
-## Adapting to Other Agents
-
-TrustMem uses the **Model Context Protocol (MCP)** standard. Any agent system that supports MCP or external tool plugins can integrate TrustMem by:
-
-1. **Pointing to the MCP server**: `python -m mo_memory_mcp`
-2. **Providing steering rules**: Adapt the examples in `.kiro/steering/memory.md` to your agent's instruction format
-3. **Configuring database**: Set `TRUSTMEM_DB_URL` environment variable or use `trustmem init`
-
-**Generic integration template:**
-```json
-{
-  "mcpServers": {
-    "trustmem": {
-      "command": "python",
-      "args": ["-m", "mo_memory_mcp"],
-      "env": {
-        "TRUSTMEM_DB_URL": "mysql+pymysql://root:111@localhost:6001/trustmem"
-      }
-    }
-  }
-}
-```
-
-Then add steering instructions equivalent to:
-- "Retrieve memories at conversation start"
-- "Store new facts, preferences, and decisions"
-- "Correct memories when user says they're wrong"
-- "Forget memories when user requests"
-
-See [SETUP_GUIDE.md](SETUP_GUIDE.md) for detailed integration examples.
-
-## Commands
-
-| Command | Description |
-|---------|-------------|
-| `trustmem init` | Configure everything (tables + MCP + rules) |
-| `trustmem status` | Show configuration and rule versions |
-| `trustmem update-rules` | Update steering rules to latest version |
-| `trustmem migrate` | Create/update database tables only |
-| `trustmem health` | Check memory service health |
-| `trustmem governance` | Run memory cleanup and maintenance |
-
-## Memory Types
-
-| Type | What it stores | Example |
-|------|---------------|---------|
-| `semantic` | Project facts, technical decisions | "This project uses Go 1.22 with modules" |
-| `profile` | User/agent preferences | "Always use pytest, never unittest" |
-| `procedural` | How-to knowledge, workflows | "To deploy: run make build then kubectl apply" |
-| `working` | Temporary context for current task | "Currently refactoring the auth module" |
-| `tool_result` | Results from tool executions | Cached command outputs |
+---
 
 ## API Reference
 
@@ -310,6 +276,20 @@ TrustMem exposes MCP tools that your AI tool calls automatically based on steeri
 | `memory_reflect` | Synthesize high-level insights from memory clusters via LLM (2h cooldown) |
 | `memory_rebuild_index` | Rebuild IVF vector index for a table |
 
+---
+
+## Memory Types
+
+| Type | What it stores | Example |
+|------|---------------|---------|
+| `semantic` | Project facts, technical decisions | "This project uses Go 1.22 with modules" |
+| `profile` | User/agent preferences | "Always use pytest, never unittest" |
+| `procedural` | How-to knowledge, workflows | "To deploy: run make build then kubectl apply" |
+| `working` | Temporary context for current task | "Currently refactoring the auth module" |
+| `tool_result` | Results from tool executions | Cached command outputs |
+
+---
+
 ## Usage Examples
 
 ### Store and Retrieve
@@ -343,8 +323,6 @@ AI:  → calls memory_purge(topic="old auth module", reason="no longer relevant"
 
 ### Snapshots: Save and Restore State
 
-Snapshots capture the entire memory state at a point in time — useful before risky changes.
-
 ```
 You: "Take a snapshot before we refactor the database layer"
 AI:  → calls memory_snapshot(name="before_db_refactor", description="pre-refactor state")
@@ -357,73 +335,26 @@ AI:  → calls memory_rollback(name="before_db_refactor")
      ← "Rolled back to snapshot 'before_db_refactor'."
 ```
 
-List snapshots:
-```
-You: "Show my snapshots"
-AI:  → calls memory_snapshots()
-     ← before_db_refactor (2026-03-10 12:00:00)
-        initial_setup (2026-03-08 09:30:00)
-```
-
 ### Branches: Isolated Experimentation
 
-Branches let you experiment with different memory states without affecting main. Think of it like git branches, but for memories.
-
-**Create a branch and experiment:**
 ```
 You: "Create a memory branch to evaluate switching from PostgreSQL to SQLite"
 AI:  → calls memory_branch(name="eval_sqlite")
-     ← "Branch 'eval_sqlite' created. Use memory_checkout to switch to it."
      → calls memory_checkout(name="eval_sqlite")
      ← "Switched to branch 'eval_sqlite'. 42 memories on this branch."
 
 You: "We're now using SQLite instead of PostgreSQL"
 AI:  → calls memory_store("Project uses SQLite for persistence", type="semantic")
      (stored on the eval_sqlite branch only — main is untouched)
-```
 
-**Preview changes before merging:**
-```
 You: "What would change if we merge this branch?"
 AI:  → calls memory_diff(source="eval_sqlite")
      ← Branch 'eval_sqlite': 3 total changes
         Summary: 2 new, 1 conflict
-          [new] Project uses SQLite for persistence
-          [new] SQLite config: WAL mode enabled
-          [conflict] Database engine is PostgreSQL 15 ↔ Project uses SQLite
-```
 
-**Merge or discard:**
-```
 You: "Merge it"
 AI:  → calls memory_merge(source="eval_sqlite", strategy="replace")
      ← "Merged 3 memories from 'eval_sqlite' (skipped 0)."
-
-# Or discard:
-You: "Delete that branch, we're sticking with PostgreSQL"
-AI:  → calls memory_branch_delete(name="eval_sqlite")
-     ← "Branch 'eval_sqlite' deleted."
-```
-
-**Branch from a snapshot or timestamp:**
-```
-You: "Create a branch from the snapshot we took yesterday"
-AI:  → calls memory_branch(name="alt_approach", from_snapshot="before_db_refactor")
-
-You: "Branch from 5 minutes ago"
-AI:  → calls memory_branch(name="quick_test", from_timestamp="2026-03-10 15:45:00")
-```
-
-**List and switch branches:**
-```
-You: "Show all branches"
-AI:  → calls memory_branches()
-     ←   * main
-          eval_sqlite
-          alt_approach
-
-You: "Switch back to main"
-AI:  → calls memory_checkout(name="main")
 ```
 
 ### Maintenance
@@ -433,10 +364,6 @@ You: "Clean up my memories"
 AI:  → calls memory_governance()
      ← "Governance done: quarantined=2, cleaned_stale=5, scenes_created=0"
 
-You: "Check for contradictions"
-AI:  → calls memory_consolidate()
-     ← "Consolidation done: merged_nodes=1, conflicts_detected=2, promoted=3, demoted=1"
-
 You: "What do you know about me?"
 AI:  → calls memory_profile()
      ← Profile for default:
@@ -444,6 +371,8 @@ AI:  → calls memory_profile()
         - Works on Go 1.22 project with MatrixOne backend
         - Deploys via kubectl, uses make for builds
 ```
+
+---
 
 ## How Your AI Tool Uses It
 
@@ -460,21 +389,72 @@ You can also ask:
 - "Take a snapshot" → saves current state for later rollback
 - "Create a branch for experimenting" → isolated memory sandbox
 
-## Architecture
+---
 
+## Commands
+
+| Command | Description |
+|---------|-------------|
+| `trustmem init` | Configure everything (tables + MCP + rules) |
+| `trustmem status` | Show configuration and rule versions |
+| `trustmem update-rules` | Update steering rules to latest version |
+| `trustmem migrate` | Create/update database tables only |
+| `trustmem health` | Check memory service health |
+| `trustmem governance` | Run memory cleanup and maintenance |
+
+---
+
+## Manual Tuning & Optimization
+
+**Integration quality depends on your AI agent's capabilities and steering rules.** Out-of-the-box behavior may not be optimal — when/how memory tools are called is determined by:
+
+1. **Agent reasoning ability** — how well it understands when to retrieve, store, or correct memories
+2. **Steering rules** — the instructions in `.kiro/steering/memory.md`, `.cursor/rules/memory.mdc`, or `CLAUDE.md`
+
+**If memory usage feels suboptimal:**
+- Edit the steering rules to be more explicit about when to call `memory_retrieve`, `memory_store`, etc.
+- Add examples of good/bad memory usage patterns
+- Adjust retrieval triggers (e.g., "always retrieve at conversation start" vs. "retrieve only when user asks about past context")
+- Tune memory type selection (semantic vs. profile vs. procedural)
+
+**Example tuning**: If your agent forgets to retrieve memories at conversation start, add to steering rules:
+```markdown
+CRITICAL: At the start of EVERY conversation, call memory_retrieve with the user's first message.
 ```
-┌─────────────┐     MCP (stdio)     ┌──────────────┐     SQL      ┌────────────┐
-│  Kiro /      │ ◄─────────────────► │  TrustMem    │ ◄──────────► │ MatrixOne  │
-│  Cursor /    │   store / retrieve  │  MCP Server  │  vector +    │  Database   │
-│  Claude Code │                     │              │  fulltext    │            │
-└─────────────┘                      └──────────────┘              └────────────┘
+
+---
+
+## Adapting to Other Agents
+
+TrustMem uses the **Model Context Protocol (MCP)** standard. Any agent system that supports MCP or external tool plugins can integrate TrustMem by:
+
+1. **Pointing to the MCP server**: `python -m mo_memory_mcp`
+2. **Providing steering rules**: Adapt the examples in `.kiro/steering/memory.md` to your agent's instruction format
+3. **Configuring database**: Set `TRUSTMEM_DB_URL` environment variable or use `trustmem init`
+
+**Generic integration template:**
+```json
+{
+  "mcpServers": {
+    "trustmem": {
+      "command": "python",
+      "args": ["-m", "mo_memory_mcp"],
+      "env": {
+        "TRUSTMEM_DB_URL": "mysql+pymysql://root:111@localhost:6001/trustmem"
+      }
+    }
+  }
+}
 ```
+
+See [SETUP_GUIDE.md](SETUP_GUIDE.md) for detailed integration examples.
+
+---
 
 ## Troubleshooting
 
 ### "Cannot connect to database"
 
-Make sure MatrixOne is running:
 ```bash
 docker ps | grep matrixone
 # If not running:
@@ -483,25 +463,22 @@ docker start matrixone
 
 ### "sentence-transformers not installed"
 
-Install with local embedding support:
 ```bash
 pip install --index-url https://pypi.org/simple/ --extra-index-url https://test.pypi.org/simple/ 'trust-mem-lite[local-embedding]'
 ```
 
 ### First query is slow
 
-This is expected with local embedding. The model (~80MB) loads into memory on the first query, which takes a few seconds. Subsequent queries are fast. To avoid this, use an embedding service instead:
+Expected with local embedding — model loads into memory on first query (~3-5s). Use an embedding service to avoid this:
 ```bash
 trustmem init --embedding-provider openai --embedding-api-key sk-...
-# or a self-hosted endpoint:
-trustmem init --embedding-provider openai --embedding-base-url http://localhost:11434/v1
 ```
 
 ### AI tool doesn't seem to use memory
 
 1. Check config: `trustmem status`
-2. Make sure you restarted the AI tool after `trustmem init`
-3. Check that MCP server starts: `python -m mo_memory_mcp`
+2. Restart the AI tool after `trustmem init`
+3. Verify MCP server starts: `python -m mo_memory_mcp`
 
 ### Update steering rules after upgrading
 
@@ -510,24 +487,24 @@ pip install --upgrade trust-mem-lite
 trustmem update-rules
 ```
 
+---
+
 ## For AI Agents
 
 If you're an AI agent helping a user set up TrustMem, **ask before acting**:
 
 1. **Which AI tool?** Kiro / Cursor / Claude Code?
-2. **MatrixOne database?** Three options:
-   - Already have one → get the connection URL
-   - Local Docker → `docker run -d --name matrixone -p 6001:6001 -v ./data/matrixone:/mo-data --memory=2g matrixorigin/matrixone:latest`
-   - [MatrixOne Cloud](https://cloud.matrixorigin.cn) (free tier) → no Docker needed, register and get URL
-3. **Embedding?** Already have an embedding service (OpenAI, Ollama, custom)? Use it. Otherwise local is fine.
-4. **Virtual environment?** Create one if not already in one: `python3 -m venv .venv && source .venv/bin/activate`
-5. **Install**: `pip install --index-url https://pypi.org/simple/ --extra-index-url https://test.pypi.org/simple/ 'trust-mem-lite[local-embedding]'`
-6. **Configure**: `cd <user-project> && trustmem init` (add `--db-url` for cloud/remote DB, `--embedding-provider` if not local)
-7. **Verify**: `trustmem status`
-8. Tell user to **restart their AI tool**
+2. **MatrixOne database?** Already have one → get URL. Local Docker → `docker compose up -d`. [MatrixOne Cloud](https://cloud.matrixorigin.cn) → no Docker needed.
+3. **Embedding?** Already have an embedding service? Use it. Otherwise local is fine.
+4. **Install**: `pip install --index-url https://pypi.org/simple/ --extra-index-url https://test.pypi.org/simple/ 'trust-mem-lite[local-embedding]'`
+5. **Configure**: `cd <user-project> && trustmem init`
+6. **Verify**: `trustmem status`
+7. Tell user to **restart their AI tool**
 
 For detailed troubleshooting, see [SETUP_GUIDE.md](SETUP_GUIDE.md).
 
+---
+
 ## License
 
-Apache-2.0
+Apache-2.0 © [MatrixOrigin](https://github.com/matrixorigin)
