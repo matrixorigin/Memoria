@@ -22,12 +22,44 @@ TrustMem is a **persistent memory layer** for AI agents with Git-level version c
 Every memory change is tracked, auditable, and reversible — snapshots, branches, merges, and time-travel rollback, all powered by MatrixOne's native Copy-on-Write engine.
 
 ```mermaid
+%%{init: {'theme': 'base', 'themeVariables': { 
+  'primaryColor': '#0A2540',
+  'primaryTextColor': '#E0F7FF',
+  'primaryBorderColor': '#00D4FF',
+  'lineColor': '#00A3CC',
+  'secondaryColor': '#1E3A5F',
+  'tertiaryColor': '#00D4FF'
+}}}%%
+
 graph TD
-    A[AI Agent] -->|MCP Protocol| B[TrustMem Core]
-    B --> C[Canonical Storage]
-    B --> D[Retrieval Strategy<br/>vector · semantic · activation]
-    C --> E[Git-for-Data Engine<br/>Snapshot · Branch · Merge · Rollback]
+    A[AI Agent] 
+    -->|MCP Protocol| B[TrustMem Core]
+
+    B --> C[Canonical Storage<br/>Single Source of Truth]
+    B --> D[Retrieval Strategy<br/>Pluggable Search]
+
+    C --> E[Git-for-Data Engine]
     E --> F[MatrixOne]
+
+    subgraph "Security Layer"
+        G[Snapshot & Branch<br/>Zero-Copy Isolation]
+        H[Audit & Provenance<br/>Full Traceability]
+        I[Self-Governance<br/>Contradiction Detection]
+    end
+
+    B --> G
+    B --> H
+    B --> I
+
+    classDef core fill:#0A2540,stroke:#00D4FF,stroke-width:3px,color:#E0F7FF,rx:15,ry:15;
+    classDef storage fill:#1E3A5F,stroke:#00A3CC,stroke-width:2px,color:#E0F7FF;
+    classDef strategy fill:#1E3A5F,stroke:#00D4FF,stroke-width:2px,color:#E0F7FF;
+    classDef engine fill:#00A3CC,stroke:#00D4FF,color:#0A2540;
+
+    class A,B core;
+    class C,D storage;
+    class E engine;
+    class G,H,I strategy;
 ```
 
 **Core Capabilities:**
