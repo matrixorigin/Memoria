@@ -30,7 +30,7 @@ CONFLICT_PENALTY = {"superseded": 0.5, "pending": 0.7}
 
 # Node type weights: scene nodes are distilled insights (highest value),
 # semantic nodes are facts/preferences, episodic nodes are raw events.
-NODE_TYPE_WEIGHT = {"scene": 1.2, "semantic": 1.0, "episodic": 0.8}
+NODE_TYPE_WEIGHT = {"scene": 1.2, "semantic": 1.0, "episodic": 0.8, "entity": 0.6}
 
 MIN_GRAPH_NODES = 10
 ANCHOR_TOP_K = 10

@@ -335,3 +335,81 @@ class GraphMemoryService:
     def consolidate(self, user_id: str) -> ConsolidationResult:
         """Run graph consolidation directly (for testing/admin)."""
         return self._consolidator.consolidate(user_id)
+
+    def extract_entities_llm(self, user_id: str, llm_client: Any) -> dict[str, Any]:
+        """Manual LLM entity extraction for all active semantic memories.
+
+        Scans memories that don't yet have entity_link edges, extracts entities
+        via LLM, creates entity nodes and edges. Idempotent — skips already-linked.
+        """
+        from memoria.core.memory.graph.entity_extractor import (
+            LLMEntityExtractionResult,
+            extract_entities_llm as _extract_llm,
+        )
+        from memoria.core.memory.graph.graph_store import _new_id
+        from memoria.core.memory.graph.types import EdgeType, GraphNodeData, NodeType
+
+        result = LLMEntityExtractionResult()
+
+        # Get semantic nodes without entity_link edges
+        semantic_nodes = self._store.get_user_nodes(
+            user_id, node_type=NodeType.SEMANTIC, active_only=True,
+            load_embedding=False,
+        )
+        if not semantic_nodes:
+            return {"total_memories": 0, "entities_found": 0, "edges_created": 0}
+
+        # Find which nodes already have entity_link edges
+        node_ids = {n.node_id for n in semantic_nodes}
+        existing_edges = self._store.get_edges_for_nodes(node_ids)
+        linked_ids = {
+            nid for nid, edges in existing_edges.items()
+            if any(e.edge_type == EdgeType.ENTITY_LINK.value for e in edges)
+        }
+        unlinked = [n for n in semantic_nodes if n.node_id not in linked_ids]
+        result.total_memories = len(unlinked)
+
+        if not unlinked:
+            return {"total_memories": 0, "entities_found": 0, "edges_created": 0}
+
+        entity_cache: dict[str, str] = {}
+        pending_edges: list[tuple[str, str, str, float]] = []
+
+        for node in unlinked:
+            try:
+                entities = _extract_llm(node.content, llm_client)
+                for ent in entities:
+                    result.entities_found += 1
+                    ent_node_id = entity_cache.get(ent.name)
+                    if not ent_node_id:
+                        existing = self._store.find_entity_node(user_id, ent.name)
+                        if existing:
+                            ent_node_id = existing.node_id
+                        else:
+                            ent_node_id = _new_id()
+                            # LLM extraction is more accurate → importance 0.4 (vs 0.3 for lightweight regex)
+                        self._store.create_node(GraphNodeData(
+                                node_id=ent_node_id, user_id=user_id,
+                                node_type=NodeType.ENTITY,
+                                content=ent.display_name,
+                                confidence=1.0, trust_tier="T1",
+                                importance=0.4,
+                            ))
+                        entity_cache[ent.name] = ent_node_id
+                    pending_edges.append((
+                        node.node_id, ent_node_id,
+                        EdgeType.ENTITY_LINK.value, 1.0,
+                    ))
+            except Exception as e:
+                result.errors.append(f"{node.node_id}: {e}")
+
+        if pending_edges:
+            self._store.add_edges_batch(pending_edges, user_id)
+            result.edges_created = len(pending_edges)
+
+        return {
+            "total_memories": result.total_memories,
+            "entities_found": result.entities_found,
+            "edges_created": result.edges_created,
+            "errors": result.errors,
+        }

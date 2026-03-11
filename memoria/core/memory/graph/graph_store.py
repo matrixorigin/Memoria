@@ -176,6 +176,17 @@ class GraphStore(DbConsumer):
             )
             return _to_domain(row) if row else None
 
+    def find_entity_node(self, user_id: str, entity_name: str) -> GraphNodeData | None:
+        """Find an existing active entity node by exact content match."""
+        with self._db() as db:
+            row = (
+                db.query(GraphNode)
+                .filter_by(user_id=user_id, node_type=NodeType.ENTITY.value, is_active=1)
+                .filter(GraphNode.content == entity_name)
+                .first()
+            )
+            return _to_domain(row) if row else None
+
     def count_user_nodes(self, user_id: str) -> int:
         with self._db() as db:
             return db.query(GraphNode).filter_by(user_id=user_id, is_active=1).count()

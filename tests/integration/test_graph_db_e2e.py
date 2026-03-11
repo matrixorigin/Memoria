@@ -823,3 +823,85 @@ class TestGraphCandidatesAndService:
         provider = GraphCandidateProvider(db_factory)
         candidates = provider.get_reflection_candidates(user_id)
         assert isinstance(candidates, list)
+
+
+# ── Entity Linking ────────────────────────────────────────────────────
+
+
+class TestEntityLinking:
+    """Entity extraction + graph node/edge creation."""
+
+    def test_lightweight_entity_nodes_created(self, store, user_id):
+        """Ingest a memory mentioning tech terms → entity nodes + entity_link edges created."""
+        from memoria.core.memory.graph.graph_builder import GraphBuilder
+        from memoria.core.memory.graph.types import EdgeType, NodeType
+        from memoria.core.memory.types import Memory, MemoryType, TrustTier
+
+        builder = GraphBuilder(store)
+        mem = Memory(
+            memory_id=uuid4().hex, user_id=user_id,
+            memory_type=MemoryType.SEMANTIC,
+            content="We deploy with Docker on AWS using PostgreSQL",
+            embedding=_embed(0.2), initial_confidence=0.9,
+            trust_tier=TrustTier.T3_INFERRED,
+        )
+        created = builder.ingest(user_id, [mem], [])
+
+        # Should have semantic node + entity nodes
+        entity_nodes = [n for n in created if n.node_type == NodeType.ENTITY]
+        entity_names = {n.content.lower() for n in entity_nodes}
+        assert "docker" in entity_names
+        assert "aws" in entity_names
+        assert "postgresql" in entity_names
+
+        # Check entity_link edges exist
+        semantic_node = [n for n in created if n.node_type == NodeType.SEMANTIC][0]
+        edges = store.get_outgoing_edges(semantic_node.node_id)
+        entity_link_edges = [e for e in edges if e.edge_type == EdgeType.ENTITY_LINK.value]
+        assert len(entity_link_edges) >= 3
+
+    def test_entity_node_reuse(self, store, user_id):
+        """Two memories mentioning the same entity → same entity node reused."""
+        from memoria.core.memory.graph.graph_builder import GraphBuilder
+        from memoria.core.memory.graph.types import NodeType
+        from memoria.core.memory.types import Memory, MemoryType, TrustTier
+
+        builder = GraphBuilder(store)
+        mem1 = Memory(
+            memory_id=uuid4().hex, user_id=user_id,
+            memory_type=MemoryType.SEMANTIC,
+            content="Python is my favorite language",
+            embedding=_embed(0.3), initial_confidence=0.9,
+            trust_tier=TrustTier.T3_INFERRED,
+        )
+        mem2 = Memory(
+            memory_id=uuid4().hex, user_id=user_id,
+            memory_type=MemoryType.SEMANTIC,
+            content="I use Python for data analysis",
+            embedding=_embed(0.4), initial_confidence=0.9,
+            trust_tier=TrustTier.T3_INFERRED,
+        )
+        builder.ingest(user_id, [mem1], [])
+        builder.ingest(user_id, [mem2], [])
+
+        # Only one "python" entity node should exist
+        all_nodes = store.get_user_nodes(user_id, node_type=NodeType.ENTITY, active_only=True)
+        python_nodes = [n for n in all_nodes if n.content.lower() == "python"]
+        assert len(python_nodes) == 1
+
+    def test_find_entity_node(self, store, user_id):
+        """find_entity_node returns existing entity, None for missing."""
+        from memoria.core.memory.graph.types import GraphNodeData, NodeType
+
+        node = GraphNodeData(
+            node_id=uuid4().hex, user_id=user_id,
+            node_type=NodeType.ENTITY, content="redis",
+            confidence=1.0, trust_tier="T1", importance=0.3,
+        )
+        store.create_node(node)
+
+        found = store.find_entity_node(user_id, "redis")
+        assert found is not None
+        assert found.node_id == node.node_id
+
+        assert store.find_entity_node(user_id, "nonexistent") is None

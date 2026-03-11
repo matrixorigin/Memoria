@@ -10,6 +10,7 @@ class NodeType(str, enum.Enum):
     EPISODIC = "episodic"
     SEMANTIC = "semantic"
     SCENE = "scene"
+    ENTITY = "entity"
 
 
 class EdgeType(str, enum.Enum):
@@ -18,6 +19,7 @@ class EdgeType(str, enum.Enum):
     ASSOCIATION = "association"  # concept co-occurrence (weight: cosine_sim)
     CAUSAL = "causal"            # cause-effect (weight: 1.5)
     CONSOLIDATION = "consolidation"  # scene synthesis (weight: 1.0)
+    ENTITY_LINK = "entity_link"  # memory ↔ named entity (weight: 1.0)
 
 
 # Activation multipliers per edge type (spreading activation)
@@ -27,6 +29,7 @@ EDGE_TYPE_MULTIPLIER: dict[str, float] = {
     EdgeType.ASSOCIATION: 1.0,
     EdgeType.CAUSAL: 1.5,
     EdgeType.CONSOLIDATION: 1.0,
+    EdgeType.ENTITY_LINK: 1.2,
 }
 
 

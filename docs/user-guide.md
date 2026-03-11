@@ -92,6 +92,7 @@ Once connected, your AI assistant can use these 11 tools:
 | `memory_snapshot_diff` | Compare snapshot with current state |
 | `memory_consolidate` | Detect contradictions, fix orphans (30min cooldown) |
 | `memory_reflect` | Synthesize insights from memory clusters (2h cooldown) |
+| `memory_extract_entities` | LLM entity extraction — build entity graph (manual trigger) |
 
 ---
 

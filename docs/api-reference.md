@@ -295,6 +295,14 @@ POST /v1/reflect?force=false
 
 Analyze memory clusters and synthesize high-level insights. 2-hour cooldown. Requires LLM configuration.
 
+### Extract Entities
+
+```
+POST /v1/extract-entities
+```
+
+LLM entity extraction for unlinked memories. Builds entity graph nodes and entity_link edges. Idempotent — skips already-linked memories. Requires LLM configuration.
+
 ---
 
 ## Auth

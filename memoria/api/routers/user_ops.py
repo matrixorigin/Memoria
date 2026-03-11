@@ -12,7 +12,7 @@ router = APIRouter(tags=["memory"])
 
 # In-memory TTL cache: (user_id, op) → (timestamp, result)
 _cache: dict[tuple[str, str], tuple[float, Any]] = {}
-_TTL = {"consolidate": 1800, "reflect": 7200}  # seconds
+_TTL = {"consolidate": 1800, "reflect": 7200, "extract_entities": 3600}  # seconds
 
 
 def _with_cache(user_id: str, op: str, fn, force: bool) -> dict:
@@ -69,3 +69,22 @@ def reflect(
         except Exception as e:
             return {"insights": 0, "skipped": 0, "note": f"reflect unavailable: {e}"}
     return _with_cache(user_id, "reflect", _run, force)
+
+
+@router.post("/extract-entities")
+def extract_entities(
+    force: bool = False,
+    user_id: str = Depends(get_current_user_id),
+    db_factory=Depends(get_db_factory),
+):
+    """LLM entity extraction for unlinked memories. Manual trigger only. 1h cooldown."""
+    def _run():
+        try:
+            from memoria.core.memory.graph.service import GraphMemoryService
+            from memoria.core.llm import get_llm_client
+            llm = get_llm_client()
+            svc = GraphMemoryService(db_factory)
+            return svc.extract_entities_llm(user_id, llm)
+        except Exception as e:
+            return {"total_memories": 0, "entities_found": 0, "edges_created": 0, "error": str(e)}
+    return _with_cache(user_id, "extract_entities", _run, force)

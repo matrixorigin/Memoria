@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any
 
+from memoria.core.memory.graph.entity_extractor import extract_entities_lightweight
 from memoria.core.memory.graph.graph_store import GraphStore, _new_id
 from memoria.core.memory.graph.types import EdgeType, GraphNodeData, NodeType
 
@@ -94,6 +95,11 @@ class GraphBuilder:
 
         # Causal edges
         self._collect_causal_edges(episodic_nodes, source_events, pending_edges)
+
+        # Entity linking (lightweight — no LLM)
+        all_content_nodes = episodic_nodes + semantic_nodes
+        entity_nodes = self._link_entities(user_id, all_content_nodes, pending_edges)
+        created.extend(entity_nodes)
 
         if pending_edges:
             self._store.add_edges_batch(pending_edges, user_id)
@@ -205,3 +211,52 @@ class GraphBuilder:
                         EdgeType.CAUSAL.value, 1.5,
                     ))
             prev_event = ev
+
+    def _link_entities(
+        self, user_id: str,
+        content_nodes: list[GraphNodeData],
+        pending_edges: list[tuple[str, str, str, float]],
+    ) -> list[GraphNodeData]:
+        """Extract entities from content nodes and link them.
+
+        Reuses existing entity nodes (by name match) to build a shared entity graph.
+        """
+        if not content_nodes:
+            return []
+
+        created_entities: list[GraphNodeData] = []
+        # Cache: entity_name → node_id (avoid repeated DB lookups within batch)
+        entity_cache: dict[str, str] = {}
+
+        for node in content_nodes:
+            if not node.content:
+                continue
+            entities = extract_entities_lightweight(node.content)
+            for ent in entities:
+                ent_node_id = entity_cache.get(ent.name)
+                if not ent_node_id:
+                    # Check DB for existing entity node
+                    existing = self._store.find_entity_node(user_id, ent.name)
+                    if existing:
+                        ent_node_id = existing.node_id
+                    else:
+                        ent_node_id = _new_id()
+                        # Lightweight regex extraction → importance 0.3
+                        # (LLM extraction in service.extract_entities_llm uses 0.4)
+                        ent_node = GraphNodeData(
+                            node_id=ent_node_id, user_id=user_id,
+                            node_type=NodeType.ENTITY,
+                            content=ent.display_name,
+                            confidence=1.0, trust_tier="T1",
+                            importance=0.3,
+                        )
+                        self._store.create_node(ent_node)
+                        created_entities.append(ent_node)
+                    entity_cache[ent.name] = ent_node_id
+
+                pending_edges.append((
+                    node.node_id, ent_node_id,
+                    EdgeType.ENTITY_LINK.value, 1.0,
+                ))
+
+        return created_entities

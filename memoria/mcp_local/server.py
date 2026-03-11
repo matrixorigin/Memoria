@@ -38,6 +38,7 @@ class MemoryBackend:
     def governance(self, user_id: str, force: bool = False) -> dict: ...
     def consolidate(self, user_id: str, force: bool = False) -> dict: ...
     def reflect(self, user_id: str, force: bool = False) -> dict: ...
+    def extract_entities(self, user_id: str) -> dict: ...
     def rebuild_index(self, table: str) -> str: ...
     def health_warnings(self, user_id: str) -> list[str]: ...
     # Branching
@@ -319,8 +320,8 @@ class EmbeddedBackend(MemoryBackend):
             provider = GraphCandidateProvider(self._db_factory)
             svc = GraphMemoryService(self._db_factory)
             try:
-                from memoria.core.llmclient import LLMClient
-                llm = LLMClient(db_factory=self._db_factory)
+                from memoria.core.llm import get_llm_client
+                llm = get_llm_client()
             except Exception:
                 return {"error": "LLM client not available for reflection"}
             engine = ReflectionEngine(provider, svc, llm)
@@ -333,6 +334,16 @@ class EmbeddedBackend(MemoryBackend):
         gs = GovernanceScheduler(self._db_factory)
         result = gs.rebuild_vector_index(table)
         return f"Rebuilt IVF index for {table}: lists {result['old_lists']} → {result['new_lists']} (rows={result['total_rows']})"
+
+    def extract_entities(self, user_id: str) -> dict:
+        try:
+            from memoria.core.memory.graph.service import GraphMemoryService
+            from memoria.core.llm import get_llm_client
+            llm = get_llm_client()
+            svc = GraphMemoryService(self._db_factory)
+            return svc.extract_entities_llm(user_id, llm)
+        except Exception as e:
+            return {"total_memories": 0, "entities_found": 0, "edges_created": 0, "error": str(e)}
 
     # ── Branching ─────────────────────────────────────────────────────
 
@@ -1045,6 +1056,12 @@ class HTTPBackend(MemoryBackend):
         r.raise_for_status()
         return r.json()
 
+    def extract_entities(self, user_id: str) -> dict:
+        # user_id is resolved server-side from the API key in Authorization header
+        r = self._client.post("/v1/extract-entities")
+        r.raise_for_status()
+        return r.json()
+
     def rebuild_index(self, table: str) -> str:
         r = self._client.post("/v1/memories/rebuild-index", json={"table": table})
         r.raise_for_status()
@@ -1314,6 +1331,26 @@ def create_server(backend: MemoryBackend, default_user: str = "default") -> Fast
         if "error" in result:
             return f"Reflection failed: {result['error']}"
         return f"Reflection done: scenes_created={result['scenes_created']}, candidates_found={result['candidates_found']}"
+
+    @server.tool()
+    def memory_extract_entities(
+        user_id: str | None = None,
+    ) -> str:
+        """Extract named entities from memories using LLM and build entity graph.
+
+        Only call when user explicitly asks to "extract entities", "build entity graph",
+        or "link entities". Requires LLM. Processes only unlinked memories (idempotent).
+
+        Args:
+            user_id: User ID (optional).
+        """
+        result = backend.extract_entities(_user(user_id))
+        if "error" in result:
+            return f"Entity extraction failed: {result['error']}"
+        return (
+            f"Entity extraction done: {result['total_memories']} memories processed, "
+            f"{result['entities_found']} entities found, {result['edges_created']} edges created."
+        )
 
     @server.tool()
     def memory_rebuild_index(

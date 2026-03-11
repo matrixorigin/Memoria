@@ -1,4 +1,4 @@
-.PHONY: help start stop logs status build test test-docker test-mcp test-all clean reset \
+.PHONY: help start stop logs status build test test-docker test-mcp test-all test-all-cov clean reset \
         cloud-start cloud-stop cloud-logs cloud-status cloud-clean cloud-rebuild \
         install dev build-wheel publish publish-test
 
@@ -30,6 +30,7 @@ help:
 	@echo "  make test-docker        Run Docker integration tests (needs: make start)"
 	@echo "  make test-mcp           Run MCP server tests"
 	@echo "  make test-all           Run all tests"
+	@echo "  make test-all-cov       Run all tests with coverage report"
 	@echo ""
 	@echo "Build & Publish:"
 	@echo "  make build              Build Docker image"
@@ -109,6 +110,17 @@ test-mcp:
 
 test-all: test-unit test test-mcp
 	@echo "For Docker tests: make start && make test-docker"
+
+test-all-cov:
+	@echo "Running all tests with coverage..."
+	@python -m pytest tests/unit/ memoria/tests/test_e2e.py memoria/tests/test_mcp.py \
+		--cov=memoria --cov-report=term-missing --cov-report=html:htmlcov \
+		-v -n auto 2>&1 | tee coverage.log
+	@echo ""
+	@echo "✅ Coverage report generated:"
+	@echo "   - Terminal: see above"
+	@echo "   - HTML: htmlcov/index.html"
+	@echo "   - Log: coverage.log"
 
 # ── Build & Publish ─────────────────────────────────────────────────
 

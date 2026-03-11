@@ -386,6 +386,7 @@ Memoria exposes MCP tools that your AI tool calls automatically based on steerin
 | `memory_governance` | Quarantine low-confidence memories, clean stale data (1h cooldown) |
 | `memory_consolidate` | Detect contradictions, fix orphaned graph nodes (30min cooldown) |
 | `memory_reflect` | Synthesize high-level insights from memory clusters via LLM (2h cooldown) |
+| `memory_extract_entities` | LLM entity extraction — build entity graph from unlinked memories |
 | `memory_rebuild_index` | Rebuild IVF vector index for a table |
 
 ---
