@@ -1663,7 +1663,7 @@ def create_server(backend: MemoryBackend, default_user: str = "default") -> Fast
             "2. AFTER each response, call memory_store for any new fact, preference, or decision.\n"
             "\n"
             "CRUD: memory_store, memory_retrieve, memory_correct, memory_purge, memory_profile, memory_search.\n"
-            "memory_purge supports single ID or topic-based bulk delete (e.g. 'forget everything about X').\n"
+            "memory_purge supports single ID, comma-separated batch IDs (e.g. 'id1,id2,id3'), or topic-based bulk delete.\n"
             "MAINTENANCE (only when user asks): memory_governance, memory_consolidate, memory_reflect, memory_rebuild_index.\n"
             "\n"
             "memory_store types: semantic (default), profile, procedural, working, tool_result."
