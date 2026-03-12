@@ -37,6 +37,7 @@ class ReflectionResult:
     candidates_skipped_low_importance: int = 0
     scenes_created: int = 0
     llm_calls: int = 0
+    opinion_checks: int = 0
     errors: list[str] = field(default_factory=list)
     total_ms: float = 0.0
     # Low-importance candidates: [(signal, score)] — lightweight summary only
@@ -55,16 +56,23 @@ class SynthesizedInsight:
 
 
 class ReflectionEngine:
-    """Backend-agnostic reflection: candidates → threshold filter → LLM → persist.
+    """Backend-agnostic reflection: 3-stage pipeline.
 
-    Candidates arrive with pre-computed importance_score from their backend.
-    Engine only filters by threshold, synthesizes, and persists.
+    Stage 1: Collect high-activation subgraph around candidate cluster
+    Stage 2: Synthesize scene with enriched context (neighbors + entities)
+    Stage 3: Persist scene node + run opinion evolution against existing scenes
 
     Args:
         candidate_provider: backend-specific provider (tabular or graph).
         writer: MemoryWriter for persisting new scene memories.
         llm_client: LLM client for synthesis calls.
         threshold: minimum importance score to trigger synthesis.
+        subgraph_collector: optional callable(user_id, memory_ids) → context string.
+            If provided, Stage 1 collects neighbor/entity context for richer synthesis.
+        opinion_checker: optional callable(user_id, content) → list of conflicts.
+            If provided, Stage 3 checks new scene against existing scenes.
+        entity_names_collector: optional callable(user_id, memory_ids) → set of entity names.
+            If provided, enriches persisted scene content with entity summary (0B.4).
     """
 
     def __init__(
@@ -75,6 +83,9 @@ class ReflectionEngine:
         threshold: float = DAILY_THRESHOLD,
         llm_threshold: float | None = None,
         llm_retries: int = 1,
+        subgraph_collector: Any = None,
+        opinion_checker: Any = None,
+        entity_names_collector: Any = None,
     ):
         self._provider = candidate_provider
         self._writer = writer
@@ -82,6 +93,9 @@ class ReflectionEngine:
         self._threshold = threshold
         self._llm_threshold = llm_threshold if llm_threshold is not None else threshold
         self._llm_retries = llm_retries
+        self._subgraph_collector = subgraph_collector
+        self._opinion_checker = opinion_checker
+        self._entity_names_collector = entity_names_collector
 
     def reflect(
         self,
@@ -90,19 +104,19 @@ class ReflectionEngine:
         since_hours: int = 24,
         existing_knowledge: str = "",
     ) -> ReflectionResult:
-        """Run one reflection cycle for a user.
+        """Run one reflection cycle for a user (3-stage pipeline).
 
-        1. Get candidates from backend-specific provider
-        2. Score by importance, filter below threshold
-        3. LLM synthesis for qualifying candidates
-        4. Persist as scene-type memories (T4, conservative confidence)
+        Stage 1: Get candidates, filter by importance, collect subgraph context
+                 for all qualifying candidates (neighbors + entities)
+        Stage 2: LLM synthesis with enriched context per candidate
+        Stage 3: Persist scene + opinion evolution against existing scenes
         """
         import time
 
         start = time.time()
         result = ReflectionResult()
 
-        # 1. Get candidates
+        # ── Stage 1: Get candidates ──
         try:
             candidates = self._provider.get_reflection_candidates(
                 user_id,
@@ -119,30 +133,65 @@ class ReflectionEngine:
             result.total_ms = (time.time() - start) * 1000
             return result
 
-        # 2. Score and filter
-        scored = [(c, c.importance_score) for c in candidates]
-        passed = [(c, s) for c, s in scored if s >= self._threshold]
+        # Score and filter
+        passed = [
+            (c, c.importance_score)
+            for c in candidates
+            if c.importance_score >= self._threshold
+        ]
         result.candidates_passed = len(passed)
 
         if not passed:
             result.total_ms = (time.time() - start) * 1000
             return result
 
-        # 2b. Split: high-importance → LLM synthesis, low → candidates-only
+        # Split: high-importance → LLM synthesis, low → candidates-only
         synth_candidates = [(c, s) for c, s in passed if s >= self._llm_threshold]
         low_candidates = [(c, s) for c, s in passed if s < self._llm_threshold]
         result.candidates_skipped_low_importance = len(low_candidates)
         result.low_importance_candidates = [(c.signal, s) for c, s in low_candidates]
 
-        # 3. Synthesize each qualifying candidate
-        for candidate, score in synth_candidates:
-            try:
-                result.llm_calls += 1
-                insights = self._synthesize_with_retry(candidate, existing_knowledge)
+        # ── Stage 1b: Collect subgraph context for all synth candidates ──
+        subgraph_contexts: dict[int, str] = {}
+        if self._subgraph_collector and synth_candidates:
+            for idx, (candidate, _score) in enumerate(synth_candidates):
+                try:
+                    mem_ids = [m.memory_id for m in candidate.memories]
+                    subgraph_contexts[idx] = self._subgraph_collector(user_id, mem_ids)
+                except Exception as e:
+                    logger.debug(
+                        "Subgraph collection failed for %s: %s", candidate.signal, e
+                    )
 
-                # 4. Persist all insights from this candidate
+        # ── Stage 2: Synthesize with enriched context ──
+        for idx, (candidate, score) in enumerate(synth_candidates):
+            try:
+                subgraph_context = subgraph_contexts.get(idx, "")
+
+                result.llm_calls += 1
+                insights = self._synthesize_with_retry(
+                    candidate, existing_knowledge, subgraph_context
+                )
+
+                # ── Stage 3: Persist + opinion check ──
                 for insight in insights:
                     try:
+                        # Check for conflicts with existing scenes before persisting
+                        if self._opinion_checker:
+                            try:
+                                conflicts = self._opinion_checker(
+                                    user_id, insight.content
+                                )
+                                if conflicts:
+                                    result.opinion_checks += 1
+                                    logger.info(
+                                        "New scene conflicts with %d existing scenes, flagging",
+                                        len(conflicts),
+                                    )
+                                    insight.confidence = min(insight.confidence, 0.4)
+                            except Exception as e:
+                                logger.debug("Opinion check failed: %s", e)
+
                         self._persist_insight(user_id, insight)
                         result.scenes_created += 1
                     except Exception as e:
@@ -160,12 +209,13 @@ class ReflectionEngine:
         self,
         candidate: ReflectionCandidate,
         existing_knowledge: str,
+        subgraph_context: str = "",
     ) -> list[SynthesizedInsight]:
         """Call _synthesize with retry on failure."""
         last_err: Exception | None = None
         for attempt in range(1 + self._llm_retries):
             try:
-                return self._synthesize(candidate, existing_knowledge)
+                return self._synthesize(candidate, existing_knowledge, subgraph_context)
             except Exception as e:
                 last_err = e
                 if attempt < self._llm_retries:
@@ -176,11 +226,16 @@ class ReflectionEngine:
         self,
         candidate: ReflectionCandidate,
         existing_knowledge: str,
+        subgraph_context: str = "",
     ) -> list[SynthesizedInsight]:
         """LLM synthesis for a single candidate cluster."""
         experiences = "\n\n".join(
             f"[{m.memory_type.value}] {m.content}" for m in candidate.memories
         )
+
+        # Enrich with subgraph context (neighbors + entities) if available
+        if subgraph_context:
+            experiences = f"{experiences}\n\nRELATED CONTEXT:\n{subgraph_context}"
 
         prompt = REFLECTION_SYNTHESIS_PROMPT.format(
             existing_knowledge=existing_knowledge or "(none)",
@@ -241,10 +296,31 @@ class ReflectionEngine:
         return insights
 
     def _persist_insight(self, user_id: str, insight: SynthesizedInsight) -> None:
-        """Persist a synthesized insight as a scene-type memory."""
+        """Persist a synthesized insight as a scene-type memory.
+
+        Enriches content with source_count and entity summary (0B.4).
+        """
+        source_count = len(insight.source_memory_ids)
+        content = insight.content
+        if source_count > 0:
+            content = f"{content}\n[source_count={source_count}]"
+
+        # Collect entity names from source memories via subgraph_collector context
+        if self._entity_names_collector:
+            try:
+                entity_names = self._entity_names_collector(
+                    user_id, insight.source_memory_ids
+                )
+                if entity_names:
+                    content = (
+                        f"{content}\n[entities: {', '.join(sorted(entity_names))}]"
+                    )
+            except Exception as e:
+                logger.debug("Entity names collection failed: %s", e)
+
         self._writer.store(
             user_id=user_id,
-            content=insight.content,
+            content=content,
             memory_type=insight.memory_type,
             source_event_ids=insight.source_memory_ids,
             initial_confidence=insight.confidence,

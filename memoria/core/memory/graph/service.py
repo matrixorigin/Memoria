@@ -95,7 +95,9 @@ class GraphMemoryService:
     @property
     def _retriever(self) -> ActivationRetriever:
         if self._activation_retriever is None:
-            self._activation_retriever = ActivationRetriever(self._store)
+            self._activation_retriever = ActivationRetriever(
+                self._store, config=self._config
+            )
         return self._activation_retriever
 
     @property
@@ -323,11 +325,26 @@ class GraphMemoryService:
         pending = self.drain_pending_graph_sync()
         if pending:
             logger.info("Retrying graph sync for %d memories", len(pending))
-            # Governance will re-ingest on next consolidation cycle;
-            # just log for observability.
+            retried = 0
+            still_pending = []
+            for mid in pending:
+                mem = self._tabular_delegate.get_memory(mid)
+                if not mem:
+                    continue
+                try:
+                    created = self._builder.ingest(
+                        user_id, [mem], [], session_id=mem.session_id
+                    )
+                    self._run_opinion_evolution(user_id, created)
+                    retried += 1
+                except _RECOVERABLE:
+                    still_pending.append(mid)
+            self._pending_graph_sync.extend(still_pending)
             if report.errors is None:
                 report.errors = []
-            report.errors.append(f"graph_pending_sync: {len(pending)} memories")
+            report.errors.append(
+                f"graph_pending_sync: retried={retried}, still_pending={len(still_pending)}"
+            )
 
         # Graph consolidation (conflict detection, source integrity)
         try:

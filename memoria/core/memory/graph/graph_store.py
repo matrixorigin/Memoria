@@ -5,6 +5,9 @@ from __future__ import annotations
 import logging
 import uuid
 
+from sqlalchemy.orm import Session
+
+from memoria.core.memory.models.entity import Entity
 from memoria.core.memory.models.graph import GraphEdge, GraphNode
 from memoria.core.db_consumer import DbConsumer
 from memoria.core.memory.graph.types import Edge, EdgeType, GraphNodeData, NodeType
@@ -202,16 +205,16 @@ class GraphStore(DbConsumer):
         *,
         source: str = "regex",
     ) -> tuple[list[GraphNodeData], list[tuple[str, str, str, float]], int]:
-        """Unified entity linking: create entity nodes + collect edges.
+        """Unified entity linking: dual-write entity tables + graph nodes/edges.
 
-        Args:
-            content_nodes: nodes to link entities from.
-            entities_per_node: {node_id: [(canonical_name, entity_type), ...]}.
-            source: "regex" (weight 0.8), "llm" (0.9), or "manual" (1.0).
+        Writes to all four tables in a single transaction:
+        1. mem_entities (source of truth)
+        2. mem_memory_entity_links (for semantic nodes with memory_id)
+        3. memory_graph_nodes (entity nodes, entity_id == node_id)
+        4. memory_graph_edges (collected as pending_edges, committed by caller)
 
         Returns:
             (created_entity_nodes, pending_edges, reused_count).
-            reused_count = entities that already existed and were linked (not newly created).
         """
         _WEIGHT = {"regex": 0.8, "llm": 0.9, "manual": 1.0}
         weight = _WEIGHT.get(source, 1.0)
@@ -223,38 +226,56 @@ class GraphStore(DbConsumer):
         reused = 0
         pending_edges: list[tuple[str, str, str, float]] = []
 
-        for node in content_nodes:
-            ent_list = entities_per_node.get(node.node_id, [])
-            for canonical_name, etype in ent_list:
-                ent_node_id = entity_cache.get(canonical_name)
-                if not ent_node_id:
-                    existing = self.find_entity_node(user_id, canonical_name)
-                    if existing:
-                        ent_node_id = existing.node_id
-                        reused += 1
-                    else:
-                        ent_node_id = _new_id()
-                        ent_node = GraphNodeData(
-                            node_id=ent_node_id,
-                            user_id=user_id,
-                            node_type=NodeType.ENTITY,
-                            content=canonical_name.lower(),
-                            entity_type=etype,
-                            confidence=1.0,
-                            trust_tier="T1",
-                            importance=importance,
+        with self._db() as db:
+            # 1. Upsert mem_entities + cache entity_id
+            for node in content_nodes:
+                for canonical_name, etype in entities_per_node.get(node.node_id, []):
+                    if canonical_name not in entity_cache:
+                        eid = self._upsert_entity_in(
+                            db, user_id, canonical_name, canonical_name, etype
                         )
-                        self.create_node(ent_node)
-                        created.append(ent_node)
-                    entity_cache[canonical_name] = ent_node_id
-                pending_edges.append(
-                    (
-                        node.node_id,
-                        ent_node_id,
-                        EdgeType.ENTITY_LINK.value,
-                        weight,
-                    )
-                )
+                        # Check if graph node already exists (reused vs new)
+                        existing_graph = (
+                            db.query(GraphNode).filter_by(node_id=eid).first()
+                        )
+                        if existing_graph:
+                            reused += 1
+                        else:
+                            ent_node = GraphNodeData(
+                                node_id=eid,
+                                user_id=user_id,
+                                node_type=NodeType.ENTITY,
+                                content=canonical_name.lower(),
+                                entity_type=etype,
+                                confidence=1.0,
+                                trust_tier="T1",
+                                importance=importance,
+                            )
+                            db.add(GraphNode(**_to_row(ent_node)))
+                            created.append(ent_node)
+                        entity_cache[canonical_name] = eid
+
+            # 2. Write mem_memory_entity_links for semantic nodes
+            for node in content_nodes:
+                if not node.memory_id:
+                    continue
+                for canonical_name, _etype in entities_per_node.get(node.node_id, []):
+                    eid = entity_cache.get(canonical_name)
+                    if eid:
+                        self._upsert_link_in(
+                            db, node.memory_id, eid, user_id, source, weight
+                        )
+
+            # 3. Collect pending edges (caller commits via add_edges_batch)
+            for node in content_nodes:
+                for canonical_name, _etype in entities_per_node.get(node.node_id, []):
+                    eid = entity_cache.get(canonical_name)
+                    if eid:
+                        pending_edges.append(
+                            (node.node_id, eid, EdgeType.ENTITY_LINK.value, weight)
+                        )
+
+            db.commit()
 
         return created, pending_edges, reused
 
@@ -337,6 +358,48 @@ class GraphStore(DbConsumer):
                 .first()
             )
             return float(result.sim) if result else None
+
+    def fulltext_search(
+        self,
+        user_id: str,
+        query: str,
+        *,
+        top_k: int = 10,
+    ) -> list[tuple[GraphNodeData, float]]:
+        """Fulltext (BM25-like) search on memory_graph_nodes.content.
+
+        Uses MatrixOne's boolean_match for fulltext index (ft_graph_content).
+        Returns (node, relevance_score) pairs.
+        Gracefully returns [] if fulltext is unavailable.
+        """
+        if not query or not query.strip():
+            return []
+        import re as _re
+
+        safe = _re.sub(r"[+\-<>()~*\"@]", " ", query).strip()
+        if not safe:
+            return []
+
+        try:
+            from matrixone.sqlalchemy_ext import boolean_match
+            from sqlalchemy import literal_column
+
+            with self._db() as db:
+                ft = boolean_match("content").must(safe)
+                ft_sql = ft.compile()
+                ft_score = literal_column(str(ft_sql)).label("ft_score")
+                rows = (
+                    db.query(GraphNode, ft_score)
+                    .filter_by(user_id=user_id, is_active=1)
+                    .filter(ft)
+                    .order_by(ft_score.desc())
+                    .limit(top_k)
+                    .all()
+                )
+                return [(_to_domain(row), float(score)) for row, score in rows]
+        except Exception:
+            logger.debug("Fulltext search failed", exc_info=True)
+            return []
 
     def get_pairs_similarity_batch(
         self,
@@ -642,10 +705,18 @@ class GraphStore(DbConsumer):
             return _to_domain(row) if row else None
 
     def delete_user_data(self, user_id: str) -> None:
-        """Remove all graph nodes and edges for a user."""
+        """Remove all graph nodes, edges, entities, and entity links for a user."""
         with self._db() as db:
             from sqlalchemy import text as sa_text
 
+            db.execute(
+                sa_text("DELETE FROM mem_memory_entity_links WHERE user_id = :uid"),
+                {"uid": user_id},
+            )
+            db.execute(
+                sa_text("DELETE FROM mem_entities WHERE user_id = :uid"),
+                {"uid": user_id},
+            )
             db.execute(
                 sa_text("DELETE FROM memory_graph_edges WHERE user_id = :uid"),
                 {"uid": user_id},
@@ -655,3 +726,215 @@ class GraphStore(DbConsumer):
                 {"uid": user_id},
             )
             db.commit()
+
+    # ── Entity Table Operations ───────────────────────────────────────
+
+    def upsert_entity(
+        self,
+        user_id: str,
+        name: str,
+        display_name: str,
+        entity_type: str,
+        *,
+        session: Session | None = None,
+    ) -> str:
+        """Upsert into mem_entities. Returns entity_id (existing or new).
+
+        If ``session`` is provided, uses it without committing (caller owns tx).
+        Otherwise opens a new session and commits.
+        """
+        if session is not None:
+            return self._upsert_entity_in(
+                session, user_id, name, display_name, entity_type
+            )
+        with self._db() as db:
+            eid = self._upsert_entity_in(db, user_id, name, display_name, entity_type)
+            db.commit()
+            return eid
+
+    @staticmethod
+    def _upsert_entity_in(
+        db: Session, user_id: str, name: str, display_name: str, entity_type: str
+    ) -> str:
+        existing = db.query(Entity).filter_by(user_id=user_id, name=name).first()
+        if existing:
+            return existing.entity_id
+        entity_id = _new_id()
+        db.add(
+            Entity(
+                entity_id=entity_id,
+                user_id=user_id,
+                name=name,
+                display_name=display_name,
+                entity_type=entity_type,
+            )
+        )
+        db.flush()
+        return entity_id
+
+    def upsert_memory_entity_link(
+        self,
+        memory_id: str,
+        entity_id: str,
+        user_id: str,
+        *,
+        source: str = "regex",
+        weight: float = 0.8,
+        session: Session | None = None,
+    ) -> None:
+        """Insert link into mem_memory_entity_links, skip if exists.
+
+        If ``session`` is provided, uses it without committing (caller owns tx).
+        """
+        if session is not None:
+            self._upsert_link_in(session, memory_id, entity_id, user_id, source, weight)
+            return
+        with self._db() as db:
+            self._upsert_link_in(db, memory_id, entity_id, user_id, source, weight)
+            db.commit()
+
+    @staticmethod
+    def _upsert_link_in(
+        db: Session,
+        memory_id: str,
+        entity_id: str,
+        user_id: str,
+        source: str,
+        weight: float,
+    ) -> None:
+        from sqlalchemy import text as sa_text
+
+        db.execute(
+            sa_text(
+                "INSERT INTO mem_memory_entity_links "
+                "(memory_id, entity_id, user_id, source, weight) "
+                "VALUES (:mid, :eid, :uid, :src, :w) "
+                "ON DUPLICATE KEY UPDATE weight = VALUES(weight)"
+            ),
+            {
+                "mid": memory_id,
+                "eid": entity_id,
+                "uid": user_id,
+                "src": source,
+                "w": weight,
+            },
+        )
+
+    def get_memories_by_entity(
+        self,
+        entity_id: str,
+        user_id: str,
+        *,
+        limit: int = 50,
+    ) -> list[tuple[str, float]]:
+        """Reverse lookup: entity → memory_ids with weights via mem_memory_entity_links.
+
+        Returns list of (memory_id, weight) ordered by weight DESC.
+        """
+        with self._db() as db:
+            from sqlalchemy import text as sa_text
+
+            rows = db.execute(
+                sa_text(
+                    "SELECT l.memory_id, l.weight "
+                    "FROM mem_memory_entity_links l "
+                    "JOIN mem_memories m ON l.memory_id = m.memory_id "
+                    "WHERE l.entity_id = :eid AND l.user_id = :uid AND m.is_active = 1 "
+                    "ORDER BY l.weight DESC, m.created_at DESC "
+                    "LIMIT :lim"
+                ),
+                {"eid": entity_id, "uid": user_id, "lim": limit},
+            ).fetchall()
+            return [(r[0], float(r[1])) for r in rows]
+
+    def find_entity_by_name(self, user_id: str, name: str) -> str | None:
+        """Find entity_id in mem_entities by exact name match."""
+        with self._db() as db:
+            row = (
+                db.query(Entity.entity_id).filter_by(user_id=user_id, name=name).first()
+            )
+            return row[0] if row else None
+
+    def get_user_entities(self, user_id: str) -> list[tuple[str, str, str]]:
+        """List all entities for a user. Returns [(entity_id, name, entity_type)]."""
+        with self._db() as db:
+            rows = (
+                db.query(Entity.entity_id, Entity.name, Entity.entity_type)
+                .filter_by(user_id=user_id)
+                .all()
+            )
+            return [(r[0], r[1], r[2]) for r in rows]
+
+    def repair_entity_graph_consistency(self, user_id: str) -> dict[str, int]:
+        """Scan mem_entities vs memory_graph_nodes(node_type='entity') and fix gaps.
+
+        Invariant: entity_id in mem_entities == node_id in memory_graph_nodes.
+        - Entity in table but no graph node with that ID → create graph node
+        - Graph entity node whose node_id is NOT in mem_entities → adopt or deactivate
+
+        Returns counts of repairs made.
+        """
+        repaired_graph = 0
+        repaired_table = 0
+
+        with self._db() as db:
+            table_entities = (
+                db.query(Entity.entity_id, Entity.name, Entity.entity_type)
+                .filter_by(user_id=user_id)
+                .all()
+            )
+            table_map = {r[0]: (r[1], r[2]) for r in table_entities}
+
+            graph_entities = (
+                db.query(GraphNode.node_id, GraphNode.content, GraphNode.entity_type)
+                .filter_by(
+                    user_id=user_id, node_type=NodeType.ENTITY.value, is_active=1
+                )
+                .all()
+            )
+            graph_map = {r[0]: (r[1], r[2]) for r in graph_entities}
+
+        # Table entity missing graph node → create graph node with same ID
+        for eid, (name, etype) in table_map.items():
+            if eid not in graph_map:
+                self.create_node(
+                    GraphNodeData(
+                        node_id=eid,
+                        user_id=user_id,
+                        node_type=NodeType.ENTITY,
+                        content=name,
+                        entity_type=etype or "concept",
+                        confidence=1.0,
+                        trust_tier="T1",
+                        importance=0.3,
+                    )
+                )
+                repaired_graph += 1
+
+        # Graph entity node not in table → create entity row or deactivate orphan
+        for nid, (content, etype) in graph_map.items():
+            if nid not in table_map:
+                with self._db() as db:
+                    existing = (
+                        db.query(Entity.entity_id)
+                        .filter_by(user_id=user_id, name=content)
+                        .first()
+                    )
+                if existing:
+                    # Name already exists with different ID — orphan graph node
+                    self.deactivate_node(nid)
+                else:
+                    with self._db() as db:
+                        db.add(
+                            Entity(
+                                entity_id=nid,
+                                user_id=user_id,
+                                name=content,
+                                display_name=content,
+                                entity_type=etype or "concept",
+                            )
+                        )
+                        db.commit()
+                    repaired_table += 1
+
+        return {"repaired_graph": repaired_graph, "repaired_table": repaired_table}

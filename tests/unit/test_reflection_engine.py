@@ -157,7 +157,10 @@ class TestReflectionEngine:
         writer.store.assert_called_once()
         call_kwargs = writer.store.call_args
         assert call_kwargs.kwargs["user_id"] == "u1"
-        assert call_kwargs.kwargs["content"] == "Always run linter before commit"
+        assert (
+            call_kwargs.kwargs["content"]
+            == "Always run linter before commit\n[source_count=5]"
+        )
         assert call_kwargs.kwargs["memory_type"] == MemoryType.PROCEDURAL
         assert call_kwargs.kwargs["initial_confidence"] == 0.6
         assert call_kwargs.kwargs["trust_tier"] == TrustTier.T4_UNVERIFIED

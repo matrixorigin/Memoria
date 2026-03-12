@@ -285,6 +285,17 @@ class TestTrustTierLifecycle:
         result = c.consolidate("u1")
 
         assert result.promoted == 0
+        # T2 with confidence 0.4 < 0.7 → demoted to T3
+        assert result.demoted == 1
+        c._store.update_confidence_and_tier.assert_called_once_with("s1", 0.4, "T3")
+
+    def test_t2_not_demoted_when_confident(self):
+        c = self._make_consolidator()
+        scene = self._scene(confidence=0.75, trust_tier="T2", age_days=100)
+        c._store.get_user_nodes.return_value = [scene]
+
+        result = c.consolidate("u1")
+
         assert result.demoted == 0
 
 

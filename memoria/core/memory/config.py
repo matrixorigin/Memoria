@@ -69,13 +69,17 @@ class MemoryGovernanceConfig:
 
     # ── Opinion evolution ──
     opinion_supporting_delta: float = 0.05
-    opinion_contradicting_delta: float = -0.10
+    opinion_contradicting_delta: float = -0.12
     opinion_confidence_cap: float = 0.95
     opinion_supporting_threshold: float = 0.8
     opinion_contradicting_threshold: float = 0.3
-    opinion_quarantine_threshold: float = 0.2
+    opinion_quarantine_threshold: float = 0.18
     opinion_t4_to_t3_confidence: float = 0.8
     opinion_t4_to_t3_min_age_days: int = 7
+
+    # ── Entity retrieval ──
+    entity_boost: float = 1.8
+    entity_node_type_weight: float = 0.8
 
     # ── Distributed: run_daily_all sharding ──
     daily_batch_size: int = 2000

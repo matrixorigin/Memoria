@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import unicodedata
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -94,12 +95,94 @@ _TECH_TERMS: set[str] = {
     "tensorflow",
 }
 
+# Chinese city names (top-50 by population + common travel/food cities)
+_CHINESE_CITIES: set[str] = {
+    "北京",
+    "上海",
+    "广州",
+    "深圳",
+    "成都",
+    "杭州",
+    "武汉",
+    "西安",
+    "南京",
+    "重庆",
+    "天津",
+    "苏州",
+    "长沙",
+    "郑州",
+    "东莞",
+    "青岛",
+    "沈阳",
+    "宁波",
+    "昆明",
+    "大连",
+    "厦门",
+    "合肥",
+    "佛山",
+    "福州",
+    "哈尔滨",
+    "济南",
+    "温州",
+    "南宁",
+    "长春",
+    "泉州",
+    "石家庄",
+    "贵阳",
+    "南昌",
+    "金华",
+    "常州",
+    "无锡",
+    "嘉兴",
+    "太原",
+    "徐州",
+    "珠海",
+    "兰州",
+    "乌鲁木齐",
+    "拉萨",
+    "海口",
+    "三亚",
+    "丽江",
+    "桂林",
+    "洛阳",
+    "扬州",
+    "香港",
+    "澳门",
+    "台北",
+}
+
+# Chinese time expressions
+_CHINESE_TIME_RE = re.compile(
+    r"(?:今天|昨天|前天|明天|后天|上周|本周|下周|上个月|这个月|下个月|去年|今年|明年"
+    r"|周[一二三四五六日天]|星期[一二三四五六日天]"
+    r"|\d{4}年(?:\d{1,2}月)?(?:\d{1,2}[日号])?"
+    r"|\d{1,2}月\d{1,2}[日号])"
+)
+
 # Pattern: @mention or owner/repo
 _MENTION_RE = re.compile(r"@([\w.-]+)")
 _REPO_RE = re.compile(r"\b([\w.-]+/[\w.-]+)\b")
 
 # Pattern: CamelCase identifiers (likely class/project names)
 _CAMEL_RE = re.compile(r"\b([A-Z][a-z]+(?:[A-Z][a-z]+)+)\b")
+
+# Pattern: quoted strings and backtick terms (project/product names)
+_QUOTED_RE = re.compile(r'["\u201c]([^"\u201d]{2,30})["\u201d]')
+_BACKTICK_RE = re.compile(r"`([^`]{2,30})`")
+
+
+def normalize_entity_name(name: str) -> str:
+    """Normalize entity name: NFKC, trim, collapse whitespace, lowercase ASCII only."""
+    name = unicodedata.normalize("NFKC", name).strip()
+    name = re.sub(r"\s+", " ", name)
+    # Lowercase ASCII characters only; Chinese/other scripts unchanged
+    result = []
+    for ch in name:
+        if ch.isascii() and ch.isalpha():
+            result.append(ch.lower())
+        else:
+            result.append(ch)
+    return "".join(result)
 
 
 @dataclass
@@ -117,7 +200,7 @@ def extract_entities_lightweight(text: str) -> list[ExtractedEntity]:
     entities: list[ExtractedEntity] = []
 
     def _add(name: str, display: str, etype: str) -> None:
-        key = name.lower()
+        key = normalize_entity_name(name)
         if key not in seen and len(key) >= 2:
             seen.add(key)
             entities.append(ExtractedEntity(key, display, etype))
@@ -139,8 +222,27 @@ def extract_entities_lightweight(text: str) -> list[ExtractedEntity]:
     # 4. CamelCase identifiers (likely project/class names)
     for m in _CAMEL_RE.finditer(text):
         name = m.group(1)
-        if name.lower() not in seen and name.lower() not in _TECH_TERMS:
-            _add(name.lower(), name, "project")
+        if normalize_entity_name(name) not in seen and name.lower() not in _TECH_TERMS:
+            _add(name, name, "project")
+
+    # 5. Chinese city names
+    for city in _CHINESE_CITIES:
+        if city in text:
+            _add(city, city, "location")
+
+    # 6. Chinese time expressions
+    for m in _CHINESE_TIME_RE.finditer(text):
+        _add(m.group(0), m.group(0), "time")
+
+    # 7. Quoted strings and backtick terms
+    for m in _QUOTED_RE.finditer(text):
+        val = m.group(1).strip()
+        if normalize_entity_name(val) not in seen:
+            _add(val, val, "project")
+    for m in _BACKTICK_RE.finditer(text):
+        val = m.group(1).strip()
+        if normalize_entity_name(val) not in seen:
+            _add(val, val, "project")
 
     return entities
 

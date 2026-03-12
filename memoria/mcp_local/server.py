@@ -474,7 +474,80 @@ class EmbeddedBackend(MemoryBackend):
                 llm = get_llm_client()
             except Exception:
                 return {"error": "LLM client not available for reflection"}
-            engine = ReflectionEngine(provider, svc, llm)
+
+            store = svc._store  # GraphStore for callbacks
+
+            def _subgraph_collector(uid: str, mem_ids: list[str]) -> str:
+                """Collect neighbor + entity context for candidate memories."""
+                parts: list[str] = []
+                for mid in mem_ids[:10]:
+                    node = store.get_node_by_memory_id(mid)
+                    if not node:
+                        continue
+                    edges = store.get_outgoing_edges(node.node_id)
+                    for edge in edges[:5]:
+                        neighbor = store.get_node(edge.target_id)
+                        if neighbor and neighbor.is_active and neighbor.content:
+                            parts.append(f"[{neighbor.node_type}] {neighbor.content}")
+                return "\n".join(parts[:20])
+
+            def _opinion_checker(uid: str, content: str) -> list[str]:
+                """Check new scene against existing high-confidence scenes via embedding similarity."""
+                embed_client = self._get_embed_client()
+                if not embed_client:
+                    return []
+                try:
+                    new_emb = embed_client.embed_text(content)
+                except Exception:
+                    return []
+                from memoria.core.memory.graph.types import NodeType as NT
+
+                scenes = store.get_user_nodes(
+                    uid, node_type=NT.SCENE, active_only=True, load_embedding=True
+                )
+                conflicts = []
+                for s in scenes:
+                    if s.confidence < 0.7 or not s.embedding:
+                        continue
+                    # Cosine similarity
+                    dot = sum(a * b for a, b in zip(new_emb, s.embedding))
+                    na = sum(a * a for a in new_emb) ** 0.5
+                    nb = sum(b * b for b in s.embedding) ** 0.5
+                    sim = dot / (na * nb) if na and nb else 0.0
+                    # High similarity but different content → potential contradiction
+                    if sim > 0.75:
+                        conflicts.append(s.node_id)
+                return conflicts
+
+            def _entity_names_collector(uid: str, mem_ids: list[str]) -> set[str]:
+                """Collect entity names linked to source memories."""
+                from memoria.core.memory.models.entity import Entity, MemoryEntityLink
+
+                names: set[str] = set()
+                with svc._db_factory() as db:
+                    rows = (
+                        db.query(Entity.name)
+                        .join(
+                            MemoryEntityLink,
+                            Entity.entity_id == MemoryEntityLink.entity_id,
+                        )
+                        .filter(
+                            MemoryEntityLink.memory_id.in_(mem_ids),
+                            MemoryEntityLink.user_id == uid,
+                        )
+                        .all()
+                    )
+                    names = {r[0] for r in rows}
+                return names
+
+            engine = ReflectionEngine(
+                provider,
+                svc,
+                llm,
+                subgraph_collector=_subgraph_collector,
+                opinion_checker=_opinion_checker,
+                entity_names_collector=_entity_names_collector,
+            )
             result = engine.reflect(user_id)
             return {
                 "scenes_created": result.scenes_created,

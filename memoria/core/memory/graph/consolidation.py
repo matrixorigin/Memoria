@@ -25,7 +25,11 @@ logger = logging.getLogger(__name__)
 
 CONTRADICTION_ASSOCIATION_THRESHOLD = 0.7
 SOURCE_INTEGRITY_RATIO = 0.5
-T3_DEMOTION_STALE_DAYS = 60  # T3 with no supporting evidence for 60 days → demote to T4
+T3_DEMOTION_STALE_DAYS = 60
+T3_TO_T2_MIN_AGE_DAYS = 30
+T3_TO_T2_MIN_CONFIDENCE = 0.85
+T3_TO_T2_MIN_CROSS_SESSION = 3
+T2_DEMOTION_CONFIDENCE = 0.7
 
 
 @dataclass
@@ -152,11 +156,12 @@ class GraphConsolidator:
         return orphaned
 
     def _trust_tier_lifecycle(self, user_id: str) -> tuple[int, int]:
-        """§4.7 Trust tier promotion and demotion.
+        """Trust tier promotion and demotion.
 
         Promotion: T4 → T3 if confidence > threshold AND age > min_days.
-        Demotion:  T3 → T4 if age > stale_days (no recent reinforcement kept confidence high
-                   but the node is old enough that it should prove itself again).
+        Promotion: T3 → T2 if confidence ≥ 0.85 AND age ≥ 30 days AND cross_session ≥ 3.
+        Demotion:  T3 → T4 if age > stale_days AND confidence < threshold.
+        Demotion:  T2 → T3 if confidence < 0.7 (after contradicting evidence).
 
         Returns:
             (promoted_count, demoted_count)
@@ -180,15 +185,13 @@ class GraphConsolidator:
             age_days = self._node_age_days(scene, now)
 
             if scene.trust_tier == "T4":
-                # Promotion: confidence > 0.8 AND age > 7 days
+                # T4 → T3: confidence ≥ 0.8 AND age ≥ 7 days
                 if (
                     scene.confidence >= confidence_threshold
                     and age_days >= min_age_days
                 ):
                     self._store.update_confidence_and_tier(
-                        scene.node_id,
-                        scene.confidence,
-                        "T3",
+                        scene.node_id, scene.confidence, "T3"
                     )
                     promoted += 1
                     logger.info(
@@ -199,15 +202,30 @@ class GraphConsolidator:
                     )
 
             elif scene.trust_tier == "T3":
-                # Demotion: stale T3 with low confidence → back to T4
+                # T3 → T2: confidence ≥ 0.85 AND age ≥ 30 days AND cross_session ≥ 3
                 if (
+                    scene.confidence >= T3_TO_T2_MIN_CONFIDENCE
+                    and age_days >= T3_TO_T2_MIN_AGE_DAYS
+                    and scene.cross_session_count >= T3_TO_T2_MIN_CROSS_SESSION
+                ):
+                    self._store.update_confidence_and_tier(
+                        scene.node_id, scene.confidence, "T2"
+                    )
+                    promoted += 1
+                    logger.info(
+                        "Promoted scene %s T3→T2 (confidence=%.2f, age=%d, cross_session=%d)",
+                        scene.node_id,
+                        scene.confidence,
+                        age_days,
+                        scene.cross_session_count,
+                    )
+                # T3 → T4: stale with low confidence
+                elif (
                     age_days >= T3_DEMOTION_STALE_DAYS
                     and scene.confidence < confidence_threshold
                 ):
                     self._store.update_confidence_and_tier(
-                        scene.node_id,
-                        scene.confidence,
-                        "T4",
+                        scene.node_id, scene.confidence, "T4"
                     )
                     demoted += 1
                     logger.info(
@@ -215,6 +233,19 @@ class GraphConsolidator:
                         scene.node_id,
                         scene.confidence,
                         age_days,
+                    )
+
+            elif scene.trust_tier == "T2":
+                # T2 → T3: confidence dropped below threshold
+                if scene.confidence < T2_DEMOTION_CONFIDENCE:
+                    self._store.update_confidence_and_tier(
+                        scene.node_id, scene.confidence, "T3"
+                    )
+                    demoted += 1
+                    logger.info(
+                        "Demoted scene %s T2→T3 (confidence=%.2f)",
+                        scene.node_id,
+                        scene.confidence,
                     )
 
         return promoted, demoted

@@ -61,8 +61,10 @@ DEFAULT_DB_URL = "mysql+pymysql://root:111@localhost:6001/memoria"
 TABLE_NAMES = [
     "mem_branches",
     "mem_edit_log",
+    "mem_entities",
     "mem_experiments",
     "mem_memories",
+    "mem_memory_entity_links",
     "mem_user_memory_config",
     "mem_user_state",
     "memory_graph_edges",
@@ -104,6 +106,21 @@ def _ddl_statements(dim: int) -> list[str]:
           PRIMARY KEY (`edit_id`),
           KEY `idx_edit_operation` (`operation`),
           KEY `idx_edit_user` (`user_id`)
+        )
+        """,
+        # ── mem_entities ──────────────────────────────────────────
+        f"""
+        CREATE TABLE IF NOT EXISTS `mem_entities` (
+          `entity_id`    VARCHAR(32)  NOT NULL,
+          `user_id`      VARCHAR(64)  NOT NULL,
+          `name`         VARCHAR(200) NOT NULL,
+          `display_name` VARCHAR(200) DEFAULT NULL,
+          `entity_type`  VARCHAR(20)  NOT NULL DEFAULT 'concept',
+          `embedding`    VECF32({dim}) DEFAULT NULL,
+          `created_at`   DATETIME(6)  NOT NULL DEFAULT NOW(),
+          PRIMARY KEY (`entity_id`),
+          UNIQUE KEY `uidx_entity_user_name` (`user_id`, `name`),
+          KEY `idx_entity_user` (`user_id`)
         )
         """,
         # ── mem_experiments ───────────────────────────────────────
@@ -155,6 +172,20 @@ def _ddl_statements(dim: int) -> list[str]:
           KEY `idx_memory_superseded_by` (`superseded_by`),
           KEY `idx_memory_user_active_type_observed` (`user_id`, `is_active`, `memory_type`, `observed_at`),
           FULLTEXT `ft_memory_content`(`content`) WITH PARSER ngram
+        )
+        """,
+        # ── mem_memory_entity_links ────────────────────────────────
+        """
+        CREATE TABLE IF NOT EXISTS `mem_memory_entity_links` (
+          `memory_id`  VARCHAR(64) NOT NULL,
+          `entity_id`  VARCHAR(32) NOT NULL,
+          `user_id`    VARCHAR(64) NOT NULL,
+          `source`     VARCHAR(10) NOT NULL DEFAULT 'regex',
+          `weight`     FLOAT       NOT NULL DEFAULT 0.8,
+          `created_at` DATETIME(6) NOT NULL DEFAULT NOW(),
+          PRIMARY KEY (`memory_id`, `entity_id`),
+          KEY `idx_link_user_entity` (`user_id`, `entity_id`),
+          KEY `idx_link_entity_user` (`entity_id`, `user_id`)
         )
         """,
         # ── mem_user_memory_config ────────────────────────────────

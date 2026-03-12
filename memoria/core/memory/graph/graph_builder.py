@@ -9,9 +9,12 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any
 
-from memoria.core.memory.graph.entity_extractor import extract_entities_lightweight
+from memoria.core.memory.graph.entity_extractor import (
+    extract_entities_lightweight,
+)
 from memoria.core.memory.graph.graph_store import GraphStore, _new_id
 from memoria.core.memory.graph.types import EdgeType, GraphNodeData, NodeType
+from memoria.core.memory.types import TrustTier
 
 if TYPE_CHECKING:
     from memoria.core.memory.types import Memory
@@ -99,11 +102,15 @@ class GraphBuilder:
         for node in semantic_nodes:
             if not node.embedding:
                 continue
+            # Search both semantic and scene nodes for associations
+            search_type = (
+                None if node.node_type == NodeType.SCENE else NodeType.SEMANTIC
+            )
             similar = self._store.find_similar_with_scores(
                 user_id,
                 node.embedding,
                 top_k=ASSOCIATION_TOP_K,
-                node_type=NodeType.SEMANTIC,
+                node_type=search_type,
             )
             for candidate, cos_sim in similar:
                 if candidate.node_id == node.node_id:
@@ -120,6 +127,21 @@ class GraphBuilder:
 
         # Causal edges
         self._collect_causal_edges(episodic_nodes, source_events, pending_edges)
+
+        # Consolidation edges: scene → source memories
+        for node in semantic_nodes:
+            if node.node_type == NodeType.SCENE and node.source_nodes:
+                for src_mid in node.source_nodes:
+                    src_node = self._store.get_node_by_memory_id(src_mid)
+                    if src_node:
+                        pending_edges.append(
+                            (
+                                node.node_id,
+                                src_node.node_id,
+                                EdgeType.CONSOLIDATION.value,
+                                1.0,
+                            )
+                        )
 
         # Entity linking (lightweight — no LLM)
         all_content_nodes = episodic_nodes + semantic_nodes
@@ -206,10 +228,18 @@ class GraphBuilder:
                 nodes.append(existing)
                 continue
 
+            # Reflection-produced memories (T4 with source_event_ids pointing to
+            # other memories) become scene nodes in the graph.
+            is_scene = (
+                mem.trust_tier == TrustTier.T4_UNVERIFIED
+                and len(mem.source_event_ids) > 0
+            )
+            node_type = NodeType.SCENE if is_scene else NodeType.SEMANTIC
+
             node = GraphNodeData(
                 node_id=_new_id(),
                 user_id=user_id,
-                node_type=NodeType.SEMANTIC,
+                node_type=node_type,
                 content=mem.content,
                 embedding=mem.embedding,
                 memory_id=mem.memory_id,
@@ -218,7 +248,8 @@ class GraphBuilder:
                 trust_tier=mem.trust_tier.value
                 if hasattr(mem.trust_tier, "value")
                 else str(mem.trust_tier),
-                importance=_compute_ingest_importance(NodeType.SEMANTIC, memory=mem),
+                importance=_compute_ingest_importance(node_type, memory=mem),
+                source_nodes=mem.source_event_ids if is_scene else [],
             )
             new_nodes.append(node)
             nodes.append(node)
@@ -266,11 +297,25 @@ class GraphBuilder:
         content_nodes: list[GraphNodeData],
         pending_edges: list[tuple[str, str, str, float]],
     ) -> list[GraphNodeData]:
-        """Extract entities from content nodes and link them via unified store method."""
+        """Extract entities from content nodes and link them.
+
+        Dual-write in a single transaction (all-or-nothing):
+        1. mem_entities (source of truth)
+        2. mem_memory_entity_links (semantic nodes only)
+        3. memory_graph_nodes (entity nodes, entity_id == node_id)
+        4. memory_graph_edges (collected into pending_edges for batch commit)
+
+        entity_id in mem_entities == node_id in memory_graph_nodes (1:1 mapping).
+        Only semantic nodes (with memory_id) get written to mem_memory_entity_links;
+        episodic nodes only get graph edges (they have no mem_memories row).
+        """
         if not content_nodes:
             return []
 
-        # Build {node_id: [(canonical_name, entity_type), ...]} for batch linking
+        _WEIGHT = {"regex": 0.8, "llm": 0.9, "manual": 1.0}
+        weight = _WEIGHT.get("regex", 0.8)
+
+        # Build {node_id: [(canonical_name, entity_type), ...]}
         entities_per_node: dict[str, list[tuple[str, str]]] = {}
         for node in content_nodes:
             if not node.content:
@@ -281,11 +326,69 @@ class GraphBuilder:
                     (ent.name, ent.entity_type) for ent in entities
                 ]
 
-        created, new_edges, _reused = self._store.link_entities_batch(
-            user_id,
-            content_nodes,
-            entities_per_node,
-            source="regex",
-        )
-        pending_edges.extend(new_edges)
+        if not entities_per_node:
+            return []
+
+        # Single transaction for all four tables
+        entity_id_cache: dict[str, str] = {}
+        created: list[GraphNodeData] = []
+
+        with self._store._db() as db:
+            # 1. Upsert mem_entities
+            for node in content_nodes:
+                for canonical_name, etype in entities_per_node.get(node.node_id, []):
+                    if canonical_name not in entity_id_cache:
+                        entity_id_cache[canonical_name] = self._store._upsert_entity_in(
+                            db, user_id, canonical_name, canonical_name, etype
+                        )
+
+            # 2. Write mem_memory_entity_links (semantic nodes only)
+            for node in content_nodes:
+                if not node.memory_id:
+                    continue
+                for canonical_name, _etype in entities_per_node.get(node.node_id, []):
+                    entity_id = entity_id_cache.get(canonical_name)
+                    if entity_id:
+                        self._store._upsert_link_in(
+                            db, node.memory_id, entity_id, user_id, "regex", weight
+                        )
+
+            # 3. Ensure graph entity nodes exist (entity_id == node_id)
+            from memoria.core.memory.models.graph import GraphNode
+
+            seen: set[str] = set()
+            for ent_list in entities_per_node.values():
+                for canonical_name, etype in ent_list:
+                    eid = entity_id_cache.get(canonical_name)
+                    if not eid or eid in seen:
+                        continue
+                    seen.add(eid)
+                    existing = db.query(GraphNode).filter_by(node_id=eid).first()
+                    if not existing:
+                        gnode = GraphNodeData(
+                            node_id=eid,
+                            user_id=user_id,
+                            node_type=NodeType.ENTITY,
+                            content=canonical_name.lower(),
+                            entity_type=etype,
+                            confidence=1.0,
+                            trust_tier="T1",
+                            importance=0.3,
+                        )
+                        from memoria.core.memory.graph.graph_store import _to_row
+
+                        db.add(GraphNode(**_to_row(gnode)))
+                        created.append(gnode)
+
+            db.commit()
+
+        # 4. Collect graph edges (all content nodes, including episodic)
+        for node in content_nodes:
+            for canonical_name, _etype in entities_per_node.get(node.node_id, []):
+                ent_node_id = entity_id_cache.get(canonical_name)
+                if ent_node_id:
+                    pending_edges.append(
+                        (node.node_id, ent_node_id, EdgeType.ENTITY_LINK.value, weight)
+                    )
+
         return created
