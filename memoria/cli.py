@@ -75,6 +75,10 @@ def _mcp_entry(
         "EMBEDDING_DIM": embed.get("EMBEDDING_DIM", ""),
         "EMBEDDING_API_KEY": embed.get("EMBEDDING_API_KEY", ""),
         "EMBEDDING_BASE_URL": embed.get("EMBEDDING_BASE_URL", ""),
+        "HF_HUB_OFFLINE": "1",
+        "TRANSFORMERS_OFFLINE": "1",
+        "_HF_ENDPOINT": "https://hf-mirror.com",
+        "_comment_HF_ENDPOINT": "Uncomment and rename to HF_ENDPOINT to use HuggingFace mirror (remove leading underscore)",
     }
     return {"command": cmd, "args": args, "env": env}
 
