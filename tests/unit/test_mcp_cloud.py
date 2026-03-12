@@ -65,6 +65,9 @@ class MockTransport(httpx.BaseTransport):
                     "matched_content": "old",
                 },
             )
+        if path == "/v1/memories/purge" and request.method == "POST":
+            ids = body.get("memory_ids", [])
+            return httpx.Response(200, json={"purged": len(ids)})
         if request.method == "DELETE":
             return httpx.Response(200, json={"purged": 1})
 
@@ -182,7 +185,7 @@ async def test_cloud_correct_json(server):
 @pytest.mark.asyncio
 async def test_cloud_purge_text(server):
     result = await call(server, "memory_purge", memory_id="mem_001")
-    assert "mem_001" in result
+    assert "Purged" in result
 
 
 @pytest.mark.asyncio
@@ -191,6 +194,24 @@ async def test_cloud_purge_json(server):
     data = json.loads(result)
     assert data["status"] == "ok"
     assert data["purged"] == 1
+
+
+@pytest.mark.asyncio
+async def test_cloud_purge_batch(server):
+    result = await call(server, "memory_purge", memory_id="mem_001,mem_002,mem_003")
+    assert "3" in result
+
+
+@pytest.mark.asyncio
+async def test_cloud_purge_topic(server):
+    result = await call(server, "memory_purge", topic="test")
+    assert "Purged" in result
+
+
+@pytest.mark.asyncio
+async def test_cloud_purge_no_target(server):
+    result = await call(server, "memory_purge")
+    assert "Provide" in result
 
 
 @pytest.mark.asyncio

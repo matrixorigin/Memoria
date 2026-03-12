@@ -1042,28 +1042,30 @@ class EmbeddedBackend(MemoryBackend):
         if name == "main":
             self._set_active_branch(user_id, "main")
             return {"active_branch": "main"}
+        safe = self._sanitize_name(name)
         with self._db_factory() as db:
             row = db.execute(
                 text(
                     "SELECT name FROM mem_branches WHERE user_id = :uid AND name = :name AND status = 'active'"
                 ),
-                {"uid": user_id, "name": name},
+                {"uid": user_id, "name": safe},
             ).fetchone()
         if not row:
             return {"error": f"Branch '{name}' not found"}
-        self._set_active_branch(user_id, name)
-        return {"active_branch": name}
+        self._set_active_branch(user_id, safe)
+        return {"active_branch": safe}
 
     def branch_delete(self, user_id: str, name: str) -> dict:
         if name == "main":
             return {"error": "Cannot delete main"}
+        safe = self._sanitize_name(name)
         with self._db_factory() as db:
             row = db.execute(
                 text(
                     "SELECT branch_id, branch_db FROM mem_branches "
                     "WHERE user_id = :uid AND name = :name AND status = 'active'"
                 ),
-                {"uid": user_id, "name": name},
+                {"uid": user_id, "name": safe},
             ).fetchone()
         if not row:
             return {"error": f"Branch '{name}' not found"}
@@ -1098,11 +1100,11 @@ class EmbeddedBackend(MemoryBackend):
         except Exception:
             logger.warning("Failed to drop branch DB %s", row.branch_db)
 
-        if self._get_active_branch(user_id) == name:
+        if self._get_active_branch(user_id) == safe:
             self._set_active_branch(user_id, "main")
         # Evict cached factory and dispose its engine (points to dropped DB).
-        self._evict_branch_cache(user_id, name)
-        return {"deleted": name}
+        self._evict_branch_cache(user_id, safe)
+        return {"deleted": safe}
 
     def _get_diff_rows(self, branch_db: str, src_db: str, limit: int):
         """Get diff rows via SDK. Returns (total, rows). limit=0 means count only.
@@ -1140,13 +1142,14 @@ class EmbeddedBackend(MemoryBackend):
 
     def _resolve_branch(self, user_id: str, name: str):
         """Lookup active branch. Returns (branch_db, error_dict)."""
+        safe = self._sanitize_name(name)
         with self._db_factory() as db:
             row = db.execute(
                 text(
                     "SELECT branch_id, branch_db FROM mem_branches "
                     "WHERE user_id = :uid AND name = :name AND status = 'active'"
                 ),
-                {"uid": user_id, "name": name},
+                {"uid": user_id, "name": safe},
             ).fetchone()
         if not row:
             return None, {"error": f"Branch '{name}' not found"}
@@ -1660,7 +1663,7 @@ def create_server(backend: MemoryBackend, default_user: str = "default") -> Fast
             "2. AFTER each response, call memory_store for any new fact, preference, or decision.\n"
             "\n"
             "CRUD: memory_store, memory_retrieve, memory_correct, memory_purge, memory_profile, memory_search.\n"
-            "memory_purge supports single ID or topic-based bulk delete (e.g. 'forget everything about X').\n"
+            "memory_purge supports single ID, comma-separated batch IDs (e.g. 'id1,id2,id3'), or topic-based bulk delete.\n"
             "MAINTENANCE (only when user asks): memory_governance, memory_consolidate, memory_reflect, memory_rebuild_index.\n"
             "\n"
             "memory_store types: semantic (default), profile, procedural, working, tool_result."
@@ -1694,6 +1697,15 @@ def create_server(backend: MemoryBackend, default_user: str = "default") -> Fast
             )
         return str(result)
 
+    _VALID_MEMORY_TYPES = {
+        "profile",
+        "semantic",
+        "procedural",
+        "working",
+        "tool_result",
+    }
+    _VALID_REBUILD_TABLES = {"mem_memories", "memory_graph_nodes"}
+
     @server.tool()
     def memory_store(
         content: str,
@@ -1711,6 +1723,20 @@ def create_server(backend: MemoryBackend, default_user: str = "default") -> Fast
             session_id: Session context (optional).
             format: 'text' (default) or 'json' for structured response with memory_id, content, warning fields.
         """
+        if not content or not content.strip():
+            err = "content is required and cannot be empty."
+            return (
+                _format({"status": "error", "error": err}, "json")
+                if format == "json"
+                else err
+            )
+        if memory_type not in _VALID_MEMORY_TYPES:
+            err = f"Invalid memory_type '{memory_type}'. Must be one of: {', '.join(sorted(_VALID_MEMORY_TYPES))}"
+            return (
+                _format({"status": "error", "error": err}, "json")
+                if format == "json"
+                else err
+            )
         result = backend.store(_user(user_id), content, memory_type, session_id)
         if format == "json":
             return _format(
@@ -1747,6 +1773,7 @@ def create_server(backend: MemoryBackend, default_user: str = "default") -> Fast
             format: 'text' (default) or 'json' for structured response with memory_id, type, content per item.
         """
         uid = _user(user_id)
+        top_k = max(1, min(top_k, 100))
         results = backend.retrieve(uid, query, top_k, session_id=session_id)
         warnings = backend.health_warnings(uid)
         if format == "json":
@@ -1924,7 +1951,7 @@ def create_server(backend: MemoryBackend, default_user: str = "default") -> Fast
             user_id: User ID (optional).
             format: 'text' (default) or 'json' for structured response with memory_id, type, content per item.
         """
-        results = backend.search(_user(user_id), query, top_k)
+        results = backend.search(_user(user_id), query, max(1, min(top_k, 100)))
         if format == "json":
             return _format(
                 {
@@ -2186,6 +2213,8 @@ def create_server(backend: MemoryBackend, default_user: str = "default") -> Fast
             table: Table to rebuild. One of: 'mem_memories', 'memory_graph_nodes'.
             user_id: User ID (optional, unused but kept for consistency).
         """
+        if table not in _VALID_REBUILD_TABLES:
+            return f"Error: Invalid table '{table}'. Must be one of: {', '.join(sorted(_VALID_REBUILD_TABLES))}"
         return backend.rebuild_index(table)
 
     @server.tool()
@@ -2230,6 +2259,14 @@ def create_server(backend: MemoryBackend, default_user: str = "default") -> Fast
 
     # ── Snapshot tools ────────────────────────────────────────────────
 
+    def _validate_name(name: str, label: str = "name") -> str | None:
+        """Return error message if name is invalid, else None."""
+        if not name or not name.strip():
+            return f"{label} is required and cannot be empty."
+        if len(name) > 100:
+            return f"{label} is too long (max 100 characters)."
+        return None
+
     @server.tool()
     def memory_snapshot(
         name: str,
@@ -2243,6 +2280,9 @@ def create_server(backend: MemoryBackend, default_user: str = "default") -> Fast
             description: Optional description.
             user_id: User ID (optional).
         """
+        err = _validate_name(name, "Snapshot name")
+        if err:
+            return f"Error: {err}"
         result = backend.snapshot_create(_user(user_id), name, description)
         if "error" in result:
             return f"Error: {result['error']}"
@@ -2272,6 +2312,9 @@ def create_server(backend: MemoryBackend, default_user: str = "default") -> Fast
             name: Snapshot name to rollback to.
             user_id: User ID (optional).
         """
+        err = _validate_name(name, "Snapshot name")
+        if err:
+            return f"Error: {err}"
         result = backend.snapshot_rollback(_user(user_id), name)
         if "error" in result:
             return f"Error: {result['error']}"
@@ -2298,17 +2341,23 @@ def create_server(backend: MemoryBackend, default_user: str = "default") -> Fast
         """
         if from_snapshot and from_timestamp:
             return "Error: specify from_snapshot or from_timestamp, not both."
+        err = _validate_name(name, "Branch name")
+        if err:
+            return f"Error: {err}"
         result = backend.branch_create(
             _user(user_id), name, from_snapshot, from_timestamp
         )
         if "error" in result:
             return f"Error: {result['error']}"
+        actual_name = result.get("name", name)
         src = ""
         if from_snapshot:
             src = f" from snapshot '{from_snapshot}'"
         elif from_timestamp:
             src = f" from timestamp '{from_timestamp}'"
-        return f"Branch '{name}' created{src}. Use memory_checkout to switch to it."
+        return (
+            f"Branch '{actual_name}' created{src}. Use memory_checkout to switch to it."
+        )
 
     @server.tool()
     def memory_branches(user_id: str | None = None) -> str:
@@ -2333,6 +2382,10 @@ def create_server(backend: MemoryBackend, default_user: str = "default") -> Fast
             user_id: User ID (optional).
         """
         uid = _user(user_id)
+        err = _validate_name(name, "Branch name")
+        if err:
+            return f"Error: {err}"
+        top_k = max(1, min(top_k, 200))
         result = backend.branch_checkout(uid, name)
         if "error" in result:
             return f"Error: {result['error']}"
@@ -2353,6 +2406,9 @@ def create_server(backend: MemoryBackend, default_user: str = "default") -> Fast
             name: Branch name to delete.
             user_id: User ID (optional).
         """
+        err = _validate_name(name, "Branch name")
+        if err:
+            return f"Error: {err}"
         result = backend.branch_delete(_user(user_id), name)
         if "error" in result:
             return f"Error: {result['error']}"
@@ -2371,6 +2427,11 @@ def create_server(backend: MemoryBackend, default_user: str = "default") -> Fast
             strategy: 'append' (skip duplicates) or 'replace' (overwrite duplicates).
             user_id: User ID (optional).
         """
+        err = _validate_name(source, "Branch name")
+        if err:
+            return f"Error: {err}"
+        if strategy not in ("append", "replace"):
+            return "Error: strategy must be 'append' or 'replace'."
         result = backend.branch_merge(_user(user_id), source, strategy)
         if "error" in result:
             return f"Error: {result['error']}"
@@ -2396,6 +2457,10 @@ def create_server(backend: MemoryBackend, default_user: str = "default") -> Fast
             limit: Max changes to return (default 50).
             user_id: User ID (optional).
         """
+        err = _validate_name(source, "Branch name")
+        if err:
+            return f"Error: {err}"
+        limit = max(1, min(limit, 500))
         result = backend.branch_diff(_user(user_id), source, limit)
         if "error" in result:
             return f"Error: {result['error']}"

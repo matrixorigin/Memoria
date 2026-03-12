@@ -2,7 +2,7 @@
 inclusion: always
 ---
 
-<!-- memoria-version: 0.1.7-->
+<!-- memoria-version: 0.1.8-->
 
 # Memory Integration (Memoria Lite)
 
@@ -52,7 +52,7 @@ Before storing a new memory, consider:
 |------|-------------|------------|
 | `memory_store` | User shares a fact, preference, or decision | `content`, `memory_type` (default: semantic), `session_id` (optional) |
 | `memory_correct` | User says a stored memory is wrong | `memory_id` or `query` (one required), `new_content`, `reason` |
-| `memory_purge` | User asks to forget something | `memory_id` (single) or `topic` (bulk keyword match), `reason` |
+| `memory_purge` | User asks to forget something | `memory_id` (single or comma-separated batch, e.g. `"id1,id2"`) or `topic` (bulk keyword match), `reason` |
 
 ### Read tools
 | Tool | When to use | Key params |

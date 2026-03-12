@@ -38,9 +38,9 @@ pytestmark = [pytest.mark.slow, pytest.mark.xdist_group("mcp_stdio")]
 
 DB_URL = os.environ.get(
     "MCP_E2E_DB_URL",
-    "mysql+pymysql://root:111@10.222.1.57:6001/memoria_e2e_test",
+    "mysql+pymysql://root:111@localhost:6001/memoria_e2e_test",
 )
-_DB_HOST = "10.222.1.57"
+_DB_HOST = os.environ.get("MEMORIA_DB_HOST", "localhost")
 _DB_PORT = 6001
 
 

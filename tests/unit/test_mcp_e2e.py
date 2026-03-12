@@ -72,11 +72,21 @@ class FakeBackend(MemoryBackend):
         return {"memory_id": memory_id, "content": new_content}
 
     def purge(
-        self, user_id: str, memory_id: str | None, topic: str | None, reason: str
+        self,
+        user_id: str,
+        memory_id: str | None,
+        topic: str | None,
+        reason: str,
+        memory_ids: list[str] | None = None,
     ) -> dict:
         deleted = 0
         with self._lock:
-            if memory_id:
+            if memory_ids:
+                for mid in memory_ids:
+                    if mid in self._memories:
+                        del self._memories[mid]
+                        deleted += 1
+            elif memory_id:
                 if memory_id in self._memories:
                     del self._memories[memory_id]
                     deleted = 1

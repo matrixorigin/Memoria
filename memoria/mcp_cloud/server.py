@@ -182,20 +182,54 @@ def create_server(api_url: str, api_key: str) -> FastMCP:
 
     @server.tool()
     async def memory_purge(
-        memory_id: str, reason: str = "", format: str = "text"
+        memory_id: str | None = None,
+        topic: str | None = None,
+        reason: str = "",
+        format: str = "text",
     ) -> str:
-        """Delete a memory.
+        """Delete memories. Use memory_id for a single memory, or topic to bulk-delete all memories matching a keyword.
 
         Args:
-            memory_id: ID of the memory to delete.
+            memory_id: ID of a specific memory to delete. Supports comma-separated IDs for batch delete (e.g. "id1,id2,id3").
+            topic: Keyword/topic — finds and deletes all matching memories.
             reason: Why it should be deleted.
             format: 'text' (default) or 'json' for structured response.
         """
-        r = client.delete(f"/v1/memories/{memory_id}", params={"reason": reason})
-        r.raise_for_status()
+        if not memory_id and not topic:
+            err = "Provide either memory_id or topic."
+            if format == "json":
+                return _json_dumps({"status": "error", "error": err})
+            return err
+
+        if topic:
+            # Search then batch purge
+            hits = client.post(
+                "/v1/memories/search", json={"query": topic, "top_k": 50}
+            )
+            hits.raise_for_status()
+            ids = [h["memory_id"] for h in hits.json()]
+            if not ids:
+                if format == "json":
+                    return _json_dumps({"status": "ok", "purged": 0})
+                return "Purged 0 memory(ies)."
+        else:
+            ids = [mid.strip() for mid in memory_id.split(",") if mid.strip()]  # type: ignore[union-attr]
+
+        if len(ids) == 1:
+            r = client.delete(f"/v1/memories/{ids[0]}", params={"reason": reason})
+            r.raise_for_status()
+            purged = r.json().get("purged", 1)
+        else:
+            r = client.post(
+                "/v1/memories/purge",
+                json={"memory_ids": ids, "reason": reason},
+            )
+            r.raise_for_status()
+            purged = r.json().get("purged", len(ids))
+
         if format == "json":
-            return _json_dumps({"status": "ok", "purged": 1, "memory_id": memory_id})
-        return f"Purged memory {memory_id}"
+            return _json_dumps({"status": "ok", "purged": purged})
+        return f"Purged {purged} memory(ies)."
 
     @server.tool()
     async def memory_profile() -> str:
