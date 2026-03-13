@@ -370,7 +370,13 @@ Configure via environment variables in the MCP config `env` block:
 
 Leave all empty to use local embedding (all-MiniLM-L6-v2, dim=384).
 
-**⚠️ CRITICAL: Configure embedding BEFORE the MCP server starts for the first time.** Tables are created on first startup with the configured dimension. Changing it later requires re-creating the embedding column (destructive).
+**💡 Local Embedding Tips:**
+If you are using the `local` provider (default), Memoria will download the model from Hugging Face on the first run.
+- **Mirroring:** If `huggingface.co` is slow or blocked, set `HF_ENDPOINT=https://hf-mirror.com`.
+- **Offline Mode:** To run completely offline, first run Memoria once with internet access to cache the model, then set `HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1`. *Do not set these before the model is cached, or it will fail.*
+
+**⚠️ CRITICAL: Configure embedding BEFORE the MCP server starts for the first time.**
+ Tables are created on first startup with the configured dimension. Changing it later requires re-creating the embedding column (destructive).
 
 ---
 

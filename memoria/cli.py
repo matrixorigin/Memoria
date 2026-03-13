@@ -69,15 +69,18 @@ def _mcp_entry(
     if user != "default":
         args += ["--user", user]
     # Always emit all env vars so users can see what's configurable.
-    # Empty string = "not set" — MCP server uses defaults (local embedding, dim=384).
+    # We prefix them with '_' so they don't override defaults (mock) until the user
+    # explicitly uncomments/renames them and provides a value.
     env: dict[str, str] = {
-        "EMBEDDING_PROVIDER": embed.get("EMBEDDING_PROVIDER", ""),
-        "EMBEDDING_MODEL": embed.get("EMBEDDING_MODEL", ""),
-        "EMBEDDING_DIM": embed.get("EMBEDDING_DIM", ""),
-        "EMBEDDING_API_KEY": embed.get("EMBEDDING_API_KEY", ""),
-        "EMBEDDING_BASE_URL": embed.get("EMBEDDING_BASE_URL", ""),
-        "HF_HUB_OFFLINE": "1",
-        "TRANSFORMERS_OFFLINE": "1",
+        "_EMBEDDING_PROVIDER": embed.get("EMBEDDING_PROVIDER", ""),
+        "_EMBEDDING_MODEL": embed.get("EMBEDDING_MODEL", ""),
+        "_EMBEDDING_DIM": embed.get("EMBEDDING_DIM", ""),
+        "_EMBEDDING_API_KEY": embed.get("EMBEDDING_API_KEY", ""),
+        "_EMBEDDING_BASE_URL": embed.get("EMBEDDING_BASE_URL", ""),
+        "_comment_EMBEDDING": "Remove the leading underscore '_' and provide a value to override defaults (mock).",
+        "HF_HUB_OFFLINE": "0",
+        "TRANSFORMERS_OFFLINE": "0",
+        "_comment_OFFLINE": "Set HF_HUB_OFFLINE and TRANSFORMERS_OFFLINE to 1 after models are cached in ~/.cache/huggingface to speed up startup.",
         "_HF_ENDPOINT": "https://hf-mirror.com",
         "_comment_HF_ENDPOINT": "Uncomment and rename to HF_ENDPOINT to use HuggingFace mirror (remove leading underscore)",
     }
