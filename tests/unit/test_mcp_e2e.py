@@ -180,6 +180,23 @@ class FakeBackend(MemoryBackend):
                 raise KeyError(f"Snapshot {name} not found")
         return {"rolled_back_to": name}
 
+    def snapshot_delete(
+        self,
+        user_id: str,
+        names: list[str] | None = None,
+        prefix: str | None = None,
+        older_than: str | None = None,
+    ) -> dict:
+        with self._lock:
+            to_del: list[str] = []
+            if names:
+                to_del = [n for n in names if n in self._snapshots]
+            elif prefix:
+                to_del = [n for n in self._snapshots if n.startswith(prefix)]
+            for n in to_del:
+                del self._snapshots[n]
+            return {"deleted": len(to_del), "names": to_del}
+
     # ── Branches ──────────────────────────────────────────────────────
 
     def branch_create(

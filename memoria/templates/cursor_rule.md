@@ -1,4 +1,4 @@
-<!-- memoria-version: 0.1.10-->
+<!-- memoria-version: 0.1.11-->
 
 # Memory Integration (Memoria Lite)
 
@@ -13,8 +13,8 @@ Call `memory_retrieve` with the user's first message BEFORE responding.
 ## 🔴 MANDATORY: Every conversation turn
 After responding, decide if anything is worth remembering:
 - User stated a preference, fact, or decision → `memory_store`
-- User corrected you → `memory_store` the correction
-- You learned something about the project/workflow → `memory_store`
+- User corrected a previously stored fact → `memory_correct` (not `memory_store` + `memory_purge`)
+- You learned something new about the project/workflow → `memory_store`
 - Do NOT store: greetings, trivial questions, things already in memory.
 
 **Deduplication is automatic.** The system detects semantically similar memories and supersedes old ones. You do not need to check for duplicates before storing.
@@ -66,8 +66,13 @@ Before storing a new memory, consider:
 | `working` | Temporary context for current task | "Currently debugging embedding issue" |
 | `tool_result` | Tool execution results worth caching | "Last CI run: 126 passed, 0 failed" |
 
-### Snapshots (save/restore)
-Use before risky changes. `memory_snapshot(name)` saves state, `memory_rollback(name)` restores it, `memory_snapshots()` lists all.
+### Snapshots (save/restore/cleanup)
+Use before risky changes. `memory_snapshot(name)` saves state, `memory_rollback(name)` restores it, `memory_snapshots(limit, offset)` lists with pagination, `memory_snapshot_delete(names|prefix|older_than)` cleans up.
+
+When `memory_governance` reports snapshot_health with high auto_ratio (>50%), suggest cleanup:
+- `memory_snapshot_delete(prefix="auto:")` — remove auto-generated snapshots
+- `memory_snapshot_delete(prefix="pre_")` — remove safety snapshots from purge/correct
+- `memory_snapshot_delete(older_than="2026-01-01")` — remove snapshots before a date
 
 ### Branches (isolated experiments)
 Git-like workflow for memory. `memory_branch(name)` creates, `memory_checkout(name)` switches, `memory_diff(source)` previews changes, `memory_merge(source)` merges back, `memory_branch_delete(name)` cleans up. `memory_branches()` lists all.
@@ -96,6 +101,7 @@ Git-like workflow for memory. `memory_branch(name)` creates, `memory_checkout(na
 | `memory_consolidate` | "check for contradictions", "fix conflicts" | 30 min |
 | `memory_reflect` | "find patterns", "summarize what you know" | 2 hours |
 | `memory_rebuild_index` | Only when governance reports `needs_rebuild=True` | — |
+| `memory_snapshot_delete` | When governance reports high snapshot auto_ratio, or user asks to clean snapshots | — |
 
 `memory_reflect` and `memory_extract_entities` support `mode` parameter:
 - `auto` (default): uses Memoria's internal LLM if configured, otherwise returns candidates for YOU to process

@@ -104,6 +104,14 @@ class MemoryBackend(ABC):
     @abstractmethod
     def snapshot_list(self, user_id: str) -> list[dict]: ...
     @abstractmethod
+    def snapshot_delete(
+        self,
+        user_id: str,
+        names: list[str] | None = None,
+        prefix: str | None = None,
+        older_than: str | None = None,
+    ) -> dict: ...
+    @abstractmethod
     def snapshot_rollback(self, user_id: str, name: str) -> dict: ...
     @abstractmethod
     def branch_create(
@@ -380,7 +388,8 @@ class EmbeddedBackend(MemoryBackend):
                 user_id, memory_ids=ids, reason=reason or f"topic purge: {topic}"
             )
         elif memory_id:
-            result = editor.purge(user_id, memory_ids=[memory_id], reason=reason)
+            ids = [m.strip() for m in memory_id.split(",") if m.strip()]
+            result = editor.purge(user_id, memory_ids=ids, reason=reason)
         else:
             return {"purged": 0}
         return {"purged": result.deactivated}
@@ -433,13 +442,31 @@ class EmbeddedBackend(MemoryBackend):
 
             gs = GovernanceScheduler(self._db_factory)
             result = gs.run_cycle(user_id)
-            return {
+            gov_result: dict = {
                 "quarantined": result.quarantined,
                 "cleaned_stale": result.cleaned_stale,
                 "compressed_redundant": result.compressed_redundant,
                 "scenes_created": result.scenes_created,
                 "vector_index_health": result.vector_index_health,
             }
+            # Snapshot health: count total and auto-generated snapshots
+            try:
+                snaps = self.snapshot_list(user_id)
+                total = len(snaps)
+                auto = sum(
+                    1
+                    for s in snaps
+                    if s.get("snapshot_name", "").startswith("mem_milestone_")
+                    or s.get("name", "").startswith("auto:")
+                    or s.get("name", "").startswith("pre_")
+                )
+                gov_result["snapshot_health"] = {
+                    "total": total,
+                    "auto_ratio": round(auto / total, 2) if total > 0 else 0.0,
+                }
+            except Exception:
+                pass
+            return gov_result
 
         return self._with_cooldown(user_id, "governance", _run, force=force)
 
@@ -858,6 +885,57 @@ class EmbeddedBackend(MemoryBackend):
                     }
                 )
         return sorted(result, key=lambda x: x["timestamp"], reverse=True)
+
+    def snapshot_delete(
+        self,
+        user_id: str,
+        names: list[str] | None = None,
+        prefix: str | None = None,
+        older_than: str | None = None,
+    ) -> dict:
+        """Delete snapshots by name list, prefix, or age.
+
+        Returns dict with 'deleted' count and 'names' list.
+        """
+        from datetime import datetime
+
+        snaps = self.snapshot_list(user_id)
+        git = self._git()
+        to_delete: list[dict] = []
+
+        if names:
+            name_set = set(names)
+            to_delete = [s for s in snaps if s["name"] in name_set]
+        elif prefix:
+            to_delete = [s for s in snaps if s["name"].startswith(prefix)]
+        elif older_than:
+            try:
+                cutoff = datetime.fromisoformat(older_than)
+            except ValueError:
+                return {
+                    "error": "older_than must be ISO format (e.g. '2026-03-01' or '2026-03-01T00:00:00')"
+                }
+            to_delete = [
+                s
+                for s in snaps
+                if s["timestamp"] and datetime.fromisoformat(s["timestamp"]) < cutoff
+            ]
+        else:
+            return {"error": "Provide names, prefix, or older_than"}
+
+        deleted_names: list[str] = []
+        errors: list[str] = []
+        for s in to_delete:
+            try:
+                git.drop_snapshot(s["snapshot_name"])
+                deleted_names.append(s["name"])
+            except Exception as e:
+                errors.append(f"{s['name']}: {e}")
+
+        result: dict = {"deleted": len(deleted_names), "names": deleted_names}
+        if errors:
+            result["errors"] = errors
+        return result
 
     def snapshot_rollback(self, user_id: str, name: str) -> dict:
         safe = self._sanitize_name(name)
@@ -1619,6 +1697,15 @@ class HTTPBackend(MemoryBackend):
     def snapshot_list(self, user_id: str) -> list[dict]:
         return []
 
+    def snapshot_delete(
+        self,
+        user_id: str,
+        names: list[str] | None = None,
+        prefix: str | None = None,
+        older_than: str | None = None,
+    ) -> dict:
+        return {"error": "Not available via HTTP"}
+
     def snapshot_rollback(self, user_id: str, name: str) -> dict:
         return {"error": "Not available via HTTP"}
 
@@ -1904,7 +1991,7 @@ def create_server(backend: MemoryBackend, default_user: str = "default") -> Fast
         """Delete memories. Use memory_id for a single memory, or topic to bulk-delete all memories matching a keyword.
 
         Args:
-            memory_id: ID of a specific memory to delete.
+            memory_id: ID of a specific memory to delete. Supports comma-separated batch (e.g. "id1,id2,id3").
             topic: Keyword/topic — finds and deletes all matching memories.
             reason: Why it should be deleted.
             user_id: User ID (optional).
@@ -1998,8 +2085,9 @@ def create_server(backend: MemoryBackend, default_user: str = "default") -> Fast
         """
         result = backend.governance(_user(user_id), force=force)
         if result.get("skipped"):
-            return f"{MSG_GOVERNANCE_SKIPPED}{result['cooldown_remaining_s']}s remaining). Last result: {', '.join(f'{k}={v}' for k, v in result.items() if k not in ('skipped', 'cooldown_remaining_s', 'vector_index_health'))}"
+            return f"{MSG_GOVERNANCE_SKIPPED}{result['cooldown_remaining_s']}s remaining). Last result: {', '.join(f'{k}={v}' for k, v in result.items() if k not in ('skipped', 'cooldown_remaining_s', 'vector_index_health', 'snapshot_health'))}"
         health = result.pop("vector_index_health", {})
+        snap_health = result.pop("snapshot_health", {})
         parts = [f"{k}={v}" for k, v in result.items()]
         msg = f"{MSG_GOVERNANCE_DONE}{', '.join(parts)}"
         for table, h in health.items():
@@ -2009,6 +2097,12 @@ def create_server(backend: MemoryBackend, default_user: str = "default") -> Fast
                 msg += f"\n{MSG_INDEX_REBUILT.format(table=table)}"
             elif h.get("rebuild_error"):
                 msg += f"\n❌ {table}: IVF rebuild failed: {h['rebuild_error']}"
+        if snap_health:
+            total = snap_health.get("total", 0)
+            auto_ratio = snap_health.get("auto_ratio", 0.0)
+            msg += f"\n📸 Snapshots: {total} total, {auto_ratio:.0%} auto-generated."
+            if auto_ratio > 0.5 and total > 10:
+                msg += " Consider cleaning up with memory_snapshot_delete(prefix=...) or memory_snapshot_delete(older_than=...)."
         return msg
 
     @server.tool()
@@ -2248,6 +2342,7 @@ def create_server(backend: MemoryBackend, default_user: str = "default") -> Fast
                     "memory_governance",
                     "memory_rebuild_index",
                     "memory_rollback",
+                    "memory_snapshot_delete",
                     "memory_branch",
                     "memory_branches",
                     "memory_checkout",
@@ -2290,17 +2385,73 @@ def create_server(backend: MemoryBackend, default_user: str = "default") -> Fast
         return f"Snapshot '{name}' created."
 
     @server.tool()
-    def memory_snapshots(user_id: str | None = None) -> str:
-        """List all memory snapshots.
+    def memory_snapshots(
+        limit: int = 20, offset: int = 0, user_id: str | None = None
+    ) -> str:
+        """List memory snapshots with pagination.
+
+        Returns up to `limit` snapshots starting from `offset`, sorted newest first.
+        Shows total count so the agent can inform the user and paginate if needed.
 
         Args:
+            limit: Max snapshots to return (default 20).
+            offset: Number of snapshots to skip (default 0, starts from newest).
             user_id: User ID (optional).
         """
         snaps = backend.snapshot_list(_user(user_id))
         if not snaps:
             return "No snapshots found."
-        lines = [f"  {s['name']} ({s['timestamp']})" for s in snaps[:20]]
-        return f"Found {len(snaps)} snapshots:\n" + "\n".join(lines)
+        total = len(snaps)
+        page = snaps[offset : offset + limit]
+        lines = [f"  {s['name']} ({s['timestamp']})" for s in page]
+        start = offset + 1
+        end = offset + len(page)
+        header = f"Found {total} snapshots (showing {start}-{end} of {total}):\n"
+        return header + "\n".join(lines)
+
+    @server.tool()
+    def memory_snapshot_delete(
+        names: str | None = None,
+        prefix: str | None = None,
+        older_than: str | None = None,
+        user_id: str | None = None,
+    ) -> str:
+        """Delete snapshots by name(s), prefix, or age. Supports batch deletion.
+
+        Use this to clean up auto-generated or outdated snapshots.
+        Typically called after memory_governance reports high auto_ratio in snapshot_health,
+        or when memory_snapshots shows too many entries.
+
+        Exactly one of names, prefix, or older_than must be provided.
+
+        Common prefixes:
+        - "auto:" — auto-generated milestone snapshots (from governance/health checks)
+        - "pre_" — safety snapshots created before purge/correct operations
+
+        Args:
+            names: Comma-separated snapshot names to delete (e.g. "snap1,snap2,snap3").
+            prefix: Delete all snapshots whose name starts with this prefix (e.g. "auto:" or "pre_").
+            older_than: Delete snapshots older than this ISO date (e.g. "2026-03-01").
+            user_id: User ID (optional).
+        """
+        name_list = (
+            [n.strip() for n in names.split(",") if n.strip()] if names else None
+        )
+        result = backend.snapshot_delete(
+            _user(user_id), names=name_list, prefix=prefix, older_than=older_than
+        )
+        if "error" in result:
+            return f"Error: {result['error']}"
+        deleted = result.get("deleted", 0)
+        errors = result.get("errors", [])
+        msg = f"Deleted {deleted} snapshot(s)."
+        if result.get("names"):
+            msg += f" Names: {', '.join(result['names'][:10])}"
+            if len(result["names"]) > 10:
+                msg += f" ... and {len(result['names']) - 10} more"
+        if errors:
+            msg += f"\n⚠️ {len(errors)} error(s): {'; '.join(errors[:5])}"
+        return msg
 
     @server.tool()
     def memory_rollback(

@@ -407,7 +407,8 @@ Memoria exposes MCP tools that your AI tool calls automatically based on steerin
 | Tool | Description |
 |------|-------------|
 | `memory_snapshot` | Create a named snapshot of current memory state |
-| `memory_snapshots` | List all snapshots |
+| `memory_snapshots` | List snapshots with pagination (`limit`, `offset`). Shows total count |
+| `memory_snapshot_delete` | Delete snapshots by name(s), prefix, or age. Supports batch deletion |
 | `memory_rollback` | Restore memories to a previous snapshot |
 
 ### Branches
@@ -431,6 +432,7 @@ Memoria exposes MCP tools that your AI tool calls automatically based on steerin
 | `memory_extract_entities` | Extract named entities and build entity graph (proactive) |
 | `memory_link_entities` | Write entity links from your own extraction results |
 | `memory_rebuild_index` | Rebuild IVF vector index for a table |
+| `memory_snapshot_delete` | Delete snapshots by name(s), prefix, or age. Supports batch deletion |
 
 ---
 
