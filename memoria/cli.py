@@ -16,7 +16,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-_VERSION = "0.1.12"
+_VERSION = "0.1.14"
 _MCP_KEY = "memoria"
 
 
@@ -107,7 +107,7 @@ def _detect(project_dir: Path) -> list[str]:
 def _installed_version(path: Path) -> str | None:
     if not path.exists():
         return None
-    m = re.search(r"memoria-version:\s*([\d.]+)", path.read_text()[:500])
+    m = re.search(r"memoria-version:\s*([\d.]+)", path.read_text())
     return m.group(1) if m else None
 
 

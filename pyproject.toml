@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mo-memoria"
-version = "0.1.12"
+version = "0.1.14"
 description = "Multi-tenant memory service for AI assistants"
 readme = "README.pypi.md"
 requires-python = ">=3.11"
