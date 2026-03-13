@@ -284,22 +284,31 @@ class TestGraphPathFilterConsistency:
     def test_memory_types_filter_applied(self):
         """Graph path should filter out memories whose type is not in memory_types."""
         mem_semantic = Memory(
-            memory_id="m1", user_id="u1", memory_type=MemoryType.SEMANTIC,
+            memory_id="m1",
+            user_id="u1",
+            memory_type=MemoryType.SEMANTIC,
             content="semantic fact",
         )
         mem_working = Memory(
-            memory_id="m2", user_id="u1", memory_type=MemoryType.WORKING,
+            memory_id="m2",
+            user_id="u1",
+            memory_type=MemoryType.WORKING,
             content="working note",
         )
         tabular = {"m1": mem_semantic, "m2": mem_working}
         nodes = [
             (_make_node("semantic fact", memory_id="m1"), 0.9),
-            (_make_node("working note", node_type=NodeType.EPISODIC, memory_id="m2"), 0.8),
+            (
+                _make_node("working note", node_type=NodeType.EPISODIC, memory_id="m2"),
+                0.8,
+            ),
         ]
         strategy = self._make_strategy(nodes, tabular)
 
         results, _ = strategy.retrieve(
-            "u1", "test", [0.1] * 10,
+            "u1",
+            "test",
+            [0.1] * 10,
             memory_types=[MemoryType.SEMANTIC],
         )
         types = {m.memory_type for m in results}
@@ -310,12 +319,18 @@ class TestGraphPathFilterConsistency:
         """Graph path with include_cross_session=False should only return
         memories from the requested session."""
         mem_same = Memory(
-            memory_id="m1", user_id="u1", memory_type=MemoryType.SEMANTIC,
-            content="same session", session_id="sess-A",
+            memory_id="m1",
+            user_id="u1",
+            memory_type=MemoryType.SEMANTIC,
+            content="same session",
+            session_id="sess-A",
         )
         mem_other = Memory(
-            memory_id="m2", user_id="u1", memory_type=MemoryType.SEMANTIC,
-            content="other session", session_id="sess-B",
+            memory_id="m2",
+            user_id="u1",
+            memory_type=MemoryType.SEMANTIC,
+            content="other session",
+            session_id="sess-B",
         )
         tabular = {"m1": mem_same, "m2": mem_other}
         nodes = [
@@ -325,7 +340,9 @@ class TestGraphPathFilterConsistency:
         strategy = self._make_strategy(nodes, tabular)
 
         results, _ = strategy.retrieve(
-            "u1", "test", [0.1] * 10,
+            "u1",
+            "test",
+            [0.1] * 10,
             session_id="sess-A",
             include_cross_session=False,
         )
@@ -335,12 +352,18 @@ class TestGraphPathFilterConsistency:
     def test_cross_session_true_returns_all(self):
         """Graph path with include_cross_session=True returns all sessions."""
         mem_a = Memory(
-            memory_id="m1", user_id="u1", memory_type=MemoryType.SEMANTIC,
-            content="session A", session_id="sess-A",
+            memory_id="m1",
+            user_id="u1",
+            memory_type=MemoryType.SEMANTIC,
+            content="session A",
+            session_id="sess-A",
         )
         mem_b = Memory(
-            memory_id="m2", user_id="u1", memory_type=MemoryType.SEMANTIC,
-            content="session B", session_id="sess-B",
+            memory_id="m2",
+            user_id="u1",
+            memory_type=MemoryType.SEMANTIC,
+            content="session B",
+            session_id="sess-B",
         )
         tabular = {"m1": mem_a, "m2": mem_b}
         nodes = [
@@ -350,7 +373,9 @@ class TestGraphPathFilterConsistency:
         strategy = self._make_strategy(nodes, tabular)
 
         results, _ = strategy.retrieve(
-            "u1", "test", [0.1] * 10,
+            "u1",
+            "test",
+            [0.1] * 10,
             session_id="sess-A",
             include_cross_session=True,
         )
@@ -370,7 +395,9 @@ class TestGraphPathFilterConsistency:
         strategy._vector_fallback_strategy.retrieve.return_value = ([], None)
 
         strategy.retrieve(
-            "u1", "test", [0.1] * 10,
+            "u1",
+            "test",
+            [0.1] * 10,
             memory_types=[MemoryType.SEMANTIC],
             session_id="sess-X",
             include_cross_session=False,
@@ -386,7 +413,7 @@ class TestGraphPathFilterConsistency:
 
 
 class TestFallbackWarnings:
-    """All silent fallback points must emit WARNING-level logs."""
+    """All silent fallback points must emit logs (WARNING or INFO level)."""
 
     def test_graph_retriever_warns_on_no_embedding(self, caplog):
         from memoria.core.memory.graph.retriever import ActivationRetriever
@@ -424,10 +451,10 @@ class TestFallbackWarnings:
         strategy._vector_fallback_strategy = MagicMock()
         strategy._vector_fallback_strategy.retrieve.return_value = ([], None)
 
-        with caplog.at_level(logging.WARNING):
+        with caplog.at_level(logging.INFO):
             strategy.retrieve("u1", "test", query_embedding=[0.1] * 10)
 
-        assert "vector fallback" in caplog.text
+        assert "vector_fallback" in caplog.text
 
 
 # ── 6. API endpoint must call embed ──────────────────────────────────

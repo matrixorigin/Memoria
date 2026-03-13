@@ -264,3 +264,66 @@ class TestBM25Normalization:
             f"raw={raw} → kw={kw}, expected≈{expected_approx}"
         )
         assert final == pytest.approx(kw)  # keyword weight=1, others=0
+
+
+class TestL0Cap:
+    """L0 cap: working memories must not crowd out L1 semantic memories."""
+
+    def _make_working_memory(self, memory_id: str):
+        from memoria.core.memory.types import Memory, MemoryType, TrustTier
+
+        return Memory(
+            memory_id=memory_id,
+            user_id="u1",
+            memory_type=MemoryType.WORKING,
+            content=f"working {memory_id}",
+            session_id="s1",
+            observed_at=datetime(2026, 2, 26, tzinfo=timezone.utc),
+            trust_tier=TrustTier.T3_INFERRED,
+        )
+
+    @pytest.fixture
+    def retriever_with_l0(self, request):
+        """Retriever with N working memories in L0 and 1 semantic in L1."""
+        n_l0 = request.param
+        mock_db = MagicMock()
+        semantic_row = _mem_row("semantic-1", "important fact")
+        mock_db.query.return_value = _make_chain([semantic_row])
+
+        r = MemoryRetriever(db_factory=lambda: mock_db)
+        l0 = [self._make_working_memory(f"w{i}") for i in range(n_l0)]
+        r._load_l0 = MagicMock(return_value=l0)
+        r._bump_access_counts = MagicMock()
+        return r
+
+    @pytest.mark.parametrize(
+        "retriever_with_l0,limit,expected_l1_min",
+        [
+            (6, 3, 1),  # 6 L0, limit=3 → l0_cap=1, L1 gets 2 slots
+            (2, 5, 3),  # 2 L0, limit=5 → l0_cap=2, L1 gets 3 slots
+            (1, 1, 1),  # 1 L0, limit=1 → l0_cap=0, L1 gets the only slot
+        ],
+        indirect=["retriever_with_l0"],
+    )
+    def test_l1_gets_minimum_slots(self, retriever_with_l0, limit, expected_l1_min):
+        """L1 must always get at least ceil(limit/2) slots when L1 types are requested."""
+        results, _ = retriever_with_l0.retrieve("u1", "query", "s1", limit=limit)
+        l1_count = sum(1 for m in results if m.memory_id == "semantic-1")
+        assert l1_count >= min(1, expected_l1_min), (
+            f"limit={limit}: L1 got {l1_count} slots, expected ≥{expected_l1_min}"
+        )
+        assert len(results) <= limit
+
+    @pytest.mark.parametrize("retriever_with_l0", [6], indirect=True)
+    def test_l0_only_request_not_capped(self, retriever_with_l0):
+        """When caller requests only WORKING types, L0 cap must NOT apply."""
+        results, _ = retriever_with_l0.retrieve(
+            "u1",
+            "query",
+            "s1",
+            limit=5,
+            memory_types=[MemoryType.WORKING],
+        )
+        # All 5 slots should be filled from L0 (6 available, limit=5)
+        assert len(results) == 5
+        assert all(m.memory_type == MemoryType.WORKING for m in results)

@@ -96,7 +96,8 @@ class ActivationRetrievalStrategy:
         include_cross_session: bool = True,
         explain: bool = False,
     ) -> tuple[list[Memory], Any]:
-        """Retrieve via graph activation, fallback to vector if no results."""
+        """Retrieve via graph activation, fallback to vector if insufficient."""
+        graph_memories: list[Memory] = []
         if query_embedding:
             try:
                 activated = self._activation_retriever.retrieve(
@@ -107,33 +108,33 @@ class ActivationRetrievalStrategy:
                     task_type=task_type,
                 )
                 if activated:
-                    memories = self._nodes_to_memories(activated, user_id)
-                    memories = _apply_post_filters(
-                        memories,
+                    graph_memories = self._nodes_to_memories(activated, user_id)
+                    graph_memories = _apply_post_filters(
+                        graph_memories,
                         memory_types=memory_types,
                         session_id=session_id,
                         include_cross_session=include_cross_session,
                     )
-                    logger.info(
-                        "activation:v1 graph path — user=%s results=%d",
-                        user_id,
-                        len(memories),
-                    )
-                    explain_info = (
-                        {"path": "graph", "results": len(memories)} if explain else None
-                    )
-                    return memories, explain_info
             except Exception:
                 logger.warning(
                     "Activation retrieval failed, using vector fallback",
                     exc_info=True,
                 )
 
-        # Vector fallback when graph returns nothing
-        logger.warning(
-            "activation:v1 vector fallback — user=%s query=%r", user_id, query
-        )
-        memories, vec_explain = self._get_vector_fallback().retrieve(
+        # If graph returned enough results, use them directly
+        if len(graph_memories) >= top_k:
+            logger.info(
+                "activation:v1 graph path — user=%s results=%d",
+                user_id,
+                len(graph_memories),
+            )
+            explain_info = (
+                {"path": "graph", "results": len(graph_memories)} if explain else None
+            )
+            return graph_memories[:top_k], explain_info
+
+        # Graph insufficient — supplement with vector results
+        vec_memories, vec_explain = self._get_vector_fallback().retrieve(
             user_id,
             query,
             query_embedding,
@@ -145,9 +146,33 @@ class ActivationRetrievalStrategy:
             include_cross_session=include_cross_session,
             explain=explain,
         )
+
+        # Merge: graph results first, then vector results (deduped)
+        seen = {m.memory_id for m in graph_memories}
+        merged = list(graph_memories)
+        for m in vec_memories:
+            if m.memory_id not in seen:
+                seen.add(m.memory_id)
+                merged.append(m)
+                if len(merged) >= top_k:
+                    break
+
+        path = "graph+vector" if graph_memories else "vector_fallback"
+        logger.info(
+            "activation:v1 %s — user=%s graph=%d vector=%d merged=%d",
+            path,
+            user_id,
+            len(graph_memories),
+            len(vec_memories),
+            len(merged),
+        )
         if explain:
-            return memories, {"path": "vector_fallback", "vec_explain": vec_explain}
-        return memories, vec_explain
+            return merged, {
+                "path": path,
+                "graph_results": len(graph_memories),
+                "vec_explain": vec_explain,
+            }
+        return merged, vec_explain
 
     def _get_vector_fallback(self) -> Any:
         """Lazy-init vector fallback."""
