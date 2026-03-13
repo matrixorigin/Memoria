@@ -31,6 +31,10 @@ pip install memoria
 # Self-hosted embedded mode — choose an embedding provider:
 pip install "memoria[openai-embedding]"   # OpenAI / SiliconFlow / any OpenAI-compatible endpoint
 pip install "memoria[local-embedding]"    # Local sentence-transformers (~900MB download)
+
+# If no NVIDIA GPU available, install CPU-only PyTorch first to avoid large CUDA dependencies:
+pip install torch --index-url https://download.pytorch.org/whl/cpu
+pip install "memoria[local-embedding]"
 ```
 
 ---

@@ -196,6 +196,10 @@ pip install mo-memoria
 
 # Only needed if using local embedding model (no external API):
 pip install "mo-memoria[local-embedding]"    # Local sentence-transformers (~900MB download)
+
+# If no NVIDIA GPU available, install CPU-only PyTorch first to avoid large CUDA dependencies:
+pip install torch --index-url https://download.pytorch.org/whl/cpu
+pip install "mo-memoria[local-embedding]"
 ```
 
 **⚠️ Configure embedding BEFORE the MCP server starts for the first time.** Tables are created on first startup with the configured embedding dimension. Changing it later requires re-creating the embedding column.
