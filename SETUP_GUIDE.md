@@ -187,6 +187,10 @@ python3 -m venv .venv && source .venv/bin/activate
 Then install:
 ```bash
 # Install with local embedding support (recommended)
+# - With NVIDIA GPU:
+pip install 'memoria[local-embedding]'
+# - Without GPU (CPU-only, avoids large CUDA dependencies):
+pip install torch --index-url https://download.pytorch.org/whl/cpu
 pip install 'memoria[local-embedding]'
 ```
 
@@ -278,6 +282,10 @@ memoria init
 
 ### "sentence-transformers not installed"
 ```bash
+# With NVIDIA GPU:
+pip install 'memoria[local-embedding]'
+# Without GPU (CPU-only):
+pip install torch --index-url https://download.pytorch.org/whl/cpu
 pip install 'memoria[local-embedding]'
 ```
 

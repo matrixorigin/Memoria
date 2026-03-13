@@ -93,6 +93,10 @@ source .venv/bin/activate
 ```bash
 # Step 5: Install Memoria (run alone)
 # If using local embedding:
+# - With NVIDIA GPU:
+pip install 'mo-memoria[local-embedding]'
+# - Without GPU (CPU-only, avoids large CUDA dependencies):
+pip install torch --index-url https://download.pytorch.org/whl/cpu
 pip install 'mo-memoria[local-embedding]'
 # If using an existing embedding service (no 900MB download):
 pip install mo-memoria
@@ -125,9 +129,14 @@ source .venv/bin/activate
 ```
 ```bash
 # 4. Install
+# If using local embedding:
+# - With NVIDIA GPU:
 pip install 'mo-memoria[local-embedding]'
-# or, if using an existing embedding service:
-# pip install mo-memoria
+# - Without GPU (CPU-only):
+pip install torch --index-url https://download.pytorch.org/whl/cpu
+pip install 'mo-memoria[local-embedding]'
+# If using an existing embedding service:
+pip install mo-memoria
 ```
 ```bash
 # 5. Configure with cloud URL
@@ -147,9 +156,14 @@ source .venv/bin/activate
 ```
 ```bash
 # 2. Install
+# If using local embedding:
+# - With NVIDIA GPU:
 pip install 'mo-memoria[local-embedding]'
-# or, if using an existing embedding service:
-# pip install mo-memoria
+# - Without GPU (CPU-only):
+pip install torch --index-url https://download.pytorch.org/whl/cpu
+pip install 'mo-memoria[local-embedding]'
+# If using an existing embedding service:
+pip install mo-memoria
 ```
 ```bash
 # 3. Configure with existing DB
