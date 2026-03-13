@@ -1,5 +1,4 @@
-# Validate PR title (Conventional Commits style).
-name: pr-title
+name: PR Title Check
 
 on:
   pull_request:

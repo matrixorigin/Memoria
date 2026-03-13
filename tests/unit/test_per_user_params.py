@@ -1,6 +1,5 @@
 """Tests for per-user activation param overrides in factory."""
 
-from dataclasses import replace
 from unittest.mock import MagicMock, patch
 
 from memoria.core.memory.config import DEFAULT_CONFIG, MemoryGovernanceConfig
@@ -73,7 +72,9 @@ class TestPerUserParamMerge:
         assert cfg.activation_lambda_activation == 0.5
         assert cfg.activation_association_threshold == 0.6
         # Other fields unchanged
-        assert cfg.activation_lambda_semantic == DEFAULT_CONFIG.activation_lambda_semantic
+        assert (
+            cfg.activation_lambda_semantic == DEFAULT_CONFIG.activation_lambda_semantic
+        )
 
     def test_invalid_param_key_ignored(self):
         """Unknown keys in params_json are silently ignored."""

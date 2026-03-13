@@ -360,7 +360,9 @@ def cmd_benchmark(args: argparse.Namespace) -> None:
 
             avg_a = sum(results_a.values()) / len(results_a) if results_a else 0
             avg_b = sum(results_b.values()) / len(results_b) if results_b else 0
-            print(f"\n  Average: {strat_a}={avg_a:.1f}  {strat_b}={avg_b:.1f}  delta={avg_b - avg_a:+.1f}")
+            print(
+                f"\n  Average: {strat_a}={avg_a:.1f}  {strat_b}={avg_b:.1f}  delta={avg_b - avg_a:+.1f}"
+            )
         finally:
             executor.close()
         return

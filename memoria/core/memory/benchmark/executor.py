@@ -160,7 +160,10 @@ class BenchmarkExecutor:
         return user_id
 
     def evaluate(
-        self, scenario: Scenario, user_id: str, strategy: str,
+        self,
+        scenario: Scenario,
+        user_id: str,
+        strategy: str,
     ) -> ScenarioExecution:
         """Run assertions only against an already-seeded user, with a given strategy."""
         sid = scenario.scenario_id.lower()

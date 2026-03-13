@@ -27,7 +27,7 @@ class ActivationV1Params(BaseModel):
     num_iterations: int = Field(3, ge=1, le=10)
     inhibition_beta: float = Field(0.15, ge=0.0, le=1.0)
     sigmoid_theta: float = Field(0.1, ge=0.0, le=1.0)
-    min_graph_nodes: int = Field(50, ge=1)
+    min_graph_nodes: int = Field(10, ge=1)
 
 
 # Strategy key → params schema

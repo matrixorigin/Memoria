@@ -325,10 +325,10 @@ class GraphBuilder:
 
         # Entity link weight by extraction source — higher = more confident
         _ENTITY_WEIGHT: dict[str, float] = {
-            "person": 1.0,   # @mention or Chinese name — high confidence
-            "tech": 0.9,     # capitalized word or known term
-            "project": 0.85, # CamelCase or service-name pattern
-            "repo": 0.95,    # owner/repo pattern — very specific
+            "person": 1.0,  # @mention or Chinese name — high confidence
+            "tech": 0.9,  # capitalized word or known term
+            "project": 0.85,  # CamelCase or service-name pattern
+            "repo": 0.95,  # owner/repo pattern — very specific
             "org": 0.8,
             "location": 0.7,
             "time": 0.6,
@@ -343,7 +343,11 @@ class GraphBuilder:
             entities = get_ner_backend().extract(node.content)
             if entities:
                 entities_per_node[node.node_id] = [
-                    (ent.name, ent.entity_type, _ENTITY_WEIGHT.get(ent.entity_type, 0.8))
+                    (
+                        ent.name,
+                        ent.entity_type,
+                        _ENTITY_WEIGHT.get(ent.entity_type, 0.8),
+                    )
                     for ent in entities
                 ]
 
@@ -373,10 +377,16 @@ class GraphBuilder:
         with self._store._db() as db:
             # 1. Upsert mem_entities
             for node in content_nodes:
-                for canonical_name, etype, _w in entities_per_node.get(node.node_id, []):
+                for canonical_name, etype, _w in entities_per_node.get(
+                    node.node_id, []
+                ):
                     if canonical_name not in entity_id_cache:
                         entity_id_cache[canonical_name] = self._store._upsert_entity_in(
-                            db, user_id, canonical_name, canonical_name, etype,
+                            db,
+                            user_id,
+                            canonical_name,
+                            canonical_name,
+                            etype,
                             embedding=entity_embeddings.get(canonical_name),
                         )
 
@@ -384,7 +394,9 @@ class GraphBuilder:
             for node in content_nodes:
                 if not node.memory_id:
                     continue
-                for canonical_name, _etype, w in entities_per_node.get(node.node_id, []):
+                for canonical_name, _etype, w in entities_per_node.get(
+                    node.node_id, []
+                ):
                     entity_id = entity_id_cache.get(canonical_name)
                     if entity_id:
                         self._store._upsert_link_in(

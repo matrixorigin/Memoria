@@ -55,7 +55,9 @@ class TestAcronymExtraction:
         assert "ETL" in _names("ETL pipeline 使用 Apache Spark 处理")
 
     def test_rsc(self):
-        assert "RSC" in _names("RSC 在嵌套动态路由场景下有严重的 hydration mismatch bug")
+        assert "RSC" in _names(
+            "RSC 在嵌套动态路由场景下有严重的 hydration mismatch bug"
+        )
 
     def test_api(self):
         assert "API" in _names("后端 API 部署在 AWS ECS 上")

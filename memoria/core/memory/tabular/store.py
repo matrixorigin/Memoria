@@ -137,9 +137,11 @@ class MemoryStore(DbConsumer):
         if not memory_ids:
             return {}
         with self._db() as db:
-            rows = db.query(MemoryRecord).filter(
-                MemoryRecord.memory_id.in_(memory_ids)
-            ).all()
+            rows = (
+                db.query(MemoryRecord)
+                .filter(MemoryRecord.memory_id.in_(memory_ids))
+                .all()
+            )
             return {r.memory_id: _to_domain(r) for r in rows}
 
     def update_content(self, memory_id: str, content: str) -> None:

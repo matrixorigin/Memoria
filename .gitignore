@@ -4,6 +4,7 @@ data/
 # Benchmark outputs (reports, results) — datasets are tracked
 /tmp/
 benchmark-result*.json
+benchmark-*.html
 
 # Python
 __pycache__/

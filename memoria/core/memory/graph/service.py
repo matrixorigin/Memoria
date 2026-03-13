@@ -90,7 +90,9 @@ class GraphMemoryService:
     def _builder(self) -> GraphBuilder:
         if self._graph_builder is None:
             self._graph_builder = GraphBuilder(
-                self._store, config=self._config, embed_fn=self._embed_fn,
+                self._store,
+                config=self._config,
+                embed_fn=self._embed_fn,
             )
         return self._graph_builder
 

@@ -194,7 +194,13 @@ def admin_trigger_governance(
     Runs synchronously, skips all cooldowns.
     Used by benchmark executor for maturation phase.
     """
-    valid_ops = ("governance", "consolidate", "reflect", "extract_entities", "extract_entities_llm")
+    valid_ops = (
+        "governance",
+        "consolidate",
+        "reflect",
+        "extract_entities",
+        "extract_entities_llm",
+    )
     if op not in valid_ops:
         from fastapi import HTTPException
 
@@ -284,7 +290,11 @@ def admin_trigger_governance(
                         for ent in entities:
                             if ent.name not in entity_id_cache:
                                 entity_id_cache[ent.name] = store._upsert_entity_in(
-                                    db, user_id, ent.name, ent.display_name, ent.entity_type
+                                    db,
+                                    user_id,
+                                    ent.name,
+                                    ent.display_name,
+                                    ent.entity_type,
                                 )
                         if mem.memory_id:
                             for ent in entities:
@@ -312,7 +322,11 @@ def admin_trigger_governance(
         return {
             "op": op,
             "user_id": user_id,
-            "result": {"processed": processed, "skipped": skipped, "errors": errors[:10]},
+            "result": {
+                "processed": processed,
+                "skipped": skipped,
+                "errors": errors[:10],
+            },
         }
 
     from memoria.core.memory.factory import create_memory_service

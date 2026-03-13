@@ -57,7 +57,7 @@ class ActivationRetrievalStrategy:
         self._metrics = metrics
         self._store = GraphStore(db_factory)
         self._mem_store = MemoryStore(db_factory, metrics=metrics)
-        self._activation_retriever = ActivationRetriever(self._store)
+        self._activation_retriever = ActivationRetriever(self._store, config=config)
         self._vector_fallback_strategy: Any = None
 
     @property
@@ -106,7 +106,9 @@ class ActivationRetrievalStrategy:
                 )
 
         # Vector fallback when graph returns nothing
-        logger.warning("activation:v1 vector fallback — user=%s query=%r", user_id, query)
+        logger.warning(
+            "activation:v1 vector fallback — user=%s query=%r", user_id, query
+        )
         memories, vec_explain = self._get_vector_fallback().retrieve(
             user_id,
             query,
@@ -142,9 +144,7 @@ class ActivationRetrievalStrategy:
     ) -> list[Memory]:
         """Convert scored graph nodes to Memory objects, enriched from mem_memories."""
         # Collect memory_ids to batch-fetch full rows from tabular store
-        memory_ids = [
-            node.memory_id for node, _ in scored_nodes if node.memory_id
-        ]
+        memory_ids = [node.memory_id for node, _ in scored_nodes if node.memory_id]
         tabular = self._mem_store.get_by_ids(memory_ids) if memory_ids else {}
 
         memories: list[Memory] = []
@@ -178,5 +178,4 @@ class ActivationRetrievalStrategy:
                         trust_tier=tier,
                     )
                 )
-        return memories
         return memories

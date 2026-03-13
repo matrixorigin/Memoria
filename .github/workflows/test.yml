@@ -1,4 +1,4 @@
-name: CI
+name: Test & Lint
 
 on:
   push:
@@ -6,10 +6,17 @@ on:
   pull_request:
     branches: [main, develop]
 
+env:
+  MEMORIA_MASTER_KEY: ci-master-key-memoria-test
+  MEMORIA_EMBEDDING_PROVIDER: openai
+  MEMORIA_EMBEDDING_MODEL: ${{ vars.EMBEDDING_MODEL || 'BAAI/bge-m3' }}
+  MEMORIA_EMBEDDING_DIM: ${{ vars.EMBEDDING_DIM || '1024' }}
+  MEMORIA_EMBEDDING_API_KEY: ${{ secrets.EMBEDDING_API_KEY }}
+  MEMORIA_EMBEDDING_BASE_URL: ${{ vars.EMBEDDING_BASE_URL || '' }}
+
 jobs:
-  # ── Job 1: Lint & type check (fast, no DB) ────────────────────────────
   lint:
-    name: lint
+    name: Lint & Type Check
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -33,19 +40,10 @@ jobs:
       - name: Type check
         run: make type-check
 
-  # ── Job 2: Fast tests (unit + e2e + mcp, no heavy integration) ────────
-  test-fast:
-    name: test-fast
+  test:
+    name: Unit & Integration Tests
     runs-on: ubuntu-latest
     needs: lint
-    env:
-      MEMORIA_MASTER_KEY: ci-master-key-memoria-test
-      MEMORIA_EMBEDDING_PROVIDER: openai
-      MEMORIA_EMBEDDING_MODEL: ${{ vars.EMBEDDING_MODEL || 'BAAI/bge-m3' }}
-      MEMORIA_EMBEDDING_DIM: ${{ vars.EMBEDDING_DIM || '1024' }}
-      MEMORIA_EMBEDDING_API_KEY: ${{ secrets.EMBEDDING_API_KEY }}
-      MEMORIA_EMBEDDING_BASE_URL: ${{ vars.EMBEDDING_BASE_URL || '' }}
-
     steps:
       - uses: actions/checkout@v4
 
@@ -64,7 +62,13 @@ jobs:
         uses: actions/cache@v4
         with:
           path: /tmp/matrixone.tar
-          key: docker-matrixone-${{ hashFiles('docker-compose.yml') }}-latest
+          key: docker-matrixone-${{ env.MATRIXONE_IMAGE }}-${{ steps.date.outputs.date }}
+        env:
+          MATRIXONE_IMAGE: matrixorigin/matrixone:latest
+
+      - name: Get date for cache key
+        id: date
+        run: echo "date=$(date +%Y-%m-%d)" >> $GITHUB_OUTPUT
 
       - name: Load cached image
         if: steps.mo-cache.outputs.cache-hit == 'true'
@@ -88,73 +92,13 @@ jobs:
       - name: Install dependencies
         run: pip install -e ".[dev,openai-embedding]"
 
-      - name: Run fast tests
-        run: make test-fast
+      - name: Run tests
+        run: make test
 
-  # ── Job 3: Slow tests (integration, heavy DB operations) ──────────────
-  test-slow:
-    name: test-slow
-    runs-on: ubuntu-latest
-    needs: lint
-    env:
-      MEMORIA_MASTER_KEY: ci-master-key-memoria-test
-      MEMORIA_EMBEDDING_PROVIDER: openai
-      MEMORIA_EMBEDDING_MODEL: ${{ vars.EMBEDDING_MODEL || 'BAAI/bge-m3' }}
-      MEMORIA_EMBEDDING_DIM: ${{ vars.EMBEDDING_DIM || '1024' }}
-      MEMORIA_EMBEDDING_API_KEY: ${{ secrets.EMBEDDING_API_KEY }}
-      MEMORIA_EMBEDDING_BASE_URL: ${{ vars.EMBEDDING_BASE_URL || '' }}
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('pyproject.toml') }}
-          restore-keys: ${{ runner.os }}-pip-
-
-      - name: Cache MatrixOne image
-        id: mo-cache
-        uses: actions/cache@v4
-        with:
-          path: /tmp/matrixone.tar
-          key: docker-matrixone-${{ hashFiles('docker-compose.yml') }}-latest
-
-      - name: Load cached image
-        if: steps.mo-cache.outputs.cache-hit == 'true'
-        run: docker load -i /tmp/matrixone.tar
-
-      - name: Pull and save image
-        if: steps.mo-cache.outputs.cache-hit != 'true'
-        run: |
-          docker pull matrixorigin/matrixone:latest
-          docker save matrixorigin/matrixone:latest -o /tmp/matrixone.tar
-
-      - name: Start MatrixOne
-        run: |
-          docker run -d --name matrixone -p 6001:6001 --memory=2g matrixorigin/matrixone:latest
-          for i in $(seq 1 18); do
-            bash -c 'echo > /dev/tcp/127.0.0.1/6001' 2>/dev/null && break
-            echo "Waiting for MatrixOne... ($i/18)"
-            sleep 5
-          done
-
-      - name: Install dependencies
-        run: pip install -e ".[dev,openai-embedding]"
-
-      - name: Run slow tests
-        run: make test-slow
-
-  # ── Job 4: Docker regression tests ───────────────────────────────────
   docker:
-    name: docker
+    name: Docker Integration Tests
     runs-on: ubuntu-latest
-    needs: [test-fast, test-slow]
-
+    needs: test
     steps:
       - uses: actions/checkout@v4
 
@@ -173,7 +117,13 @@ jobs:
         uses: actions/cache@v4
         with:
           path: /tmp/matrixone.tar
-          key: docker-matrixone-${{ hashFiles('docker-compose.yml') }}-latest
+          key: docker-matrixone-${{ env.MATRIXONE_IMAGE }}-${{ steps.date.outputs.date }}
+        env:
+          MATRIXONE_IMAGE: matrixorigin/matrixone:latest
+
+      - name: Get date for cache key
+        id: date
+        run: echo "date=$(date +%Y-%m-%d)" >> $GITHUB_OUTPUT
 
       - name: Load cached image
         if: steps.mo-cache.outputs.cache-hit == 'true'
@@ -213,7 +163,6 @@ jobs:
       - name: Run Docker tests
         env:
           MEMORIA_URL: http://localhost:8100
-          MEMORIA_MASTER_KEY: ci-master-key-memoria-test
         run: make test-docker
 
       - name: Logs on failure

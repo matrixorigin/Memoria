@@ -141,7 +141,11 @@ class GraphStore(DbConsumer):
         if not node_ids:
             return []
         with self._db() as db:
-            rows = db.query(GraphNode).filter(GraphNode.node_id.in_(node_ids)).all()
+            rows = (
+                db.query(GraphNode)
+                .filter(GraphNode.node_id.in_(node_ids), GraphNode.is_active == 1)
+                .all()
+            )
             return [_to_domain(r) for r in rows]
 
     def get_user_nodes(
@@ -474,26 +478,48 @@ class GraphStore(DbConsumer):
             )
             db.commit()
 
+    def _active_node_ids(self, db: Session) -> object:
+        """Scalar subquery: node_ids where is_active=1."""
+        return (
+            db.query(GraphNode.node_id)
+            .filter(GraphNode.is_active == 1)
+            .scalar_subquery()
+        )
+
     def get_outgoing_edges(self, node_id: str) -> list[Edge]:
-        """All outgoing edges from a node."""
+        """All outgoing edges from a node (only to active targets)."""
         with self._db() as db:
-            rows = db.query(GraphEdge).filter_by(source_id=node_id).all()
+            active = self._active_node_ids(db)
+            rows = (
+                db.query(GraphEdge)
+                .filter_by(source_id=node_id)
+                .filter(GraphEdge.target_id.in_(active))
+                .all()
+            )
             return [Edge(r.target_id, r.edge_type, r.weight) for r in rows]
 
     def get_incoming_edges(self, node_id: str) -> list[Edge]:
-        """All incoming edges to a node."""
+        """All incoming edges to a node (only from active sources)."""
         with self._db() as db:
-            rows = db.query(GraphEdge).filter_by(target_id=node_id).all()
+            active = self._active_node_ids(db)
+            rows = (
+                db.query(GraphEdge)
+                .filter_by(target_id=node_id)
+                .filter(GraphEdge.source_id.in_(active))
+                .all()
+            )
             return [Edge(r.source_id, r.edge_type, r.weight) for r in rows]
 
     def get_edges_for_nodes(self, node_ids: set[str]) -> dict[str, list[Edge]]:
-        """Batch: all outgoing edges for a set of nodes. Single query."""
+        """Batch: all outgoing edges for a set of nodes (only to active targets)."""
         if not node_ids:
             return {}
         with self._db() as db:
+            active = self._active_node_ids(db)
             rows = (
                 db.query(GraphEdge)
                 .filter(GraphEdge.source_id.in_(list(node_ids)))
+                .filter(GraphEdge.target_id.in_(active))
                 .all()
             )
             result: dict[str, list[Edge]] = {nid: [] for nid in node_ids}
@@ -507,19 +533,26 @@ class GraphStore(DbConsumer):
     ) -> tuple[dict[str, list[Edge]], dict[str, list[Edge]]]:
         """Batch: incoming AND outgoing edges for a set of nodes.
 
-        Two indexed queries (each uses its own index efficiently).
+        Filters out edges to/from inactive nodes.
         Returns (incoming, outgoing).
         """
         if not node_ids:
             return {}, {}
         id_list = list(node_ids)
         with self._db() as db:
-            # Query 1: outgoing (uses PK: source_id leading column)
+            active = self._active_node_ids(db)
             out_rows = (
-                db.query(GraphEdge).filter(GraphEdge.source_id.in_(id_list)).all()
+                db.query(GraphEdge)
+                .filter(GraphEdge.source_id.in_(id_list))
+                .filter(GraphEdge.target_id.in_(active))
+                .all()
             )
-            # Query 2: incoming (uses idx_edge_target)
-            in_rows = db.query(GraphEdge).filter(GraphEdge.target_id.in_(id_list)).all()
+            in_rows = (
+                db.query(GraphEdge)
+                .filter(GraphEdge.target_id.in_(id_list))
+                .filter(GraphEdge.source_id.in_(active))
+                .all()
+            )
             incoming: dict[str, list[Edge]] = {nid: [] for nid in node_ids}
             outgoing: dict[str, list[Edge]] = {nid: [] for nid in node_ids}
             for r in out_rows:
@@ -529,13 +562,15 @@ class GraphStore(DbConsumer):
             return incoming, outgoing
 
     def get_incoming_for_nodes(self, node_ids: set[str]) -> dict[str, list[Edge]]:
-        """Batch: all incoming edges for a set of nodes. Single query."""
+        """Batch: all incoming edges for a set of nodes (only from active sources)."""
         if not node_ids:
             return {}
         with self._db() as db:
+            active = self._active_node_ids(db)
             rows = (
                 db.query(GraphEdge)
                 .filter(GraphEdge.target_id.in_(list(node_ids)))
+                .filter(GraphEdge.source_id.in_(active))
                 .all()
             )
             result: dict[str, list[Edge]] = {nid: [] for nid in node_ids}
@@ -544,18 +579,21 @@ class GraphStore(DbConsumer):
             return result
 
     def get_neighbor_ids(self, node_ids: set[str]) -> set[str]:
-        """All 1-hop neighbor IDs (both directions). Single query."""
+        """All 1-hop active neighbor IDs (both directions)."""
         if not node_ids:
             return set()
         with self._db() as db:
+            active = self._active_node_ids(db)
             out_rows = (
                 db.query(GraphEdge.target_id)
                 .filter(GraphEdge.source_id.in_(list(node_ids)))
+                .filter(GraphEdge.target_id.in_(active))
                 .all()
             )
             in_rows = (
                 db.query(GraphEdge.source_id)
                 .filter(GraphEdge.target_id.in_(list(node_ids)))
+                .filter(GraphEdge.source_id.in_(active))
                 .all()
             )
             return {r[0] for r in out_rows} | {r[0] for r in in_rows}
@@ -754,7 +792,11 @@ class GraphStore(DbConsumer):
 
     @staticmethod
     def _upsert_entity_in(
-        db: Session, user_id: str, name: str, display_name: str, entity_type: str,
+        db: Session,
+        user_id: str,
+        name: str,
+        display_name: str,
+        entity_type: str,
         embedding: list[float] | None = None,
     ) -> str:
         # Exact name match only — soft dedup happens at retrieval time via find_entities_soft
@@ -858,9 +900,7 @@ class GraphStore(DbConsumer):
         """Find entity_id by exact name match."""
         with self._db() as db:
             row = (
-                db.query(Entity.entity_id)
-                .filter_by(user_id=user_id, name=name)
-                .first()
+                db.query(Entity.entity_id).filter_by(user_id=user_id, name=name).first()
             )
             return row[0] if row else None
 
@@ -868,7 +908,11 @@ class GraphStore(DbConsumer):
     _NO_ACTIVATION_ENTITY_TYPES = {"time", "person"}
 
     def find_entities_soft(
-        self, user_id: str, embedding: list[float], top_k: int = 5, threshold: float = 1.0,
+        self,
+        user_id: str,
+        embedding: list[float],
+        top_k: int = 5,
+        threshold: float = 1.0,
     ) -> list[tuple[str, float]]:
         """Soft entity linking via embedding similarity.
 

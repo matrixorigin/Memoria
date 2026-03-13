@@ -1,7 +1,7 @@
 .PHONY: help start stop logs status build test test-fast test-slow test-docker test-mcp test-all-cov clean reset \
         cloud-start cloud-stop cloud-logs cloud-status cloud-health cloud-clean cloud-rebuild \
         install dev build-wheel publish publish-test bump-version check lint format type-check \
-        new-key list-keys revoke-keys
+        new-key list-keys revoke-keys bench bench-compare
 
 # Load environment variables from .env file if it exists
 ifneq (,$(wildcard .env))
@@ -43,6 +43,8 @@ help:
 	@echo "  make test-docker        Run Docker integration tests (needs: make start)"
 	@echo "  make test-mcp           Run MCP server tests"
 	@echo "  make test-all-cov       Run all tests with coverage report"
+	@echo "  make bench              Run benchmark (needs: make start)"
+	@echo "  make bench-compare      Compare two retrieval strategies"
 	@echo ""
 	@echo "Build & Publish:"
 	@echo "  make build              Build Docker image"
@@ -249,6 +251,31 @@ test-all-cov:
 	@echo "   - Terminal: see above"
 	@echo "   - HTML: htmlcov/index.html"
 	@echo "   - Log: coverage.log"
+
+BENCH_URL     ?= http://localhost:$${API_PORT:-8100}
+BENCH_TOKEN   ?= $${MEMORIA_MASTER_KEY:-test-master-key-for-docker-compose}
+
+bench:
+	@echo "Running all benchmarks..."
+	@for ds in memoria/datasets/*.json; do \
+		echo "\n── $$(basename $$ds) ──"; \
+		memoria benchmark "$$ds" \
+			--api-url "$(BENCH_URL)" --api-token "$(BENCH_TOKEN)" \
+			--html "benchmark-$$(basename $$ds .json).html"; \
+	done
+	@echo "\n✅ HTML reports: benchmark-*.html"
+
+BENCH_COMPARE_A ?= vector:v1
+BENCH_COMPARE_B ?= activation:v1
+
+bench-compare:
+	@echo "Comparing $(BENCH_COMPARE_A) vs $(BENCH_COMPARE_B)..."
+	@for ds in memoria/datasets/*.json; do \
+		echo "\n── $$(basename $$ds) ──"; \
+		memoria benchmark "$$ds" \
+			--api-url "$(BENCH_URL)" --api-token "$(BENCH_TOKEN)" \
+			--compare $(BENCH_COMPARE_A) $(BENCH_COMPARE_B); \
+	done
 
 # ── Build & Publish ─────────────────────────────────────────────────
 

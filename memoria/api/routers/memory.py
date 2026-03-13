@@ -246,7 +246,9 @@ def retrieve_memories(
 
         query_embedding = get_embedding_client().embed(req.query)
     except Exception as e:
-        logger.warning("retrieve: failed to embed query, graph/vector path degraded: %s", e)
+        logger.warning(
+            "retrieve: failed to embed query, graph/vector path degraded: %s", e
+        )
 
     memories, _meta = svc.retrieve(
         user_id,
@@ -277,7 +279,10 @@ def search_memories(
         logger.warning("search: failed to embed query, vector search degraded: %s", e)
 
     memories, _meta = svc.retrieve(
-        user_id, req.query, query_embedding=query_embedding, top_k=req.top_k,
+        user_id,
+        req.query,
+        query_embedding=query_embedding,
+        top_k=req.top_k,
     )
     return [_to_response(m) for m in memories]
 
@@ -371,7 +376,9 @@ def purge_memories(
         ids = [r[0] for r in rows]
         if not ids:
             return {"purged": 0}
-        result = editor.purge(user_id, memory_ids=ids, reason=req.reason or f"topic purge: {req.topic}")
+        result = editor.purge(
+            user_id, memory_ids=ids, reason=req.reason or f"topic purge: {req.topic}"
+        )
         return {"purged": result.deactivated}
 
     memory_types = (

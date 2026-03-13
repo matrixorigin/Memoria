@@ -9,15 +9,28 @@
 
 services:
 
+  matrixone-init:
+    image: ${MATRIXONE_IMAGE:-matrixorigin/matrixone:latest}
+    user: root
+    entrypoint: ["sh", "-c", "chown -R 1000:1000 /mo-data"]
+    volumes:
+      - ${MATRIXONE_DATA_DIR:-./data/matrixone}:/mo-data
+    networks:
+      - memoria-net
+
   matrixone:
     image: ${MATRIXONE_IMAGE:-matrixorigin/matrixone:latest}
     hostname: matrixone
+    user: "1000:1000"
+    depends_on:
+      matrixone-init:
+        condition: service_completed_successfully
     ports:
       - "${MATRIXONE_PORT:-6001}:6001"
       # Debug HTTP port (pprof) — disabled by default, set MATRIXONE_DEBUG_PORT to enable
       - "${MATRIXONE_DEBUG_PORT:-}:6060"
     volumes:
-      - ${MATRIXONE_DATA_DIR:-./data/matrixone}:/mo-data
+      - ${MATRIXONE_DATA_DIR:-mo-data}:/mo-data
     environment:
       - TZ=Asia/Shanghai
     networks:

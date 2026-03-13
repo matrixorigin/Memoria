@@ -118,6 +118,7 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
 
         # Master key is exempt from rate limiting (used by admin/benchmark)
         from memoria.api.dependencies import _is_master_key
+
         if _is_master_key(api_key):
             return await call_next(request)
 

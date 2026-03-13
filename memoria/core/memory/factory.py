@@ -188,7 +188,9 @@ def create_memory_service(
     Returns:
         MemoryService with canonical storage + selected retrieval strategy.
     """
-    strategy_key, user_params = _resolve_strategy(db_factory, user_id, backend, strategy)
+    strategy_key, user_params = _resolve_strategy(
+        db_factory, user_id, backend, strategy
+    )
 
     if config is None:
         from memoria.core.memory.config import DEFAULT_CONFIG

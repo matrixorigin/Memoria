@@ -55,7 +55,9 @@ class TestEntityLinkWeightStratification:
                 ExtractedEntity("redis", "Redis", "tech"),
                 ExtractedEntity("auth-service", "auth-service", "project"),
             ]
-            store._upsert_entity_in.side_effect = lambda db, uid, name, disp, etype, embedding=None: f"eid-{name}"
+            store._upsert_entity_in.side_effect = (
+                lambda db, uid, name, disp, etype, embedding=None: f"eid-{name}"
+            )
 
             builder._link_entities("user1", [node], pending_edges)
 
@@ -103,7 +105,7 @@ class TestAssociationThresholdConfig:
         from memoria.core.memory.config import MemoryGovernanceConfig
         from dataclasses import replace
 
-        cfg = replace(DEFAULT_CONFIG := MemoryGovernanceConfig(), activation_association_threshold=0.7)
+        cfg = replace(MemoryGovernanceConfig(), activation_association_threshold=0.7)
         store = MagicMock()
         builder = GraphBuilder(store, config=cfg, embed_fn=lambda x: [0.1] * 10)
         assert builder._assoc_threshold == 0.7
@@ -115,24 +117,21 @@ class TestAssociationThresholdConfig:
             (MagicMock(node_id="other", embedding=[0.1]), 0.4),  # below 0.55
         ]
         builder = GraphBuilder(store, embed_fn=lambda x: [0.1] * 10)
-        node = GraphNodeData(
-            node_id="n1",
-            user_id="u1",
-            node_type=NodeType.SEMANTIC,
-            content="test",
-            embedding=[0.1] * 10,
-            memory_id="m1",
-        )
         pending_edges: list[tuple] = []
-        builder._create_semantic_nodes("u1", [MagicMock(
-            memory_id="m1",
-            trust_tier=MagicMock(value="T3"),
-            initial_confidence=0.8,
-            content="test",
-            embedding=[0.1] * 10,
-            session_id="s1",
-            source_event_ids=[],
-        )])
+        builder._create_semantic_nodes(
+            "u1",
+            [
+                MagicMock(
+                    memory_id="m1",
+                    trust_tier=MagicMock(value="T3"),
+                    initial_confidence=0.8,
+                    content="test",
+                    embedding=[0.1] * 10,
+                    session_id="s1",
+                    source_event_ids=[],
+                )
+            ],
+        )
         # Verify find_similar_with_scores was called (association edge logic)
         # The actual edge creation depends on cos_sim > threshold
         # With threshold=0.55 and sim=0.4, no edge should be added

@@ -110,12 +110,15 @@ class ActivationRetriever:
         task_type: str | None = None,
     ) -> list[tuple[GraphNodeData, float]]:
         if not query_embedding:
-            logger.warning("graph_retriever: query_embedding is None, graph path skipped (returning empty)")
+            logger.warning(
+                "graph_retriever: query_embedding is None, graph path skipped (returning empty)"
+            )
             return []
         if not self._store.has_min_nodes(user_id, MIN_GRAPH_NODES):
             logger.warning(
                 "graph_retriever: insufficient graph nodes for user=%s (min=%d), graph path skipped",
-                user_id, MIN_GRAPH_NODES,
+                user_id,
+                MIN_GRAPH_NODES,
             )
             return []
 
@@ -154,7 +157,9 @@ class ActivationRetriever:
         # 2. Soft entity linking: find entity candidates via embedding similarity,
         #    inject as weighted activation anchors.
         entity_anchors, entity_memory_ids = self._entity_recall(
-            user_id, query, query_embedding=query_embedding,
+            user_id,
+            query,
+            query_embedding=query_embedding,
         )
 
         # Inject entity anchors with similarity-weighted activation
@@ -267,7 +272,10 @@ class ActivationRetriever:
         # Soft linking: use query embedding to find similar entities
         if query_embedding:
             soft_matches = self._store.find_entities_soft(
-                user_id, query_embedding, top_k=5, threshold=1.0,
+                user_id,
+                query_embedding,
+                top_k=5,
+                threshold=1.0,
             )
             for entity_id, sim_score in soft_matches:
                 entity_anchors[entity_id] = sim_score

@@ -77,8 +77,19 @@ def _restart_api_with_env(
 
     # Run with overrides
     subprocess.run(
-        ["docker", "compose", "run", "-d", "--name", f"memoria-{service}-grid",
-         "-p", f"{port}:8000", *env_args, "--rm", service],
+        [
+            "docker",
+            "compose",
+            "run",
+            "-d",
+            "--name",
+            f"memoria-{service}-grid",
+            "-p",
+            f"{port}:8000",
+            *env_args,
+            "--rm",
+            service,
+        ],
         cwd=compose_dir,
         capture_output=True,
     )
@@ -191,7 +202,11 @@ def run_grid_search(
             run_file = Path(output_dir) / f"run_{i:03d}.json"
             run_file.write_text(
                 json.dumps(
-                    {"params": env, "score": report.overall_score, "scenarios": scenario_scores},
+                    {
+                        "params": env,
+                        "score": report.overall_score,
+                        "scenarios": scenario_scores,
+                    },
                     indent=2,
                 ),
                 encoding="utf-8",
@@ -212,14 +227,21 @@ def run_grid_search(
             params_str = " ".join(
                 f"{k.split('_')[-1]}={v}" for k, v in gr.params.items()
             )
-            print(f"  #{rank} {gr.overall_score:5.1f} ({gr.overall_grade}) {params_str}")
+            print(
+                f"  #{rank} {gr.overall_score:5.1f} ({gr.overall_grade}) {params_str}"
+            )
 
         # Save summary
         summary_file = Path(output_dir) / "summary.json"
         summary_file.write_text(
             json.dumps(
                 [
-                    {"rank": i + 1, "params": r.params, "score": r.overall_score, "grade": r.overall_grade}
+                    {
+                        "rank": i + 1,
+                        "params": r.params,
+                        "score": r.overall_score,
+                        "grade": r.overall_grade,
+                    }
                     for i, r in enumerate(results)
                 ],
                 indent=2,
