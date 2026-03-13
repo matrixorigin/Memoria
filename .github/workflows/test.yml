@@ -5,6 +5,7 @@ on:
     branches: [main, develop]
   pull_request:
     branches: [main, develop]
+    types: [opened, synchronize]
 
 env:
   MEMORIA_MASTER_KEY: ci-master-key-memoria-test
