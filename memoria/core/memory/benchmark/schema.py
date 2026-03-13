@@ -59,6 +59,16 @@ class SeedMemory(BaseModel):
     is_outdated: bool = Field(
         default=False, description="True if this should NOT be returned"
     )
+    age_days: float | None = Field(
+        default=None,
+        description="Simulate memory age: observed_at = now - age_days. Used for decay tests.",
+    )
+    initial_confidence: float | None = Field(
+        default=None, description="Override initial confidence (default: 1.0)"
+    )
+    trust_tier: str | None = Field(
+        default=None, description="Override trust tier (e.g. 'T1', 'T4')"
+    )
 
 
 MaturationOp = Literal[
@@ -77,6 +87,10 @@ class ScenarioStep(BaseModel):
     # For store/correct:
     content: str | None = None
     memory_type: str | None = None
+    # For store: time/confidence/tier overrides (same semantics as SeedMemory)
+    age_days: float | None = None
+    initial_confidence: float | None = None
+    trust_tier: str | None = None
     # For retrieve/search:
     query: str | None = None
     top_k: int | None = None

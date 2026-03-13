@@ -185,7 +185,7 @@ class GraphMemoryService:
     def _nodes_to_memories(scored_nodes: list[tuple[Any, float]]) -> list[Memory]:
         """Convert scored graph nodes to Memory domain objects."""
         memories: list[Memory] = []
-        for node, _score in scored_nodes:
+        for node, score in scored_nodes:
             try:
                 tier = TrustTier(node.trust_tier)
             except ValueError:
@@ -200,6 +200,7 @@ class GraphMemoryService:
                     embedding=node.embedding,
                     session_id=node.session_id,
                     trust_tier=tier,
+                    retrieval_score=round(score, 4),
                 )
             )
         return memories

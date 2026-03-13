@@ -203,7 +203,9 @@ class ActivationRetrievalStrategy:
             if mid in tabular:
                 if mid not in seen:
                     seen.add(mid)
-                    memories.append(tabular[mid])
+                    mem = tabular[mid]
+                    mem.retrieval_score = round(_score, 4)
+                    memories.append(mem)
                 continue
             # Skip entity/scene nodes that have no backing memory row
             if not node.memory_id:
@@ -225,6 +227,7 @@ class ActivationRetrievalStrategy:
                         embedding=node.embedding,
                         session_id=node.session_id,
                         trust_tier=tier,
+                        retrieval_score=round(_score, 4),
                     )
                 )
         return memories

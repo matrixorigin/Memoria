@@ -58,7 +58,7 @@ def create_server(api_url: str, api_key: str) -> FastMCP:
         Args:
             query: What to search for in memories.
             top_k: Max number of memories to return (default 5).
-            format: 'text' (default) or 'json' for structured response.
+            format: 'text' (default) or 'json' for structured response with memory_id, type, content, score per item.
         """
         r = client.post("/v1/memories/retrieve", json={"query": query, "top_k": top_k})
         r.raise_for_status()
@@ -73,6 +73,7 @@ def create_server(api_url: str, api_key: str) -> FastMCP:
                             "memory_id": m.get("memory_id", ""),
                             "type": m.get("memory_type", "fact"),
                             "content": m["content"],
+                            "score": m.get("retrieval_score"),
                         }
                         for m in items
                     ],

@@ -25,6 +25,8 @@ class StoreRequest(BaseModel):
     trust_tier: str | None = None
     session_id: str | None = None
     source: str = "api"
+    observed_at: datetime | None = None  # benchmark: override timestamp for decay tests
+    initial_confidence: float | None = None  # benchmark: override confidence
 
 
 class BatchStoreRequest(BaseModel):
@@ -86,6 +88,7 @@ def _to_response(mem: Any) -> dict[str, Any]:
         "observed_at": mem.observed_at.isoformat()
         if hasattr(mem, "observed_at") and mem.observed_at
         else None,
+        "retrieval_score": getattr(mem, "retrieval_score", None),
     }
 
 
@@ -199,6 +202,10 @@ def store_memory(
             trust_tier=TrustTier(req.trust_tier) if req.trust_tier else None,
             source=req.source,
             session_id=req.session_id,
+            observed_at=req.observed_at,
+            initial_confidence=req.initial_confidence
+            if req.initial_confidence is not None
+            else 1.0,
         )
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))

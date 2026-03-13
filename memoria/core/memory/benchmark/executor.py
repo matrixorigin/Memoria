@@ -119,7 +119,16 @@ class BenchmarkExecutor:
 
             # Phase 1: load seed memories
             for seed in scenario.seed_memories:
-                self._store(seed.content, seed.memory_type, session_id)
+                mid = self._store(
+                    seed.content,
+                    seed.memory_type,
+                    session_id,
+                    age_days=seed.age_days,
+                    initial_confidence=seed.initial_confidence,
+                    trust_tier=seed.trust_tier,
+                )
+                if seed.is_outdated and mid:
+                    self._purge([mid], reason="seed marked is_outdated")
 
             # Phase 2: maturation — run backend ops so graph/entities are built
             for op in scenario.maturation:
@@ -149,7 +158,16 @@ class BenchmarkExecutor:
         session_id = f"bench-{self._run_id}-{sid}"
 
         for seed in scenario.seed_memories:
-            self._store(seed.content, seed.memory_type, session_id)
+            mid = self._store(
+                seed.content,
+                seed.memory_type,
+                session_id,
+                age_days=seed.age_days,
+                initial_confidence=seed.initial_confidence,
+                trust_tier=seed.trust_tier,
+            )
+            if seed.is_outdated and mid:
+                self._purge([mid], reason="seed marked is_outdated")
 
         for op in scenario.maturation:
             self._run_maturation(op, user_id)
@@ -190,18 +208,36 @@ class BenchmarkExecutor:
             execution.error = str(e)
         return execution
 
-    def _store(self, content: str, memory_type: str, session_id: str) -> bool:
-        resp = self._client.post(
-            "/v1/memories",
-            json={
-                "content": content,
-                "memory_type": memory_type,
-                "session_id": session_id,
-                "source": "benchmark",
-            },
-        )
+    def _store(
+        self,
+        content: str,
+        memory_type: str,
+        session_id: str,
+        *,
+        age_days: float | None = None,
+        initial_confidence: float | None = None,
+        trust_tier: str | None = None,
+    ) -> str:
+        """Store a memory and return its memory_id."""
+        from datetime import datetime, timedelta, timezone
+
+        body: dict = {
+            "content": content,
+            "memory_type": memory_type,
+            "session_id": session_id,
+            "source": "benchmark",
+        }
+        if age_days is not None:
+            body["observed_at"] = (
+                datetime.now(timezone.utc) - timedelta(days=age_days)
+            ).isoformat()
+        if initial_confidence is not None:
+            body["initial_confidence"] = initial_confidence
+        if trust_tier is not None:
+            body["trust_tier"] = trust_tier
+        resp = self._client.post("/v1/memories", json=body)
         resp.raise_for_status()
-        return True
+        return resp.json().get("memory_id", "")
 
     # ── Maturation: trigger backend ops via admin endpoint (no cooldown) ──
 
@@ -273,7 +309,12 @@ class BenchmarkExecutor:
         try:
             if step.action == "store":
                 self._store(
-                    step.content or "", step.memory_type or "semantic", session_id
+                    step.content or "",
+                    step.memory_type or "semantic",
+                    session_id,
+                    age_days=step.age_days,
+                    initial_confidence=step.initial_confidence,
+                    trust_tier=step.trust_tier,
                 )
                 return StepResult(action="store", success=True)
             elif step.action == "retrieve":

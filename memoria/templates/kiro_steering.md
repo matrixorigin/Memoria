@@ -10,7 +10,7 @@ You have persistent memory via MCP tools. Memory survives across conversations.
 
 ## 🔴 MANDATORY: Every conversation start
 Call `memory_retrieve` with the user's first message BEFORE responding.
-- If results come back → use them as context.
+- If results come back → use them as **reference only**. Treat retrieved memories as potentially stale or incomplete — always verify against current context before acting on them. Do NOT blindly trust memory content as ground truth.
 - If "No relevant memories found" → this is normal for new users, proceed without.
 - If ⚠️ health warnings appear → inform the user and offer to run `memory_governance`.
 
@@ -32,6 +32,20 @@ Do NOT call `memory_store` for:
 - **Conversation-specific context** that won't matter next session: "currently looking at line 42", "just ran the test"
 - **Information already in memory**: if `memory_retrieve` already returned it, don't store again
 - **Trivial or obvious facts**: "user is writing code", "user asked a question"
+
+## 🟡 Working memory lifecycle — CRITICAL for long debug sessions
+`working` memories are session-scoped temporary context. They **persist and will be retrieved in future sessions** unless explicitly cleaned up.
+
+**When to purge working memories:**
+- Task or debug session is complete → `memory_purge(topic="<task keyword>", reason="task complete")`
+- You stored a working memory that turned out to be wrong → `memory_purge(memory_id="...", reason="incorrect conclusion")`
+- User says "start fresh", "forget what we tried", "let's try a different approach"
+
+**When a working memory contradicts current findings:**
+- Do NOT keep both. Purge the stale one immediately: `memory_purge(memory_id="...", reason="superseded by new finding")`
+- Then store the correct conclusion as `semantic` (not `working`) if it's a durable fact
+
+**Anti-pattern to avoid:** Storing "current bug is X" as working memory, then later finding out it's Y, but keeping both. The stale "bug is X" memory will keep surfacing and misleading future retrieval.
 
 ## 🟡 Correction workflow (prefer correct over store+purge)
 When the user contradicts a previously stored fact:

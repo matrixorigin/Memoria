@@ -1,0 +1,294 @@
+{
+    "dataset_id": "memoria-forget-v1",
+    "version": "v1.0",
+    "description": "Memory forgetting and decay benchmark. Tests temporal confidence decay, trust tier half-life differences, and governance quarantine/cleanup. Validates that the system correctly applies query-time decay and tier-based retention.",
+    "scenarios": [
+        {
+            "scenario_id": "FORGET-001",
+            "title": "Temporal decay: newer memory wins with same initial confidence",
+            "description": "Two memories with same initial_confidence and trust_tier, but different ages (10 days vs 100 days). Query-time half-life decay should rank the newer one higher, even though both have identical initial confidence.",
+            "domain": "engineering",
+            "difficulty": "L3",
+            "horizon": "medium",
+            "tags": [
+                "trust",
+                "drift"
+            ],
+            "seed_memories": [
+                {
+                    "content": "API rate limit is 1000 requests per minute for all endpoints.",
+                    "memory_type": "semantic",
+                    "age_days": 100,
+                    "trust_tier": "T3"
+                },
+                {
+                    "content": "API rate limit increased to 2000 requests per minute after infrastructure upgrade.",
+                    "memory_type": "semantic",
+                    "age_days": 1,
+                    "trust_tier": "T3"
+                }
+            ],
+            "steps": [
+                {
+                    "action": "store",
+                    "content": "API rate limit is 1000 requests per minute for all endpoints.",
+                    "memory_type": "semantic",
+                    "age_days": 100,
+                    "trust_tier": "T3"
+                },
+                {
+                    "action": "store",
+                    "content": "API rate limit increased to 2000 requests per minute after infrastructure upgrade.",
+                    "memory_type": "semantic",
+                    "age_days": 1,
+                    "trust_tier": "T3"
+                }
+            ],
+            "assertions": [
+                {
+                    "query": "What is the current API rate limit?",
+                    "top_k": 2,
+                    "expected_contents": [
+                        "2000 requests per minute"
+                    ],
+                    "excluded_contents": [
+                        "1000 requests per minute"
+                    ]
+                }
+            ],
+            "maturation": [
+                "extract_entities",
+                "consolidate"
+            ]
+        },
+        {
+            "scenario_id": "FORGET-002",
+            "title": "Trust tier half-life: T1 survives longer than T4",
+            "description": "T1 memory (6 months old, 365-day half-life) vs T4 memory (1 month old, 30-day half-life). Despite T4 being newer, T1's effective confidence should be higher due to dramatically longer half-life. Tests that trust tier correctly modulates decay rate.",
+            "domain": "architecture",
+            "difficulty": "L4",
+            "horizon": "long",
+            "tags": [
+                "trust"
+            ],
+            "seed_memories": [
+                {
+                    "content": "Core platform architecture follows microservices pattern with event-driven communication.",
+                    "memory_type": "semantic",
+                    "age_days": 180,
+                    "trust_tier": "T1",
+                    "initial_confidence": 1.0
+                },
+                {
+                    "content": "Considering migration to monolith due to operational complexity concerns.",
+                    "memory_type": "semantic",
+                    "age_days": 30,
+                    "trust_tier": "T4",
+                    "initial_confidence": 1.0
+                }
+            ],
+            "steps": [
+                {
+                    "action": "store",
+                    "content": "Core platform architecture follows microservices pattern with event-driven communication.",
+                    "memory_type": "semantic",
+                    "age_days": 180,
+                    "trust_tier": "T1",
+                    "initial_confidence": 1.0
+                },
+                {
+                    "action": "store",
+                    "content": "Considering migration to monolith due to operational complexity concerns.",
+                    "memory_type": "semantic",
+                    "age_days": 30,
+                    "trust_tier": "T4",
+                    "initial_confidence": 1.0
+                }
+            ],
+            "assertions": [
+                {
+                    "query": "What is our platform architecture?",
+                    "top_k": 2,
+                    "expected_contents": [
+                        "microservices",
+                        "event-driven"
+                    ],
+                    "excluded_contents": [
+                        "monolith",
+                        "migration"
+                    ]
+                }
+            ],
+            "maturation": [
+                "extract_entities",
+                "consolidate"
+            ]
+        },
+        {
+            "scenario_id": "FORGET-003",
+            "title": "Governance quarantine: low effective confidence memories excluded",
+            "description": "Old memory with very low effective confidence (due to age decay) should be quarantined by governance and excluded from retrieval. T3 half-life=60d, quarantine_threshold=0.3: a 200-day-old memory has effective_confidence\u22480.036, well below threshold. Tests the governance loop that marks is_active=0 for stale memories.",
+            "domain": "compliance",
+            "difficulty": "L4",
+            "horizon": "long",
+            "tags": [
+                "trust",
+                "drift"
+            ],
+            "seed_memories": [
+                {
+                    "content": "Data retention policy 2024: Customer data retained for 30 days after account closure.",
+                    "memory_type": "semantic",
+                    "age_days": 200,
+                    "trust_tier": "T3",
+                    "initial_confidence": 1.0
+                },
+                {
+                    "content": "Data retention policy 2025: Customer data retained for 90 days after account closure per legal requirements.",
+                    "memory_type": "semantic",
+                    "age_days": 1,
+                    "trust_tier": "T3"
+                }
+            ],
+            "steps": [
+                {
+                    "action": "store",
+                    "content": "Data retention policy 2025: Customer data retained for 90 days after account closure per legal requirements.",
+                    "memory_type": "semantic",
+                    "age_days": 1,
+                    "trust_tier": "T3"
+                }
+            ],
+            "assertions": [
+                {
+                    "query": "What is our data retention policy for customer data?",
+                    "top_k": 3,
+                    "expected_contents": [
+                        "90 days",
+                        "legal requirements"
+                    ],
+                    "excluded_contents": [
+                        "30 days",
+                        "2024"
+                    ]
+                }
+            ],
+            "maturation": [
+                "extract_entities",
+                "consolidate",
+                "governance"
+            ]
+        },
+        {
+            "scenario_id": "FORGET-004",
+            "title": "Activation decay: distant graph nodes receive lower scores",
+            "description": "In a multi-hop entity chain, nodes further from the anchor should have lower activation scores due to spreading decay. Tests that activation propagation correctly applies decay rate at each hop.",
+            "domain": "engineering",
+            "difficulty": "L5",
+            "horizon": "medium",
+            "tags": [
+                "trust"
+            ],
+            "seed_memories": [
+                {
+                    "content": "Alice is the tech lead for the payment team.",
+                    "memory_type": "semantic"
+                },
+                {
+                    "content": "Payment team owns the billing-service microservice.",
+                    "memory_type": "semantic"
+                },
+                {
+                    "content": "Billing-service uses Stripe API for payment processing.",
+                    "memory_type": "semantic"
+                },
+                {
+                    "content": "Stripe API requires webhook endpoint configuration for async events.",
+                    "memory_type": "semantic"
+                },
+                {
+                    "content": "Webhook endpoints must be HTTPS with valid SSL certificates.",
+                    "memory_type": "semantic"
+                }
+            ],
+            "steps": [],
+            "assertions": [
+                {
+                    "query": "What does Alice's team work on?",
+                    "top_k": 5,
+                    "expected_contents": [
+                        "payment team",
+                        "billing-service"
+                    ],
+                    "excluded_contents": [
+                        "webhook endpoints",
+                        "SSL certificates"
+                    ]
+                }
+            ],
+            "maturation": [
+                "extract_entities",
+                "consolidate"
+            ]
+        },
+        {
+            "scenario_id": "FORGET-005",
+            "title": "Temporal recency boost in final scoring",
+            "description": "Even with similar activation and semantic scores, more recent memories should rank higher due to temporal recency factor in scoring. Tests the TEMPORAL_DECAY_HOURS component of retrieval scoring.",
+            "domain": "incident",
+            "difficulty": "L3",
+            "horizon": "short",
+            "tags": [
+                "drift"
+            ],
+            "seed_memories": [
+                {
+                    "content": "Incident #1234: Database connection pool exhausted at 14:00. Resolved by restarting connection pool.",
+                    "memory_type": "semantic",
+                    "age_days": 30,
+                    "trust_tier": "T3"
+                },
+                {
+                    "content": "Incident #1235: Database connection pool exhausted again at 16:00. Root cause identified as connection leak in auth service.",
+                    "memory_type": "semantic",
+                    "age_days": 1,
+                    "trust_tier": "T3"
+                }
+            ],
+            "steps": [
+                {
+                    "action": "store",
+                    "content": "Incident #1234: Database connection pool exhausted at 14:00. Resolved by restarting connection pool.",
+                    "memory_type": "semantic",
+                    "age_days": 30,
+                    "trust_tier": "T3"
+                },
+                {
+                    "action": "store",
+                    "content": "Incident #1235: Database connection pool exhausted again at 16:00. Root cause identified as connection leak in auth service.",
+                    "memory_type": "semantic",
+                    "age_days": 1,
+                    "trust_tier": "T3"
+                }
+            ],
+            "assertions": [
+                {
+                    "query": "What caused the database connection pool issue?",
+                    "top_k": 2,
+                    "expected_contents": [
+                        "connection leak",
+                        "auth service",
+                        "#1235"
+                    ],
+                    "excluded_contents": [
+                        "restarting connection pool"
+                    ]
+                }
+            ],
+            "maturation": [
+                "extract_entities",
+                "consolidate"
+            ]
+        }
+    ]
+}

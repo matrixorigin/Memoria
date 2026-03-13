@@ -288,7 +288,12 @@ class EmbeddedBackend(MemoryBackend):
             session_id=session_id or "",
         )
         return [
-            {"memory_id": m.memory_id, "content": m.content, "type": str(m.memory_type)}
+            {
+                "memory_id": m.memory_id,
+                "content": m.content,
+                "type": str(m.memory_type),
+                "score": m.retrieval_score,
+            }
             for m in memories
         ]
 
@@ -1858,7 +1863,7 @@ def create_server(backend: MemoryBackend, default_user: str = "default") -> Fast
             session_id: Session context (optional). When set, prioritizes memories from this session.
                 When None, searches across all sessions (include_cross_session=True).
                 When set, the underlying retrieval strategy ranks session-scoped memories higher.
-            format: 'text' (default) or 'json' for structured response with memory_id, type, content per item.
+            format: 'text' (default) or 'json' for structured response with memory_id, type, content, score per item.
         """
         uid = _user(user_id)
         top_k = max(1, min(top_k, 100))
@@ -1874,6 +1879,7 @@ def create_server(backend: MemoryBackend, default_user: str = "default") -> Fast
                             "memory_id": r["memory_id"],
                             "type": r.get("type", "fact"),
                             "content": r["content"],
+                            "score": r.get("score"),
                         }
                         for r in results
                     ],

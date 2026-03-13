@@ -1,11 +1,16 @@
 """Unit tests for MemoryRetriever — ORM-based."""
 
+import time
 from datetime import datetime, timezone
 from unittest.mock import MagicMock
 
 import pytest
 
-from memoria.core.memory.tabular.retriever import TASK_WEIGHTS, MemoryRetriever
+from memoria.core.memory.tabular.retriever import (
+    TASK_WEIGHTS,
+    MemoryRetriever,
+    _Candidate,
+)
 from memoria.core.memory.types import MemoryType
 from tests.conftest import TEST_EMBEDDING_DIM
 
@@ -141,6 +146,141 @@ class TestRetrievePhase2:
             "u1", "test", session_id="s1", query_embedding=[0.1] * TEST_EMBEDDING_DIM
         )
         assert len(results) >= 1
+
+
+class TestRetrievalScore:
+    """retrieval_score must be populated on both keyword-only and vector paths."""
+
+    @pytest.fixture
+    def retriever(self):
+        r = MemoryRetriever(db_factory=lambda: MagicMock())
+        r._load_l0 = MagicMock(return_value=[])
+        r._bump_access_counts = MagicMock()
+        return r
+
+    def test_keyword_only_path_populates_score(self, retriever):
+        """No embedding → keyword-only path must still set retrieval_score."""
+        mock_db = MagicMock()
+        mock_db.query.return_value = _make_chain([_mem_row("m1", ft_score=2.0)])
+        retriever._db_factory = lambda: mock_db
+
+        results, _ = retriever.retrieve("u1", "test query", "s1")  # no query_embedding
+        assert len(results) == 1
+        assert results[0].retrieval_score is not None
+        assert 0.0 <= results[0].retrieval_score <= 1.0
+
+    def test_vector_path_populates_score(self, retriever):
+        """With embedding → merge path must set retrieval_score."""
+        mock_db = MagicMock()
+        p1_row = _mem_row("m1", ft_score=1.0)
+        p2_row = _vec_row("m1", l2_dist=0.3)
+
+        call_count = 0
+
+        def side_effect(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            return _make_chain([p1_row] if call_count == 1 else [p2_row])
+
+        mock_db.query.side_effect = side_effect
+        retriever._db_factory = lambda: mock_db
+
+        results, _ = retriever.retrieve(
+            "u1", "test", "s1", query_embedding=[0.1] * TEST_EMBEDDING_DIM
+        )
+        assert len(results) == 1
+        assert results[0].retrieval_score is not None
+        assert 0.0 <= results[0].retrieval_score <= 1.0
+
+    def test_l0_memories_have_score(self):
+        """L0 working/tool_result memories must also have retrieval_score populated."""
+        from memoria.core.memory.types import Memory, MemoryType, TrustTier
+
+        working_mem = Memory(
+            memory_id="w1",
+            user_id="u1",
+            memory_type=MemoryType.WORKING,
+            content="debug context",
+            session_id="s1",
+            observed_at=datetime(2026, 2, 26, tzinfo=timezone.utc),
+            trust_tier=TrustTier.T3_INFERRED,
+        )
+        mock_db = MagicMock()
+        mock_db.query.return_value = _make_chain([])  # L1 empty
+
+        r = MemoryRetriever(db_factory=lambda: mock_db)
+        r._load_l0 = MagicMock(return_value=[working_mem])
+        r._bump_access_counts = MagicMock()
+
+        results, _ = r.retrieve("u1", "query", "s1")
+        assert any(m.memory_id == "w1" for m in results)
+        w = next(m for m in results if m.memory_id == "w1")
+        assert w.retrieval_score is not None
+        assert w.retrieval_score > 0.0
+
+    def test_l0_scoring_uses_caller_weights(self):
+        """L0 scoring must use the same weights as L1 (caller-supplied or default)."""
+        from memoria.core.memory.tabular.retriever import RetrievalWeights
+        from memoria.core.memory.types import Memory, MemoryType, TrustTier
+
+        # Two L0 memories: one recent, one old
+        recent = Memory(
+            memory_id="recent",
+            user_id="u1",
+            memory_type=MemoryType.WORKING,
+            content="recent context",
+            session_id="s1",
+            observed_at=datetime(2026, 3, 13, tzinfo=timezone.utc),
+            trust_tier=TrustTier.T3_INFERRED,
+        )
+        old = Memory(
+            memory_id="old",
+            user_id="u1",
+            memory_type=MemoryType.WORKING,
+            content="old context",
+            session_id="s1",
+            observed_at=datetime(2025, 1, 1, tzinfo=timezone.utc),
+            trust_tier=TrustTier.T3_INFERRED,
+        )
+        mock_db = MagicMock()
+        mock_db.query.return_value = _make_chain([])
+
+        r = MemoryRetriever(db_factory=lambda: mock_db)
+        r._load_l0 = MagicMock(return_value=[recent, old])
+        r._bump_access_counts = MagicMock()
+
+        # High temporal weight → recent should score higher
+        w = RetrievalWeights(vector=0.0, keyword=0.0, temporal=1.0, confidence=0.0)
+        results, _ = r.retrieve("u1", "query", "s1", weights=w)
+        scores = {m.memory_id: m.retrieval_score for m in results}
+        assert scores["recent"] > scores["old"], (
+            "recent L0 memory must score higher than old one under high temporal weight"
+        )
+
+    def test_score_preserves_raw_value(self):
+        """retrieval_score must preserve the raw score without capping at 1.0."""
+        from memoria.core.memory.tabular.retriever import RetrievalWeights
+
+        r = MemoryRetriever(db_factory=lambda: MagicMock())
+        c = _Candidate(
+            memory_id="m1",
+            content="x",
+            memory_type="semantic",
+            initial_confidence=1.0,
+            observed_at=datetime(2026, 3, 13, tzinfo=timezone.utc),
+            session_id=None,
+            trust_tier="T1",
+            keyword_score=999.0,  # very high BM25
+            l2_dist=0.0,  # perfect vector match
+            access_count=100,  # large boost
+        )
+        w = RetrievalWeights(vector=0.25, keyword=0.25, temporal=0.25, confidence=0.25)
+        raw_score = r._score_candidate(c, w, time.time())[0]
+        assert raw_score > 1.0, "precondition: raw score should exceed 1.0 with boosts"
+
+        mem = r._to_memory(c, "u1", score=raw_score)
+        assert mem.retrieval_score is not None
+        assert mem.retrieval_score > 1.0, "raw score above 1.0 must not be capped"
 
 
 class TestRetrieveExplain:
@@ -327,3 +467,48 @@ class TestL0Cap:
         # All 5 slots should be filled from L0 (6 available, limit=5)
         assert len(results) == 5
         assert all(m.memory_type == MemoryType.WORKING for m in results)
+
+
+class TestL0Real:
+    """_load_l0 must construct Memory objects with correct fields from DB rows."""
+
+    def _make_l0_row(self, memory_id: str, content: str):
+        """Simulate a DB row returned by _load_l0's query (no l2_dist column)."""
+        row = MagicMock()
+        row.memory_id = memory_id
+        row.content = content
+        row.memory_type = "working"
+        row.initial_confidence = 0.9
+        row.observed_at = datetime(2026, 3, 1, tzinfo=timezone.utc)
+        row.session_id = "s1"
+        row.trust_tier = "T3"
+        return row
+
+    def test_load_l0_constructs_memories(self):
+        """_load_l0 must return Memory objects with correct memory_type and content."""
+        row = self._make_l0_row("w1", "current task context")
+        db = MagicMock()
+        db.query.return_value = _make_chain([row])
+
+        r = MemoryRetriever(db_factory=lambda: db)
+        r._bump_access_counts = MagicMock()
+
+        memories = r._load_l0("u1", "s1")
+        assert len(memories) == 1
+        m = memories[0]
+        assert m.memory_id == "w1"
+        assert m.content == "current task context"
+        from memoria.core.memory.types import MemoryType
+
+        assert m.memory_type == MemoryType.WORKING
+
+    def test_load_l0_no_session_returns_empty(self):
+        """_load_l0 with empty session_id must return empty list (no L0 context)."""
+        db = MagicMock()
+        db.query.return_value = _make_chain([])
+
+        r = MemoryRetriever(db_factory=lambda: db)
+        r._bump_access_counts = MagicMock()
+
+        memories = r._load_l0("u1", "")
+        assert memories == []

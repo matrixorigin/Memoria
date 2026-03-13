@@ -136,6 +136,22 @@ class MemoryRetriever(DbConsumer):
         )
         if session_id and not caller_excluded_l0:
             l0_memories = self._load_l0(user_id, session_id, query_embedding)
+            # Score L0 memories so retrieval_score is populated consistently.
+            # vec_score=0 (no l2_dist), keyword_score=0 (not from fulltext search).
+            now_ts = time.time()
+            for m in l0_memories:
+                c = _Candidate(
+                    memory_id=m.memory_id,
+                    content=m.content,
+                    memory_type=m.memory_type.value,
+                    initial_confidence=m.initial_confidence,
+                    observed_at=m.observed_at,
+                    session_id=m.session_id,
+                    trust_tier=m.trust_tier.value if m.trust_tier else "T3",
+                    access_count=m.access_count,
+                )
+                score = self._score_candidate(c, weights, now_ts)[0]
+                m.retrieval_score = round(score, 4)
 
         # ── L1: cross-session semantic/procedural/profile (default retrieval) ──
         l1_types = memory_types or [
@@ -197,7 +213,13 @@ class MemoryRetriever(DbConsumer):
                 logger.warning(
                     "tabular_retriever: query_embedding is None, skipping phase2 vector search"
                 )
-                l1 = [self._to_memory(c, user_id) for c in phase1[:l1_limit]]
+                now_ts = time.time()
+                l1 = [
+                    self._to_memory(
+                        c, user_id, score=self._score_candidate(c, weights, now_ts)[0]
+                    )
+                    for c in phase1[:l1_limit]
+                ]
                 memories = l0_memories + l1
                 memories = memories[:limit]
                 if stats:
@@ -592,17 +614,19 @@ class MemoryRetriever(DbConsumer):
                 )
                 for i, (sc, c) in enumerate(selected)
             ]
-            return [self._to_memory(c, user_id) for _, c in selected]
+            return [self._to_memory(c, user_id, score=sc[0]) for sc, c in selected]
 
         # Hot path: only compute final score, skip per-dimension breakdown
         scored = [
             (self._score_candidate(c, weights, now_ts)[0], c) for c in merged.values()
         ]
         scored.sort(key=lambda x: x[0], reverse=True)
-        return [self._to_memory(c, user_id) for _, c in scored[:limit]]
+        return [self._to_memory(c, user_id, score=s) for s, c in scored[:limit]]
 
     @staticmethod
-    def _to_memory(c: _Candidate, user_id: str) -> Memory:
+    def _to_memory(
+        c: _Candidate, user_id: str, score: Optional[float] = None
+    ) -> Memory:
         return Memory(
             memory_id=c.memory_id,
             user_id=user_id,
@@ -615,6 +639,7 @@ class MemoryRetriever(DbConsumer):
             trust_tier=TrustTier(c.trust_tier)
             if c.trust_tier
             else TrustTier.T3_INFERRED,
+            retrieval_score=round(score, 4) if score is not None else None,
         )
 
     def _bump_access_counts(self, memory_ids: list[str]) -> None:

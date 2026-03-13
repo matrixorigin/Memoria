@@ -82,6 +82,9 @@ class Memory:
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
     trust_tier: TrustTier = TrustTier.T3_INFERRED
+    retrieval_score: Optional[float] = (
+        None  # set by retriever; None if not retrieved via scoring
+    )
 
     def effective_confidence(self, half_life_days: Optional[float] = None) -> float:
         """Query-time confidence decay. Uses tier-specific half-life if not overridden."""

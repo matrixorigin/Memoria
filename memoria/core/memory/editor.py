@@ -73,6 +73,8 @@ class MemoryEditor:
         trust_tier: TrustTier | None = None,
         source: str = "admin_inject",
         session_id: str | None = None,
+        observed_at: datetime | None = None,
+        initial_confidence: float = 1.0,
     ) -> Memory:
         """Inject a memory with high trust tier.
 
@@ -83,6 +85,8 @@ class MemoryEditor:
             trust_tier: Trust tier (default: T1_VERIFIED).
             source: Source identifier for audit.
             session_id: Optional session context.
+            observed_at: Override timestamp (e.g. for decay benchmark tests).
+            initial_confidence: Override initial confidence (default: 1.0).
 
         Returns:
             The created Memory.
@@ -97,10 +101,20 @@ class MemoryEditor:
             content,
             memory_type=memory_type,
             trust_tier=trust_tier,
-            initial_confidence=1.0,
+            initial_confidence=initial_confidence,
             session_id=session_id,
             source_event_ids=[f"inject:{source}"],
         )
+        if observed_at is not None:
+            mem.observed_at = observed_at
+            # Backdate the stored record so decay scoring uses the correct timestamp
+            with self._db_factory() as db:
+                from memoria.core.memory.tabular.models import MemoryRecord as _MR
+
+                db.query(_MR).filter(_MR.memory_id == mem.memory_id).update(
+                    {"observed_at": observed_at}
+                )
+                db.commit()
 
         if self._index_manager:
             self._index_manager.on_memories_stored(

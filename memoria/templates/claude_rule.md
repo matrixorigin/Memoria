@@ -6,7 +6,7 @@ You have persistent memory via MCP tools. Memory survives across conversations.
 
 ## 🔴 MANDATORY: Every conversation start
 Call `memory_retrieve` with the user's first message BEFORE responding.
-- If results come back → use them as context.
+- If results come back → use them as **reference only**. Treat retrieved memories as potentially stale or incomplete — always verify against current context before acting on them. Do NOT blindly trust memory content as ground truth.
 - If "No relevant memories found" → this is normal for new users, proceed without.
 - If ⚠️ health warnings appear → inform the user and offer to run `memory_governance`.
 
