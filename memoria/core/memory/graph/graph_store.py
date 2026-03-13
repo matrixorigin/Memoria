@@ -230,9 +230,7 @@ class GraphStore(DbConsumer):
             filtered.append(node)
         return filtered
 
-    def filter_retrievable_node_ids(
-        self, user_id: str, node_ids: set[str]
-    ) -> set[str]:
+    def filter_retrievable_node_ids(self, user_id: str, node_ids: set[str]) -> set[str]:
         if not node_ids:
             return set()
         nodes = self.get_nodes_by_ids(list(node_ids))

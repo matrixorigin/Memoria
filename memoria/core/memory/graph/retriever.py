@@ -145,8 +145,13 @@ class ActivationRetriever:
                     user_id, {node.node_id for node, _score in bm25_results}
                 )
                 for node, _score in bm25_results:
-                    if node.node_id in retrievable_bm25_ids and node.node_id not in anchors:
-                        anchors[node.node_id] = 0.7  # BM25 anchors slightly below vector
+                    if (
+                        node.node_id in retrievable_bm25_ids
+                        and node.node_id not in anchors
+                    ):
+                        anchors[node.node_id] = (
+                            0.7  # BM25 anchors slightly below vector
+                        )
         except Exception:
             logger.debug(
                 "Fulltext search failed, using vector-only anchors", exc_info=True

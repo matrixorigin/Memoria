@@ -559,8 +559,12 @@ class TestEditorPurgeSyncsGraphNodes:
 
         uid = _uid()
         storage = CanonicalStorage(db_factory)
-        editor = MemoryEditor(storage, db_factory, index_manager=None, embed_client=None)
-        memory = storage.create_memory(_mem(uid, content="port is 6001", memory_type=MemoryType.SEMANTIC))
+        editor = MemoryEditor(
+            storage, db_factory, index_manager=None, embed_client=None
+        )
+        memory = storage.create_memory(
+            _mem(uid, content="port is 6001", memory_type=MemoryType.SEMANTIC)
+        )
 
         graph_store = GraphStore(db_factory)
         graph_store.create_node(
@@ -597,8 +601,12 @@ class TestEditorPurgeSyncsGraphNodes:
 
         uid = _uid()
         storage = CanonicalStorage(db_factory)
-        editor = MemoryEditor(storage, db_factory, index_manager=None, embed_client=None)
-        memory = storage.create_memory(_mem(uid, content="port is 6001", memory_type=MemoryType.SEMANTIC))
+        editor = MemoryEditor(
+            storage, db_factory, index_manager=None, embed_client=None
+        )
+        memory = storage.create_memory(
+            _mem(uid, content="port is 6001", memory_type=MemoryType.SEMANTIC)
+        )
 
         graph_store = GraphStore(db_factory)
         graph_store.create_node(
