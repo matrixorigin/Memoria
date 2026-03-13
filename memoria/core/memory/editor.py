@@ -109,7 +109,7 @@ class MemoryEditor:
             mem.observed_at = observed_at
             # Backdate the stored record so decay scoring uses the correct timestamp
             with self._db_factory() as db:
-                from memoria.core.memory.tabular.models import MemoryRecord as _MR
+                from memoria.core.memory.models.memory import MemoryRecord as _MR
 
                 db.query(_MR).filter(_MR.memory_id == mem.memory_id).update(
                     {"observed_at": observed_at}

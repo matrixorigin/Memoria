@@ -224,9 +224,12 @@ def admin_trigger_governance(
         }
 
     if op == "extract_entities":
+        from memoria.core.embedding import get_embedding_client
         from memoria.core.memory.strategy.activation_index import ActivationIndexManager
 
-        mgr = ActivationIndexManager(db_factory)
+        embed_client = get_embedding_client()
+        embed_fn = embed_client.embed if embed_client is not None else None
+        mgr = ActivationIndexManager(db_factory, embed_fn=embed_fn)
         result = mgr.backfill(user_id)
         return {
             "op": op,

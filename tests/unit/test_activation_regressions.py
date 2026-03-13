@@ -191,7 +191,7 @@ class TestEntityEdgeExclusion:
                 ExtractedEntity("etl", "ETL", "tech"),
             ]
         )
-        # Only tech entities get edges
+        # Only tech entities get edges (time/person excluded)
         assert len(edges) == 2
         targets = {e[1] for e in edges}
         assert "eid-redis" in targets

@@ -1,606 +1,611 @@
 {
-  "dataset_id": "memoria-graph-entity-v1",
-  "version": "v1.0",
-  "description": "Graph + Entity architecture benchmark. Tests multi-hop reasoning, entity disambiguation, and contextual retrieval where graph structure provides a measurable advantage over pure vector/fulltext. Each scenario is designed so that vector-only retrieval will fail on at least one assertion.",
-  "scenarios": [
-    {
-      "scenario_id": "GRAPH-001",
-      "title": "Two-hop entity bridge: person → module → vulnerability",
-      "description": "Query names only the person (Alice). Answer requires two hops: Alice → auth-service → CVE. Vector fails because 'Alice' and 'CVE-2024-33531' share zero semantic overlap; only the entity graph connects them.",
-      "domain": "engineering",
-      "difficulty": "L4",
-      "horizon": "medium",
-      "tags": [
-        "trust"
-      ],
-      "seed_memories": [
+    "dataset_id": "memoria-graph-entity-v1",
+    "version": "v1.0",
+    "description": "Graph + Entity architecture benchmark. Tests multi-hop reasoning, entity disambiguation, and contextual retrieval where graph structure provides a measurable advantage over pure vector/fulltext. Each scenario is designed so that vector-only retrieval will fail on at least one assertion.",
+    "scenarios": [
         {
-          "content": "Alice 负责 auth-service 模块的开发和维护。",
-          "memory_type": "semantic"
+            "scenario_id": "GRAPH-001",
+            "title": "Two-hop entity bridge: person → module → vulnerability",
+            "description": "Query names only the person (Alice). Answer requires two hops: Alice → auth-service → CVE. Vector fails because 'Alice' and 'CVE-2024-33531' share zero semantic overlap; only the entity graph connects them.",
+            "domain": "engineering",
+            "difficulty": "L4",
+            "horizon": "medium",
+            "tags": [
+                "trust"
+            ],
+            "seed_memories": [
+                {
+                    "content": "Alice 负责 auth-service 模块的开发和维护。",
+                    "memory_type": "semantic"
+                },
+                {
+                    "content": "auth-service 使用了 jsonwebtoken 库 v8.5.1 来处理用户认证。",
+                    "memory_type": "semantic"
+                },
+                {
+                    "content": "jsonwebtoken v8.5.1 存在 CVE-2024-33531 漏洞，可能导致 token 伪造。",
+                    "memory_type": "semantic"
+                },
+                {
+                    "content": "Bob 负责 payment-service 模块，使用 Stripe SDK。",
+                    "memory_type": "semantic",
+                    "is_noise": true
+                },
+                {
+                    "content": "公司安全策略要求所有依赖每季度审计一次。",
+                    "memory_type": "semantic",
+                    "is_noise": true
+                }
+            ],
+            "steps": [],
+            "assertions": [
+                {
+                    "query": "Alice 负责的东西有没有已知问题？",
+                    "top_k": 3,
+                    "expected_contents": [
+                        "CVE-2024-33531",
+                        "token 伪造",
+                        "jsonwebtoken"
+                    ],
+                    "excluded_contents": [
+                        "payment-service",
+                        "Stripe",
+                        "季度审计"
+                    ],
+                    "follow_ups": [
+                        {
+                            "name": "entity_expand",
+                            "description": "Agent sees auth-service in results, queries it next",
+                            "max_rounds": 2,
+                            "mode": "entity_expand"
+                        },
+                        {
+                            "name": "explicit_chain",
+                            "description": "Agent explicitly follows the person->module->vuln chain",
+                            "max_rounds": 2,
+                            "mode": "entity_expand",
+                            "follow_up_queries": [
+                                "auth-service 依赖库",
+                                "jsonwebtoken 漏洞"
+                            ]
+                        }
+                    ]
+                }
+            ],
+            "maturation": [
+                "extract_entities",
+                "consolidate"
+            ]
         },
         {
-          "content": "auth-service 使用了 jsonwebtoken 库 v8.5.1 来处理用户认证。",
-          "memory_type": "semantic"
+            "scenario_id": "GRAPH-002",
+            "title": "Same-name entity disambiguation via typed edges",
+            "description": "Two people named '张伟' in different teams. Graph entity_type=person with team edges disambiguates. Vector returns both because names are identical.",
+            "domain": "team",
+            "difficulty": "L4",
+            "horizon": "medium",
+            "tags": [
+                "trust"
+            ],
+            "seed_memories": [
+                {
+                    "content": "前端组的张伟提出了一个 React 性能优化方案，使用 memo 和 useMemo 减少重渲染。",
+                    "memory_type": "semantic"
+                },
+                {
+                    "content": "后端组的张伟设计了数据库分片策略，按用户 ID 哈希分到 8 个分片。",
+                    "memory_type": "semantic"
+                },
+                {
+                    "content": "前端组的张伟上周做了 Lighthouse 性能评测，首屏加载从 3.2s 降到 1.8s。",
+                    "memory_type": "semantic"
+                },
+                {
+                    "content": "后端组的张伟在排查 MySQL 慢查询，发现缺少联合索引。",
+                    "memory_type": "semantic"
+                },
+                {
+                    "content": "前端组本周的 sprint 目标是完成用户中心页面重构。",
+                    "memory_type": "semantic",
+                    "is_noise": true
+                }
+            ],
+            "steps": [],
+            "assertions": [
+                {
+                    "query": "前端的张伟最近在做什么？",
+                    "top_k": 3,
+                    "expected_contents": [
+                        "React",
+                        "memo",
+                        "Lighthouse",
+                        "首屏加载"
+                    ],
+                    "excluded_contents": [
+                        "数据库分片",
+                        "MySQL 慢查询",
+                        "联合索引"
+                    ]
+                }
+            ],
+            "maturation": [
+                "extract_entities",
+                "consolidate"
+            ]
         },
         {
-          "content": "jsonwebtoken v8.5.1 存在 CVE-2024-33531 漏洞，可能导致 token 伪造。",
-          "memory_type": "semantic"
+            "scenario_id": "GRAPH-003",
+            "title": "Three-hop causal chain: config → service → symptom → fix",
+            "description": "User asks about fix for timeout. The causal chain is: DNS config → service discovery failure → connection timeout → increase timeout + fix DNS. Vector matches 'timeout' directly but misses the root cause (DNS).",
+            "domain": "engineering",
+            "difficulty": "L5",
+            "horizon": "long",
+            "tags": [
+                "trust",
+                "interruption"
+            ],
+            "seed_memories": [
+                {
+                    "content": "运维修改了内网 DNS 配置，将 resolver 从 10.0.0.1 切换到 10.0.0.2。",
+                    "memory_type": "semantic"
+                },
+                {
+                    "content": "DNS 切换后，service-mesh 的服务发现开始间歇性失败，Consul 健康检查超时。",
+                    "memory_type": "semantic"
+                },
+                {
+                    "content": "服务发现失败导致 gateway 到 user-service 的连接超时，P99 延迟从 200ms 飙升到 5s。",
+                    "memory_type": "semantic"
+                },
+                {
+                    "content": "临时修复：将 gateway 的连接超时从 3s 调到 10s，同时回滚 DNS 到 10.0.0.1。",
+                    "memory_type": "semantic"
+                },
+                {
+                    "content": "上周五部署了新版本的监控 dashboard，Grafana 升级到 v10。",
+                    "memory_type": "semantic",
+                    "is_noise": true
+                },
+                {
+                    "content": "团队决定下周迁移到 Kubernetes 的 CoreDNS。",
+                    "memory_type": "semantic",
+                    "is_noise": true
+                }
+            ],
+            "steps": [],
+            "assertions": [
+                {
+                    "query": "上次超时问题的根本原因是什么？",
+                    "top_k": 4,
+                    "expected_contents": [
+                        "DNS",
+                        "10.0.0.2",
+                        "服务发现",
+                        "回滚"
+                    ],
+                    "excluded_contents": [
+                        "Grafana",
+                        "CoreDNS"
+                    ]
+                }
+            ],
+            "maturation": [
+                "extract_entities",
+                "consolidate"
+            ]
         },
         {
-          "content": "Bob 负责 payment-service 模块，使用 Stripe SDK。",
-          "memory_type": "semantic",
-          "is_noise": true
+            "scenario_id": "GRAPH-004",
+            "title": "Opinion evolution: decision reversal with evidence chain",
+            "description": "Initial positive evaluation of RSC is contradicted by later evidence. Graph opinion edges track confidence decay. Vector returns all mentions equally without temporal weighting.",
+            "domain": "engineering",
+            "difficulty": "L5",
+            "horizon": "long",
+            "tags": [
+                "conflict",
+                "trust",
+                "drift"
+            ],
+            "seed_memories": [
+                {
+                    "content": "3月1日评估：React Server Components 性能测试结果很好，首屏渲染快了 40%，决定在新项目中采用。",
+                    "memory_type": "semantic",
+                    "age_days": 30.0
+                },
+                {
+                    "content": "3月8日发现：RSC 在嵌套动态路由场景下有严重的 hydration mismatch bug，导致页面白屏。",
+                    "memory_type": "semantic",
+                    "age_days": 3.0
+                },
+                {
+                    "content": "3月10日团队会议决定：暂停使用 RSC，回退到传统 CSR 模式，等 React 19.1 修复后再评估。",
+                    "memory_type": "semantic",
+                    "age_days": 1.0
+                },
+                {
+                    "content": "3月12日：已将所有页面从 RSC 迁移回 CSR，线上稳定运行。",
+                    "memory_type": "semantic",
+                    "age_days": 0.2
+                },
+                {
+                    "content": "React 官方文档更新了 Server Components 的最佳实践指南。",
+                    "memory_type": "semantic",
+                    "is_noise": true,
+                    "age_days": 15.0
+                }
+            ],
+            "steps": [],
+            "assertions": [
+                {
+                    "query": "我们现在应该用 React Server Components 吗？",
+                    "top_k": 3,
+                    "expected_contents": [
+                        "暂停使用",
+                        "hydration mismatch",
+                        "回退到传统 CSR"
+                    ],
+                    "excluded_contents": [
+                        "性能测试结果很好",
+                        "首屏渲染快了 40%",
+                        "决定在新项目中采用"
+                    ]
+                }
+            ],
+            "maturation": [
+                "extract_entities",
+                "consolidate"
+            ]
         },
         {
-          "content": "公司安全策略要求所有依赖每季度审计一次。",
-          "memory_type": "semantic",
-          "is_noise": true
+            "scenario_id": "GRAPH-005",
+            "title": "Cross-domain entity aggregation via shared tech entity",
+            "description": "Redis appears in unrelated contexts (caching, session, rate-limiting). Query asks about 'the in-memory store' without naming Redis. Entity node 'Redis' aggregates all mentions; vector fails because 'in-memory store' doesn't match 'Redis' directly.",
+            "domain": "engineering",
+            "difficulty": "L3",
+            "horizon": "long",
+            "tags": [
+                "trust"
+            ],
+            "seed_memories": [
+                {
+                    "content": "搜索服务用 Redis 做查询结果缓存，TTL 设为 5 分钟，命中率 85%。",
+                    "memory_type": "semantic"
+                },
+                {
+                    "content": "用户认证模块用 Redis 存储 session，单节点支撑 10 万并发。",
+                    "memory_type": "semantic"
+                },
+                {
+                    "content": "API 网关用 Redis 实现滑动窗口限流，每秒 1000 次请求上限。",
+                    "memory_type": "semantic"
+                },
+                {
+                    "content": "Redis 集群上周扩容到 6 节点，内存从 32GB 升到 64GB。",
+                    "memory_type": "semantic"
+                },
+                {
+                    "content": "MongoDB 用于存储用户行为日志，每天写入 500 万条。",
+                    "memory_type": "semantic",
+                    "is_noise": true
+                },
+                {
+                    "content": "Elasticsearch 负责全文搜索，索引大小 200GB。",
+                    "memory_type": "semantic",
+                    "is_noise": true
+                }
+            ],
+            "steps": [],
+            "assertions": [
+                {
+                    "query": "我们的内存存储组件都承担了哪些职责？容量情况怎么样？",
+                    "top_k": 4,
+                    "expected_contents": [
+                        "查询结果缓存",
+                        "session",
+                        "滑动窗口限流",
+                        "6 节点"
+                    ],
+                    "excluded_contents": [
+                        "MongoDB",
+                        "Elasticsearch",
+                        "行为日志"
+                    ]
+                }
+            ],
+            "maturation": [
+                "extract_entities",
+                "consolidate"
+            ]
+        },
+        {
+            "scenario_id": "GRAPH-006",
+            "title": "Indirect expertise routing via project ownership chain",
+            "description": "Query describes only the symptom (batch job crashing at night) without naming Spark or ETL. Answer requires: symptom → Spark → ETL pipeline → @李明. Vector fails because '凌晨崩溃' has no overlap with '李明' or '数据平台'.",
+            "domain": "team",
+            "difficulty": "L4",
+            "horizon": "medium",
+            "tags": [
+                "trust"
+            ],
+            "seed_memories": [
+                {
+                    "content": "@李明 是数据平台组的 tech lead，负责 ETL pipeline 和数据质量。",
+                    "memory_type": "semantic"
+                },
+                {
+                    "content": "ETL pipeline 使用 Apache Spark 处理，每天凌晨 2 点跑批。",
+                    "memory_type": "semantic"
+                },
+                {
+                    "content": "Spark 任务最近频繁报 OutOfMemoryError，executor 内存不够。",
+                    "memory_type": "semantic"
+                },
+                {
+                    "content": "@王芳 负责前端团队，精通 React 和 TypeScript。",
+                    "memory_type": "semantic",
+                    "is_noise": true
+                },
+                {
+                    "content": "@赵强 是 SRE 组长，负责基础设施和监控。",
+                    "memory_type": "semantic",
+                    "is_noise": true
+                }
+            ],
+            "steps": [],
+            "assertions": [
+                {
+                    "query": "凌晨的批处理任务一直崩溃，内存不够，应该找谁？",
+                    "top_k": 3,
+                    "expected_contents": [
+                        "李明",
+                        "数据平台",
+                        "ETL"
+                    ],
+                    "excluded_contents": [
+                        "王芳",
+                        "赵强",
+                        "前端",
+                        "SRE"
+                    ],
+                    "follow_ups": [
+                        {
+                            "name": "entity_expand",
+                            "description": "Agent sees Spark/ETL in results, queries who owns it",
+                            "max_rounds": 1,
+                            "mode": "entity_expand",
+                            "follow_up_queries": [
+                                "ETL pipeline 负责人"
+                            ]
+                        }
+                    ]
+                }
+            ],
+            "maturation": [
+                "extract_entities",
+                "consolidate"
+            ]
+        },
+        {
+            "scenario_id": "GRAPH-007",
+            "title": "Temporal episode chain without explicit ordering markers",
+            "description": "A sequence of related events without 'Step N' markers. Query describes only the end state ('用户体验问题修好了') without naming OAuth or token. Graph temporal edges link the episode chain; vector fails because the query has no lexical overlap with the intermediate steps.",
+            "domain": "engineering",
+            "difficulty": "L4",
+            "horizon": "long",
+            "tags": [
+                "interruption"
+            ],
+            "seed_memories": [
+                {
+                    "content": "用户反馈登录页面加载很慢，有时候要等 8 秒。",
+                    "memory_type": "working"
+                },
+                {
+                    "content": "排查发现是 OAuth 回调接口响应慢，平均 3 秒。",
+                    "memory_type": "working"
+                },
+                {
+                    "content": "定位到 OAuth provider 的 token 验证接口有 2 秒延迟。",
+                    "memory_type": "working"
+                },
+                {
+                    "content": "加了 token 缓存后，OAuth 回调降到 200ms，登录页面恢复正常。",
+                    "memory_type": "working"
+                },
+                {
+                    "content": "顺便发现注册页面的验证码服务也偶尔超时，但不影响登录。",
+                    "memory_type": "working",
+                    "is_noise": true
+                }
+            ],
+            "steps": [],
+            "assertions": [
+                {
+                    "query": "上周那个影响用户体验的性能问题，排查过程和最终方案是什么？",
+                    "top_k": 5,
+                    "expected_contents": [
+                        "OAuth 回调",
+                        "token 验证",
+                        "2 秒延迟",
+                        "token 缓存",
+                        "200ms"
+                    ],
+                    "excluded_contents": [
+                        "验证码服务"
+                    ]
+                }
+            ],
+            "maturation": [
+                "extract_entities",
+                "consolidate"
+            ]
+        },
+        {
+            "scenario_id": "GRAPH-008",
+            "title": "Scene memory supersedes episodic details",
+            "description": "A pre-formed scene insight should be surfaced alongside supporting episodes. Query describes only the business symptom ('服务响应时间变长') without naming the database or connection pool. Graph abstraction edges link scene to episodes; vector fails because the query has no lexical overlap with 'max_connections' or 'CPU 核数'.",
+            "domain": "engineering",
+            "difficulty": "L4",
+            "horizon": "long",
+            "tags": [
+                "trust"
+            ],
+            "seed_memories": [
+                {
+                    "content": "周一：线上 API 响应变慢，P99 从 500ms 升到 2s。",
+                    "memory_type": "working"
+                },
+                {
+                    "content": "周二：发现是数据库连接池耗尽，max_connections 只有 20。",
+                    "memory_type": "working"
+                },
+                {
+                    "content": "周三：调大连接池到 100，同时加了连接复用，P99 恢复到 300ms。",
+                    "memory_type": "working"
+                },
+                {
+                    "content": "经验总结：数据库连接池是性能瓶颈的常见原因，建议默认设为 CPU 核数 × 4。",
+                    "memory_type": "semantic"
+                },
+                {
+                    "content": "周四：团队团建去了密室逃脱，很好玩。",
+                    "memory_type": "working",
+                    "is_noise": true
+                }
+            ],
+            "steps": [],
+            "assertions": [
+                {
+                    "query": "上次服务响应时间变长是怎么定位和解决的？沉淀了什么经验？",
+                    "top_k": 4,
+                    "expected_contents": [
+                        "连接池",
+                        "max_connections",
+                        "CPU 核数",
+                        "300ms"
+                    ],
+                    "excluded_contents": [
+                        "密室逃脱",
+                        "团建"
+                    ]
+                }
+            ],
+            "maturation": [
+                "extract_entities",
+                "consolidate"
+            ]
+        },
+        {
+            "scenario_id": "GRAPH-009",
+            "title": "Ambiguous tech term disambiguation: 'Go' as language vs verb",
+            "description": "Query about 'Go' in tech context. Entity type=tech disambiguates from English verb usage. Vector struggles because 'Go' appears in both contexts with similar surrounding words.",
+            "domain": "engineering",
+            "difficulty": "L3",
+            "horizon": "short",
+            "tags": [
+                "trust"
+            ],
+            "seed_memories": [
+                {
+                    "content": "后端微服务用 Go 编写，使用 gin 框架，性能比 Python 版本快 5 倍。",
+                    "memory_type": "semantic"
+                },
+                {
+                    "content": "Go 的 goroutine 调度器在高并发场景下表现优异，GMP 模型很高效。",
+                    "memory_type": "semantic"
+                },
+                {
+                    "content": "We need to go through the code review process before merging any PR.",
+                    "memory_type": "semantic",
+                    "is_noise": true
+                },
+                {
+                    "content": "Let's go ahead and schedule the deployment for next Tuesday.",
+                    "memory_type": "semantic",
+                    "is_noise": true
+                },
+                {
+                    "content": "Go 1.22 引入了 range over func，简化了迭代器模式。",
+                    "memory_type": "semantic"
+                }
+            ],
+            "steps": [],
+            "assertions": [
+                {
+                    "query": "Go 语言有什么特点？我们怎么用的？",
+                    "top_k": 3,
+                    "expected_contents": [
+                        "gin 框架",
+                        "goroutine",
+                        "range over func"
+                    ],
+                    "excluded_contents": [
+                        "code review",
+                        "schedule the deployment"
+                    ]
+                }
+            ],
+            "maturation": [
+                "extract_entities",
+                "consolidate"
+            ]
+        },
+        {
+            "scenario_id": "GRAPH-010",
+            "title": "Implicit relationship: technology choice → deployment constraint",
+            "description": "User asks about deployment requirements. The answer requires linking: chosen framework (Next.js) → its runtime requirement (Node.js 18+) → deployment constraint (Docker base image). No single memory states the full chain.",
+            "domain": "engineering",
+            "difficulty": "L5",
+            "horizon": "medium",
+            "tags": [
+                "trust",
+                "interruption"
+            ],
+            "seed_memories": [
+                {
+                    "content": "新项目前端选用 Next.js 14，使用 App Router 架构。",
+                    "memory_type": "semantic"
+                },
+                {
+                    "content": "Next.js 14 要求 Node.js 18.17 以上版本，低版本会构建失败。",
+                    "memory_type": "semantic"
+                },
+                {
+                    "content": "生产环境 Docker 镜像统一使用 node:18-alpine 作为基础镜像。",
+                    "memory_type": "semantic"
+                },
+                {
+                    "content": "CI/CD 流水线在 GitHub Actions 上运行，用 ubuntu-latest runner。",
+                    "memory_type": "semantic",
+                    "is_noise": true
+                },
+                {
+                    "content": "后端 API 部署在 AWS ECS 上，使用 Fargate 模式。",
+                    "memory_type": "semantic",
+                    "is_noise": true
+                }
+            ],
+            "steps": [],
+            "assertions": [
+                {
+                    "query": "新项目的前端部署需要注意什么？",
+                    "top_k": 3,
+                    "expected_contents": [
+                        "Next.js 14",
+                        "Node.js 18",
+                        "node:18-alpine"
+                    ],
+                    "excluded_contents": [
+                        "GitHub Actions",
+                        "AWS ECS",
+                        "Fargate"
+                    ]
+                }
+            ],
+            "maturation": [
+                "extract_entities",
+                "consolidate"
+            ]
         }
-      ],
-      "steps": [],
-      "assertions": [
-        {
-          "query": "Alice 负责的东西有没有已知问题？",
-          "top_k": 3,
-          "expected_contents": [
-            "CVE-2024-33531",
-            "token 伪造",
-            "jsonwebtoken"
-          ],
-          "excluded_contents": [
-            "payment-service",
-            "Stripe",
-            "季度审计"
-          ],
-          "follow_ups": [
-            {
-              "name": "entity_expand",
-              "description": "Agent sees auth-service in results, queries it next",
-              "max_rounds": 2,
-              "mode": "entity_expand"
-            },
-            {
-              "name": "explicit_chain",
-              "description": "Agent explicitly follows the person->module->vuln chain",
-              "max_rounds": 2,
-              "mode": "entity_expand",
-              "follow_up_queries": [
-                "auth-service 依赖库",
-                "jsonwebtoken 漏洞"
-              ]
-            }
-          ]
-        }
-      ],
-      "maturation": [
-        "extract_entities",
-        "consolidate"
-      ]
-    },
-    {
-      "scenario_id": "GRAPH-002",
-      "title": "Same-name entity disambiguation via typed edges",
-      "description": "Two people named '张伟' in different teams. Graph entity_type=person with team edges disambiguates. Vector returns both because names are identical.",
-      "domain": "team",
-      "difficulty": "L4",
-      "horizon": "medium",
-      "tags": [
-        "trust"
-      ],
-      "seed_memories": [
-        {
-          "content": "前端组的张伟提出了一个 React 性能优化方案，使用 memo 和 useMemo 减少重渲染。",
-          "memory_type": "semantic"
-        },
-        {
-          "content": "后端组的张伟设计了数据库分片策略，按用户 ID 哈希分到 8 个分片。",
-          "memory_type": "semantic"
-        },
-        {
-          "content": "前端组的张伟上周做了 Lighthouse 性能评测，首屏加载从 3.2s 降到 1.8s。",
-          "memory_type": "semantic"
-        },
-        {
-          "content": "后端组的张伟在排查 MySQL 慢查询，发现缺少联合索引。",
-          "memory_type": "semantic"
-        },
-        {
-          "content": "前端组本周的 sprint 目标是完成用户中心页面重构。",
-          "memory_type": "semantic",
-          "is_noise": true
-        }
-      ],
-      "steps": [],
-      "assertions": [
-        {
-          "query": "前端的张伟最近在做什么？",
-          "top_k": 3,
-          "expected_contents": [
-            "React",
-            "memo",
-            "Lighthouse",
-            "首屏加载"
-          ],
-          "excluded_contents": [
-            "数据库分片",
-            "MySQL 慢查询",
-            "联合索引"
-          ]
-        }
-      ],
-      "maturation": [
-        "extract_entities",
-        "consolidate"
-      ]
-    },
-    {
-      "scenario_id": "GRAPH-003",
-      "title": "Three-hop causal chain: config → service → symptom → fix",
-      "description": "User asks about fix for timeout. The causal chain is: DNS config → service discovery failure → connection timeout → increase timeout + fix DNS. Vector matches 'timeout' directly but misses the root cause (DNS).",
-      "domain": "engineering",
-      "difficulty": "L5",
-      "horizon": "long",
-      "tags": [
-        "trust",
-        "interruption"
-      ],
-      "seed_memories": [
-        {
-          "content": "运维修改了内网 DNS 配置，将 resolver 从 10.0.0.1 切换到 10.0.0.2。",
-          "memory_type": "semantic"
-        },
-        {
-          "content": "DNS 切换后，service-mesh 的服务发现开始间歇性失败，Consul 健康检查超时。",
-          "memory_type": "semantic"
-        },
-        {
-          "content": "服务发现失败导致 gateway 到 user-service 的连接超时，P99 延迟从 200ms 飙升到 5s。",
-          "memory_type": "semantic"
-        },
-        {
-          "content": "临时修复：将 gateway 的连接超时从 3s 调到 10s，同时回滚 DNS 到 10.0.0.1。",
-          "memory_type": "semantic"
-        },
-        {
-          "content": "上周五部署了新版本的监控 dashboard，Grafana 升级到 v10。",
-          "memory_type": "semantic",
-          "is_noise": true
-        },
-        {
-          "content": "团队决定下周迁移到 Kubernetes 的 CoreDNS。",
-          "memory_type": "semantic",
-          "is_noise": true
-        }
-      ],
-      "steps": [],
-      "assertions": [
-        {
-          "query": "上次超时问题的根本原因是什么？",
-          "top_k": 4,
-          "expected_contents": [
-            "DNS",
-            "10.0.0.2",
-            "服务发现",
-            "回滚"
-          ],
-          "excluded_contents": [
-            "Grafana",
-            "CoreDNS"
-          ]
-        }
-      ],
-      "maturation": [
-        "extract_entities",
-        "consolidate"
-      ]
-    },
-    {
-      "scenario_id": "GRAPH-004",
-      "title": "Opinion evolution: decision reversal with evidence chain",
-      "description": "Initial positive evaluation of RSC is contradicted by later evidence. Graph opinion edges track confidence decay. Vector returns all mentions equally without temporal weighting.",
-      "domain": "engineering",
-      "difficulty": "L5",
-      "horizon": "long",
-      "tags": [
-        "conflict",
-        "trust",
-        "drift"
-      ],
-      "seed_memories": [
-        {
-          "content": "3月1日评估：React Server Components 性能测试结果很好，首屏渲染快了 40%，决定在新项目中采用。",
-          "memory_type": "semantic"
-        },
-        {
-          "content": "3月8日发现：RSC 在嵌套动态路由场景下有严重的 hydration mismatch bug，导致页面白屏。",
-          "memory_type": "semantic"
-        },
-        {
-          "content": "3月10日团队会议决定：暂停使用 RSC，回退到传统 CSR 模式，等 React 19.1 修复后再评估。",
-          "memory_type": "semantic"
-        },
-        {
-          "content": "3月12日：已将所有页面从 RSC 迁移回 CSR，线上稳定运行。",
-          "memory_type": "semantic"
-        },
-        {
-          "content": "React 官方文档更新了 Server Components 的最佳实践指南。",
-          "memory_type": "semantic",
-          "is_noise": true
-        }
-      ],
-      "steps": [],
-      "assertions": [
-        {
-          "query": "我们现在应该用 React Server Components 吗？",
-          "top_k": 3,
-          "expected_contents": [
-            "暂停使用",
-            "hydration mismatch",
-            "回退到传统 CSR"
-          ],
-          "excluded_contents": [
-            "性能测试结果很好",
-            "首屏渲染快了 40%",
-            "决定在新项目中采用"
-          ]
-        }
-      ],
-      "maturation": [
-        "extract_entities",
-        "consolidate"
-      ]
-    },
-    {
-      "scenario_id": "GRAPH-005",
-      "title": "Cross-domain entity aggregation via shared tech entity",
-      "description": "Redis appears in unrelated contexts (caching, session, rate-limiting). Query asks about 'the in-memory store' without naming Redis. Entity node 'Redis' aggregates all mentions; vector fails because 'in-memory store' doesn't match 'Redis' directly.",
-      "domain": "engineering",
-      "difficulty": "L3",
-      "horizon": "long",
-      "tags": [
-        "trust"
-      ],
-      "seed_memories": [
-        {
-          "content": "搜索服务用 Redis 做查询结果缓存，TTL 设为 5 分钟，命中率 85%。",
-          "memory_type": "semantic"
-        },
-        {
-          "content": "用户认证模块用 Redis 存储 session，单节点支撑 10 万并发。",
-          "memory_type": "semantic"
-        },
-        {
-          "content": "API 网关用 Redis 实现滑动窗口限流，每秒 1000 次请求上限。",
-          "memory_type": "semantic"
-        },
-        {
-          "content": "Redis 集群上周扩容到 6 节点，内存从 32GB 升到 64GB。",
-          "memory_type": "semantic"
-        },
-        {
-          "content": "MongoDB 用于存储用户行为日志，每天写入 500 万条。",
-          "memory_type": "semantic",
-          "is_noise": true
-        },
-        {
-          "content": "Elasticsearch 负责全文搜索，索引大小 200GB。",
-          "memory_type": "semantic",
-          "is_noise": true
-        }
-      ],
-      "steps": [],
-      "assertions": [
-        {
-          "query": "我们的内存存储组件都承担了哪些职责？容量情况怎么样？",
-          "top_k": 4,
-          "expected_contents": [
-            "查询结果缓存",
-            "session",
-            "滑动窗口限流",
-            "6 节点"
-          ],
-          "excluded_contents": [
-            "MongoDB",
-            "Elasticsearch",
-            "行为日志"
-          ]
-        }
-      ],
-      "maturation": [
-        "extract_entities",
-        "consolidate"
-      ]
-    },
-    {
-      "scenario_id": "GRAPH-006",
-      "title": "Indirect expertise routing via project ownership chain",
-      "description": "Query describes only the symptom (batch job crashing at night) without naming Spark or ETL. Answer requires: symptom → Spark → ETL pipeline → @李明. Vector fails because '凌晨崩溃' has no overlap with '李明' or '数据平台'.",
-      "domain": "team",
-      "difficulty": "L4",
-      "horizon": "medium",
-      "tags": [
-        "trust"
-      ],
-      "seed_memories": [
-        {
-          "content": "@李明 是数据平台组的 tech lead，负责 ETL pipeline 和数据质量。",
-          "memory_type": "semantic"
-        },
-        {
-          "content": "ETL pipeline 使用 Apache Spark 处理，每天凌晨 2 点跑批。",
-          "memory_type": "semantic"
-        },
-        {
-          "content": "Spark 任务最近频繁报 OutOfMemoryError，executor 内存不够。",
-          "memory_type": "semantic"
-        },
-        {
-          "content": "@王芳 负责前端团队，精通 React 和 TypeScript。",
-          "memory_type": "semantic",
-          "is_noise": true
-        },
-        {
-          "content": "@赵强 是 SRE 组长，负责基础设施和监控。",
-          "memory_type": "semantic",
-          "is_noise": true
-        }
-      ],
-      "steps": [],
-      "assertions": [
-        {
-          "query": "凌晨的批处理任务一直崩溃，内存不够，应该找谁？",
-          "top_k": 3,
-          "expected_contents": [
-            "李明",
-            "数据平台",
-            "ETL"
-          ],
-          "excluded_contents": [
-            "王芳",
-            "赵强",
-            "前端",
-            "SRE"
-          ],
-          "follow_ups": [
-            {
-              "name": "entity_expand",
-              "description": "Agent sees Spark/ETL in results, queries who owns it",
-              "max_rounds": 1,
-              "mode": "entity_expand",
-              "follow_up_queries": [
-                "ETL pipeline 负责人"
-              ]
-            }
-          ]
-        }
-      ],
-      "maturation": [
-        "extract_entities",
-        "consolidate"
-      ]
-    },
-    {
-      "scenario_id": "GRAPH-007",
-      "title": "Temporal episode chain without explicit ordering markers",
-      "description": "A sequence of related events without 'Step N' markers. Query describes only the end state ('用户体验问题修好了') without naming OAuth or token. Graph temporal edges link the episode chain; vector fails because the query has no lexical overlap with the intermediate steps.",
-      "domain": "engineering",
-      "difficulty": "L4",
-      "horizon": "long",
-      "tags": [
-        "interruption"
-      ],
-      "seed_memories": [
-        {
-          "content": "用户反馈登录页面加载很慢，有时候要等 8 秒。",
-          "memory_type": "working"
-        },
-        {
-          "content": "排查发现是 OAuth 回调接口响应慢，平均 3 秒。",
-          "memory_type": "working"
-        },
-        {
-          "content": "定位到 OAuth provider 的 token 验证接口有 2 秒延迟。",
-          "memory_type": "working"
-        },
-        {
-          "content": "加了 token 缓存后，OAuth 回调降到 200ms，登录页面恢复正常。",
-          "memory_type": "working"
-        },
-        {
-          "content": "顺便发现注册页面的验证码服务也偶尔超时，但不影响登录。",
-          "memory_type": "working",
-          "is_noise": true
-        }
-      ],
-      "steps": [],
-      "assertions": [
-        {
-          "query": "上周那个影响用户体验的性能问题，排查过程和最终方案是什么？",
-          "top_k": 4,
-          "expected_contents": [
-            "OAuth 回调",
-            "token 验证",
-            "2 秒延迟",
-            "token 缓存",
-            "200ms"
-          ],
-          "excluded_contents": [
-            "验证码服务"
-          ]
-        }
-      ],
-      "maturation": [
-        "extract_entities",
-        "consolidate"
-      ]
-    },
-    {
-      "scenario_id": "GRAPH-008",
-      "title": "Scene memory supersedes episodic details",
-      "description": "A pre-formed scene insight should be surfaced alongside supporting episodes. Query describes only the business symptom ('服务响应时间变长') without naming the database or connection pool. Graph abstraction edges link scene to episodes; vector fails because the query has no lexical overlap with 'max_connections' or 'CPU 核数'.",
-      "domain": "engineering",
-      "difficulty": "L4",
-      "horizon": "long",
-      "tags": [
-        "trust"
-      ],
-      "seed_memories": [
-        {
-          "content": "周一：线上 API 响应变慢，P99 从 500ms 升到 2s。",
-          "memory_type": "working"
-        },
-        {
-          "content": "周二：发现是数据库连接池耗尽，max_connections 只有 20。",
-          "memory_type": "working"
-        },
-        {
-          "content": "周三：调大连接池到 100，同时加了连接复用，P99 恢复到 300ms。",
-          "memory_type": "working"
-        },
-        {
-          "content": "经验总结：数据库连接池是性能瓶颈的常见原因，建议默认设为 CPU 核数 × 4。",
-          "memory_type": "semantic"
-        },
-        {
-          "content": "周四：团队团建去了密室逃脱，很好玩。",
-          "memory_type": "working",
-          "is_noise": true
-        }
-      ],
-      "steps": [],
-      "assertions": [
-        {
-          "query": "上次服务响应时间变长是怎么定位和解决的？沉淀了什么经验？",
-          "top_k": 4,
-          "expected_contents": [
-            "连接池",
-            "max_connections",
-            "CPU 核数",
-            "300ms"
-          ],
-          "excluded_contents": [
-            "密室逃脱",
-            "团建"
-          ]
-        }
-      ],
-      "maturation": [
-        "extract_entities",
-        "consolidate"
-      ]
-    },
-    {
-      "scenario_id": "GRAPH-009",
-      "title": "Ambiguous tech term disambiguation: 'Go' as language vs verb",
-      "description": "Query about 'Go' in tech context. Entity type=tech disambiguates from English verb usage. Vector struggles because 'Go' appears in both contexts with similar surrounding words.",
-      "domain": "engineering",
-      "difficulty": "L3",
-      "horizon": "short",
-      "tags": [
-        "trust"
-      ],
-      "seed_memories": [
-        {
-          "content": "后端微服务用 Go 编写，使用 gin 框架，性能比 Python 版本快 5 倍。",
-          "memory_type": "semantic"
-        },
-        {
-          "content": "Go 的 goroutine 调度器在高并发场景下表现优异，GMP 模型很高效。",
-          "memory_type": "semantic"
-        },
-        {
-          "content": "We need to go through the code review process before merging any PR.",
-          "memory_type": "semantic",
-          "is_noise": true
-        },
-        {
-          "content": "Let's go ahead and schedule the deployment for next Tuesday.",
-          "memory_type": "semantic",
-          "is_noise": true
-        },
-        {
-          "content": "Go 1.22 引入了 range over func，简化了迭代器模式。",
-          "memory_type": "semantic"
-        }
-      ],
-      "steps": [],
-      "assertions": [
-        {
-          "query": "Go 语言有什么特点？我们怎么用的？",
-          "top_k": 3,
-          "expected_contents": [
-            "gin 框架",
-            "goroutine",
-            "range over func"
-          ],
-          "excluded_contents": [
-            "code review",
-            "schedule the deployment"
-          ]
-        }
-      ],
-      "maturation": [
-        "extract_entities",
-        "consolidate"
-      ]
-    },
-    {
-      "scenario_id": "GRAPH-010",
-      "title": "Implicit relationship: technology choice → deployment constraint",
-      "description": "User asks about deployment requirements. The answer requires linking: chosen framework (Next.js) → its runtime requirement (Node.js 18+) → deployment constraint (Docker base image). No single memory states the full chain.",
-      "domain": "engineering",
-      "difficulty": "L5",
-      "horizon": "medium",
-      "tags": [
-        "trust",
-        "interruption"
-      ],
-      "seed_memories": [
-        {
-          "content": "新项目前端选用 Next.js 14，使用 App Router 架构。",
-          "memory_type": "semantic"
-        },
-        {
-          "content": "Next.js 14 要求 Node.js 18.17 以上版本，低版本会构建失败。",
-          "memory_type": "semantic"
-        },
-        {
-          "content": "生产环境 Docker 镜像统一使用 node:18-alpine 作为基础镜像。",
-          "memory_type": "semantic"
-        },
-        {
-          "content": "CI/CD 流水线在 GitHub Actions 上运行，用 ubuntu-latest runner。",
-          "memory_type": "semantic",
-          "is_noise": true
-        },
-        {
-          "content": "后端 API 部署在 AWS ECS 上，使用 Fargate 模式。",
-          "memory_type": "semantic",
-          "is_noise": true
-        }
-      ],
-      "steps": [],
-      "assertions": [
-        {
-          "query": "新项目的前端部署需要注意什么？",
-          "top_k": 3,
-          "expected_contents": [
-            "Next.js 14",
-            "Node.js 18",
-            "node:18-alpine"
-          ],
-          "excluded_contents": [
-            "GitHub Actions",
-            "AWS ECS",
-            "Fargate"
-          ]
-        }
-      ],
-      "maturation": [
-        "extract_entities",
-        "consolidate"
-      ]
-    }
-  ]
+    ]
 }

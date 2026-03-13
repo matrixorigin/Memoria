@@ -147,15 +147,18 @@ class ActivationRetrievalStrategy:
             explain=explain,
         )
 
-        # Merge: graph results first, then vector results (deduped)
-        seen = {m.memory_id for m in graph_memories}
-        merged = list(graph_memories)
-        for m in vec_memories:
+        # Merge: deduplicate, then sort by retrieval_score descending.
+        # Graph results have activation-based scores; vector results have
+        # vector/keyword scores. Sorting by score lets the best results win
+        # regardless of which path produced them.
+        seen: set[str] = set()
+        pool: list[Memory] = []
+        for m in graph_memories + vec_memories:
             if m.memory_id not in seen:
                 seen.add(m.memory_id)
-                merged.append(m)
-                if len(merged) >= top_k:
-                    break
+                pool.append(m)
+        pool.sort(key=lambda m: m.retrieval_score or 0.0, reverse=True)
+        merged = pool[:top_k]
 
         path = "graph+vector" if graph_memories else "vector_fallback"
         logger.info(

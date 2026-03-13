@@ -261,6 +261,9 @@ class GraphBuilder:
                 else str(mem.trust_tier),
                 importance=_compute_ingest_importance(node_type, memory=mem),
                 source_nodes=mem.source_event_ids if is_scene else [],
+                # Inherit observed_at from memory so temporal decay works correctly
+                # for backdated memories (e.g. benchmark age_days seeds).
+                created_at=str(mem.observed_at) if mem.observed_at else None,
             )
             new_nodes.append(node)
             nodes.append(node)

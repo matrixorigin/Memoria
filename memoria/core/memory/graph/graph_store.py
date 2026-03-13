@@ -77,7 +77,7 @@ def _row_tuple_to_domain(row) -> GraphNodeData:
 
 def _to_row(node: GraphNodeData) -> dict:
     """Convert domain object to column dict for INSERT."""
-    return {
+    row: dict = {
         "node_id": node.node_id,
         "user_id": node.user_id,
         "node_type": node.node_type.value
@@ -100,6 +100,10 @@ def _to_row(node: GraphNodeData) -> dict:
         "is_active": 1 if node.is_active else 0,
         "superseded_by": node.superseded_by,
     }
+    # Allow backdating graph nodes to match memory observed_at (e.g. for age_days seeds)
+    if node.created_at is not None:
+        row["created_at"] = node.created_at
+    return row
 
 
 class GraphStore(DbConsumer):

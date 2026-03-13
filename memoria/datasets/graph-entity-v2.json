@@ -1,261 +1,533 @@
 {
-  "dataset_id": "memoria-graph-entity-v2",
-  "version": "v1.0",
-  "description": "Extended graph benchmark. Tests 4-hop chains, entity alias resolution, negative relationships, multi-entity convergence, entity state evolution, and cross-session entity linking. All scenarios require graph traversal to pass — vector-only retrieval will fail.",
-  "scenarios": [
-    {
-      "scenario_id": "GRAPH2-001",
-      "title": "Four-hop chain: person → team → project → dependency → vulnerability",
-      "description": "Query names only the person. Answer requires 4 hops: Bob → backend team → payment-service → stripe-sdk → CVE. Vector cannot bridge 'Bob' to 'CVE' with no semantic overlap.",
-      "domain": "engineering",
-      "difficulty": "L5",
-      "horizon": "long",
-      "tags": ["trust"],
-      "seed_memories": [
-        {"content": "Bob 是后端团队的成员，负责 payment-service 的日常维护。", "memory_type": "semantic"},
-        {"content": "payment-service 使用 stripe-sdk v3.2.1 处理支付请求。", "memory_type": "semantic"},
-        {"content": "stripe-sdk v3.2.1 存在 CVE-2024-11223 漏洞，可能导致支付数据泄露。", "memory_type": "semantic"},
-        {"content": "Alice 负责 auth-service，与 payment-service 无关。", "memory_type": "semantic", "is_noise": true},
-        {"content": "前端团队使用 React 18，不涉及支付逻辑。", "memory_type": "semantic", "is_noise": true}
-      ],
-      "steps": [],
-      "assertions": [
+    "dataset_id": "memoria-graph-entity-v2",
+    "version": "v1.0",
+    "description": "Extended graph benchmark. Tests 4-hop chains, entity alias resolution, negative relationships, multi-entity convergence, entity state evolution, and cross-session entity linking. All scenarios require graph traversal to pass — vector-only retrieval will fail.",
+    "scenarios": [
         {
-          "query": "Bob 负责的东西有没有安全漏洞？",
-          "top_k": 3,
-          "expected_contents": ["CVE-2024-11223", "支付数据泄露", "stripe-sdk"],
-          "excluded_contents": ["auth-service", "React 18"]
-        }
-      ],
-      "maturation": ["extract_entities", "consolidate"]
-    },
-    {
-      "scenario_id": "GRAPH2-002",
-      "title": "Entity alias resolution: React = ReactJS = React.js",
-      "description": "The same technology is referred to by different names across memories. Entity graph should unify them. Vector may miss cross-alias connections.",
-      "domain": "engineering",
-      "difficulty": "L4",
-      "horizon": "medium",
-      "tags": ["trust"],
-      "seed_memories": [
-        {"content": "前端框架选用 React 18，使用 Hooks API 和 Context。", "memory_type": "semantic"},
-        {"content": "ReactJS 的 Server Components 功能在 Next.js 14 中已稳定。", "memory_type": "semantic"},
-        {"content": "React.js 的 Concurrent Mode 解决了大列表渲染卡顿问题。", "memory_type": "semantic"},
-        {"content": "Vue 3 是另一个选项，但团队更熟悉 React 生态。", "memory_type": "semantic", "is_noise": true}
-      ],
-      "steps": [],
-      "assertions": [
+            "scenario_id": "GRAPH2-001",
+            "title": "Four-hop chain: person → team → project → dependency → vulnerability",
+            "description": "Query names only the person. Answer requires 4 hops: Bob → backend team → payment-service → stripe-sdk → CVE. Vector cannot bridge 'Bob' to 'CVE' with no semantic overlap.",
+            "domain": "engineering",
+            "difficulty": "L5",
+            "horizon": "long",
+            "tags": [
+                "trust"
+            ],
+            "seed_memories": [
+                {
+                    "content": "Bob 是后端团队的成员，负责 payment-service 的日常维护。",
+                    "memory_type": "semantic"
+                },
+                {
+                    "content": "payment-service 使用 stripe-sdk v3.2.1 处理支付请求。",
+                    "memory_type": "semantic"
+                },
+                {
+                    "content": "stripe-sdk v3.2.1 存在 CVE-2024-11223 漏洞，可能导致支付数据泄露。",
+                    "memory_type": "semantic"
+                },
+                {
+                    "content": "Alice 负责 auth-service，与 payment-service 无关。",
+                    "memory_type": "semantic",
+                    "is_noise": true
+                },
+                {
+                    "content": "前端团队使用 React 18，不涉及支付逻辑。",
+                    "memory_type": "semantic",
+                    "is_noise": true
+                }
+            ],
+            "steps": [],
+            "assertions": [
+                {
+                    "query": "Bob 负责的东西有没有安全漏洞？",
+                    "top_k": 3,
+                    "expected_contents": [
+                        "CVE-2024-11223",
+                        "支付数据泄露",
+                        "stripe-sdk"
+                    ],
+                    "excluded_contents": [
+                        "auth-service",
+                        "React 18"
+                    ]
+                }
+            ],
+            "maturation": [
+                "extract_entities",
+                "consolidate"
+            ]
+        },
         {
-          "query": "我们用的前端框架有哪些特性？",
-          "top_k": 3,
-          "expected_contents": ["Hooks", "Server Components", "Concurrent Mode"],
-          "excluded_contents": ["Vue 3"]
-        }
-      ],
-      "maturation": ["extract_entities", "consolidate"]
-    },
-    {
-      "scenario_id": "GRAPH2-003",
-      "title": "Negative relationship: A is incompatible with B",
-      "description": "A stored incompatibility between two technologies. Query asks if they can be used together — answer must surface the incompatibility.",
-      "domain": "engineering",
-      "difficulty": "L4",
-      "horizon": "medium",
-      "tags": ["conflict", "trust"],
-      "seed_memories": [
-        {"content": "Webpack 5 与 Node.js 12 不兼容，必须使用 Node.js 14 以上。", "memory_type": "semantic"},
-        {"content": "项目当前使用 Webpack 5 作为打包工具。", "memory_type": "semantic"},
-        {"content": "遗留服务仍在 Node.js 12 上运行，尚未迁移。", "memory_type": "semantic"},
-        {"content": "Vite 是 Webpack 的替代方案，支持 Node.js 12+。", "memory_type": "semantic", "is_noise": true}
-      ],
-      "steps": [],
-      "assertions": [
+            "scenario_id": "GRAPH2-002",
+            "title": "Entity alias resolution: React = ReactJS = React.js",
+            "description": "The same technology is referred to by different names across memories. Entity graph should unify them. Vector may miss cross-alias connections.",
+            "domain": "engineering",
+            "difficulty": "L4",
+            "horizon": "medium",
+            "tags": [
+                "trust"
+            ],
+            "seed_memories": [
+                {
+                    "content": "前端框架选用 React 18，使用 Hooks API 和 Context。",
+                    "memory_type": "semantic"
+                },
+                {
+                    "content": "ReactJS 的 Server Components 功能在 Next.js 14 中已稳定。",
+                    "memory_type": "semantic"
+                },
+                {
+                    "content": "React.js 的 Concurrent Mode 解决了大列表渲染卡顿问题。",
+                    "memory_type": "semantic"
+                },
+                {
+                    "content": "Vue 3 是另一个选项，但团队更熟悉 React 生态。",
+                    "memory_type": "semantic",
+                    "is_noise": true
+                }
+            ],
+            "steps": [],
+            "assertions": [
+                {
+                    "query": "我们用的前端框架有哪些特性？",
+                    "top_k": 3,
+                    "expected_contents": [
+                        "Hooks",
+                        "Server Components",
+                        "Concurrent Mode"
+                    ],
+                    "excluded_contents": [
+                        "Vue 3"
+                    ]
+                }
+            ],
+            "maturation": [
+                "extract_entities",
+                "consolidate"
+            ]
+        },
         {
-          "query": "Webpack 5 能在遗留服务上用吗？",
-          "top_k": 3,
-          "expected_contents": ["不兼容", "Node.js 12", "Node.js 14"],
-          "excluded_contents": ["Vite"]
-        }
-      ],
-      "maturation": ["extract_entities", "consolidate"]
-    },
-    {
-      "scenario_id": "GRAPH2-004",
-      "title": "Multi-entity convergence: two independent chains point to same conclusion",
-      "description": "Two separate chains (frontend team + backend team) both lead to the same bottleneck (shared Redis). Query about the bottleneck must surface both chains.",
-      "domain": "engineering",
-      "difficulty": "L5",
-      "horizon": "long",
-      "tags": ["trust"],
-      "seed_memories": [
-        {"content": "前端的 SSR 服务用 Redis 做页面缓存，TTL 60 秒。", "memory_type": "semantic"},
-        {"content": "后端的 session 服务也用同一个 Redis 集群存储用户会话。", "memory_type": "semantic"},
-        {"content": "Redis 集群在高峰期 CPU 使用率达到 95%，成为系统瓶颈。", "memory_type": "semantic"},
-        {"content": "消息队列用 Kafka，与 Redis 无关。", "memory_type": "semantic", "is_noise": true}
-      ],
-      "steps": [],
-      "assertions": [
+            "scenario_id": "GRAPH2-003",
+            "title": "Negative relationship: A is incompatible with B",
+            "description": "A stored incompatibility between two technologies. Query asks if they can be used together — answer must surface the incompatibility.",
+            "domain": "engineering",
+            "difficulty": "L4",
+            "horizon": "medium",
+            "tags": [
+                "conflict",
+                "trust"
+            ],
+            "seed_memories": [
+                {
+                    "content": "Webpack 5 与 Node.js 12 不兼容，必须使用 Node.js 14 以上。",
+                    "memory_type": "semantic"
+                },
+                {
+                    "content": "项目当前使用 Webpack 5 作为打包工具。",
+                    "memory_type": "semantic"
+                },
+                {
+                    "content": "遗留服务仍在 Node.js 12 上运行，尚未迁移。",
+                    "memory_type": "semantic"
+                },
+                {
+                    "content": "Vite 是 Webpack 的替代方案，支持 Node.js 12+。",
+                    "memory_type": "semantic",
+                    "is_noise": true
+                }
+            ],
+            "steps": [],
+            "assertions": [
+                {
+                    "query": "Webpack 5 能在遗留服务上用吗？",
+                    "top_k": 3,
+                    "expected_contents": [
+                        "不兼容",
+                        "Node.js 12",
+                        "Node.js 14"
+                    ],
+                    "excluded_contents": [
+                        "Vite"
+                    ]
+                }
+            ],
+            "maturation": [
+                "extract_entities",
+                "consolidate"
+            ]
+        },
         {
-          "query": "系统的性能瓶颈在哪里？哪些服务受影响？",
-          "top_k": 4,
-          "expected_contents": ["Redis", "SSR", "session", "95%"],
-          "excluded_contents": ["Kafka"]
-        }
-      ],
-      "maturation": ["extract_entities", "consolidate"]
-    },
-    {
-      "scenario_id": "GRAPH2-005",
-      "title": "Entity state evolution: technology adoption lifecycle",
-      "description": "A technology goes through states: evaluated → adopted → deprecated → replaced. Query asks current state. Vector returns all states equally; graph tracks the latest.",
-      "domain": "engineering",
-      "difficulty": "L5",
-      "horizon": "long",
-      "tags": ["drift", "conflict", "trust"],
-      "seed_memories": [
-        {"content": "2024年Q1：评估 GraphQL，性能测试结果良好，决定在新项目中试用。", "memory_type": "semantic"},
-        {"content": "2024年Q3：GraphQL 在 user-profile-service 中正式上线，替代 REST。", "memory_type": "semantic"},
-        {"content": "2025年Q1：GraphQL 的 N+1 查询问题导致数据库压力过大，开始评估替代方案。", "memory_type": "semantic"},
-        {"content": "2025年Q3：决定废弃 GraphQL，迁回 REST+OpenAPI，预计 2026年Q1 完成迁移。", "memory_type": "semantic"},
-        {"content": "GraphQL 的 schema 定义语言比 OpenAPI 更简洁。", "memory_type": "semantic", "is_noise": true}
-      ],
-      "steps": [],
-      "assertions": [
+            "scenario_id": "GRAPH2-004",
+            "title": "Multi-entity convergence: two independent chains point to same conclusion",
+            "description": "Two separate chains (frontend team + backend team) both lead to the same bottleneck (shared Redis). Query about the bottleneck must surface both chains.",
+            "domain": "engineering",
+            "difficulty": "L5",
+            "horizon": "long",
+            "tags": [
+                "trust"
+            ],
+            "seed_memories": [
+                {
+                    "content": "前端的 SSR 服务用 Redis 做页面缓存，TTL 60 秒。",
+                    "memory_type": "semantic"
+                },
+                {
+                    "content": "后端的 session 服务也用同一个 Redis 集群存储用户会话。",
+                    "memory_type": "semantic"
+                },
+                {
+                    "content": "Redis 集群在高峰期 CPU 使用率达到 95%，成为系统瓶颈。",
+                    "memory_type": "semantic"
+                },
+                {
+                    "content": "消息队列用 Kafka，与 Redis 无关。",
+                    "memory_type": "semantic",
+                    "is_noise": true
+                }
+            ],
+            "steps": [],
+            "assertions": [
+                {
+                    "query": "系统的性能瓶颈在哪里？哪些服务受影响？",
+                    "top_k": 4,
+                    "expected_contents": [
+                        "Redis",
+                        "SSR",
+                        "session",
+                        "95%"
+                    ],
+                    "excluded_contents": [
+                        "Kafka"
+                    ]
+                }
+            ],
+            "maturation": [
+                "extract_entities",
+                "consolidate"
+            ]
+        },
         {
-          "query": "我们现在还在用 GraphQL 吗？",
-          "top_k": 3,
-          "expected_contents": ["废弃", "迁回 REST", "2026年Q1"],
-          "excluded_contents": ["决定在新项目中试用", "正式上线"]
-        }
-      ],
-      "maturation": ["extract_entities", "consolidate"]
-    },
-    {
-      "scenario_id": "GRAPH2-006",
-      "title": "Person → multiple projects → shared risk",
-      "description": "One person owns multiple projects. A risk in one project affects all. Query about the person's risk exposure requires aggregating across all their projects.",
-      "domain": "team",
-      "difficulty": "L4",
-      "horizon": "medium",
-      "tags": ["trust"],
-      "seed_memories": [
-        {"content": "@陈磊 是平台组的 tech lead，负责 data-pipeline 和 ml-serving 两个项目。", "memory_type": "semantic"},
-        {"content": "data-pipeline 依赖 Apache Airflow 2.6，该版本有已知的任务调度 bug。", "memory_type": "semantic"},
-        {"content": "ml-serving 使用 Triton Inference Server，最近发现内存泄漏问题。", "memory_type": "semantic"},
-        {"content": "@王建 负责前端项目，与平台组无关。", "memory_type": "semantic", "is_noise": true }
-      ],
-      "steps": [],
-      "assertions": [
+            "scenario_id": "GRAPH2-005",
+            "title": "Entity state evolution: technology adoption lifecycle",
+            "description": "A technology goes through states: evaluated → adopted → deprecated → replaced. Query asks current state. Vector returns all states equally; graph tracks the latest.",
+            "domain": "engineering",
+            "difficulty": "L5",
+            "horizon": "long",
+            "tags": [
+                "drift",
+                "conflict",
+                "trust"
+            ],
+            "seed_memories": [
+                {
+                    "content": "2024年Q1：评估 GraphQL，性能测试结果良好，决定在新项目中试用。",
+                    "memory_type": "semantic",
+                    "age_days": 365.0
+                },
+                {
+                    "content": "2024年Q3：GraphQL 在 user-profile-service 中正式上线，替代 REST。",
+                    "memory_type": "semantic",
+                    "age_days": 270.0
+                },
+                {
+                    "content": "2025年Q1：GraphQL 的 N+1 查询问题导致数据库压力过大，开始评估替代方案。",
+                    "memory_type": "semantic",
+                    "age_days": 90.0
+                },
+                {
+                    "content": "2025年Q3：决定废弃 GraphQL，迁回 REST+OpenAPI，预计 2026年Q1 完成迁移。",
+                    "memory_type": "semantic",
+                    "age_days": 30.0
+                },
+                {
+                    "content": "GraphQL 的 schema 定义语言比 OpenAPI 更简洁。",
+                    "memory_type": "semantic",
+                    "is_noise": true,
+                    "age_days": 180.0
+                }
+            ],
+            "steps": [],
+            "assertions": [
+                {
+                    "query": "我们现在还在用 GraphQL 吗？",
+                    "top_k": 3,
+                    "expected_contents": [
+                        "废弃",
+                        "迁回 REST",
+                        "2026年Q1"
+                    ],
+                    "excluded_contents": [
+                        "决定在新项目中试用",
+                        "正式上线"
+                    ]
+                }
+            ],
+            "maturation": [
+                "extract_entities",
+                "consolidate"
+            ]
+        },
         {
-          "query": "陈磊负责的项目有什么风险？",
-          "top_k": 4,
-          "expected_contents": ["Airflow", "调度 bug", "Triton", "内存泄漏"],
-          "excluded_contents": ["王建", "前端"]
-        }
-      ],
-      "maturation": ["extract_entities", "consolidate"]
-    },
-    {
-      "scenario_id": "GRAPH2-007",
-      "title": "Technology → team → contact routing",
-      "description": "Query describes a technology problem without naming the team. Answer requires: technology → module → team → contact. No single memory connects the technology to the contact.",
-      "domain": "team",
-      "difficulty": "L4",
-      "horizon": "medium",
-      "tags": ["trust"],
-      "seed_memories": [
-        {"content": "@刘洋 是基础设施组的负责人，管理 Kubernetes 集群和 CI/CD 流水线。", "memory_type": "semantic"},
-        {"content": "CI/CD 流水线基于 Jenkins，部署在 Kubernetes 上。", "memory_type": "semantic"},
-        {"content": "Jenkins 最近频繁出现 executor 资源耗尽，导致构建队列积压。", "memory_type": "semantic"},
-        {"content": "@赵敏 负责产品设计，与基础设施无关。", "memory_type": "semantic", "is_noise": true}
-      ],
-      "steps": [],
-      "assertions": [
+            "scenario_id": "GRAPH2-006",
+            "title": "Person → multiple projects → shared risk",
+            "description": "One person owns multiple projects. A risk in one project affects all. Query about the person's risk exposure requires aggregating across all their projects.",
+            "domain": "team",
+            "difficulty": "L4",
+            "horizon": "medium",
+            "tags": [
+                "trust"
+            ],
+            "seed_memories": [
+                {
+                    "content": "@陈磊 是平台组的 tech lead，负责 data-pipeline 和 ml-serving 两个项目。",
+                    "memory_type": "semantic"
+                },
+                {
+                    "content": "data-pipeline 依赖 Apache Airflow 2.6，该版本有已知的任务调度 bug。",
+                    "memory_type": "semantic"
+                },
+                {
+                    "content": "ml-serving 使用 Triton Inference Server，最近发现内存泄漏问题。",
+                    "memory_type": "semantic"
+                },
+                {
+                    "content": "@王建 负责前端项目，与平台组无关。",
+                    "memory_type": "semantic",
+                    "is_noise": true
+                }
+            ],
+            "steps": [],
+            "assertions": [
+                {
+                    "query": "陈磊负责的项目有什么风险？",
+                    "top_k": 4,
+                    "expected_contents": [
+                        "Airflow",
+                        "调度 bug",
+                        "Triton",
+                        "内存泄漏"
+                    ],
+                    "excluded_contents": [
+                        "王建",
+                        "前端"
+                    ]
+                }
+            ],
+            "maturation": [
+                "extract_entities",
+                "consolidate"
+            ]
+        },
         {
-          "query": "构建队列积压的问题应该找谁？",
-          "top_k": 3,
-          "expected_contents": ["刘洋", "基础设施", "CI/CD"],
-          "excluded_contents": ["赵敏", "产品设计"]
-        }
-      ],
-      "maturation": ["extract_entities", "consolidate"]
-    },
-    {
-      "scenario_id": "GRAPH2-008",
-      "title": "Shared dependency risk: multiple services affected by one library",
-      "description": "A vulnerable library is used by multiple services. Query asks which services are at risk. Entity graph aggregates all usages; vector only returns the closest match.",
-      "domain": "engineering",
-      "difficulty": "L4",
-      "horizon": "medium",
-      "tags": ["trust"],
-      "seed_memories": [
-        {"content": "user-service 使用 log4j 2.14.1 处理日志。", "memory_type": "semantic"},
-        {"content": "order-service 使用 log4j 2.14.1 作为日志框架。", "memory_type": "semantic"},
-        {"content": "notification-service 也依赖 log4j 2.14.1。", "memory_type": "semantic"},
-        {"content": "log4j 2.14.1 存在 Log4Shell 漏洞（CVE-2021-44228），需要立即升级到 2.17.1。", "memory_type": "semantic"},
-        {"content": "payment-service 使用 logback，不受 log4j 漏洞影响。", "memory_type": "semantic", "is_noise": true}
-      ],
-      "steps": [],
-      "assertions": [
+            "scenario_id": "GRAPH2-007",
+            "title": "Technology → team → contact routing",
+            "description": "Query describes a technology problem without naming the team. Answer requires: technology → module → team → contact. No single memory connects the technology to the contact.",
+            "domain": "team",
+            "difficulty": "L4",
+            "horizon": "medium",
+            "tags": [
+                "trust"
+            ],
+            "seed_memories": [
+                {
+                    "content": "@刘洋 是基础设施组的负责人，管理 Kubernetes 集群和 CI/CD 流水线。",
+                    "memory_type": "semantic"
+                },
+                {
+                    "content": "CI/CD 流水线基于 Jenkins，部署在 Kubernetes 上。",
+                    "memory_type": "semantic"
+                },
+                {
+                    "content": "Jenkins 最近频繁出现 executor 资源耗尽，导致构建队列积压。",
+                    "memory_type": "semantic"
+                },
+                {
+                    "content": "@赵敏 负责产品设计，与基础设施无关。",
+                    "memory_type": "semantic",
+                    "is_noise": true
+                }
+            ],
+            "steps": [],
+            "assertions": [
+                {
+                    "query": "构建队列积压的问题应该找谁？",
+                    "top_k": 3,
+                    "expected_contents": [
+                        "刘洋",
+                        "基础设施",
+                        "CI/CD"
+                    ],
+                    "excluded_contents": [
+                        "赵敏",
+                        "产品设计"
+                    ]
+                }
+            ],
+            "maturation": [
+                "extract_entities",
+                "consolidate"
+            ]
+        },
         {
-          "query": "哪些服务受到 log4j 漏洞影响？",
-          "top_k": 4,
-          "expected_contents": ["user-service", "order-service", "notification-service", "CVE-2021-44228"],
-          "excluded_contents": ["payment-service", "logback"]
-        }
-      ],
-      "maturation": ["extract_entities", "consolidate"]
-    },
-    {
-      "scenario_id": "GRAPH2-009",
-      "title": "Indirect config dependency: env var → service behavior → user impact",
-      "description": "A config change has downstream effects. Query asks about user impact. Chain: env var change → service behavior change → user-visible symptom. No single memory states the full chain.",
-      "domain": "engineering",
-      "difficulty": "L5",
-      "horizon": "long",
-      "tags": ["trust", "interruption"],
-      "seed_memories": [
-        {"content": "运维将 MAX_CONNECTIONS 从 100 改为 20，以减少数据库负载。", "memory_type": "semantic"},
-        {"content": "MAX_CONNECTIONS 控制 connection pool 的最大连接数。", "memory_type": "semantic"},
-        {"content": "连接池耗尽时，新请求会等待最多 5 秒，超时后返回 503 错误。", "memory_type": "semantic"},
-        {"content": "用户反馈：高峰期频繁出现 503 错误，无法完成操作。", "memory_type": "working"},
-        {"content": "Nginx 的 worker_processes 设置与此问题无关。", "memory_type": "semantic", "is_noise": true}
-      ],
-      "steps": [],
-      "assertions": [
+            "scenario_id": "GRAPH2-008",
+            "title": "Shared dependency risk: multiple services affected by one library",
+            "description": "A vulnerable library is used by multiple services. Query asks which services are at risk. Entity graph aggregates all usages; vector only returns the closest match.",
+            "domain": "engineering",
+            "difficulty": "L4",
+            "horizon": "medium",
+            "tags": [
+                "trust"
+            ],
+            "seed_memories": [
+                {
+                    "content": "user-service 使用 log4j 2.14.1 处理日志。",
+                    "memory_type": "semantic"
+                },
+                {
+                    "content": "order-service 使用 log4j 2.14.1 作为日志框架。",
+                    "memory_type": "semantic"
+                },
+                {
+                    "content": "notification-service 也依赖 log4j 2.14.1。",
+                    "memory_type": "semantic"
+                },
+                {
+                    "content": "log4j 2.14.1 存在 Log4Shell 漏洞（CVE-2021-44228），需要立即升级到 2.17.1。",
+                    "memory_type": "semantic"
+                },
+                {
+                    "content": "payment-service 使用 logback，不受 log4j 漏洞影响。",
+                    "memory_type": "semantic",
+                    "is_noise": true
+                }
+            ],
+            "steps": [],
+            "assertions": [
+                {
+                    "query": "哪些服务受到 log4j 漏洞影响？",
+                    "top_k": 4,
+                    "expected_contents": [
+                        "user-service",
+                        "order-service",
+                        "notification-service",
+                        "CVE-2021-44228"
+                    ],
+                    "excluded_contents": [
+                        "payment-service",
+                        "logback"
+                    ]
+                }
+            ],
+            "maturation": [
+                "extract_entities",
+                "consolidate"
+            ]
+        },
         {
-          "query": "用户为什么会看到 503 错误？",
-          "top_k": 4,
-          "expected_contents": ["MAX_CONNECTIONS", "connection pool", "连接池耗尽"],
-          "excluded_contents": ["Nginx", "worker_processes"]
-        }
-      ],
-      "maturation": ["extract_entities", "consolidate"]
-    },
-    {
-      "scenario_id": "GRAPH2-010",
-      "title": "Cross-domain entity: same person in engineering and management contexts",
-      "description": "The same person appears in both technical and organizational memories. Query about their technical work must not return organizational noise, and vice versa.",
-      "domain": "team",
-      "difficulty": "L4",
-      "horizon": "medium",
-      "tags": ["trust"],
-      "seed_memories": [
-        {"content": "@张华 是后端架构师，设计了微服务拆分方案，将单体拆成 12 个服务。", "memory_type": "semantic"},
-        {"content": "@张华 同时担任技术委员会成员，参与季度技术规划。", "memory_type": "semantic"},
-        {"content": "@张华 主导了 gRPC 迁移项目，将 REST API 替换为 gRPC。", "memory_type": "semantic"},
-        {"content": "技术委员会每季度开会，讨论技术路线图。", "memory_type": "semantic", "is_noise": true}
-      ],
-      "steps": [],
-      "assertions": [
+            "scenario_id": "GRAPH2-009",
+            "title": "Indirect config dependency: env var → service behavior → user impact",
+            "description": "A config change has downstream effects. Query asks about user impact. Chain: env var change → service behavior change → user-visible symptom. No single memory states the full chain.",
+            "domain": "engineering",
+            "difficulty": "L5",
+            "horizon": "long",
+            "tags": [
+                "trust",
+                "interruption"
+            ],
+            "seed_memories": [
+                {
+                    "content": "运维将 MAX_CONNECTIONS 从 100 改为 20，以减少数据库负载。",
+                    "memory_type": "semantic"
+                },
+                {
+                    "content": "MAX_CONNECTIONS 控制 connection pool 的最大连接数。",
+                    "memory_type": "semantic"
+                },
+                {
+                    "content": "连接池耗尽时，新请求会等待最多 5 秒，超时后返回 503 错误。",
+                    "memory_type": "semantic"
+                },
+                {
+                    "content": "用户反馈：高峰期频繁出现 503 错误，无法完成操作。",
+                    "memory_type": "working"
+                },
+                {
+                    "content": "Nginx 的 worker_processes 设置与此问题无关。",
+                    "memory_type": "semantic",
+                    "is_noise": true
+                }
+            ],
+            "steps": [],
+            "assertions": [
+                {
+                    "query": "用户为什么会看到 503 错误？",
+                    "top_k": 4,
+                    "expected_contents": [
+                        "MAX_CONNECTIONS",
+                        "connection pool",
+                        "连接池耗尽"
+                    ],
+                    "excluded_contents": [
+                        "Nginx",
+                        "worker_processes"
+                    ]
+                }
+            ],
+            "maturation": [
+                "extract_entities",
+                "consolidate"
+            ]
+        },
         {
-          "query": "张华做了哪些技术工作？",
-          "top_k": 3,
-          "expected_contents": ["微服务拆分", "gRPC 迁移", "12 个服务"],
-          "excluded_contents": ["技术委员会", "季度技术规划"]
+            "scenario_id": "GRAPH2-010",
+            "title": "Cross-domain entity: same person in engineering and management contexts",
+            "description": "The same person appears in both technical and organizational memories. Query about their technical work must not return organizational noise, and vice versa.",
+            "domain": "team",
+            "difficulty": "L4",
+            "horizon": "medium",
+            "tags": [
+                "trust"
+            ],
+            "seed_memories": [
+                {
+                    "content": "@张华 是后端架构师，设计了微服务拆分方案，将单体拆成 12 个服务。",
+                    "memory_type": "semantic"
+                },
+                {
+                    "content": "@张华 同时担任技术委员会成员，参与季度技术规划。",
+                    "memory_type": "semantic"
+                },
+                {
+                    "content": "@张华 主导了 gRPC 迁移项目，将 REST API 替换为 gRPC。",
+                    "memory_type": "semantic"
+                },
+                {
+                    "content": "技术委员会每季度开会，讨论技术路线图。",
+                    "memory_type": "semantic",
+                    "is_noise": true
+                }
+            ],
+            "steps": [],
+            "assertions": [
+                {
+                    "query": "张华做了哪些技术工作？",
+                    "top_k": 3,
+                    "expected_contents": [
+                        "微服务拆分",
+                        "gRPC 迁移",
+                        "12 个服务"
+                    ],
+                    "excluded_contents": [
+                        "技术委员会",
+                        "季度技术规划"
+                    ]
+                }
+            ],
+            "maturation": [
+                "extract_entities",
+                "consolidate"
+            ]
         }
-      ],
-      "maturation": ["extract_entities", "consolidate"]
-    }
-  ]
+    ]
 }

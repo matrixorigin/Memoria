@@ -30,12 +30,12 @@ LAMBDA_IMPORTANCE = 0.10
 
 CONFLICT_PENALTY = {"superseded": 0.5, "pending": 0.7}
 
-NODE_TYPE_WEIGHT = {"scene": 1.2, "semantic": 1.0, "episodic": 0.8, "entity": 0.8}
+NODE_TYPE_WEIGHT = {"scene": 1.5, "semantic": 1.0, "episodic": 0.6, "entity": 0.8}
 
 MIN_GRAPH_NODES = 3
 ANCHOR_TOP_K = 10
 
-# Temporal decay for graph nodes (hours)
+# Temporal decay for graph nodes (hours) — shorter decay to penalize old nodes more
 TEMPORAL_DECAY_HOURS = 720.0
 
 # §13.2 Memory mode → activation parameters per task type
@@ -154,13 +154,8 @@ class ActivationRetriever:
         if not anchors:
             return []
 
-        # 2. Soft entity linking: find entity candidates via embedding similarity,
-        #    inject as weighted activation anchors.
-        entity_anchors, entity_memory_ids = self._entity_recall(
-            user_id,
-            query,
-            query_embedding=query_embedding,
-        )
+        # 2. Entity recall via hard name match (NER on query text).
+        entity_anchors, entity_memory_ids = self._entity_recall(user_id, query)
 
         # Inject entity anchors with similarity-weighted activation
         for nid, weight in entity_anchors.items():
@@ -255,36 +250,15 @@ class ActivationRetriever:
         self,
         user_id: str,
         query: str,
-        query_embedding: list[float] | None = None,
     ) -> tuple[dict[str, float], set[str]]:
-        """Soft entity linking: find entity candidates via embedding similarity.
-
-        Falls back to hard name match when no embedding is available.
+        """Entity recall via hard name match (NER on query text).
 
         Returns:
-            (entity_anchors {node_id: weight}, memory_ids) —
-            entity_anchors with similarity-weighted activation,
-            memory_ids for candidate recall injection.
+            (entity_anchors {node_id: weight}, memory_ids)
         """
         entity_anchors: dict[str, float] = {}
         memory_ids: set[str] = set()
 
-        # Soft linking: use query embedding to find similar entities
-        if query_embedding:
-            soft_matches = self._store.find_entities_soft(
-                user_id,
-                query_embedding,
-                top_k=5,
-                threshold=1.0,
-            )
-            for entity_id, sim_score in soft_matches:
-                entity_anchors[entity_id] = sim_score
-                for mid, _weight in self._store.get_memories_by_entity(
-                    entity_id, user_id, limit=20
-                ):
-                    memory_ids.add(mid)
-
-        # Hard linking: extract entity names from query text
         _NO_ACTIVATION = {"time", "person"}
         query_entities = get_ner_backend().extract(query)
         for ent in query_entities:
@@ -292,7 +266,7 @@ class ActivationRetriever:
                 continue
             entity_id = self._store.find_entity_by_name(user_id, ent.name)
             if entity_id and entity_id not in entity_anchors:
-                entity_anchors[entity_id] = 1.0  # exact match = full weight
+                entity_anchors[entity_id] = 1.0
                 for mid, _weight in self._store.get_memories_by_entity(
                     entity_id, user_id, limit=20
                 ):

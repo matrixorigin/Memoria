@@ -24,11 +24,11 @@ class EdgeType(str, enum.Enum):
 
 # Activation multipliers per edge type (spreading activation)
 EDGE_TYPE_MULTIPLIER: dict[str, float] = {
-    EdgeType.TEMPORAL: 1.0,
+    EdgeType.TEMPORAL: 1.5,
     EdgeType.ABSTRACTION: 0.8,
     EdgeType.ASSOCIATION: 1.0,
-    EdgeType.CAUSAL: 1.5,
-    EdgeType.CONSOLIDATION: 1.0,
+    EdgeType.CAUSAL: 2.0,
+    EdgeType.CONSOLIDATION: 1.2,
     EdgeType.ENTITY_LINK: 1.2,
 }
 
