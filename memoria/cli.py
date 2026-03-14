@@ -16,7 +16,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-_VERSION = "0.1.18"
+_VERSION = "0.1.19"
 _MCP_KEY = "memoria"
 
 
