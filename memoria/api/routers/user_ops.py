@@ -12,6 +12,7 @@ from sqlalchemy import text
 
 from memoria.api.database import get_db_factory
 from memoria.api.dependencies import get_current_user_id
+from memoria.core.memory.types import enum_value
 
 router = APIRouter(tags=["memory"])
 
@@ -173,7 +174,7 @@ def reflect_candidates(
                     {
                         "memory_id": m.memory_id,
                         "content": m.content,
-                        "type": str(m.memory_type),
+                        "type": enum_value(m.memory_type),
                     }
                     for m in c.memories
                 ],

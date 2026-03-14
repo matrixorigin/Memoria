@@ -77,13 +77,16 @@ _CURSOR_FMT = "%Y-%m-%d %H:%M:%S.%f"
 
 
 def _to_response(mem: Any) -> dict[str, Any]:
+    from memoria.core.memory.types import enum_value
+
+    mem_type_str = enum_value(mem.memory_type) or "fact"
+    trust_tier_str = enum_value(mem.trust_tier) if hasattr(mem, "trust_tier") else None
+
     return {
         "memory_id": mem.memory_id,
         "content": mem.content,
-        "memory_type": str(mem.memory_type) if mem.memory_type else "fact",
-        "trust_tier": str(mem.trust_tier)
-        if hasattr(mem, "trust_tier") and mem.trust_tier
-        else None,
+        "memory_type": mem_type_str,
+        "trust_tier": trust_tier_str,
         "confidence": getattr(mem, "initial_confidence", None),
         "observed_at": mem.observed_at.isoformat()
         if hasattr(mem, "observed_at") and mem.observed_at

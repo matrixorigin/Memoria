@@ -136,7 +136,7 @@ class MemoryEditor:
 
         Args:
             user_id: Target user.
-            specs: List of dicts with 'content', optional 'type' and 'trust'.
+            specs: List of dicts with 'content', optional 'memory_type' and 'trust'.
             source: Source identifier for audit.
             session_id: Optional session context.
 
@@ -157,7 +157,7 @@ class MemoryEditor:
             mem = MemoryObj(
                 memory_id=_uuid.uuid4().hex,
                 user_id=user_id,
-                memory_type=MemoryType(spec.get("type", "semantic")),
+                memory_type=MemoryType(spec.get("memory_type", "semantic")),
                 content=spec["content"],
                 initial_confidence=1.0,
                 trust_tier=TrustTier(spec.get("trust", "T2")),

@@ -660,6 +660,39 @@ class TestMemory:
                 f"embedding must not be NULL for batch memory {mid}"
             )
 
+    def test_batch_store_respects_memory_type(self, client, db):
+        """Batch store should preserve user-specified memory_type (not force semantic)."""
+        uid, h, _ = _make_user(client)
+        r = client.post(
+            "/v1/memories/batch",
+            json={
+                "memories": [
+                    {"content": "working context", "memory_type": "working"},
+                    {"content": "tool result", "memory_type": "tool_result"},
+                    {"content": "semantic fact", "memory_type": "semantic"},
+                ]
+            },
+            headers=h,
+        )
+        assert r.status_code == 201
+        results = r.json()
+        assert len(results) == 3
+
+        # Verify response preserves memory_type
+        memory_types = [m["memory_type"] for m in results]
+        assert "working" in memory_types
+        assert "tool_result" in memory_types
+        assert "semantic" in memory_types
+
+        # Verify DB stores correct types
+        for m in results:
+            row = db.execute(
+                text("SELECT memory_type FROM mem_memories WHERE memory_id = :mid"),
+                {"mid": m["memory_id"]},
+            ).first()
+            assert row is not None
+            assert row[0] == m["memory_type"]
+
     def test_search_returns_relevant(self, client, user_key):
         uid, h = user_key
         # Store something searchable

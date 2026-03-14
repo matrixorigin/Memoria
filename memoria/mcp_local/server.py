@@ -21,6 +21,7 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 from mcp.server import FastMCP
 
+from memoria.core.memory.types import enum_value
 from memoria.mcp_local.messages import (
     MSG_CONSOLIDATION_DONE,
     MSG_CONSOLIDATION_SKIPPED,
@@ -291,7 +292,7 @@ class EmbeddedBackend(MemoryBackend):
             {
                 "memory_id": m.memory_id,
                 "content": m.content,
-                "type": str(m.memory_type),
+                "type": enum_value(m.memory_type),
                 "score": m.retrieval_score,
             }
             for m in memories
@@ -630,7 +631,7 @@ class EmbeddedBackend(MemoryBackend):
                         {
                             "memory_id": m.memory_id,
                             "content": m.content,
-                            "type": str(m.memory_type),
+                            "type": enum_value(m.memory_type),
                         }
                         for m in c.memories
                     ],

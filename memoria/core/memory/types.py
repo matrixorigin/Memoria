@@ -14,6 +14,20 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def enum_value(e) -> str:
+    """Get string value from Enum, handling None and non-Enum types.
+
+    Args:
+        e: An Enum instance, string, or None.
+
+    Returns:
+        The .value if Enum, str(e) otherwise, or empty string for None.
+    """
+    if e is None:
+        return ""
+    return e.value if hasattr(e, "value") else str(e)
+
+
 class MemoryType(str, enum.Enum):
     PROFILE = "profile"
     SEMANTIC = "semantic"
