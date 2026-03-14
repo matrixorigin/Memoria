@@ -1854,6 +1854,7 @@ def create_server(backend: MemoryBackend, default_user: str = "default") -> Fast
         user_id: str | None = None,
         session_id: str | None = None,
         format: str = "text",
+        explain: str = "none",
     ) -> str:
         """Retrieve relevant memories for a query. Call this at conversation start or when context is needed.
 
@@ -1865,29 +1866,50 @@ def create_server(backend: MemoryBackend, default_user: str = "default") -> Fast
                 When None, searches across all sessions (include_cross_session=True).
                 When set, the underlying retrieval strategy ranks session-scoped memories higher.
             format: 'text' (default) or 'json' for structured response with memory_id, type, content, score per item.
+            explain: Debug/performance analysis level (default 'none'). Use 'basic' to see execution path
+                and timing when debugging slow queries. 'verbose' adds detailed metrics. 'analyze' includes
+                internal diagnostics. Only use when explicitly debugging - adds overhead.
         """
+        from memoria.core.explain import init_explain, clear_explain
+
         uid = _user(user_id)
         top_k = max(1, min(top_k, 100))
-        results = backend.retrieve(uid, query, top_k, session_id=session_id)
-        warnings = backend.health_warnings(uid)
-        if format == "json":
-            return _format(
-                {
-                    "status": "ok",
-                    "count": len(results),
-                    "memories": [
-                        {
-                            "memory_id": r["memory_id"],
-                            "type": r.get("type", "fact"),
-                            "content": r["content"],
-                            "score": r.get("score"),
-                        }
-                        for r in results
-                    ],
-                    **({"warnings": warnings} if warnings else {}),
-                },
-                "json",
-            )
+
+        # Initialize explain context
+        explain_ctx = init_explain(explain)
+
+        try:
+            results = backend.retrieve(uid, query, top_k, session_id=session_id)
+            warnings = backend.health_warnings(uid)
+
+            response: dict[str, Any] = {
+                "status": "ok",
+                "count": len(results),
+                "memories": [
+                    {
+                        "memory_id": r["memory_id"],
+                        "type": r.get("type", "fact"),
+                        "content": r["content"],
+                        "score": r.get("score"),
+                    }
+                    for r in results
+                ],
+            }
+
+            if warnings:
+                response["warnings"] = warnings
+
+            # Add explain output if requested
+            if explain_ctx is not None:
+                explain_ctx.finish()
+                response["explain"] = explain_ctx.to_dict()
+
+            if format == "json":
+                return _format(response, "json")
+        finally:
+            clear_explain()
+
+        # Text format
         parts: list[str] = []
         if not results:
             parts.append(MSG_RETRIEVE_EMPTY)
@@ -1903,6 +1925,15 @@ def create_server(backend: MemoryBackend, default_user: str = "default") -> Fast
             )
         if warnings:
             parts.append(MSG_HEALTH_HEADER + "\n".join(f"- {w}" for w in warnings))
+
+        # Add explain summary for text format
+        if explain_ctx is not None:
+            explain_ctx.finish()
+            explain_dict = explain_ctx.to_dict()
+            total_ms = explain_dict.get("total_ms", 0)
+            path = explain_dict.get("path", "unknown")
+            parts.append(f"\n[explain] total={total_ms:.1f}ms path={path}")
+
         return "\n".join(parts)
 
     @server.tool()
@@ -2037,6 +2068,7 @@ def create_server(backend: MemoryBackend, default_user: str = "default") -> Fast
         top_k: int = 10,
         user_id: str | None = None,
         format: str = "text",
+        explain: str = "none",
     ) -> str:
         """Semantic search over all memories.
 
@@ -2045,35 +2077,63 @@ def create_server(backend: MemoryBackend, default_user: str = "default") -> Fast
             top_k: Max results (default 10).
             user_id: User ID (optional).
             format: 'text' (default) or 'json' for structured response with memory_id, type, content per item.
+            explain: Debug/performance analysis level (default 'none'). Use 'basic' to see execution path
+                and timing when debugging slow queries. Only use when explicitly debugging - adds overhead.
         """
-        results = backend.search(_user(user_id), query, max(1, min(top_k, 100)))
-        if format == "json":
-            return _format(
-                {
-                    "status": "ok",
-                    "count": len(results),
-                    "memories": [
-                        {
-                            "memory_id": r["memory_id"],
-                            "type": r.get("type", "fact"),
-                            "content": r["content"],
-                        }
-                        for r in results
-                    ],
-                },
-                "json",
-            )
-        if not results:
-            return MSG_SEARCH_EMPTY
-        lines = [
-            MSG_SEARCH_ITEM.format(
-                type=r.get("type", "fact"),
-                memory_id=r["memory_id"],
-                content=r["content"],
-            )
-            for r in results
-        ]
-        return MSG_SEARCH_FOUND.format(count=len(results)) + "\n".join(lines)
+        from memoria.core.explain import init_explain, clear_explain
+
+        # Initialize explain context
+        explain_ctx = init_explain(explain)
+
+        try:
+            results = backend.search(_user(user_id), query, max(1, min(top_k, 100)))
+
+            response: dict[str, Any] = {
+                "status": "ok",
+                "count": len(results),
+                "memories": [
+                    {
+                        "memory_id": r["memory_id"],
+                        "type": r.get("type", "fact"),
+                        "content": r["content"],
+                    }
+                    for r in results
+                ],
+            }
+
+            # Add explain output if requested
+            if explain_ctx is not None:
+                explain_ctx.finish()
+                response["explain"] = explain_ctx.to_dict()
+
+            if format == "json":
+                return _format(response, "json")
+
+            # Text format
+            if not results:
+                return MSG_SEARCH_EMPTY
+
+            lines = [
+                MSG_SEARCH_ITEM.format(
+                    type=r.get("type", "fact"),
+                    memory_id=r["memory_id"],
+                    content=r["content"],
+                )
+                for r in results
+            ]
+            result_text = MSG_SEARCH_FOUND.format(count=len(results)) + "\n".join(lines)
+
+            # Add explain summary for text format
+            if explain_ctx is not None:
+                explain_ctx.finish()
+                explain_dict = explain_ctx.to_dict()
+                total_ms = explain_dict.get("total_ms", 0)
+                path = explain_dict.get("path", "unknown")
+                result_text += f"\n\n[explain] total={total_ms:.1f}ms path={path}"
+
+            return result_text
+        finally:
+            clear_explain()
 
     @server.tool()
     def memory_governance(

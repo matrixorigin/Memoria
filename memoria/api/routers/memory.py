@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field
 
 from memoria.api.database import get_db_factory
 from memoria.api.dependencies import get_current_user_id
+from memoria.core.explain import init_explain, clear_explain
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["memory"])
@@ -39,6 +40,9 @@ class RetrieveRequest(BaseModel):
     memory_types: list[str] | None = None
     session_id: str | None = None
     include_cross_session: bool = True
+    explain: str = Field(
+        default="none", description="Explain level: none, basic, verbose, analyze"
+    )
 
 
 class CorrectRequest(BaseModel):
@@ -63,6 +67,9 @@ class PurgeRequest(BaseModel):
 class SearchRequest(BaseModel):
     query: str = Field(..., min_length=1)
     top_k: int = Field(default=10, ge=1, le=100)
+    explain: str = Field(
+        default="none", description="Explain level: none, basic, verbose, analyze"
+    )
 
 
 class ObserveRequest(BaseModel):
@@ -241,35 +248,64 @@ def retrieve_memories(
     req: RetrieveRequest,
     user_id: str = Depends(get_current_user_id),
     db_factory=Depends(get_db_factory),
-):
+) -> dict[str, Any]:
     from memoria.core.memory.types import MemoryType
 
-    svc = _get_service(db_factory, user_id=user_id)
-    memory_types = (
-        [MemoryType(t) for t in req.memory_types] if req.memory_types else None
-    )
+    # Initialize explain context
+    explain_ctx = init_explain(req.explain)
 
-    # Embed query for vector search and activation strategy
-    query_embedding = None
     try:
-        from memoria.core.embedding import get_embedding_client
-
-        query_embedding = get_embedding_client().embed(req.query)
-    except Exception as e:
-        logger.warning(
-            "retrieve: failed to embed query, graph/vector path degraded: %s", e
+        svc = _get_service(db_factory, user_id=user_id)
+        memory_types = (
+            [MemoryType(t) for t in req.memory_types] if req.memory_types else None
         )
 
-    memories, _meta = svc.retrieve(
-        user_id,
-        req.query,
-        query_embedding=query_embedding,
-        top_k=req.top_k,
-        memory_types=memory_types,
-        session_id=req.session_id or "",
-        include_cross_session=req.include_cross_session,
-    )
-    return [_to_response(m) for m in memories]
+        # Embed query for vector search and activation strategy
+        query_embedding = None
+        try:
+            from memoria.core.embedding import get_embedding_client
+
+            query_embedding = get_embedding_client().embed(req.query)
+        except Exception as e:
+            logger.warning(
+                "retrieve: failed to embed query, graph/vector path degraded: %s", e
+            )
+
+        memories, _meta = svc.retrieve(
+            user_id,
+            req.query,
+            query_embedding=query_embedding,
+            top_k=req.top_k,
+            memory_types=memory_types,
+            session_id=req.session_id or "",
+            include_cross_session=req.include_cross_session,
+            explain=explain_ctx is not None,
+        )
+
+        response: dict[str, Any] = {"results": [_to_response(m) for m in memories]}
+
+        # Add explain output if requested
+        if explain_ctx is not None:
+            explain_ctx.finish()
+            result = explain_ctx.to_dict()
+
+            # Bridge old explain system data if available
+            if _meta:
+                if isinstance(_meta, dict):
+                    if "path" in _meta:
+                        result["path"] = _meta["path"]
+                    # Merge any other metadata
+                    if "metrics" not in result:
+                        result["metrics"] = {}
+                    for k, v in _meta.items():
+                        if k != "path":
+                            result["metrics"][k] = v
+
+            response["explain"] = result
+
+        return response
+    finally:
+        clear_explain()
 
 
 @router.post("/memories/search")
@@ -277,24 +313,55 @@ def search_memories(
     req: SearchRequest,
     user_id: str = Depends(get_current_user_id),
     db_factory=Depends(get_db_factory),
-):
-    svc = _get_service(db_factory, user_id=user_id)
+) -> dict[str, Any]:
+    # Initialize explain context
+    explain_ctx = init_explain(req.explain)
 
-    query_embedding = None
     try:
-        from memoria.core.embedding import get_embedding_client
+        svc = _get_service(db_factory, user_id=user_id)
 
-        query_embedding = get_embedding_client().embed(req.query)
-    except Exception as e:
-        logger.warning("search: failed to embed query, vector search degraded: %s", e)
+        query_embedding = None
+        try:
+            from memoria.core.embedding import get_embedding_client
 
-    memories, _meta = svc.retrieve(
-        user_id,
-        req.query,
-        query_embedding=query_embedding,
-        top_k=req.top_k,
-    )
-    return [_to_response(m) for m in memories]
+            query_embedding = get_embedding_client().embed(req.query)
+        except Exception as e:
+            logger.warning(
+                "search: failed to embed query, vector search degraded: %s", e
+            )
+
+        memories, _meta = svc.retrieve(
+            user_id,
+            req.query,
+            query_embedding=query_embedding,
+            top_k=req.top_k,
+            explain=explain_ctx is not None,
+        )
+
+        response: dict[str, Any] = {"results": [_to_response(m) for m in memories]}
+
+        # Add explain output if requested
+        if explain_ctx is not None:
+            explain_ctx.finish()
+            result = explain_ctx.to_dict()
+
+            # Bridge old explain system data if available
+            if _meta:
+                if isinstance(_meta, dict):
+                    if "path" in _meta:
+                        result["path"] = _meta["path"]
+                    # Merge any other metadata
+                    if "metrics" not in result:
+                        result["metrics"] = {}
+                    for k, v in _meta.items():
+                        if k != "path":
+                            result["metrics"][k] = v
+
+            response["explain"] = result
+
+        return response
+    finally:
+        clear_explain()
 
 
 @router.put("/memories/{memory_id}/correct")

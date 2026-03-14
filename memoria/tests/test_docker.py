@@ -251,7 +251,9 @@ class TestMemory:
             "/v1/memories/retrieve", json={"query": "database", "top_k": 5}, headers=h
         )
         assert r.status_code == 200
-        assert isinstance(r.json(), list)
+        data = r.json()
+        assert "results" in data
+        assert isinstance(data["results"], list)
 
     def test_search(self, user):
         _, h = user

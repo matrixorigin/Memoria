@@ -90,7 +90,8 @@ Hybrid retrieval: vector similarity + fulltext search, ranked by relevance.
   "top_k": 10,
   "memory_types": ["semantic", "profile"],
   "session_id": null,
-  "include_cross_session": true
+  "include_cross_session": true,
+  "explain": "none"
 }
 ```
 
@@ -101,6 +102,7 @@ Hybrid retrieval: vector similarity + fulltext search, ranked by relevance.
 | `memory_types` | No | all | Filter by types |
 | `session_id` | No | — | Prioritize session memories |
 | `include_cross_session` | No | true | Include other sessions |
+| `explain` | No | "none" | Debug level: "none" (default, no overhead), "basic" (execution path + timing), "verbose" (detailed metrics), "analyze" (full diagnostics). Use for performance debugging only. |
 
 ### Search Memories
 
@@ -111,11 +113,52 @@ POST /v1/memories/search
 ```json
 {
   "query": "Python",
-  "top_k": 10
+  "top_k": 10,
+  "explain": "none"
 }
 ```
 
+| Field | Required | Default | Description |
+|-------|----------|---------|-------------|
+| `query` | Yes | — | Search query |
+| `top_k` | No | 10 | Max results (1–100) |
+| `explain` | No | "none" | Debug level: "none" (default), "basic" (execution path + timing), "verbose" (detailed metrics). Use for performance debugging only. |
+
 Same as retrieve but without session prioritization.
+
+#### Response Format
+
+Both retrieve and search endpoints return:
+
+```json
+{
+  "results": [
+    {
+      "memory_id": "abc123",
+      "content": "User prefers Python",
+      "memory_type": "semantic",
+      "confidence": 0.85,
+      "score": 0.92
+    }
+  ],
+  "explain": {
+    "version": "1.0",
+    "level": "basic",
+    "path": "graph+vector",
+    "total_ms": 45.2,
+    "metrics": {
+      "results": 5
+    }
+  }
+}
+```
+
+**Note**: The `explain` field is only present when the request includes `explain` parameter with a value other than "none". The content varies by level:
+- `basic`: execution path, total time
+- `verbose`: adds detailed metrics per phase
+- `analyze`: includes internal diagnostics
+
+The `explain` field is only present when `explain` parameter is not "none".
 
 ### Correct Memory
 

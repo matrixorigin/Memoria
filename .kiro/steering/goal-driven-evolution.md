@@ -90,9 +90,9 @@ memory_correct(
 
 4. If on a branch, validate then merge:
 ```
-memory_diff(source="goal_[name]_iter_[N]")   # preview changes
+memory_diff(source="goal_[name]_iter_[N]")        # preview changes (LCA-based diff)
 memory_checkout(name="main")
-memory_merge(source="goal_[name]_iter_[N]")   # merge validated results
+memory_merge(source="goal_[name]_iter_[N]", strategy="append")  # merge validated results
 memory_branch_delete(name="goal_[name]_iter_[N]")
 ```
 

@@ -32,24 +32,28 @@ class MockTransport(httpx.BaseTransport):
         if path == "/v1/memories/retrieve":
             return httpx.Response(
                 200,
-                json=[
-                    {
-                        "memory_id": "mem_001",
-                        "memory_type": "semantic",
-                        "content": "test memory",
-                    }
-                ],
+                json={
+                    "results": [
+                        {
+                            "memory_id": "mem_001",
+                            "memory_type": "semantic",
+                            "content": "test memory",
+                        }
+                    ]
+                },
             )
         if path == "/v1/memories/search":
             return httpx.Response(
                 200,
-                json=[
-                    {
-                        "memory_id": "mem_001",
-                        "memory_type": "semantic",
-                        "content": "test memory",
-                    }
-                ],
+                json={
+                    "results": [
+                        {
+                            "memory_id": "mem_001",
+                            "memory_type": "semantic",
+                            "content": "test memory",
+                        }
+                    ]
+                },
             )
         if path.endswith("/correct") and request.method == "PUT":
             return httpx.Response(

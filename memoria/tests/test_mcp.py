@@ -98,7 +98,8 @@ def _store(http, content, memory_type="semantic", session_id=None):
 def _retrieve(http, query, top_k=5):
     r = http.post("/v1/memories/retrieve", json={"query": query, "top_k": top_k})
     r.raise_for_status()
-    items = r.json()
+    data = r.json()
+    items = data.get("results", [])
     if not items:
         return "No relevant memories found."
     return "\n".join(f"- [{m['memory_type']}] {m['content']}" for m in items)
@@ -107,7 +108,8 @@ def _retrieve(http, query, top_k=5):
 def _search(http, query, top_k=10):
     r = http.post("/v1/memories/search", json={"query": query, "top_k": top_k})
     r.raise_for_status()
-    items = r.json()
+    data = r.json()
+    items = data.get("results", [])
     if not items:
         return "No memories found."
     return "\n".join(
@@ -376,3 +378,38 @@ class TestMCPSnapshotDiff:
         assert d["added_count"] >= 1
         assert "snapshot_count" in d
         assert "current_count" in d
+
+
+class TestMCPExplain:
+    """Test explain functionality in MCP text format."""
+
+    def test_retrieve_text_with_explain(self, http, user_and_key):
+        """Test that text format includes explain summary."""
+        _store(http, "Python is great for data science")
+
+        # Call via MCP backend (simulates actual MCP tool call)
+        r = http.post(
+            "/v1/memories/retrieve",
+            json={"query": "programming", "top_k": 5, "explain": "basic"},
+        )
+        assert r.status_code == 200
+        data = r.json()
+
+        # JSON format should have explain field
+        assert "results" in data
+        assert "explain" in data
+        assert data["explain"]["level"] == "basic"
+        assert "path" in data["explain"]
+
+    def test_search_text_with_explain(self, http, user_and_key):
+        """Test that search text format includes explain summary."""
+        r = http.post(
+            "/v1/memories/search",
+            json={"query": "test", "top_k": 5, "explain": "basic"},
+        )
+        assert r.status_code == 200
+        data = r.json()
+
+        assert "results" in data
+        assert "explain" in data
+        assert data["explain"]["level"] == "basic"

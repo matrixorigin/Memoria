@@ -706,7 +706,8 @@ class TestMemory:
             "/v1/memories/search", json={"query": "database", "top_k": 5}, headers=h
         )
         assert r.status_code == 200
-        results = r.json()
+        data = r.json()
+        results = data.get("results", [])
         assert len(results) >= 1
 
     def test_retrieve_returns_results(self, client, user_key):
@@ -715,6 +716,100 @@ class TestMemory:
             "/v1/memories/retrieve", json={"query": "favorite", "top_k": 5}, headers=h
         )
         assert r.status_code == 200
+
+    def test_retrieve_with_explain_basic(self, client, user_key):
+        _, h = user_key
+        # Store a memory to ensure we have data
+        client.post(
+            "/v1/memories",
+            json={
+                "content": "User loves Python programming",
+                "memory_type": "semantic",
+            },
+            headers=h,
+        )
+
+        r = client.post(
+            "/v1/memories/retrieve",
+            json={"query": "programming language", "top_k": 5, "explain": "basic"},
+            headers=h,
+        )
+        assert r.status_code == 200
+        data = r.json()
+
+        assert "results" in data
+        assert "explain" in data
+        explain = data["explain"]
+        assert explain["version"] == "1.0"
+        assert explain["level"] == "basic"
+        assert "total_ms" in explain
+        assert explain["total_ms"] > 0
+
+        # Verify actual execution path data is included
+        assert "path" in explain, "Missing execution path from retrieval strategy"
+        assert explain["path"] in [
+            "graph",
+            "vector",
+            "graph+vector",
+            "vector_fallback",
+        ], f"Unexpected path: {explain['path']}"
+        # Should have path from retrieval strategy
+        assert "path" in explain or "metrics" in explain
+
+    def test_retrieve_with_explain_verbose(self, client, user_key):
+        _, h = user_key
+        r = client.post(
+            "/v1/memories/retrieve",
+            json={"query": "favorite", "top_k": 5, "explain": "verbose"},
+            headers=h,
+        )
+        assert r.status_code == 200
+        data = r.json()
+        assert "results" in data
+        assert "explain" in data
+        explain = data["explain"]
+        assert explain["level"] == "verbose"
+        assert "total_ms" in explain
+        # Verbose should include metrics with detailed stats
+        assert "metrics" in explain or "path" in explain
+
+    def test_retrieve_with_explain_analyze(self, client, user_key):
+        _, h = user_key
+        r = client.post(
+            "/v1/memories/retrieve",
+            json={"query": "favorite", "top_k": 5, "explain": "analyze"},
+            headers=h,
+        )
+        assert r.status_code == 200
+        data = r.json()
+        assert "results" in data
+        assert "explain" in data
+        explain = data["explain"]
+        assert explain["level"] == "analyze"
+
+    def test_search_with_explain(self, client, user_key):
+        _, h = user_key
+        r = client.post(
+            "/v1/memories/search",
+            json={"query": "test", "top_k": 5, "explain": "basic"},
+            headers=h,
+        )
+        assert r.status_code == 200
+        data = r.json()
+        assert "results" in data
+        assert "explain" in data
+
+    def test_retrieve_with_explain_none(self, client, user_key):
+        _, h = user_key
+        r = client.post(
+            "/v1/memories/retrieve",
+            json={"query": "favorite", "top_k": 5, "explain": "none"},
+            headers=h,
+        )
+        assert r.status_code == 200
+        data = r.json()
+        assert "results" in data
+        assert "explain" not in data
 
     def test_purge_by_type_db(self, client, db):
         uid, h, _ = _make_user(client)

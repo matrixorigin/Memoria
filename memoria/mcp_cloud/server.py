@@ -62,7 +62,8 @@ def create_server(api_url: str, api_key: str) -> FastMCP:
         """
         r = client.post("/v1/memories/retrieve", json={"query": query, "top_k": top_k})
         r.raise_for_status()
-        items = r.json()
+        data = r.json()
+        items = data.get("results", [])
         if format == "json":
             return _json_dumps(
                 {
@@ -95,7 +96,8 @@ def create_server(api_url: str, api_key: str) -> FastMCP:
         """
         r = client.post("/v1/memories/search", json={"query": query, "top_k": top_k})
         r.raise_for_status()
-        items = r.json()
+        data = r.json()
+        items = data.get("results", [])
         if format == "json":
             return _json_dumps(
                 {
@@ -208,7 +210,9 @@ def create_server(api_url: str, api_key: str) -> FastMCP:
                 "/v1/memories/search", json={"query": topic, "top_k": 50}
             )
             hits.raise_for_status()
-            ids = [h["memory_id"] for h in hits.json()]
+            hits_data = hits.json()
+            hits_items = hits_data.get("results", [])
+            ids = [h["memory_id"] for h in hits_items]
             if not ids:
                 if format == "json":
                     return _json_dumps({"status": "ok", "purged": 0})
