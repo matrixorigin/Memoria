@@ -31,3 +31,4 @@ spacy_models/
 # Claude
 .claude
 .mcp.json
+CLAUDE.md
