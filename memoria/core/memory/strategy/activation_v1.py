@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any
 
-from memoria.core.explain import set_explain_path
+from memoria.core.explain import explain_timer, set_explain_path
 from memoria.core.memory.graph.retriever import ActivationRetriever
 from memoria.core.memory.types import Memory, MemoryType, TrustTier
 
@@ -101,21 +101,27 @@ class ActivationRetrievalStrategy:
         graph_memories: list[Memory] = []
         if query_embedding:
             try:
-                activated = self._activation_retriever.retrieve(
-                    user_id,
-                    query,
-                    query_embedding,
-                    top_k=top_k,
-                    task_type=task_type,
-                )
-                if activated:
-                    graph_memories = self._nodes_to_memories(activated, user_id)
-                    graph_memories = _apply_post_filters(
-                        graph_memories,
-                        memory_types=memory_types,
-                        session_id=session_id,
-                        include_cross_session=include_cross_session,
+                with explain_timer("phase1_graph_activation") as timer:
+                    activated = self._activation_retriever.retrieve(
+                        user_id,
+                        query,
+                        query_embedding,
+                        top_k=top_k,
+                        task_type=task_type,
                     )
+                    timer.add_metric("candidates_returned", len(activated))
+
+                    if activated:
+                        graph_memories = self._nodes_to_memories(activated, user_id)
+                        timer.add_metric("memories_converted", len(graph_memories))
+
+                        graph_memories = _apply_post_filters(
+                            graph_memories,
+                            memory_types=memory_types,
+                            session_id=session_id,
+                            include_cross_session=include_cross_session,
+                        )
+                        timer.add_metric("after_filters", len(graph_memories))
             except Exception:
                 logger.warning(
                     "Activation retrieval failed, using vector fallback",
@@ -136,31 +142,39 @@ class ActivationRetrievalStrategy:
             return graph_memories[:top_k], explain_info
 
         # Graph insufficient — supplement with vector results
-        vec_memories, vec_explain = self._get_vector_fallback().retrieve(
-            user_id,
-            query,
-            query_embedding,
-            top_k=top_k,
-            task_type=task_type,
-            session_id=session_id,
-            memory_types=memory_types,
-            weights=weights,
-            include_cross_session=include_cross_session,
-            explain=explain,
-        )
+        with explain_timer("phase2_vector_fallback") as timer:
+            vec_memories, vec_explain = self._get_vector_fallback().retrieve(
+                user_id,
+                query,
+                query_embedding,
+                top_k=top_k,
+                task_type=task_type,
+                session_id=session_id,
+                memory_types=memory_types,
+                weights=weights,
+                include_cross_session=include_cross_session,
+                explain=explain,
+            )
+            timer.add_metric("vector_results", len(vec_memories))
 
         # Merge: deduplicate, then sort by retrieval_score descending.
         # Graph results have activation-based scores; vector results have
         # vector/keyword scores. Sorting by score lets the best results win
         # regardless of which path produced them.
-        seen: set[str] = set()
-        pool: list[Memory] = []
-        for m in graph_memories + vec_memories:
-            if m.memory_id not in seen:
-                seen.add(m.memory_id)
-                pool.append(m)
-        pool.sort(key=lambda m: m.retrieval_score or 0.0, reverse=True)
-        merged = pool[:top_k]
+        with explain_timer("merge_rerank") as timer:
+            seen: set[str] = set()
+            pool: list[Memory] = []
+            for m in graph_memories + vec_memories:
+                if m.memory_id not in seen:
+                    seen.add(m.memory_id)
+                    pool.append(m)
+            pool.sort(key=lambda m: m.retrieval_score or 0.0, reverse=True)
+            merged = pool[:top_k]
+
+            timer.add_metric("graph_candidates", len(graph_memories))
+            timer.add_metric("vector_candidates", len(vec_memories))
+            timer.add_metric("unique_after_dedup", len(pool))
+            timer.add_metric("final_results", len(merged))
 
         path = "graph+vector" if graph_memories else "vector_fallback"
         set_explain_path(path)

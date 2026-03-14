@@ -413,3 +413,31 @@ class TestMCPExplain:
         assert "results" in data
         assert "explain" in data
         assert data["explain"]["level"] == "basic"
+
+    def test_retrieve_with_verbose_explain(self, http, user_and_key):
+        """Test that verbose explain includes detailed phase metrics."""
+        _store(http, "Python is great for data science")
+        _store(http, "JavaScript is popular for web development")
+
+        r = http.post(
+            "/v1/memories/retrieve",
+            json={"query": "programming languages", "top_k": 5, "explain": "verbose"},
+        )
+        assert r.status_code == 200
+        data = r.json()
+
+        # Should have explain with detailed metrics
+        assert "explain" in data
+        assert data["explain"]["level"] == "verbose"
+        assert "total_ms" in data["explain"]
+        assert "path" in data["explain"]
+
+        # Print for inspection
+        import json
+
+        print("\n=== EXPLAIN OUTPUT ===")
+        print(json.dumps(data["explain"], indent=2))
+
+        # Should have phase metrics (phase1, phase2, or merge depending on path)
+        metrics = data["explain"].get("metrics", {})
+        assert len(metrics) > 0, "Should have phase metrics in verbose mode"

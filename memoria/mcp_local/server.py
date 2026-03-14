@@ -63,7 +63,12 @@ class MemoryBackend(ABC):
     ) -> dict: ...
     @abstractmethod
     def retrieve(
-        self, user_id: str, query: str, top_k: int, session_id: str | None = None
+        self,
+        user_id: str,
+        query: str,
+        top_k: int,
+        session_id: str | None = None,
+        explain: bool = False,
     ) -> list[dict]: ...
     @abstractmethod
     def correct(
@@ -80,7 +85,9 @@ class MemoryBackend(ABC):
     @abstractmethod
     def profile(self, user_id: str) -> dict: ...
     @abstractmethod
-    def search(self, user_id: str, query: str, top_k: int) -> list[dict]: ...
+    def search(
+        self, user_id: str, query: str, top_k: int, explain: bool = False
+    ) -> list[dict]: ...
     @abstractmethod
     def governance(self, user_id: str, force: bool = False) -> dict: ...
     @abstractmethod
@@ -266,7 +273,12 @@ class EmbeddedBackend(MemoryBackend):
         return result
 
     def retrieve(
-        self, user_id: str, query: str, top_k: int, session_id: str | None = None
+        self,
+        user_id: str,
+        query: str,
+        top_k: int,
+        session_id: str | None = None,
+        explain: bool = False,
     ) -> list[dict]:
         db_factory = self._branch_db_factory(user_id)
         svc = self._create_service(db_factory, user_id=user_id)
@@ -281,13 +293,42 @@ class EmbeddedBackend(MemoryBackend):
                 logger.warning(
                     "Query embedding failed, falling back to keyword search: %s", e
                 )
-        memories, _ = svc.retrieve(
+        memories, _meta = svc.retrieve(
             user_id,
             query,
             query_embedding=query_embedding,
             top_k=top_k,
             session_id=session_id or "",
+            explain=explain,
         )
+
+        # Bridge old explain system data if available (when explain=True)
+        if explain and _meta:
+            from dataclasses import asdict
+
+            from memoria.core.explain import get_explain_ctx
+            from memoria.core.memory.tabular.explain import RetrievalStats
+
+            explain_ctx = get_explain_ctx()
+            if explain_ctx:
+                # Handle RetrievalStats object
+                if isinstance(_meta, RetrievalStats):
+                    # Convert to dict and merge all fields
+                    meta_dict = asdict(_meta)
+                    for k, v in meta_dict.items():
+                        if k == "candidate_scores":
+                            # Skip large nested structures
+                            continue
+                        explain_ctx.add_metric(k, v)
+                # Handle simple dict (from activation strategy)
+                elif isinstance(_meta, dict):
+                    if "path" in _meta:
+                        explain_ctx.set_path(_meta["path"])
+                    # Merge other metrics
+                    for k, v in _meta.items():
+                        if k != "path":
+                            explain_ctx.add_metric(k, v)
+
         return [
             {
                 "memory_id": m.memory_id,
@@ -405,8 +446,10 @@ class EmbeddedBackend(MemoryBackend):
         svc = self._create_service(db_factory, user_id=user_id)
         return {"user_id": user_id, "profile": svc.get_profile(user_id)}
 
-    def search(self, user_id: str, query: str, top_k: int) -> list[dict]:
-        return self.retrieve(user_id, query, top_k)
+    def search(
+        self, user_id: str, query: str, top_k: int, explain: bool = False
+    ) -> list[dict]:
+        return self.retrieve(user_id, query, top_k, explain=explain)
 
     # Cooldown: governance/consolidate/reflect are expensive, throttle per user.
     # key = (user_id, op_name), value = (timestamp, result).
@@ -1566,7 +1609,12 @@ class HTTPBackend(MemoryBackend):
         return r.json()
 
     def retrieve(
-        self, user_id: str, query: str, top_k: int, session_id: str | None = None
+        self,
+        user_id: str,
+        query: str,
+        top_k: int,
+        session_id: str | None = None,
+        explain: bool = False,
     ) -> list[dict]:
         payload: dict[str, Any] = {"query": query, "top_k": top_k}
         # Only include session_id in payload if provided (not None).
@@ -1574,6 +1622,8 @@ class HTTPBackend(MemoryBackend):
         # and "empty session context" (""), enabling proper cross-session retrieval behavior.
         if session_id:
             payload["session_id"] = session_id
+        if explain:
+            payload["explain"] = "basic"
         r = self._client.post("/v1/memories/retrieve", json=payload)
         r.raise_for_status()
         return r.json()
@@ -1640,10 +1690,13 @@ class HTTPBackend(MemoryBackend):
         r.raise_for_status()
         return r.json()
 
-    def search(self, user_id: str, query: str, top_k: int) -> list[dict]:
-        r = self._client.post(
-            "/v1/memories/search", json={"query": query, "top_k": top_k}
-        )
+    def search(
+        self, user_id: str, query: str, top_k: int, explain: bool = False
+    ) -> list[dict]:
+        payload: dict[str, Any] = {"query": query, "top_k": top_k}
+        if explain:
+            payload["explain"] = "basic"
+        r = self._client.post("/v1/memories/search", json=payload)
         r.raise_for_status()
         return r.json()
 
@@ -1875,7 +1928,13 @@ def create_server(backend: MemoryBackend, default_user: str = "default") -> Fast
         explain_ctx = init_explain(explain)
 
         try:
-            results = backend.retrieve(uid, query, top_k, session_id=session_id)
+            results = backend.retrieve(
+                uid,
+                query,
+                top_k,
+                session_id=session_id,
+                explain=explain_ctx is not None,
+            )
             warnings = backend.health_warnings(uid)
 
             response: dict[str, Any] = {
@@ -2081,7 +2140,12 @@ def create_server(backend: MemoryBackend, default_user: str = "default") -> Fast
         explain_ctx = init_explain(explain)
 
         try:
-            results = backend.search(_user(user_id), query, max(1, min(top_k, 100)))
+            results = backend.search(
+                _user(user_id),
+                query,
+                max(1, min(top_k, 100)),
+                explain=explain_ctx is not None,
+            )
 
             response: dict[str, Any] = {
                 "status": "ok",

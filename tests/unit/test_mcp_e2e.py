@@ -70,7 +70,12 @@ class FakeBackend(MemoryBackend):
         return {"memory_id": mid, "content": content}
 
     def retrieve(
-        self, user_id: str, query: str, top_k: int, session_id: str | None = None
+        self,
+        user_id: str,
+        query: str,
+        top_k: int,
+        session_id: str | None = None,
+        explain: bool = False,
     ) -> list[dict]:
         with self._lock:
             results = [
@@ -128,8 +133,10 @@ class FakeBackend(MemoryBackend):
             count = sum(1 for r in self._memories.values() if r["user_id"] == user_id)
         return {"user_id": user_id, "memory_count": count}
 
-    def search(self, user_id: str, query: str, top_k: int) -> list[dict]:
-        return self.retrieve(user_id, query, top_k)
+    def search(
+        self, user_id: str, query: str, top_k: int, explain: bool = False
+    ) -> list[dict]:
+        return self.retrieve(user_id, query, top_k, explain=explain)
 
     # ── Maintenance (stubs) ───────────────────────────────────────────
 
