@@ -163,7 +163,7 @@ def _configure_cursor(project_dir: Path, entry: dict, force: bool) -> list[str]:
 
 
 def _configure_claude(project_dir: Path, entry: dict, force: bool) -> list[str]:
-    actions = [_write_mcp_json(project_dir / ".claude/mcp.json", entry, project_dir)]
+    actions = [_write_mcp_json(project_dir / ".mcp.json", entry, project_dir)]
     claude_md = project_dir / "CLAUDE.md"
     rule = _claude_rule()
     if claude_md.exists():
@@ -225,7 +225,7 @@ def cmd_status(args: argparse.Namespace) -> None:
     mcp_paths = {
         "kiro": project_dir / ".kiro/settings/mcp.json",
         "cursor": project_dir / ".cursor/mcp.json",
-        "claude": project_dir / ".claude/mcp.json",
+        "claude": project_dir / ".mcp.json",
     }
     for tool in ("kiro", "cursor", "claude"):
         mcp = mcp_paths[tool]

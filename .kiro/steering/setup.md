@@ -112,7 +112,7 @@ memoria init  # + embedding flags if applicable
 # If you need to customize (database URL, embedding settings), edit the file now before restarting:
 # - Kiro: .kiro/settings/mcp.json
 # - Cursor: .cursor/mcp.json
-# - Claude Code: .claude/mcp.json"
+# - Claude Code: .mcp.json"
 ```
 
 ### Path B: MatrixOne Cloud

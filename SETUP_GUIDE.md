@@ -234,7 +234,7 @@ cd <project-directory>
 memoria init
 ```
 This creates:
-- `.claude/mcp.json` — MCP server config
+- `.mcp.json` — MCP server config
 - `CLAUDE.md` — rules appended or created
 
 ### Custom database URL:

@@ -231,7 +231,7 @@ memoria init --embedding-provider openai \
 This creates:
 - **Kiro**: `.kiro/settings/mcp.json` + `.kiro/steering/memory.md`
 - **Cursor**: `.cursor/mcp.json` + `.cursor/rules/memory.mdc`
-- **Claude**: `.claude/mcp.json` + `CLAUDE.md`
+- **Claude**: `.mcp.json` + `CLAUDE.md`
 
 Then restart your AI tool — database tables are created automatically when the MCP server starts.
 
@@ -251,7 +251,7 @@ Or ask your AI tool: *"Do you have memory tools available?"* — it should list 
 
 - **Kiro**: `.kiro/settings/mcp.json`
 - **Cursor**: `.cursor/mcp.json`
-- **Claude**: `.claude/mcp.json`
+- **Claude**: `.mcp.json`
 
 **Switch from local DB to remote server:**
 ```json
