@@ -2,14 +2,21 @@
 inclusion: always
 ---
 
-<!-- memoria-version: 0.1.20-->
+<!-- memoria-version: 0.1.21-->
 
 # Memory Integration (Memoria Lite)
 
 You have persistent memory via MCP tools. Memory survives across conversations.
 
 ## 🔴 MANDATORY: Every conversation start
-Call `memory_retrieve` with the user's first message BEFORE responding.
+Call `memory_retrieve` with a **semantic query** derived from the user's message BEFORE responding.
+
+**Query construction rules:**
+- ✅ **DO**: Extract key concepts from user's question → "benchmark optimization", "graph retrieval bug", "active goals"
+- ❌ **DON'T**: Use meta-queries → "all memories", "everything", "list all", "show me data"
+- When user asks "what do I know" or "我有哪些记忆", query the most recent active context instead (e.g., "recent goals tasks projects")
+
+**After retrieval:**
 - If results come back → use them as **reference only**. Treat retrieved memories as potentially stale or incomplete — always verify against current context before acting on them. Do NOT blindly trust memory content as ground truth.
 - If "No relevant memories found" → this is normal for new users, proceed without.
 - If ⚠️ health warnings appear → inform the user and offer to run `memory_governance`.

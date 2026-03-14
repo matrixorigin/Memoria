@@ -1,4 +1,8 @@
-<!-- memoria-version: 0.1.21-->
+---
+inclusion: always
+---
+
+<!-- memoria-version: 0.1.20-->
 
 # Memory Integration (Memoria Lite)
 
@@ -27,6 +31,40 @@ After responding, decide if anything is worth remembering:
 **Deduplication is automatic.** The system detects semantically similar memories and supersedes old ones. You do not need to check for duplicates before storing.
 
 If `memory_store` or `memory_correct` response contains ⚠️, tell the user — it means the embedding service is down and retrieval will degrade to keyword-only search.
+
+## 🟡 When NOT to store (noise reduction)
+Do NOT call `memory_store` for:
+- **Transient debug context**: temporary print statements, one-off test values, ephemeral error messages
+- **Vague or low-confidence observations**: "might be using X", "probably prefers Y" — wait for confirmation
+- **Conversation-specific context** that won't matter next session: "currently looking at line 42", "just ran the test"
+- **Information already in memory**: if `memory_retrieve` already returned it, don't store again
+- **Trivial or obvious facts**: "user is writing code", "user asked a question"
+
+## 🟡 Working memory lifecycle — CRITICAL for long debug sessions
+`working` memories are session-scoped temporary context. They **persist and will be retrieved in future sessions** unless explicitly cleaned up.
+
+**When to purge working memories:**
+- Task or debug session is complete → `memory_purge(topic="<task keyword>", reason="task complete")`
+- You stored a working memory that turned out to be wrong → `memory_purge(memory_id="...", reason="incorrect conclusion")`
+- User says "start fresh", "forget what we tried", "let's try a different approach"
+
+**When a working memory contradicts current findings:**
+- Do NOT keep both. Purge the stale one immediately: `memory_purge(memory_id="...", reason="superseded by new finding")`
+- Then store the correct conclusion as `semantic` (not `working`) if it's a durable fact
+
+**Anti-pattern to avoid:** Storing "current bug is X" as working memory, then later finding out it's Y, but keeping both. The stale "bug is X" memory will keep surfacing and misleading future retrieval.
+
+## 🟡 Correction workflow (prefer correct over store+purge)
+When the user contradicts a previously stored fact:
+1. **Always use `memory_correct`** — not `memory_store` + `memory_purge`. This preserves the audit trail.
+2. **Prefer query-based correction**: `memory_correct(query="formatting tool", new_content="Uses ruff for formatting", reason="switched from black")` — no need to look up memory_id first.
+3. **Only use `memory_purge`** when the user explicitly asks to forget something entirely, not when updating a fact.
+
+## 🟡 Deduplication before storing
+Before storing a new memory, consider:
+- Did `memory_retrieve` at conversation start already return a similar fact? → skip or `memory_correct` instead
+- Is this a refinement of something already stored? → use `memory_correct` with the original as query
+- When in doubt, `memory_search` with the key phrase first — if a match exists, correct it rather than creating a duplicate
 
 ## Tool reference
 
