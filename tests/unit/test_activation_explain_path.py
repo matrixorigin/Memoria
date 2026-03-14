@@ -72,7 +72,8 @@ def test_activation_sets_path_graph():
     ctx = get_explain_ctx()
     assert ctx is not None
     assert ctx.path == "graph"
-    assert explain_info["path"] == "graph"
+    # explain_info is None now — all data in context
+    assert explain_info is None
 
 
 def test_activation_sets_path_hybrid():
@@ -140,7 +141,8 @@ def test_activation_sets_path_hybrid():
     ctx = get_explain_ctx()
     assert ctx is not None
     assert ctx.path == "graph+vector"
-    assert explain_info["path"] == "graph+vector"
+    # explain_info is None now — all data in context
+    assert explain_info is None
 
 
 def test_activation_sets_path_fallback():
@@ -179,4 +181,5 @@ def test_activation_sets_path_fallback():
     ctx = get_explain_ctx()
     assert ctx is not None
     assert ctx.path == "vector_fallback"
-    assert explain_info["path"] == "vector_fallback"
+    # explain_info is None now — all data in context
+    assert explain_info is None

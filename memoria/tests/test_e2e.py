@@ -787,6 +787,19 @@ class TestMemory:
         explain = data["explain"]
         assert explain["level"] == "analyze"
 
+        # CRITICAL: analyze mode must include phases with detailed metrics
+        assert "phases" in explain, "analyze mode must include phases"
+        phases = explain["phases"]
+        assert len(phases) > 0, "phases must not be empty in analyze mode"
+
+        # Verify each phase has timing and metrics
+        for phase_name, phase_data in phases.items():
+            assert "ms" in phase_data, f"phase {phase_name} must have timing"
+            # analyze mode should have rich metrics
+            assert len(phase_data) > 1, (
+                f"phase {phase_name} should have detailed metrics"
+            )
+
     def test_search_with_explain(self, client, user_key):
         _, h = user_key
         r = client.post(

@@ -432,12 +432,21 @@ class TestMCPExplain:
         assert "total_ms" in data["explain"]
         assert "path" in data["explain"]
 
+        # CRITICAL: Must have phases with actual phase data
+        assert "phases" in data["explain"], "verbose mode must include phases"
+        phases = data["explain"]["phases"]
+        assert len(phases) > 0, "phases must not be empty"
+
+        # Verify phase structure (at least one phase should have metrics)
+        for phase_name, phase_data in phases.items():
+            assert "ms" in phase_data, f"phase {phase_name} must have 'ms' field"
+            # verbose mode should include metrics beyond just timing
+            assert len(phase_data) > 1, (
+                f"phase {phase_name} should have metrics beyond 'ms'"
+            )
+
         # Print for inspection
         import json
 
         print("\n=== EXPLAIN OUTPUT ===")
         print(json.dumps(data["explain"], indent=2))
-
-        # Should have phase metrics (phase1, phase2, or merge depending on path)
-        metrics = data["explain"].get("metrics", {})
-        assert len(metrics) > 0, "Should have phase metrics in verbose mode"

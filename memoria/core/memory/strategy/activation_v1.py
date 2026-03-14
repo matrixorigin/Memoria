@@ -136,10 +136,8 @@ class ActivationRetrievalStrategy:
                 len(graph_memories),
             )
             set_explain_path("graph")
-            explain_info = (
-                {"path": "graph", "results": len(graph_memories)} if explain else None
-            )
-            return graph_memories[:top_k], explain_info
+            # explain_timer already collected phase1 data in explain context
+            return graph_memories[:top_k], None
 
         # Graph insufficient — supplement with vector results
         with explain_timer("phase2_vector_fallback") as timer:
@@ -186,13 +184,9 @@ class ActivationRetrievalStrategy:
             len(vec_memories),
             len(merged),
         )
-        if explain:
-            return merged, {
-                "path": path,
-                "graph_results": len(graph_memories),
-                "vec_explain": vec_explain,
-            }
-        return merged, vec_explain
+        # explain_timer already collected all phase data in explain context
+        # No need to return dict —桥接逻辑会从 context 读取
+        return merged, None
 
     def _get_vector_fallback(self) -> Any:
         """Lazy-init vector fallback."""
