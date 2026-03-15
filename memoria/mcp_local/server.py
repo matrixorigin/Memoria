@@ -1917,7 +1917,7 @@ def create_server(backend: MemoryBackend, default_user: str = "default") -> Fast
             user_id: User ID (optional).
             session_id: Session context (optional). When set, prioritizes this session's memories.
             format: 'text' (default) or 'json' for structured response.
-            explain: false (default) = no debug, true = show timing and retrieval path, 'verbose' = detailed metrics, 'analyze' = full diagnostics. Use when debugging query issues.
+            explain: false (default) = no debug, true = show timing and retrieval path, 'verbose' = detailed metrics, 'analyze' = full diagnostics. **DO NOT use unless user explicitly asks to debug slow queries or investigate retrieval quality.** Adds overhead.
         """
         from memoria.core.explain import init_explain, clear_explain
 
@@ -2132,7 +2132,7 @@ def create_server(backend: MemoryBackend, default_user: str = "default") -> Fast
             top_k: Max results (default 10).
             user_id: User ID (optional).
             format: 'text' (default) or 'json' for structured response.
-            explain: false (default) = no debug, true = show timing and retrieval path, 'verbose' = detailed metrics. Use when debugging query issues.
+            explain: false (default) = no debug, true = show timing and retrieval path, 'verbose' = detailed metrics. **DO NOT use unless user explicitly asks to debug slow queries or investigate retrieval quality.** Adds overhead.
         """
         from memoria.core.explain import init_explain, clear_explain
 
