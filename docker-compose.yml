@@ -53,7 +53,7 @@ services:
         INSTALL_EXTRAS: ${INSTALL_EXTRAS:-}
     hostname: memoria-api
     ports:
-      - "${API_PORT:-8100}:8000"
+      - "${API_PORT:-8100}:8100"
     environment:
       - MEMORIA_DB_HOST=matrixone
       - MEMORIA_DB_PORT=6001

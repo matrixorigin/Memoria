@@ -160,6 +160,7 @@ def _ddl_statements(dim: int) -> list[str]:
           `trust_tier`         VARCHAR(10)  DEFAULT NULL,
           `embedding`          VECF32({dim}) DEFAULT NULL,
           `source_event_ids`   JSON         NOT NULL,
+          `extra_metadata`     JSON         DEFAULT NULL,
           `superseded_by`      VARCHAR(64)  DEFAULT NULL,
           `is_active`          SMALLINT     NOT NULL DEFAULT 1,
           `observed_at`        DATETIME(6)  NOT NULL,
@@ -346,6 +347,23 @@ def _ensure_entity_type_column(conn: Any) -> None:
         )
 
 
+def _ensure_metadata_column(conn: Any) -> None:
+    """Add extra_metadata JSON column to mem_memories if it doesn't exist (for episodic memory)."""
+    row = conn.execute(
+        text(
+            "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS "
+            "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME='mem_memories' AND COLUMN_NAME='extra_metadata'"
+        )
+    ).fetchone()
+    if row is None:
+        logger.info("Adding extra_metadata column to mem_memories")
+        conn.execute(
+            text(
+                "ALTER TABLE `mem_memories` ADD COLUMN `extra_metadata` JSON DEFAULT NULL AFTER `source_event_ids`"
+            )
+        )
+
+
 def ensure_tables(
     engine: Engine, *, dim: int | None = None, force: bool = False
 ) -> list[str]:
@@ -373,5 +391,6 @@ def ensure_tables(
             created.append(name)
         _fix_embedding_dim(conn, dim, force=force)
         _ensure_entity_type_column(conn)
+        _ensure_metadata_column(conn)
         conn.commit()
     return created

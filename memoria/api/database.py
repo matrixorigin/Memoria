@@ -92,10 +92,26 @@ def get_db_context():
 
 
 def init_db():
+    from sqlalchemy.sql.ddl import CreateIndex, CreateTable
+
     from memoria.api.models import Base
 
     engine = _get_engine()
-    Base.metadata.create_all(bind=engine, checkfirst=True)
+    # Use IF NOT EXISTS instead of checkfirst to avoid TOCTOU races
+    # when multiple processes initialise the same database concurrently
+    # (e.g. pytest-xdist workers).  MatrixOne's dialect supports has_table()
+    # but the check-then-create is not atomic, so a parallel worker can
+    # slip in between the check and the CREATE TABLE.
+    with engine.begin() as conn:
+        for table in Base.metadata.sorted_tables:
+            conn.execute(CreateTable(table, if_not_exists=True))
+            for idx in table.indexes:
+                try:
+                    conn.execute(CreateIndex(idx))
+                except Exception as exc:
+                    # 1061 = duplicate key name (index already exists)
+                    if "1061" not in str(exc):
+                        raise
 
     from memoria.schema import ensure_tables
 

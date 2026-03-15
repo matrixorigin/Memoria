@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mo-memoria"
-version = "0.1.22"
+version = "0.1.23"
 description = "Multi-tenant memory service for AI assistants"
 readme = "README.pypi.md"
 requires-python = ">=3.11"
@@ -59,6 +59,30 @@ markers = [
     "slow: marks tests as slow (e2e, subprocess per test)",
     "benchmark: marks performance benchmark tests",
     "local_embedding: marks tests requiring local sentence-transformers",
+    "integration: marks integration tests requiring a live database",
+]
+
+[tool.coverage.run]
+source = ["memoria"]
+omit = [
+    "memoria/tests/*",
+    "memoria/cli.py",
+    "memoria/api/main.py",
+    "memoria/mcp_local/__main__.py",
+    "memoria/core/logging_config.py",
+    "memoria/core/memory/benchmark/grid_search.py",
+    "memoria/core/memory/benchmark/report_html.py",
+    "memoria/core/memory/benchmark/executor.py",
+]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+    "\\.\\.\\.",
+    "pass",
 ]
 
 [tool.mypy]
@@ -78,6 +102,7 @@ module = [
     "memoria.core.llm",
     "memoria.api.routers.snapshots",
     "memoria.api.routers.auth",
+    "memoria.api.routers.sessions",
     "memoria.core.memory.editor",
     "memoria.core.memory.service",
 ]

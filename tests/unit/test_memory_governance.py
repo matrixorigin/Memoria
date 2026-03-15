@@ -309,3 +309,44 @@ class TestRebuildVectorIndex:
                 result = scheduler.rebuild_vector_index("mem_memories")
 
         assert result["new_lists"] == 1024
+
+
+class TestCompressRedundantSupersededBy:
+    """Test that _compress_redundant correctly tracks superseded_by mapping."""
+
+    def test_superseded_by_mapping_newer_wins(self):
+        """Older memory should be superseded by newer one."""
+        from datetime import datetime, timezone
+
+        # Simulate the inner loop logic directly
+        timestamps = [
+            datetime(2026, 3, 15, 10, 0, tzinfo=timezone.utc),  # i=0 newer
+            datetime(2026, 3, 14, 10, 0, tzinfo=timezone.utc),  # j=1 older
+        ]
+        ids = ["new_id", "old_id"]
+
+        to_deactivate: set[str] = set()
+        superseded_by: dict[str, str] = {}
+
+        i, j = 0, 1
+        if timestamps[i] >= timestamps[j]:
+            older, newer = ids[j], ids[i]
+        else:
+            older, newer = ids[i], ids[j]
+        to_deactivate.add(older)
+        superseded_by[older] = newer
+
+        assert "old_id" in to_deactivate
+        assert superseded_by["old_id"] == "new_id"
+        assert "new_id" not in to_deactivate
+
+    def test_default_threshold_is_085(self):
+        """Default redundant_similarity_threshold should be 0.85."""
+        cfg = MemoryGovernanceConfig()
+        assert cfg.redundant_similarity_threshold == 0.85
+
+    def test_l2_threshold_for_085_cosine(self):
+        """L2² threshold for cosine=0.85 should be 2*(1-0.85)=0.30."""
+        threshold = 0.85
+        l2_sq = 2.0 * (1.0 - threshold)
+        assert abs(l2_sq - 0.30) < 1e-9

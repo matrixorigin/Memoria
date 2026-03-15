@@ -197,12 +197,14 @@ class CanonicalStorage:
         messages: list[dict[str, Any]],
         *,
         source_event_ids: list[str] | None = None,
+        session_id: str | None = None,
     ) -> list[Memory]:
         """Extract and persist memories from a conversation turn."""
         memories, _ = self._observer_lazy.observe(
             user_id=user_id,
             messages=messages,
             source_event_ids=source_event_ids,
+            session_id=session_id,
         )
         return memories
 

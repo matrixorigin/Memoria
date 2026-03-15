@@ -140,19 +140,21 @@ class MemoryService:
         messages: list[dict[str, Any]],
         *,
         source_event_ids: list[str] | None = None,
+        session_id: str | None = None,
     ) -> list[Memory]:
         """Extract memories from turn, then update index."""
         memories = self._storage.observe_turn(
             user_id,
             messages,
             source_event_ids=source_event_ids,
+            session_id=session_id,
         )
         if self._index_manager and memories:
-            session_id = memories[0].session_id if memories else None
+            sid = session_id or (memories[0].session_id if memories else None)
             self._index_manager.on_memories_stored(
                 user_id,
                 memories,
-                session_id=session_id,
+                session_id=sid,
             )
         return memories
 

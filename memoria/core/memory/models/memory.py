@@ -51,6 +51,9 @@ class MemoryRecord(Base):
     trust_tier = Column(String(10), default="T3", nullable=True)
     embedding = Column(VectorType(EMBEDDING_DIM, VectorPrecision.F32))
     source_event_ids = Column(JSON, nullable=False, default=list)
+    extra_metadata = Column(
+        JSON, nullable=True
+    )  # For episodic and other structured metadata
     superseded_by = Column(String(64), nullable=True)
     # access_count moved to mem_memories_stats table
     is_active = Column(SmallInteger, server_default="1", nullable=False)

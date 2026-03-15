@@ -13,6 +13,10 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import text
 
+# Same group as test_e2e.py — all run on one worker, serially.
+pytestmark = pytest.mark.xdist_group("e2e_serial")
+
+
 MASTER_KEY = "e2e-master-key"
 os.environ["MEMORIA_MASTER_KEY"] = MASTER_KEY
 

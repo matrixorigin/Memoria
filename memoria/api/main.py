@@ -82,11 +82,20 @@ from memoria.api.middleware import RateLimitMiddleware  # noqa: E402
 
 app.add_middleware(RateLimitMiddleware)
 
-from memoria.api.routers import auth, memory, snapshots, health, admin, user_ops  # noqa: E402
+from memoria.api.routers import (  # noqa: E402
+    auth,
+    memory,
+    snapshots,
+    health,
+    admin,
+    user_ops,
+    sessions,
+)
 
 app.include_router(auth.router, prefix="/auth")
 app.include_router(memory.router, prefix="/v1")
 app.include_router(snapshots.router, prefix="/v1")
 app.include_router(user_ops.router, prefix="/v1")
+app.include_router(sessions.router, prefix="/v1")
 app.include_router(admin.router)
 app.include_router(health.router)

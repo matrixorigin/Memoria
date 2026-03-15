@@ -194,8 +194,14 @@ class TabularMemoryService:
         initial_confidence: float = 0.75,
         trust_tier: TrustTier = TrustTier.T3_INFERRED,
         session_id: str | None = None,
-    ) -> Memory:
-        """Store a single memory with contradiction detection."""
+        extra_metadata: dict[str, Any] | None = None,
+        generate_embedding: bool = True,
+    ) -> str:
+        """Store a single memory with contradiction detection.
+
+        Returns:
+            memory_id of the created memory
+        """
         mem, _ = self._observer_lazy.observe_explicit(
             user_id=user_id,
             content=content,
@@ -204,8 +210,10 @@ class TabularMemoryService:
             source_event_ids=source_event_ids,
             trust_tier=trust_tier,
             session_id=session_id,
+            extra_metadata=extra_metadata,
+            generate_embedding=generate_embedding,
         )
-        return mem
+        return mem.memory_id
 
     def observe_turn(
         self,
@@ -213,14 +221,81 @@ class TabularMemoryService:
         messages: list[dict[str, Any]],
         *,
         source_event_ids: list[str] | None = None,
+        session_id: str | None = None,
+        turn_count: int = 0,
     ) -> list[Memory]:
-        """Extract and persist memories from a conversation turn."""
+        """Extract and persist memories from a conversation turn.
+
+        If session_id and turn_count are provided, auto-triggers a lightweight
+        episodic summary when turn_count reaches the configured threshold.
+        """
         memories, _ = self._observer_lazy.observe(
             user_id=user_id,
             messages=messages,
             source_event_ids=source_event_ids,
         )
+
+        # Auto-trigger lightweight episodic summary
+        if session_id and turn_count > 0 and self._llm_client is not None:
+            threshold = self._config.auto_trigger_threshold
+            if threshold > 0 and turn_count % threshold == 0:
+                self._trigger_lightweight_summary_async(user_id, session_id, messages)
+
         return memories
+
+    def _trigger_lightweight_summary_async(
+        self,
+        user_id: str,
+        session_id: str,
+        messages: list[dict[str, Any]],
+    ) -> None:
+        """Fire-and-forget lightweight episodic summary in background thread."""
+        import threading
+
+        from memoria.core.memory.episodic import generate_lightweight_summary
+        from memoria.core.memory.episodic.tasks import get_task_manager
+        from memoria.core.memory.types import MemoryType
+
+        task_manager = get_task_manager()
+        if not task_manager.check_lightweight_rate_limit(session_id):
+            logger.debug(
+                "Auto-trigger skipped: lightweight rate limit reached for session %s",
+                session_id,
+            )
+            return
+        # Increment before spawning thread to prevent concurrent over-triggering
+        task_manager.increment_lightweight_count(session_id)
+
+        llm_client = self._llm_client
+        embed_fn = self._embed_fn
+
+        def _run() -> None:
+            try:
+                points, _ = generate_lightweight_summary(messages, llm_client)
+                content = "Session Highlights:\n" + "\n".join(f"• {p}" for p in points)
+                self.store(
+                    user_id=user_id,
+                    content=content,
+                    memory_type=MemoryType.EPISODIC,
+                    session_id=None,
+                    extra_metadata={
+                        "mode": "lightweight",
+                        "points": points,
+                        "auto_triggered": True,
+                    },
+                    generate_embedding=embed_fn is not None,
+                )
+                logger.debug(
+                    "Auto-triggered lightweight summary for session %s", session_id
+                )
+            except Exception as e:
+                logger.warning(
+                    "Auto-trigger lightweight summary failed for session %s: %s",
+                    session_id,
+                    e,
+                )
+
+        threading.Thread(target=_run, daemon=True).start()
 
     def run_pipeline(
         self,

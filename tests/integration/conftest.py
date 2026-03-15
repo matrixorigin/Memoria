@@ -72,10 +72,11 @@ def _get_session_local():
 def _init_tables():
     engine = _get_engine()
     from memoria.schema import ensure_tables
-    from memoria.core.base import Base
 
     ensure_tables(engine, dim=384, force=True)
-    Base.metadata.create_all(bind=engine, checkfirst=True)
+    # Note: Base.metadata.create_all() is NOT needed — ensure_tables() creates all tables
+    # including those defined in ORM models. Calling it would recreate tables without
+    # schema migrations (e.g., extra_metadata column).
 
 
 def _drop_worker_db():

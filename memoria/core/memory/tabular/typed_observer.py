@@ -63,11 +63,14 @@ class TypedObserver:
         messages: list[dict[str, Any]],
         source_event_ids: Optional[list[str]] = None,
         explain: bool = False,
+        session_id: Optional[str] = None,
     ) -> tuple[list[Memory], Optional[ObserverStats]]:
         start = time.time() if explain else 0
         stats = ObserverStats() if explain else None
 
-        candidates = self.extract_candidates(user_id, messages, source_event_ids)
+        candidates = self.extract_candidates(
+            user_id, messages, source_event_ids, session_id=session_id
+        )
         if stats:
             stats.memories_extracted = len(candidates)
 
@@ -92,6 +95,7 @@ class TypedObserver:
         user_id: str,
         messages: list[dict[str, Any]],
         source_event_ids: Optional[list[str]] = None,
+        session_id: Optional[str] = None,
     ) -> list[Memory]:
         """Extract candidate memories WITHOUT persisting. Applies sensitivity filter."""
         if not self.llm:
@@ -108,6 +112,9 @@ class TypedObserver:
             mem = self._parse_item(item, user_id, source_event_ids or [], now)
             if not mem:
                 continue
+
+            if session_id:
+                mem.session_id = session_id
 
             # Sensitivity filter — block HIGH-risk, redact MEDIUM-risk
             sensitivity = check_sensitivity(mem.content)
@@ -151,6 +158,8 @@ class TypedObserver:
         source_event_ids: Optional[list[str]] = None,
         trust_tier: TrustTier = TrustTier.T3_INFERRED,
         session_id: Optional[str] = None,
+        extra_metadata: Optional[dict[str, Any]] = None,
+        generate_embedding: bool = True,
         explain: bool = False,
     ) -> tuple[Memory, Optional[ContradictionStats]]:
         """Directly write a memory (from MemoryWriteTool), skipping LLM extraction."""
@@ -182,9 +191,10 @@ class TypedObserver:
             trust_tier=trust_tier,
             source_event_ids=source_event_ids or [],
             session_id=session_id,
+            extra_metadata=extra_metadata,
             observed_at=_utcnow(),
         )
-        if self.embed_fn:
+        if generate_embedding and self.embed_fn:
             try:
                 mem.embedding = self.embed_fn(content)
             except Exception as e:

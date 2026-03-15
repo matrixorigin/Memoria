@@ -549,6 +549,10 @@ class EmbeddedBackend(MemoryBackend):
                 from memoria.core.llm import get_llm_client
 
                 llm = get_llm_client()
+                if llm is None:
+                    return {
+                        "error": "LLM not configured — reflect unavailable. Set LLM_API_KEY to enable."
+                    }
             except Exception:
                 return {"error": "LLM client not available for reflection"}
 
@@ -641,20 +645,11 @@ class EmbeddedBackend(MemoryBackend):
         return f"Rebuilt IVF index for {table}: lists {result['old_lists']} → {result['new_lists']} (rows={result['total_rows']})"
 
     def extract_entities(self, user_id: str) -> dict:
-        try:
-            from memoria.core.memory.graph.service import GraphMemoryService
-            from memoria.core.llm import get_llm_client
+        from memoria.core.memory.graph.service import GraphMemoryService
+        from memoria.core.llm import get_llm_client
 
-            llm = get_llm_client()
-            svc = GraphMemoryService(self._db_factory)
-            return svc.extract_entities_llm(user_id, llm)
-        except Exception as e:
-            return {
-                "total_memories": 0,
-                "entities_found": 0,
-                "edges_created": 0,
-                "error": str(e),
-            }
+        svc = GraphMemoryService(self._db_factory, llm_client=get_llm_client())
+        return svc.extract_entities_llm(user_id)
 
     def get_reflect_candidates(self, user_id: str) -> dict:
         """Return raw reflection candidates for user-LLM synthesis (no internal LLM)."""

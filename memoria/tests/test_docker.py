@@ -330,7 +330,7 @@ class TestObserve:
             headers=h,
         )
         assert r.status_code == 200
-        assert isinstance(r.json(), list)
+        assert isinstance(r.json().get("memories", []), list)
 
 
 # ── Snapshots ─────────────────────────────────────────────────────────

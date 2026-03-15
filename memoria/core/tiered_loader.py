@@ -105,7 +105,11 @@ class TieredMemoryLoader:
                 query=query,
                 session_id=session_id,
                 query_embedding=query_embedding,
-                memory_types=[MemoryType.SEMANTIC, MemoryType.PROCEDURAL],
+                memory_types=[
+                    MemoryType.SEMANTIC,
+                    MemoryType.PROCEDURAL,
+                    MemoryType.EPISODIC,
+                ],
                 top_k=limit,
                 task_hint=task_hint,
                 explain=explain,

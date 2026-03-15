@@ -108,22 +108,11 @@ def reflect(
     """Analyze memory clusters, synthesize insights. 2h cooldown. Requires LLM."""
 
     def _run():
-        try:
-            from memoria.core.memory.reflection.engine import ReflectionEngine
-            from memoria.core.memory.tabular.candidates import CandidateProvider
-            from memoria.core.memory.tabular.store import TabularStore
+        from memoria.core.memory.graph.service import GraphMemoryService
+        from memoria.core.llm import get_llm_client
 
-            store = TabularStore(db_factory)
-            provider = CandidateProvider(db_factory)
-            # LLM client — may not be configured
-            from memoria.core.llm import get_llm_client
-
-            llm = get_llm_client()
-            engine = ReflectionEngine(provider, store, llm)
-            result = engine.reflect(user_id)
-            return {"insights": len(result.new_scenes), "skipped": result.skipped}
-        except Exception as e:
-            return {"insights": 0, "skipped": 0, "note": f"reflect unavailable: {e}"}
+        gsvc = GraphMemoryService(db_factory, llm_client=get_llm_client())
+        return gsvc.reflect(user_id)
 
     return _with_cache(user_id, "reflect", _run, force, db_factory)
 
@@ -137,20 +126,11 @@ def extract_entities(
     """LLM entity extraction for unlinked memories. Manual trigger only. 1h cooldown."""
 
     def _run():
-        try:
-            from memoria.core.memory.graph.service import GraphMemoryService
-            from memoria.core.llm import get_llm_client
+        from memoria.core.memory.graph.service import GraphMemoryService
+        from memoria.core.llm import get_llm_client
 
-            llm = get_llm_client()
-            svc = GraphMemoryService(db_factory)
-            return svc.extract_entities_llm(user_id, llm)
-        except Exception as e:
-            return {
-                "total_memories": 0,
-                "entities_found": 0,
-                "edges_created": 0,
-                "error": str(e),
-            }
+        gsvc = GraphMemoryService(db_factory, llm_client=get_llm_client())
+        return gsvc.extract_entities_llm(user_id)
 
     return _with_cache(user_id, "extract_entities", _run, force, db_factory)
 

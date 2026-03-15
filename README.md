@@ -451,6 +451,9 @@ Memoria exposes MCP tools that your AI tool calls automatically based on steerin
 | `procedural` | How-to knowledge, workflows | "To deploy: run make build then kubectl apply" |
 | `working` | Temporary context for current task | "Currently refactoring the auth module" |
 | `tool_result` | Results from tool executions | Cached command outputs |
+| `episodic` | Session summaries (topic/action/outcome) | "Session Summary: Database optimization\n\nActions: Added indexes\n\nOutcome: 93% faster" |
+
+**Episodic Memory**: High-level summaries of work sessions, generated via API. See [Episodic Memory API](docs/api/episodic_memory.md) for details.
 
 ---
 
@@ -595,31 +598,29 @@ pip install "mo-memoria[local-embedding]"
 
 Expected with local embedding — model loads into memory on first query (~3-5s). Use an embedding service to avoid this by setting `EMBEDDING_PROVIDER=openai` in the MCP config `env` block.
 
-## Troubleshooting
-
-### "Cannot connect to database"
-
-```bash
-docker ps | grep matrixone
-# If not running:
-docker start matrixone
-```
-
-### "sentence-transformers not installed"
-
-```bash
-pip install "mo-memoria[local-embedding]"
-```
-
-### First query is slow
-
-Expected with local embedding — model loads into memory on first query (~3-5s). Use an embedding service to avoid this by setting `EMBEDDING_PROVIDER=openai` in the MCP config `env` block.
-
 ### AI tool doesn't seem to use memory
 
 1. Verify `memoria-mcp` is in PATH: `which memoria-mcp`
 2. Restart the AI tool after editing the MCP config
 3. Test the server directly: `memoria-mcp --db-url "mysql+pymysql://root:111@localhost:6001/memoria"`
+
+### `memory_reflect` / `memory_extract_entities` returns "LLM not configured"
+
+These tools require an LLM to synthesize insights. Configure via environment variables in the MCP config `env` block:
+
+```json
+"env": {
+  "LLM_API_KEY": "sk-...",
+  "LLM_BASE_URL": "https://api.openai.com/v1",
+  "LLM_MODEL": "gpt-4o-mini"
+}
+```
+
+Any OpenAI-compatible endpoint works. Without LLM, these tools return a degraded response (HTTP 200 with an error/note field) — all other memory tools work normally. Use `memory_reflect(mode="candidates")` or `memory_extract_entities(mode="candidates")` as LLM-free alternatives.
+
+### Episodic memory returns HTTP 503
+
+`POST /v1/sessions/{id}/summary` requires LLM configuration. Set `LLM_API_KEY` in the MCP config `env` block (see above).
 
 ---
 

@@ -20,6 +20,6 @@ RUN pip install --no-cache-dir --no-deps -i https://pypi.tuna.tsinghua.edu.cn/si
 RUN chown -R appuser:appuser /app
 USER appuser
 
-EXPOSE 8000
+EXPOSE 8100
 
-CMD ["python", "-m", "uvicorn", "memoria.api.main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["python", "-m", "uvicorn", "memoria.api.main:app", "--host", "0.0.0.0", "--port", "8100"]

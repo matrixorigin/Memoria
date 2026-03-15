@@ -403,12 +403,40 @@ class GraphMemoryService:
         """Run graph consolidation directly (for testing/admin)."""
         return self._consolidator.consolidate(user_id)
 
-    def extract_entities_llm(self, user_id: str, llm_client: Any) -> dict[str, Any]:
+    def reflect(self, user_id: str) -> dict[str, Any]:
+        """Synthesize insights from memory clusters. Requires LLM."""
+        if self._llm_client is None:
+            return {
+                "insights": 0,
+                "skipped": 0,
+                "note": "LLM not configured — reflect unavailable. Set LLM_API_KEY to enable.",
+            }
+        try:
+            from memoria.core.memory.reflection.engine import ReflectionEngine
+            from memoria.core.memory.graph.candidates import GraphCandidateProvider
+
+            provider = GraphCandidateProvider(self._db_factory)
+            engine = ReflectionEngine(provider, self._store, self._llm_client)
+            result = engine.reflect(user_id)
+            return {"insights": len(result.new_scenes), "skipped": result.skipped}
+        except Exception as e:
+            return {"insights": 0, "skipped": 0, "note": f"reflect unavailable: {e}"}
+
+    def extract_entities_llm(
+        self, user_id: str, llm_client: Any = None
+    ) -> dict[str, Any]:
         """Manual LLM entity extraction for all active semantic memories.
 
-        Scans memories that don't yet have entity_link edges, extracts entities
-        via LLM, creates entity nodes and edges. Idempotent — skips already-linked.
+        Uses self._llm_client if llm_client not provided. Returns error dict if no LLM.
         """
+        llm = llm_client or self._llm_client
+        if llm is None:
+            return {
+                "total_memories": 0,
+                "entities_found": 0,
+                "edges_created": 0,
+                "error": "LLM not configured — set LLM_API_KEY to enable.",
+            }
         from memoria.core.memory.graph.entity_extractor import (
             LLMEntityExtractionResult,
             extract_entities_llm as _extract_llm,
@@ -445,7 +473,7 @@ class GraphMemoryService:
         entities_per_node: dict[str, list[tuple[str, str]]] = {}
         for node in unlinked:
             try:
-                entities = _extract_llm(node.content, llm_client)
+                entities = _extract_llm(node.content, llm)
                 if entities:
                     entities_per_node[node.node_id] = [
                         (ent.name, ent.entity_type) for ent in entities

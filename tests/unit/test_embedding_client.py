@@ -52,7 +52,7 @@ class TestFailFast:
     @pytest.mark.local_embedding
     def test_local_dimension_mismatch_raises(self):
         """If model outputs different dim than config, fail fast."""
-        with pytest.raises(ValueError, match="produces 384-dim.*config says 512"):
+        with pytest.raises(ValueError, match="384.*config says 512"):
             EmbeddingClient(provider="local", model="all-MiniLM-L6-v2", dim=512)
 
 

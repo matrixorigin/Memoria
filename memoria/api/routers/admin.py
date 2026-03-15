@@ -252,6 +252,12 @@ def admin_trigger_governance(
         from memoria.core.memory.graph.graph_store import GraphStore
 
         llm = get_llm_client()
+        if llm is None:
+            return {
+                "op": op,
+                "user_id": user_id,
+                "error": "LLM not configured — set LLM_API_KEY to enable.",
+            }
 
         # Backfill using LLM NER (LLM results merged with regex)
         from memoria.core.memory.tabular.store import MemoryStore
