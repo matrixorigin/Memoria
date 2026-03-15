@@ -6,6 +6,7 @@ Usage:
     python scripts/bump_version.py minor   # 0.1.3 -> 0.2.0
     python scripts/bump_version.py major   # 0.1.3 -> 1.0.0
 """
+
 import re
 import sys
 from pathlib import Path
@@ -15,10 +16,12 @@ ROOT = Path(__file__).resolve().parent.parent
 FILES = [
     ("pyproject.toml", r'(version\s*=\s*")([^"]+)(")'),
     ("memoria/cli.py", r'(_VERSION\s*=\s*")([^"]+)(")'),
-    ("memoria/templates/kiro_steering.md", r'(<!-- memoria-version:\s*)([^"]+)(\s*-->)'),
+    (
+        "memoria/templates/kiro_steering.md",
+        r'(<!-- memoria-version:\s*)([^"]+)(\s*-->)',
+    ),
     ("memoria/templates/claude_rule.md", r'(<!-- memoria-version:\s*)([^"]+)(\s*-->)'),
     ("memoria/templates/cursor_rule.md", r'(<!-- memoria-version:\s*)([^"]+)(\s*-->)'),
-
 ]
 
 
@@ -48,7 +51,7 @@ def main() -> None:
     old = m.group(1)
 
     # Support direct version string (e.g. "0.1.0") or bump type (patch/minor/major)
-    new = part if re.match(r'^\d+\.\d+\.\d+$', part) else bump(old, part)
+    new = part if re.match(r"^\d+\.\d+\.\d+$", part) else bump(old, part)
 
     for relpath, pattern in FILES:
         path = ROOT / relpath

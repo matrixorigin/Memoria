@@ -31,7 +31,7 @@ class MemoryGovernanceConfig:
     pollution_threshold: float = 0.3
     sandbox_enabled_types: tuple[str, ...] = ("profile",)
     contradiction_similarity_threshold: float = 0.85
-    redundant_similarity_threshold: float = 0.95
+    redundant_similarity_threshold: float = 0.85
     redundant_window_days: int = 90
     redundant_max_pairs: int = 5000
 
@@ -55,6 +55,12 @@ class MemoryGovernanceConfig:
     # ── Session summary ──
     session_summary_turn_threshold: int = 10
     session_summary_time_threshold_hours: float = 10 / 60  # 10 minutes
+
+    # ── Episodic auto-trigger (Phase 2) ──
+    auto_trigger_threshold: int = (
+        20  # trigger lightweight summary every N turns (0 = disabled)
+    )
+    max_lightweight_per_session: int = 3  # max lightweight summaries per session
 
     # ── Reflection: candidate selection ──
     cluster_similarity_threshold: float = 0.8

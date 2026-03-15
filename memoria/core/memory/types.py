@@ -6,7 +6,9 @@ import enum
 import math
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Any, Optional
+
+from pydantic import BaseModel, Field
 
 
 def _utcnow() -> datetime:
@@ -34,6 +36,7 @@ class MemoryType(str, enum.Enum):
     PROCEDURAL = "procedural"
     WORKING = "working"
     TOOL_RESULT = "tool_result"
+    EPISODIC = "episodic"
 
 
 class TrustTier(str, enum.Enum):
@@ -95,6 +98,9 @@ class Memory:
     observed_at: Optional[datetime] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
+    extra_metadata: Optional[dict[str, Any]] = (
+        None  # For episodic and other structured metadata
+    )
     trust_tier: TrustTier = TrustTier.T3_INFERRED
     retrieval_score: Optional[float] = (
         None  # set by retriever; None if not retrieved via scoring
@@ -128,3 +134,19 @@ class RetrievalWeights:
         total = self.vector + self.keyword + self.temporal + self.confidence
         if abs(total - 1.0) > 0.01:
             raise ValueError(f"Weights must sum to 1.0, got {total}")
+
+
+class EpisodicMetadata(BaseModel):
+    """Metadata structure for episodic memories stored in mem_memories.extra_metadata JSON field."""
+
+    topic: str = Field(..., description="Main topic or theme of the session")
+    action: str = Field(..., description="Key actions or activities performed")
+    outcome: str = Field(..., description="Results or conclusions reached")
+    source_event_ids: list[str] = Field(
+        default_factory=list,
+        description="Message IDs that contributed to this episodic memory",
+    )
+    session_id: Optional[str] = Field(
+        default=None,
+        description="Source session ID for cross-session correlation",
+    )

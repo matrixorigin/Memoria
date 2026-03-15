@@ -1,11 +1,14 @@
-"""Memoria test configuration."""
+"""Memoria e2e test configuration.
+
+Each xdist worker gets its own isolated DB (memoria_e2e_gw0, etc.) with dim=1024.
+This allows e2e tests to run in parallel safely.
+"""
 
 import os
 import pytest
 
 
 def pytest_configure(config):
-    """Fail fast if local embedding is configured in CI."""
     ci = os.environ.get("CI") or os.environ.get("GITHUB_ACTIONS")
     provider = os.environ.get("MEMORIA_EMBEDDING_PROVIDER", "local")
     if ci and provider == "local":
@@ -17,24 +20,30 @@ def pytest_configure(config):
 
 
 def pytest_collection_modifyitems(items):
-    """Force governance tests to run in the same xdist group."""
+    """Keep governance tests on one worker to avoid lock contention."""
     for item in items:
         if "Governance" in item.nodeid or "AdminStatsAccuracy" in item.nodeid:
             item.add_marker(pytest.mark.xdist_group("governance"))
 
 
 @pytest.fixture(scope="session", autouse=True)
-def isolated_test_db(request):
-    """Each xdist worker gets its own isolated test database.
+def isolated_e2e_db(request):
+    """Give each xdist worker its own e2e DB (dim=1024).
 
-    worker_id is 'master' when not using xdist, 'gw0'/'gw1'/... with -n auto.
-    Database is dropped after the session to avoid accumulation.
+    Without xdist: uses 'memoria' (the default).
+    With xdist -n auto: uses 'memoria_e2e_gw0', 'memoria_e2e_gw1', etc.
     """
-    worker_id = getattr(request.config, "workerinput", {}).get("workerid", "master")
-    db_name = f"memoria_test_{worker_id}"
+    worker = os.environ.get("PYTEST_XDIST_WORKER", "")
+    if not worker:
+        # Serial run — use the real DB as-is
+        yield os.environ.get("MEMORIA_DB_NAME", "memoria")
+        return
+
+    # Parallel run — give this worker its own DB
+    db_name = f"memoria_e2e_{worker}"
     os.environ["MEMORIA_DB_NAME"] = db_name
 
-    # Reset module-level singletons so they pick up the new DB name
+    # Reset singletons so they pick up the new DB name
     import memoria.api.database as _db_mod
     import memoria.config as _cfg_mod
 
@@ -42,9 +51,14 @@ def isolated_test_db(request):
     _db_mod._SessionLocal = None
     _cfg_mod._settings = None
 
+    # Bootstrap: create DB and tables (dim=1024 from settings)
+    from memoria.api.database import init_db
+
+    init_db()
+
     yield db_name
 
-    # Teardown: drop the test database
+    # Teardown: drop the worker DB
     try:
         from sqlalchemy import text
         from matrixone import Client as MoClient
@@ -64,4 +78,4 @@ def isolated_test_db(request):
             c.execute(text("COMMIT"))
         bootstrap._engine.dispose()
     except Exception:
-        pass  # best-effort cleanup
+        pass

@@ -455,6 +455,77 @@ def correct_by_query(
     }
 
 
+@router.get("/memories/{memory_id}/history")
+def get_memory_history(
+    memory_id: str,
+    user_id: str = Depends(get_current_user_id),
+    db_factory=Depends(get_db_factory),
+):
+    """Return the version chain for a memory (superseded_by links).
+
+    Walks the superseded_by chain starting from memory_id, returning
+    all versions in order from oldest to newest.
+    """
+    from memoria.core.memory.models.memory import MemoryRecord as M
+
+    with db_factory() as db:
+        # Collect the full chain: start from given id, follow superseded_by forward
+        # First, find the root (oldest ancestor) by walking backwards via superseded_by
+        # Then walk forward. Simpler: collect all records in the chain by scanning.
+
+        # Gather all versions: find the root by walking superseded_by backwards
+        chain: list[Any] = []
+        visited: set[str] = set()
+
+        # Walk backwards to find root (the one that supersedes this id)
+        current_id = memory_id
+        while current_id and current_id not in visited:
+            visited.add(current_id)
+            row = db.query(M).filter_by(memory_id=current_id, user_id=user_id).first()
+            if row is None:
+                raise HTTPException(status_code=404, detail="Memory not found")
+            chain.append(row)
+            # Check if something supersedes this (i.e., this is an older version)
+            # We need to find if any record has superseded_by = current_id... no,
+            # superseded_by points FROM old TO new. So row.superseded_by is the newer one.
+            # Walk forward: follow superseded_by
+            current_id = row.superseded_by  # type: ignore[assignment]
+
+        # chain is oldest-first if we started at root, but we may have started mid-chain
+        # Also find if there's an older version that points to memory_id
+        # Walk backwards: find records where superseded_by = memory_id
+        root_row = chain[0]
+        older = (
+            db.query(M)
+            .filter_by(superseded_by=root_row.memory_id, user_id=user_id)
+            .first()
+        )
+        while older and older.memory_id not in visited:
+            visited.add(older.memory_id)
+            chain.insert(0, older)
+            older = (
+                db.query(M)
+                .filter_by(superseded_by=older.memory_id, user_id=user_id)
+                .first()
+            )
+
+        return {
+            "memory_id": memory_id,
+            "versions": [
+                {
+                    "memory_id": r.memory_id,
+                    "content": r.content,
+                    "is_active": bool(r.is_active),
+                    "superseded_by": r.superseded_by,
+                    "observed_at": r.observed_at.isoformat() if r.observed_at else None,
+                    "memory_type": r.memory_type,
+                }
+                for r in chain
+            ],
+            "total": len(chain),
+        }
+
+
 @router.delete("/memories/{memory_id}")
 def delete_memory(
     memory_id: str,
@@ -592,8 +663,13 @@ def observe_turn(
     user_id: str = Depends(get_current_user_id),
     db_factory=Depends(get_db_factory),
 ):
+    from memoria.core.llm import get_llm_client
+
     svc = _get_service(db_factory, user_id=user_id)
     memories = svc.observe_turn(
         user_id, req.messages, source_event_ids=req.source_event_ids
     )
-    return [_to_response(m) for m in memories]
+    result: dict = {"memories": [_to_response(m) for m in memories]}
+    if get_llm_client() is None:
+        result["warning"] = "LLM not configured — memory extraction unavailable"
+    return result

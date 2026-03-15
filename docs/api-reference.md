@@ -336,7 +336,16 @@ Detect contradicting memories, fix orphaned graph nodes. 30-minute cooldown per 
 POST /v1/reflect?force=false
 ```
 
-Analyze memory clusters and synthesize high-level insights. 2-hour cooldown. Requires LLM configuration.
+Analyze memory clusters and synthesize high-level insights. 2-hour cooldown.
+
+**LLM behavior:** Requires LLM configuration (`LLM_API_KEY`). Without LLM, returns HTTP 200 with a degraded response:
+```json
+{
+  "insights": 0,
+  "skipped": 0,
+  "note": "LLM not configured — reflect unavailable. Set LLM_API_KEY to enable."
+}
+```
 
 ### Extract Entities
 
@@ -344,7 +353,19 @@ Analyze memory clusters and synthesize high-level insights. 2-hour cooldown. Req
 POST /v1/extract-entities
 ```
 
-LLM entity extraction for unlinked memories. Builds entity graph nodes and entity_link edges. Idempotent — skips already-linked memories. Requires LLM configuration.
+LLM entity extraction for unlinked memories. Builds entity graph nodes and entity_link edges. Idempotent — skips already-linked memories.
+
+**LLM behavior:** Requires LLM configuration (`LLM_API_KEY`). Without LLM, returns HTTP 200 with a degraded response:
+```json
+{
+  "total_memories": 0,
+  "entities_found": 0,
+  "edges_created": 0,
+  "error": "LLM not configured — set LLM_API_KEY to enable."
+}
+```
+
+Use `/v1/reflect/candidates` and `/v1/extract-entities/candidates` for LLM-free alternatives that return raw data for you to process.
 
 ---
 

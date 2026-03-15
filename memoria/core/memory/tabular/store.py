@@ -85,6 +85,7 @@ class MemoryStore(DbConsumer):
                 trust_tier=memory.trust_tier.value,
                 embedding=memory.embedding,
                 source_event_ids=memory.source_event_ids,
+                extra_metadata=memory.extra_metadata,
                 is_active=1,
                 observed_at=memory.observed_at,
             )
@@ -117,6 +118,7 @@ class MemoryStore(DbConsumer):
                     trust_tier=mem.trust_tier.value,
                     embedding=mem.embedding,
                     source_event_ids=mem.source_event_ids,
+                    extra_metadata=mem.extra_metadata,
                     is_active=1,
                     observed_at=mem.observed_at,
                 )

@@ -708,6 +708,7 @@ class GovernanceScheduler(DbConsumer):
                 by_type.setdefault(r.memory_type, []).append(r)
 
             to_deactivate: set[str] = set()
+            superseded_by: dict[str, str] = {}  # older_id -> newer_id
             pairs_checked = 0
 
             for _mtype, group in by_type.items():
@@ -738,8 +739,12 @@ class GovernanceScheduler(DbConsumer):
                             continue
                         pairs_checked += 1
                         if dist_sq < l2_sq_threshold:
-                            older = ids[j] if timestamps[i] >= timestamps[j] else ids[i]
+                            if timestamps[i] >= timestamps[j]:
+                                older, newer = ids[j], ids[i]
+                            else:
+                                older, newer = ids[i], ids[j]
                             to_deactivate.add(older)
+                            superseded_by[older] = newer
                     if pairs_checked >= max_pairs:
                         break
                 if pairs_checked >= max_pairs:
@@ -749,17 +754,16 @@ class GovernanceScheduler(DbConsumer):
                 ids_list = list(to_deactivate)
                 for i in range(0, len(ids_list), 500):
                     batch = ids_list[i : i + 500]
-                    placeholders = ", ".join(f":id{j}" for j in range(len(batch)))
-                    params: dict[str, object] = {
-                        f"id{j}": mid for j, mid in enumerate(batch)
-                    }
-                    db.execute(
-                        text(
-                            f"UPDATE mem_memories SET is_active = 0, updated_at = NOW() "
-                            f"WHERE memory_id IN ({placeholders})"
-                        ),
-                        params,
-                    )
+                    for mid in batch:
+                        newer_id = superseded_by.get(mid)
+                        db.execute(
+                            text(
+                                "UPDATE mem_memories SET is_active = 0, updated_at = NOW()"
+                                + (", superseded_by = :newer" if newer_id else "")
+                                + " WHERE memory_id = :mid"
+                            ),
+                            {"mid": mid, **({"newer": newer_id} if newer_id else {})},
+                        )
                 db.commit()
                 deactivated = len(to_deactivate)
 

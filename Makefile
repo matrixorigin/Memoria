@@ -42,7 +42,7 @@ help:
 	@echo "  make test-integration   Run integration tests (needs DB)"
 	@echo "  make test-docker        Run Docker integration tests (needs: make start)"
 	@echo "  make test-mcp           Run MCP server tests"
-	@echo "  make test-all-cov       Run all tests with coverage report"
+	@echo "  make test-all-cov       Run all tests (unit+e2e+mcp+docker) with combined coverage"
 	@echo "  make bench              Run benchmark (needs: make start)"
 	@echo "  make bench-compare      Compare two retrieval strategies"
 	@echo ""
@@ -219,20 +219,26 @@ dev:
 # ── Tests ───────────────────────────────────────────────────────────
 
 test:
-	@python -m pytest tests/unit/ memoria/tests/test_e2e.py memoria/tests/test_mcp.py tests/integration/ -v -n auto --dist=loadgroup --ignore=tests/integration/test_mcp_stdio_e2e.py
+	@echo "Running unit + integration tests (parallel)..."
+	@python -m pytest tests/unit/ tests/integration/ -n auto --dist=loadgroup --ignore=tests/integration/test_mcp_stdio_e2e.py -q
+	@echo "Running e2e + mcp tests (parallel, isolated DBs)..."
+	@python -m pytest memoria/tests/test_e2e_core.py memoria/tests/test_e2e_admin.py memoria/tests/test_e2e_governance.py memoria/tests/test_mcp.py -n auto --dist=loadgroup -q
 	@echo "For Docker tests: make start && make test-docker"
 
 test-fast:
-	@python -m pytest tests/unit/ memoria/tests/test_e2e.py memoria/tests/test_mcp.py -v -n auto
+	@python -m pytest tests/unit/ -n auto -q
 
 test-slow:
-	@python -m pytest tests/integration/ -v -n auto --dist=loadgroup --ignore=tests/integration/test_mcp_stdio_e2e.py
+	@python -m pytest tests/integration/ -n auto --dist=loadgroup --ignore=tests/integration/test_mcp_stdio_e2e.py -q
 
 test-unit:
-	@python -m pytest tests/unit/ -v -n auto
+	@python -m pytest tests/unit/ -n auto -q
 
 test-integration:
-	@python -m pytest tests/integration/ -v -n auto --dist=loadgroup --ignore=tests/integration/test_mcp_stdio_e2e.py
+	@python -m pytest tests/integration/ -n auto --dist=loadgroup --ignore=tests/integration/test_mcp_stdio_e2e.py -q
+
+test-e2e:
+	@python -m pytest memoria/tests/test_e2e_core.py memoria/tests/test_e2e_admin.py memoria/tests/test_e2e_governance.py memoria/tests/test_mcp.py -n auto --dist=loadgroup -v
 
 test-docker:
 	@echo "Requires: make start"
@@ -242,13 +248,20 @@ test-mcp:
 	@python -m pytest memoria/tests/test_mcp.py -v
 
 test-all-cov:
-	@echo "Running all tests with coverage..."
-	@python -m pytest tests/unit/ memoria/tests/test_e2e.py memoria/tests/test_mcp.py \
-		--cov=memoria --cov-report=term-missing --cov-report=html:htmlcov \
-		-v -n auto 2>&1 | tee coverage.log
+	@echo "Running all tests with coverage (parallel)..."
+	@python -m pytest tests/unit/ tests/integration/ \
+		--ignore=tests/integration/test_mcp_stdio_e2e.py \
+		--cov=memoria --cov-report= \
+		-n auto --dist=loadgroup -q 2>&1 | tee coverage.log
+	@python -m pytest memoria/tests/test_e2e_core.py memoria/tests/test_e2e_admin.py memoria/tests/test_e2e_governance.py memoria/tests/test_mcp.py \
+		--cov=memoria --cov-append --cov-report= \
+		-n auto --dist=loadgroup -q 2>&1 | tee -a coverage.log
+	@echo "Running Docker tests (requires: make start)..."
+	@python -m pytest memoria/tests/test_docker.py \
+		--cov=memoria --cov-append --cov-report=term-missing --cov-report=html:htmlcov \
+		-v 2>&1 | tee -a coverage.log
 	@echo ""
 	@echo "✅ Coverage report generated:"
-	@echo "   - Terminal: see above"
 	@echo "   - HTML: htmlcov/index.html"
 	@echo "   - Log: coverage.log"
 

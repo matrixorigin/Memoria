@@ -151,6 +151,8 @@ class TypedObserver:
         source_event_ids: Optional[list[str]] = None,
         trust_tier: TrustTier = TrustTier.T3_INFERRED,
         session_id: Optional[str] = None,
+        extra_metadata: Optional[dict[str, Any]] = None,
+        generate_embedding: bool = True,
         explain: bool = False,
     ) -> tuple[Memory, Optional[ContradictionStats]]:
         """Directly write a memory (from MemoryWriteTool), skipping LLM extraction."""
@@ -182,9 +184,10 @@ class TypedObserver:
             trust_tier=trust_tier,
             source_event_ids=source_event_ids or [],
             session_id=session_id,
+            extra_metadata=extra_metadata,
             observed_at=_utcnow(),
         )
-        if self.embed_fn:
+        if generate_embedding and self.embed_fn:
             try:
                 mem.embedding = self.embed_fn(content)
             except Exception as e:

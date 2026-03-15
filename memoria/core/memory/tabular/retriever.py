@@ -18,7 +18,7 @@ import logging
 import math
 import time
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Optional
 
 from sqlalchemy import literal_column, text
 from sqlalchemy.sql import func
@@ -71,6 +71,9 @@ class _Candidate:
     keyword_score: float = 0.0  # Continuous BM25 score from MATCH AGAINST
     l2_dist: Optional[float] = None
     access_count: int = 0
+    extra_metadata: Optional[dict[str, Any]] = (
+        None  # For episodic and other structured metadata
+    )
 
 
 @dataclass
@@ -153,11 +156,12 @@ class MemoryRetriever(DbConsumer):
                 score = self._score_candidate(c, weights, now_ts)[0]
                 m.retrieval_score = round(score, 4)
 
-        # ── L1: cross-session semantic/procedural/profile (default retrieval) ──
+        # ── L1: cross-session semantic/procedural/profile/episodic (default retrieval) ──
         l1_types = memory_types or [
             MemoryType.SEMANTIC,
             MemoryType.PROCEDURAL,
             MemoryType.PROFILE,
+            MemoryType.EPISODIC,
         ]
         # Exclude L0 types from L1 query to avoid duplicates
         l1_types = [
@@ -361,6 +365,7 @@ class MemoryRetriever(DbConsumer):
                     M.observed_at,
                     M.session_id,
                     M.trust_tier,
+                    M.extra_metadata,
                     MemoryStats.access_count,
                     rel,
                 )
@@ -420,6 +425,7 @@ class MemoryRetriever(DbConsumer):
                             trust_tier=r.trust_tier or "T3",
                             keyword_score=float(r.ft_score or 0.0),
                             access_count=r.access_count or 0,
+                            extra_metadata=r.extra_metadata,
                         )
                         for r in rows
                     ], stats
@@ -440,6 +446,7 @@ class MemoryRetriever(DbConsumer):
                 r.session_id,
                 trust_tier=r.trust_tier or "T3",
                 access_count=r.access_count or 0,
+                extra_metadata=r.extra_metadata,
             )
             for r in rows
         ], stats
@@ -475,6 +482,7 @@ class MemoryRetriever(DbConsumer):
                     M.observed_at,
                     M.session_id,
                     M.trust_tier,
+                    M.extra_metadata,
                     MemoryStats.access_count,
                     dist_expr,
                 )
@@ -510,6 +518,7 @@ class MemoryRetriever(DbConsumer):
                     trust_tier=r.trust_tier or "T3",
                     l2_dist=float(r.l2_dist),
                     access_count=r.access_count or 0,
+                    extra_metadata=r.extra_metadata,
                 )
                 for r in rows
             ], stats
@@ -654,6 +663,7 @@ class MemoryRetriever(DbConsumer):
             if c.trust_tier
             else TrustTier.T3_INFERRED,
             retrieval_score=round(score, 4) if score is not None else None,
+            extra_metadata=c.extra_metadata,
         )
 
     def _bump_access_counts(self, memory_ids: list[str]) -> None:
