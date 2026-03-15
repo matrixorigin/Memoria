@@ -10,8 +10,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 
-from memoria.api.database import get_db_factory
-from memoria.api.dependencies import get_current_user_id
+from memoria.api.dependencies import AuthContext, get_auth_context
 from memoria.core.explain import init_explain, clear_explain
 
 logger = logging.getLogger(__name__)
@@ -198,12 +197,14 @@ def list_memories(
     memory_type: str | None = None,
     limit: int = 100,
     cursor: str | None = None,
-    user_id: str = Depends(get_current_user_id),
-    db_factory=Depends(get_db_factory),
+    auth: AuthContext = Depends(get_auth_context),
 ):
     """List active memories for the current user. Cursor-based pagination (pass last observed_at|memory_id)."""
     from memoria.core.memory.models.memory import MemoryRecord as M
     from sqlalchemy import or_, and_
+
+    user_id = auth.user_id
+    db_factory = auth.db_factory
 
     db = db_factory()
     try:
@@ -262,11 +263,12 @@ def list_memories(
 @router.post("/memories", status_code=status.HTTP_201_CREATED)
 def store_memory(
     req: StoreRequest,
-    user_id: str = Depends(get_current_user_id),
-    db_factory=Depends(get_db_factory),
+    auth: AuthContext = Depends(get_auth_context),
 ):
     from memoria.core.memory.types import MemoryType, TrustTier
 
+    user_id = auth.user_id
+    db_factory = auth.db_factory
     editor = _get_editor(db_factory, user_id)
     try:
         mem = editor.inject(
@@ -289,11 +291,12 @@ def store_memory(
 @router.post("/memories/batch", status_code=status.HTTP_201_CREATED)
 def batch_store(
     req: BatchStoreRequest,
-    user_id: str = Depends(get_current_user_id),
-    db_factory=Depends(get_db_factory),
+    auth: AuthContext = Depends(get_auth_context),
 ):
     from memoria.core.memory.types import MemoryType
 
+    user_id = auth.user_id
+    db_factory = auth.db_factory
     editor = _get_editor(db_factory, user_id)
     specs = [
         {
@@ -310,10 +313,12 @@ def batch_store(
 @router.post("/memories/retrieve")
 def retrieve_memories(
     req: RetrieveRequest,
-    user_id: str = Depends(get_current_user_id),
-    db_factory=Depends(get_db_factory),
+    auth: AuthContext = Depends(get_auth_context),
 ) -> dict[str, Any]:
     from memoria.core.memory.types import MemoryType
+
+    user_id = auth.user_id
+    db_factory = auth.db_factory
 
     # Initialize explain context (handles bool → str conversion internally)
     explain_ctx = init_explain(req.explain)
@@ -375,9 +380,11 @@ def retrieve_memories(
 @router.post("/memories/search")
 def search_memories(
     req: SearchRequest,
-    user_id: str = Depends(get_current_user_id),
-    db_factory=Depends(get_db_factory),
+    auth: AuthContext = Depends(get_auth_context),
 ) -> dict[str, Any]:
+    user_id = auth.user_id
+    db_factory = auth.db_factory
+
     # Initialize explain context (handles bool → str conversion internally)
     explain_ctx = init_explain(req.explain)
 
@@ -432,9 +439,10 @@ def search_memories(
 def correct_memory(
     memory_id: str,
     req: CorrectRequest,
-    user_id: str = Depends(get_current_user_id),
-    db_factory=Depends(get_db_factory),
+    auth: AuthContext = Depends(get_auth_context),
 ):
+    user_id = auth.user_id
+    db_factory = auth.db_factory
     _verify_ownership(db_factory, memory_id, user_id)
     editor = _get_editor(db_factory, user_id)
     try:
@@ -447,10 +455,11 @@ def correct_memory(
 @router.post("/memories/correct")
 def correct_by_query(
     req: CorrectByQueryRequest,
-    user_id: str = Depends(get_current_user_id),
-    db_factory=Depends(get_db_factory),
+    auth: AuthContext = Depends(get_auth_context),
 ):
     """Find the best-matching memory by semantic search and correct it."""
+    user_id = auth.user_id
+    db_factory = auth.db_factory
     editor = _get_editor(db_factory, user_id)
     match = editor.find_best_match(user_id, req.query)
     if match is None:
@@ -467,8 +476,7 @@ def correct_by_query(
 @router.get("/memories/{memory_id}/history")
 def get_memory_history(
     memory_id: str,
-    user_id: str = Depends(get_current_user_id),
-    db_factory=Depends(get_db_factory),
+    auth: AuthContext = Depends(get_auth_context),
 ):
     """Return the version chain for a memory (superseded_by links).
 
@@ -477,7 +485,11 @@ def get_memory_history(
     """
     from memoria.core.memory.models.memory import MemoryRecord as M
 
-    with db_factory() as db:
+    user_id = auth.user_id
+    db_factory = auth.db_factory
+
+    db = db_factory()
+    try:
         # Collect the full chain: start from given id, follow superseded_by forward
         # First, find the root (oldest ancestor) by walking backwards via superseded_by
         # Then walk forward. Simpler: collect all records in the chain by scanning.
@@ -533,20 +545,26 @@ def get_memory_history(
             ],
             "total": len(chain),
         }
+    finally:
+        db.close()
 
 
 @router.get("/memories/{memory_id}")
 def get_memory(
     memory_id: str,
-    user_id: str = Depends(get_current_user_id),
-    db_factory=Depends(get_db_factory),
+    auth: AuthContext = Depends(get_auth_context),
 ):
     """Get a single memory by ID."""
+    user_id = auth.user_id
+    db_factory = auth.db_factory
     _verify_ownership(db_factory, memory_id, user_id)
     from memoria.core.memory.models.memory import MemoryRecord as M
 
-    with db_factory() as db:
+    db = db_factory()
+    try:
         row = db.query(M).filter(M.memory_id == memory_id, M.user_id == user_id).first()
+    finally:
+        db.close()
     if not row:
         raise HTTPException(status_code=404, detail=f"Memory {memory_id} not found")
     from memoria.core.memory.types import MemoryType, TrustTier, Memory
@@ -570,9 +588,10 @@ def get_memory(
 def delete_memory(
     memory_id: str,
     reason: str = "",
-    user_id: str = Depends(get_current_user_id),
-    db_factory=Depends(get_db_factory),
+    auth: AuthContext = Depends(get_auth_context),
 ):
+    user_id = auth.user_id
+    db_factory = auth.db_factory
     _verify_ownership(db_factory, memory_id, user_id)
     editor = _get_editor(db_factory, user_id)
     result = editor.purge(user_id, memory_ids=[memory_id], reason=reason)
@@ -582,11 +601,12 @@ def delete_memory(
 @router.post("/memories/purge")
 def purge_memories(
     req: PurgeRequest,
-    user_id: str = Depends(get_current_user_id),
-    db_factory=Depends(get_db_factory),
+    auth: AuthContext = Depends(get_auth_context),
 ):
     from memoria.core.memory.types import MemoryType
 
+    user_id = auth.user_id
+    db_factory = auth.db_factory
     editor = _get_editor(db_factory, user_id)
 
     # Topic purge: find matching memory_ids via fulltext search, then purge by ID
@@ -640,10 +660,11 @@ def purge_memories(
 @router.get("/profiles/{target_user_id}")
 def get_profile(
     target_user_id: str,
-    user_id: str = Depends(get_current_user_id),
-    db_factory=Depends(get_db_factory),
+    auth: AuthContext = Depends(get_auth_context),
 ):
     # "me" resolves to the authenticated user
+    user_id = auth.user_id
+    db_factory = auth.db_factory
     resolved = user_id if target_user_id == "me" else target_user_id
     svc = _get_service(db_factory, user_id=resolved)
     profile = svc.get_profile(resolved)
@@ -700,11 +721,12 @@ def get_profile(
 @router.post("/observe")
 def observe_turn(
     req: ObserveRequest,
-    user_id: str = Depends(get_current_user_id),
-    db_factory=Depends(get_db_factory),
+    auth: AuthContext = Depends(get_auth_context),
 ):
     from memoria.core.llm import get_llm_client
 
+    user_id = auth.user_id
+    db_factory = auth.db_factory
     svc = _get_service(db_factory, user_id=user_id)
     memories = svc.observe_turn(
         user_id,

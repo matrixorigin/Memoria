@@ -74,6 +74,17 @@ class MemoriaSettings(BaseSettings):
     llm_base_url: str | None = None
     llm_model: str = "gpt-4o-mini"
 
+    # Remote auth service (apikey mode)
+    remote_auth_service_url: str = Field(
+        default="",
+        description="Base URL of the remote auth service for apikey mode. "
+        "When set, API accepts X-API-Key header and resolves per-user DB connections.",
+    )
+    conn_cache_ttl: int = Field(
+        default=60,
+        description="TTL in seconds for caching remote auth service responses. 0 = no cache.",
+    )
+
     # Limits
     snapshot_limit: int = Field(default=100, description="Max snapshots per user")
 

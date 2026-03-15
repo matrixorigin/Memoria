@@ -109,12 +109,16 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
             for k in stale:
                 del _windows[k]
 
-        # Extract API key from Authorization header
+        # Extract API key from Authorization or X-API-Key header
         auth = request.headers.get("authorization", "")
-        if not auth.startswith("Bearer "):
-            return await call_next(request)
+        x_api_key = request.headers.get("x-api-key", "")
 
-        api_key = auth[7:]
+        if x_api_key:
+            api_key = x_api_key
+        elif auth.startswith("Bearer "):
+            api_key = auth[7:]
+        else:
+            return await call_next(request)
 
         # Master key is exempt from rate limiting (used by admin/benchmark)
         from memoria.api.dependencies import _is_master_key

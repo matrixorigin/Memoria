@@ -471,10 +471,12 @@ class TestRetrieveEndpointEmbedding:
             mock_embed.return_value.embed.return_value = [0.1] * 384
             mock_svc.return_value.retrieve.return_value = ([], None)
 
+            from memoria.api.dependencies import AuthContext
             from memoria.api.routers.memory import retrieve_memories, RetrieveRequest
 
             req = RetrieveRequest(query="test query")
-            retrieve_memories(req, user_id="u1", db_factory=MagicMock())
+            auth = AuthContext(user_id="u1", db_factory=MagicMock())
+            retrieve_memories(req, auth=auth)
 
             mock_embed.return_value.embed.assert_called_once_with("test query")
             call_kwargs = mock_svc.return_value.retrieve.call_args
@@ -488,12 +490,14 @@ class TestRetrieveEndpointEmbedding:
             mock_embed.return_value.embed.side_effect = RuntimeError("embed failed")
             mock_svc.return_value.retrieve.return_value = ([], None)
 
+            from memoria.api.dependencies import AuthContext
             from memoria.api.routers.memory import retrieve_memories, RetrieveRequest
 
             req = RetrieveRequest(query="test")
+            auth = AuthContext(user_id="u1", db_factory=MagicMock())
 
             with caplog.at_level(logging.WARNING):
-                retrieve_memories(req, user_id="u1", db_factory=MagicMock())
+                retrieve_memories(req, auth=auth)
 
             assert "failed to embed query" in caplog.text
             call_kwargs = mock_svc.return_value.retrieve.call_args

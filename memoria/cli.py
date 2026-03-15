@@ -51,7 +51,12 @@ def _claude_rule() -> str:
 
 
 def _mcp_entry(
-    db_url: str | None, api_url: str | None, token: str | None, user: str, **embed: str
+    db_url: str | None,
+    api_url: str | None,
+    token: str | None,
+    user: str,
+    apikey: str | None = None,
+    **embed: str,
 ) -> dict[str, Any]:
     import shutil
 
@@ -59,7 +64,9 @@ def _mcp_entry(
     cmd = shutil.which("memoria-mcp") or "memoria-mcp"
     if api_url:
         args = ["--api-url", api_url]
-        if token:
+        if apikey:
+            args += ["--apikey", apikey]
+        elif token:
             args += ["--token", token]
         if user != "default":
             args += ["--user", user]
@@ -183,6 +190,10 @@ def _configure_claude(project_dir: Path, entry: dict, force: bool) -> list[str]:
 
 
 def cmd_init(args: argparse.Namespace) -> None:
+    if args.token and args.apikey:
+        print("Error: --token and --apikey are mutually exclusive.")
+        return
+
     project_dir = Path(args.dir).resolve()
     tools = args.tool or _detect(project_dir)
     if not tools:
@@ -201,7 +212,14 @@ def cmd_init(args: argparse.Namespace) -> None:
     if args.embedding_base_url:
         embed_env["EMBEDDING_BASE_URL"] = args.embedding_base_url
 
-    entry = _mcp_entry(args.db_url, args.api_url, args.token, args.user, **embed_env)
+    entry = _mcp_entry(
+        args.db_url,
+        args.api_url,
+        args.token,
+        args.user,
+        apikey=args.apikey,
+        **embed_env,
+    )
 
     writers = {
         "kiro": _configure_kiro,
@@ -430,7 +448,11 @@ def main() -> None:
     )
     p.add_argument("--db-url", help="Database URL for embedded mode")
     p.add_argument("--api-url", help="Memoria REST API URL for remote mode")
-    p.add_argument("--token", help="API token for remote mode")
+    p.add_argument("--token", help="API token for remote mode (Authorization: Bearer)")
+    p.add_argument(
+        "--apikey",
+        help="API key for remote mode (X-API-Key header, mutually exclusive with --token)",
+    )
     p.add_argument("--user", default="default", help="Default user ID")
     p.add_argument(
         "--force", action="store_true", help="Overwrite customized rule files"

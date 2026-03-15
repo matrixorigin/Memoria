@@ -10,8 +10,7 @@ from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field
 from sqlalchemy import text
 
-from memoria.api.database import get_db_factory
-from memoria.api.dependencies import get_current_user_id
+from memoria.api.dependencies import AuthContext, get_auth_context
 from memoria.core.memory.types import enum_value
 
 router = APIRouter(tags=["memory"])
@@ -84,10 +83,11 @@ def _with_cache(user_id: str, op: str, fn, force: bool, db_factory) -> dict:
 @router.post("/consolidate")
 def consolidate(
     force: bool = False,
-    user_id: str = Depends(get_current_user_id),
-    db_factory=Depends(get_db_factory),
+    auth: AuthContext = Depends(get_auth_context),
 ):
     """Detect contradictions, fix orphaned nodes. 30min cooldown."""
+    user_id = auth.user_id
+    db_factory = auth.db_factory
 
     def _run():
         from memoria.core.memory.factory import create_memory_service
@@ -102,10 +102,11 @@ def consolidate(
 @router.post("/reflect")
 def reflect(
     force: bool = False,
-    user_id: str = Depends(get_current_user_id),
-    db_factory=Depends(get_db_factory),
+    auth: AuthContext = Depends(get_auth_context),
 ):
     """Analyze memory clusters, synthesize insights. 2h cooldown. Requires LLM."""
+    user_id = auth.user_id
+    db_factory = auth.db_factory
 
     def _run():
         from memoria.core.memory.graph.service import GraphMemoryService
@@ -120,10 +121,11 @@ def reflect(
 @router.post("/extract-entities")
 def extract_entities(
     force: bool = False,
-    user_id: str = Depends(get_current_user_id),
-    db_factory=Depends(get_db_factory),
+    auth: AuthContext = Depends(get_auth_context),
 ):
     """LLM entity extraction for unlinked memories. Manual trigger only. 1h cooldown."""
+    user_id = auth.user_id
+    db_factory = auth.db_factory
 
     def _run():
         from memoria.core.memory.graph.service import GraphMemoryService
@@ -137,10 +139,11 @@ def extract_entities(
 
 @router.post("/reflect/candidates")
 def reflect_candidates(
-    user_id: str = Depends(get_current_user_id),
-    db_factory=Depends(get_db_factory),
+    auth: AuthContext = Depends(get_auth_context),
 ):
     """Return raw reflection candidates for user-LLM synthesis (no internal LLM needed)."""
+    user_id = auth.user_id
+    db_factory = auth.db_factory
     from memoria.core.memory.graph.candidates import GraphCandidateProvider
 
     provider = GraphCandidateProvider(db_factory)
@@ -166,10 +169,11 @@ def reflect_candidates(
 
 @router.post("/extract-entities/candidates")
 def entity_candidates(
-    user_id: str = Depends(get_current_user_id),
-    db_factory=Depends(get_db_factory),
+    auth: AuthContext = Depends(get_auth_context),
 ):
     """Return unlinked memories for user-LLM entity extraction."""
+    user_id = auth.user_id
+    db_factory = auth.db_factory
     from memoria.core.memory.graph.graph_store import GraphStore
     from memoria.core.memory.graph.types import EdgeType, NodeType
 
@@ -213,10 +217,11 @@ class LinkEntitiesRequest(BaseModel):
 
 @router.get("/entities")
 def list_entities(
-    user_id: str = Depends(get_current_user_id),
-    db_factory=Depends(get_db_factory),
+    auth: AuthContext = Depends(get_auth_context),
 ):
     """List all entity nodes for the current user."""
+    user_id = auth.user_id
+    db_factory = auth.db_factory
     from memoria.core.memory.graph.graph_store import GraphStore
     from memoria.core.memory.graph.types import NodeType
 
@@ -240,10 +245,11 @@ def list_entities(
 @router.post("/extract-entities/link")
 def link_entities(
     req: LinkEntitiesRequest,
-    user_id: str = Depends(get_current_user_id),
-    db_factory=Depends(get_db_factory),
+    auth: AuthContext = Depends(get_auth_context),
 ):
     """Write entity nodes + edges from user-LLM extraction results."""
+    user_id = auth.user_id
+    db_factory = auth.db_factory
     from memoria.core.memory.graph.graph_store import GraphStore
     from memoria.core.memory.graph.types import GraphNodeData
 

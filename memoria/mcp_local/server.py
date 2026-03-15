@@ -1581,10 +1581,16 @@ class EmbeddedBackend(MemoryBackend):
 class HTTPBackend(MemoryBackend):
     """Proxy to memory service REST API — for remote mode."""
 
-    def __init__(self, api_url: str, token: str | None = None) -> None:
+    def __init__(
+        self, api_url: str, token: str | None = None, apikey: str | None = None
+    ) -> None:
         import httpx
 
-        headers = {"Authorization": f"Bearer {token}"} if token else {}
+        headers: dict[str, str] = {}
+        if apikey:
+            headers["X-API-Key"] = apikey
+        elif token:
+            headers["Authorization"] = f"Bearer {token}"
         self._client = httpx.Client(
             base_url=api_url.rstrip("/"), headers=headers, timeout=30
         )
@@ -2765,6 +2771,10 @@ def main():
         "--db-url", help="Database URL for embedded mode (or set MEMORIA_DB_URL)"
     )
     parser.add_argument("--token", help="Auth token for remote mode")
+    parser.add_argument(
+        "--apikey",
+        help="API key for remote mode (uses X-API-Key header instead of Authorization)",
+    )
     parser.add_argument("--user", default="default", help="Default user ID")
     parser.add_argument("--transport", choices=["stdio", "sse"], default="stdio")
     args = parser.parse_args()
@@ -2775,8 +2785,17 @@ def main():
     logging.root.handlers = [_stderr_handler]
     logging.root.setLevel(logging.WARNING)
 
+    if args.token and args.apikey:
+        print("Error: --token and --apikey are mutually exclusive", file=sys.stderr)
+        sys.exit(1)
+
     if args.api_url:
-        backend: MemoryBackend = HTTPBackend(args.api_url, token=args.token)
+        if args.apikey:
+            backend: MemoryBackend = HTTPBackend(
+                args.api_url, token=None, apikey=args.apikey
+            )
+        else:
+            backend = HTTPBackend(args.api_url, token=args.token)
     else:
         # Priority: --db-url > MEMORIA_DB_URL > config碎变量 (MEMORIA_DB_HOST etc) > DEFAULT_DB_URL
         db_url = args.db_url or os.environ.get("MEMORIA_DB_URL")

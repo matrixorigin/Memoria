@@ -44,23 +44,30 @@ async def lifespan(app: FastAPI):
     init_db()
 
     # Start periodic governance scheduler (hourly/daily/weekly)
-    from memoria.core.scheduler import (
-        GovernanceTaskRunner,
-        AsyncIOBackend,
-        MemoryGovernanceScheduler,
-    )
-    from memoria.api.database import get_db_context, get_db_factory
+    # Only in token mode — apikey mode uses on-demand governance
+    from memoria.config import get_settings as _get_settings
 
-    runner = GovernanceTaskRunner(
-        get_db_context, db_factory=get_db_factory(), memory_only=True
-    )
-    backend = AsyncIOBackend(runner)
-    scheduler = MemoryGovernanceScheduler(backend=backend)
-    await scheduler.start()
+    _s = _get_settings()
+    scheduler = None
+    if not _s.remote_auth_service_url:
+        from memoria.core.scheduler import (
+            GovernanceTaskRunner,
+            AsyncIOBackend,
+            MemoryGovernanceScheduler,
+        )
+        from memoria.api.database import get_db_context, get_db_factory
+
+        runner = GovernanceTaskRunner(
+            get_db_context, db_factory=get_db_factory(), memory_only=True
+        )
+        backend = AsyncIOBackend(runner)
+        scheduler = MemoryGovernanceScheduler(backend=backend)
+        await scheduler.start()
 
     yield
 
-    await scheduler.stop()
+    if scheduler:
+        await scheduler.stop()
 
 
 app = FastAPI(
