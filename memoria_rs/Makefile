@@ -38,7 +38,7 @@ test:
 	DATABASE_URL=mysql://root:111@localhost:6001/memoria_rs_test SQLX_OFFLINE=true cargo test -p memoria-storage --test branch_ops -- --test-threads=1 --nocapture
 	$(CARGO) test -p memoria-mcp --test tools_unit --test core_tools_e2e --test mcp_e2e -- --nocapture
 	$(CARGO) test -p memoria-mcp --test snapshot_e2e --test branch_e2e --test integration_full --test graph_e2e -- --test-threads=1 --nocapture
-	$(CARGO) test -p memoria-api --test api_e2e -- --nocapture
+	$(CARGO) test -p memoria-api --test api_e2e -- --test-threads=1 --nocapture
 
 clean:
 	cargo clean

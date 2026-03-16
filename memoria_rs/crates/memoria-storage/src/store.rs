@@ -447,6 +447,20 @@ impl SqlMemoryStore {
         Ok(cleaned)
     }
 
+    /// Detect pollution: high supersede ratio in recent changes (threshold=0.3).
+    pub async fn detect_pollution(&self, user_id: &str, since_hours: i64) -> Result<bool, MemoriaError> {
+        let row: (i64, i64) = sqlx::query_as(
+            "SELECT COUNT(*) as total_changes, \
+             SUM(CASE WHEN superseded_by IS NOT NULL THEN 1 ELSE 0 END) as supersedes \
+             FROM mem_memories \
+             WHERE user_id = ? AND updated_at >= DATE_SUB(NOW(), INTERVAL ? HOUR)"
+        ).bind(user_id).bind(since_hours)
+         .fetch_one(&self.pool).await.map_err(db_err)?;
+        let (total, supersedes) = row;
+        if total == 0 { return Ok(false); }
+        Ok(supersedes as f64 / total as f64 > 0.3)
+    }
+
     /// Per-type stats: count, avg_confidence, contradiction_rate, avg_staleness_hours.
     pub async fn health_analyze(&self, user_id: &str) -> Result<serde_json::Value, MemoriaError> {
         let rows: Vec<(String, i64, f64, i64, f64)> = sqlx::query_as(

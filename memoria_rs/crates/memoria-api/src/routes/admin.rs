@@ -166,6 +166,7 @@ pub async fn trigger_governance(
             let archived_working = sql.archive_stale_working(24).await.map_err(db_err)?;
             let compressed = sql.compress_redundant(&user_id, 0.95, 30, 10_000).await.map_err(db_err)?;
             let cleaned_incrementals = sql.cleanup_orphaned_incrementals(&user_id, 24).await.map_err(db_err)?;
+            let pollution_detected = sql.detect_pollution(&user_id, 24).await.map_err(db_err)?;
             Ok(Json(serde_json::json!({
                 "op": op, "user_id": user_id,
                 "quarantined": quarantined,
@@ -174,6 +175,7 @@ pub async fn trigger_governance(
                 "archived_working": archived_working,
                 "compressed_redundant": compressed,
                 "cleaned_incrementals": cleaned_incrementals,
+                "pollution_detected": pollution_detected,
             })))
         }
         "consolidate" => {
