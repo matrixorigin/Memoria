@@ -393,7 +393,12 @@ class GraphStore(DbConsumer):
             return []
         import re as _re
 
-        safe = _re.sub(r"[+\-<>()~*\"@]", " ", query).replace("'", "").replace("\\", "").strip()
+        safe = (
+            _re.sub(r"[+\-<>()~*\"@]", " ", query)
+            .replace("'", "")
+            .replace("\\", "")
+            .strip()
+        )
         if not safe:
             return []
 
