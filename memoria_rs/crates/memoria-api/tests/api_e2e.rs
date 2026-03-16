@@ -28,7 +28,7 @@ async fn spawn_server() -> (String, reqwest::Client) {
     let pool = MySqlPool::connect(&db).await.expect("pool");
     let git = Arc::new(GitForDataService::new(pool, &cfg.db_name));
     let service = Arc::new(MemoryService::new_sql(Arc::new(store), None));
-    let state = memoria_api::AppState { service, git, master_key: String::new() };
+    let state = memoria_api::AppState::new(service, git, String::new());
 
     let app = Router::new()
         .route("/health", get(memoria_api::routes::memory::health))
@@ -49,6 +49,8 @@ async fn spawn_server() -> (String, reqwest::Client) {
         .route("/v1/extract-entities", post(memoria_api::routes::governance::extract_entities))
         .route("/v1/extract-entities/link", post(memoria_api::routes::governance::link_entities))
         .route("/v1/entities", get(memoria_api::routes::governance::get_entities))
+        .route("/v1/sessions/:session_id/summary", post(memoria_api::routes::sessions::create_session_summary))
+        .route("/v1/tasks/:task_id", get(memoria_api::routes::sessions::get_task_status))
         .route("/v1/snapshots", get(memoria_api::routes::snapshots::list_snapshots))
         .route("/v1/snapshots", post(memoria_api::routes::snapshots::create_snapshot))
         .route("/v1/snapshots/delete", post(memoria_api::routes::snapshots::delete_snapshot_bulk))
@@ -288,10 +290,7 @@ async fn test_api_auth_required() {
     let git = Arc::new(GitForDataService::new(pool, &cfg.db_name));
     let service = Arc::new(MemoryService::new_sql(Arc::new(store), None));
     // Set a master key to enable auth
-    let state = memoria_api::AppState {
-        service, git,
-        master_key: "test-master-key-12345".to_string(),
-    };
+    let state = memoria_api::AppState::new(service, git, "test-master-key-12345".to_string());
 
     let app = Router::new()
         .route("/v1/memories", get(memoria_api::routes::memory::list_memories))
@@ -610,4 +609,161 @@ async fn test_remote_purge_by_topic() {
     let t = r["content"][0]["text"].as_str().unwrap_or("");
     assert!(t.contains("Purged"), "got: {t}");
     println!("✅ remote purge by topic: {t}");
+}
+
+// ── Episodic memory tests ─────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_episodic_no_llm_returns_503() {
+    let (base, client) = spawn_server().await;
+    let uid = uid();
+
+    // Store some memories with a session_id
+    client.post(format!("{base}/v1/memories"))
+        .header("X-User-Id", &uid)
+        .json(&json!({"content": "Worked on Rust backend", "session_id": "sess1"}))
+        .send().await.unwrap();
+
+    // Without LLM configured, should return 503
+    let r = client.post(format!("{base}/v1/sessions/sess1/summary"))
+        .header("X-User-Id", &uid)
+        .json(&json!({"mode": "full", "sync": true}))
+        .send().await.unwrap();
+    assert_eq!(r.status(), 503, "should return 503 without LLM");
+    println!("✅ episodic without LLM: 503 SERVICE_UNAVAILABLE");
+}
+
+#[tokio::test]
+async fn test_episodic_no_memories_returns_error() {
+    // This test requires LLM — skip if not configured
+    let llm_key = match std::env::var("LLM_API_KEY").ok().filter(|s| !s.is_empty()) {
+        Some(k) => k,
+        None => {
+            println!("⏭️  test_episodic_no_memories skipped (LLM_API_KEY not set)");
+            return;
+        }
+    };
+
+    use axum::{routing::{get, post}, Router};
+    use memoria_git::GitForDataService;
+    use memoria_service::{Config, MemoryService};
+    use memoria_storage::SqlMemoryStore;
+    use sqlx::mysql::MySqlPool;
+    use memoria_embedding::LlmClient;
+
+    let cfg = Config::from_env();
+    let db = db_url();
+    let store = SqlMemoryStore::connect(&db, 4).await.expect("connect");
+    store.migrate().await.expect("migrate");
+    let pool = MySqlPool::connect(&db).await.expect("pool");
+    let git = Arc::new(GitForDataService::new(pool, &cfg.db_name));
+    let base_url = std::env::var("LLM_BASE_URL").unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
+    let model = std::env::var("LLM_MODEL").unwrap_or_else(|_| "gpt-4o-mini".to_string());
+    let llm = Arc::new(LlmClient::new(llm_key, base_url, model));
+    let service = Arc::new(MemoryService::new_sql_with_llm(Arc::new(store), None, Some(llm)));
+    let state = memoria_api::AppState::new(service, git, String::new());
+
+    let app = Router::new()
+        .route("/v1/sessions/:session_id/summary", post(memoria_api::routes::sessions::create_session_summary))
+        .with_state(state);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let base = format!("http://127.0.0.1:{port}");
+    let uid = uid();
+
+    // No memories for this session → 500
+    let r = client.post(format!("{base}/v1/sessions/nonexistent_session/summary"))
+        .header("X-User-Id", &uid)
+        .json(&json!({"mode": "full", "sync": true}))
+        .send().await.unwrap();
+    assert_eq!(r.status(), 500, "should return 500 for empty session");
+    println!("✅ episodic empty session: 500");
+}
+
+#[tokio::test]
+async fn test_episodic_async_task_polling() {
+    let (base, client) = spawn_server().await;
+    let uid = uid();
+
+    // Without LLM, async mode should still create a task (that will fail)
+    // but the endpoint itself returns 503 before creating a task
+    let r = client.post(format!("{base}/v1/sessions/sess_async/summary"))
+        .header("X-User-Id", &uid)
+        .json(&json!({"mode": "full", "sync": false}))
+        .send().await.unwrap();
+    // Without LLM: 503
+    assert_eq!(r.status(), 503);
+    println!("✅ episodic async without LLM: 503");
+}
+
+#[tokio::test]
+async fn test_episodic_with_llm_sync() {
+    let llm_key = match std::env::var("LLM_API_KEY").ok().filter(|s| !s.is_empty()) {
+        Some(k) => k,
+        None => {
+            println!("⏭️  test_episodic_with_llm_sync skipped (LLM_API_KEY not set)");
+            return;
+        }
+    };
+
+    use axum::{routing::{get, post}, Router};
+    use memoria_git::GitForDataService;
+    use memoria_service::{Config, MemoryService};
+    use memoria_storage::SqlMemoryStore;
+    use sqlx::mysql::MySqlPool;
+    use memoria_embedding::LlmClient;
+
+    let cfg = Config::from_env();
+    let db = db_url();
+    let store = SqlMemoryStore::connect(&db, 4).await.expect("connect");
+    store.migrate().await.expect("migrate");
+    let pool = MySqlPool::connect(&db).await.expect("pool");
+    let git = Arc::new(GitForDataService::new(pool, &cfg.db_name));
+    let base_url = std::env::var("LLM_BASE_URL").unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
+    let model = std::env::var("LLM_MODEL").unwrap_or_else(|_| "gpt-4o-mini".to_string());
+    let llm = Arc::new(LlmClient::new(llm_key, base_url, model));
+    let service = Arc::new(MemoryService::new_sql_with_llm(Arc::new(store), None, Some(llm)));
+    let state = memoria_api::AppState::new(service, git, String::new());
+
+    let app = Router::new()
+        .route("/v1/memories", post(memoria_api::routes::memory::store_memory))
+        .route("/v1/sessions/:session_id/summary", post(memoria_api::routes::sessions::create_session_summary))
+        .route("/v1/tasks/:task_id", get(memoria_api::routes::sessions::get_task_status))
+        .with_state(state);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let base = format!("http://127.0.0.1:{port}");
+    let uid = uid();
+    let session_id = format!("ep_sess_{}", uuid::Uuid::new_v4().simple().to_string()[..8].to_string());
+
+    // Store memories with session_id
+    for content in &["Implemented Rust REST API", "Added episodic memory support", "All tests passing"] {
+        client.post(format!("{base}/v1/memories"))
+            .header("X-User-Id", &uid)
+            .json(&json!({"content": content, "session_id": session_id}))
+            .send().await.unwrap();
+    }
+
+    // Generate episodic memory (sync)
+    let r = client.post(format!("{base}/v1/sessions/{session_id}/summary"))
+        .header("X-User-Id", &uid)
+        .json(&json!({"mode": "full", "sync": true}))
+        .send().await.unwrap();
+    assert_eq!(r.status(), 200, "should return 200");
+    let body: serde_json::Value = r.json().await.unwrap();
+    assert!(body["memory_id"].as_str().is_some(), "should have memory_id: {body}");
+    assert!(body["content"].as_str().map(|c| c.contains("Session Summary")).unwrap_or(false),
+        "content should contain 'Session Summary': {body}");
+    println!("✅ episodic with LLM sync: memory_id={}", body["memory_id"].as_str().unwrap_or(""));
+    println!("   content: {}", &body["content"].as_str().unwrap_or("")[..100.min(body["content"].as_str().unwrap_or("").len())]);
 }

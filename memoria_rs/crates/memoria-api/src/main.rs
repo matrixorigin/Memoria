@@ -61,7 +61,7 @@ async fn main() -> Result<()> {
     });
 
     let service = Arc::new(MemoryService::new_sql_with_llm(Arc::new(store), embedder, llm));
-    let state = AppState { service, git, master_key: args.master_key };
+    let state = AppState::new(service, git, args.master_key);
 
     let app = Router::new()
         // Health
@@ -98,6 +98,9 @@ async fn main() -> Result<()> {
         .route("/v1/branches/:name/merge", post(routes::snapshots::merge_branch))
         .route("/v1/branches/:name/diff", get(routes::snapshots::diff_branch))
         .route("/v1/branches/:name", delete(routes::snapshots::delete_branch))
+        // Sessions (episodic memory)
+        .route("/v1/sessions/:session_id/summary", post(routes::sessions::create_session_summary))
+        .route("/v1/tasks/:task_id", get(routes::sessions::get_task_status))
         .layer(TraceLayer::new_for_http())
         .with_state(state);
 
