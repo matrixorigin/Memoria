@@ -7,7 +7,7 @@ use memoria_embedding::LlmClient;
 use memoria_storage::SqlMemoryStore;
 use std::sync::Arc;
 use uuid::Uuid;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 
 /// Explain stats for retrieve/search — like SQL EXPLAIN ANALYZE.
 #[derive(Debug, Default, serde::Serialize)]
@@ -84,6 +84,8 @@ impl MemoryService {
         memory_type: MemoryType,
         session_id: Option<String>,
         trust_tier: Option<TrustTier>,
+        observed_at: Option<DateTime<Utc>>,
+        initial_confidence: Option<f64>,
     ) -> Result<Memory, MemoriaError> {
         // Sensitivity check — block HIGH tier, redact MEDIUM tier
         let sensitivity = check_sensitivity(content);
@@ -101,14 +103,15 @@ impl MemoryService {
             user_id: user_id.to_string(),
             memory_type,
             content: content.to_string(),
-            initial_confidence: trust_tier.as_ref().map(|t| t.initial_confidence()).unwrap_or(0.75),
+            initial_confidence: initial_confidence
+                .unwrap_or_else(|| trust_tier.as_ref().map(|t| t.initial_confidence()).unwrap_or(0.75)),
             embedding,
             source_event_ids: vec![],
             superseded_by: None,
             is_active: true,
             access_count: 0,
             session_id,
-            observed_at: Some(Utc::now()),
+            observed_at: Some(observed_at.unwrap_or_else(Utc::now)),
             created_at: None,
             updated_at: None,
             extra_metadata: None,

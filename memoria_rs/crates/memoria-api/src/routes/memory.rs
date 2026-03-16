@@ -49,7 +49,10 @@ pub async fn store_memory(
     let tier = req.trust_tier.as_deref()
         .map(parse_trust_tier).transpose()
         .map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e))?;
-    let m = state.service.store_memory(&user_id, &req.content, mt, req.session_id, tier)
+    let observed_at = req.observed_at.as_deref()
+        .map(|s| chrono::DateTime::parse_from_rfc3339(s).map(|dt| dt.with_timezone(&chrono::Utc)))
+        .transpose().map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
+    let m = state.service.store_memory(&user_id, &req.content, mt, req.session_id, tier, observed_at, req.initial_confidence)
         .await.map_err(api_err)?;
     Ok((StatusCode::CREATED, Json(m.into())))
 }
@@ -65,7 +68,7 @@ pub async fn batch_store(
         let tier = r.trust_tier.as_deref()
             .map(parse_trust_tier).transpose()
             .map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e))?;
-        let m = state.service.store_memory(&user_id, &r.content, mt, r.session_id, tier)
+        let m = state.service.store_memory(&user_id, &r.content, mt, r.session_id, tier, None, None)
             .await.map_err(api_err)?;
         results.push(m.into());
     }
@@ -206,7 +209,7 @@ pub async fn observe_turn(
             let m = state.service.store_memory(
                 &user_id, content,
                 memoria_core::MemoryType::Semantic,
-                req.session_id.clone(), None,
+                req.session_id.clone(), None, None, None,
             ).await.map_err(api_err)?;
             stored.push(serde_json::json!({
                 "memory_id": m.memory_id,

@@ -208,3 +208,18 @@ pub async fn health_capacity(
     let result = sql.health_capacity(&user_id).await.map_err(db_err)?;
     Ok(Json(result))
 }
+
+/// POST /admin/users/:id/strategy?strategy=... — set retrieval strategy (no-op stub for benchmark compat)
+pub async fn set_user_strategy(
+    Path(user_id): Path<String>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+    _state: State<AppState>,
+) -> Json<serde_json::Value> {
+    let strategy = params.get("strategy").cloned().unwrap_or_else(|| "vector:v1".to_string());
+    Json(serde_json::json!({
+        "user_id": user_id,
+        "strategy": strategy,
+        "previous": "vector:v1",
+        "status": "ok",
+    }))
+}

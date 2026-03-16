@@ -178,7 +178,7 @@ pub async fn call(
                 .map(TrustTier::from_str).transpose().ok().flatten();
             let mt = MemoryType::from_str(memory_type)
                 .unwrap_or(MemoryType::Semantic);
-            let m = match service.store_memory(user_id, &content, mt, session_id.clone(), trust_tier).await {
+            let m = match service.store_memory(user_id, &content, mt, session_id.clone(), trust_tier, None, None).await {
                 Ok(m) => m,
                 Err(memoria_core::MemoriaError::Blocked(reason)) => {
                     return Ok(json!({"result": format!("⚠️ Memory blocked: {reason}")}));
@@ -549,7 +549,8 @@ pub async fn call(
                     // Store as T4 (unverified insight from reflection)
                     let _ = service.store_memory(
                         user_id, &content, mt, None,
-                        Some(TrustTier::from_str("T4").unwrap_or(TrustTier::T4Unverified))
+                        Some(TrustTier::from_str("T4").unwrap_or(TrustTier::T4Unverified)),
+                        None, None,
                     ).await;
                     scenes_created += 1;
                     let _ = confidence; // used in future for graph node confidence

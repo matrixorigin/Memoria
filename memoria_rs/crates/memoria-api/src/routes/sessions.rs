@@ -136,7 +136,7 @@ async fn generate_and_store(
         let content = format!("Session Highlights:\n{}",
             points.iter().map(|p| format!("• {}", p.as_str().unwrap_or(""))).collect::<Vec<_>>().join("\n"));
         let metadata = json!({"mode": "lightweight", "points": points});
-        let m = state.service.store_memory(user_id, &content, memoria_core::MemoryType::Episodic, None, None)
+        let m = state.service.store_memory(user_id, &content, memoria_core::MemoryType::Episodic, None, None, None, None)
             .await.map_err(|e| e.to_string())?;
         Ok((m.memory_id, content, truncated, metadata))
     } else {
@@ -155,7 +155,7 @@ async fn generate_and_store(
         if topic.is_empty() { return Err("LLM returned empty topic".to_string()); }
         let content = format!("Session Summary: {topic}\n\nActions: {action}\n\nOutcome: {outcome}");
         let metadata = json!({"mode": "full", "topic": topic, "action": action, "outcome": outcome, "session_id": session_id});
-        let m = state.service.store_memory(user_id, &content, memoria_core::MemoryType::Episodic, None, None)
+        let m = state.service.store_memory(user_id, &content, memoria_core::MemoryType::Episodic, None, None, None, None)
             .await.map_err(|e| e.to_string())?;
         Ok((m.memory_id, content, truncated, metadata))
     }

@@ -60,6 +60,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/admin/users/:user_id/stats", get(routes::admin::user_stats))
         .route("/admin/users/:user_id", delete(routes::admin::delete_user))
         .route("/admin/users/:user_id/reset-access-counts", post(routes::admin::reset_access_counts))
+        .route("/admin/users/:user_id/strategy", post(routes::admin::set_user_strategy))
         .route("/admin/governance/:user_id/trigger", post(routes::admin::trigger_governance))
         // Health
         .route("/v1/health/analyze", get(routes::admin::health_analyze))

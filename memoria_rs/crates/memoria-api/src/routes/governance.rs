@@ -110,7 +110,7 @@ pub async fn reflect(
             let mt_str = item["type"].as_str().unwrap_or("semantic");
             let mt = memoria_core::MemoryType::from_str(mt_str).unwrap_or(memoria_core::MemoryType::Semantic);
             let _ = state.service.store_memory(&user_id, &content, mt, None,
-                Some(memoria_core::TrustTier::T4Unverified)).await;
+                Some(memoria_core::TrustTier::T4Unverified), None, None).await;
             scenes_created += 1;
         }
     }

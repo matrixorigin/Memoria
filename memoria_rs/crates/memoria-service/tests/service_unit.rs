@@ -80,7 +80,7 @@ fn make_service() -> MemoryService {
 #[tokio::test]
 async fn test_store_and_retrieve() {
     let svc = make_service();
-    let m = svc.store_memory("u1", "rust is fast", MemoryType::Semantic, None, None).await.unwrap();
+    let m = svc.store_memory("u1", "rust is fast", MemoryType::Semantic, None, None, None, None).await.unwrap();
     assert!(!m.memory_id.is_empty());
     assert_eq!(m.content, "rust is fast");
     assert!(m.embedding.is_some());
@@ -95,7 +95,7 @@ async fn test_store_and_retrieve() {
 #[tokio::test]
 async fn test_correct() {
     let svc = make_service();
-    let m = svc.store_memory("u1", "old content", MemoryType::Semantic, None, None).await.unwrap();
+    let m = svc.store_memory("u1", "old content", MemoryType::Semantic, None, None, None, None).await.unwrap();
     let corrected = svc.correct(&m.memory_id, "new content").await.unwrap();
     assert_eq!(corrected.content, "new content");
     assert!(corrected.embedding.is_some());
@@ -105,7 +105,7 @@ async fn test_correct() {
 #[tokio::test]
 async fn test_purge() {
     let svc = make_service();
-    let m = svc.store_memory("u1", "to delete", MemoryType::Working, None, None).await.unwrap();
+    let m = svc.store_memory("u1", "to delete", MemoryType::Working, None, None, None, None).await.unwrap();
     svc.purge(&m.memory_id).await.unwrap();
     let got = svc.get(&m.memory_id).await.unwrap();
     assert!(got.is_none());
@@ -115,8 +115,8 @@ async fn test_purge() {
 #[tokio::test]
 async fn test_list_active_excludes_deleted() {
     let svc = make_service();
-    svc.store_memory("u1", "keep this", MemoryType::Semantic, None, None).await.unwrap();
-    let del = svc.store_memory("u1", "delete this", MemoryType::Working, None, None).await.unwrap();
+    svc.store_memory("u1", "keep this", MemoryType::Semantic, None, None, None, None).await.unwrap();
+    let del = svc.store_memory("u1", "delete this", MemoryType::Working, None, None, None, None).await.unwrap();
     svc.purge(&del.memory_id).await.unwrap();
 
     let list = svc.list_active("u1", 10).await.unwrap();
@@ -130,7 +130,7 @@ async fn test_memory_types() {
     let svc = make_service();
     for mt in [MemoryType::Semantic, MemoryType::Profile, MemoryType::Procedural,
                MemoryType::Working, MemoryType::ToolResult, MemoryType::Episodic] {
-        let m = svc.store_memory("u1", "content", mt.clone(), None, None).await.unwrap();
+        let m = svc.store_memory("u1", "content", mt.clone(), None, None, None, None).await.unwrap();
         assert_eq!(m.memory_type, mt);
     }
     println!("✅ all 6 memory types");
@@ -145,7 +145,7 @@ async fn test_trust_tiers() {
         (TrustTier::T3Inferred, 0.65),
         (TrustTier::T4Unverified, 0.40),
     ] {
-        let m = svc.store_memory("u1", "content", MemoryType::Semantic, None, Some(tier)).await.unwrap();
+        let m = svc.store_memory("u1", "content", MemoryType::Semantic, None, Some(tier), None, None).await.unwrap();
         assert!((m.initial_confidence - expected_conf).abs() < 1e-6);
     }
     println!("✅ all 4 trust tiers");
@@ -154,7 +154,7 @@ async fn test_trust_tiers() {
 #[tokio::test]
 async fn test_no_embedder_still_works() {
     let svc = MemoryService::new(Arc::new(MockStore::default()), None);
-    let m = svc.store_memory("u1", "no embedding", MemoryType::Semantic, None, None).await.unwrap();
+    let m = svc.store_memory("u1", "no embedding", MemoryType::Semantic, None, None, None, None).await.unwrap();
     assert!(m.embedding.is_none());
     println!("✅ no_embedder_still_works");
 }

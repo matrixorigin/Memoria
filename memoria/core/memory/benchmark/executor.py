@@ -274,7 +274,11 @@ class BenchmarkExecutor:
         )
         resp.raise_for_status()
         data = resp.json()
-        return data if isinstance(data, list) else []
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict) and "results" in data:
+            return data["results"]
+        return []
 
     def _search(self, query: str, top_k: int = 10) -> list[dict[str, Any]]:
         resp = self._client.post(
@@ -283,7 +287,11 @@ class BenchmarkExecutor:
         )
         resp.raise_for_status()
         data = resp.json()
-        return data if isinstance(data, list) else []
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict) and "results" in data:
+            return data["results"]
+        return []
 
     def _correct(self, query: str, new_content: str, reason: str) -> bool:
         resp = self._client.post(

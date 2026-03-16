@@ -37,9 +37,10 @@ impl FromRequestParts<AppState> for AuthUser {
             }
         }
 
-        // Extract user_id from X-User-Id header, then query param, then default
+        // Extract user_id from X-User-Id header, X-Impersonate-User, then query param, then default
         let user_id = parts.headers
             .get("X-User-Id")
+            .or_else(|| parts.headers.get("X-Impersonate-User"))
             .and_then(|v| v.to_str().ok())
             .map(String::from)
             .or_else(|| {

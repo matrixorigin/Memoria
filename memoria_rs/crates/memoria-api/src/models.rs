@@ -15,6 +15,8 @@ pub struct StoreRequest {
     pub session_id: Option<String>,
     pub trust_tier: Option<String>,
     pub initial_confidence: Option<f64>,
+    pub observed_at: Option<String>,
+    pub source: Option<String>,
 }
 fn default_memory_type() -> String { "semantic".to_string() }
 
