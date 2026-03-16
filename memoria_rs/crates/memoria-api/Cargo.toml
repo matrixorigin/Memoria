@@ -7,17 +7,32 @@ edition = "2021"
 name = "memoria-api"
 path = "src/main.rs"
 
+[lib]
+name = "memoria_api"
+path = "src/lib.rs"
+
 [dependencies]
 memoria-core = { workspace = true }
 memoria-storage = { workspace = true }
 memoria-embedding = { workspace = true }
 memoria-service = { workspace = true }
+memoria-git = { workspace = true }
+memoria-mcp = { workspace = true }
 axum = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+serde_urlencoded = "0.7"
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 tower-http = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+sqlx = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+serde_json = { workspace = true }
+reqwest = { workspace = true }

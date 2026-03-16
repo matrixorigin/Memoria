@@ -1147,17 +1147,24 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "chrono",
  "clap",
  "memoria-core",
  "memoria-embedding",
+ "memoria-git",
+ "memoria-mcp",
  "memoria-service",
  "memoria-storage",
+ "reqwest",
  "serde",
  "serde_json",
+ "serde_urlencoded",
+ "sqlx",
  "tokio",
  "tower-http 0.5.2",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

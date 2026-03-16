@@ -35,6 +35,7 @@ memoria-storage = { path = "crates/memoria-storage" }
 memoria-embedding = { path = "crates/memoria-embedding" }
 memoria-service = { path = "crates/memoria-service" }
 memoria-git = { path = "crates/memoria-git" }
+memoria-mcp = { path = "crates/memoria-mcp" }
 
 [patch.crates-io]
 # MatrixOne returns type code 0xf1 for JSON columns in `data branch diff` output,
