@@ -1,0 +1,22 @@
+[package]
+name = "memoria-service"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+memoria-core = { workspace = true }
+memoria-storage = { workspace = true }
+memoria-embedding = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+async-trait = { workspace = true }
+memoria-core = { workspace = true }

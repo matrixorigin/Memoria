@@ -1,0 +1,44 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/memoria-core",
+    "crates/memoria-storage",
+    "crates/memoria-embedding",
+    "crates/memoria-service",
+    "crates/memoria-git",
+    "crates/memoria-api",
+    "crates/memoria-mcp",
+    "crates/memoria-cli",
+]
+
+[workspace.dependencies]
+tokio = { version = "1.40", features = ["full"] }
+axum = "0.7"
+sqlx = { version = "0.8", features = ["runtime-tokio", "mysql", "chrono", "json", "macros"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+chrono = { version = "0.4", features = ["serde"] }
+thiserror = "1.0"
+anyhow = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4.5", features = ["derive", "env"] }
+reqwest = { version = "0.12", features = ["json"] }
+uuid = { version = "1.0", features = ["v4"] }
+async-trait = "0.1"
+tower = "0.4"
+tower-http = { version = "0.5", features = ["trace", "cors"] }
+
+# Internal crates
+memoria-core = { path = "crates/memoria-core" }
+memoria-storage = { path = "crates/memoria-storage" }
+memoria-embedding = { path = "crates/memoria-embedding" }
+memoria-service = { path = "crates/memoria-service" }
+memoria-git = { path = "crates/memoria-git" }
+
+[patch.crates-io]
+# MatrixOne returns type code 0xf1 for JSON columns in `data branch diff` output,
+# which is non-standard (MySQL uses 0xf5 for JSON). This patch maps 0xf1 -> Blob
+# so sqlx can decode the result set without panicking.
+# Filed as MatrixOne bug: data branch diff uses inconsistent column type codes.
+sqlx-mysql = { path = "vendor/sqlx-mysql" }

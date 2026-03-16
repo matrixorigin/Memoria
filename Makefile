@@ -1,7 +1,8 @@
 .PHONY: help start stop logs status build test test-fast test-slow test-docker test-mcp test-all-cov clean reset \
         cloud-start cloud-stop cloud-logs cloud-status cloud-health cloud-clean cloud-rebuild \
         install dev build-wheel publish publish-test bump-version check lint format type-check \
-        new-key list-keys revoke-keys bench bench-compare
+        new-key list-keys revoke-keys bench bench-compare \
+        test-rust test-rust-unit test-rust-integration
 
 # Load environment variables from .env file if it exists
 ifneq (,$(wildcard .env))
@@ -264,6 +265,37 @@ test-all-cov:
 	@echo "✅ Coverage report generated:"
 	@echo "   - HTML: htmlcov/index.html"
 	@echo "   - Log: coverage.log"
+
+# ── Rust (memoria_rs) ─────────────────────────────────────────────────────────
+
+RUST_DB_URL ?= mysql://root:111@localhost:6001/memoria_rs
+
+test-rust:
+	@echo "Running Rust tests (memoria_rs)..."
+	@cd memoria_rs && DATABASE_URL=$(RUST_DB_URL) SQLX_OFFLINE=true cargo test -q
+
+test-rust-e2e:
+	@echo "Running Rust e2e tests (needs DB + embedding)..."
+	@cd memoria_rs && DATABASE_URL=$(RUST_DB_URL) \
+		EMBEDDING_BASE_URL=$(MEMORIA_EMBEDDING_BASE_URL) \
+		EMBEDDING_API_KEY=$(MEMORIA_EMBEDDING_API_KEY) \
+		EMBEDDING_MODEL=$(MEMORIA_EMBEDDING_MODEL) \
+		EMBEDDING_DIM=$(MEMORIA_EMBEDDING_DIM) \
+		SQLX_OFFLINE=true cargo test -p memoria-mcp --test mcp_e2e -- --nocapture
+
+build-rust:
+	@echo "Building memoria-mcp-rs (release)..."
+	@cd memoria_rs && SQLX_OFFLINE=true cargo build --release -p memoria-mcp
+	@echo "Binary: memoria_rs/target/release/memoria-mcp-rs"
+	@ls -lh memoria_rs/target/release/memoria-mcp-rs
+
+test-rust-unit:
+	@echo "Running Rust unit tests (no DB)..."
+	@cd memoria_rs && SQLX_OFFLINE=true cargo test --lib -p memoria-core -p memoria-service -p memoria-mcp -q
+
+test-rust-integration:
+	@echo "Running Rust integration tests (needs MatrixOne)..."
+	@cd memoria_rs && DATABASE_URL=$(RUST_DB_URL) SQLX_OFFLINE=true cargo test -p memoria-storage -- --test-threads=1 -q
 
 BENCH_URL     ?= http://localhost:$${API_PORT:-8100}
 BENCH_TOKEN   ?= $${MEMORIA_MASTER_KEY:-test-master-key-for-docker-compose}
