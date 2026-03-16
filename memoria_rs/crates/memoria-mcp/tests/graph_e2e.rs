@@ -328,3 +328,141 @@ async fn test_graph_full_entity_workflow() {
 
     println!("✅ full entity workflow: {} entities linked to memory {}", entities.len(), &mid[..8]);
 }
+
+// ── 14. store → graph node auto-created ──────────────────────────────────────
+
+#[tokio::test]
+async fn test_store_creates_graph_node() {
+    use memoria_storage::SqlMemoryStore;
+    use memoria_service::MemoryService;
+    use std::sync::Arc;
+
+    let db_url = std::env::var("DATABASE_URL")
+        .unwrap_or_else(|_| "mysql://root:111@localhost:6001/memoria_rs".to_string());
+    let sql = SqlMemoryStore::connect(&db_url, 4).await.expect("connect");
+    sql.migrate().await.expect("migrate");
+    let uid = format!("gsync_{}", uuid::Uuid::new_v4().simple());
+    let svc = Arc::new(MemoryService::new_sql(Arc::new(sql.clone()), None));
+
+    // Call memory_store via tools
+    let r = memoria_mcp::tools::call(
+        "memory_store",
+        serde_json::json!({"content": "Project uses Rust and MatrixOne database", "memory_type": "semantic"}),
+        &svc, &uid,
+    ).await.expect("call");
+    let text = r["content"][0]["text"].as_str().unwrap_or("");
+    assert!(text.contains("Stored memory"), "got: {text}");
+
+    // Extract memory_id from response
+    let mid = text.split_whitespace().nth(2).unwrap_or("").trim_end_matches(':');
+
+    // Verify graph node was created
+    let graph = sql.graph_store();
+    let node = graph.get_node_by_memory_id(mid).await.expect("query");
+    assert!(node.is_some(), "graph node should be created for memory {mid}");
+    let node = node.unwrap();
+    assert_eq!(node.content, "Project uses Rust and MatrixOne database");
+    println!("✅ store creates graph node: {}", node.node_id);
+
+    // Verify entity extraction happened
+    let entities = graph.get_user_entities(&uid).await.expect("entities");
+    println!("✅ auto-extracted entities: {:?}", entities.iter().map(|(n,_)| n.as_str()).collect::<Vec<_>>());
+    // Should have extracted "rust" and/or "matrixone"
+    let names: Vec<&str> = entities.iter().map(|(n, _)| n.as_str()).collect();
+    assert!(names.contains(&"rust") || names.contains(&"matrixone"),
+        "expected rust or matrixone in {names:?}");
+}
+
+// ── 15. correct → graph node content updated ─────────────────────────────────
+
+#[tokio::test]
+async fn test_correct_updates_graph_node() {
+    use memoria_storage::SqlMemoryStore;
+    use memoria_service::MemoryService;
+    use std::sync::Arc;
+
+    let db_url = std::env::var("DATABASE_URL")
+        .unwrap_or_else(|_| "mysql://root:111@localhost:6001/memoria_rs".to_string());
+    let sql = SqlMemoryStore::connect(&db_url, 4).await.expect("connect");
+    sql.migrate().await.expect("migrate");
+    let uid = format!("gcorr_{}", uuid::Uuid::new_v4().simple());
+    let svc = Arc::new(MemoryService::new_sql(Arc::new(sql.clone()), None));
+
+    // Store
+    let r = memoria_mcp::tools::call(
+        "memory_store",
+        serde_json::json!({"content": "Uses black for formatting"}),
+        &svc, &uid,
+    ).await.expect("store");
+    let text = r["content"][0]["text"].as_str().unwrap_or("");
+    let mid = text.split_whitespace().nth(2).unwrap_or("").trim_end_matches(':').to_string();
+
+    // Correct
+    memoria_mcp::tools::call(
+        "memory_correct",
+        serde_json::json!({"memory_id": mid, "new_content": "Uses ruff for formatting", "reason": "switched"}),
+        &svc, &uid,
+    ).await.expect("correct");
+
+    // Verify graph node updated
+    let graph = sql.graph_store();
+    let node = graph.get_node_by_memory_id(&mid).await.expect("query").expect("exists");
+    assert_eq!(node.content, "Uses ruff for formatting", "graph node content should be updated");
+    println!("✅ correct updates graph node: {}", node.content);
+}
+
+// ── 16. purge → graph node deactivated ───────────────────────────────────────
+
+#[tokio::test]
+async fn test_purge_deactivates_graph_node() {
+    use memoria_storage::SqlMemoryStore;
+    use memoria_service::MemoryService;
+    use std::sync::Arc;
+
+    let db_url = std::env::var("DATABASE_URL")
+        .unwrap_or_else(|_| "mysql://root:111@localhost:6001/memoria_rs".to_string());
+    let sql = SqlMemoryStore::connect(&db_url, 4).await.expect("connect");
+    sql.migrate().await.expect("migrate");
+    let uid = format!("gpurge_{}", uuid::Uuid::new_v4().simple());
+    let svc = Arc::new(MemoryService::new_sql(Arc::new(sql.clone()), None));
+
+    // Store
+    let r = memoria_mcp::tools::call(
+        "memory_store",
+        serde_json::json!({"content": "Temporary working memory"}),
+        &svc, &uid,
+    ).await.expect("store");
+    let text = r["content"][0]["text"].as_str().unwrap_or("");
+    let mid = text.split_whitespace().nth(2).unwrap_or("").trim_end_matches(':').to_string();
+
+    // Verify graph node exists
+    let graph = sql.graph_store();
+    assert!(graph.get_node_by_memory_id(&mid).await.expect("query").is_some());
+
+    // Purge
+    memoria_mcp::tools::call(
+        "memory_purge",
+        serde_json::json!({"memory_id": mid}),
+        &svc, &uid,
+    ).await.expect("purge");
+
+    // Verify graph node deactivated
+    let node = graph.get_node_by_memory_id(&mid).await.expect("query");
+    assert!(node.is_none(), "deactivated node should not appear in active query");
+    println!("✅ purge deactivates graph node");
+}
+
+// ── 17. NER: regex extraction unit test via tools ────────────────────────────
+
+#[test]
+fn test_ner_extract_entities() {
+    let entities = memoria_storage::extract_entities(
+        "Project uses Rust and MatrixOne. See matrixorigin/matrixone for details. The auth-service handles login."
+    );
+    let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
+    println!("extracted: {names:?}");
+    assert!(names.contains(&"rust"), "rust not found in {names:?}");
+    assert!(names.contains(&"matrixone"), "matrixone not found in {names:?}");
+    assert!(names.contains(&"matrixorigin/matrixone"), "repo not found in {names:?}");
+    assert!(names.contains(&"auth-service"), "auth-service not found in {names:?}");
+}

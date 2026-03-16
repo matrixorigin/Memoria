@@ -176,7 +176,47 @@ pub async fn call(
                 .map(TrustTier::from_str).transpose().ok().flatten();
             let mt = MemoryType::from_str(memory_type)
                 .unwrap_or(MemoryType::Semantic);
-            let m = service.store_memory(user_id, &content, mt, session_id, trust_tier).await?;
+            let m = service.store_memory(user_id, &content, mt, session_id.clone(), trust_tier).await?;
+
+            // Graph sync: create SEMANTIC node + auto entity extraction (best-effort)
+            if let Some(sql) = &service.sql_store {
+                let graph = sql.graph_store();
+                let node = memoria_storage::GraphNode {
+                    node_id: uuid::Uuid::new_v4().simple().to_string()[..32].to_string(),
+                    user_id: user_id.to_string(),
+                    node_type: memoria_storage::NodeType::Semantic,
+                    content: m.content.clone(),
+                    entity_type: None,
+                    embedding: None,
+                    memory_id: Some(m.memory_id.clone()),
+                    session_id: session_id.clone(),
+                    confidence: m.initial_confidence as f32,
+                    trust_tier: format!("{}", m.trust_tier),
+                    importance: 0.5,
+                    source_nodes: vec![],
+                    conflicts_with: None,
+                    conflict_resolution: None,
+                    access_count: 0,
+                    cross_session_count: 0,
+                    is_active: true,
+                    superseded_by: None,
+                    created_at: m.created_at.map(|dt| dt.naive_utc()),
+                };
+                let _ = graph.create_node(&node).await; // best-effort
+
+                // Auto entity extraction (regex, lightweight)
+                let entities = memoria_storage::extract_entities(&m.content);
+                for ent in &entities {
+                    if let Ok((entity_id, _)) = graph.upsert_entity(
+                        user_id, &ent.name, &ent.display, &ent.entity_type
+                    ).await {
+                        let _ = graph.upsert_memory_entity_link(
+                            &m.memory_id, &entity_id, user_id, "regex"
+                        ).await;
+                    }
+                }
+            }
+
             Ok(mcp_text(&format!("Stored memory {}: {}", m.memory_id, m.content)))
         }
 
@@ -214,6 +254,11 @@ pub async fn call(
             } else {
                 return Ok(mcp_text("Provide memory_id or query"));
             };
+            // Graph sync: update content in graph node (best-effort)
+            if let Some(sql) = &service.sql_store {
+                let graph = sql.graph_store();
+                let _ = graph.update_content_by_memory_id(&m.memory_id, &m.content).await;
+            }
             Ok(mcp_text(&format!("Corrected memory {}: {}", m.memory_id, m.content)))
         }
 
@@ -226,6 +271,10 @@ pub async fn call(
                 let count = ids.len();
                 for id in &ids {
                     service.purge(id).await?;
+                    // Graph sync: deactivate graph node (best-effort)
+                    if let Some(sql) = &service.sql_store {
+                        let _ = sql.graph_store().deactivate_by_memory_id(id).await;
+                    }
                 }
                 Ok(mcp_text(&format!("Purged {count} memory(s)")))
             } else if !topic.is_empty() {
@@ -234,6 +283,9 @@ pub async fn call(
                 let count = results.len();
                 for m in &results {
                     service.purge(&m.memory_id).await?;
+                    if let Some(sql) = &service.sql_store {
+                        let _ = sql.graph_store().deactivate_by_memory_id(&m.memory_id).await;
+                    }
                 }
                 Ok(mcp_text(&format!("Purged {count} memory(s) matching '{topic}'")))
             } else {

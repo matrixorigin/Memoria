@@ -195,6 +195,27 @@ impl GraphStore {
         Ok(())
     }
 
+    /// Deactivate all graph nodes linked to a memory_id.
+    pub async fn deactivate_by_memory_id(&self, memory_id: &str) -> Result<(), MemoriaError> {
+        sqlx::query("UPDATE memory_graph_nodes SET is_active = 0 WHERE memory_id = ?")
+            .bind(memory_id).execute(&self.pool).await.map_err(db_err)?;
+        Ok(())
+    }
+
+    /// Update content (and optionally confidence) of a graph node by memory_id.
+    pub async fn update_content_by_memory_id(
+        &self,
+        memory_id: &str,
+        new_content: &str,
+    ) -> Result<(), MemoriaError> {
+        sqlx::query(
+            "UPDATE memory_graph_nodes SET content = ? WHERE memory_id = ? AND is_active = 1"
+        )
+        .bind(new_content).bind(memory_id)
+        .execute(&self.pool).await.map_err(db_err)?;
+        Ok(())
+    }
+
     pub async fn update_confidence_and_tier(
         &self, node_id: &str, confidence: f32, tier: &str,
     ) -> Result<(), MemoriaError> {

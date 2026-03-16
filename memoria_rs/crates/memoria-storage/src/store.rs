@@ -21,6 +21,7 @@ fn mo_to_vec(s: &str) -> Result<Vec<f32>, MemoriaError> {
         .collect()
 }
 
+#[derive(Clone)]
 pub struct SqlMemoryStore {
     pool: MySqlPool,
     embedding_dim: usize,
