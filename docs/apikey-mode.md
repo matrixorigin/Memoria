@@ -49,6 +49,16 @@ EMBEDDING_BASE_URL=https://api.siliconflow.cn/v1
 # 连接信息缓存 TTL（秒），默认 60，0 = 不缓存
 MEMORIA_CONN_CACHE_TTL=60
 
+# 数据库连接覆盖 — 私网环境下使用内部地址替代远程认证服务返回的公网域名
+# 例如 k8s 集群内使用 service name，避免流量绕行公网
+MEMORIA_USER_DB_HOST_OVERRIDE=matrixone.default.svc.cluster.local
+MEMORIA_USER_DB_PORT_OVERRIDE=6001   # 0 = 不覆盖（默认）
+
+# 每用户连接池调优（通常无需修改）
+MEMORIA_USER_POOL_SIZE=1             # 每用户连接池大小（默认 1）
+MEMORIA_USER_POOL_MAX_OVERFLOW=2     # 每用户最大溢出连接（默认 2）
+MEMORIA_MAX_USER_ENGINES=256         # LRU 缓存最大 Engine 数量（默认 256）
+
 # Master Key（如果同时需要 token 模式的管理员操作）
 MEMORIA_MASTER_KEY=your-master-key-here
 
@@ -126,7 +136,44 @@ Authorization: Bearer <apikey>
 
 ---
 
-## 三、MCP 客户端注册到 IDE
+## 三、连接池架构
+
+Apikey 模式下，每个用户拥有独立的 MatrixOne account（不同的 user/password），因此连接无法跨用户共享。Memoria 采用 per-user 小连接池 + LRU 缓存的策略来平衡性能和资源消耗。
+
+### 工作原理
+
+```
+用户 A 请求 → 查找 LRU cache → 命中 → 复用 Engine（pool_size=1, max_overflow=2）
+用户 B 请求 → 查找 LRU cache → 未命中 → 创建新 Engine → 放入 cache
+                                          ↓ cache 满时
+                                   驱逐最久未使用的 Engine → dispose() 释放连接
+```
+
+### 资源上限
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `USER_POOL_SIZE` | 1 | 每用户保持的常驻连接数 |
+| `USER_POOL_MAX_OVERFLOW` | 2 | 每用户允许的临时溢出连接数 |
+| `MAX_USER_ENGINES` | 256 | LRU 缓存的最大 Engine 数量 |
+
+最大总连接数 = `MAX_USER_ENGINES` × (`USER_POOL_SIZE` + `USER_POOL_MAX_OVERFLOW`) = 256 × 3 = 768
+
+### 私网部署
+
+远程认证服务返回的 `db_host` 通常是公网域名。如果 API Server 和 MatrixOne 在同一内网（如 k8s 集群），可以通过覆盖配置使用内部地址，避免流量绕行公网：
+
+```bash
+# .env
+MEMORIA_USER_DB_HOST_OVERRIDE=matrixone.default.svc.cluster.local
+MEMORIA_USER_DB_PORT_OVERRIDE=6001
+```
+
+覆盖在 `_resolve_apikey()` 中应用，对远程认证服务透明。
+
+---
+
+## 四、MCP 客户端注册到 IDE
 
 ### 方式一：使用 `memoria init` 命令
 
@@ -191,7 +238,7 @@ memoria init --api-url http://localhost:8100 --apikey your-api-key --tool claude
 
 ---
 
-## 四、`memoria-mcp` 启动参数
+## 五、`memoria-mcp` 启动参数
 
 | 参数 | 说明 | 示例 |
 |------|------|------|
@@ -217,7 +264,7 @@ memoria-mcp --api-url "http://localhost:8100" --apikey "your-api-key"
 
 ---
 
-## 五、测试 Apikey 模式
+## 六、测试 Apikey 模式
 
 ### 使用 curl 测试
 
@@ -251,20 +298,21 @@ curl http://localhost:8100/v1/profiles/me \
 
 ---
 
-## 六、与 Token 模式的区别
+## 七、与 Token 模式的区别
 
 | 特性 | Token 模式 | Apikey 模式 |
 |------|-----------|-------------|
 | 认证头 | `Authorization: Bearer <token>` | `X-API-Key: <apikey>` |
-| 数据库 | 所有用户共享一个数据库 | 每用户独立数据库 |
+| 数据库 | 所有用户共享一个数据库 | 每用户独立数据库（独立 account） |
 | 用户隔离 | 通过 `user_id` 字段隔离 | 物理数据库隔离 |
+| 连接池 | 全局共享一个 Engine | 每用户独立 Engine（小连接池 + LRU 缓存） |
 | 自动治理 | 后台定时调度（每小时/每天/每周） | 仅按需触发（无自动调度） |
 | API Key 管理 | 通过 master key + `/auth/keys` 接口 | 由外部认证服务管理 |
 | 适用场景 | 单租户 / 小团队 | 多租户 SaaS / 企业级 |
 
 ---
 
-## 七、`memoria init` 完整参数
+## 八、`memoria init` 完整参数
 
 ```bash
 memoria init [选项]
@@ -290,3 +338,19 @@ Embedding 选项（仅嵌入模式需要）：
 ```
 
 > 远程模式（`--api-url`）下不需要 embedding 参数，因为 embedding 由 server 端处理。
+
+---
+
+## 九、Server 端配置参考
+
+| 环境变量 | 默认值 | 说明 |
+|----------|--------|------|
+| `MEMORIA_REMOTE_AUTH_SERVICE_URL` | `""` | 远程认证服务地址，为空时 apikey 模式不可用 |
+| `MEMORIA_CONN_CACHE_TTL` | `60` | 认证结果缓存 TTL（秒），0 = 不缓存 |
+| `MEMORIA_USER_DB_HOST_OVERRIDE` | `""` | 覆盖 db_host（私网部署用） |
+| `MEMORIA_USER_DB_PORT_OVERRIDE` | `0` | 覆盖 db_port，0 = 不覆盖 |
+| `MEMORIA_USER_POOL_SIZE` | `1` | 每用户连接池大小 |
+| `MEMORIA_USER_POOL_MAX_OVERFLOW` | `2` | 每用户最大溢出连接 |
+| `MEMORIA_MAX_USER_ENGINES` | `256` | LRU 缓存最大 Engine 数，驱逐时 `dispose()` |
+
+以上配置仅影响 apikey 模式，对 token 模式无任何影响。

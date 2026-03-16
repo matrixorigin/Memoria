@@ -216,69 +216,88 @@ class TestHTTPBackendHeaders:
 
 
 class TestUserEngineDbNameValidation:
-    """_get_user_engine rejects SQL-injection-style db_names but allows hyphens."""
+    """get_user_session_factory rejects SQL-injection-style db_names but allows hyphens."""
 
     def test_rejects_semicolon_in_db_name(self):
-        from memoria.api.database import _get_user_engine
+        from memoria.api.database import get_user_session_factory
 
         with pytest.raises(ValueError, match="Invalid database name"):
-            _get_user_engine("h", 6001, "u", "p", "mem; DROP TABLE x")
+            get_user_session_factory("h", 6001, "u", "p", "mem; DROP TABLE x")
 
     def test_rejects_space_in_db_name(self):
-        from memoria.api.database import _get_user_engine
+        from memoria.api.database import get_user_session_factory
 
         with pytest.raises(ValueError, match="Invalid database name"):
-            _get_user_engine("h", 6001, "u", "p", "mem alice")
+            get_user_session_factory("h", 6001, "u", "p", "mem alice")
 
     def test_allows_hyphens_in_db_name(self):
         """Real-world: remote auth returns db_name like 'memoria-user-2'."""
-        from memoria.api.database import _get_user_engine
+        from memoria.api.database import get_user_session_factory, _user_engine_cache
 
-        with patch("matrixone.Client") as mock_client:
-            mock_engine = MagicMock()
-            mock_client.return_value._engine = mock_engine
-            engine = _get_user_engine("h", 6001, "u", "p", "memoria-user-2")
-            assert engine is mock_engine
-        _get_user_engine.cache_clear()
+        key = ("h", 6001, "u", "p", "memoria-user-2")
+
+        with (
+            patch("memoria.api.database._create_user_engine") as mock_create,
+            patch("memoria.api.database._ensure_user_tables"),
+        ):
+            mock_create.return_value = MagicMock()
+            factory = get_user_session_factory("h", 6001, "u", "p", "memoria-user-2")
+            assert factory is not None
+
+        # Clean up
+        _user_engine_cache.discard(key)
 
     def test_allows_underscores_and_digits(self):
-        from memoria.api.database import _get_user_engine
+        from memoria.api.database import get_user_session_factory, _user_engine_cache
 
-        with patch("matrixone.Client") as mock_client:
-            mock_client.return_value._engine = MagicMock()
-            _get_user_engine("h", 6001, "u", "p", "memoria_user_42")
-        _get_user_engine.cache_clear()
+        key = ("h2", 6001, "u", "p", "memoria_user_42")
+
+        with (
+            patch("memoria.api.database._create_user_engine") as mock_create,
+            patch("memoria.api.database._ensure_user_tables"),
+        ):
+            mock_create.return_value = MagicMock()
+            get_user_session_factory("h2", 6001, "u", "p", "memoria_user_42")
+
+        # Clean up
+        _user_engine_cache.discard(key)
 
 
 # ── Per-user table init runs only once ────────────────────────────────
 
 
 class TestUserSessionFactoryInitOnce:
-    """get_user_session_factory calls _ensure_user_tables only on first call per db_name."""
+    """get_user_session_factory calls _ensure_user_tables only on first call per (host, port, db_name)."""
 
     def test_tables_initialized_once_per_db(self):
         from memoria.api.database import (
             get_user_session_factory,
+            _user_engine_cache,
             _user_db_initialized,
         )
 
+        key = ("h_once", 1, "u", "p", "test_once_db")
+        init_key = ("h_once", 1, "test_once_db")
+
         # Clean up state from other tests
-        _user_db_initialized.discard("test_once_db")
+        _user_db_initialized.discard(init_key)
+        _user_engine_cache.discard(key)
 
         with (
-            patch("memoria.api.database._get_user_engine") as mock_engine,
+            patch("memoria.api.database._create_user_engine") as mock_create,
             patch("memoria.api.database._ensure_user_tables") as mock_init,
         ):
-            mock_engine.return_value = MagicMock()
+            mock_create.return_value = MagicMock()
 
-            get_user_session_factory("h", 1, "u", "p", "test_once_db")
-            get_user_session_factory("h", 1, "u", "p", "test_once_db")
+            get_user_session_factory("h_once", 1, "u", "p", "test_once_db")
+            get_user_session_factory("h_once", 1, "u", "p", "test_once_db")
 
             # _ensure_user_tables called exactly once despite two factory calls
             mock_init.assert_called_once()
 
         # Clean up
-        _user_db_initialized.discard("test_once_db")
+        _user_db_initialized.discard(init_key)
+        _user_engine_cache.discard(key)
 
 
 # ── Middleware: X-API-Key extraction for rate limiting ─────────────────

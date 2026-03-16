@@ -107,18 +107,44 @@ class RemoteAuthService:
 
 **文件**: `memoria/api/database.py`
 
+**架构关键事实**：每个 apikey 用户在 MatrixOne 中拥有独立的 account（不同的 user/password），但 db_name 相同。因此连接无法跨用户共享，每个用户需要独立的 Engine。
+
 ```python
-@lru_cache(maxsize=128)
-def _get_user_engine(host, port, user, password, db_name) -> Engine:
-    # 每个 (host, port, user, password, db_name) 组合缓存一个 Engine
-    # db_name 校验: [a-zA-Z0-9_\-]+（允许连字符）
+class _UserEngineCache:
+    """Thread-safe LRU cache for per-user SQLAlchemy engines.
+    
+    When an entry is evicted, engine.dispose() is called to release
+    all pooled connections back to the database.
+    """
+    # key = (host, port, user, password, db_name)
+    # 基于 OrderedDict 实现 O(1) LRU
+
+def _create_user_engine(host, port, user, password, db_name) -> Engine:
+    # 每用户小连接池: pool_size=1, max_overflow=2 → 最多 3 连接/用户
+    # 可通过 MEMORIA_USER_POOL_SIZE / MEMORIA_USER_POOL_MAX_OVERFLOW 配置
 
 def get_user_session_factory(host, port, user, password, db_name) -> sessionmaker:
+    # 查询 _user_engine_cache → 命中则返回缓存的 factory
+    # 未命中则创建新 Engine + sessionmaker，放入 LRU cache
     # 首次调用时自动创建 memory 表（ensure_tables + governance 基础表）
-    # 后续调用直接返回缓存的 sessionmaker
 ```
 
-**表初始化**：首次连接用户数据库时，自动创建所有必要的表（`mem_memories`、`memory_graph_nodes`、`memory_graph_edges`、治理基础表等）。通过 `_user_db_initialized` 集合确保每个 `db_name` 只初始化一次。
+**连接池策略**：
+- 每用户 Engine 使用极小连接池（默认 `pool_size=1, max_overflow=2`，最多 3 连接/用户）
+- LRU cache 默认容量 256 个 Engine（`MEMORIA_MAX_USER_ENGINES`）
+- 被驱逐的 Engine 会调用 `dispose()` 释放所有连接
+- 最大总连接数 = 256 × 3 = 768，在 MatrixOne 限制范围内
+
+**与旧设计的区别**：
+- 旧设计使用 `@lru_cache(maxsize=128)`，驱逐时不调用 `dispose()` → 连接泄漏
+- 新设计使用自定义 `_UserEngineCache`（基于 `OrderedDict`），驱逐时主动 `dispose()`
+
+**Host/Port 覆盖**：
+- `MEMORIA_USER_DB_HOST_OVERRIDE`：覆盖远程认证服务返回的 db_host（用于私网环境）
+- `MEMORIA_USER_DB_PORT_OVERRIDE`：覆盖 db_port（0 = 不覆盖）
+- 在 `_resolve_apikey()` 中应用覆盖，Engine cache key 使用覆盖后的值
+
+**表初始化**：首次连接用户数据库时，自动创建所有必要的表（`mem_memories`、`memory_graph_nodes`、`memory_graph_edges`、治理基础表等）。通过 `_user_db_initialized` 集合（key 为 `(host, port, db_name)`）确保每个数据库只初始化一次。
 
 ### 4.4 Middleware 适配
 
@@ -169,8 +195,13 @@ memoria init --api-url http://localhost:8100 --apikey your-key
 |----------|--------|------|
 | `MEMORIA_REMOTE_AUTH_SERVICE_URL` | `""` | 远程认证服务地址。为空时 apikey 模式不可用（返回 501） |
 | `MEMORIA_CONN_CACHE_TTL` | `60` | 认证结果缓存 TTL（秒）。0 = 不缓存 |
+| `MEMORIA_USER_DB_HOST_OVERRIDE` | `""` | 覆盖远程认证服务返回的 db_host（私网环境使用内部地址） |
+| `MEMORIA_USER_DB_PORT_OVERRIDE` | `0` | 覆盖 db_port。0 = 不覆盖 |
+| `MEMORIA_USER_POOL_SIZE` | `1` | 每用户 Engine 连接池大小 |
+| `MEMORIA_USER_POOL_MAX_OVERFLOW` | `2` | 每用户 Engine 最大溢出连接数 |
+| `MEMORIA_MAX_USER_ENGINES` | `256` | LRU cache 最大 Engine 数量，驱逐时调用 `dispose()` |
 
-这两个配置项仅影响 apikey 模式，对 token 模式无任何影响。
+以上配置项仅影响 apikey 模式，对 token 模式无任何影响。
 
 ## 6. 治理策略差异
 
@@ -205,7 +236,9 @@ if not _s.remote_auth_service_url:
 ### 7.2 数据库连接安全
 - `db_name` 校验：`[a-zA-Z0-9_\-]+`，防止 SQL 注入
 - `db_user` / `db_password` 使用 `quote_plus()` 编码，防止连接字符串注入
-- 每用户 Engine 通过 `@lru_cache(maxsize=128)` 缓存，避免连接泄漏
+- 每用户 Engine 通过 `_UserEngineCache`（LRU，默认 256）缓存，驱逐时调用 `dispose()` 释放连接
+- 密码不再作为 `@lru_cache` 的 key 暴露在内存中（旧设计的 P3 问题已消除）
+- 使用 SQLAlchemy `URL.create()` 构建连接 URL，避免手动拼接带来的注入风险
 
 ### 7.3 速率限制
 - 两种模式共享同一套速率限制策略
@@ -222,7 +255,7 @@ if not _s.remote_auth_service_url:
 |------|----------|------|
 | `memoria/api/remote_auth_service.py` | 新增 | 远程认证服务客户端（ConnInfo、缓存、resolve） |
 | `memoria/api/dependencies.py` | 修改 | 新增 AuthContext、get_auth_context、_resolve_apikey |
-| `memoria/api/database.py` | 修改 | 新增 _get_user_engine、get_user_session_factory、_ensure_user_tables |
+| `memoria/api/database.py` | 修改 | 新增 `_UserEngineCache`（LRU + dispose）、`_create_user_engine`（小连接池）、`get_user_session_factory`、`_ensure_user_tables` |
 | `memoria/api/main.py` | 修改 | 治理调度器条件启动（非 apikey 模式才启动） |
 | `memoria/api/middleware.py` | 修改 | 速率限制支持 X-API-Key 头 |
 | `memoria/api/routers/memory.py` | 修改 | 所有端点改用 get_auth_context 依赖 |
@@ -230,7 +263,7 @@ if not _s.remote_auth_service_url:
 | `memoria/api/routers/user_ops.py` | 修改 | 同上 |
 | `memoria/mcp_local/server.py` | 修改 | HTTPBackend 支持 --apikey 参数 |
 | `memoria/cli.py` | 修改 | memoria init 支持 --apikey 参数 |
-| `memoria/config.py` | 修改 | 新增 remote_auth_service_url、conn_cache_ttl 配置 |
+| `memoria/config.py` | 修改 | 新增 remote_auth_service_url、conn_cache_ttl、user_db_host/port_override、user_pool_size/max_overflow、max_user_engines 配置 |
 | `tests/unit/test_apikey_auth.py` | 新增 | 25 个单元测试覆盖核心逻辑 |
 
 ## 9. 向后兼容性

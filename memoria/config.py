@@ -84,6 +84,33 @@ class MemoriaSettings(BaseSettings):
         default=60,
         description="TTL in seconds for caching remote auth service responses. 0 = no cache.",
     )
+    user_db_host_override: str = Field(
+        default="",
+        description="Override db_host returned by remote auth service. "
+        "Use this when the API server can reach MatrixOne via a private network "
+        "address (e.g. k8s service name) instead of the public domain.",
+    )
+    user_db_port_override: int = Field(
+        default=0,
+        description="Override db_port returned by remote auth service. 0 = no override.",
+    )
+
+    # Per-user engine pool (apikey mode)
+    user_pool_size: int = Field(
+        default=1,
+        description="Connection pool size per user engine in apikey mode. "
+        "Keep small (1-2) to avoid connection explosion with many users.",
+    )
+    user_pool_max_overflow: int = Field(
+        default=2,
+        description="Max overflow connections per user engine. "
+        "Total max connections per user = user_pool_size + user_pool_max_overflow.",
+    )
+    max_user_engines: int = Field(
+        default=256,
+        description="Max cached user engines (LRU). "
+        "Evicted engines are dispose()d to release connections.",
+    )
 
     # Limits
     snapshot_limit: int = Field(default=100, description="Max snapshots per user")

@@ -190,9 +190,17 @@ def _resolve_apikey(apikey: str) -> AuthContext:
 
     from memoria.api.database import get_user_session_factory
 
+    # Allow config to override host/port for private network access
+    host = conn.db_host
+    port = conn.db_port
+    if settings.user_db_host_override:
+        host = settings.user_db_host_override
+    if settings.user_db_port_override:
+        port = settings.user_db_port_override
+
     factory = get_user_session_factory(
-        host=conn.db_host,
-        port=conn.db_port,
+        host=host,
+        port=port,
         user=conn.db_user,
         password=conn.db_password,
         db_name=conn.db_name,
