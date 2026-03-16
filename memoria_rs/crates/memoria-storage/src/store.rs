@@ -177,7 +177,9 @@ impl SqlMemoryStore {
         let created_at = memory.created_at.map(|dt| dt.naive_utc()).unwrap_or(now);
         let source_event_ids = serde_json::to_string(&memory.source_event_ids)?;
         let extra_metadata = memory.extra_metadata.as_ref().map(serde_json::to_string).transpose()?;
-        let embedding = memory.embedding.as_deref().map(vec_to_mo);
+        let embedding = memory.embedding.as_deref()
+            .filter(|v| !v.is_empty())  // Some([]) → None → SQL NULL
+            .map(vec_to_mo);
 
         sqlx::query(&format!(
             r#"INSERT INTO {table}

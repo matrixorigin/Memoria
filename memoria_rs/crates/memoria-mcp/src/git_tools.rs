@@ -363,23 +363,34 @@ pub async fn call(
                 .map(|(_, t)| t.clone())
                 .ok_or_else(|| anyhow::anyhow!("Branch '{source_branch}' not found"))?;
 
-            // Safety limit
+            // Safety limit: count new memories (branch rows not in main by PK)
             let count_sql = format!(
                 "SELECT COUNT(*) as cnt FROM {table_name} b WHERE b.user_id = ? \
                  AND NOT EXISTS (SELECT 1 FROM mem_memories m WHERE m.memory_id = b.memory_id)"
             );
-            let count_row = sqlx::query(&count_sql).bind(user_id)
+            let new_count: i64 = sqlx::query(&count_sql).bind(user_id)
                 .fetch_one(git.pool()).await
-                .map_err(|e| anyhow::anyhow!("count failed: {e}"))?;
-            let new_count: i64 = count_row.try_get("cnt").unwrap_or(0);
+                .map_err(|e| anyhow::anyhow!("count failed: {e}"))?
+                .try_get("cnt").unwrap_or(0);
             if new_count > 5000 {
                 return Ok(mcp_text(&format!(
                     "Too many changes ({new_count}). Max 5000. Reduce branch scope."
                 )));
             }
 
-            // Step 1: INSERT non-conflicting new memories (no semantic match in main)
             const COSINE_THRESHOLD: f64 = 0.9;
+
+            if strategy != "replace" {
+                // append: use native branch merge (kernel-level, no cosine scan needed)
+                git.merge_branch(&table_name, "mem_memories").await
+                    .map_err(|e| anyhow::anyhow!("merge failed: {e}"))?;
+                return Ok(mcp_text(&format!(
+                    "Merged branch '{source_branch}' into main ({new_count} new, 0 replaced, 0 skipped)"
+                )));
+            }
+
+            // replace strategy: SQL merge with cosine conflict detection
+            // Single-pass INSERT using OR short-circuit to avoid cosine on null/empty embeddings
             let insert_sql = format!(
                 "INSERT INTO mem_memories \
                     (memory_id, user_id, memory_type, content, embedding, session_id, \
@@ -391,37 +402,41 @@ pub async fn call(
                  FROM {table_name} b \
                  WHERE b.user_id = ? AND b.is_active = 1 \
                    AND NOT EXISTS (SELECT 1 FROM mem_memories m WHERE m.memory_id = b.memory_id) \
-                   AND NOT EXISTS ( \
-                     SELECT 1 FROM mem_memories m \
-                     WHERE m.user_id = ? AND m.is_active = 1 \
-                     AND m.memory_type = b.memory_type \
-                     AND b.embedding IS NOT NULL AND m.embedding IS NOT NULL \
-                     AND cosine_similarity(m.embedding, b.embedding) > {COSINE_THRESHOLD} \
+                   AND ( \
+                     b.embedding IS NULL OR vector_dims(b.embedding) = 0 \
+                     OR NOT EXISTS ( \
+                       SELECT 1 FROM mem_memories m \
+                       WHERE m.user_id = ? AND m.is_active = 1 \
+                         AND m.embedding IS NOT NULL AND vector_dims(m.embedding) > 0 \
+                         AND m.memory_type = b.memory_type \
+                         AND cosine_similarity(m.embedding, b.embedding) > {COSINE_THRESHOLD} \
+                     ) \
                    )"
             );
-            let res = sqlx::query(&insert_sql).bind(user_id).bind(user_id)
+            let inserted = sqlx::query(&insert_sql).bind(user_id).bind(user_id)
                 .execute(git.pool()).await
-                .map_err(|e| anyhow::anyhow!("merge insert failed: {e}"))?;
-            let inserted = res.rows_affected();
+                .map_err(|e| anyhow::anyhow!("merge insert failed: {e}"))?
+                .rows_affected();
 
-            // Step 2: handle conflicts (semantically similar memories already in main)
+            // Conflict count: branch memories with real embeddings that have semantic match in main
             let conflict_where = format!(
                 "FROM {table_name} b \
                  WHERE b.user_id = ? AND b.is_active = 1 \
+                   AND b.embedding IS NOT NULL AND vector_dims(b.embedding) > 0 \
                    AND NOT EXISTS (SELECT 1 FROM mem_memories m2 WHERE m2.memory_id = b.memory_id AND m2.is_active = 1) \
                    AND EXISTS ( \
                      SELECT 1 FROM mem_memories m \
                      WHERE m.user_id = ? AND m.is_active = 1 \
-                     AND m.memory_type = b.memory_type \
-                     AND b.embedding IS NOT NULL AND m.embedding IS NOT NULL \
-                     AND cosine_similarity(m.embedding, b.embedding) > {COSINE_THRESHOLD} \
+                       AND m.embedding IS NOT NULL AND vector_dims(m.embedding) > 0 \
+                       AND m.memory_type = b.memory_type \
+                       AND cosine_similarity(m.embedding, b.embedding) > {COSINE_THRESHOLD} \
                    )"
             );
-            let conflict_count_row = sqlx::query(&format!("SELECT COUNT(*) as cnt {conflict_where}"))
+            let conflict_count: i64 = sqlx::query(&format!("SELECT COUNT(*) as cnt {conflict_where}"))
                 .bind(user_id).bind(user_id)
                 .fetch_one(git.pool()).await
-                .map_err(|e| anyhow::anyhow!("conflict count failed: {e}"))?;
-            let conflict_count: i64 = conflict_count_row.try_get("cnt").unwrap_or(0);
+                .map_err(|e| anyhow::anyhow!("conflict count failed: {e}"))?
+                .try_get("cnt").unwrap_or(0);
 
             let (replaced, skipped) = if strategy == "replace" && conflict_count > 0 {
                 let update_sql = format!(
@@ -430,20 +445,21 @@ pub async fn call(
                        SELECT b.content FROM {table_name} b \
                        WHERE b.user_id = ? AND b.is_active = 1 \
                        AND b.memory_type = m.memory_type \
-                       AND b.embedding IS NOT NULL \
-                       AND cosine_similarity(m.embedding, b.embedding) > {COSINE_THRESHOLD} \
+                       AND b.embedding IS NOT NULL AND vector_dims(b.embedding) > 0 \
                        AND NOT EXISTS (SELECT 1 FROM mem_memories m2 WHERE m2.memory_id = b.memory_id AND m2.is_active = 1) \
+                       AND cosine_similarity(m.embedding, b.embedding) > {COSINE_THRESHOLD} \
                        LIMIT 1 \
                      ), \
                      m.updated_at = NOW() \
                      WHERE m.user_id = ? AND m.is_active = 1 \
+                       AND m.embedding IS NOT NULL AND vector_dims(m.embedding) > 0 \
                      AND EXISTS ( \
                        SELECT 1 FROM {table_name} b \
                        WHERE b.user_id = ? AND b.is_active = 1 \
                        AND b.memory_type = m.memory_type \
-                       AND b.embedding IS NOT NULL \
-                       AND cosine_similarity(m.embedding, b.embedding) > {COSINE_THRESHOLD} \
+                       AND b.embedding IS NOT NULL AND vector_dims(b.embedding) > 0 \
                        AND NOT EXISTS (SELECT 1 FROM mem_memories m2 WHERE m2.memory_id = b.memory_id AND m2.is_active = 1) \
+                       AND cosine_similarity(m.embedding, b.embedding) > {COSINE_THRESHOLD} \
                      )"
                 );
                 sqlx::query(&update_sql).bind(user_id).bind(user_id).bind(user_id)
@@ -493,7 +509,7 @@ pub async fn call(
 
             // Use native LCA-based diff count, SQL JOIN for row details
             // (native diff output limit returns unknown column types that sqlx can't decode)
-            let total = git.diff_branch_count(&table_name, "mem_memories").await
+            let total = git.diff_branch_count(&table_name, "mem_memories", user_id).await
                 .unwrap_or(0);
             if total == 0 {
                 return Ok(mcp_text(&format!("No changes in branch '{source_branch}' vs main.")));

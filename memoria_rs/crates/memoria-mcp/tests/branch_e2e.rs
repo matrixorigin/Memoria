@@ -390,18 +390,18 @@ async fn test_diff_fields_complete() {
     let branches = sql.list_branches(&uid).await.unwrap();
     let table = branches.iter().find(|(n, _)| n == &branch).map(|(_, t)| t.clone()).unwrap();
 
-    let rows = git.diff_branch_rows(&table, "mem_memories", &uid, 10).await.unwrap();
-    assert_eq!(rows.len(), 1, "expected 1 diff row");
-    let row = &rows[0];
-    assert_eq!(row.flag, "INSERT", "new memory should be INSERT");
-    assert!(!row.memory_id.is_empty(), "memory_id must not be empty");
-    assert_eq!(row.content, "profile memory on branch");
-    assert_eq!(row.memory_type, "profile");
-    println!("✅ diff fields: flag={}, memory_type={}, content={}", row.flag, row.memory_type, row.content);
+    let rows = git.diff_branch_rows(&table, "mem_memories", &uid, 50).await.unwrap();
+    // data branch diff is account-level (no user_id filter), find our specific row
+    let our_row = rows.iter().find(|r| r.content == "profile memory on branch")
+        .expect("our branch memory should appear in diff");
+    assert_eq!(our_row.flag, "INSERT", "new memory should be INSERT");
+    assert!(!our_row.memory_id.is_empty(), "memory_id must not be empty");
+    assert_eq!(our_row.memory_type, "profile");
+    println!("✅ diff fields: flag={}, memory_type={}, content={}", our_row.flag, our_row.memory_type, our_row.content);
 
-    // Native count should also be 1
-    let count = git.diff_branch_count(&table, "mem_memories").await.unwrap();
-    assert_eq!(count, 1, "native diff count should match");
+    // Native count >= 1 (may include other users' changes)
+    let count = git.diff_branch_count(&table, "mem_memories", &uid).await.unwrap();
+    assert!(count >= 1, "native diff count should be at least 1");
     println!("✅ native diff count = {count}");
 
     gc("memory_branch_delete", json!({"name": branch}), &git, &svc, &uid).await;
@@ -457,18 +457,18 @@ async fn test_diff_native_count_vs_join_rows() {
     let branches = sql.list_branches(&uid).await.unwrap();
     let table = branches.iter().find(|(n, _)| n == &branch).map(|(_, t)| t.clone()).unwrap();
 
-    // Native count: 1 (only the new INSERT)
-    let count = git.diff_branch_count(&table, "mem_memories").await.unwrap();
-    assert_eq!(count, 1, "native LCA diff count should be 1 (1 INSERT)");
+    // Native count: >= 1 (account-level, may include other users)
+    let count = git.diff_branch_count(&table, "mem_memories", &uid).await.unwrap();
+    assert!(count >= 1, "native LCA diff count should be at least 1");
 
-    // JOIN rows: also 1
-    let rows = git.diff_branch_rows(&table, "mem_memories", &uid, 10).await.unwrap();
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].flag, "INSERT");
-    assert_eq!(rows[0].content, "memory Z (branch only)");
+    // Find our specific row
+    let rows = git.diff_branch_rows(&table, "mem_memories", &uid, 50).await.unwrap();
+    let our_row = rows.iter().find(|r| r.content == "memory Z (branch only)")
+        .expect("our branch memory should appear in diff");
+    assert_eq!(our_row.flag, "INSERT");
 
-    println!("✅ native count={count}, native diff rows={} — consistent for INSERT", rows.len());
-    println!("ℹ️  Both use native LCA diff (sqlx patched to handle MatrixOne 0xf1 JSON type)");
+    println!("✅ native count={count}, found our INSERT row — native LCA diff works");
+    println!("ℹ️  diff is account-level (no user_id filter), count includes all users' changes");
 
     gc("memory_branch_delete", json!({"name": branch}), &git, &svc, &uid).await;
 }

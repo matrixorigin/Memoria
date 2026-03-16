@@ -56,22 +56,23 @@ pub fn list() -> Value {
                 "type": "object",
                 "properties": {
                     "memory_id": {"type": "string"},
+                    "query": {"type": "string", "description": "Semantic search to find memory to correct"},
                     "new_content": {"type": "string"},
                     "reason": {"type": "string"}
                 },
-                "required": ["memory_id", "new_content"]
+                "required": ["new_content"]
             }
         },
         {
             "name": "memory_purge",
-            "description": "Delete a memory by ID",
+            "description": "Delete memories by ID (single or comma-separated batch) or by topic keyword",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "memory_id": {"type": "string"},
+                    "memory_id": {"type": "string", "description": "Single ID or comma-separated batch"},
+                    "topic": {"type": "string", "description": "Keyword — bulk-delete all matching memories"},
                     "reason": {"type": "string"}
-                },
-                "required": ["memory_id"]
+                }
             }
         },
         {
@@ -130,16 +131,51 @@ pub async fn call(
         }
 
         "memory_correct" => {
-            let memory_id = args["memory_id"].as_str().unwrap_or("");
             let new_content = args["new_content"].as_str().unwrap_or("");
-            let m = service.correct(memory_id, new_content).await?;
+            if new_content.is_empty() {
+                return Ok(mcp_text("new_content is required"));
+            }
+            let memory_id = args["memory_id"].as_str().unwrap_or("");
+            let query = args["query"].as_str().unwrap_or("");
+            let m = if !memory_id.is_empty() {
+                service.correct(memory_id, new_content).await?
+            } else if !query.is_empty() {
+                // Semantic search to find best match, then correct it
+                let results = service.retrieve(user_id, query, 1).await?;
+                match results.into_iter().next() {
+                    Some(found) => {
+                        service.correct(&found.memory_id, new_content).await?
+                    }
+                    None => return Ok(mcp_text("No matching memory found for query")),
+                }
+            } else {
+                return Ok(mcp_text("Provide memory_id or query"));
+            };
             Ok(mcp_text(&format!("Corrected memory {}: {}", m.memory_id, m.content)))
         }
 
         "memory_purge" => {
             let memory_id = args["memory_id"].as_str().unwrap_or("");
-            service.purge(memory_id).await?;
-            Ok(mcp_text(&format!("Purged memory {memory_id}")))
+            let topic = args["topic"].as_str().unwrap_or("");
+            if !memory_id.is_empty() {
+                // Batch: comma-separated IDs
+                let ids: Vec<&str> = memory_id.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
+                let count = ids.len();
+                for id in &ids {
+                    service.purge(id).await?;
+                }
+                Ok(mcp_text(&format!("Purged {count} memory(s)")))
+            } else if !topic.is_empty() {
+                // Bulk by keyword: search then purge all matches
+                let results = service.retrieve(user_id, topic, 100).await?;
+                let count = results.len();
+                for m in &results {
+                    service.purge(&m.memory_id).await?;
+                }
+                Ok(mcp_text(&format!("Purged {count} memory(s) matching '{topic}'")))
+            } else {
+                Ok(mcp_text("Provide memory_id or topic"))
+            }
         }
 
         "memory_profile" => {

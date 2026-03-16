@@ -159,54 +159,70 @@ impl GitForDataService {
         exec_ddl(&self.pool, &format!("data branch delete table {db}.{safe}")).await
     }
 
-    /// Native LCA-based diff count: `data branch diff {branch} against {main} output count`.
-    /// Only returns a count — avoids sqlx unknown column type issue with diff row results.
+    /// Native branch merge: `data branch merge {branch} into {main} when conflict skip`.
+    /// Inserts rows from branch that don't exist in main (by PK). Account-level but
+    /// user_id isolation is natural — branch only contains the user's new rows.
+    pub async fn merge_branch(
+        &self,
+        branch_table: &str,
+        main_table: &str,
+    ) -> Result<(), MemoriaError> {
+        let safe_branch = validate_identifier(branch_table)?;
+        let safe_main = validate_identifier(main_table)?;
+        exec_ddl(&self.pool, &format!(
+            "data branch merge {safe_branch} into {safe_main} when conflict skip"
+        )).await
+    }
+
+    /// LCA-based diff count for a specific user.
+    /// Native `output count` is account-level, so we fetch rows and count in Rust.
     pub async fn diff_branch_count(
         &self,
         branch_table: &str,
         main_table: &str,
+        user_id: &str,
     ) -> Result<i64, MemoriaError> {
-        let safe_branch = validate_identifier(branch_table)?;
-        let safe_main = validate_identifier(main_table)?;
-        let sql = format!(
-            "data branch diff {safe_branch} against {safe_main} output count"
-        );
-        let row = sqlx::raw_sql(&sql)
-            .fetch_one(&self.pool)
-            .await
-            .map_err(db_err)?;
-        let cnt: i64 = row.try_get(0).unwrap_or(0);
-        Ok(cnt)
+        // Fetch a large batch and count user's rows
+        // For safety limit purposes, 5000 is the max we care about
+        let rows = self.diff_branch_rows(branch_table, main_table, user_id, 5001).await?;
+        Ok(rows.len() as i64)
     }
 
-    /// Native LCA-based diff rows: `data branch diff {branch} against {main} output limit N`.
+    /// Native LCA-based diff rows, filtered by user_id.
     ///
-    /// Uses patched sqlx-mysql that maps MatrixOne's custom JSON type code 0xf1 -> Blob,
-    /// allowing the result set to be decoded. Without the patch, sqlx panics with
-    /// "unknown column type 0xf1" because MatrixOne uses a non-standard type code for JSON
-    /// in `data branch diff` output (regular SELECT uses 0xfc/LongBlob for the same columns).
+    /// `data branch diff` is account-level (no WHERE clause supported), so we fetch
+    /// all rows and filter in Rust. This avoids exposing other users' memories.
     pub async fn diff_branch_rows(
         &self,
         branch_table: &str,
         main_table: &str,
-        _user_id: &str,
+        user_id: &str,
         limit: i64,
     ) -> Result<Vec<DiffRow>, MemoriaError> {
         let safe_branch = validate_identifier(branch_table)?;
         let safe_main = validate_identifier(main_table)?;
+        // Fetch more than limit to account for filtering
+        let fetch_limit = limit * 10 + 100;
         let sql = format!(
-            "data branch diff {safe_branch} against {safe_main} output limit {limit}"
+            "data branch diff {safe_branch} against {safe_main} output limit {fetch_limit}"
         );
         let rows = sqlx::raw_sql(&sql)
             .fetch_all(&self.pool)
             .await
             .map_err(db_err)?;
-        rows.iter().map(|r| Ok(DiffRow {
-            flag: r.try_get("flag").map_err(db_err)?,
-            memory_id: r.try_get("memory_id").map_err(db_err)?,
-            content: r.try_get("content").map_err(db_err)?,
-            memory_type: r.try_get("memory_type").map_err(db_err)?,
-        })).collect()
+        let mut result = Vec::new();
+        for r in &rows {
+            let uid: String = r.try_get("user_id").map_err(db_err)?;
+            if uid != user_id { continue; }
+            result.push(DiffRow {
+                flag: r.try_get("flag").map_err(db_err)?,
+                memory_id: r.try_get("memory_id").map_err(db_err)?,
+                content: r.try_get("content").map_err(db_err)?,
+                memory_type: r.try_get("memory_type").map_err(db_err)?,
+            });
+            if result.len() >= limit as usize { break; }
+        }
+        Ok(result)
     }
 
     /// Count rows in a table at a given snapshot (for diff/validation).
