@@ -178,7 +178,13 @@ pub async fn call(
                 .map(TrustTier::from_str).transpose().ok().flatten();
             let mt = MemoryType::from_str(memory_type)
                 .unwrap_or(MemoryType::Semantic);
-            let m = service.store_memory(user_id, &content, mt, session_id.clone(), trust_tier).await?;
+            let m = match service.store_memory(user_id, &content, mt, session_id.clone(), trust_tier).await {
+                Ok(m) => m,
+                Err(memoria_core::MemoriaError::Blocked(reason)) => {
+                    return Ok(json!({"result": format!("⚠️ Memory blocked: {reason}")}));
+                }
+                Err(e) => return Err(e.into()),
+            };
 
             // Graph sync: create SEMANTIC node + auto entity extraction (best-effort)
             if let Some(sql) = &service.sql_store {

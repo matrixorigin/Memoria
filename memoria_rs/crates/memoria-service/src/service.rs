@@ -1,4 +1,5 @@
 use memoria_core::{
+    check_sensitivity,
     interfaces::{EmbeddingProvider, MemoryStore},
     Memory, MemoriaError, MemoryType, TrustTier,
 };
@@ -84,6 +85,16 @@ impl MemoryService {
         session_id: Option<String>,
         trust_tier: Option<TrustTier>,
     ) -> Result<Memory, MemoriaError> {
+        // Sensitivity check — block HIGH tier, redact MEDIUM tier
+        let sensitivity = check_sensitivity(content);
+        if sensitivity.blocked {
+            return Err(MemoriaError::Blocked(format!(
+                "Memory blocked: contains sensitive content ({})",
+                sensitivity.matched_labels.join(", ")
+            )));
+        }
+        let content = sensitivity.redacted_content.as_deref().unwrap_or(content);
+
         let embedding = self.embed(content).await;
         let memory = Memory {
             memory_id: Uuid::new_v4().simple().to_string(),
@@ -112,6 +123,51 @@ impl MemoryService {
             self.store.insert(&memory).await?;
         }
         Ok(memory)
+    }
+
+    /// Validate candidate memories in a zero-copy branch before committing.
+    /// Returns true if branch retrieval score >= main (or if validation fails — fail open).
+    /// The branch is always dropped after validation.
+    pub async fn validate_in_sandbox(
+        &self,
+        user_id: &str,
+        candidates: &[Memory],
+        query: &str,
+        git: &memoria_git::GitForDataService,
+    ) -> bool {
+        let sql = match &self.sql_store {
+            Some(s) => s,
+            None => return true, // no SQL store — skip sandbox
+        };
+        if candidates.is_empty() { return true; }
+
+        let branch = format!("mem_sandbox_{}", &Uuid::new_v4().simple().to_string()[..16]);
+
+        // Create branch (zero-copy of mem_memories)
+        if git.create_branch(&branch, "mem_memories").await.is_err() {
+            return true; // fail open
+        }
+
+        let result = async {
+            // Insert candidates into branch
+            for m in candidates {
+                sql.insert_into(&branch, m).await?;
+            }
+            // Score main vs branch (top-5 fulltext score as proxy)
+            let main_results = sql.search_fulltext_from("mem_memories", user_id, query, 5).await.unwrap_or_default();
+            let branch_results = sql.search_fulltext_from(&branch, user_id, query, 5).await.unwrap_or_default();
+
+            let score = |mems: &[Memory]| -> f64 {
+                if mems.is_empty() { return 0.0; }
+                mems.iter().map(|m| m.retrieval_score.unwrap_or(0.5)).sum::<f64>() / mems.len() as f64
+            };
+            Ok::<bool, MemoriaError>(score(&branch_results) >= score(&main_results))
+        }.await;
+
+        // Always drop branch
+        let _ = git.drop_branch(&branch).await;
+
+        result.unwrap_or(true) // fail open on error
     }
 
     pub async fn retrieve(&self, user_id: &str, query: &str, top_k: i64) -> Result<Vec<Memory>, MemoriaError> {
@@ -267,6 +323,10 @@ impl MemoryService {
         self.retrieve(user_id, query, top_k).await
     }
 
+    pub async fn search_explain(&self, user_id: &str, query: &str, top_k: i64) -> Result<(Vec<Memory>, RetrievalExplain), MemoriaError> {
+        self.retrieve_explain(user_id, query, top_k).await
+    }
+
     pub async fn correct(&self, memory_id: &str, new_content: &str) -> Result<Memory, MemoriaError> {
         let old = self.store.get(memory_id).await?
             .ok_or_else(|| MemoriaError::NotFound(memory_id.to_string()))?;
@@ -321,7 +381,7 @@ impl MemoryService {
         self.store.list_active(user_id, limit).await
     }
 
-    async fn embed(&self, text: &str) -> Option<Vec<f32>> {
+    pub async fn embed(&self, text: &str) -> Option<Vec<f32>> {
         self.embedder.as_ref()?.embed(text).await.ok()
     }
 }

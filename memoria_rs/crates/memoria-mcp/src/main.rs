@@ -131,6 +131,10 @@ async fn main() -> Result<()> {
     });
 
     let service = Arc::new(MemoryService::new_sql_with_llm(Arc::new(store), embedder, llm));
+
+    // Start governance scheduler (opt-in via MEMORIA_GOVERNANCE_ENABLED=true)
+    Arc::new(memoria_service::GovernanceScheduler::new(service.clone())).start();
+
     if args.transport == "sse" {
         memoria_mcp::run_sse(service, git, cfg.user, args.port).await
     } else {

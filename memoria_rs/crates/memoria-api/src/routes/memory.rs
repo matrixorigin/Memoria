@@ -76,18 +76,30 @@ pub async fn retrieve(
     State(state): State<AppState>,
     AuthUser(user_id): AuthUser,
     Json(req): Json<RetrieveRequest>,
-) -> ApiResult<Vec<MemoryResponse>> {
-    let results = state.service.retrieve(&user_id, &req.query, req.top_k).await.map_err(api_err)?;
-    Ok(Json(results.into_iter().map(Into::into).collect()))
+) -> ApiResult<serde_json::Value> {
+    if req.explain {
+        let (results, explain) = state.service.retrieve_explain(&user_id, &req.query, req.top_k).await.map_err(api_err)?;
+        let items: Vec<MemoryResponse> = results.into_iter().map(Into::into).collect();
+        Ok(Json(serde_json::json!({"results": items, "explain": explain})))
+    } else {
+        let results = state.service.retrieve(&user_id, &req.query, req.top_k).await.map_err(api_err)?;
+        Ok(Json(serde_json::json!(results.into_iter().map(Into::into).collect::<Vec<MemoryResponse>>())))
+    }
 }
 
 pub async fn search(
     State(state): State<AppState>,
     AuthUser(user_id): AuthUser,
     Json(req): Json<RetrieveRequest>,
-) -> ApiResult<Vec<MemoryResponse>> {
-    let results = state.service.search(&user_id, &req.query, req.top_k).await.map_err(api_err)?;
-    Ok(Json(results.into_iter().map(Into::into).collect()))
+) -> ApiResult<serde_json::Value> {
+    if req.explain {
+        let (results, explain) = state.service.search_explain(&user_id, &req.query, req.top_k).await.map_err(api_err)?;
+        let items: Vec<MemoryResponse> = results.into_iter().map(Into::into).collect();
+        Ok(Json(serde_json::json!({"results": items, "explain": explain})))
+    } else {
+        let results = state.service.search(&user_id, &req.query, req.top_k).await.map_err(api_err)?;
+        Ok(Json(serde_json::json!(results.into_iter().map(Into::into).collect::<Vec<MemoryResponse>>())))
+    }
 }
 
 pub async fn get_memory(
@@ -298,5 +310,49 @@ pub async fn get_memory_history(
         "memory_id": id,
         "versions": chain,
         "total": chain.len(),
+    })))
+}
+
+// ── Pipeline ──────────────────────────────────────────────────────────────────
+
+#[derive(serde::Deserialize)]
+pub struct PipelineRequest {
+    pub candidates: Vec<PipelineCandidate>,
+    pub sandbox_query: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+pub struct PipelineCandidate {
+    pub content: String,
+    pub memory_type: Option<String>,
+    pub trust_tier: Option<String>,
+}
+
+pub async fn run_pipeline(
+    State(state): State<AppState>,
+    AuthUser(user_id): AuthUser,
+    Json(req): Json<PipelineRequest>,
+) -> ApiResult<serde_json::Value> {
+    use memoria_service::MemoryPipeline;
+    use crate::models::{parse_memory_type, parse_trust_tier};
+    use memoria_core::{MemoryType, TrustTier};
+
+    let candidates = req.candidates.into_iter().map(|c| {
+        let mt = c.memory_type.as_deref()
+            .map(|s| parse_memory_type(s).unwrap_or(MemoryType::Semantic))
+            .unwrap_or(MemoryType::Semantic);
+        let tier = c.trust_tier.as_deref()
+            .map(parse_trust_tier).transpose().ok().flatten();
+        (c.content, mt, tier)
+    }).collect();
+
+    let pipeline = MemoryPipeline::new(state.service.clone(), Some(state.git.clone()));
+    let result = pipeline.run(&user_id, candidates, req.sandbox_query.as_deref()).await;
+
+    Ok(Json(serde_json::json!({
+        "memories_stored": result.memories_stored,
+        "memories_rejected": result.memories_rejected,
+        "memories_redacted": result.memories_redacted,
+        "errors": result.errors,
     })))
 }

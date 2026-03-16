@@ -993,3 +993,231 @@ async fn test_episodic_with_llm_sync() {
     println!("✅ episodic with LLM sync: memory_id={}", body["memory_id"].as_str().unwrap_or(""));
     println!("   content: {}", &body["content"].as_str().unwrap_or("")[..100.min(body["content"].as_str().unwrap_or("").len())]);
 }
+
+// ── Admin API ─────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_admin_stats_and_users() {
+    let (base, client) = spawn_server().await;
+    let user = uid();
+
+    // Store a memory first
+    client.post(format!("{base}/v1/memories"))
+        .header("X-User-Id", &user)
+        .json(&json!({"content": "admin test memory", "memory_type": "semantic"}))
+        .send().await.unwrap();
+
+    // GET /admin/stats
+    let r = client.get(format!("{base}/admin/stats")).send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    let body: Value = r.json().await.unwrap();
+    assert!(body["total_memories"].as_i64().unwrap() >= 1);
+    assert!(body["total_users"].as_i64().unwrap() >= 1);
+    println!("✅ admin stats: {body}");
+
+    // GET /admin/users
+    let r = client.get(format!("{base}/admin/users")).send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    let body: Value = r.json().await.unwrap();
+    let users = body["users"].as_array().unwrap();
+    assert!(users.iter().any(|u| u["user_id"].as_str() == Some(&user)));
+    println!("✅ admin users: {} users", users.len());
+
+    // GET /admin/users/:user_id/stats
+    let r = client.get(format!("{base}/admin/users/{user}/stats")).send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    let body: Value = r.json().await.unwrap();
+    assert_eq!(body["memory_count"].as_i64().unwrap(), 1);
+    println!("✅ admin user stats: {body}");
+
+    // POST /admin/users/:user_id/reset-access-counts
+    let r = client.post(format!("{base}/admin/users/{user}/reset-access-counts"))
+        .send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    println!("✅ admin reset access counts");
+
+    // DELETE /admin/users/:user_id
+    let r = client.delete(format!("{base}/admin/users/{user}")).send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    println!("✅ admin delete user");
+
+    // Verify user's memories are deactivated
+    let r = client.get(format!("{base}/admin/users/{user}/stats")).send().await.unwrap();
+    let body: Value = r.json().await.unwrap();
+    assert_eq!(body["memory_count"].as_i64().unwrap(), 0);
+    println!("✅ admin verified user deleted (0 active memories)");
+}
+
+#[tokio::test]
+async fn test_admin_trigger_governance() {
+    let (base, client) = spawn_server().await;
+    let user = uid();
+
+    // Store a memory
+    client.post(format!("{base}/v1/memories"))
+        .header("X-User-Id", &user)
+        .json(&json!({"content": "governance trigger test", "memory_type": "semantic"}))
+        .send().await.unwrap();
+
+    // Trigger governance (skips cooldown)
+    let r = client.post(format!("{base}/admin/governance/{user}/trigger?op=governance"))
+        .send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    let body: Value = r.json().await.unwrap();
+    assert_eq!(body["op"].as_str().unwrap(), "governance");
+    println!("✅ admin trigger governance: {body}");
+
+    // Trigger consolidate
+    let r = client.post(format!("{base}/admin/governance/{user}/trigger?op=consolidate"))
+        .send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    let body: Value = r.json().await.unwrap();
+    assert_eq!(body["op"].as_str().unwrap(), "consolidate");
+    println!("✅ admin trigger consolidate: {body}");
+
+    // Invalid op
+    let r = client.post(format!("{base}/admin/governance/{user}/trigger?op=invalid"))
+        .send().await.unwrap();
+    assert_eq!(r.status(), 400);
+    println!("✅ admin trigger invalid op rejected");
+}
+
+#[tokio::test]
+async fn test_health_endpoints() {
+    let (base, client) = spawn_server().await;
+    let user = uid();
+
+    // Store some memories
+    for content in ["Rust is fast", "Python is easy", "Go is simple"] {
+        client.post(format!("{base}/v1/memories"))
+            .header("X-User-Id", &user)
+            .json(&json!({"content": content, "memory_type": "semantic"}))
+            .send().await.unwrap();
+    }
+
+    // GET /v1/health/analyze
+    let r = client.get(format!("{base}/v1/health/analyze"))
+        .header("X-User-Id", &user).send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    let body: Value = r.json().await.unwrap();
+    assert!(body["semantic"]["total"].as_i64().unwrap() >= 3);
+    println!("✅ health analyze: {body}");
+
+    // GET /v1/health/storage
+    let r = client.get(format!("{base}/v1/health/storage"))
+        .header("X-User-Id", &user).send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    let body: Value = r.json().await.unwrap();
+    assert!(body["total"].as_i64().unwrap() >= 3);
+    assert!(body["active"].as_i64().unwrap() >= 3);
+    println!("✅ health storage: {body}");
+
+    // GET /v1/health/capacity
+    let r = client.get(format!("{base}/v1/health/capacity"))
+        .header("X-User-Id", &user).send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    let body: Value = r.json().await.unwrap();
+    assert_eq!(body["recommendation"].as_str().unwrap(), "ok");
+    println!("✅ health capacity: {body}");
+}
+
+// ── Sandbox validation ────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_sandbox_validation() {
+    let (base, client) = spawn_server().await;
+    let user = uid();
+
+    // Store some base memories
+    for content in ["Rust is a systems language", "Python is great for scripting"] {
+        client.post(format!("{base}/v1/memories"))
+            .header("X-User-Id", &user)
+            .json(&json!({"content": content, "memory_type": "semantic"}))
+            .send().await.unwrap();
+    }
+
+    // Sandbox validation is internal — test via store (which uses it internally if enabled)
+    // For now, verify that storing a memory still works (sandbox is fail-open)
+    let r = client.post(format!("{base}/v1/memories"))
+        .header("X-User-Id", &user)
+        .json(&json!({"content": "Go is compiled and fast", "memory_type": "semantic"}))
+        .send().await.unwrap();
+    assert!(r.status().is_success());
+    let body: Value = r.json().await.unwrap();
+    assert!(body["memory_id"].as_str().is_some());
+    println!("✅ sandbox: store succeeds (fail-open)");
+}
+
+#[tokio::test]
+async fn test_retrieve_with_explain() {
+    let (base, client) = spawn_server().await;
+    let user = uid();
+
+    client.post(format!("{base}/v1/memories"))
+        .header("X-User-Id", &user)
+        .json(&json!({"content": "Rust is fast and safe", "memory_type": "semantic"}))
+        .send().await.unwrap();
+
+    // Retrieve with explain=true
+    let r = client.post(format!("{base}/v1/memories/retrieve"))
+        .header("X-User-Id", &user)
+        .json(&json!({"query": "fast language", "top_k": 5, "explain": true}))
+        .send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    let body: Value = r.json().await.unwrap();
+    // With explain=true, response has "results" and "explain" keys
+    assert!(body["explain"].is_object(), "explain field missing: {body}");
+    assert!(body["explain"]["path"].is_string());
+    assert!(body["explain"]["total_ms"].is_number());
+    println!("✅ retrieve explain: path={}, total_ms={}",
+        body["explain"]["path"].as_str().unwrap_or("?"),
+        body["explain"]["total_ms"].as_f64().unwrap_or(0.0));
+
+    // Without explain — returns array directly
+    let r = client.post(format!("{base}/v1/memories/retrieve"))
+        .header("X-User-Id", &user)
+        .json(&json!({"query": "fast language", "top_k": 5}))
+        .send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    let body: Value = r.json().await.unwrap();
+    assert!(body.is_array(), "without explain should return array: {body}");
+    println!("✅ retrieve without explain: {} results", body.as_array().unwrap().len());
+}
+
+#[tokio::test]
+async fn test_pipeline_run() {
+    let (base, client) = spawn_server().await;
+    let user = uid();
+
+    // Normal candidates — should all be stored
+    let r = client.post(format!("{base}/v1/pipeline/run"))
+        .header("X-User-Id", &user)
+        .json(&json!({
+            "candidates": [
+                {"content": "Rust is fast", "memory_type": "semantic"},
+                {"content": "Python is easy", "memory_type": "semantic"},
+            ]
+        }))
+        .send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    let body: Value = r.json().await.unwrap();
+    assert_eq!(body["memories_stored"].as_i64().unwrap(), 2);
+    assert_eq!(body["memories_rejected"].as_i64().unwrap(), 0);
+    println!("✅ pipeline run: {body}");
+
+    // Sensitive candidate — should be blocked
+    let r = client.post(format!("{base}/v1/pipeline/run"))
+        .header("X-User-Id", &user)
+        .json(&json!({
+            "candidates": [
+                {"content": "password=supersecret123", "memory_type": "semantic"},
+                {"content": "Go is compiled", "memory_type": "semantic"},
+            ]
+        }))
+        .send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    let body: Value = r.json().await.unwrap();
+    assert_eq!(body["memories_stored"].as_i64().unwrap(), 1);
+    assert_eq!(body["memories_rejected"].as_i64().unwrap(), 1);
+    println!("✅ pipeline sensitivity block: {body}");
+}

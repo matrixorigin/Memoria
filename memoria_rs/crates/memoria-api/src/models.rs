@@ -29,6 +29,8 @@ pub struct RetrieveRequest {
     #[serde(default = "default_top_k")]
     pub top_k: i64,
     pub session_id: Option<String>,
+    #[serde(default)]
+    pub explain: bool,
 }
 fn default_top_k() -> i64 { 5 }
 

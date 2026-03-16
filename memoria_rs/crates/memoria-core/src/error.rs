@@ -22,4 +22,7 @@ pub enum MemoriaError {
 
     #[error("Internal error: {0}")]
     Internal(String),
+
+    #[error("Blocked: {0}")]
+    Blocked(String),
 }

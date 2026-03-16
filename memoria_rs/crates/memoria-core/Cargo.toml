@@ -10,3 +10,5 @@ chrono = { workspace = true }
 thiserror = { workspace = true }
 uuid = { workspace = true }
 async-trait = { workspace = true }
+regex = "1.12.3"
+once_cell = "1.21.4"

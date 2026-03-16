@@ -263,6 +263,75 @@ impl SqlMemoryStore {
         Ok(res.rows_affected() as i64)
     }
 
+    /// Per-type stats: count, avg_confidence, contradiction_rate, avg_staleness_hours.
+    pub async fn health_analyze(&self, user_id: &str) -> Result<serde_json::Value, MemoriaError> {
+        let rows: Vec<(String, i64, f64, i64, f64)> = sqlx::query_as(
+            "SELECT memory_type, COUNT(*) as total, AVG(initial_confidence) as avg_conf, \
+             COUNT(CASE WHEN superseded_by IS NOT NULL THEN 1 END) as superseded, \
+             AVG(TIMESTAMPDIFF(HOUR, observed_at, NOW())) as avg_stale_h \
+             FROM mem_memories WHERE user_id = ? GROUP BY memory_type"
+        ).bind(user_id).fetch_all(&self.pool).await.map_err(db_err)?;
+
+        let mut stats = serde_json::Map::new();
+        for (mtype, total, avg_conf, superseded, avg_stale) in rows {
+            let contradiction_rate = if total > 0 { superseded as f64 / total as f64 } else { 0.0 };
+            stats.insert(mtype, serde_json::json!({
+                "total": total,
+                "avg_confidence": avg_conf,
+                "contradiction_rate": contradiction_rate,
+                "avg_staleness_hours": avg_stale,
+            }));
+        }
+        Ok(serde_json::Value::Object(stats))
+    }
+
+    /// Storage stats: total, active, inactive, avg_content_size, oldest, newest.
+    pub async fn health_storage_stats(&self, user_id: &str) -> Result<serde_json::Value, MemoriaError> {
+        let row: (i64, i64, f64) = sqlx::query_as(
+            "SELECT COUNT(*) as total, \
+             SUM(CASE WHEN is_active = 1 THEN 1 ELSE 0 END) as active, \
+             AVG(LENGTH(content)) as avg_content_size \
+             FROM mem_memories WHERE user_id = ?"
+        ).bind(user_id).fetch_one(&self.pool).await.map_err(db_err)?;
+
+        Ok(serde_json::json!({
+            "total": row.0,
+            "active": row.1,
+            "inactive": row.0 - row.1,
+            "avg_content_size": row.2,
+        }))
+    }
+
+    /// IVF capacity estimate: global vector count + growth rate + recommendation.
+    pub async fn health_capacity(&self, user_id: &str) -> Result<serde_json::Value, MemoriaError> {
+        const IVF_OPTIMAL: i64 = 50_000;
+        const IVF_DEGRADED: i64 = 200_000;
+
+        let (user_active,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM mem_memories WHERE user_id = ? AND is_active = 1"
+        ).bind(user_id).fetch_one(&self.pool).await.map_err(db_err)?;
+
+        let (global_total,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM mem_memories WHERE is_active = 1"
+        ).fetch_one(&self.pool).await.map_err(db_err)?;
+
+        let (added_30d,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM mem_memories WHERE user_id = ? AND observed_at >= NOW() - INTERVAL 30 DAY"
+        ).bind(user_id).fetch_one(&self.pool).await.map_err(db_err)?;
+
+        let recommendation = if global_total > IVF_DEGRADED { "partition_required" }
+            else if global_total > IVF_OPTIMAL { "monitor_query_latency" }
+            else { "ok" };
+
+        Ok(serde_json::json!({
+            "user_active_memories": user_active,
+            "global_vector_count": global_total,
+            "monthly_growth_rate": added_30d,
+            "ivf_thresholds": {"optimal": IVF_OPTIMAL, "degraded": IVF_DEGRADED},
+            "recommendation": recommendation,
+        }))
+    }
+
     // ── Batch reads ─────────────────────────────────────────────────────────
 
     /// Fetch multiple memories by IDs. Returns map of memory_id → Memory.

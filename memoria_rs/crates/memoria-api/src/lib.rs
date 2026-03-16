@@ -54,5 +54,18 @@ pub fn build_router(state: AppState) -> Router {
         .route("/auth/keys", get(routes::auth::list_keys))
         .route("/auth/keys/:id/rotate", put(routes::auth::rotate_key))
         .route("/auth/keys/:id", delete(routes::auth::revoke_key))
+        // Admin
+        .route("/admin/stats", get(routes::admin::system_stats))
+        .route("/admin/users", get(routes::admin::list_users))
+        .route("/admin/users/:user_id/stats", get(routes::admin::user_stats))
+        .route("/admin/users/:user_id", delete(routes::admin::delete_user))
+        .route("/admin/users/:user_id/reset-access-counts", post(routes::admin::reset_access_counts))
+        .route("/admin/governance/:user_id/trigger", post(routes::admin::trigger_governance))
+        // Health
+        .route("/v1/health/analyze", get(routes::admin::health_analyze))
+        .route("/v1/health/storage", get(routes::admin::health_storage))
+        .route("/v1/health/capacity", get(routes::admin::health_capacity))
+        // Pipeline
+        .route("/v1/pipeline/run", post(routes::memory::run_pipeline))
         .with_state(state)
 }
