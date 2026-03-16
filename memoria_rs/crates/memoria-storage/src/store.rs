@@ -57,8 +57,8 @@ impl SqlMemoryStore {
                 extra_metadata  JSON, -- MO#23859: NULL avoided at bind level
                 is_active       TINYINT(1)   NOT NULL DEFAULT 1,
                 superseded_by   VARCHAR(64),
-                trust_tier      VARCHAR(10)  DEFAULT 'T3',
-                initial_confidence FLOAT     DEFAULT 0.75,
+                trust_tier      VARCHAR(10)  DEFAULT 'T1',
+                initial_confidence FLOAT     DEFAULT 0.95,
                 observed_at     DATETIME(6)  NOT NULL,
                 created_at      DATETIME(6)  NOT NULL,
                 updated_at      DATETIME(6),
@@ -263,6 +263,190 @@ impl SqlMemoryStore {
         Ok(res.rows_affected() as i64)
     }
 
+    /// Delete expired tool_result memories (TTL = 72h by default).
+    pub async fn cleanup_tool_results(&self, ttl_hours: i64) -> Result<i64, MemoriaError> {
+        let mut total = 0i64;
+        loop {
+            let res = sqlx::query(
+                "DELETE FROM mem_memories \
+                 WHERE memory_type = 'tool_result' \
+                   AND TIMESTAMPDIFF(HOUR, observed_at, NOW()) > ? \
+                 LIMIT 5000"
+            )
+            .bind(ttl_hours).execute(&self.pool).await.map_err(db_err)?;
+            let n = res.rows_affected() as i64;
+            total += n;
+            if n < 5000 { break; }
+        }
+        Ok(total)
+    }
+
+    /// Soft-delete working memories inactive for more than `stale_hours`.
+    pub async fn archive_stale_working(&self, stale_hours: i64) -> Result<i64, MemoriaError> {
+        let res = sqlx::query(
+            "UPDATE mem_memories SET is_active = 0, updated_at = NOW() \
+             WHERE memory_type = 'working' AND is_active = 1 \
+               AND TIMESTAMPDIFF(HOUR, observed_at, NOW()) > ?"
+        )
+        .bind(stale_hours).execute(&self.pool).await.map_err(db_err)?;
+        Ok(res.rows_affected() as i64)
+    }
+
+    /// Deactivate near-duplicate memories (same user, same type, cosine sim > threshold).
+    /// Uses L2² ≈ 2(1 - cos_sim) for normalized embeddings.
+    /// Returns count of deactivated memories.
+    pub async fn compress_redundant(&self, user_id: &str, similarity_threshold: f64, window_days: i64, max_pairs: usize) -> Result<i64, MemoriaError> {
+        // Fetch active memories with embeddings within window
+        let rows: Vec<(String, String, chrono::NaiveDateTime, String)> = sqlx::query_as(
+            "SELECT memory_id, memory_type, observed_at, embedding \
+             FROM mem_memories \
+             WHERE user_id = ? AND is_active = 1 AND embedding IS NOT NULL \
+               AND TIMESTAMPDIFF(DAY, observed_at, NOW()) <= ? \
+             ORDER BY memory_type, observed_at DESC"
+        )
+        .bind(user_id).bind(window_days)
+        .fetch_all(&self.pool).await.map_err(db_err)?;
+
+        if rows.len() < 2 { return Ok(0); }
+
+        let l2_sq_threshold = 2.0 * (1.0 - similarity_threshold);
+
+        // Group by memory_type
+        let mut by_type: std::collections::HashMap<String, Vec<(String, chrono::NaiveDateTime, Vec<f32>)>> = Default::default();
+        for (mid, mtype, ts, emb_str) in &rows {
+            if let Ok(emb) = mo_to_vec(emb_str) {
+                by_type.entry(mtype.clone()).or_default().push((mid.clone(), *ts, emb));
+            }
+        }
+
+        let mut to_deactivate: Vec<(String, String)> = vec![]; // (older_id, newer_id)
+        let mut deactivated_ids: std::collections::HashSet<String> = Default::default();
+        let mut pairs_checked = 0;
+
+        'outer: for (_mtype, group) in &by_type {
+            if group.len() < 2 { continue; }
+            for i in 0..group.len() {
+                if deactivated_ids.contains(&group[i].0) { continue; }
+                for j in (i+1)..group.len() {
+                    if pairs_checked >= max_pairs { break 'outer; }
+                    if deactivated_ids.contains(&group[j].0) { continue; }
+                    pairs_checked += 1;
+                    // L2² between embeddings
+                    let dist_sq: f32 = group[i].2.iter().zip(&group[j].2)
+                        .map(|(a, b)| (a - b).powi(2)).sum();
+                    if (dist_sq as f64) < l2_sq_threshold {
+                        // group is ordered DESC by observed_at: i is newer
+                        let (older, newer) = if group[i].1 >= group[j].1 {
+                            (group[j].0.clone(), group[i].0.clone())
+                        } else {
+                            (group[i].0.clone(), group[j].0.clone())
+                        };
+                        deactivated_ids.insert(older.clone());
+                        to_deactivate.push((older, newer));
+                    }
+                }
+            }
+        }
+
+        if to_deactivate.is_empty() { return Ok(0); }
+
+        for (older, newer) in &to_deactivate {
+            sqlx::query(
+                "UPDATE mem_memories SET is_active = 0, superseded_by = ?, updated_at = NOW() WHERE memory_id = ?"
+            )
+            .bind(newer).bind(older)
+            .execute(&self.pool).await.map_err(db_err)?;
+        }
+
+        Ok(to_deactivate.len() as i64)
+    }
+
+    /// Rebuild IVF vector index for a table. lists = max(1, rows/50), capped at 1024.
+    pub async fn rebuild_vector_index(&self, table: &str) -> Result<i64, MemoriaError> {
+        let row: (i64,) = sqlx::query_as(&format!(
+            "SELECT COUNT(*) FROM {table} WHERE embedding IS NOT NULL"
+        )).fetch_one(&self.pool).await.map_err(db_err)?;
+        let total_rows = row.0;
+        if total_rows == 0 { return Ok(0); }
+        let lists = (total_rows / 50).max(1).min(1024);
+        let idx_name = format!("{table}_embedding_ivf");
+        let _ = sqlx::raw_sql(&format!("DROP INDEX {idx_name} ON {table}"))
+            .execute(&self.pool).await;
+        sqlx::raw_sql(&format!(
+            "CREATE INDEX {idx_name} USING ivfflat ON {table}(embedding) LISTS {lists} op_type 'vector_l2_ops'"
+        ))
+        .execute(&self.pool).await.map_err(db_err)?;
+        Ok(total_rows)
+    }
+
+    /// Deactivate orphaned incremental session summaries (session never closed, >24h old).
+    pub async fn cleanup_orphaned_incrementals(&self, user_id: &str, older_than_hours: i64) -> Result<i64, MemoriaError> {
+        let ids: Vec<(String,)> = sqlx::query_as(
+            "SELECT inc.memory_id FROM mem_memories AS inc \
+             WHERE inc.user_id = ? \
+               AND inc.is_active = 1 \
+               AND LOCATE('[session_summary:incremental]', inc.content) = 1 \
+               AND inc.session_id IS NOT NULL \
+               AND TIMESTAMPDIFF(HOUR, inc.observed_at, NOW()) > ? \
+               AND NOT EXISTS ( \
+                   SELECT 1 FROM mem_memories AS full_s \
+                   WHERE full_s.user_id = ? \
+                     AND full_s.is_active = 1 \
+                     AND full_s.session_id IS NULL \
+                     AND LOCATE('[session_summary]', full_s.content) = 1 \
+                     AND full_s.observed_at > inc.observed_at \
+               )"
+        ).bind(user_id).bind(older_than_hours).bind(user_id)
+         .fetch_all(&self.pool).await.map_err(db_err)?;
+
+        if ids.is_empty() { return Ok(0); }
+        for chunk in ids.chunks(500) {
+            let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let sql = format!(
+                "UPDATE mem_memories SET is_active = 0, updated_at = NOW() WHERE memory_id IN ({placeholders})"
+            );
+            let mut q = sqlx::query(&sql);
+            for (id,) in chunk { q = q.bind(id); }
+            q.execute(&self.pool).await.map_err(db_err)?;
+        }
+        Ok(ids.len() as i64)
+    }
+
+    /// Drop old milestone snapshots, keep last N (weekly).
+    pub async fn cleanup_snapshots(&self, keep_last_n: usize) -> Result<i64, MemoriaError> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT sname FROM mo_catalog.mo_snapshots \
+             WHERE prefix_eq(sname, 'mem_milestone_') ORDER BY ts DESC"
+        ).fetch_all(&self.pool).await.map_err(db_err)?;
+
+        if rows.len() <= keep_last_n { return Ok(0); }
+        let mut dropped = 0i64;
+        for (name,) in &rows[keep_last_n..] {
+            let _ = sqlx::raw_sql(&format!("DROP SNAPSHOT {name}"))
+                .execute(&self.pool).await;
+            dropped += 1;
+        }
+        Ok(dropped)
+    }
+
+    /// Clean up sandbox branches that were not properly dropped (weekly).
+    pub async fn cleanup_orphan_branches(&self) -> Result<i64, MemoriaError> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT table_name FROM information_schema.tables \
+             WHERE table_name LIKE 'memories_sandbox_%'"
+        ).fetch_all(&self.pool).await.map_err(db_err)?;
+
+        let (db_name,): (String,) = sqlx::query_as("SELECT DATABASE()")
+            .fetch_one(&self.pool).await.map_err(db_err)?;
+        let mut cleaned = 0i64;
+        for (table_name,) in rows {
+            let _ = sqlx::raw_sql(&format!("DATA BRANCH DELETE TABLE {db_name}.{table_name}"))
+                .execute(&self.pool).await;
+            cleaned += 1;
+        }
+        Ok(cleaned)
+    }
+
     /// Per-type stats: count, avg_confidence, contradiction_rate, avg_staleness_hours.
     pub async fn health_analyze(&self, user_id: &str) -> Result<serde_json::Value, MemoriaError> {
         let rows: Vec<(String, i64, f64, i64, f64)> = sqlx::query_as(
@@ -428,7 +612,13 @@ impl SqlMemoryStore {
         );
         let rows = sqlx::query(&sql).bind(user_id).bind(limit)
             .fetch_all(&self.pool).await.map_err(db_err)?;
-        rows.iter().map(row_to_memory).collect()
+        rows.iter().map(|r| {
+            let mut m = row_to_memory(r)?;
+            if let Ok(ft) = r.try_get::<f64, _>("ft_score") {
+                m.retrieval_score = Some(ft);
+            }
+            Ok(m)
+        }).collect()
     }
 
     pub async fn search_vector_from(&self, table: &str, user_id: &str, embedding: &[f32], limit: i64) -> Result<Vec<Memory>, MemoriaError> {
@@ -439,15 +629,81 @@ impl SqlMemoryStore {
              CAST(source_event_ids AS CHAR) AS src_ids, \
              CAST(extra_metadata AS CHAR) AS extra_meta, \
              is_active, superseded_by, trust_tier, initial_confidence, \
-             observed_at, created_at, updated_at \
+             observed_at, created_at, updated_at, \
+             l2_distance(embedding, '{vec_literal}') AS l2_dist \
              FROM {table} \
              WHERE user_id = ? AND is_active = 1 AND embedding IS NOT NULL \
-             ORDER BY l2_distance(embedding, '{vec_literal}') ASC \
+             ORDER BY l2_dist ASC \
              LIMIT ?"
         );
         let rows = sqlx::query(&sql).bind(user_id).bind(limit)
             .fetch_all(&self.pool).await.map_err(db_err)?;
-        rows.iter().map(row_to_memory).collect()
+        rows.iter().map(|r| {
+            let mut m = row_to_memory(r)?;
+            if let Ok(dist) = r.try_get::<f64, _>("l2_dist") {
+                m.retrieval_score = Some(1.0 / (1.0 + dist));
+            }
+            Ok(m)
+        }).collect()
+    }
+
+    /// Hybrid search: vector + fulltext, merged with 4-dimension weighted scoring.
+    /// Weights: vector=0.3, keyword=0.2, temporal=0.2, confidence=0.3 (matches Python "default")
+    pub async fn search_hybrid_from(&self, table: &str, user_id: &str, embedding: &[f32], query: &str, limit: i64) -> Result<Vec<Memory>, MemoriaError> {
+        // Fetch more candidates than needed for re-ranking
+        let fetch_k = (limit * 3).max(20);
+
+        // Vector candidates
+        let vec_results = self.search_vector_from(table, user_id, embedding, fetch_k).await?;
+
+        // Fulltext candidates (best-effort, ignore errors)
+        let ft_results = self.search_fulltext_from(table, user_id, query, fetch_k).await.unwrap_or_default();
+
+        // Build ft_score map
+        let ft_map: std::collections::HashMap<String, f64> = ft_results.iter()
+            .filter_map(|m| m.retrieval_score.map(|s| (m.memory_id.clone(), s)))
+            .collect();
+
+        // Merge: vec_results as base, add ft candidates not already present
+        let mut seen: std::collections::HashSet<String> = vec_results.iter().map(|m| m.memory_id.clone()).collect();
+        let mut candidates = vec_results;
+        for m in ft_results {
+            if seen.insert(m.memory_id.clone()) {
+                candidates.push(m);
+            }
+        }
+
+        // 4-dimension weighted scoring
+        let now = chrono::Utc::now();
+        const DECAY_HOURS: f64 = 168.0;   // 7 days
+        const HALF_LIFE_DAYS: f64 = 30.0;
+        const W_VEC: f64 = 0.3;
+        const W_KW: f64 = 0.2;
+        const W_TIME: f64 = 0.2;
+        const W_CONF: f64 = 0.3;
+
+        for m in &mut candidates {
+            let vec_score = m.retrieval_score.unwrap_or(0.0); // already 1/(1+l2)
+
+            let raw_ft = ft_map.get(&m.memory_id).copied().unwrap_or(0.0);
+            let kw_score = if raw_ft > 0.0 { raw_ft / (raw_ft + 1.0) } else { 0.0 };
+
+            let (time_score, conf_score) = if let Some(obs) = m.observed_at {
+                let age_hours = (now - obs).num_seconds() as f64 / 3600.0;
+                let age_days = age_hours / 24.0;
+                let ts = (-age_hours / DECAY_HOURS).max(-500.0).exp();
+                let cs = m.initial_confidence * (-age_days / HALF_LIFE_DAYS).max(-500.0).exp();
+                (ts, cs)
+            } else {
+                (0.0, m.initial_confidence)
+            };
+
+            m.retrieval_score = Some(W_VEC * vec_score + W_KW * kw_score + W_TIME * time_score + W_CONF * conf_score);
+        }
+
+        candidates.sort_by(|a, b| b.retrieval_score.partial_cmp(&a.retrieval_score).unwrap_or(std::cmp::Ordering::Equal));
+        candidates.truncate(limit as usize);
+        Ok(candidates)
     }
 
     // ── Entity links ──────────────────────────────────────────────────────────

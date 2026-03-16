@@ -161,8 +161,20 @@ pub async fn trigger_governance(
     match op {
         "governance" => {
             let quarantined = sql.quarantine_low_confidence(&user_id).await.map_err(db_err)?;
-            let cleaned = sql.cleanup_stale(&user_id).await.map_err(db_err)?;
-            Ok(Json(serde_json::json!({"op": op, "user_id": user_id, "quarantined": quarantined, "cleaned_stale": cleaned})))
+            let cleaned_stale = sql.cleanup_stale(&user_id).await.map_err(db_err)?;
+            let cleaned_tool_results = sql.cleanup_tool_results(72).await.map_err(db_err)?;
+            let archived_working = sql.archive_stale_working(24).await.map_err(db_err)?;
+            let compressed = sql.compress_redundant(&user_id, 0.95, 30, 10_000).await.map_err(db_err)?;
+            let cleaned_incrementals = sql.cleanup_orphaned_incrementals(&user_id, 24).await.map_err(db_err)?;
+            Ok(Json(serde_json::json!({
+                "op": op, "user_id": user_id,
+                "quarantined": quarantined,
+                "cleaned_stale": cleaned_stale,
+                "cleaned_tool_results": cleaned_tool_results,
+                "archived_working": archived_working,
+                "compressed_redundant": compressed,
+                "cleaned_incrementals": cleaned_incrementals,
+            })))
         }
         "consolidate" => {
             let graph = sql.graph_store();
@@ -170,7 +182,13 @@ pub async fn trigger_governance(
             let r = consolidator.consolidate(&user_id).await;
             Ok(Json(serde_json::json!({"op": op, "user_id": user_id, "conflicts_detected": r.conflicts_detected, "orphaned_scenes": r.orphaned_scenes})))
         }
-        _ => Err((StatusCode::BAD_REQUEST, format!("Invalid op: {op}. Must be governance|consolidate"))),
+        "weekly" => {
+            let cleaned_snapshots = sql.cleanup_snapshots(5).await.map_err(db_err)?;
+            let cleaned_branches = sql.cleanup_orphan_branches().await.map_err(db_err)?;
+            let _ = sql.rebuild_vector_index("mem_memories").await;
+            Ok(Json(serde_json::json!({"op": op, "user_id": user_id, "cleaned_snapshots": cleaned_snapshots, "cleaned_branches": cleaned_branches})))
+        }
+        _ => Err((StatusCode::BAD_REQUEST, format!("Invalid op: {op}. Must be governance|consolidate|weekly"))),
     }
 }
 

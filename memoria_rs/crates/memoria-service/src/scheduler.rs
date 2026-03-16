@@ -74,19 +74,24 @@ impl GovernanceScheduler {
         for (user_id,) in &users {
             match task {
                 "hourly" => {
-                    // Archive stale working memories (older than 24h)
+                    // Cleanup expired tool_results (TTL=72h) + archive stale working (>24h)
+                    let _ = sql.cleanup_tool_results(72).await;
+                    let _ = sql.archive_stale_working(24).await;
                     let cleaned = sql.cleanup_stale(user_id).await.unwrap_or(0);
                     total_cleaned += cleaned;
                 }
                 "daily" => {
                     let quarantined = sql.quarantine_low_confidence(user_id).await.unwrap_or(0);
                     let cleaned = sql.cleanup_stale(user_id).await.unwrap_or(0);
+                    let _ = sql.compress_redundant(user_id, 0.95, 30, 10_000).await;
+                    let _ = sql.cleanup_orphaned_incrementals(user_id, 24).await;
                     total_quarantined += quarantined;
                     total_cleaned += cleaned;
                 }
                 "weekly" => {
-                    // Weekly: cleanup old auto-generated snapshots (older than 30 days)
-                    // Snapshots are account-level in MO, skip per-user cleanup
+                    let _ = sql.rebuild_vector_index("mem_memories").await;
+                    let _ = sql.cleanup_snapshots(5).await;
+                    let _ = sql.cleanup_orphan_branches().await;
                 }
                 _ => {}
             }

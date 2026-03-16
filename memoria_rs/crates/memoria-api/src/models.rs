@@ -68,6 +68,7 @@ pub struct MemoryResponse {
     pub session_id: Option<String>,
     pub observed_at: Option<String>,
     pub created_at: Option<String>,
+    pub retrieval_score: Option<f64>,
 }
 
 impl From<Memory> for MemoryResponse {
@@ -83,6 +84,7 @@ impl From<Memory> for MemoryResponse {
             session_id: m.session_id,
             observed_at: m.observed_at.map(|dt| dt.to_rfc3339()),
             created_at: m.created_at.map(|dt| dt.to_rfc3339()),
+            retrieval_score: m.retrieval_score,
         }
     }
 }

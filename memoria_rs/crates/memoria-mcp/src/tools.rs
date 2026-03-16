@@ -397,22 +397,10 @@ pub async fn call(
                 Some(s) => s.clone(),
                 None => return Ok(mcp_text("Rebuild index requires SQL store")),
             };
-            // Count rows to compute optimal lists
-            let count_row = sqlx::query(&format!("SELECT COUNT(*) as cnt FROM {table}"))
-                .fetch_one(sql.pool()).await.map_err(|e| anyhow::anyhow!("{e}"))?;
-            let total_rows: i64 = count_row.try_get("cnt").unwrap_or(0);
-            let new_lists = (total_rows / 50).max(1).min(1024);
-            // Rebuild: drop + recreate IVF index
-            let idx_name = format!("{table}_embedding_ivf");
-            let _ = sqlx::raw_sql(&format!("ALTER TABLE {table} DROP INDEX {idx_name}"))
-                .execute(sql.pool()).await; // ignore error if not exists
-            sqlx::raw_sql(&format!(
-                "ALTER TABLE {table} ADD INDEX {idx_name} (embedding) USING IVFFLAT LISTS={new_lists}"
-            ))
-            .execute(sql.pool()).await
-            .map_err(|e| anyhow::anyhow!("rebuild index failed: {e}"))?;
+            let total_rows = sql.rebuild_vector_index(&table).await
+                .map_err(|e| anyhow::anyhow!("rebuild index failed: {e}"))?;
             Ok(mcp_text(&format!(
-                "Rebuilt IVF index for {table}: lists={new_lists} (rows={total_rows})"
+                "Rebuilt IVF index for {table}: rows={total_rows}"
             )))
         }
 

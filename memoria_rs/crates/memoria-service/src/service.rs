@@ -97,6 +97,7 @@ impl MemoryService {
         }
         let content = sensitivity.redacted_content.as_deref().unwrap_or(content);
 
+        let effective_tier = trust_tier.unwrap_or(TrustTier::T1Verified);
         let embedding = self.embed(content).await;
         let memory = Memory {
             memory_id: Uuid::new_v4().simple().to_string(),
@@ -104,7 +105,7 @@ impl MemoryService {
             memory_type,
             content: content.to_string(),
             initial_confidence: initial_confidence
-                .unwrap_or_else(|| trust_tier.as_ref().map(|t| t.initial_confidence()).unwrap_or(0.75)),
+                .unwrap_or_else(|| effective_tier.initial_confidence()),
             embedding,
             source_event_ids: vec![],
             superseded_by: None,
@@ -115,7 +116,7 @@ impl MemoryService {
             created_at: None,
             updated_at: None,
             extra_metadata: None,
-            trust_tier: trust_tier.unwrap_or_default(),
+            trust_tier: effective_tier,
             retrieval_score: None,
         };
         // Write to active branch table if sql_store available, else use trait
@@ -238,10 +239,10 @@ impl MemoryService {
                             return Ok((graph_memories, explain));
                         }
 
-                        // Graph insufficient — supplement with vector
+                        // Graph insufficient — supplement with hybrid
                         explain.vector_attempted = true;
                         let vs_start = std::time::Instant::now();
-                        let vec_results = sql.search_vector_from(&table, user_id, embedding, top_k).await?;
+                        let vec_results = sql.search_hybrid_from(&table, user_id, embedding, query, top_k).await?;
                         explain.vector_ms = vs_start.elapsed().as_secs_f64() * 1000.0;
                         explain.vector_hit = !vec_results.is_empty();
 
@@ -278,11 +279,11 @@ impl MemoryService {
             if let Some(ref embedding) = emb {
                 explain.vector_attempted = true;
                 let vs_start = std::time::Instant::now();
-                let results = sql.search_vector_from(&table, user_id, embedding, top_k).await?;
+                let results = sql.search_hybrid_from(&table, user_id, embedding, query, top_k).await?;
                 explain.vector_ms = vs_start.elapsed().as_secs_f64() * 1000.0;
                 if !results.is_empty() {
                     explain.vector_hit = true;
-                    explain.path = "vector";
+                    explain.path = "hybrid";
                     explain.result_count = results.len();
                     explain.total_ms = total_start.elapsed().as_secs_f64() * 1000.0;
                     return Ok((results, explain));
