@@ -393,30 +393,31 @@ class GraphStore(DbConsumer):
             return []
         import re as _re
 
-        safe = _re.sub(r"[+\-<>()~*\"@]", " ", query).strip()
+        safe = _re.sub(r"[+\-<>()~*\"@]", " ", query).replace("'", "").replace("\\", "").strip()
         if not safe:
             return []
 
         try:
             from matrixone.sqlalchemy_ext import boolean_match
-            from sqlalchemy import literal_column
-
-            with self._db() as db:
-                ft = boolean_match("content").must(safe)
-                ft_sql = ft.compile()
-                ft_score = literal_column(str(ft_sql)).label("ft_score")
-                rows = (
-                    db.query(GraphNode, ft_score)
-                    .filter_by(user_id=user_id, is_active=1)
-                    .filter(ft)
-                    .order_by(ft_score.desc())
-                    .limit(top_k)
-                    .all()
-                )
-                return [(_to_domain(row), float(score)) for row, score in rows]
-        except Exception:
-            logger.debug("Fulltext search failed", exc_info=True)
+        except ImportError:
+            logger.debug("boolean_match unavailable, skipping fulltext search")
             return []
+
+        from sqlalchemy import literal_column
+
+        with self._db() as db:
+            ft = boolean_match("content").must(safe)
+            ft_sql = ft.compile()
+            ft_score = literal_column(str(ft_sql)).label("ft_score")
+            rows = (
+                db.query(GraphNode, ft_score)
+                .filter_by(user_id=user_id, is_active=1)
+                .filter(ft)
+                .order_by(ft_score.desc())
+                .limit(top_k)
+                .all()
+            )
+            return [(_to_domain(row), float(score)) for row, score in rows]
 
     def get_pairs_similarity_batch(
         self,
