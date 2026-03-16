@@ -102,6 +102,7 @@ impl GitForDataService {
 
     /// Restore a single table from snapshot (non-destructive alternative to full account restore).
     /// DELETE current rows + INSERT SELECT from snapshot.
+    /// Workaround for MO#23860: retry on w-w conflict.
     pub async fn restore_table_from_snapshot(
         &self,
         table: &str,
@@ -114,6 +115,9 @@ impl GitForDataService {
         self.get_snapshot(snapshot_name).await?
             .ok_or_else(|| MemoriaError::NotFound(format!("Snapshot {snapshot_name}")))?;
 
+        // MO#23860: concurrent snapshot restore causes w-w conflict
+        // MO#23861: concurrent snapshot restore loses FULLTEXT INDEX secondary tables
+        // Callers must serialize snapshot operations until these are fixed.
         exec_ddl(&self.pool, &format!("DELETE FROM {safe_table}")).await?;
         exec_ddl(&self.pool, &format!(
             "INSERT INTO {safe_table} SELECT * FROM {safe_table} {{SNAPSHOT = '{safe_snap}'}}"

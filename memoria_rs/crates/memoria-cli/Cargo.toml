@@ -8,7 +8,6 @@ name = "memoria-rs"
 path = "src/main.rs"
 
 [dependencies]
-memoria-core = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }
-tokio = { workspace = true }
+serde_json = { workspace = true }

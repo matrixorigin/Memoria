@@ -1,13 +1,12 @@
 /// Snapshot end-to-end tests — from the user's perspective.
 /// Tests complex combinations: snapshot → mutate → rollback, pagination, prefix delete, etc.
 ///
-/// IMPORTANT: rollback operates on the global mem_memories table (DELETE + INSERT),
-/// so these tests must run serially to avoid interference.
-///
-/// Run: DATABASE_URL=mysql://root:111@localhost:6001/memoria_rs \
-///      cargo test -p memoria-mcp --test snapshot_e2e -- --test-threads=1 --nocapture
+/// IMPORTANT: These tests MUST run serially because:
+/// - MO#23860: concurrent DELETE + INSERT FROM SNAPSHOT causes w-w conflict
+/// - MO#23861: concurrent snapshot restore loses FULLTEXT INDEX secondary tables
 
 use memoria_git::GitForDataService;
+use serial_test::serial;
 use memoria_service::MemoryService;
 use memoria_storage::SqlMemoryStore;
 use serde_json::{json, Value};
@@ -21,7 +20,10 @@ fn db_url() -> String {
 }
 
 fn uid() -> String { format!("snap_{}", &Uuid::new_v4().simple().to_string()[..8]) }
-fn snap(suffix: &str) -> String { format!("s{}_{}", &Uuid::new_v4().simple().to_string()[..6], suffix) }
+fn snap(suffix: &str) -> String { 
+    // Use UUID to ensure global uniqueness across parallel tests
+    format!("s{}_{}", &Uuid::new_v4().simple().to_string()[..6], suffix)
+}
 
 /// Mirror of git_tools::sanitize_name — for test assertions on internal snapshot names.
 fn sanitize_name(name: &str) -> String {
@@ -59,6 +61,7 @@ fn text(v: &Value) -> &str { v["content"][0]["text"].as_str().unwrap_or("") }
 // ── 1. Basic: snapshot → mutate → rollback restores state ────────────────────
 
 #[tokio::test]
+#[serial]
 async fn test_snapshot_rollback_restores_state() {
     let (svc, git, uid) = setup().await;
     let snap_name = snap("basic");
@@ -97,6 +100,7 @@ async fn test_snapshot_rollback_restores_state() {
 // ── 2. Rollback to nonexistent snapshot returns error ────────────────────────
 
 #[tokio::test]
+#[serial]
 async fn test_rollback_nonexistent_snapshot_errors() {
     let (svc, git, uid) = setup().await;
     let result = memoria_mcp::git_tools::call(
@@ -109,6 +113,7 @@ async fn test_rollback_nonexistent_snapshot_errors() {
 // ── 3. Multiple snapshots: rollback to earlier one ───────────────────────────
 
 #[tokio::test]
+#[serial]
 async fn test_multiple_snapshots_rollback_to_earlier() {
     let (svc, git, uid) = setup().await;
     let snap1 = snap("v1");
@@ -136,6 +141,7 @@ async fn test_multiple_snapshots_rollback_to_earlier() {
 // ── 4. memory_snapshots pagination ───────────────────────────────────────────
 
 #[tokio::test]
+#[serial]
 async fn test_snapshots_pagination() {
     let (svc, git, uid) = setup().await;
     let names: Vec<String> = (0..5).map(|i| snap(&format!("pg{i}"))).collect();
@@ -164,6 +170,7 @@ async fn test_snapshots_pagination() {
 // ── 5. memory_snapshot_delete by prefix ──────────────────────────────────────
 
 #[tokio::test]
+#[serial]
 async fn test_snapshot_delete_by_prefix() {
     let (svc, git, uid) = setup().await;
     let prefix = format!("pre_{}", &uid[5..]);
@@ -196,6 +203,7 @@ async fn test_snapshot_delete_by_prefix() {
 // ── 6. memory_snapshot_delete batch by names ─────────────────────────────────
 
 #[tokio::test]
+#[serial]
 async fn test_snapshot_delete_batch_names() {
     let (svc, git, uid) = setup().await;
     let s1 = snap("b1");
@@ -226,6 +234,7 @@ async fn test_snapshot_delete_batch_names() {
 // ── 7. Snapshot → branch → mutate branch → rollback main (branch unaffected) ─
 
 #[tokio::test]
+#[serial]
 async fn test_snapshot_and_branch_independent() {
     let (svc, git, uid) = setup().await;
     let snap_name = snap("pre_branch");
@@ -268,6 +277,7 @@ async fn test_snapshot_and_branch_independent() {
 // ── 8. Duplicate snapshot name is rejected ───────────────────────────────────
 
 #[tokio::test]
+#[serial]
 async fn test_duplicate_snapshot_name_rejected() {
     let (svc, git, uid) = setup().await;
     let snap_name = snap("dup");
@@ -287,6 +297,7 @@ async fn test_duplicate_snapshot_name_rejected() {
 // ── 9. Multi-user isolation: user A's rollback doesn't affect user B ──────────
 
 #[tokio::test]
+#[serial]
 async fn test_multiuser_snapshot_isolation() {
     let (svc, git, _) = setup().await;
     let uid_a = uid();
@@ -329,6 +340,7 @@ async fn test_multiuser_snapshot_isolation() {
 // ── 10. older_than delete ─────────────────────────────────────────────────────
 
 #[tokio::test]
+#[serial]
 async fn test_snapshot_delete_older_than() {
     let (svc, git, uid) = setup().await;
     let s1 = snap("old1");
@@ -365,6 +377,7 @@ async fn test_snapshot_delete_older_than() {
 // memory_snapshots must only show mem_snap_/mem_milestone_ prefixed ones.
 
 #[tokio::test]
+#[serial]
 async fn test_snapshot_list_filters_system_snapshots() {
     let (svc, git, uid) = setup().await;
     let s1 = snap("mysnap");
@@ -386,6 +399,7 @@ async fn test_snapshot_list_filters_system_snapshots() {
 // ── 12. Rollback → snapshot → rollback again (chained operations) ─────────────
 
 #[tokio::test]
+#[serial]
 async fn test_chained_snapshot_rollback() {
     let (svc, git, uid) = setup().await;
     let snap_v1 = snap("v1");
@@ -420,6 +434,7 @@ async fn test_chained_snapshot_rollback() {
 // ── 13. Branch limit enforced ─────────────────────────────────────────────────
 
 #[tokio::test]
+#[serial]
 async fn test_branch_limit_enforced() {
     let (svc, git, uid) = setup().await;
 
@@ -445,6 +460,7 @@ async fn test_branch_limit_enforced() {
 // ── 14. Snapshot → branch from snapshot → verify branch has snapshot data ────
 
 #[tokio::test]
+#[serial]
 async fn test_branch_from_snapshot() {
     let (svc, git, uid) = setup().await;
     let snap_name = snap("forsplit");

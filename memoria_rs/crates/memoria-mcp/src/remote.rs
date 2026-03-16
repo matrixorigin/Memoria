@@ -8,6 +8,7 @@ use serde_json::{json, Value};
 pub struct RemoteClient {
     client: Client,
     base_url: String,
+    #[allow(dead_code)]
     user_id: String,
 }
 
@@ -48,6 +49,7 @@ impl RemoteClient {
         Self::mcp_text(&serde_json::to_string_pretty(v).unwrap_or_default())
     }
 
+    #[allow(dead_code)]
     fn mcp_err(e: impl std::fmt::Display) -> Value {
         Self::mcp_text(&format!("Error: {e}"))
     }
@@ -105,7 +107,7 @@ impl RemoteClient {
                         .send().await?
                 };
                 let body: Value = r.json().await?;
-                if let Some(err) = body.get("error") {
+                if let Some(_err) = body.get("error") {
                     return Ok(Self::mcp_text(&format!("No matching memory found for query '{query}'")));
                 }
                 Ok(Self::mcp_text(&format!("Corrected memory {}: {}",
@@ -183,7 +185,7 @@ impl RemoteClient {
             }
 
             "memory_rebuild_index" => {
-                let r = self.client.post(self.url("/v1/governance"))
+                let _r = self.client.post(self.url("/v1/governance"))
                     .json(&json!({"force": true}))
                     .send().await?;
                 Ok(Self::mcp_text("Index rebuild requested via governance endpoint."))
@@ -269,7 +271,7 @@ impl RemoteClient {
                 let r = self.client.post(self.url("/v1/snapshots"))
                     .json(&json!({"name": args["name"], "description": args["description"]}))
                     .send().await?;
-                let body: Value = r.json().await?;
+                let _body: Value = r.json().await?;
                 Ok(Self::mcp_text(&format!("Snapshot '{}' created.", args["name"].as_str().unwrap_or(""))))
             }
 
@@ -302,7 +304,7 @@ impl RemoteClient {
                 let r = self.client.post(self.url(&format!("/v1/snapshots/{name}/rollback")))
                     .json(&json!({}))
                     .send().await?;
-                let body: Value = r.json().await?;
+                let _body: Value = r.json().await?;
                 Ok(Self::mcp_text(&format!("Rolled back to snapshot '{name}'.")))
             }
 
@@ -314,7 +316,7 @@ impl RemoteClient {
                         "from_timestamp": args["from_timestamp"],
                     }))
                     .send().await?;
-                let body: Value = r.json().await?;
+                let _body: Value = r.json().await?;
                 Ok(Self::mcp_text(&format!("Branch '{}' created.", args["name"].as_str().unwrap_or(""))))
             }
 

@@ -13,7 +13,7 @@ use sqlx::Row;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-use crate::{auth::AuthUser, routes::memory::api_err, state::AppState};
+use crate::{auth::AuthUser, state::AppState};
 
 // ── Request / Response ────────────────────────────────────────────────────────
 

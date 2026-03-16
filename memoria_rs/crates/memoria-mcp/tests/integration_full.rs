@@ -8,7 +8,6 @@
 ///      cargo test -p memoria-mcp --test integration_full -- --test-threads=1 --nocapture
 
 use chrono::Utc;
-use memoria_core::{MemoryType, TrustTier};
 use memoria_git::GitForDataService;
 use memoria_service::MemoryService;
 use memoria_storage::SqlMemoryStore;
@@ -122,7 +121,7 @@ async fn test_full_stack_all_fields() {
         "content": "deploy with: make build && kubectl apply",
         "memory_type": "procedural"
     }), &svc, &uid).await;
-    let mid_procedural = extract_mid(text(&r));
+    let _mid_procedural = extract_mid(text(&r));
 
     // Working memory
     let r = tc("memory_store", json!({
@@ -146,7 +145,8 @@ async fn test_full_stack_all_fields() {
     assert_eq!(row["is_active"], "1", "is_active should be 1");
     assert!(row["superseded_by"].is_empty(), "superseded_by should be NULL");
     assert!(row["source_event_ids"].contains('['), "source_event_ids should be JSON array");
-    assert!(row["extra_metadata"].is_empty(), "extra_metadata should be NULL");
+    // MO#23859 workaround: NULL stored as "{}" to avoid ByteJson corruption
+    assert!(row["extra_metadata"].is_empty() || row["extra_metadata"] == "{}", "extra_metadata should be NULL or {{}} (MO#23859 workaround)");
     assert!(row["embedding"].is_empty(), "embedding should be NULL without embedder");
     assert!(!row["created_at"].is_empty(), "created_at must be set");
     assert!(!row["observed_at"].is_empty(), "observed_at must be set");
@@ -175,10 +175,20 @@ async fn test_full_stack_all_fields() {
     }), &svc, &uid).await;
     assert!(text(&r).contains("debugging resolved"), "{}", text(&r));
 
-    let row = db_row(&pool, "mem_memories", &mid_working).await;
-    assert_eq!(row["content"], "debugging resolved: embedding service was misconfigured");
-    assert!(!row["updated_at"].is_empty(), "updated_at must be set after correct");
-    println!("✅ Phase 4: correct by ID — DB content and updated_at verified");
+    // correct creates a new memory — extract new id
+    let new_mid_working = text(&r).split_whitespace().nth(2).unwrap_or("").trim_end_matches(':').to_string();
+    assert_ne!(new_mid_working, mid_working, "correct should create new memory");
+
+    // Old memory should be deactivated with superseded_by
+    let old_row = db_row(&pool, "mem_memories", &mid_working).await;
+    assert_eq!(old_row["is_active"], "0", "old memory should be deactivated");
+    assert_eq!(old_row["superseded_by"], new_mid_working, "old should point to new");
+
+    // New memory should have corrected content
+    let new_row = db_row(&pool, "mem_memories", &new_mid_working).await;
+    assert_eq!(new_row["content"], "debugging resolved: embedding service was misconfigured");
+    assert!(!new_row["updated_at"].is_empty() || !new_row["created_at"].is_empty(), "timestamps must be set");
+    println!("✅ Phase 4: correct by ID — superseded_by chain verified");
 
     // ── Phase 5: Correct by query ─────────────────────────────────────────────
 
@@ -189,8 +199,9 @@ async fn test_full_stack_all_fields() {
     }), &svc, &uid).await;
     assert!(text(&r).contains("helm"), "{}", text(&r));
 
-    let row = db_row(&pool, "mem_memories", &mid_procedural).await;
-    assert_eq!(row["content"], "deploy with: make release && helm upgrade");
+    let new_mid_proc = text(&r).split_whitespace().nth(2).unwrap_or("").trim_end_matches(':').to_string();
+    let new_row = db_row(&pool, "mem_memories", &new_mid_proc).await;
+    assert_eq!(new_row["content"], "deploy with: make release && helm upgrade");
     println!("✅ Phase 5: correct by query — DB verified");
 
     // ── Phase 6: Profile tool ─────────────────────────────────────────────────
@@ -254,15 +265,17 @@ async fn test_full_stack_all_fields() {
 
     // ── Phase 8: Purge batch ──────────────────────────────────────────────────
 
+    // mid_working was already deactivated by correct in Phase 4, so purge it + mid_branch
     let r = tc("memory_purge", json!({
-        "memory_id": format!("{mid_working},{mid_branch}"),
+        "memory_id": format!("{new_mid_working},{mid_branch}"),
         "reason": "cleanup working memories"
     }), &svc, &uid).await;
+    // Both should be purged (new_mid_working is active, mid_branch is active)
     assert!(text(&r).contains("2"), "{}", text(&r));
 
     // Verify soft-deleted in DB (is_active = 0)
     let sql = "SELECT is_active FROM mem_memories WHERE memory_id = ?";
-    let row = sqlx::query(sql).bind(&mid_working).fetch_one(&pool).await.unwrap();
+    let row = sqlx::query(sql).bind(&new_mid_working).fetch_one(&pool).await.unwrap();
     let active: i8 = row.try_get("is_active").unwrap_or(1);
     assert_eq!(active, 0, "purged memory should have is_active=0");
     println!("✅ Phase 8: purge batch — is_active=0 verified in DB");

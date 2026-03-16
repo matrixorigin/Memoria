@@ -24,6 +24,8 @@ tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
 reqwest = { workspace = true }
+futures = { workspace = true }
+axum = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
@@ -33,3 +35,4 @@ memoria-storage = { workspace = true }
 memoria-embedding = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
+serial_test = "3.4.0"

@@ -110,11 +110,23 @@ async fn test_correct_by_id() {
     let r = call("memory_correct",
         json!({"memory_id": mid, "new_content": "corrected content", "reason": "test"}),
         &svc, &uid).await;
-    assert!(text(&r).contains("corrected content"), "{}", text(&r));
+    let t = text(&r);
+    assert!(t.contains("corrected content"), "{t}");
 
-    let m = svc.get(&mid).await.unwrap().unwrap();
-    assert_eq!(m.content, "corrected content");
-    println!("✅ correct by id: {}", text(&r));
+    // correct creates a new memory — extract new id from response
+    let new_mid = t.split_whitespace().nth(2).unwrap_or("").trim_end_matches(':');
+    assert!(!new_mid.is_empty(), "should have new memory_id");
+    assert_ne!(new_mid, mid, "new memory should have different id");
+
+    // New memory should have corrected content
+    let new = svc.get(new_mid).await.unwrap().unwrap();
+    assert_eq!(new.content, "corrected content");
+    assert!(new.is_active, "new memory should be active");
+
+    // Old memory should be deactivated (get returns None for inactive)
+    let old = svc.get(&mid).await.unwrap();
+    assert!(old.is_none(), "old memory should not be returned by get (deactivated)");
+    println!("✅ correct by id: old={mid} → new={new_mid} (superseded_by chain)");
 }
 
 // ── 7. memory_correct by query (semantic search) ─────────────────────────────
@@ -635,4 +647,103 @@ async fn test_extract_entities_with_llm_if_configured() {
         "with LLM should return done or complete, got: {t}"
     );
     println!("✅ extract_entities with LLM: {t}");
+}
+
+// ── 33. retrieve: fulltext fallback when no embedding ────────────────────────
+
+#[tokio::test]
+async fn test_retrieve_fulltext_fallback() {
+    let (svc, uid) = setup().await;
+    // Store a memory with a unique keyword
+    call("memory_store", json!({"content": "xylophone_unique_test_keyword_42"}), &svc, &uid).await;
+    // Retrieve by exact keyword — should work via fulltext even without embedding
+    let r = call("memory_retrieve", json!({"query": "xylophone_unique_test_keyword_42", "top_k": 5}), &svc, &uid).await;
+    let t = text(&r);
+    assert!(t.contains("xylophone_unique_test_keyword_42"), "fulltext fallback should find exact keyword: {t}");
+    println!("✅ retrieve fulltext fallback works");
+}
+
+// ── 34. search: top_k=0 returns empty ────────────────────────────────────────
+
+#[tokio::test]
+async fn test_search_top_k_zero() {
+    let (svc, uid) = setup().await;
+    call("memory_store", json!({"content": "topk zero test"}), &svc, &uid).await;
+    let r = call("memory_search", json!({"query": "topk zero", "top_k": 0}), &svc, &uid).await;
+    let t = text(&r);
+    // top_k=0 should return no results or "No relevant memories"
+    assert!(t.contains("No relevant") || !t.contains("topk zero test"),
+        "top_k=0 should return empty: {t}");
+    println!("✅ search top_k=0: {}", &t[..t.len().min(80)]);
+}
+
+// ── 35. store + retrieve with session_id ─────────────────────────────────────
+
+#[tokio::test]
+async fn test_store_with_session_id_retrievable() {
+    let (svc, uid) = setup().await;
+    let sid = format!("sess_{}", uuid::Uuid::new_v4().simple().to_string()[..8].to_string());
+    call("memory_store", json!({"content": "session-specific memory alpha", "session_id": sid}), &svc, &uid).await;
+    let r = call("memory_retrieve", json!({"query": "session-specific alpha", "top_k": 5}), &svc, &uid).await;
+    let t = text(&r);
+    assert!(t.contains("session-specific memory alpha"), "should find session memory: {t}");
+    println!("✅ store with session_id retrievable");
+}
+
+// ── 36. purge by topic then verify gone ──────────────────────────────────────
+
+#[tokio::test]
+async fn test_purge_topic_then_search_empty() {
+    let (svc, uid) = setup().await;
+    let tag = format!("purgetopic_{}", uuid::Uuid::new_v4().simple().to_string()[..6].to_string());
+    for i in 0..3 {
+        call("memory_store", json!({"content": format!("{tag} item {i}")}), &svc, &uid).await;
+    }
+    // Purge by topic
+    let r = call("memory_purge", json!({"topic": &tag}), &svc, &uid).await;
+    let t = text(&r);
+    assert!(t.contains("Purged") || t.contains("purged") || t.contains("Deleted"), "purge result: {t}");
+    println!("✅ purge by topic: {t}");
+
+    // Search should find nothing
+    let r = call("memory_search", json!({"query": &tag, "top_k": 10}), &svc, &uid).await;
+    let t = text(&r);
+    assert!(t.contains("No relevant") || !t.contains(&tag), "should be empty after purge: {t}");
+    println!("✅ search after purge: empty");
+}
+
+// ── 37. explain mode on retrieve ─────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_retrieve_explain_mode() {
+    let (svc, uid) = setup().await;
+    call("memory_store", json!({"content": "explain test memory alpha"}), &svc, &uid).await;
+
+    let r = call("memory_retrieve", json!({"query": "explain test alpha", "top_k": 5, "explain": true}), &svc, &uid).await;
+    let t = text(&r);
+    assert!(t.contains("--- explain ---"), "should contain explain section: {t}");
+    assert!(t.contains("\"path\""), "should contain path field: {t}");
+    assert!(t.contains("\"total_ms\""), "should contain total_ms: {t}");
+    println!("✅ retrieve explain mode: {}", &t[t.find("--- explain ---").unwrap_or(0)..]);
+}
+
+#[tokio::test]
+async fn test_retrieve_explain_empty() {
+    let (svc, uid) = setup().await;
+    let r = call("memory_retrieve", json!({"query": "nonexistent_xyz_123", "top_k": 5, "explain": true}), &svc, &uid).await;
+    let t = text(&r);
+    assert!(t.contains("No relevant memories"), "should say no results: {t}");
+    assert!(t.contains("--- explain ---"), "should still have explain: {t}");
+    println!("✅ retrieve explain empty: has stats even with no results");
+}
+
+#[tokio::test]
+async fn test_search_explain_mode() {
+    let (svc, uid) = setup().await;
+    call("memory_store", json!({"content": "search explain test beta"}), &svc, &uid).await;
+
+    let r = call("memory_search", json!({"query": "search explain beta", "top_k": 5, "explain": true}), &svc, &uid).await;
+    let t = text(&r);
+    assert!(t.contains("--- explain ---"), "search should also support explain: {t}");
+    println!("✅ search explain mode works");
 }

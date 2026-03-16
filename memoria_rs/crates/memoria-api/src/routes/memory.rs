@@ -162,3 +162,141 @@ pub async fn get_profile(
         .collect();
     Ok(Json(serde_json::json!({ "profile": profile.join("\n") })))
 }
+
+#[derive(serde::Deserialize)]
+pub struct ObserveRequest {
+    pub messages: Vec<serde_json::Value>,
+    pub source_event_ids: Option<Vec<String>>,
+    pub session_id: Option<String>,
+}
+
+/// Extract and store memories from a conversation turn.
+/// Without LLM: stores each non-empty assistant message as a semantic memory.
+/// With LLM: (future) extract facts from the conversation.
+pub async fn observe_turn(
+    State(state): State<AppState>,
+    AuthUser(user_id): AuthUser,
+    Json(req): Json<ObserveRequest>,
+) -> ApiResult<serde_json::Value> {
+    let mut stored = Vec::new();
+    let mut warning: Option<&str> = None;
+
+    if state.service.llm.is_none() {
+        warning = Some("LLM not configured — storing assistant messages as-is");
+    }
+
+    for msg in &req.messages {
+        let role = msg["role"].as_str().unwrap_or("");
+        let content = msg["content"].as_str().unwrap_or("").trim();
+        if content.is_empty() { continue; }
+        // Store assistant messages as semantic memories
+        if role == "assistant" || role == "user" {
+            let m = state.service.store_memory(
+                &user_id, content,
+                memoria_core::MemoryType::Semantic,
+                req.session_id.clone(), None,
+            ).await.map_err(api_err)?;
+            stored.push(serde_json::json!({
+                "memory_id": m.memory_id,
+                "content": m.content,
+                "memory_type": m.memory_type.to_string(),
+            }));
+        }
+    }
+
+    let mut result = serde_json::json!({ "memories": stored });
+    if let Some(w) = warning {
+        result["warning"] = serde_json::json!(w);
+    }
+    Ok(Json(result))
+}
+
+/// GET /v1/memories/:id/history — version chain via superseded_by links.
+pub async fn get_memory_history(
+    State(state): State<AppState>,
+    AuthUser(user_id): AuthUser,
+    Path(id): Path<String>,
+) -> ApiResult<serde_json::Value> {
+    use sqlx::Row;
+
+    let sql = state.service.sql_store.as_ref()
+        .ok_or_else(|| (StatusCode::SERVICE_UNAVAILABLE, "SQL store required".to_string()))?;
+    let table = sql.active_table(&user_id).await.map_err(api_err)?;
+
+    let mut chain = Vec::new();
+    let mut visited = std::collections::HashSet::new();
+
+    // Walk forward from the given id following superseded_by
+    let mut current_id = Some(id.clone());
+    while let Some(cid) = current_id {
+        if !visited.insert(cid.clone()) { break; }
+        let row = sqlx::query(
+            &format!(
+                "SELECT memory_id, content, is_active, superseded_by, observed_at, memory_type \
+                 FROM `{}` WHERE memory_id = ? AND user_id = ?", table
+            )
+        )
+        .bind(&cid).bind(&user_id)
+        .fetch_optional(sql.pool()).await.map_err(api_err)?;
+
+        match row {
+            Some(r) => {
+                let mid: String = r.try_get("memory_id").unwrap_or_default();
+                let sup: Option<String> = r.try_get("superseded_by").ok().flatten();
+                chain.push(serde_json::json!({
+                    "memory_id": mid,
+                    "content": r.try_get::<String, _>("content").unwrap_or_default(),
+                    "is_active": r.try_get::<i8, _>("is_active").unwrap_or(0) != 0,
+                    "superseded_by": sup,
+                    "observed_at": r.try_get::<Option<String>, _>("observed_at").ok().flatten(),
+                    "memory_type": r.try_get::<String, _>("memory_type").unwrap_or_default(),
+                }));
+                current_id = sup;
+            }
+            None => {
+                if chain.is_empty() {
+                    return Err((StatusCode::NOT_FOUND, "Memory not found".to_string()));
+                }
+                break;
+            }
+        }
+    }
+
+    // Walk backwards: find older versions that point to our root
+    if let Some(root_id) = chain.first().and_then(|v| v["memory_id"].as_str()) {
+        let mut prev_id = root_id.to_string();
+        loop {
+            let older = sqlx::query(
+                &format!(
+                    "SELECT memory_id, content, is_active, superseded_by, observed_at, memory_type \
+                     FROM `{}` WHERE superseded_by = ? AND user_id = ?", table
+                )
+            )
+            .bind(&prev_id).bind(&user_id)
+            .fetch_optional(sql.pool()).await.map_err(api_err)?;
+
+            match older {
+                Some(r) => {
+                    let mid: String = r.try_get("memory_id").unwrap_or_default();
+                    if !visited.insert(mid.clone()) { break; }
+                    prev_id = mid.clone();
+                    chain.insert(0, serde_json::json!({
+                        "memory_id": mid,
+                        "content": r.try_get::<String, _>("content").unwrap_or_default(),
+                        "is_active": r.try_get::<i8, _>("is_active").unwrap_or(0) != 0,
+                        "superseded_by": r.try_get::<Option<String>, _>("superseded_by").ok().flatten(),
+                        "observed_at": r.try_get::<Option<String>, _>("observed_at").ok().flatten(),
+                        "memory_type": r.try_get::<String, _>("memory_type").unwrap_or_default(),
+                    }));
+                }
+                None => break,
+            }
+        }
+    }
+
+    Ok(Json(serde_json::json!({
+        "memory_id": id,
+        "versions": chain,
+        "total": chain.len(),
+    })))
+}

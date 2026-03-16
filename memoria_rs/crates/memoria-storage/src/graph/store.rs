@@ -340,13 +340,19 @@ impl GraphStore {
         source: &str,
     ) -> Result<(), MemoriaError> {
         let now = chrono::Utc::now().naive_utc();
+        // Weight by extraction source — higher = more confident
+        let weight: f32 = match source {
+            "manual" => 1.0,
+            "llm" => 0.9,
+            _ => 0.8, // regex, unknown
+        };
         sqlx::query(
             "INSERT INTO mem_memory_entity_links \
              (memory_id, entity_id, user_id, source, weight, created_at) \
-             VALUES (?,?,?,?,0.8,?) \
-             ON DUPLICATE KEY UPDATE source = VALUES(source)"
+             VALUES (?,?,?,?,?,?) \
+             ON DUPLICATE KEY UPDATE source = VALUES(source), weight = VALUES(weight)"
         )
-        .bind(memory_id).bind(entity_id).bind(user_id).bind(source).bind(now)
+        .bind(memory_id).bind(entity_id).bind(user_id).bind(source).bind(weight).bind(now)
         .execute(&self.pool).await.map_err(db_err)?;
         Ok(())
     }
@@ -388,6 +394,186 @@ impl GraphStore {
             let etype: String = r.try_get("entity_type").ok()?;
             Some((name, etype))
         }).collect::<Vec<_>>())
+    }
+
+    // ── Graph retrieval queries ─────────────────────────────────────────
+
+    /// Vector similarity search on graph nodes (cosine via l2_distance).
+    pub async fn search_nodes_vector(
+        &self,
+        user_id: &str,
+        embedding: &[f32],
+        top_k: i64,
+    ) -> Result<Vec<(GraphNode, f32)>, MemoriaError> {
+        let vec_lit = format!(
+            "[{}]",
+            embedding.iter().map(|f| f.to_string()).collect::<Vec<_>>().join(",")
+        );
+        let sql = format!(
+            "SELECT *, cosine_similarity(embedding, '{vec_lit}') AS cos_sim \
+             FROM memory_graph_nodes \
+             WHERE user_id = ? AND is_active = 1 AND embedding IS NOT NULL \
+             ORDER BY l2_distance(embedding, '{vec_lit}') ASC \
+             LIMIT ?"
+        );
+        let rows = sqlx::query(&sql)
+            .bind(user_id)
+            .bind(top_k)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(db_err)?;
+        Ok(rows
+            .iter()
+            .map(|r| {
+                let sim: f32 = r.try_get("cos_sim").unwrap_or(0.0);
+                (row_to_node(r), sim)
+            })
+            .collect())
+    }
+
+    /// Fulltext (BM25) search on graph nodes.
+    pub async fn search_nodes_fulltext(
+        &self,
+        user_id: &str,
+        query: &str,
+        top_k: i64,
+    ) -> Result<Vec<(GraphNode, f32)>, MemoriaError> {
+        if query.trim().is_empty() {
+            return Ok(vec![]);
+        }
+        // Sanitize query for MATCH AGAINST
+        let safe: String = query
+            .chars()
+            .map(|c| if "+-<>()~*\"@".contains(c) { ' ' } else { c })
+            .collect();
+        let safe = safe.trim();
+        if safe.is_empty() {
+            return Ok(vec![]);
+        }
+        let sql = format!(
+            "SELECT *, MATCH(content) AGAINST('{safe}' IN BOOLEAN MODE) AS ft_score \
+             FROM memory_graph_nodes \
+             WHERE user_id = ? AND is_active = 1 \
+             AND MATCH(content) AGAINST('{safe}' IN BOOLEAN MODE) \
+             ORDER BY ft_score DESC LIMIT ?"
+        );
+        let rows = sqlx::query(&sql)
+            .bind(user_id)
+            .bind(top_k)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(db_err)?;
+        Ok(rows
+            .iter()
+            .map(|r| {
+                let score: f32 = r.try_get("ft_score").unwrap_or(0.0);
+                (row_to_node(r), score)
+            })
+            .collect())
+    }
+
+    /// Find entity_id by exact name match.
+    pub async fn find_entity_by_name(
+        &self,
+        user_id: &str,
+        name: &str,
+    ) -> Result<Option<String>, MemoriaError> {
+        let row = sqlx::query(
+            "SELECT entity_id FROM mem_entities WHERE user_id = ? AND name = ?",
+        )
+        .bind(user_id)
+        .bind(name)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(row.and_then(|r| r.try_get("entity_id").ok()))
+    }
+
+    /// Reverse lookup: entity → memory_ids with weights.
+    pub async fn get_memories_by_entity(
+        &self,
+        entity_id: &str,
+        user_id: &str,
+        limit: i64,
+    ) -> Result<Vec<(String, f32)>, MemoriaError> {
+        let rows = sqlx::query(
+            "SELECT l.memory_id, l.weight \
+             FROM mem_memory_entity_links l \
+             JOIN mem_memories m ON l.memory_id = m.memory_id \
+             WHERE l.entity_id = ? AND l.user_id = ? AND m.is_active = 1 \
+             ORDER BY l.weight DESC, m.created_at DESC \
+             LIMIT ?",
+        )
+        .bind(entity_id)
+        .bind(user_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(rows
+            .iter()
+            .filter_map(|r| {
+                let mid: String = r.try_get("memory_id").ok()?;
+                let w: f32 = r.try_get("weight").ok()?;
+                Some((mid, w))
+            })
+            .collect())
+    }
+
+    /// Bidirectional edge fetch for a set of node IDs.
+    /// Returns (incoming, outgoing) maps: node_id → Vec<(peer_id, edge_type, weight)>.
+    pub async fn get_edges_bidirectional(
+        &self,
+        node_ids: &[String],
+    ) -> Result<(
+        std::collections::HashMap<String, Vec<(String, String, f32)>>,
+        std::collections::HashMap<String, Vec<(String, String, f32)>>,
+    ), MemoriaError> {
+        if node_ids.is_empty() {
+            return Ok((Default::default(), Default::default()));
+        }
+        let ph = node_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        // Outgoing: source_id IN node_ids, peer = target_id
+        // Incoming: target_id IN node_ids, peer = source_id
+        let sql = format!(
+            "SELECT e.source_id, e.target_id, e.edge_type, e.weight, 0 AS direction \
+             FROM memory_graph_edges e \
+             JOIN memory_graph_nodes n ON n.node_id = e.target_id AND n.is_active = 1 \
+             WHERE e.source_id IN ({ph}) \
+             UNION ALL \
+             SELECT e.source_id, e.target_id, e.edge_type, e.weight, 1 AS direction \
+             FROM memory_graph_edges e \
+             JOIN memory_graph_nodes n ON n.node_id = e.source_id AND n.is_active = 1 \
+             WHERE e.target_id IN ({ph})"
+        );
+        let mut q = sqlx::query(&sql);
+        for id in node_ids {
+            q = q.bind(id);
+        }
+        for id in node_ids {
+            q = q.bind(id);
+        }
+        let rows = q.fetch_all(&self.pool).await.map_err(db_err)?;
+
+        let mut incoming: std::collections::HashMap<String, Vec<(String, String, f32)>> =
+            Default::default();
+        let mut outgoing: std::collections::HashMap<String, Vec<(String, String, f32)>> =
+            Default::default();
+        for r in &rows {
+            let src: String = r.try_get("source_id").unwrap_or_default();
+            let tgt: String = r.try_get("target_id").unwrap_or_default();
+            let etype: String = r.try_get("edge_type").unwrap_or_default();
+            let w: f32 = r.try_get("weight").unwrap_or(1.0);
+            let dir: i32 = r.try_get("direction").unwrap_or(0);
+            if dir == 0 {
+                // outgoing: anchor=source_id, peer=target_id
+                outgoing.entry(src).or_default().push((tgt, etype, w));
+            } else {
+                // incoming: anchor=target_id, peer=source_id
+                incoming.entry(tgt).or_default().push((src, etype, w));
+            }
+        }
+        Ok((incoming, outgoing))
     }
 
     /// Count active nodes for a user.

@@ -1,3 +1,6 @@
+-include .env
+export
+
 DATABASE_URL ?= mysql://root:111@localhost:6001/memoria_rs
 CARGO = SQLX_OFFLINE=true DATABASE_URL=$(DATABASE_URL) cargo
 

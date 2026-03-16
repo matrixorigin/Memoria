@@ -62,6 +62,14 @@ struct Args {
     /// Database name for git-for-data
     #[arg(long, env = "MEMORIA_DB_NAME")]
     db_name: Option<String>,
+
+    /// Transport: stdio (default) or sse
+    #[arg(long, default_value = "stdio")]
+    transport: String,
+
+    /// Port for SSE transport (default 8200)
+    #[arg(long, env = "MCP_PORT", default_value = "8200")]
+    port: u16,
 }
 
 #[tokio::main]
@@ -123,5 +131,9 @@ async fn main() -> Result<()> {
     });
 
     let service = Arc::new(MemoryService::new_sql_with_llm(Arc::new(store), embedder, llm));
-    memoria_mcp::run_stdio(service, git, cfg.user).await
+    if args.transport == "sse" {
+        memoria_mcp::run_sse(service, git, cfg.user, args.port).await
+    } else {
+        memoria_mcp::run_stdio(service, git, cfg.user).await
+    }
 }

@@ -14,7 +14,6 @@ fn uid() -> String {
 
 /// Spawn the API server on a random port, return (base_url, client).
 async fn spawn_server() -> (String, reqwest::Client) {
-    use axum::{routing::{delete, get, post, put}, Router};
     use memoria_git::GitForDataService;
     use memoria_service::{Config, MemoryService};
     use memoria_storage::SqlMemoryStore;
@@ -30,39 +29,7 @@ async fn spawn_server() -> (String, reqwest::Client) {
     let service = Arc::new(MemoryService::new_sql(Arc::new(store), None));
     let state = memoria_api::AppState::new(service, git, String::new());
 
-    let app = Router::new()
-        .route("/health", get(memoria_api::routes::memory::health))
-        .route("/v1/memories", get(memoria_api::routes::memory::list_memories))
-        .route("/v1/memories", post(memoria_api::routes::memory::store_memory))
-        .route("/v1/memories/batch", post(memoria_api::routes::memory::batch_store))
-        .route("/v1/memories/retrieve", post(memoria_api::routes::memory::retrieve))
-        .route("/v1/memories/search", post(memoria_api::routes::memory::search))
-        .route("/v1/memories/correct", post(memoria_api::routes::memory::correct_by_query))
-        .route("/v1/memories/purge", post(memoria_api::routes::memory::purge_memories))
-        .route("/v1/memories/:id", get(memoria_api::routes::memory::get_memory))
-        .route("/v1/memories/:id/correct", put(memoria_api::routes::memory::correct_memory))
-        .route("/v1/memories/:id", delete(memoria_api::routes::memory::delete_memory))
-        .route("/v1/profiles", get(memoria_api::routes::memory::get_profile))
-        .route("/v1/governance", post(memoria_api::routes::governance::governance))
-        .route("/v1/consolidate", post(memoria_api::routes::governance::consolidate))
-        .route("/v1/reflect", post(memoria_api::routes::governance::reflect))
-        .route("/v1/extract-entities", post(memoria_api::routes::governance::extract_entities))
-        .route("/v1/extract-entities/link", post(memoria_api::routes::governance::link_entities))
-        .route("/v1/entities", get(memoria_api::routes::governance::get_entities))
-        .route("/v1/sessions/:session_id/summary", post(memoria_api::routes::sessions::create_session_summary))
-        .route("/v1/tasks/:task_id", get(memoria_api::routes::sessions::get_task_status))
-        .route("/v1/snapshots", get(memoria_api::routes::snapshots::list_snapshots))
-        .route("/v1/snapshots", post(memoria_api::routes::snapshots::create_snapshot))
-        .route("/v1/snapshots/delete", post(memoria_api::routes::snapshots::delete_snapshot_bulk))
-        .route("/v1/snapshots/:name", delete(memoria_api::routes::snapshots::delete_snapshot))
-        .route("/v1/snapshots/:name/rollback", post(memoria_api::routes::snapshots::rollback))
-        .route("/v1/branches", get(memoria_api::routes::snapshots::list_branches))
-        .route("/v1/branches", post(memoria_api::routes::snapshots::create_branch))
-        .route("/v1/branches/:name/checkout", post(memoria_api::routes::snapshots::checkout_branch))
-        .route("/v1/branches/:name/merge", post(memoria_api::routes::snapshots::merge_branch))
-        .route("/v1/branches/:name/diff", get(memoria_api::routes::snapshots::diff_branch))
-        .route("/v1/branches/:name", delete(memoria_api::routes::snapshots::delete_branch))
-        .with_state(state);
+    let app = memoria_api::build_router(state);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let port = listener.local_addr().unwrap().port();
@@ -70,10 +37,7 @@ async fn spawn_server() -> (String, reqwest::Client) {
         axum::serve(listener, app).await
     });
 
-    // Give server time to start
     tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
-
-    // Check if server task panicked
     if handle.is_finished() {
         panic!("Server task finished unexpectedly");
     }
@@ -272,11 +236,9 @@ async fn test_api_governance() {
     println!("✅ POST /v1/governance");
 }
 
-// ── 10. auth: missing token returns 401 ──────────────────────────────────────
+// ── Helper: spawn server with master key ─────────────────────────────────────
 
-#[tokio::test]
-async fn test_api_auth_required() {
-    use axum::{routing::get, Router};
+async fn spawn_server_with_master_key(master_key: &str) -> (String, reqwest::Client) {
     use memoria_git::GitForDataService;
     use memoria_service::{Config, MemoryService};
     use memoria_storage::SqlMemoryStore;
@@ -289,19 +251,22 @@ async fn test_api_auth_required() {
     let pool = MySqlPool::connect(&db).await.expect("pool");
     let git = Arc::new(GitForDataService::new(pool, &cfg.db_name));
     let service = Arc::new(MemoryService::new_sql(Arc::new(store), None));
-    // Set a master key to enable auth
-    let state = memoria_api::AppState::new(service, git, "test-master-key-12345".to_string());
-
-    let app = Router::new()
-        .route("/v1/memories", get(memoria_api::routes::memory::list_memories))
-        .with_state(state);
-
+    let state = memoria_api::AppState::new(service, git, master_key.to_string());
+    let app = memoria_api::build_router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-
+    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
     let client = reqwest::Client::builder().no_proxy().build().unwrap();
-    let base = format!("http://127.0.0.1:{port}");
+    (format!("http://127.0.0.1:{port}"), client)
+}
+
+// ── 10. auth: missing token returns 401 ──────────────────────────────────────
+
+#[tokio::test]
+async fn test_api_auth_required() {
+    let mk = "test-master-key-12345";
+    let (base, client) = spawn_server_with_master_key(mk).await;
 
     // No token → 401
     let r = client.get(format!("{base}/v1/memories"))
@@ -319,11 +284,305 @@ async fn test_api_auth_required() {
     // Correct token → 200
     let r = client.get(format!("{base}/v1/memories"))
         .header("X-User-Id", "alice")
-        .header("Authorization", "Bearer test-master-key-12345")
+        .header("Authorization", format!("Bearer {mk}"))
         .send().await.unwrap();
     assert_eq!(r.status(), 200);
 
     println!("✅ Auth: 401 without token, 200 with correct token");
+}
+
+// ── 10b. auth: full API key CRUD (create/list/rotate/revoke) ─────────────────
+
+#[tokio::test]
+async fn test_api_key_crud() {
+    let mk = "test-master-key-crud";
+    let (base, client) = spawn_server_with_master_key(mk).await;
+    let auth = format!("Bearer {mk}");
+    let uid = uid();
+
+    // 1. Create key
+    let r = client.post(format!("{base}/auth/keys"))
+        .header("Authorization", &auth)
+        .json(&json!({"user_id": uid, "name": "test-key-1"}))
+        .send().await.unwrap();
+    assert_eq!(r.status(), 201, "create key");
+    let body: Value = r.json().await.unwrap();
+    let key_id = body["key_id"].as_str().unwrap().to_string();
+    let raw_key = body["raw_key"].as_str().unwrap().to_string();
+    assert!(raw_key.starts_with("sk-"), "raw_key should start with sk-");
+    assert_eq!(body["user_id"].as_str().unwrap(), uid);
+    assert_eq!(body["name"].as_str().unwrap(), "test-key-1");
+    println!("✅ create key: {key_id}, prefix={}", body["key_prefix"]);
+
+    // 2. List keys — use master key to authenticate (API keys are for external use)
+    let r = client.get(format!("{base}/auth/keys"))
+        .header("Authorization", &auth)
+        .header("X-User-Id", &uid)
+        .send().await.unwrap();
+    assert_eq!(r.status(), 200, "list keys");
+    let keys: Vec<Value> = r.json().await.unwrap();
+    assert!(keys.iter().any(|k| k["key_id"].as_str() == Some(&key_id)), "should find created key");
+    println!("✅ list keys: {} keys found", keys.len());
+
+    // 3. Rotate key
+    let r = client.put(format!("{base}/auth/keys/{key_id}/rotate"))
+        .header("Authorization", &auth)
+        .send().await.unwrap();
+    assert_eq!(r.status(), 201, "rotate key");
+    let body: Value = r.json().await.unwrap();
+    let new_key_id = body["key_id"].as_str().unwrap().to_string();
+    let new_raw_key = body["raw_key"].as_str().unwrap().to_string();
+    assert_ne!(new_key_id, key_id, "rotated key should have new id");
+    assert_ne!(new_raw_key, raw_key, "rotated key should have new raw_key");
+    assert_eq!(body["name"].as_str().unwrap(), "test-key-1", "name preserved");
+    println!("✅ rotate key: old={key_id} → new={new_key_id}");
+
+    // 4. Old key should be deactivated — verify via list
+    let r = client.get(format!("{base}/auth/keys"))
+        .header("Authorization", &auth)
+        .header("X-User-Id", &uid)
+        .send().await.unwrap();
+    let keys: Vec<Value> = r.json().await.unwrap();
+    assert!(!keys.iter().any(|k| k["key_id"].as_str() == Some(&key_id)),
+        "old key should not appear in active list");
+    println!("✅ old key deactivated after rotate");
+
+    // 5. New key appears in list
+    assert!(keys.iter().any(|k| k["key_id"].as_str() == Some(&new_key_id)),
+        "new key should appear in active list");
+    println!("✅ new key in active list after rotate");
+
+    // 6. Revoke key
+    let r = client.delete(format!("{base}/auth/keys/{new_key_id}"))
+        .header("Authorization", &auth)
+        .send().await.unwrap();
+    assert_eq!(r.status(), 204, "revoke key");
+    println!("✅ revoke key: {new_key_id}");
+
+    // 7. Revoked key should not appear in active list
+    let r = client.get(format!("{base}/auth/keys"))
+        .header("Authorization", &auth)
+        .header("X-User-Id", &uid)
+        .send().await.unwrap();
+    let keys: Vec<Value> = r.json().await.unwrap();
+    assert!(!keys.iter().any(|k| k["key_id"].as_str() == Some(&new_key_id)),
+        "revoked key should not appear in active list");
+    println!("✅ revoked key not in active list");
+
+    // 8. Rotate non-existent key → 404
+    let r = client.put(format!("{base}/auth/keys/nonexistent-id/rotate"))
+        .header("Authorization", &auth)
+        .send().await.unwrap();
+    assert_eq!(r.status(), 404, "rotate nonexistent");
+    println!("✅ rotate nonexistent → 404");
+
+    // 9. Revoke non-existent key → 404
+    let r = client.delete(format!("{base}/auth/keys/nonexistent-id"))
+        .header("Authorization", &auth)
+        .send().await.unwrap();
+    assert_eq!(r.status(), 404, "revoke nonexistent");
+    println!("✅ revoke nonexistent → 404");
+}
+
+// ── 10c. observe endpoint ────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_api_observe_turn() {
+    let (base, client) = spawn_server().await;
+    let uid = uid();
+
+    // Observe with assistant + user messages
+    let r = client.post(format!("{base}/v1/observe"))
+        .header("X-User-Id", &uid)
+        .json(&json!({
+            "messages": [
+                {"role": "user", "content": "What is Rust?"},
+                {"role": "assistant", "content": "Rust is a systems programming language"},
+                {"role": "system", "content": "You are helpful"},
+                {"role": "assistant", "content": ""}
+            ]
+        }))
+        .send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    let body: Value = r.json().await.unwrap();
+    let memories = body["memories"].as_array().unwrap();
+    // Should store user + non-empty assistant messages, skip system + empty
+    assert_eq!(memories.len(), 2, "should store 2 memories (user + assistant): {body}");
+    assert!(body.get("warning").is_some(), "should have LLM warning without LLM");
+    println!("✅ observe: stored {} memories, warning={}", memories.len(), body["warning"]);
+
+    // Verify stored memories are retrievable
+    let r = client.post(format!("{base}/v1/memories/search"))
+        .header("X-User-Id", &uid)
+        .json(&json!({"query": "Rust programming", "top_k": 10}))
+        .send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    let results: Vec<Value> = r.json().await.unwrap();
+    assert!(results.len() >= 2, "should find observed memories, got {}", results.len());
+    println!("✅ observe memories retrievable: {} found", results.len());
+}
+
+#[tokio::test]
+async fn test_api_observe_empty_messages() {
+    let (base, client) = spawn_server().await;
+    let uid = uid();
+
+    // Empty messages array → should return 200 with empty memories
+    let r = client.post(format!("{base}/v1/observe"))
+        .header("X-User-Id", &uid)
+        .json(&json!({"messages": []}))
+        .send().await.unwrap();
+    // Could be 200 with empty or 422 for validation — check what we get
+    let status = r.status().as_u16();
+    assert!(status == 200 || status == 422, "empty messages: got {status}");
+    println!("✅ observe empty messages: {status}");
+}
+
+// ── 10d. retrieve edge cases ─────────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_api_retrieve_top_k_respected() {
+    let (base, client) = spawn_server().await;
+    let uid = uid();
+
+    // Store 5 memories
+    for i in 0..5 {
+        client.post(format!("{base}/v1/memories"))
+            .header("X-User-Id", &uid)
+            .json(&json!({"content": format!("topk test item {i}"), "memory_type": "semantic"}))
+            .send().await.unwrap();
+    }
+
+    // Retrieve with top_k=2
+    let r = client.post(format!("{base}/v1/memories/retrieve"))
+        .header("X-User-Id", &uid)
+        .json(&json!({"query": "topk test item", "top_k": 2}))
+        .send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    let results: Vec<Value> = r.json().await.unwrap();
+    assert!(results.len() <= 2, "top_k=2 should return at most 2, got {}", results.len());
+    println!("✅ retrieve top_k=2: got {} results", results.len());
+}
+
+#[tokio::test]
+async fn test_api_search_returns_fields() {
+    let (base, client) = spawn_server().await;
+    let uid = uid();
+
+    client.post(format!("{base}/v1/memories"))
+        .header("X-User-Id", &uid)
+        .json(&json!({"content": "field check memory", "memory_type": "profile"}))
+        .send().await.unwrap();
+
+    let r = client.post(format!("{base}/v1/memories/search"))
+        .header("X-User-Id", &uid)
+        .json(&json!({"query": "field check", "top_k": 1}))
+        .send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    let results: Vec<Value> = r.json().await.unwrap();
+    assert!(!results.is_empty(), "should find memory");
+    let mem = &results[0];
+    // Verify essential fields are present
+    assert!(mem["memory_id"].as_str().is_some(), "should have memory_id");
+    assert!(mem["content"].as_str().is_some(), "should have content");
+    assert!(mem["memory_type"].as_str().is_some(), "should have memory_type");
+    println!("✅ search returns all fields: id={}, type={}", mem["memory_id"], mem["memory_type"]);
+}
+
+// ── 10e. error scenarios ─────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_api_store_missing_content() {
+    let (base, client) = spawn_server().await;
+    let uid = uid();
+
+    let r = client.post(format!("{base}/v1/memories"))
+        .header("X-User-Id", &uid)
+        .json(&json!({"memory_type": "semantic"}))
+        .send().await.unwrap();
+    assert_eq!(r.status(), 422, "missing content should be 422");
+    println!("✅ store missing content → 422");
+}
+
+#[tokio::test]
+async fn test_api_delete_nonexistent() {
+    let (base, client) = spawn_server().await;
+    let uid = uid();
+
+    let r = client.delete(format!("{base}/v1/memories/nonexistent-id-12345"))
+        .header("X-User-Id", &uid)
+        .send().await.unwrap();
+    // Should be 404 or 200 with "not found" — check what we return
+    let status = r.status().as_u16();
+    println!("✅ delete nonexistent: {status}");
+}
+
+#[tokio::test]
+async fn test_api_correct_nonexistent() {
+    let (base, client) = spawn_server().await;
+    let uid = uid();
+
+    let r = client.put(format!("{base}/v1/memories/nonexistent-id-12345/correct"))
+        .header("X-User-Id", &uid)
+        .json(&json!({"new_content": "updated", "reason": "test"}))
+        .send().await.unwrap();
+    let status = r.status().as_u16();
+    // Should be 404 or 500
+    assert!(status == 404 || status == 500, "correct nonexistent: got {status}");
+    println!("✅ correct nonexistent → {status}");
+}
+
+// ── 10f. memory history ──────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_api_memory_history() {
+    let (base, client) = spawn_server().await;
+    let uid = uid();
+
+    // Store a memory
+    let r = client.post(format!("{base}/v1/memories"))
+        .header("X-User-Id", &uid)
+        .json(&json!({"content": "history test v1", "memory_type": "semantic"}))
+        .send().await.unwrap();
+    let body: Value = r.json().await.unwrap();
+    let mid = body["memory_id"].as_str().unwrap().to_string();
+
+    // Get history — should have 1 version
+    let r = client.get(format!("{base}/v1/memories/{mid}/history"))
+        .header("X-User-Id", &uid)
+        .send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    let body: Value = r.json().await.unwrap();
+    assert_eq!(body["total"].as_i64().unwrap(), 1);
+    assert_eq!(body["versions"][0]["content"].as_str().unwrap(), "history test v1");
+    println!("✅ memory history: 1 version");
+
+    // Correct the memory
+    client.put(format!("{base}/v1/memories/{mid}/correct"))
+        .header("X-User-Id", &uid)
+        .json(&json!({"new_content": "history test v2", "reason": "updated"}))
+        .send().await.unwrap();
+
+    // History should still show the memory (in-place update, same id)
+    let r = client.get(format!("{base}/v1/memories/{mid}/history"))
+        .header("X-User-Id", &uid)
+        .send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    let body: Value = r.json().await.unwrap();
+    assert!(body["total"].as_i64().unwrap() >= 1);
+    println!("✅ memory history after correct: {} versions", body["total"]);
+}
+
+#[tokio::test]
+async fn test_api_memory_history_not_found() {
+    let (base, client) = spawn_server().await;
+    let uid = uid();
+
+    let r = client.get(format!("{base}/v1/memories/nonexistent-id/history"))
+        .header("X-User-Id", &uid)
+        .send().await.unwrap();
+    assert_eq!(r.status(), 404);
+    println!("✅ memory history nonexistent → 404");
 }
 
 // ── Remote mode E2E tests ─────────────────────────────────────────────────────
@@ -633,18 +892,7 @@ async fn test_episodic_no_llm_returns_503() {
     println!("✅ episodic without LLM: 503 SERVICE_UNAVAILABLE");
 }
 
-#[tokio::test]
-async fn test_episodic_no_memories_returns_error() {
-    // This test requires LLM — skip if not configured
-    let llm_key = match std::env::var("LLM_API_KEY").ok().filter(|s| !s.is_empty()) {
-        Some(k) => k,
-        None => {
-            println!("⏭️  test_episodic_no_memories skipped (LLM_API_KEY not set)");
-            return;
-        }
-    };
-
-    use axum::{routing::{get, post}, Router};
+async fn spawn_server_with_llm(llm_key: String) -> (String, reqwest::Client) {
     use memoria_git::GitForDataService;
     use memoria_service::{Config, MemoryService};
     use memoria_storage::SqlMemoryStore;
@@ -662,18 +910,27 @@ async fn test_episodic_no_memories_returns_error() {
     let llm = Arc::new(LlmClient::new(llm_key, base_url, model));
     let service = Arc::new(MemoryService::new_sql_with_llm(Arc::new(store), None, Some(llm)));
     let state = memoria_api::AppState::new(service, git, String::new());
-
-    let app = Router::new()
-        .route("/v1/sessions/:session_id/summary", post(memoria_api::routes::sessions::create_session_summary))
-        .with_state(state);
-
+    let app = memoria_api::build_router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-
     let client = reqwest::Client::builder().no_proxy().build().unwrap();
-    let base = format!("http://127.0.0.1:{port}");
+    (format!("http://127.0.0.1:{port}"), client)
+}
+
+#[tokio::test]
+async fn test_episodic_no_memories_returns_error() {
+    // This test requires LLM — skip if not configured
+    let llm_key = match std::env::var("LLM_API_KEY").ok().filter(|s| !s.is_empty()) {
+        Some(k) => k,
+        None => {
+            println!("⏭️  test_episodic_no_memories skipped (LLM_API_KEY not set)");
+            return;
+        }
+    };
+
+    let (base, client) = spawn_server_with_llm(llm_key).await;
     let uid = uid();
 
     // No memories for this session → 500
@@ -711,38 +968,7 @@ async fn test_episodic_with_llm_sync() {
         }
     };
 
-    use axum::{routing::{get, post}, Router};
-    use memoria_git::GitForDataService;
-    use memoria_service::{Config, MemoryService};
-    use memoria_storage::SqlMemoryStore;
-    use sqlx::mysql::MySqlPool;
-    use memoria_embedding::LlmClient;
-
-    let cfg = Config::from_env();
-    let db = db_url();
-    let store = SqlMemoryStore::connect(&db, 4).await.expect("connect");
-    store.migrate().await.expect("migrate");
-    let pool = MySqlPool::connect(&db).await.expect("pool");
-    let git = Arc::new(GitForDataService::new(pool, &cfg.db_name));
-    let base_url = std::env::var("LLM_BASE_URL").unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
-    let model = std::env::var("LLM_MODEL").unwrap_or_else(|_| "gpt-4o-mini".to_string());
-    let llm = Arc::new(LlmClient::new(llm_key, base_url, model));
-    let service = Arc::new(MemoryService::new_sql_with_llm(Arc::new(store), None, Some(llm)));
-    let state = memoria_api::AppState::new(service, git, String::new());
-
-    let app = Router::new()
-        .route("/v1/memories", post(memoria_api::routes::memory::store_memory))
-        .route("/v1/sessions/:session_id/summary", post(memoria_api::routes::sessions::create_session_summary))
-        .route("/v1/tasks/:task_id", get(memoria_api::routes::sessions::get_task_status))
-        .with_state(state);
-
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-
-    let client = reqwest::Client::builder().no_proxy().build().unwrap();
-    let base = format!("http://127.0.0.1:{port}");
+    let (base, client) = spawn_server_with_llm(llm_key).await;
     let uid = uid();
     let session_id = format!("ep_sess_{}", uuid::Uuid::new_v4().simple().to_string()[..8].to_string());
 

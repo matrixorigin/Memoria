@@ -3,7 +3,7 @@
 /// Validates Bearer token against master key.
 
 use axum::{
-    extract::{FromRequestParts, Query},
+    extract::FromRequestParts,
     http::{request::Parts, StatusCode},
 };
 use serde::Deserialize;

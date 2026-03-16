@@ -10,6 +10,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 #[derive(Deserialize)]
 struct Request {
     #[serde(default)]
+    #[allow(dead_code)]
     jsonrpc: String,
     id: Option<Value>,
     method: String,
@@ -39,6 +40,75 @@ pub async fn run_stdio(
 /// Run in remote mode (proxy to REST API).
 pub async fn run_stdio_remote(remote: RemoteClient, user_id: String) -> Result<()> {
     run_loop(Mode::Remote(remote), user_id).await
+}
+
+/// Run SSE transport — MCP over HTTP.
+/// Clients connect to GET /sse for server-sent events, POST /message to send requests.
+pub async fn run_sse(
+    service: Arc<MemoryService>,
+    git: Arc<GitForDataService>,
+    user_id: String,
+    port: u16,
+) -> Result<()> {
+    use axum::{
+        extract::State,
+        response::sse::{Event, Sse},
+        routing::{get, post},
+        Router,
+    };
+    use futures::stream::{self};
+    use std::convert::Infallible;
+    use tokio::sync::broadcast;
+
+    #[derive(Clone)]
+    struct SseState {
+        tx: broadcast::Sender<String>,
+        service: Arc<MemoryService>,
+        git: Arc<GitForDataService>,
+        user_id: String,
+    }
+
+    let (tx, _) = broadcast::channel::<String>(64);
+    let state = SseState { tx: tx.clone(), service, git, user_id };
+
+    let app = Router::new()
+        .route("/sse", get(|State(s): State<SseState>| async move {
+            let rx = s.tx.subscribe();
+            let stream = stream::unfold(rx, |mut rx| async move {
+                match rx.recv().await {
+                    Ok(msg) => Some((Ok::<Event, Infallible>(Event::default().data(msg)), rx)),
+                    Err(_) => None,
+                }
+            });
+            Sse::new(stream)
+        }))
+        .route("/message", post(|State(s): State<SseState>, body: String| async move {
+            let req: serde_json::Value = match serde_json::from_str(&body) {
+                Ok(v) => v,
+                Err(e) => {
+                    let resp = serde_json::json!({"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":e.to_string()}});
+                    let _ = s.tx.send(serde_json::to_string(&resp).unwrap_or_default());
+                    return;
+                }
+            };
+            let id = req["id"].clone();
+            let method = req["method"].as_str().unwrap_or("").to_string();
+            let params = req["params"].clone();
+            let mode = Mode::Embedded { service: s.service.clone(), git: s.git.clone() };
+            let result = dispatch(&method, Some(params), &mode, &s.user_id).await;
+            let resp = match result {
+                Ok(v) => serde_json::json!({"jsonrpc":"2.0","id":id,"result":if v.is_null(){serde_json::json!({})}else{v}}),
+                Err(e) => serde_json::json!({"jsonrpc":"2.0","id":id,"error":{"code":-32000,"message":e.to_string()}}),
+            };
+            let _ = s.tx.send(serde_json::to_string(&resp).unwrap_or_default());
+        }))
+        .with_state(state);
+
+    let addr = format!("0.0.0.0:{port}");
+    tracing::info!("Memoria MCP SSE transport listening on {addr}");
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    axum::serve(listener, app).await?;
+    Ok(())
 }
 
 enum Mode {

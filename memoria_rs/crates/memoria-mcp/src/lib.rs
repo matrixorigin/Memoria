@@ -4,4 +4,4 @@ pub mod remote;
 pub mod tools;
 mod server;
 
-pub use server::{run_stdio, run_stdio_remote};
+pub use server::{run_stdio, run_stdio_remote, run_sse};

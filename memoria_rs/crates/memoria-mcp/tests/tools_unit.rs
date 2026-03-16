@@ -1,7 +1,7 @@
 /// MCP tools unit tests — verifies JSON-RPC dispatch and tool responses.
 
 use async_trait::async_trait;
-use memoria_core::{interfaces::{EmbeddingProvider, MemoryStore}, Memory, MemoriaError, MemoryType};
+use memoria_core::{interfaces::{EmbeddingProvider, MemoryStore}, Memory, MemoriaError};
 use memoria_service::MemoryService;
 use std::sync::{Arc, Mutex};
 use serde_json::json;

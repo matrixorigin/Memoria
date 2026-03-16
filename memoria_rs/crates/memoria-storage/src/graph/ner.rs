@@ -215,4 +215,61 @@ mod tests {
         let names: Vec<&str> = e.iter().map(|x| x.name.as_str()).collect();
         assert!(names.contains(&"cargo test"), "{names:?}");
     }
+
+    #[test]
+    fn test_mixed_language_with_english_entities() {
+        // Chinese text with English tech terms — should still extract English entities
+        let e = extract_entities("我们使用 docker 和 Kubernetes 部署服务");
+        let names: Vec<&str> = e.iter().map(|x| x.name.as_str()).collect();
+        assert!(names.contains(&"docker"), "should find docker in mixed text: {names:?}");
+        assert!(names.contains(&"kubernetes"), "should find Kubernetes: {names:?}");
+    }
+
+    #[test]
+    fn test_camel_case_identifier() {
+        let e = extract_entities("The MemoryService handles all storage");
+        let names: Vec<&str> = e.iter().map(|x| x.name.as_str()).collect();
+        assert!(names.contains(&"memoryservice"), "should find CamelCase: {names:?}");
+    }
+
+    #[test]
+    fn test_pure_acronym() {
+        let e = extract_entities("We deploy on AWS using ECS");
+        let names: Vec<&str> = e.iter().map(|x| x.name.as_str()).collect();
+        assert!(names.contains(&"aws"), "{names:?}");
+        assert!(names.contains(&"ecs"), "{names:?}");
+    }
+
+    #[test]
+    fn test_empty_and_short_input() {
+        assert!(extract_entities("").is_empty());
+        assert!(extract_entities("a").is_empty());
+        assert!(extract_entities("hi there").is_empty());
+    }
+
+    #[test]
+    fn test_no_duplicates() {
+        let e = extract_entities("docker docker Docker DOCKER");
+        let docker_count = e.iter().filter(|x| x.name == "docker").count();
+        assert_eq!(docker_count, 1, "should deduplicate: {e:?}");
+    }
+
+    #[test]
+    fn test_multiple_at_mentions() {
+        let e = extract_entities("Ask @alice and @bob about @charlie's work");
+        let names: Vec<&str> = e.iter().map(|x| x.name.as_str()).collect();
+        assert!(names.contains(&"alice"), "{names:?}");
+        assert!(names.contains(&"bob"), "{names:?}");
+        assert!(names.contains(&"charlie"), "{names:?}");
+    }
+
+    #[test]
+    fn test_common_english_excluded() {
+        let e = extract_entities("The First Step Is To Check");
+        let names: Vec<&str> = e.iter().map(|x| x.name.as_str()).collect();
+        // All these are in COMMON_ENGLISH
+        assert!(!names.contains(&"the"), "should exclude common: {names:?}");
+        assert!(!names.contains(&"first"), "should exclude common: {names:?}");
+        assert!(!names.contains(&"step"), "should exclude common: {names:?}");
+    }
 }

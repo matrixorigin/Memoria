@@ -54,7 +54,7 @@ impl SqlMemoryStore {
                 embedding       vecf32({dim}),
                 session_id      VARCHAR(64),
                 source_event_ids JSON        NOT NULL,
-                extra_metadata  JSON,
+                extra_metadata  JSON, -- MO#23859: NULL avoided at bind level
                 is_active       TINYINT(1)   NOT NULL DEFAULT 1,
                 superseded_by   VARCHAR(64),
                 trust_tier      VARCHAR(10)  DEFAULT 'T3',
@@ -64,7 +64,7 @@ impl SqlMemoryStore {
                 updated_at      DATETIME(6),
                 INDEX idx_user_active (user_id, is_active),
                 INDEX idx_user_session (user_id, session_id),
-                FULLTEXT INDEX ft_content (content) WITH PARSER ngram
+                FULLTEXT INDEX ft_content (content) WITH PARSER ngram -- MO#23861: breaks on concurrent snapshot restore
             )"#,
             dim = self.embedding_dim
         );
@@ -263,6 +263,36 @@ impl SqlMemoryStore {
         Ok(res.rows_affected() as i64)
     }
 
+    // ── Batch reads ─────────────────────────────────────────────────────────
+
+    /// Fetch multiple memories by IDs. Returns map of memory_id → Memory.
+    pub async fn get_by_ids(&self, ids: &[String]) -> Result<std::collections::HashMap<String, Memory>, MemoriaError> {
+        if ids.is_empty() {
+            return Ok(Default::default());
+        }
+        let ph = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT memory_id, user_id, memory_type, content, \
+             embedding AS emb_str, session_id, \
+             CAST(source_event_ids AS CHAR) AS src_ids, \
+             CAST(extra_metadata AS CHAR) AS extra_meta, \
+             is_active, superseded_by, trust_tier, initial_confidence, \
+             observed_at, created_at, updated_at \
+             FROM mem_memories WHERE memory_id IN ({ph}) AND is_active = 1"
+        );
+        let mut q = sqlx::query(&sql);
+        for id in ids {
+            q = q.bind(id);
+        }
+        let rows = q.fetch_all(&self.pool).await.map_err(db_err)?;
+        let mut map = std::collections::HashMap::new();
+        for r in &rows {
+            let m = row_to_memory(r)?;
+            map.insert(m.memory_id.clone(), m);
+        }
+        Ok(map)
+    }
+
     // ── Table-aware CRUD ──────────────────────────────────────────────────────
 
     pub async fn insert_into(&self, table: &str, memory: &Memory) -> Result<(), MemoriaError> {
@@ -270,7 +300,10 @@ impl SqlMemoryStore {
         let observed_at = memory.observed_at.map(|dt| dt.naive_utc()).unwrap_or(now);
         let created_at = memory.created_at.map(|dt| dt.naive_utc()).unwrap_or(now);
         let source_event_ids = serde_json::to_string(&memory.source_event_ids)?;
-        let extra_metadata = memory.extra_metadata.as_ref().map(serde_json::to_string).transpose()?;
+        // Workaround: MO#23859 — PREPARE/EXECUTE corrupts NULL JSON on 2nd+ execution.
+        let extra_metadata = memory.extra_metadata.as_ref()
+            .map(serde_json::to_string).transpose()?
+            .unwrap_or_else(|| "{}".to_string());
         let embedding = memory.embedding.as_deref()
             .filter(|v| !v.is_empty())  // Some([]) → None → SQL NULL
             .map(vec_to_mo);
@@ -433,7 +466,10 @@ impl MemoryStore for SqlMemoryStore {
 
     async fn update(&self, memory: &Memory) -> Result<(), MemoriaError> {
         let now = Utc::now().naive_utc();
-        let extra_metadata = memory.extra_metadata.as_ref().map(serde_json::to_string).transpose()?;
+        // Workaround: MO#23859 — PREPARE/EXECUTE corrupts NULL JSON on 2nd+ execution.
+        let extra_metadata = memory.extra_metadata.as_ref()
+            .map(serde_json::to_string).transpose()?
+            .unwrap_or_else(|| "{}".to_string());
         sqlx::query(
             r#"UPDATE mem_memories
                SET content = ?, memory_type = ?, trust_tier = ?,
@@ -482,7 +518,8 @@ fn row_to_memory(row: &sqlx::mysql::MySqlRow) -> Result<Memory, MemoriaError> {
     };
     let extra_metadata = {
         let s: Option<String> = row.try_get("extra_meta").map_err(db_err)?;
-        s.map(|v| serde_json::from_str(&v)).transpose()?
+        // Workaround: MO#23859 — we store "{}" instead of NULL; treat empty object as None.
+        s.filter(|v| v != "{}").map(|v| serde_json::from_str(&v)).transpose()?
     };
     let embedding: Option<Vec<f32>> = {
         let s: Option<String> = row.try_get("emb_str").map_err(db_err)?;

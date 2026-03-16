@@ -6,10 +6,16 @@ use memoria_git::GitForDataService;
 use sqlx::mysql::MySqlPool;
 use uuid::Uuid;
 
+use memoria_storage::SqlMemoryStore;
+
 async fn setup() -> (GitForDataService, String) {
     let url = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "mysql://root:111@localhost:6001/memoria_rs".to_string());
     let pool = MySqlPool::connect(&url).await.expect("connect");
+    // Ensure full schema exists (branch/count tests need mem_memories)
+    let dim: usize = std::env::var("EMBEDDING_DIM").ok()
+        .and_then(|v| v.parse().ok()).unwrap_or(384);
+    SqlMemoryStore::new(pool.clone(), dim).migrate().await.expect("migrate");
     let svc = GitForDataService::new(pool, "memoria_rs");
     let suffix = Uuid::new_v4().simple().to_string()[..8].to_string();
     (svc, suffix)

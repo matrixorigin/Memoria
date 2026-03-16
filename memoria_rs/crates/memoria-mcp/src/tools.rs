@@ -33,7 +33,8 @@ pub fn list() -> Value {
                 "properties": {
                     "query": {"type": "string"},
                     "top_k": {"type": "integer", "default": 5},
-                    "session_id": {"type": "string"}
+                    "session_id": {"type": "string"},
+                    "explain": {"type": "boolean", "default": false, "description": "Show retrieval timing and path (debug)"}
                 },
                 "required": ["query"]
             }
@@ -45,7 +46,8 @@ pub fn list() -> Value {
                 "type": "object",
                 "properties": {
                     "query": {"type": "string"},
-                    "top_k": {"type": "integer", "default": 10}
+                    "top_k": {"type": "integer", "default": 10},
+                    "explain": {"type": "boolean", "default": false, "description": "Show retrieval timing and path (debug)"}
                 },
                 "required": ["query"]
             }
@@ -223,14 +225,29 @@ pub async fn call(
         "memory_retrieve" | "memory_search" => {
             let query = args["query"].as_str().unwrap_or("").to_string();
             let top_k = args["top_k"].as_i64().unwrap_or(5);
-            let results = service.retrieve(user_id, &query, top_k).await?;
-            if results.is_empty() {
-                return Ok(mcp_text("No relevant memories found."));
+            let explain = args["explain"].as_bool().unwrap_or(false);
+
+            if explain {
+                let (results, stats) = service.retrieve_explain(user_id, &query, top_k).await?;
+                if results.is_empty() {
+                    let explain_json = serde_json::to_string_pretty(&stats).unwrap_or_default();
+                    return Ok(mcp_text(&format!("No relevant memories found.\n\n--- explain ---\n{explain_json}")));
+                }
+                let text = results.iter().map(|m| {
+                    format!("[{}] ({}) {}", m.memory_id, m.memory_type, m.content)
+                }).collect::<Vec<_>>().join("\n");
+                let explain_json = serde_json::to_string_pretty(&stats).unwrap_or_default();
+                Ok(mcp_text(&format!("{text}\n\n--- explain ---\n{explain_json}")))
+            } else {
+                let results = service.retrieve(user_id, &query, top_k).await?;
+                if results.is_empty() {
+                    return Ok(mcp_text("No relevant memories found."));
+                }
+                let text = results.iter().map(|m| {
+                    format!("[{}] ({}) {}", m.memory_id, m.memory_type, m.content)
+                }).collect::<Vec<_>>().join("\n");
+                Ok(mcp_text(&text))
             }
-            let text = results.iter().map(|m| {
-                format!("[{}] ({}) {}", m.memory_id, m.memory_type, m.content)
-            }).collect::<Vec<_>>().join("\n");
-            Ok(mcp_text(&text))
         }
 
         "memory_correct" => {
@@ -240,23 +257,26 @@ pub async fn call(
             }
             let memory_id = args["memory_id"].as_str().unwrap_or("");
             let query = args["query"].as_str().unwrap_or("");
-            let m = if !memory_id.is_empty() {
-                service.correct(memory_id, new_content).await?
+
+            // Resolve old memory_id for graph sync
+            let old_mid = if !memory_id.is_empty() {
+                memory_id.to_string()
             } else if !query.is_empty() {
-                // Semantic search to find best match, then correct it
                 let results = service.retrieve(user_id, query, 1).await?;
                 match results.into_iter().next() {
-                    Some(found) => {
-                        service.correct(&found.memory_id, new_content).await?
-                    }
+                    Some(found) => found.memory_id,
                     None => return Ok(mcp_text("No matching memory found for query")),
                 }
             } else {
                 return Ok(mcp_text("Provide memory_id or query"));
             };
-            // Graph sync: update content in graph node (best-effort)
+
+            let m = service.correct(&old_mid, new_content).await?;
+
+            // Graph sync: deactivate old node, create/update new node
             if let Some(sql) = &service.sql_store {
                 let graph = sql.graph_store();
+                let _ = graph.deactivate_by_memory_id(&old_mid).await;
                 let _ = graph.update_content_by_memory_id(&m.memory_id, &m.content).await;
             }
             Ok(mcp_text(&format!("Corrected memory {}: {}", m.memory_id, m.content)))
