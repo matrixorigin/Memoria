@@ -173,6 +173,88 @@ class TestFulltextSearch:
         results = store.fulltext_search(user_id, "Docker")
         assert len(results) == 0
 
+    def test_fulltext_query_with_single_quotes(self, store, user_id):
+        """Query containing single quotes must not cause SQL syntax error (regression)."""
+        store.create_node(
+            GraphNodeData(
+                node_id=_new_id(),
+                user_id=user_id,
+                node_type=NodeType.SEMANTIC,
+                content="called list_dir 4 times with no progress",
+                embedding=_embed(),
+                confidence=0.8,
+                trust_tier="T3",
+                importance=0.5,
+            )
+        )
+        # Must not raise — single quotes in query were breaking AGAINST(... IN BOOLEAN MODE)
+        results = store.fulltext_search(
+            user_id,
+            "[SYSTEM] You have called 'list_dir' 4 times in a row with different arguments",
+        )
+        assert isinstance(results, list)
+
+    def test_fulltext_query_with_boolean_operators(self, store, user_id):
+        """Boolean mode operators (+, -, *, ~, <, >) in query must be stripped safely."""
+        store.create_node(
+            GraphNodeData(
+                node_id=_new_id(),
+                user_id=user_id,
+                node_type=NodeType.SEMANTIC,
+                content="kubernetes deployment scaling",
+                embedding=_embed(),
+                confidence=0.8,
+                trust_tier="T3",
+                importance=0.5,
+            )
+        )
+        # All of these would break boolean mode if not stripped
+        for query in ["+kubernetes -scaling", "kube*", "~deploy", "<scale>"]:
+            results = store.fulltext_search(user_id, query)
+            assert isinstance(results, list), f"Failed for query: {query!r}"
+
+    def test_fulltext_query_only_special_chars(self, store, user_id):
+        """Query that reduces to empty after stripping special chars returns []."""
+        for query in ["'", "+-<>", "' \" \\"]:
+            results = store.fulltext_search(user_id, query)
+            assert results == [], f"Expected [] for query {query!r}, got {results}"
+
+    def test_fulltext_query_with_backslash(self, store, user_id):
+        """Backslash in query must not cause SQL escape issues."""
+        store.create_node(
+            GraphNodeData(
+                node_id=_new_id(),
+                user_id=user_id,
+                node_type=NodeType.SEMANTIC,
+                content="windows path separator usage",
+                embedding=_embed(),
+                confidence=0.8,
+                trust_tier="T3",
+                importance=0.5,
+            )
+        )
+        results = store.fulltext_search(user_id, "C:\\Users\\path\\to\\file")
+        assert isinstance(results, list)
+
+    def test_fulltext_user_isolation(self, store):
+        """Results must be scoped to the querying user only."""
+        uid_a = _uid()
+        uid_b = _uid()
+        store.create_node(
+            GraphNodeData(
+                node_id=_new_id(),
+                user_id=uid_a,
+                node_type=NodeType.SEMANTIC,
+                content="secret project alpha",
+                embedding=_embed(),
+                confidence=0.8,
+                trust_tier="T3",
+                importance=0.5,
+            )
+        )
+        results = store.fulltext_search(uid_b, "secret project alpha")
+        assert results == [], "User B must not see User A's memories"
+
 
 class TestDualTriggerRetriever:
     def test_bm25_anchor_injected(self, store, user_id):
