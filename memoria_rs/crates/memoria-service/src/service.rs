@@ -2,6 +2,7 @@ use memoria_core::{
     interfaces::{EmbeddingProvider, MemoryStore},
     Memory, MemoriaError, MemoryType, TrustTier,
 };
+use memoria_embedding::LlmClient;
 use memoria_storage::SqlMemoryStore;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -13,21 +14,39 @@ pub struct MemoryService {
     /// Concrete store for branch-aware ops (None in tests)
     pub sql_store: Option<Arc<SqlMemoryStore>>,
     pub embedder: Option<Arc<dyn EmbeddingProvider>>,
+    /// LLM client for reflect/extract (None if LLM_API_KEY not set)
+    pub llm: Option<Arc<LlmClient>>,
 }
 
 impl MemoryService {
     /// Production constructor — uses SqlMemoryStore for branch support
     pub fn new_sql(store: Arc<SqlMemoryStore>, embedder: Option<Arc<dyn EmbeddingProvider>>) -> Self {
+        let llm = LlmClient::from_env().map(Arc::new);
         Self {
             store: store.clone(),
             sql_store: Some(store),
             embedder,
+            llm,
+        }
+    }
+
+    /// Production constructor with explicit LLM client.
+    pub fn new_sql_with_llm(
+        store: Arc<SqlMemoryStore>,
+        embedder: Option<Arc<dyn EmbeddingProvider>>,
+        llm: Option<Arc<LlmClient>>,
+    ) -> Self {
+        Self {
+            store: store.clone(),
+            sql_store: Some(store),
+            embedder,
+            llm,
         }
     }
 
     /// Test constructor — any MemoryStore, no branch support
     pub fn new(store: Arc<dyn MemoryStore>, embedder: Option<Arc<dyn EmbeddingProvider>>) -> Self {
-        Self { store, sql_store: None, embedder }
+        Self { store, sql_store: None, embedder, llm: None }
     }
 
     async fn active_table(&self, user_id: &str) -> String {

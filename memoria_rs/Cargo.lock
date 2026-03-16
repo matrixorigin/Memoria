@@ -1186,6 +1186,7 @@ dependencies = [
 name = "memoria-embedding"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "async-trait",
  "memoria-core",
  "reqwest",

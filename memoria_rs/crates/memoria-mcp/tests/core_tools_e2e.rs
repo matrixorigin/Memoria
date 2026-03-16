@@ -12,7 +12,6 @@ use serde_json::{json, Value};
 use sqlx::Row;
 use std::sync::Arc;
 use uuid::Uuid;
-
 fn db_url() -> String {
     std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "mysql://root:111@localhost:6001/memoria_rs".to_string())
@@ -406,7 +405,7 @@ async fn test_reflect_internal_unavailable() {
     let (svc, uid) = setup().await;
     let r = call("memory_reflect", json!({"mode": "internal"}), &svc, &uid).await;
     let t = text(&r);
-    assert!(t.contains("not available"), "got: {t}");
+    assert!(t.contains("not available") || t.contains("requires"), "got: {t}");
     println!("✅ reflect internal unavailable: {t}");
 }
 
@@ -472,4 +471,168 @@ async fn test_link_entities_invalid_json() {
     let parsed: serde_json::Value = serde_json::from_str(&t).expect("valid json");
     assert_eq!(parsed["status"], "error");
     println!("✅ link_entities invalid json: {t}");
+}
+
+// ── LLM-related tests ────────────────────────────────────────────────────────
+
+/// Helper: create service with explicit LLM client (for testing LLM paths).
+async fn setup_with_llm(llm: Option<Arc<memoria_embedding::LlmClient>>) -> (Arc<MemoryService>, String) {
+    let store = SqlMemoryStore::connect(&db_url(), 4).await.expect("connect");
+    store.migrate().await.expect("migrate");
+    let svc = Arc::new(MemoryService::new_sql_with_llm(Arc::new(store), None, llm));
+    (svc, uid())
+}
+
+// ── 26. reflect without LLM returns candidates (not error) ───────────────────
+
+#[tokio::test]
+async fn test_reflect_no_llm_returns_candidates() {
+    let (svc, uid) = setup_with_llm(None).await;
+
+    // Store memories in two different "sessions" to create clusters
+    call("memory_store", json!({"content": "Uses Rust for backend", "session_id": "s1"}), &svc, &uid).await;
+    call("memory_store", json!({"content": "Prefers async patterns", "session_id": "s1"}), &svc, &uid).await;
+    call("memory_store", json!({"content": "MatrixOne as database", "session_id": "s2"}), &svc, &uid).await;
+    call("memory_store", json!({"content": "Deploys with Docker", "session_id": "s2"}), &svc, &uid).await;
+
+    let r = call("memory_reflect", json!({"mode": "auto", "force": true}), &svc, &uid).await;
+    let t = text(&r);
+    // Without LLM: should return candidates or "no clusters" — NOT an error
+    assert!(
+        t.contains("cluster") || t.contains("Cluster") || t.contains("No memory") || t.contains("memories"),
+        "without LLM should return candidates or no-clusters message, got: {t}"
+    );
+    // Must NOT say "error" or "failed"
+    assert!(!t.to_lowercase().contains("error"), "should not return error without LLM, got: {t}");
+    println!("✅ reflect without LLM: {}", &t[..t.len().min(100)]);
+}
+
+// ── 27. reflect with mode=candidates always returns candidates ────────────────
+
+#[tokio::test]
+async fn test_reflect_candidates_mode_no_llm_needed() {
+    let (svc, uid) = setup_with_llm(None).await;
+    call("memory_store", json!({"content": "Test memory for candidates mode"}), &svc, &uid).await;
+
+    let r = call("memory_reflect", json!({"mode": "candidates", "force": true}), &svc, &uid).await;
+    let t = text(&r);
+    // candidates mode should always work regardless of LLM
+    assert!(
+        t.contains("cluster") || t.contains("Cluster") || t.contains("No memory") || t.contains("memories"),
+        "candidates mode should work without LLM, got: {t}"
+    );
+    println!("✅ reflect candidates mode (no LLM): {}", &t[..t.len().min(100)]);
+}
+
+// ── 28. reflect with mode=internal and no LLM returns clear error ─────────────
+
+#[tokio::test]
+async fn test_reflect_internal_no_llm_returns_error() {
+    let (svc, uid) = setup_with_llm(None).await;
+    let r = call("memory_reflect", json!({"mode": "internal"}), &svc, &uid).await;
+    let t = text(&r);
+    assert!(
+        t.contains("LLM_API_KEY") || t.contains("requires") || t.contains("not configured"),
+        "internal mode without LLM should return clear error, got: {t}"
+    );
+    println!("✅ reflect internal without LLM: {t}");
+}
+
+// ── 29. extract_entities without LLM returns candidates ──────────────────────
+
+#[tokio::test]
+async fn test_extract_entities_no_llm_returns_candidates() {
+    let (svc, uid) = setup_with_llm(None).await;
+    call("memory_store", json!({"content": "Project uses Rust and MatrixOne"}), &svc, &uid).await;
+
+    let r = call("memory_extract_entities", json!({"mode": "auto"}), &svc, &uid).await;
+    let t = text(&r);
+    let parsed: serde_json::Value = serde_json::from_str(&t).unwrap_or(serde_json::Value::Null);
+    // Should return candidates or complete (if regex already linked), NOT error
+    assert!(
+        parsed["status"] == "candidates" || parsed["status"] == "complete",
+        "without LLM should return candidates or complete, got: {t}"
+    );
+    println!("✅ extract_entities without LLM: status={}", parsed["status"]);
+}
+
+// ── 30. extract_entities with mode=internal and no LLM returns error ──────────
+
+#[tokio::test]
+async fn test_extract_entities_internal_no_llm_returns_error() {
+    let (svc, uid) = setup_with_llm(None).await;
+    let r = call("memory_extract_entities", json!({"mode": "internal"}), &svc, &uid).await;
+    let t = text(&r);
+    assert!(
+        t.contains("LLM_API_KEY") || t.contains("requires") || t.contains("not configured"),
+        "internal mode without LLM should return clear error, got: {t}"
+    );
+    println!("✅ extract_entities internal without LLM: {t}");
+}
+
+// ── 31. reflect with LLM (skipped if LLM_API_KEY not set) ────────────────────
+
+#[tokio::test]
+async fn test_reflect_with_llm_if_configured() {
+    let llm_key = match std::env::var("LLM_API_KEY").ok().filter(|s| !s.is_empty()) {
+        Some(k) => k,
+        None => {
+            println!("⏭️  test_reflect_with_llm skipped (LLM_API_KEY not set)");
+            return;
+        }
+    };
+    let base_url = std::env::var("LLM_BASE_URL")
+        .unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
+    let model = std::env::var("LLM_MODEL")
+        .unwrap_or_else(|_| "gpt-4o-mini".to_string());
+    let llm = Arc::new(memoria_embedding::LlmClient::new(llm_key, base_url, model));
+    let (svc, uid) = setup_with_llm(Some(llm)).await;
+
+    // Store memories across two sessions
+    for i in 0..4 {
+        let sid = if i < 2 { "llm_s1" } else { "llm_s2" };
+        call("memory_store", json!({
+            "content": format!("Memory {} for LLM reflect test", i),
+            "session_id": sid
+        }), &svc, &uid).await;
+    }
+
+    let r = call("memory_reflect", json!({"mode": "auto", "force": true}), &svc, &uid).await;
+    let t = text(&r);
+    // With LLM: should either create scenes or return candidates
+    assert!(
+        t.contains("scenes_created") || t.contains("cluster") || t.contains("No memory"),
+        "with LLM should return reflect result, got: {t}"
+    );
+    println!("✅ reflect with LLM: {t}");
+}
+
+// ── 32. extract_entities with LLM (skipped if LLM_API_KEY not set) ───────────
+
+#[tokio::test]
+async fn test_extract_entities_with_llm_if_configured() {
+    let llm_key = match std::env::var("LLM_API_KEY").ok().filter(|s| !s.is_empty()) {
+        Some(k) => k,
+        None => {
+            println!("⏭️  test_extract_entities_with_llm skipped (LLM_API_KEY not set)");
+            return;
+        }
+    };
+    let base_url = std::env::var("LLM_BASE_URL")
+        .unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
+    let model = std::env::var("LLM_MODEL")
+        .unwrap_or_else(|_| "gpt-4o-mini".to_string());
+    let llm = Arc::new(memoria_embedding::LlmClient::new(llm_key, base_url, model));
+    let (svc, uid) = setup_with_llm(Some(llm)).await;
+
+    call("memory_store", json!({"content": "Project uses Rust and MatrixOne database"}), &svc, &uid).await;
+
+    let r = call("memory_extract_entities", json!({"mode": "auto"}), &svc, &uid).await;
+    let t = text(&r);
+    let parsed: serde_json::Value = serde_json::from_str(&t).unwrap_or(serde_json::Value::Null);
+    assert!(
+        parsed["status"] == "done" || parsed["status"] == "complete",
+        "with LLM should return done or complete, got: {t}"
+    );
+    println!("✅ extract_entities with LLM: {t}");
 }

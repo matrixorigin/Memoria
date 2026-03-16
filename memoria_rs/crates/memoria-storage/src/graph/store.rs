@@ -389,6 +389,38 @@ impl GraphStore {
             Some((name, etype))
         }).collect::<Vec<_>>())
     }
+
+    /// Count active nodes for a user.
+    pub async fn count_user_nodes(&self, user_id: &str) -> Result<i64, MemoriaError> {
+        let row = sqlx::query(
+            "SELECT COUNT(*) as cnt FROM memory_graph_nodes WHERE user_id = ? AND is_active = 1"
+        )
+        .bind(user_id)
+        .fetch_one(&self.pool).await.map_err(db_err)?;
+        Ok(row.try_get("cnt").unwrap_or(0))
+    }
+
+    /// Get edges between a set of node IDs (for connected components).
+    pub async fn get_edges_for_nodes(
+        &self,
+        node_ids: &[String],
+    ) -> Result<Vec<(String, String)>, MemoriaError> {
+        if node_ids.is_empty() { return Ok(vec![]); }
+        let placeholders = node_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT source_id, target_id FROM memory_graph_edges \
+             WHERE source_id IN ({placeholders}) OR target_id IN ({placeholders})"
+        );
+        let mut q = sqlx::query(&sql);
+        for id in node_ids { q = q.bind(id); }
+        for id in node_ids { q = q.bind(id); }
+        let rows = q.fetch_all(&self.pool).await.map_err(db_err)?;
+        Ok(rows.iter().filter_map(|r| {
+            let src: String = r.try_get("source_id").ok()?;
+            let tgt: String = r.try_get("target_id").ok()?;
+            Some((src, tgt))
+        }).collect::<Vec<_>>())
+    }
 }
 
 // ── Row helpers ──────────────────────────────────────────────────────────────
