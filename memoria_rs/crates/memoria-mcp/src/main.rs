@@ -1,11 +1,6 @@
-mod config;
-mod server;
-mod tools;
-mod git_tools;
-
+use memoria_service::Config;
 use anyhow::Result;
 use clap::Parser;
-use config::Config;
 use memoria_embedding::{HttpEmbedder, LlmClient};
 use memoria_git::GitForDataService;
 use memoria_service::MemoryService;
@@ -13,14 +8,22 @@ use memoria_storage::SqlMemoryStore;
 use sqlx::mysql::MySqlPool;
 use std::sync::Arc;
 
-/// Memoria MCP server — embedded mode (direct DB connection).
+/// Memoria MCP server.
 ///
-/// All settings can be provided via CLI flags or environment variables.
-/// See Config for the full list of supported environment variables.
+/// Embedded mode (default): connects directly to MatrixOne DB.
+/// Remote mode (--api-url): proxies all calls to a Memoria REST API server.
 #[derive(Parser)]
 #[command(version, about)]
 struct Args {
-    /// MySQL connection URL
+    /// Remote Memoria API URL (remote mode). If set, --token is used for auth.
+    #[arg(long, env = "MEMORIA_API_URL")]
+    api_url: Option<String>,
+
+    /// Auth token for remote mode
+    #[arg(long, env = "MEMORIA_TOKEN")]
+    token: Option<String>,
+
+    /// MySQL connection URL (embedded mode)
     #[arg(long, env = "DATABASE_URL")]
     db_url: Option<String>,
 
@@ -28,35 +31,35 @@ struct Args {
     #[arg(long, env = "MEMORIA_USER")]
     user: Option<String>,
 
-    /// Embedding dimension (overrides EMBEDDING_DIM env var)
+    /// Embedding dimension
     #[arg(long, env = "EMBEDDING_DIM")]
     embedding_dim: Option<usize>,
 
-    /// Embedding base URL (overrides EMBEDDING_BASE_URL env var)
+    /// Embedding base URL
     #[arg(long, env = "EMBEDDING_BASE_URL")]
     embedding_base_url: Option<String>,
 
-    /// Embedding API key (overrides EMBEDDING_API_KEY env var)
+    /// Embedding API key
     #[arg(long, env = "EMBEDDING_API_KEY")]
     embedding_api_key: Option<String>,
 
-    /// Embedding model name (overrides EMBEDDING_MODEL env var)
+    /// Embedding model name
     #[arg(long, env = "EMBEDDING_MODEL")]
     embedding_model: Option<String>,
 
-    /// LLM API key for reflect/extract (overrides LLM_API_KEY env var)
+    /// LLM API key
     #[arg(long, env = "LLM_API_KEY")]
     llm_api_key: Option<String>,
 
-    /// LLM base URL (overrides LLM_BASE_URL env var)
+    /// LLM base URL
     #[arg(long, env = "LLM_BASE_URL")]
     llm_base_url: Option<String>,
 
-    /// LLM model name (overrides LLM_MODEL env var)
+    /// LLM model name
     #[arg(long, env = "LLM_MODEL")]
     llm_model: Option<String>,
 
-    /// Database name for git-for-data operations
+    /// Database name for git-for-data
     #[arg(long, env = "MEMORIA_DB_NAME")]
     db_name: Option<String>,
 }
@@ -69,7 +72,19 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
 
-    // Build config: CLI args override env vars
+    // Remote mode
+    if let Some(api_url) = &args.api_url {
+        let user = args.user.clone().unwrap_or_else(|| "default".to_string());
+        tracing::info!(api_url = %api_url, user = %user, "Starting Memoria MCP (remote mode)");
+        let remote = memoria_mcp::remote::RemoteClient::new(
+            api_url,
+            args.token.as_deref(),
+            user.clone(),
+        );
+        return memoria_mcp::run_stdio_remote(remote, user).await;
+    }
+
+    // Embedded mode
     let mut cfg = Config::from_env();
     if let Some(v) = args.db_url { cfg.db_url = v; }
     if let Some(v) = args.user { cfg.user = v; }
@@ -85,10 +100,9 @@ async fn main() -> Result<()> {
     tracing::info!(
         db_url = %cfg.db_url,
         embedding_provider = %cfg.embedding_provider,
-        embedding_dim = cfg.embedding_dim,
         has_llm = cfg.has_llm(),
         user = %cfg.user,
-        "Starting Memoria MCP server"
+        "Starting Memoria MCP (embedded mode)"
     );
 
     let store = SqlMemoryStore::connect(&cfg.db_url, cfg.embedding_dim).await?;
@@ -99,36 +113,15 @@ async fn main() -> Result<()> {
 
     let embedder = if cfg.has_embedding() {
         Some(Arc::new(HttpEmbedder::new(
-            &cfg.embedding_base_url,
-            &cfg.embedding_api_key,
-            &cfg.embedding_model,
-            cfg.embedding_dim,
+            &cfg.embedding_base_url, &cfg.embedding_api_key,
+            &cfg.embedding_model, cfg.embedding_dim,
         )) as Arc<dyn memoria_core::interfaces::EmbeddingProvider>)
-    } else {
-        if cfg.embedding_provider != "mock" {
-            tracing::warn!(
-                "Embedding provider '{}' configured but EMBEDDING_BASE_URL is empty — \
-                 falling back to keyword-only search",
-                cfg.embedding_provider
-            );
-        }
-        None
-    };
+    } else { None };
 
     let llm = cfg.llm_api_key.as_ref().map(|key| {
-        Arc::new(LlmClient::new(
-            key.clone(),
-            cfg.llm_base_url.clone(),
-            cfg.llm_model.clone(),
-        ))
+        Arc::new(LlmClient::new(key.clone(), cfg.llm_base_url.clone(), cfg.llm_model.clone()))
     });
 
-    if llm.is_some() {
-        tracing::info!(model = %cfg.llm_model, "LLM configured — reflect/extract auto mode enabled");
-    } else {
-        tracing::info!("No LLM configured — reflect/extract will use candidates mode");
-    }
-
     let service = Arc::new(MemoryService::new_sql_with_llm(Arc::new(store), embedder, llm));
-    server::run_stdio(service, git, cfg.user).await
+    memoria_mcp::run_stdio(service, git, cfg.user).await
 }

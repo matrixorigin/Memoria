@@ -3,7 +3,6 @@
 
 use std::sync::Arc;
 use serde_json::{json, Value};
-
 fn db_url() -> String {
     std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "mysql://root:111@localhost:6001/memoria_rs".to_string())
@@ -46,8 +45,13 @@ async fn spawn_server() -> (String, reqwest::Client) {
         .route("/v1/profiles", get(memoria_api::routes::memory::get_profile))
         .route("/v1/governance", post(memoria_api::routes::governance::governance))
         .route("/v1/consolidate", post(memoria_api::routes::governance::consolidate))
+        .route("/v1/reflect", post(memoria_api::routes::governance::reflect))
+        .route("/v1/extract-entities", post(memoria_api::routes::governance::extract_entities))
+        .route("/v1/extract-entities/link", post(memoria_api::routes::governance::link_entities))
+        .route("/v1/entities", get(memoria_api::routes::governance::get_entities))
         .route("/v1/snapshots", get(memoria_api::routes::snapshots::list_snapshots))
         .route("/v1/snapshots", post(memoria_api::routes::snapshots::create_snapshot))
+        .route("/v1/snapshots/delete", post(memoria_api::routes::snapshots::delete_snapshot_bulk))
         .route("/v1/snapshots/:name", delete(memoria_api::routes::snapshots::delete_snapshot))
         .route("/v1/snapshots/:name/rollback", post(memoria_api::routes::snapshots::rollback))
         .route("/v1/branches", get(memoria_api::routes::snapshots::list_branches))
@@ -321,4 +325,289 @@ async fn test_api_auth_required() {
     assert_eq!(r.status(), 200);
 
     println!("✅ Auth: 401 without token, 200 with correct token");
+}
+
+// ── Remote mode E2E tests ─────────────────────────────────────────────────────
+
+/// Spawn API server + test remote MCP client against it.
+async fn spawn_api_for_remote() -> (String, reqwest::Client) {
+    // Reuse spawn_server but return the base URL for RemoteClient
+    spawn_server().await
+}
+
+#[tokio::test]
+async fn test_remote_store_retrieve() {
+    use memoria_mcp::remote::RemoteClient;
+
+    let (base, _) = spawn_api_for_remote().await;
+    let uid = uid();
+
+    let remote = RemoteClient::new(&base, None, uid.clone());
+
+    // Store
+    let r = remote.call("memory_store", json!({
+        "content": "Remote mode test memory",
+        "memory_type": "semantic"
+    })).await.expect("store");
+    let text = r["content"][0]["text"].as_str().unwrap_or("");
+    assert!(text.contains("Stored memory"), "got: {text}");
+    println!("✅ remote store: {text}");
+
+    // Retrieve
+    let r = remote.call("memory_retrieve", json!({
+        "query": "remote mode test",
+        "top_k": 5
+    })).await.expect("retrieve");
+    let text = r["content"][0]["text"].as_str().unwrap_or("");
+    assert!(text.contains("Remote mode test memory") || text.contains("No relevant"), "got: {text}");
+    println!("✅ remote retrieve: {}", &text[..text.len().min(80)]);
+}
+
+#[tokio::test]
+async fn test_remote_correct_purge() {
+    use memoria_mcp::remote::RemoteClient;
+
+    let (base, _) = spawn_api_for_remote().await;
+    let uid = uid();
+    let remote = RemoteClient::new(&base, None, uid.clone());
+
+    // Store
+    let r = remote.call("memory_store", json!({"content": "Uses black formatter"}))
+        .await.expect("store");
+    let text = r["content"][0]["text"].as_str().unwrap_or("");
+    let mid = text.split_whitespace().nth(2).unwrap_or("").trim_end_matches(':').to_string();
+
+    // Correct by id
+    let r = remote.call("memory_correct", json!({
+        "memory_id": mid,
+        "new_content": "Uses ruff formatter",
+        "reason": "switched"
+    })).await.expect("correct");
+    let text = r["content"][0]["text"].as_str().unwrap_or("");
+    assert!(text.contains("Corrected"), "got: {text}");
+    println!("✅ remote correct: {text}");
+
+    // Purge
+    let r = remote.call("memory_purge", json!({"memory_id": mid}))
+        .await.expect("purge");
+    let text = r["content"][0]["text"].as_str().unwrap_or("");
+    assert!(text.contains("Purged"), "got: {text}");
+    println!("✅ remote purge: {text}");
+}
+
+#[tokio::test]
+async fn test_remote_governance() {
+    use memoria_mcp::remote::RemoteClient;
+
+    let (base, _) = spawn_api_for_remote().await;
+    let uid = uid();
+    let remote = RemoteClient::new(&base, None, uid.clone());
+
+    let r = remote.call("memory_governance", json!({"force": true}))
+        .await.expect("governance");
+    let text = r["content"][0]["text"].as_str().unwrap_or("");
+    assert!(text.contains("Governance complete") || text.contains("skipped"), "got: {text}");
+    println!("✅ remote governance: {text}");
+}
+
+#[tokio::test]
+async fn test_remote_capabilities() {
+    use memoria_mcp::remote::RemoteClient;
+
+    let (base, _) = spawn_api_for_remote().await;
+    let uid = uid();
+    let remote = RemoteClient::new(&base, None, uid.clone());
+
+    let r = remote.call("memory_capabilities", json!({}))
+        .await.expect("capabilities");
+    let text = r["content"][0]["text"].as_str().unwrap_or("");
+    assert!(text.contains("remote mode"), "should mention remote mode, got: {text}");
+    println!("✅ remote capabilities: {}", &text[..text.len().min(80)]);
+}
+
+#[tokio::test]
+async fn test_remote_list_search_profile() {
+    use memoria_mcp::remote::RemoteClient;
+    let (base, _) = spawn_api_for_remote().await;
+    let uid = uid();
+    let remote = RemoteClient::new(&base, None, uid.clone());
+
+    remote.call("memory_store", json!({"content": "Prefers Rust", "memory_type": "profile"})).await.unwrap();
+    remote.call("memory_store", json!({"content": "Uses MatrixOne database"})).await.unwrap();
+
+    // list
+    let r = remote.call("memory_list", json!({"limit": 10})).await.unwrap();
+    let t = r["content"][0]["text"].as_str().unwrap_or("");
+    assert!(t.contains("MatrixOne") || t.contains("Prefers"), "list: {t}");
+    println!("✅ remote list: {}", &t[..t.len().min(80)]);
+
+    // search
+    let r = remote.call("memory_search", json!({"query": "database", "top_k": 5})).await.unwrap();
+    let t = r["content"][0]["text"].as_str().unwrap_or("");
+    assert!(t.contains("MatrixOne") || t.contains("No relevant"), "search: {t}");
+    println!("✅ remote search: {}", &t[..t.len().min(80)]);
+
+    // profile
+    let r = remote.call("memory_profile", json!({})).await.unwrap();
+    let t = r["content"][0]["text"].as_str().unwrap_or("");
+    assert!(t.contains("Prefers Rust") || t.contains("No profile"), "profile: {t}");
+    println!("✅ remote profile: {t}");
+}
+
+#[tokio::test]
+async fn test_remote_snapshot_branch() {
+    use memoria_mcp::remote::RemoteClient;
+    let (base, _) = spawn_api_for_remote().await;
+    let uid = uid();
+    let remote = RemoteClient::new(&base, None, uid.clone());
+
+    // Store a memory first
+    remote.call("memory_store", json!({"content": "snapshot branch test memory"})).await.unwrap();
+
+    // Create snapshot
+    let snap_name = format!("test_snap_{}", uuid::Uuid::new_v4().simple().to_string()[..8].to_string());
+    let r = remote.call("memory_snapshot", json!({"name": snap_name})).await.unwrap();
+    let t = r["content"][0]["text"].as_str().unwrap_or("");
+    assert!(t.contains("created") || t.contains(&snap_name), "snapshot create: {t}");
+    println!("✅ remote snapshot create: {t}");
+
+    // List snapshots
+    let r = remote.call("memory_snapshots", json!({"limit": 20})).await.unwrap();
+    let t = r["content"][0]["text"].as_str().unwrap_or("");
+    println!("✅ remote snapshots list: {}", &t[..t.len().min(80)]);
+
+    // Create branch
+    let branch_name = format!("test_br_{}", uuid::Uuid::new_v4().simple().to_string()[..8].to_string());
+    let r = remote.call("memory_branch", json!({"name": branch_name})).await.unwrap();
+    let t = r["content"][0]["text"].as_str().unwrap_or("");
+    assert!(t.contains("created") || t.contains(&branch_name), "branch create: {t}");
+    println!("✅ remote branch create: {t}");
+
+    // List branches
+    let r = remote.call("memory_branches", json!({})).await.unwrap();
+    let t = r["content"][0]["text"].as_str().unwrap_or("");
+    println!("✅ remote branches list: {}", &t[..t.len().min(80)]);
+
+    // Checkout branch
+    let r = remote.call("memory_checkout", json!({"name": branch_name})).await.unwrap();
+    let t = r["content"][0]["text"].as_str().unwrap_or("");
+    assert!(t.contains("Switched") || t.contains(&branch_name), "checkout: {t}");
+    println!("✅ remote checkout: {t}");
+
+    // Store on branch
+    remote.call("memory_store", json!({"content": "branch-only memory"})).await.unwrap();
+
+    // Diff
+    let r = remote.call("memory_diff", json!({"source": branch_name})).await.unwrap();
+    let t = r["content"][0]["text"].as_str().unwrap_or("");
+    println!("✅ remote diff: {}", &t[..t.len().min(80)]);
+
+    // Merge back
+    let r = remote.call("memory_merge", json!({"source": branch_name, "strategy": "append"})).await.unwrap();
+    let t = r["content"][0]["text"].as_str().unwrap_or("");
+    println!("✅ remote merge: {}", &t[..t.len().min(80)]);
+
+    // Delete branch
+    let r = remote.call("memory_branch_delete", json!({"name": branch_name})).await.unwrap();
+    let t = r["content"][0]["text"].as_str().unwrap_or("");
+    assert!(t.contains("deleted") || t.contains(&branch_name), "branch delete: {t}");
+    println!("✅ remote branch delete: {t}");
+
+    // Delete snapshot
+    let r = remote.call("memory_snapshot_delete", json!({"names": snap_name})).await.unwrap();
+    let t = r["content"][0]["text"].as_str().unwrap_or("");
+    println!("✅ remote snapshot delete: {t}");
+}
+
+#[tokio::test]
+async fn test_remote_reflect_extract_entities() {
+    use memoria_mcp::remote::RemoteClient;
+    let (base, _) = spawn_api_for_remote().await;
+    let uid = uid();
+    let remote = RemoteClient::new(&base, None, uid.clone());
+
+    remote.call("memory_store", json!({"content": "Uses Rust for backend services", "session_id": "s1"})).await.unwrap();
+    remote.call("memory_store", json!({"content": "MatrixOne as primary database", "session_id": "s2"})).await.unwrap();
+
+    // reflect candidates (no LLM needed)
+    let r = remote.call("memory_reflect", json!({"mode": "candidates", "force": true})).await.unwrap();
+    let t = r["content"][0]["text"].as_str().unwrap_or("");
+    assert!(!t.to_lowercase().contains("error"), "reflect should not error: {t}");
+    println!("✅ remote reflect candidates: {}", &t[..t.len().min(100)]);
+
+    // extract entities candidates
+    let r = remote.call("memory_extract_entities", json!({"mode": "candidates"})).await.unwrap();
+    let t = r["content"][0]["text"].as_str().unwrap_or("");
+    let parsed: serde_json::Value = serde_json::from_str(t).unwrap_or(serde_json::Value::Null);
+    assert!(
+        parsed["status"] == "candidates" || parsed["status"] == "complete",
+        "extract: {t}"
+    );
+    println!("✅ remote extract entities: status={}", parsed["status"]);
+
+    // link entities if we have candidates
+    if parsed["status"] == "candidates" {
+        if let Some(mems) = parsed["memories"].as_array() {
+            if let Some(first) = mems.first() {
+                let mid = first["memory_id"].as_str().unwrap_or("");
+                let link_payload = serde_json::to_string(&json!([{
+                    "memory_id": mid,
+                    "entities": [{"name": "Rust", "type": "tech"}]
+                }])).unwrap();
+                let r = remote.call("memory_link_entities", json!({"entities": link_payload})).await.unwrap();
+                let t = r["content"][0]["text"].as_str().unwrap_or("");
+                let p: serde_json::Value = serde_json::from_str(t).unwrap_or(serde_json::Value::Null);
+                assert!(p.get("entities_created").is_some() || p["status"] == "done", "link: {t}");
+                println!("✅ remote link entities: {t}");
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_remote_consolidate() {
+    use memoria_mcp::remote::RemoteClient;
+    let (base, _) = spawn_api_for_remote().await;
+    let uid = uid();
+    let remote = RemoteClient::new(&base, None, uid.clone());
+
+    let r = remote.call("memory_consolidate", json!({"force": true})).await.unwrap();
+    let t = r["content"][0]["text"].as_str().unwrap_or("");
+    assert!(t.contains("Consolidation complete") || t.contains("skipped"), "got: {t}");
+    println!("✅ remote consolidate: {t}");
+}
+
+#[tokio::test]
+async fn test_remote_correct_by_query() {
+    use memoria_mcp::remote::RemoteClient;
+    let (base, _) = spawn_api_for_remote().await;
+    let uid = uid();
+    let remote = RemoteClient::new(&base, None, uid.clone());
+
+    remote.call("memory_store", json!({"content": "Uses black for Python formatting"})).await.unwrap();
+
+    let r = remote.call("memory_correct", json!({
+        "query": "black formatting",
+        "new_content": "Uses ruff for Python formatting",
+        "reason": "switched"
+    })).await.unwrap();
+    let t = r["content"][0]["text"].as_str().unwrap_or("");
+    assert!(t.contains("Corrected") || t.contains("No matching"), "got: {t}");
+    println!("✅ remote correct by query: {t}");
+}
+
+#[tokio::test]
+async fn test_remote_purge_by_topic() {
+    use memoria_mcp::remote::RemoteClient;
+    let (base, _) = spawn_api_for_remote().await;
+    let uid = uid();
+    let remote = RemoteClient::new(&base, None, uid.clone());
+
+    remote.call("memory_store", json!({"content": "topic purge test alpha"})).await.unwrap();
+    remote.call("memory_store", json!({"content": "topic purge test beta"})).await.unwrap();
+
+    let r = remote.call("memory_purge", json!({"topic": "topic purge test"})).await.unwrap();
+    let t = r["content"][0]["text"].as_str().unwrap_or("");
+    assert!(t.contains("Purged"), "got: {t}");
+    println!("✅ remote purge by topic: {t}");
 }

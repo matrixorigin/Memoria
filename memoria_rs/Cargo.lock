@@ -1230,6 +1230,7 @@ dependencies = [
  "memoria-git",
  "memoria-service",
  "memoria-storage",
+ "reqwest",
  "serde",
  "serde_json",
  "sqlx",
