@@ -4,7 +4,7 @@ use memoria_core::{interfaces::MemoryStore, Memory, MemoriaError, MemoryType, Tr
 use sqlx::{mysql::MySqlPool, Row};
 use std::str::FromStr;
 
-fn db_err(e: sqlx::Error) -> MemoriaError {
+pub(crate) fn db_err(e: sqlx::Error) -> MemoriaError {
     MemoriaError::Database(e.to_string())
 }
 
@@ -32,6 +32,10 @@ impl SqlMemoryStore {
     }
 
     pub fn pool(&self) -> &MySqlPool { &self.pool }
+
+    pub fn graph_store(&self) -> crate::graph::GraphStore {
+        crate::graph::GraphStore::new(self.pool.clone(), self.embedding_dim)
+    }
 
     pub async fn connect(database_url: &str, embedding_dim: usize) -> Result<Self, MemoriaError> {
         let pool = MySqlPool::connect(database_url).await.map_err(db_err)?;
@@ -111,6 +115,9 @@ impl SqlMemoryStore {
                 INDEX idx_user_entity (user_id, entity_name)
             )"#,
         ).execute(&self.pool).await.map_err(db_err)?;
+
+        // Graph tables
+        self.graph_store().migrate().await?;
 
         Ok(())
     }

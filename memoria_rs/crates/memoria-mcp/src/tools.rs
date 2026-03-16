@@ -352,41 +352,21 @@ pub async fn call(
                     )));
                 }
             }
-            // Detect potential contradictions: active memories with very low confidence
-            // that have a superseded_by set (corrected but old version still active)
-            let stale_row = sqlx::query(
-                "SELECT COUNT(*) as cnt FROM mem_memories \
-                 WHERE user_id = ? AND is_active = 1 AND superseded_by IS NOT NULL"
-            )
-            .bind(user_id)
-            .fetch_one(sql.pool()).await.map_err(|e| anyhow::anyhow!("{e}"))?;
-            let stale_active: i64 = stale_row.try_get("cnt").unwrap_or(0);
 
-            // Fix: deactivate memories that have been superseded
-            let fixed = if stale_active > 0 {
-                sqlx::query(
-                    "UPDATE mem_memories SET is_active = 0 \
-                     WHERE user_id = ? AND is_active = 1 AND superseded_by IS NOT NULL"
-                )
-                .bind(user_id)
-                .execute(sql.pool()).await.map_err(|e| anyhow::anyhow!("{e}"))?
-                .rows_affected()
-            } else { 0 };
-
-            // Count low-confidence active memories (potential conflicts)
-            let conflict_row = sqlx::query(
-                "SELECT COUNT(*) as cnt FROM mem_memories \
-                 WHERE user_id = ? AND is_active = 1 AND initial_confidence < 0.4"
-            )
-            .bind(user_id)
-            .fetch_one(sql.pool()).await.map_err(|e| anyhow::anyhow!("{e}"))?;
-            let conflicts_detected: i64 = conflict_row.try_get("cnt").unwrap_or(0);
+            let graph = sql.graph_store();
+            let consolidator = memoria_storage::GraphConsolidator::new(&graph);
+            let result = consolidator.consolidate(user_id).await;
 
             sql.set_cooldown(user_id, "consolidate").await?;
-            Ok(mcp_text(&format!(
-                "Consolidation complete: fixed_stale={fixed}, conflicts_detected={conflicts_detected}, \
-                 promoted=0, demoted=0"
-            )))
+
+            let mut msg = format!(
+                "Consolidation complete: conflicts_detected={}, orphaned_scenes={}, promoted={}, demoted={}",
+                result.conflicts_detected, result.orphaned_scenes, result.promoted, result.demoted
+            );
+            if !result.errors.is_empty() {
+                msg.push_str(&format!(" (warnings: {})", result.errors.join("; ")));
+            }
+            Ok(mcp_text(&msg))
         }
 
         "memory_reflect" => {
@@ -478,24 +458,8 @@ pub async fn call(
                 ));
             }
 
-            // Get memories that don't have entity links yet
-            let linked_ids = sql.get_linked_memory_ids(user_id).await?;
-            let rows = sqlx::query(
-                "SELECT memory_id, content FROM mem_memories \
-                 WHERE user_id = ? AND is_active = 1 ORDER BY created_at DESC LIMIT 100"
-            )
-            .bind(user_id)
-            .fetch_all(sql.pool()).await.map_err(|e| anyhow::anyhow!("{e}"))?;
-
-            let unlinked: Vec<serde_json::Value> = rows.iter()
-                .filter_map(|r| {
-                    let mid: String = r.try_get("memory_id").ok()?;
-                    if linked_ids.contains(&mid) { return None; }
-                    let content: String = r.try_get("content").ok()?;
-                    Some(json!({"memory_id": mid, "content": content}))
-                })
-                .take(50)
-                .collect();
+            let graph = sql.graph_store();
+            let unlinked = graph.get_unlinked_memories(user_id, 50).await?;
 
             if unlinked.is_empty() {
                 return Ok(mcp_text(&serde_json::to_string(&json!({
@@ -505,15 +469,18 @@ pub async fn call(
                 }))?));
             }
 
-            let existing = sql.get_entity_names(user_id).await?;
+            let existing = graph.get_user_entities(user_id).await?;
             let existing_json: Vec<serde_json::Value> = existing.iter()
                 .map(|(name, etype)| json!({"name": name, "entity_type": etype}))
+                .collect();
+            let memories_json: Vec<serde_json::Value> = unlinked.iter()
+                .map(|(mid, content)| json!({"memory_id": mid, "content": content}))
                 .collect();
 
             Ok(mcp_text(&serde_json::to_string(&json!({
                 "status": "candidates",
-                "unlinked": unlinked.len(),
-                "memories": unlinked,
+                "unlinked": memories_json.len(),
+                "memories": memories_json,
                 "existing_entities": existing_json,
                 "instruction": "Extract named entities (people, tech, projects, repos) from each memory, then call memory_link_entities."
             }))?))
@@ -535,6 +502,7 @@ pub async fn call(
                 }))?)),
             };
 
+            let graph = sql.graph_store();
             let mut total_created = 0usize;
             let mut total_reused = 0usize;
             let mut total_edges = 0usize;
@@ -544,22 +512,24 @@ pub async fn call(
                     Some(id) => id,
                     None => continue,
                 };
-                let ents: Vec<(String, String)> = item["entities"].as_array()
+                let ents: Vec<(String, String, String)> = item["entities"].as_array()
                     .unwrap_or(&vec![])
                     .iter()
                     .filter_map(|e| {
-                        let name = e["name"].as_str()?.trim().to_string();
+                        let name = e["name"].as_str()?.trim().to_lowercase();
                         if name.is_empty() { return None; }
+                        let display = e["name"].as_str().unwrap_or("").trim().to_string();
                         let etype = e["type"].as_str().unwrap_or("concept").to_string();
-                        Some((name, etype))
+                        Some((name, display, etype))
                     })
                     .collect();
 
                 if ents.is_empty() { continue; }
-                let (created, reused) = sql.insert_entity_links(user_id, memory_id, &ents).await?;
-                total_created += created;
-                total_reused += reused;
-                total_edges += created; // one edge per new link
+                for (name, display, etype) in &ents {
+                    let (entity_id, is_new) = graph.upsert_entity(user_id, name, display, etype).await?;
+                    graph.upsert_memory_entity_link(memory_id, &entity_id, user_id, "manual").await?;
+                    if is_new { total_created += 1; total_edges += 1; } else { total_reused += 1; }
+                }
             }
 
             Ok(mcp_text(&serde_json::to_string(&json!({

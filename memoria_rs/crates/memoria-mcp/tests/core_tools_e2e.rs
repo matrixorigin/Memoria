@@ -373,7 +373,7 @@ async fn test_consolidate_basic() {
     let r = call("memory_consolidate", json!({"force": true}), &svc, &uid).await;
     let t = text(&r);
     assert!(t.contains("Consolidation complete"), "got: {t}");
-    assert!(t.contains("fixed_stale="), "got: {t}");
+    assert!(t.contains("conflicts_detected="), "got: {t}");
     println!("✅ consolidate basic: {t}");
 
     // Second run without force should hit cooldown
