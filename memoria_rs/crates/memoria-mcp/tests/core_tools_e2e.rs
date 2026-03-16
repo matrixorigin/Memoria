@@ -9,6 +9,7 @@
 use memoria_service::MemoryService;
 use memoria_storage::SqlMemoryStore;
 use serde_json::{json, Value};
+use sqlx::Row;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -278,4 +279,197 @@ async fn test_unknown_tool_errors() {
     let result = memoria_mcp::tools::call("nonexistent", json!({}), &svc, &uid).await;
     assert!(result.is_err());
     println!("✅ unknown tool → error");
+}
+
+// ── 19. memory_governance: quarantine + cleanup + cooldown ───────────────────
+
+#[tokio::test]
+async fn test_governance_quarantine_and_cooldown() {
+    let (svc, uid) = setup().await;
+
+    // Store a memory with very low initial_confidence (T4 = 0.4) and old observed_at
+    // so effective_confidence = 0.4 * exp(-365/30) ≈ 0 < 0.2 threshold
+    let sql = svc.sql_store.as_ref().unwrap();
+    let mid = format!("gov_{}", uuid::Uuid::new_v4().simple());
+    sqlx::query(
+        "INSERT INTO mem_memories (memory_id, user_id, memory_type, content, source_event_ids, \
+         is_active, trust_tier, initial_confidence, observed_at, created_at) \
+         VALUES (?, ?, 'semantic', 'old low confidence memory', '[]', 1, 'T4', 0.4, \
+         DATE_SUB(NOW(), INTERVAL 365 DAY), NOW())"
+    )
+    .bind(&mid).bind(&uid)
+    .execute(sql.pool()).await.expect("insert old memory");
+
+    // Store a high-confidence memory that should NOT be quarantined
+    call("memory_store", json!({"content": "recent high confidence", "trust_tier": "T1"}), &svc, &uid).await;
+
+    // Run governance
+    let r = call("memory_governance", json!({"force": true}), &svc, &uid).await;
+    let t = text(&r);
+    assert!(t.contains("quarantined=1"), "expected 1 quarantined, got: {t}");
+    assert!(t.contains("Governance complete"), "{t}");
+    println!("✅ governance: {t}");
+
+    // Verify the old memory is now inactive in DB
+    let row = sqlx::query("SELECT is_active FROM mem_memories WHERE memory_id = ?")
+        .bind(&mid).fetch_one(sql.pool()).await.expect("fetch");
+    let active: i8 = row.try_get("is_active").unwrap_or(1);
+    assert_eq!(active, 0, "quarantined memory should have is_active=0");
+    println!("✅ quarantined memory has is_active=0 in DB");
+
+    // High-confidence memory should still be active
+    let list = svc.list_active(&uid, 10).await.unwrap();
+    assert!(list.iter().any(|m| m.content == "recent high confidence"));
+    println!("✅ high-confidence memory still active");
+
+    // Cooldown: second call without force should be skipped
+    let r2 = call("memory_governance", json!({}), &svc, &uid).await;
+    assert!(text(&r2).contains("cooldown"), "expected cooldown message: {}", text(&r2));
+    println!("✅ cooldown enforced: {}", text(&r2));
+
+    // force=true bypasses cooldown
+    let r3 = call("memory_governance", json!({"force": true}), &svc, &uid).await;
+    assert!(text(&r3).contains("Governance complete"), "{}", text(&r3));
+    println!("✅ force=true bypasses cooldown");
+}
+
+// ── 20. memory_governance: cleanup_stale removes soft-deleted low-confidence ──
+
+#[tokio::test]
+async fn test_governance_cleanup_stale() {
+    let (svc, uid) = setup().await;
+    let sql = svc.sql_store.as_ref().unwrap();
+
+    // Insert a soft-deleted memory with very low confidence
+    let mid = format!("stale_{}", uuid::Uuid::new_v4().simple());
+    sqlx::query(
+        "INSERT INTO mem_memories (memory_id, user_id, memory_type, content, source_event_ids, \
+         is_active, trust_tier, initial_confidence, observed_at, created_at) \
+         VALUES (?, ?, 'semantic', 'stale deleted memory', '[]', 0, 'T4', 0.05, NOW(), NOW())"
+    )
+    .bind(&mid).bind(&uid)
+    .execute(sql.pool()).await.expect("insert stale");
+
+    let r = call("memory_governance", json!({"force": true}), &svc, &uid).await;
+    let t = text(&r);
+    assert!(t.contains("cleaned_stale=1"), "expected 1 cleaned, got: {t}");
+    println!("✅ cleanup_stale: {t}");
+
+    // Verify physically deleted
+    let row = sqlx::query("SELECT COUNT(*) as cnt FROM mem_memories WHERE memory_id = ?")
+        .bind(&mid).fetch_one(sql.pool()).await.expect("fetch");
+    let cnt: i64 = row.try_get("cnt").unwrap_or(1);
+    assert_eq!(cnt, 0, "stale memory should be physically deleted");
+    println!("✅ stale memory physically deleted from DB");
+}
+
+// ── 21. memory_consolidate: cooldown and basic run ──────────────────────────
+
+#[tokio::test]
+async fn test_consolidate_basic() {
+    let (svc, uid) = setup().await;
+
+    // First run should succeed
+    let r = call("memory_consolidate", json!({"force": true}), &svc, &uid).await;
+    let t = text(&r);
+    assert!(t.contains("Consolidation complete"), "got: {t}");
+    assert!(t.contains("fixed_stale="), "got: {t}");
+    println!("✅ consolidate basic: {t}");
+
+    // Second run without force should hit cooldown
+    let r2 = call("memory_consolidate", json!({}), &svc, &uid).await;
+    let t2 = text(&r2);
+    assert!(t2.contains("cooldown"), "expected cooldown, got: {t2}");
+    println!("✅ consolidate cooldown: {t2}");
+}
+
+// ── 22. memory_reflect: returns candidates ───────────────────────────────────
+
+#[tokio::test]
+async fn test_reflect_candidates() {
+    let (svc, uid) = setup().await;
+
+    // Store a few memories first
+    call("memory_store", json!({"content": "Uses Rust for backend services", "memory_type": "semantic"}), &svc, &uid).await;
+    call("memory_store", json!({"content": "Prefers async/await patterns", "memory_type": "profile"}), &svc, &uid).await;
+
+    let r = call("memory_reflect", json!({"mode": "candidates"}), &svc, &uid).await;
+    let t = text(&r);
+    assert!(t.contains("Cluster") || t.contains("memory clusters") || t.contains("No memories"), "got: {t}");
+    println!("✅ reflect candidates: {}", &t[..t.len().min(120)]);
+}
+
+// ── 23. memory_reflect: internal mode returns error ──────────────────────────
+
+#[tokio::test]
+async fn test_reflect_internal_unavailable() {
+    let (svc, uid) = setup().await;
+    let r = call("memory_reflect", json!({"mode": "internal"}), &svc, &uid).await;
+    let t = text(&r);
+    assert!(t.contains("not available"), "got: {t}");
+    println!("✅ reflect internal unavailable: {t}");
+}
+
+// ── 24. memory_extract_entities + memory_link_entities ───────────────────────
+
+#[tokio::test]
+async fn test_extract_and_link_entities() {
+    let (svc, uid) = setup().await;
+
+    // Store a memory
+    let store_r = call("memory_store", json!({"content": "Project uses Rust and MatrixOne database"}), &svc, &uid).await;
+    let store_t = text(&store_r);
+    println!("store: {store_t}");
+
+    // Extract candidates
+    let r = call("memory_extract_entities", json!({"mode": "candidates"}), &svc, &uid).await;
+    let t = text(&r);
+    println!("extract: {}", &t[..t.len().min(200)]);
+
+    let parsed: serde_json::Value = serde_json::from_str(&t).unwrap_or(serde_json::Value::Null);
+    if parsed["status"] == "complete" {
+        println!("✅ no unlinked memories (already linked or empty)");
+        return;
+    }
+    assert_eq!(parsed["status"], "candidates", "got: {t}");
+    let memories = parsed["memories"].as_array().expect("memories array");
+    assert!(!memories.is_empty(), "should have unlinked memories");
+
+    let memory_id = memories[0]["memory_id"].as_str().expect("memory_id");
+
+    // Link entities
+    let link_payload = serde_json::to_string(&json!([{
+        "memory_id": memory_id,
+        "entities": [{"name": "Rust", "type": "tech"}, {"name": "MatrixOne", "type": "tech"}]
+    }])).unwrap();
+
+    let r2 = call("memory_link_entities", json!({"entities": link_payload}), &svc, &uid).await;
+    let t2 = text(&r2);
+    let parsed2: serde_json::Value = serde_json::from_str(&t2).expect("valid json");
+    assert_eq!(parsed2["status"], "done", "got: {t2}");
+    assert!(parsed2["entities_created"].as_i64().unwrap_or(0) >= 1, "got: {t2}");
+    println!("✅ link_entities: {t2}");
+
+    // Re-extract: this memory should now be linked
+    let r3 = call("memory_extract_entities", json!({"mode": "candidates"}), &svc, &uid).await;
+    let t3 = text(&r3);
+    let parsed3: serde_json::Value = serde_json::from_str(&t3).unwrap_or(serde_json::Value::Null);
+    // The linked memory should no longer appear in unlinked list
+    if parsed3["status"] == "candidates" {
+        let mems = parsed3["memories"].as_array().unwrap();
+        assert!(!mems.iter().any(|m| m["memory_id"] == memory_id), "linked memory should not appear again");
+    }
+    println!("✅ extract after link: {}", &t3[..t3.len().min(100)]);
+}
+
+// ── 25. memory_link_entities: invalid JSON returns error ─────────────────────
+
+#[tokio::test]
+async fn test_link_entities_invalid_json() {
+    let (svc, uid) = setup().await;
+    let r = call("memory_link_entities", json!({"entities": "not json"}), &svc, &uid).await;
+    let t = text(&r);
+    let parsed: serde_json::Value = serde_json::from_str(&t).expect("valid json");
+    assert_eq!(parsed["status"], "error");
+    println!("✅ link_entities invalid json: {t}");
 }

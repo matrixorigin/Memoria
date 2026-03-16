@@ -29,7 +29,7 @@ test-mcp:
 # All tests (serial for snapshot/branch safety)
 test:
 	$(CARGO) test -p memoria-core -p memoria-service -p memoria-storage -p memoria-git -- --nocapture
-	$(CARGO) test -p memoria-mcp --test core_tools_e2e --test mcp_e2e -- --nocapture
+	$(CARGO) test -p memoria-mcp --test tools_unit --test core_tools_e2e --test mcp_e2e -- --nocapture
 	$(CARGO) test -p memoria-mcp --test snapshot_e2e --test branch_e2e --test integration_full -- --test-threads=1 --nocapture
 
 clean:

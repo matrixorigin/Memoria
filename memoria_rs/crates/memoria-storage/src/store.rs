@@ -87,6 +87,31 @@ impl SqlMemoryStore {
             )"#,
         ).execute(&self.pool).await.map_err(db_err)?;
 
+        // mem_governance_cooldown — per-user cooldown tracking
+        sqlx::query(
+            r#"CREATE TABLE IF NOT EXISTS mem_governance_cooldown (
+                user_id     VARCHAR(64)  NOT NULL,
+                operation   VARCHAR(32)  NOT NULL,
+                last_run_at DATETIME(6)  NOT NULL,
+                PRIMARY KEY (user_id, operation)
+            )"#,
+        ).execute(&self.pool).await.map_err(db_err)?;
+
+        // mem_entity_links — entity graph (lightweight, no graph tables)
+        sqlx::query(
+            r#"CREATE TABLE IF NOT EXISTS mem_entity_links (
+                id          VARCHAR(64)  PRIMARY KEY,
+                user_id     VARCHAR(64)  NOT NULL,
+                memory_id   VARCHAR(64)  NOT NULL,
+                entity_name VARCHAR(200) NOT NULL,
+                entity_type VARCHAR(50)  NOT NULL DEFAULT 'concept',
+                source      VARCHAR(20)  NOT NULL DEFAULT 'manual',
+                created_at  DATETIME(6)  NOT NULL,
+                INDEX idx_user_memory (user_id, memory_id),
+                INDEX idx_user_entity (user_id, entity_name)
+            )"#,
+        ).execute(&self.pool).await.map_err(db_err)?;
+
         Ok(())
     }
 
@@ -167,6 +192,67 @@ impl SqlMemoryStore {
             r.try_get::<String, _>("name").map_err(db_err)?,
             r.try_get::<String, _>("table_name").map_err(db_err)?,
         ))).collect()
+    }
+
+    // ── Governance ────────────────────────────────────────────────────────────
+
+    /// Check cooldown. Returns Some(remaining_seconds) if still in cooldown, None if can run.
+    pub async fn check_cooldown(&self, user_id: &str, operation: &str, cooldown_secs: i64) -> Result<Option<i64>, MemoriaError> {
+        let row = sqlx::query(
+            "SELECT TIMESTAMPDIFF(SECOND, last_run_at, NOW()) as elapsed \
+             FROM mem_governance_cooldown WHERE user_id = ? AND operation = ?"
+        )
+        .bind(user_id).bind(operation)
+        .fetch_optional(&self.pool).await.map_err(db_err)?;
+        match row {
+            None => Ok(None),
+            Some(r) => {
+                let elapsed: i64 = r.try_get("elapsed").unwrap_or(cooldown_secs + 1);
+                if elapsed >= cooldown_secs { Ok(None) }
+                else { Ok(Some(cooldown_secs - elapsed)) }
+            }
+        }
+    }
+
+    pub async fn set_cooldown(&self, user_id: &str, operation: &str) -> Result<(), MemoriaError> {
+        let now = Utc::now().naive_utc();
+        sqlx::query(
+            "INSERT INTO mem_governance_cooldown (user_id, operation, last_run_at) \
+             VALUES (?, ?, ?) ON DUPLICATE KEY UPDATE last_run_at = ?"
+        )
+        .bind(user_id).bind(operation).bind(now).bind(now)
+        .execute(&self.pool).await.map_err(db_err)?;
+        Ok(())
+    }
+
+    /// Quarantine memories whose effective confidence has decayed below threshold.
+    /// effective_confidence = initial_confidence * EXP(-age_days / half_life)
+    pub async fn quarantine_low_confidence(&self, user_id: &str) -> Result<i64, MemoriaError> {
+        // Half-lives per tier (days): T1=365, T2=180, T3=60, T4=30
+        // Quarantine threshold: 0.2
+        const THRESHOLD: f64 = 0.2;
+        let tiers: &[(&str, f64)] = &[("T1", 365.0), ("T2", 180.0), ("T3", 60.0), ("T4", 30.0)];
+        let mut total = 0i64;
+        for (tier, hl) in tiers {
+            let res = sqlx::query(&format!(
+                "UPDATE mem_memories SET is_active = 0, updated_at = NOW() \
+                 WHERE user_id = ? AND is_active = 1 AND trust_tier = ? \
+                   AND (initial_confidence * EXP(-TIMESTAMPDIFF(DAY, observed_at, NOW()) / {hl})) < {THRESHOLD}"
+            ))
+            .bind(user_id).bind(tier)
+            .execute(&self.pool).await.map_err(db_err)?;
+            total += res.rows_affected() as i64;
+        }
+        Ok(total)
+    }
+
+    /// Delete inactive memories with very low initial_confidence (already superseded/stale).
+    pub async fn cleanup_stale(&self, user_id: &str) -> Result<i64, MemoriaError> {
+        let res = sqlx::query(
+            "DELETE FROM mem_memories WHERE user_id = ? AND is_active = 0 AND initial_confidence < 0.1"
+        )
+        .bind(user_id).execute(&self.pool).await.map_err(db_err)?;
+        Ok(res.rows_affected() as i64)
     }
 
     // ── Table-aware CRUD ──────────────────────────────────────────────────────
@@ -252,6 +338,68 @@ impl SqlMemoryStore {
         let rows = sqlx::query(&sql).bind(user_id).bind(limit)
             .fetch_all(&self.pool).await.map_err(db_err)?;
         rows.iter().map(row_to_memory).collect()
+    }
+
+    // ── Entity links ──────────────────────────────────────────────────────────
+
+    /// Returns memory_ids that already have entity links for a user.
+    pub async fn get_linked_memory_ids(&self, user_id: &str) -> Result<std::collections::HashSet<String>, MemoriaError> {
+        let rows = sqlx::query(
+            "SELECT DISTINCT memory_id FROM mem_entity_links WHERE user_id = ?"
+        )
+        .bind(user_id)
+        .fetch_all(&self.pool).await.map_err(db_err)?;
+        Ok(rows.iter().filter_map(|r| r.try_get::<String, _>("memory_id").ok()).collect())
+    }
+
+    /// Returns all entity names for a user (for existing_entities list).
+    pub async fn get_entity_names(&self, user_id: &str) -> Result<Vec<(String, String)>, MemoriaError> {
+        let rows = sqlx::query(
+            "SELECT DISTINCT entity_name, entity_type FROM mem_entity_links WHERE user_id = ? ORDER BY entity_name"
+        )
+        .bind(user_id)
+        .fetch_all(&self.pool).await.map_err(db_err)?;
+        Ok(rows.iter().filter_map(|r| {
+            let name = r.try_get::<String, _>("entity_name").ok()?;
+            let etype = r.try_get::<String, _>("entity_type").ok()?;
+            Some((name, etype))
+        }).collect())
+    }
+
+    /// Insert entity links for a memory. Skips duplicates.
+    pub async fn insert_entity_links(
+        &self,
+        user_id: &str,
+        memory_id: &str,
+        entities: &[(String, String)], // (name, type)
+    ) -> Result<(usize, usize), MemoriaError> { // (created, reused)
+        let existing: std::collections::HashSet<String> = {
+            let rows = sqlx::query(
+                "SELECT entity_name FROM mem_entity_links WHERE user_id = ? AND memory_id = ?"
+            )
+            .bind(user_id).bind(memory_id)
+            .fetch_all(&self.pool).await.map_err(db_err)?;
+            rows.iter().filter_map(|r| r.try_get::<String, _>("entity_name").ok()).collect()
+        };
+        let now = chrono::Utc::now().naive_utc();
+        let mut created = 0usize;
+        let mut reused = 0usize;
+        for (name, etype) in entities {
+            let name_lc = name.to_lowercase();
+            if existing.contains(&name_lc) {
+                reused += 1;
+                continue;
+            }
+            let id = uuid::Uuid::new_v4().to_string().replace('-', "");
+            sqlx::query(
+                "INSERT INTO mem_entity_links (id, user_id, memory_id, entity_name, entity_type, source, created_at) \
+                 VALUES (?, ?, ?, ?, ?, 'manual', ?)"
+            )
+            .bind(&id).bind(user_id).bind(memory_id).bind(&name_lc).bind(etype).bind(now)
+            .execute(&self.pool).await.map_err(db_err)?;
+            created += 1;
+        }
+        Ok((created, reused))
     }
 }
 

@@ -114,8 +114,8 @@ async fn test_e2e_mcp_initialize() {
 #[tokio::test]
 async fn test_e2e_tools_list_has_8() {
     let tools = memoria_mcp::tools::list();
-    assert_eq!(tools.as_array().unwrap().len(), 8);
-    println!("✅ tools_list: 8 tools");
+    assert_eq!(tools.as_array().unwrap().len(), 14, "expected 14 core tools");
+    println!("✅ tools_list: 14 tools");
 }
 
 // ── MCP branch → store → merge end-to-end ────────────────────────────────────

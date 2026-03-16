@@ -56,13 +56,15 @@ fn make_service() -> Arc<MemoryService> {
 async fn test_tools_list() {
     let tools = memoria_mcp::tools::list();
     let arr = tools.as_array().unwrap();
-    assert_eq!(arr.len(), 8);
+    assert_eq!(arr.len(), 14);
     let names: Vec<&str> = arr.iter().map(|t| t["name"].as_str().unwrap()).collect();
     assert!(names.contains(&"memory_store"));
     assert!(names.contains(&"memory_retrieve"));
     assert!(names.contains(&"memory_correct"));
     assert!(names.contains(&"memory_purge"));
-    println!("✅ tools_list: 8 tools");
+    assert!(names.contains(&"memory_governance"));
+    assert!(names.contains(&"memory_rebuild_index"));
+    println!("✅ tools_list: 14 tools");
 }
 
 #[tokio::test]

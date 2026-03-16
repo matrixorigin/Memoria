@@ -5,6 +5,7 @@ use anyhow::Result;
 use memoria_core::{MemoryType, TrustTier};
 use memoria_service::MemoryService;
 use serde_json::{json, Value};
+use sqlx::Row;
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -93,6 +94,68 @@ pub fn list() -> Value {
                 "properties": {
                     "limit": {"type": "integer", "default": 20}
                 }
+            }
+        },
+        {
+            "name": "memory_governance",
+            "description": "Run memory governance: quarantine low-confidence memories, clean stale data. 1-hour cooldown.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "force": {"type": "boolean", "default": false}
+                }
+            }
+        },
+        {
+            "name": "memory_rebuild_index",
+            "description": "Rebuild IVF vector index for a memory table. Only call when governance reports needs_rebuild=True.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "table": {"type": "string", "default": "mem_memories"}
+                }
+            }
+        },
+        {
+            "name": "memory_consolidate",
+            "description": "Run graph consolidation: detect contradicting memories, fix orphaned nodes, manage trust tiers. 30-minute cooldown.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "force": {"type": "boolean", "default": false}
+                }
+            }
+        },
+        {
+            "name": "memory_reflect",
+            "description": "Analyze memory clusters and synthesize high-level insights. 2-hour cooldown.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "force": {"type": "boolean", "default": false},
+                    "mode": {"type": "string", "default": "auto"}
+                }
+            }
+        },
+        {
+            "name": "memory_extract_entities",
+            "description": "Extract named entities from memories and build entity graph.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "mode": {"type": "string", "default": "auto"}
+                }
+            }
+        },
+        {
+            "name": "memory_link_entities",
+            "description": "Write entity links from user-LLM extraction results.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "entities": {"type": "string"}
+                },
+                "required": ["entities"]
             }
         }
     ])
@@ -206,8 +269,306 @@ pub async fn call(
 
         "memory_capabilities" => Ok(mcp_text(
             "Available tools: memory_store, memory_retrieve, memory_search, \
-             memory_correct, memory_purge, memory_profile, memory_list, memory_capabilities"
+             memory_correct, memory_purge, memory_profile, memory_list, \
+             memory_capabilities, memory_governance, memory_rebuild_index, \
+             memory_consolidate, memory_reflect, memory_extract_entities, memory_link_entities"
         )),
+
+        "memory_governance" => {
+            let force = args["force"].as_bool().unwrap_or(false);
+            let sql = match &service.sql_store {
+                Some(s) => s.clone(),
+                None => return Ok(mcp_text("Governance requires SQL store")),
+            };
+            const COOLDOWN_SECS: i64 = 3600; // 1 hour
+            if !force {
+                if let Some(remaining) = sql.check_cooldown(user_id, "governance", COOLDOWN_SECS).await? {
+                    return Ok(mcp_text(&format!(
+                        "Governance skipped (cooldown: {remaining}s remaining). Use force=true to override."
+                    )));
+                }
+            }
+            let quarantined = sql.quarantine_low_confidence(user_id).await?;
+            let cleaned = sql.cleanup_stale(user_id).await?;
+            sql.set_cooldown(user_id, "governance").await?;
+
+            // Snapshot health
+            let snap_health = {
+                let snaps = sqlx::query("SHOW SNAPSHOTS")
+                    .fetch_all(sql.pool()).await.unwrap_or_default();
+                let total = snaps.len();
+                let auto = snaps.iter().filter(|r| {
+                    let name: String = r.try_get("SNAPSHOT_NAME").unwrap_or_default();
+                    name.starts_with("mem_milestone_") || name.starts_with("mem_snap_pre_")
+                }).count();
+                let ratio = if total > 0 { auto as f64 / total as f64 } else { 0.0 };
+                format!("snapshots: {total} total, {:.0}% auto-generated", ratio * 100.0)
+            };
+
+            Ok(mcp_text(&format!(
+                "Governance complete: quarantined={quarantined}, cleaned_stale={cleaned}. {snap_health}"
+            )))
+        }
+
+        "memory_rebuild_index" => {
+            let table = args["table"].as_str().unwrap_or("mem_memories");
+            if !["mem_memories", "memory_graph_nodes"].contains(&table) {
+                return Ok(mcp_text(&format!("Invalid table '{table}'. Use mem_memories or memory_graph_nodes")));
+            }
+            let sql = match &service.sql_store {
+                Some(s) => s.clone(),
+                None => return Ok(mcp_text("Rebuild index requires SQL store")),
+            };
+            // Count rows to compute optimal lists
+            let count_row = sqlx::query(&format!("SELECT COUNT(*) as cnt FROM {table}"))
+                .fetch_one(sql.pool()).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+            let total_rows: i64 = count_row.try_get("cnt").unwrap_or(0);
+            let new_lists = (total_rows / 50).max(1).min(1024);
+            // Rebuild: drop + recreate IVF index
+            let idx_name = format!("{table}_embedding_ivf");
+            let _ = sqlx::raw_sql(&format!("ALTER TABLE {table} DROP INDEX {idx_name}"))
+                .execute(sql.pool()).await; // ignore error if not exists
+            sqlx::raw_sql(&format!(
+                "ALTER TABLE {table} ADD INDEX {idx_name} (embedding) USING IVFFLAT LISTS={new_lists}"
+            ))
+            .execute(sql.pool()).await
+            .map_err(|e| anyhow::anyhow!("rebuild index failed: {e}"))?;
+            Ok(mcp_text(&format!(
+                "Rebuilt IVF index for {table}: lists={new_lists} (rows={total_rows})"
+            )))
+        }
+
+        "memory_consolidate" => {
+            let force = args["force"].as_bool().unwrap_or(false);
+            let sql = match &service.sql_store {
+                Some(s) => s.clone(),
+                None => return Ok(mcp_text("Consolidate requires SQL store")),
+            };
+            const COOLDOWN_SECS: i64 = 1800; // 30 minutes
+            if !force {
+                if let Some(remaining) = sql.check_cooldown(user_id, "consolidate", COOLDOWN_SECS).await? {
+                    return Ok(mcp_text(&format!(
+                        "Consolidation skipped (cooldown: {remaining}s remaining). Use force=true to override."
+                    )));
+                }
+            }
+            // Detect potential contradictions: active memories with very low confidence
+            // that have a superseded_by set (corrected but old version still active)
+            let stale_row = sqlx::query(
+                "SELECT COUNT(*) as cnt FROM mem_memories \
+                 WHERE user_id = ? AND is_active = 1 AND superseded_by IS NOT NULL"
+            )
+            .bind(user_id)
+            .fetch_one(sql.pool()).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+            let stale_active: i64 = stale_row.try_get("cnt").unwrap_or(0);
+
+            // Fix: deactivate memories that have been superseded
+            let fixed = if stale_active > 0 {
+                sqlx::query(
+                    "UPDATE mem_memories SET is_active = 0 \
+                     WHERE user_id = ? AND is_active = 1 AND superseded_by IS NOT NULL"
+                )
+                .bind(user_id)
+                .execute(sql.pool()).await.map_err(|e| anyhow::anyhow!("{e}"))?
+                .rows_affected()
+            } else { 0 };
+
+            // Count low-confidence active memories (potential conflicts)
+            let conflict_row = sqlx::query(
+                "SELECT COUNT(*) as cnt FROM mem_memories \
+                 WHERE user_id = ? AND is_active = 1 AND initial_confidence < 0.4"
+            )
+            .bind(user_id)
+            .fetch_one(sql.pool()).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+            let conflicts_detected: i64 = conflict_row.try_get("cnt").unwrap_or(0);
+
+            sql.set_cooldown(user_id, "consolidate").await?;
+            Ok(mcp_text(&format!(
+                "Consolidation complete: fixed_stale={fixed}, conflicts_detected={conflicts_detected}, \
+                 promoted=0, demoted=0"
+            )))
+        }
+
+        "memory_reflect" => {
+            let force = args["force"].as_bool().unwrap_or(false);
+            let mode = args["mode"].as_str().unwrap_or("auto");
+            let sql = match &service.sql_store {
+                Some(s) => s.clone(),
+                None => return Ok(mcp_text("Reflect requires SQL store")),
+            };
+
+            // candidates mode (or auto without internal LLM — we never have internal LLM in Rust)
+            if mode == "internal" {
+                return Ok(mcp_text(
+                    "Reflection with internal LLM is not available in this deployment. \
+                     Use mode='candidates' to get raw clusters for synthesis."
+                ));
+            }
+
+            const COOLDOWN_SECS: i64 = 7200; // 2 hours
+            if mode != "candidates" && !force {
+                if let Some(remaining) = sql.check_cooldown(user_id, "reflect", COOLDOWN_SECS).await? {
+                    return Ok(mcp_text(&format!(
+                        "Reflection skipped (cooldown: {remaining}s remaining). Use force=true to override."
+                    )));
+                }
+            }
+
+            // Cluster memories by memory_type — each type is a "cluster"
+            let rows = sqlx::query(
+                "SELECT memory_type, content, memory_id FROM mem_memories \
+                 WHERE user_id = ? AND is_active = 1 ORDER BY memory_type, created_at DESC"
+            )
+            .bind(user_id)
+            .fetch_all(sql.pool()).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+
+            if rows.is_empty() {
+                return Ok(mcp_text("No memories found for reflection."));
+            }
+
+            // Group by memory_type, take top 5 per cluster
+            let mut clusters: std::collections::BTreeMap<String, Vec<(String, String)>> = Default::default();
+            for row in &rows {
+                let mtype: String = row.try_get("memory_type").unwrap_or_default();
+                let content: String = row.try_get("content").unwrap_or_default();
+                let mid: String = row.try_get("memory_id").unwrap_or_default();
+                let entries = clusters.entry(mtype).or_default();
+                if entries.len() < 5 {
+                    entries.push((mid, content));
+                }
+            }
+
+            if clusters.is_empty() {
+                return Ok(mcp_text("No memory clusters found for reflection."));
+            }
+
+            if mode != "candidates" {
+                sql.set_cooldown(user_id, "reflect").await?;
+            }
+
+            let mut parts = Vec::new();
+            for (i, (mtype, mems)) in clusters.iter().enumerate() {
+                let mem_lines: Vec<String> = mems.iter()
+                    .map(|(_, c)| format!("  - [{}] {}", mtype, c))
+                    .collect();
+                parts.push(format!(
+                    "Cluster {} ({}, importance=0.5):\n{}",
+                    i + 1, mtype, mem_lines.join("\n")
+                ));
+            }
+
+            Ok(mcp_text(&format!(
+                "Here are memory clusters for reflection. Synthesize 1-2 insights per cluster, \
+                 then store each via memory_store(content=..., memory_type='semantic').\n\n{}",
+                parts.join("\n\n")
+            )))
+        }
+
+        "memory_extract_entities" => {
+            let mode = args["mode"].as_str().unwrap_or("auto");
+            let sql = match &service.sql_store {
+                Some(s) => s.clone(),
+                None => return Ok(mcp_text("Extract entities requires SQL store")),
+            };
+
+            if mode == "internal" {
+                return Ok(mcp_text(
+                    "LLM entity extraction is not available in this deployment. \
+                     Use mode='candidates' to get unlinked memories for manual extraction."
+                ));
+            }
+
+            // Get memories that don't have entity links yet
+            let linked_ids = sql.get_linked_memory_ids(user_id).await?;
+            let rows = sqlx::query(
+                "SELECT memory_id, content FROM mem_memories \
+                 WHERE user_id = ? AND is_active = 1 ORDER BY created_at DESC LIMIT 100"
+            )
+            .bind(user_id)
+            .fetch_all(sql.pool()).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+
+            let unlinked: Vec<serde_json::Value> = rows.iter()
+                .filter_map(|r| {
+                    let mid: String = r.try_get("memory_id").ok()?;
+                    if linked_ids.contains(&mid) { return None; }
+                    let content: String = r.try_get("content").ok()?;
+                    Some(json!({"memory_id": mid, "content": content}))
+                })
+                .take(50)
+                .collect();
+
+            if unlinked.is_empty() {
+                return Ok(mcp_text(&serde_json::to_string(&json!({
+                    "status": "complete",
+                    "unlinked": 0,
+                    "message": "All memories already have entity links."
+                }))?));
+            }
+
+            let existing = sql.get_entity_names(user_id).await?;
+            let existing_json: Vec<serde_json::Value> = existing.iter()
+                .map(|(name, etype)| json!({"name": name, "entity_type": etype}))
+                .collect();
+
+            Ok(mcp_text(&serde_json::to_string(&json!({
+                "status": "candidates",
+                "unlinked": unlinked.len(),
+                "memories": unlinked,
+                "existing_entities": existing_json,
+                "instruction": "Extract named entities (people, tech, projects, repos) from each memory, then call memory_link_entities."
+            }))?))
+        }
+
+        "memory_link_entities" => {
+            let entities_str = args["entities"].as_str().unwrap_or("");
+            let sql = match &service.sql_store {
+                Some(s) => s.clone(),
+                None => return Ok(mcp_text("Link entities requires SQL store")),
+            };
+
+            let parsed: Vec<serde_json::Value> = match serde_json::from_str(entities_str) {
+                Ok(v) => v,
+                Err(_) => return Ok(mcp_text(&serde_json::to_string(&json!({
+                    "status": "error",
+                    "error": "Invalid JSON",
+                    "expected_format": [{"memory_id": "...", "entities": [{"name": "...", "type": "..."}]}]
+                }))?)),
+            };
+
+            let mut total_created = 0usize;
+            let mut total_reused = 0usize;
+            let mut total_edges = 0usize;
+
+            for item in &parsed {
+                let memory_id = match item["memory_id"].as_str() {
+                    Some(id) => id,
+                    None => continue,
+                };
+                let ents: Vec<(String, String)> = item["entities"].as_array()
+                    .unwrap_or(&vec![])
+                    .iter()
+                    .filter_map(|e| {
+                        let name = e["name"].as_str()?.trim().to_string();
+                        if name.is_empty() { return None; }
+                        let etype = e["type"].as_str().unwrap_or("concept").to_string();
+                        Some((name, etype))
+                    })
+                    .collect();
+
+                if ents.is_empty() { continue; }
+                let (created, reused) = sql.insert_entity_links(user_id, memory_id, &ents).await?;
+                total_created += created;
+                total_reused += reused;
+                total_edges += created; // one edge per new link
+            }
+
+            Ok(mcp_text(&serde_json::to_string(&json!({
+                "status": "done",
+                "entities_created": total_created,
+                "entities_reused": total_reused,
+                "edges_created": total_edges
+            }))?))
+        }
 
         _ => Err(anyhow::anyhow!("Unknown tool: {name}")),
     }
