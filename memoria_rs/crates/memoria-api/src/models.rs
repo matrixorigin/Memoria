@@ -31,11 +31,15 @@ pub struct RetrieveRequest {
     #[serde(default = "default_top_k")]
     pub top_k: i64,
     pub session_id: Option<String>,
+    /// When false and session_id is set, only return memories from that session.
+    #[serde(default = "default_true")]
+    pub include_cross_session: bool,
     /// Explain level: false/"none" = off, true/"basic" = basic, "verbose" = per-candidate scores, "analyze" = full
     #[serde(default, deserialize_with = "deserialize_explain")]
     pub explain: String,
 }
 fn default_top_k() -> i64 { 5 }
+fn default_true() -> bool { true }
 
 fn deserialize_explain<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
     use serde::Deserialize;

@@ -81,13 +81,23 @@ pub async fn retrieve(
     Json(req): Json<RetrieveRequest>,
 ) -> ApiResult<serde_json::Value> {
     let level = memoria_service::ExplainLevel::from_str_or_bool(&req.explain);
+    let filter_session = req.session_id.as_deref().filter(|_| !req.include_cross_session);
+
+    let apply_filter = |mut mems: Vec<memoria_core::Memory>| -> Vec<memoria_core::Memory> {
+        if let Some(sid) = filter_session {
+            mems.retain(|m| m.session_id.as_deref() == Some(sid));
+        }
+        mems
+    };
+
     if level != memoria_service::ExplainLevel::None {
         let (results, explain) = state.service.retrieve_explain_level(&user_id, &req.query, req.top_k, level).await.map_err(api_err)?;
-        let items: Vec<MemoryResponse> = results.into_iter().map(Into::into).collect();
+        let items: Vec<MemoryResponse> = apply_filter(results).into_iter().map(Into::into).collect();
         Ok(Json(serde_json::json!({"results": items, "explain": explain})))
     } else {
         let results = state.service.retrieve(&user_id, &req.query, req.top_k).await.map_err(api_err)?;
-        Ok(Json(serde_json::json!(results.into_iter().map(Into::into).collect::<Vec<MemoryResponse>>())))
+        let items: Vec<MemoryResponse> = apply_filter(results).into_iter().map(Into::into).collect();
+        Ok(Json(serde_json::json!(items)))
     }
 }
 

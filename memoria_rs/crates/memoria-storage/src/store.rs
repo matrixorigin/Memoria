@@ -368,8 +368,14 @@ impl SqlMemoryStore {
         )).fetch_one(&self.pool).await.map_err(db_err)?;
         let total_rows = row.0;
         if total_rows == 0 { return Ok(0); }
-        let lists = (total_rows / 50).max(1).min(1024);
         let idx_name = format!("{table}_embedding_ivf");
+        // IVF hurts recall on small datasets; only build when rows >= 500
+        if total_rows < 500 {
+            let _ = sqlx::raw_sql(&format!("DROP INDEX {idx_name} ON {table}"))
+                .execute(&self.pool).await;
+            return Ok(total_rows);
+        }
+        let lists = (total_rows / 50).max(1).min(1024);
         let _ = sqlx::raw_sql(&format!("DROP INDEX {idx_name} ON {table}"))
             .execute(&self.pool).await;
         sqlx::raw_sql(&format!(
@@ -610,7 +616,9 @@ impl SqlMemoryStore {
     }
 
     pub async fn search_fulltext_from(&self, table: &str, user_id: &str, query: &str, limit: i64) -> Result<Vec<Memory>, MemoriaError> {
-        let safe = query.replace('\'', "").replace('\\', "");
+        let safe = query.replace('\'', "").replace('\\', "").replace('+', " ").replace('-', " ");
+        // Use OR semantics (no + prefix) — AND is too strict for natural language queries
+        // because stopwords are removed from the index but +stopword still requires a match.
         let sql = format!(
             "SELECT memory_id, user_id, memory_type, content, \
              embedding AS emb_str, session_id, \
@@ -618,10 +626,10 @@ impl SqlMemoryStore {
              CAST(extra_metadata AS CHAR) AS extra_meta, \
              is_active, superseded_by, trust_tier, initial_confidence, \
              observed_at, created_at, updated_at, \
-             MATCH(content) AGAINST('+{safe}' IN BOOLEAN MODE) AS ft_score \
+             MATCH(content) AGAINST('{safe}' IN BOOLEAN MODE) AS ft_score \
              FROM {table} \
              WHERE user_id = ? AND is_active = 1 \
-               AND MATCH(content) AGAINST('+{safe}' IN BOOLEAN MODE) \
+               AND MATCH(content) AGAINST('{safe}' IN BOOLEAN MODE) \
              ORDER BY ft_score DESC LIMIT ?"
         );
         let rows = sqlx::query(&sql).bind(user_id).bind(limit)
@@ -630,6 +638,8 @@ impl SqlMemoryStore {
             let mut m = row_to_memory(r)?;
             if let Ok(ft) = r.try_get::<f64, _>("ft_score") {
                 m.retrieval_score = Some(ft);
+            } else if let Ok(ft) = r.try_get::<f32, _>("ft_score") {
+                m.retrieval_score = Some(ft as f64);
             }
             Ok(m)
         }).collect()
