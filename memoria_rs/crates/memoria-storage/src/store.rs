@@ -664,44 +664,43 @@ impl SqlMemoryStore {
     /// Hybrid search: vector + fulltext, merged with 4-dimension weighted scoring.
     /// Weights: vector=0.3, keyword=0.2, temporal=0.2, confidence=0.3 (matches Python "default")
     pub async fn search_hybrid_from(&self, table: &str, user_id: &str, embedding: &[f32], query: &str, limit: i64) -> Result<Vec<Memory>, MemoriaError> {
-        // Fetch more candidates than needed for re-ranking
+        let (mems, _) = self.search_hybrid_from_scored(table, user_id, embedding, query, limit).await?;
+        Ok(mems)
+    }
+
+    /// Like search_hybrid_from but also returns per-candidate score breakdown.
+    /// scores: (memory_id, vec_score, kw_score, time_score, conf_score, final_score)
+    pub async fn search_hybrid_from_scored(
+        &self, table: &str, user_id: &str, embedding: &[f32], query: &str, limit: i64,
+    ) -> Result<(Vec<Memory>, Vec<(String, f64, f64, f64, f64, f64)>), MemoriaError> {
         let fetch_k = (limit * 3).max(20);
-
-        // Vector candidates
         let vec_results = self.search_vector_from(table, user_id, embedding, fetch_k).await?;
-
-        // Fulltext candidates (best-effort, ignore errors)
         let ft_results = self.search_fulltext_from(table, user_id, query, fetch_k).await.unwrap_or_default();
 
-        // Build ft_score map
         let ft_map: std::collections::HashMap<String, f64> = ft_results.iter()
             .filter_map(|m| m.retrieval_score.map(|s| (m.memory_id.clone(), s)))
             .collect();
 
-        // Merge: vec_results as base, add ft candidates not already present
         let mut seen: std::collections::HashSet<String> = vec_results.iter().map(|m| m.memory_id.clone()).collect();
         let mut candidates = vec_results;
         for m in ft_results {
-            if seen.insert(m.memory_id.clone()) {
-                candidates.push(m);
-            }
+            if seen.insert(m.memory_id.clone()) { candidates.push(m); }
         }
 
-        // 4-dimension weighted scoring
         let now = chrono::Utc::now();
-        const DECAY_HOURS: f64 = 168.0;   // 7 days
+        const DECAY_HOURS: f64 = 168.0;
         const HALF_LIFE_DAYS: f64 = 30.0;
         const W_VEC: f64 = 0.3;
         const W_KW: f64 = 0.2;
         const W_TIME: f64 = 0.2;
         const W_CONF: f64 = 0.3;
 
-        for m in &mut candidates {
-            let vec_score = m.retrieval_score.unwrap_or(0.0); // already 1/(1+l2)
+        let mut score_breakdown: Vec<(String, f64, f64, f64, f64, f64)> = Vec::new();
 
+        for m in &mut candidates {
+            let vec_score = m.retrieval_score.unwrap_or(0.0);
             let raw_ft = ft_map.get(&m.memory_id).copied().unwrap_or(0.0);
             let kw_score = if raw_ft > 0.0 { raw_ft / (raw_ft + 1.0) } else { 0.0 };
-
             let (time_score, conf_score) = if let Some(obs) = m.observed_at {
                 let age_hours = (now - obs).num_seconds() as f64 / 3600.0;
                 let age_days = age_hours / 24.0;
@@ -711,13 +710,19 @@ impl SqlMemoryStore {
             } else {
                 (0.0, m.initial_confidence)
             };
-
-            m.retrieval_score = Some(W_VEC * vec_score + W_KW * kw_score + W_TIME * time_score + W_CONF * conf_score);
+            let final_score = W_VEC * vec_score + W_KW * kw_score + W_TIME * time_score + W_CONF * conf_score;
+            m.retrieval_score = Some(final_score);
+            score_breakdown.push((m.memory_id.clone(), vec_score, kw_score, time_score, conf_score, final_score));
         }
 
         candidates.sort_by(|a, b| b.retrieval_score.partial_cmp(&a.retrieval_score).unwrap_or(std::cmp::Ordering::Equal));
+        // Re-sort score_breakdown to match candidate order
+        let order: std::collections::HashMap<String, usize> = candidates.iter().enumerate()
+            .map(|(i, m)| (m.memory_id.clone(), i)).collect();
+        score_breakdown.sort_by_key(|(id, ..)| order.get(id).copied().unwrap_or(usize::MAX));
         candidates.truncate(limit as usize);
-        Ok(candidates)
+        score_breakdown.truncate(limit as usize);
+        Ok((candidates, score_breakdown))
     }
 
     // ── Entity links ──────────────────────────────────────────────────────────

@@ -34,7 +34,7 @@ pub fn list() -> Value {
                     "query": {"type": "string"},
                     "top_k": {"type": "integer", "default": 5},
                     "session_id": {"type": "string"},
-                    "explain": {"type": "boolean", "default": false, "description": "Show retrieval timing and path (debug)"}
+                    "explain": {"type": ["boolean", "string"], "default": false, "description": "Explain level: false/\"none\"=off, true/\"basic\"=timing+path, \"verbose\"=+per-candidate scores, \"analyze\"=full"}
                 },
                 "required": ["query"]
             }
@@ -47,7 +47,7 @@ pub fn list() -> Value {
                 "properties": {
                     "query": {"type": "string"},
                     "top_k": {"type": "integer", "default": 10},
-                    "explain": {"type": "boolean", "default": false, "description": "Show retrieval timing and path (debug)"}
+                    "explain": {"type": ["boolean", "string"], "default": false, "description": "Explain level: false/\"none\"=off, true/\"basic\"=timing+path, \"verbose\"=+per-candidate scores, \"analyze\"=full"}
                 },
                 "required": ["query"]
             }
@@ -231,10 +231,16 @@ pub async fn call(
         "memory_retrieve" | "memory_search" => {
             let query = args["query"].as_str().unwrap_or("").to_string();
             let top_k = args["top_k"].as_i64().unwrap_or(5);
-            let explain = args["explain"].as_bool().unwrap_or(false);
+            // explain accepts bool or string: true/"basic"/"verbose"/"analyze"
+            let explain_str = match &args["explain"] {
+                serde_json::Value::Bool(true) => "basic",
+                serde_json::Value::String(s) => s.as_str(),
+                _ => "none",
+            };
+            let level = memoria_service::ExplainLevel::from_str_or_bool(explain_str);
 
-            if explain {
-                let (results, stats) = service.retrieve_explain(user_id, &query, top_k).await?;
+            if level != memoria_service::ExplainLevel::None {
+                let (results, stats) = service.retrieve_explain_level(user_id, &query, top_k, level).await?;
                 if results.is_empty() {
                     let explain_json = serde_json::to_string_pretty(&stats).unwrap_or_default();
                     return Ok(mcp_text(&format!("No relevant memories found.\n\n--- explain ---\n{explain_json}")));

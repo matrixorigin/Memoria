@@ -1039,6 +1039,35 @@ async fn spawn_server_with_llm(llm_key: String) -> (String, reqwest::Client) {
     (format!("http://127.0.0.1:{port}"), client)
 }
 
+async fn spawn_server_with_embedding(emb_key: String) -> (String, reqwest::Client) {
+    use memoria_git::GitForDataService;
+    use memoria_service::{Config, MemoryService};
+    use memoria_storage::SqlMemoryStore;
+    use sqlx::mysql::MySqlPool;
+    use memoria_embedding::HttpEmbedder;
+
+    let cfg = Config::from_env();
+    let db = db_url();
+    let store = SqlMemoryStore::connect(&db, 1024).await.expect("connect");
+    store.migrate().await.expect("migrate");
+    let pool = MySqlPool::connect(&db).await.expect("pool");
+    let git = Arc::new(GitForDataService::new(pool, &cfg.db_name));
+    let base_url = std::env::var("EMBEDDING_BASE_URL")
+        .unwrap_or_else(|_| "https://api.siliconflow.cn/v1".to_string());
+    let model = std::env::var("EMBEDDING_MODEL")
+        .unwrap_or_else(|_| "BAAI/bge-m3".to_string());
+    let embedder = Arc::new(HttpEmbedder::new(base_url, emb_key, model, 1024));
+    let service = Arc::new(MemoryService::new_sql(Arc::new(store), Some(embedder)));
+    let state = memoria_api::AppState::new(service, git, String::new());
+    let app = memoria_api::build_router(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    (format!("http://127.0.0.1:{port}"), client)
+}
+
 #[tokio::test]
 async fn test_episodic_no_memories_returns_error() {
     // This test requires LLM — skip if not configured
@@ -1278,22 +1307,43 @@ async fn test_retrieve_with_explain() {
         .json(&json!({"content": "Rust is fast and safe", "memory_type": "semantic"}))
         .send().await.unwrap();
 
-    // Retrieve with explain=true
+    // explain=true (basic)
     let r = client.post(format!("{base}/v1/memories/retrieve"))
         .header("X-User-Id", &user)
         .json(&json!({"query": "fast language", "top_k": 5, "explain": true}))
         .send().await.unwrap();
     assert_eq!(r.status(), 200);
     let body: Value = r.json().await.unwrap();
-    // With explain=true, response has "results" and "explain" keys
     assert!(body["explain"].is_object(), "explain field missing: {body}");
     assert!(body["explain"]["path"].is_string());
     assert!(body["explain"]["total_ms"].is_number());
-    println!("✅ retrieve explain: path={}, total_ms={}",
+    assert_eq!(body["explain"]["level"], "basic");
+    println!("✅ explain=basic: path={}, total_ms={}",
         body["explain"]["path"].as_str().unwrap_or("?"),
         body["explain"]["total_ms"].as_f64().unwrap_or(0.0));
 
-    // Without explain — returns array directly
+    // explain="verbose" — should include candidate_scores
+    let r = client.post(format!("{base}/v1/memories/retrieve"))
+        .header("X-User-Id", &user)
+        .json(&json!({"query": "fast language", "top_k": 5, "explain": "verbose"}))
+        .send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    let body: Value = r.json().await.unwrap();
+    assert_eq!(body["explain"]["level"], "verbose");
+    // candidate_scores present when results exist
+    if !body["results"].as_array().map(|a| a.is_empty()).unwrap_or(true) {
+        let scores = &body["explain"]["candidate_scores"];
+        assert!(scores.is_array(), "verbose should have candidate_scores: {body}");
+        let first = &scores[0];
+        assert!(first["final_score"].is_number(), "missing final_score: {first}");
+        assert!(first["vector_score"].is_number());
+        assert!(first["keyword_score"].is_number());
+        assert!(first["temporal_score"].is_number());
+        assert!(first["confidence_score"].is_number());
+        println!("✅ explain=verbose: candidate_scores[0]={}", first);
+    }
+
+    // explain="none" — returns array directly
     let r = client.post(format!("{base}/v1/memories/retrieve"))
         .header("X-User-Id", &user)
         .json(&json!({"query": "fast language", "top_k": 5}))
@@ -1301,7 +1351,57 @@ async fn test_retrieve_with_explain() {
     assert_eq!(r.status(), 200);
     let body: Value = r.json().await.unwrap();
     assert!(body.is_array(), "without explain should return array: {body}");
-    println!("✅ retrieve without explain: {} results", body.as_array().unwrap().len());
+    println!("✅ explain=none: {} results", body.as_array().unwrap().len());
+}
+
+#[tokio::test]
+async fn test_explain_verbose_candidate_scores() {
+    let emb_key = match std::env::var("EMBEDDING_API_KEY").ok().filter(|s| !s.is_empty()) {
+        Some(k) => k,
+        None => { println!("⏭️  test_explain_verbose_candidate_scores skipped (EMBEDDING_API_KEY not set)"); return; }
+    };
+    let (base, client) = spawn_server_with_embedding(emb_key).await;
+    let uid = uid();
+
+    // Store a few memories
+    for content in ["Rust is fast and memory-safe", "Python is easy to learn", "Go has great concurrency"] {
+        client.post(format!("{base}/v1/memories"))
+            .header("X-User-Id", &uid)
+            .json(&json!({"content": content, "memory_type": "semantic"}))
+            .send().await.unwrap();
+    }
+
+    // explain=verbose should return candidate_scores with 4-dim breakdown
+    let r = client.post(format!("{base}/v1/memories/retrieve"))
+        .header("X-User-Id", &uid)
+        .json(&json!({"query": "fast programming language", "top_k": 5, "explain": "verbose"}))
+        .send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    let body: Value = r.json().await.unwrap();
+    assert_eq!(body["explain"]["level"], "verbose", "level mismatch: {body}");
+    assert!(body["explain"]["path"].is_string());
+
+    let results = body["results"].as_array().expect("results array");
+    if !results.is_empty() {
+        let scores = body["explain"]["candidate_scores"].as_array()
+            .expect("candidate_scores should be array when results non-empty");
+        assert!(!scores.is_empty(), "candidate_scores empty");
+        let first = &scores[0];
+        assert!(first["final_score"].is_number(), "missing final_score");
+        assert!(first["vector_score"].is_number(), "missing vector_score");
+        assert!(first["keyword_score"].is_number(), "missing keyword_score");
+        assert!(first["temporal_score"].is_number(), "missing temporal_score");
+        assert!(first["confidence_score"].is_number(), "missing confidence_score");
+        assert_eq!(first["rank"], 1);
+        println!("✅ explain=verbose candidate_scores[0]: final={:.4} vec={:.4} kw={:.4} time={:.4} conf={:.4}",
+            first["final_score"].as_f64().unwrap_or(0.0),
+            first["vector_score"].as_f64().unwrap_or(0.0),
+            first["keyword_score"].as_f64().unwrap_or(0.0),
+            first["temporal_score"].as_f64().unwrap_or(0.0),
+            first["confidence_score"].as_f64().unwrap_or(0.0));
+    } else {
+        println!("⚠️  no results returned (embedding may not have indexed yet)");
+    }
 }
 
 #[tokio::test]

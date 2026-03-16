@@ -9,9 +9,51 @@ use std::sync::Arc;
 use uuid::Uuid;
 use chrono::{DateTime, Utc};
 
+#[inline]
+fn round4(v: f64) -> f64 { (v * 10000.0).round() / 10000.0 }
+
+/// Explain level — mirrors Python's ExplainLevel enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ExplainLevel {
+    #[default]
+    None,
+    Basic,
+    Verbose,
+    Analyze,
+}
+
+impl ExplainLevel {
+    pub fn from_str_or_bool(s: &str) -> Self {
+        match s {
+            "true" | "basic" => Self::Basic,
+            "verbose" => Self::Verbose,
+            "analyze" => Self::Analyze,
+            _ => Self::None,
+        }
+    }
+    pub fn at_least(&self, min: ExplainLevel) -> bool {
+        (*self as u8) >= (min as u8)
+    }
+}
+
+/// Per-candidate scoring breakdown — answers "why is this memory ranked here?"
+/// Only populated at Verbose/Analyze level.
+#[derive(Debug, serde::Serialize)]
+pub struct CandidateScore {
+    pub memory_id: String,
+    pub rank: usize,
+    pub final_score: f64,
+    pub vector_score: f64,
+    pub keyword_score: f64,
+    pub temporal_score: f64,
+    pub confidence_score: f64,
+}
+
 /// Explain stats for retrieve/search — like SQL EXPLAIN ANALYZE.
 #[derive(Debug, Default, serde::Serialize)]
 pub struct RetrievalExplain {
+    pub level: ExplainLevel,
     pub path: &'static str,           // "vector", "fulltext", "graph", "graph+vector", "none"
     pub vector_attempted: bool,
     pub vector_hit: bool,
@@ -26,6 +68,9 @@ pub struct RetrievalExplain {
     pub fulltext_ms: f64,
     pub graph_ms: f64,
     pub total_ms: f64,
+    /// Per-candidate scores (Verbose/Analyze only)
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub candidate_scores: Vec<CandidateScore>,
 }
 
 pub struct MemoryService {
@@ -175,17 +220,22 @@ impl MemoryService {
     }
 
     pub async fn retrieve(&self, user_id: &str, query: &str, top_k: i64) -> Result<Vec<Memory>, MemoriaError> {
-        self.retrieve_inner(user_id, query, top_k).await.map(|(mems, _)| mems)
+        self.retrieve_inner(user_id, query, top_k, ExplainLevel::None).await.map(|(mems, _)| mems)
     }
 
-    /// Retrieve with optional explain stats.
+    /// Retrieve with explain stats at the given level.
     pub async fn retrieve_explain(&self, user_id: &str, query: &str, top_k: i64) -> Result<(Vec<Memory>, RetrievalExplain), MemoriaError> {
-        self.retrieve_inner(user_id, query, top_k).await
+        self.retrieve_inner(user_id, query, top_k, ExplainLevel::Basic).await
     }
 
-    async fn retrieve_inner(&self, user_id: &str, query: &str, top_k: i64) -> Result<(Vec<Memory>, RetrievalExplain), MemoriaError> {
+    /// Retrieve with explicit explain level (none/basic/verbose/analyze).
+    pub async fn retrieve_explain_level(&self, user_id: &str, query: &str, top_k: i64, level: ExplainLevel) -> Result<(Vec<Memory>, RetrievalExplain), MemoriaError> {
+        self.retrieve_inner(user_id, query, top_k, level).await
+    }
+
+    async fn retrieve_inner(&self, user_id: &str, query: &str, top_k: i64, level: ExplainLevel) -> Result<(Vec<Memory>, RetrievalExplain), MemoriaError> {
         let total_start = std::time::Instant::now();
-        let mut explain = RetrievalExplain::default();
+        let mut explain = RetrievalExplain { level, ..Default::default() };
 
         if let Some(sql) = &self.sql_store {
             let table = sql.active_table(user_id).await?;
@@ -242,7 +292,11 @@ impl MemoryService {
                         // Graph insufficient — supplement with hybrid
                         explain.vector_attempted = true;
                         let vs_start = std::time::Instant::now();
-                        let vec_results = sql.search_hybrid_from(&table, user_id, embedding, query, top_k).await?;
+                        let (vec_results, scores) = if level.at_least(ExplainLevel::Verbose) {
+                            sql.search_hybrid_from_scored(&table, user_id, embedding, query, top_k).await?
+                        } else {
+                            (sql.search_hybrid_from(&table, user_id, embedding, query, top_k).await?, vec![])
+                        };
                         explain.vector_ms = vs_start.elapsed().as_secs_f64() * 1000.0;
                         explain.vector_hit = !vec_results.is_empty();
 
@@ -259,6 +313,15 @@ impl MemoryService {
                         });
                         graph_memories.truncate(top_k as usize);
 
+                        if level.at_least(ExplainLevel::Verbose) {
+                            explain.candidate_scores = scores.into_iter().enumerate()
+                                .map(|(i, (id, vs, ks, ts, cs, fs))| CandidateScore {
+                                    memory_id: id, rank: i + 1,
+                                    final_score: round4(fs), vector_score: round4(vs),
+                                    keyword_score: round4(ks), temporal_score: round4(ts),
+                                    confidence_score: round4(cs),
+                                }).collect();
+                        }
                         explain.path = "graph+vector";
                         explain.result_count = graph_memories.len();
                         explain.total_ms = total_start.elapsed().as_secs_f64() * 1000.0;
@@ -279,10 +342,23 @@ impl MemoryService {
             if let Some(ref embedding) = emb {
                 explain.vector_attempted = true;
                 let vs_start = std::time::Instant::now();
-                let results = sql.search_hybrid_from(&table, user_id, embedding, query, top_k).await?;
+                let (results, scores) = if level.at_least(ExplainLevel::Verbose) {
+                    sql.search_hybrid_from_scored(&table, user_id, embedding, query, top_k).await?
+                } else {
+                    (sql.search_hybrid_from(&table, user_id, embedding, query, top_k).await?, vec![])
+                };
                 explain.vector_ms = vs_start.elapsed().as_secs_f64() * 1000.0;
                 if !results.is_empty() {
                     explain.vector_hit = true;
+                    if level.at_least(ExplainLevel::Verbose) {
+                        explain.candidate_scores = scores.into_iter().enumerate()
+                            .map(|(i, (id, vs, ks, ts, cs, fs))| CandidateScore {
+                                memory_id: id, rank: i + 1,
+                                final_score: round4(fs), vector_score: round4(vs),
+                                keyword_score: round4(ks), temporal_score: round4(ts),
+                                confidence_score: round4(cs),
+                            }).collect();
+                    }
                     explain.path = "hybrid";
                     explain.result_count = results.len();
                     explain.total_ms = total_start.elapsed().as_secs_f64() * 1000.0;
@@ -328,7 +404,11 @@ impl MemoryService {
     }
 
     pub async fn search_explain(&self, user_id: &str, query: &str, top_k: i64) -> Result<(Vec<Memory>, RetrievalExplain), MemoriaError> {
-        self.retrieve_explain(user_id, query, top_k).await
+        self.retrieve_inner(user_id, query, top_k, ExplainLevel::Basic).await
+    }
+
+    pub async fn search_explain_level(&self, user_id: &str, query: &str, top_k: i64, level: ExplainLevel) -> Result<(Vec<Memory>, RetrievalExplain), MemoriaError> {
+        self.retrieve_inner(user_id, query, top_k, level).await
     }
 
     pub async fn correct(&self, memory_id: &str, new_content: &str) -> Result<Memory, MemoriaError> {

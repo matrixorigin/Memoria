@@ -80,8 +80,9 @@ pub async fn retrieve(
     AuthUser(user_id): AuthUser,
     Json(req): Json<RetrieveRequest>,
 ) -> ApiResult<serde_json::Value> {
-    if req.explain {
-        let (results, explain) = state.service.retrieve_explain(&user_id, &req.query, req.top_k).await.map_err(api_err)?;
+    let level = memoria_service::ExplainLevel::from_str_or_bool(&req.explain);
+    if level != memoria_service::ExplainLevel::None {
+        let (results, explain) = state.service.retrieve_explain_level(&user_id, &req.query, req.top_k, level).await.map_err(api_err)?;
         let items: Vec<MemoryResponse> = results.into_iter().map(Into::into).collect();
         Ok(Json(serde_json::json!({"results": items, "explain": explain})))
     } else {
@@ -95,8 +96,9 @@ pub async fn search(
     AuthUser(user_id): AuthUser,
     Json(req): Json<RetrieveRequest>,
 ) -> ApiResult<serde_json::Value> {
-    if req.explain {
-        let (results, explain) = state.service.search_explain(&user_id, &req.query, req.top_k).await.map_err(api_err)?;
+    let level = memoria_service::ExplainLevel::from_str_or_bool(&req.explain);
+    if level != memoria_service::ExplainLevel::None {
+        let (results, explain) = state.service.search_explain_level(&user_id, &req.query, req.top_k, level).await.map_err(api_err)?;
         let items: Vec<MemoryResponse> = results.into_iter().map(Into::into).collect();
         Ok(Json(serde_json::json!({"results": items, "explain": explain})))
     } else {
