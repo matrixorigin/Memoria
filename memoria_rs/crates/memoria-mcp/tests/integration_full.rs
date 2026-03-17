@@ -32,7 +32,7 @@ async fn setup() -> (Arc<MemoryService>, Arc<GitForDataService>, String) {
     let store = SqlMemoryStore::connect(&db_url(), test_dim()).await.expect("store");
     store.migrate().await.expect("migrate");
     let git = Arc::new(GitForDataService::new(pool, &db_name));
-    let svc = Arc::new(MemoryService::new_sql(Arc::new(store), None));
+    let svc = Arc::new(MemoryService::new_sql_with_llm(Arc::new(store), None, None));
     let uid = format!("integ_{}", &Uuid::new_v4().simple().to_string()[..8]);
     (svc, git, uid)
 }

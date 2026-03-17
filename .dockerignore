@@ -1,11 +1,5 @@
-__pycache__/
-*.pyc
-*.pyo
-.pytest_cache/
-.git/
 data/
-*.egg-info/
-dist/
-build/
+memoria_rs/target/
+.git/
 .env
-.env.*
+*.md

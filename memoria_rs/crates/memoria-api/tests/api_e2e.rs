@@ -16,6 +16,22 @@ fn uid() -> String {
     format!("api_test_{}", uuid::Uuid::new_v4().simple())
 }
 
+/// Returns LlmClient if LLM_API_KEY is set, else None.
+fn try_llm() -> Option<Arc<memoria_embedding::LlmClient>> {
+    let key = std::env::var("LLM_API_KEY").ok().filter(|s| !s.is_empty())?;
+    let base = std::env::var("LLM_BASE_URL").unwrap_or_else(|_| "https://api.openai.com/v1".into());
+    let model = std::env::var("LLM_MODEL").unwrap_or_else(|_| "gpt-4o-mini".into());
+    Some(Arc::new(memoria_embedding::LlmClient::new(key, base, model)))
+}
+
+/// Returns (key, base_url, model) if EMBEDDING_API_KEY is set, else None.
+fn try_embedding() -> Option<(String, String, String)> {
+    let key = std::env::var("EMBEDDING_API_KEY").ok().filter(|s| !s.is_empty())?;
+    let base = std::env::var("EMBEDDING_BASE_URL").unwrap_or_else(|_| "https://api.siliconflow.cn/v1".into());
+    let model = std::env::var("EMBEDDING_MODEL").unwrap_or_else(|_| "BAAI/bge-m3".into());
+    Some((key, base, model))
+}
+
 /// Spawn the API server on a random port, return (base_url, client).
 async fn spawn_server() -> (String, reqwest::Client) {
     use memoria_git::GitForDataService;
@@ -30,7 +46,7 @@ async fn spawn_server() -> (String, reqwest::Client) {
     store.migrate().await.expect("migrate");
     let pool = MySqlPool::connect(&db).await.expect("pool");
     let git = Arc::new(GitForDataService::new(pool, &cfg.db_name));
-    let service = Arc::new(MemoryService::new_sql(Arc::new(store), None));
+    let service = Arc::new(MemoryService::new_sql_with_llm(Arc::new(store), None, None));
     let state = memoria_api::AppState::new(service, git, String::new());
 
     let app = memoria_api::build_router(state);
@@ -254,7 +270,7 @@ async fn spawn_server_with_master_key(master_key: &str) -> (String, reqwest::Cli
     store.migrate().await.expect("migrate");
     let pool = MySqlPool::connect(&db).await.expect("pool");
     let git = Arc::new(GitForDataService::new(pool, &cfg.db_name));
-    let service = Arc::new(MemoryService::new_sql(Arc::new(store), None));
+    let service = Arc::new(MemoryService::new_sql_with_llm(Arc::new(store), None, None));
     let state = memoria_api::AppState::new(service, git, master_key.to_string());
     let app = memoria_api::build_router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -899,11 +915,10 @@ async fn test_governance_pollution_detection() {
 
 #[tokio::test]
 async fn test_reflect_with_llm() {
-    let llm_key = match std::env::var("LLM_API_KEY").ok().filter(|s| !s.is_empty()) {
-        Some(k) => k,
-        None => { println!("⏭️  test_reflect_with_llm skipped (LLM_API_KEY not set)"); return; }
+    let Some(llm) = try_llm() else {
+        println!("⏭️  test_reflect_with_llm skipped (LLM_API_KEY not set)"); return;
     };
-    let (base, client) = spawn_server_with_llm(llm_key).await;
+    let (base, client) = spawn_server_with_llm(llm).await;
     let uid = uid();
 
     for content in ["Project uses Rust for all backend services", "MatrixOne is the primary database", "Team deploys with Docker Compose"] {
@@ -925,11 +940,10 @@ async fn test_reflect_with_llm() {
 
 #[tokio::test]
 async fn test_extract_entities_with_llm() {
-    let llm_key = match std::env::var("LLM_API_KEY").ok().filter(|s| !s.is_empty()) {
-        Some(k) => k,
-        None => { println!("⏭️  test_extract_entities_with_llm skipped (LLM_API_KEY not set)"); return; }
+    let Some(llm) = try_llm() else {
+        println!("⏭️  test_extract_entities_with_llm skipped (LLM_API_KEY not set)"); return;
     };
-    let (base, client) = spawn_server_with_llm(llm_key).await;
+    let (base, client) = spawn_server_with_llm(llm).await;
     let uid = uid();
 
     client.post(format!("{base}/v1/memories"))
@@ -1016,12 +1030,11 @@ async fn test_episodic_no_llm_returns_503() {
     println!("✅ episodic without LLM: 503 SERVICE_UNAVAILABLE");
 }
 
-async fn spawn_server_with_llm(llm_key: String) -> (String, reqwest::Client) {
+async fn spawn_server_with_llm(llm: Arc<memoria_embedding::LlmClient>) -> (String, reqwest::Client) {
     use memoria_git::GitForDataService;
     use memoria_service::{Config, MemoryService};
     use memoria_storage::SqlMemoryStore;
     use sqlx::mysql::MySqlPool;
-    use memoria_embedding::LlmClient;
 
     let cfg = Config::from_env();
     let db = db_url();
@@ -1029,9 +1042,6 @@ async fn spawn_server_with_llm(llm_key: String) -> (String, reqwest::Client) {
     store.migrate().await.expect("migrate");
     let pool = MySqlPool::connect(&db).await.expect("pool");
     let git = Arc::new(GitForDataService::new(pool, &cfg.db_name));
-    let base_url = std::env::var("LLM_BASE_URL").unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
-    let model = std::env::var("LLM_MODEL").unwrap_or_else(|_| "gpt-4o-mini".to_string());
-    let llm = Arc::new(LlmClient::new(llm_key, base_url, model));
     let service = Arc::new(MemoryService::new_sql_with_llm(Arc::new(store), None, Some(llm)));
     let state = memoria_api::AppState::new(service, git, String::new());
     let app = memoria_api::build_router(state);
@@ -1043,7 +1053,7 @@ async fn spawn_server_with_llm(llm_key: String) -> (String, reqwest::Client) {
     (format!("http://127.0.0.1:{port}"), client)
 }
 
-async fn spawn_server_with_embedding(emb_key: String) -> (String, reqwest::Client) {
+async fn spawn_server_with_embedding(emb_key: String, base_url: String, model: String) -> (String, reqwest::Client) {
     use memoria_git::GitForDataService;
     use memoria_service::{Config, MemoryService};
     use memoria_storage::SqlMemoryStore;
@@ -1056,12 +1066,8 @@ async fn spawn_server_with_embedding(emb_key: String) -> (String, reqwest::Clien
     store.migrate().await.expect("migrate");
     let pool = MySqlPool::connect(&db).await.expect("pool");
     let git = Arc::new(GitForDataService::new(pool, &cfg.db_name));
-    let base_url = std::env::var("EMBEDDING_BASE_URL")
-        .unwrap_or_else(|_| "https://api.siliconflow.cn/v1".to_string());
-    let model = std::env::var("EMBEDDING_MODEL")
-        .unwrap_or_else(|_| "BAAI/bge-m3".to_string());
     let embedder = Arc::new(HttpEmbedder::new(base_url, emb_key, model, 1024));
-    let service = Arc::new(MemoryService::new_sql(Arc::new(store), Some(embedder)));
+    let service = Arc::new(MemoryService::new_sql_with_llm(Arc::new(store), Some(embedder), None));
     let state = memoria_api::AppState::new(service, git, String::new());
     let app = memoria_api::build_router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1075,15 +1081,12 @@ async fn spawn_server_with_embedding(emb_key: String) -> (String, reqwest::Clien
 #[tokio::test]
 async fn test_episodic_no_memories_returns_error() {
     // This test requires LLM — skip if not configured
-    let llm_key = match std::env::var("LLM_API_KEY").ok().filter(|s| !s.is_empty()) {
-        Some(k) => k,
-        None => {
-            println!("⏭️  test_episodic_no_memories skipped (LLM_API_KEY not set)");
-            return;
-        }
+    let Some(llm) = try_llm() else {
+        println!("⏭️  test_episodic_no_memories skipped (LLM_API_KEY not set)");
+        return;
     };
 
-    let (base, client) = spawn_server_with_llm(llm_key).await;
+    let (base, client) = spawn_server_with_llm(llm).await;
     let uid = uid();
 
     // No memories for this session → 500
@@ -1113,15 +1116,12 @@ async fn test_episodic_async_task_polling() {
 
 #[tokio::test]
 async fn test_episodic_with_llm_sync() {
-    let llm_key = match std::env::var("LLM_API_KEY").ok().filter(|s| !s.is_empty()) {
-        Some(k) => k,
-        None => {
-            println!("⏭️  test_episodic_with_llm_sync skipped (LLM_API_KEY not set)");
-            return;
-        }
+    let Some(llm) = try_llm() else {
+        println!("⏭️  test_episodic_with_llm_sync skipped (LLM_API_KEY not set)");
+        return;
     };
 
-    let (base, client) = spawn_server_with_llm(llm_key).await;
+    let (base, client) = spawn_server_with_llm(llm).await;
     let uid = uid();
     let session_id = format!("ep_sess_{}", uuid::Uuid::new_v4().simple().to_string()[..8].to_string());
 
@@ -1360,11 +1360,10 @@ async fn test_retrieve_with_explain() {
 
 #[tokio::test]
 async fn test_explain_verbose_candidate_scores() {
-    let emb_key = match std::env::var("EMBEDDING_API_KEY").ok().filter(|s| !s.is_empty()) {
-        Some(k) => k,
-        None => { println!("⏭️  test_explain_verbose_candidate_scores skipped (EMBEDDING_API_KEY not set)"); return; }
+    let Some((key, base_url, model)) = try_embedding() else {
+        println!("⏭️  test_explain_verbose_candidate_scores skipped (EMBEDDING_API_KEY not set)"); return;
     };
-    let (base, client) = spawn_server_with_embedding(emb_key).await;
+    let (base, client) = spawn_server_with_embedding(key, base_url, model).await;
     let uid = uid();
 
     // Store a few memories
@@ -1858,11 +1857,10 @@ async fn test_batch_store_sensitivity_filter() {
 
 #[tokio::test]
 async fn test_batch_store_with_embedding() {
-    let emb_key = match std::env::var("EMBEDDING_API_KEY").ok().filter(|s| !s.is_empty()) {
-        Some(k) => k,
-        None => { println!("⏭️  test_batch_store_with_embedding skipped (EMBEDDING_API_KEY not set)"); return; }
+    let Some((key, base_url, model)) = try_embedding() else {
+        println!("⏭️  test_batch_store_with_embedding skipped (EMBEDDING_API_KEY not set)"); return;
     };
-    let (base, client) = spawn_server_with_embedding(emb_key).await;
+    let (base, client) = spawn_server_with_embedding(key, base_url, model).await;
     let uid = uid();
 
     // Batch store 5 items — should use embed_batch (single API call)
@@ -1900,7 +1898,6 @@ async fn test_batch_store_with_embedding() {
 
 #[tokio::test]
 async fn test_remote_admin_list_revoke_keys() {
-    use memoria_mcp::remote::RemoteClient;
     let mk = "test-mk-remote-keys";
     let (base, client) = spawn_server_with_master_key(mk).await;
     let auth = format!("Bearer {mk}");

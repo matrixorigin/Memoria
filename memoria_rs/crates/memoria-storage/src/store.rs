@@ -80,6 +80,18 @@ impl SqlMemoryStore {
     }
 
     pub async fn connect(database_url: &str, embedding_dim: usize) -> Result<Self, MemoriaError> {
+        // Auto-create database if it doesn't exist
+        if let Some((base_url, db_name)) = database_url.rsplit_once('/') {
+            if !db_name.is_empty() {
+                let base_pool = sqlx::mysql::MySqlPoolOptions::new()
+                    .max_connections(1)
+                    .connect(base_url).await;
+                if let Ok(base_pool) = base_pool {
+                    let _ = sqlx::query(&format!("CREATE DATABASE IF NOT EXISTS {db_name}"))
+                        .execute(&base_pool).await;
+                }
+            }
+        }
         let pool = sqlx::mysql::MySqlPoolOptions::new()
             .max_connections(10)
             .idle_timeout(std::time::Duration::from_secs(300))
@@ -185,6 +197,36 @@ impl SqlMemoryStore {
                 .execute(&self.pool).await;
             let _ = sqlx::query("ALTER TABLE mem_memories ADD INDEX idx_user_active (user_id, is_active, memory_type)")
                 .execute(&self.pool).await;
+        }
+
+        // Migration: mem_branches may lack table_name column (old schema)
+        let has_table_name: bool = sqlx::query_scalar(
+            "SELECT COUNT(*) > 0 FROM information_schema.columns \
+             WHERE table_schema = DATABASE() AND table_name = 'mem_branches' AND column_name = 'table_name'"
+        ).fetch_one(&self.pool).await.unwrap_or(false);
+        if !has_table_name {
+            let _ = sqlx::query("ALTER TABLE mem_branches ADD COLUMN table_name VARCHAR(100) NOT NULL DEFAULT ''")
+                .execute(&self.pool).await;
+        }
+
+        // Migration: mem_branches old schema used branch_id/branch_db — recreate with new schema
+        let has_id: bool = sqlx::query_scalar(
+            "SELECT COUNT(*) > 0 FROM information_schema.columns \
+             WHERE table_schema = DATABASE() AND table_name = 'mem_branches' AND column_name = 'id'"
+        ).fetch_one(&self.pool).await.unwrap_or(false);
+        if !has_id {
+            let _ = sqlx::query("DROP TABLE IF EXISTS mem_branches").execute(&self.pool).await;
+            sqlx::query(
+                r#"CREATE TABLE IF NOT EXISTS mem_branches (
+                    id          VARCHAR(64)  PRIMARY KEY,
+                    user_id     VARCHAR(64)  NOT NULL,
+                    name        VARCHAR(100) NOT NULL,
+                    table_name  VARCHAR(100) NOT NULL,
+                    status      VARCHAR(20)  NOT NULL DEFAULT 'active',
+                    created_at  DATETIME(6)  NOT NULL,
+                    INDEX idx_user_name (user_id, name)
+                )"#,
+            ).execute(&self.pool).await.map_err(db_err)?;
         }
 
         Ok(())

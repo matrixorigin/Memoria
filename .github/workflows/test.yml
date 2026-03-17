@@ -1,175 +1,73 @@
-name: Test & Lint
+name: Test
 
 on:
   push:
     branches: [main, develop]
   pull_request:
     branches: [main, develop]
-    types: [opened, synchronize]
 
 env:
-  MEMORIA_MASTER_KEY: ci-master-key-memoria-test
-  MEMORIA_EMBEDDING_PROVIDER: openai
-  MEMORIA_EMBEDDING_MODEL: ${{ vars.EMBEDDING_MODEL || 'BAAI/bge-m3' }}
-  MEMORIA_EMBEDDING_DIM: ${{ vars.EMBEDDING_DIM || '1024' }}
-  MEMORIA_EMBEDDING_API_KEY: ${{ secrets.EMBEDDING_API_KEY }}
-  MEMORIA_EMBEDDING_BASE_URL: ${{ vars.EMBEDDING_BASE_URL || '' }}
+  CARGO_TERM_COLOR: always
+  SQLX_OFFLINE: "true"
+  DATABASE_URL: mysql://root:111@localhost:6001/memoria_test
+  EMBEDDING_API_KEY: ${{ secrets.EMBEDDING_API_KEY }}
+  EMBEDDING_BASE_URL: ${{ vars.EMBEDDING_BASE_URL || '' }}
+  EMBEDDING_MODEL: ${{ vars.EMBEDDING_MODEL || 'BAAI/bge-m3' }}
+  EMBEDDING_DIM: ${{ vars.EMBEDDING_DIM || '1024' }}
+  LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+  LLM_BASE_URL: ${{ vars.LLM_BASE_URL || '' }}
+  LLM_MODEL: ${{ vars.LLM_MODEL || '' }}
 
 jobs:
-  lint:
-    name: Lint & Type Check
+  check:
+    name: Check & Clippy
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          python-version: "3.11"
-
-      - uses: actions/cache@v4
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
         with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-check-${{ hashFiles('pyproject.toml') }}
-          restore-keys: ${{ runner.os }}-pip-check-
+          workspaces: memoria_rs
+      - name: Check
+        run: cd memoria_rs && cargo check
+      - name: Clippy
+        run: cd memoria_rs && cargo clippy -- -D warnings
 
-      - name: Install dependencies
-        run: pip install -e ".[dev]"
-
-      - name: Lint & format check
-        run: make lint
-
-      - name: Type check
-        run: make type-check
-
-  test:
-    name: Unit & Integration Tests
+  test-unit:
+    name: Unit Tests
     runs-on: ubuntu-latest
-    needs: lint
     steps:
       - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
         with:
-          python-version: '3.11'
+          workspaces: memoria_rs
+      - name: Unit tests
+        run: cd memoria_rs && cargo test --lib -p memoria-core -p memoria-service -p memoria-mcp
 
-      - uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('pyproject.toml') }}
-          restore-keys: ${{ runner.os }}-pip-
-
-      - name: Cache MatrixOne image
-        id: mo-cache
-        uses: actions/cache@v4
-        with:
-          path: /tmp/matrixone.tar
-          key: docker-matrixone-${{ env.MATRIXONE_IMAGE }}-${{ steps.date.outputs.date }}
-        env:
-          MATRIXONE_IMAGE: matrixorigin/matrixone:latest
-
-      - name: Get date for cache key
-        id: date
-        run: echo "date=$(date +%Y-%m-%d)" >> $GITHUB_OUTPUT
-
-      - name: Load cached image
-        if: steps.mo-cache.outputs.cache-hit == 'true'
-        run: docker load -i /tmp/matrixone.tar
-
-      - name: Pull and save image
-        if: steps.mo-cache.outputs.cache-hit != 'true'
-        run: |
-          docker pull matrixorigin/matrixone:latest
-          docker save matrixorigin/matrixone:latest -o /tmp/matrixone.tar
-
-      - name: Start MatrixOne
-        run: |
-          docker run -d --name matrixone -p 6001:6001 --memory=2g matrixorigin/matrixone:latest
-          for i in $(seq 1 18); do
-            bash -c 'echo > /dev/tcp/127.0.0.1/6001' 2>/dev/null && break
-            echo "Waiting for MatrixOne... ($i/18)"
-            sleep 5
-          done
-
-      - name: Install dependencies
-        run: pip install -e ".[dev,openai-embedding]"
-
-      - name: Run tests
-        run: make test
-
-  docker:
-    name: Docker Integration Tests
+  test-db:
+    name: DB Tests
     runs-on: ubuntu-latest
-    needs: test
+    needs: [check, test-unit]
+    services:
+      matrixone:
+        image: matrixorigin/matrixone:latest
+        ports:
+          - 6001:6001
+        options: --memory=2g
     steps:
       - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
         with:
-          python-version: '3.11'
-
-      - uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('pyproject.toml') }}
-          restore-keys: ${{ runner.os }}-pip-
-
-      - name: Cache MatrixOne image
-        id: mo-cache
-        uses: actions/cache@v4
-        with:
-          path: /tmp/matrixone.tar
-          key: docker-matrixone-${{ env.MATRIXONE_IMAGE }}-${{ steps.date.outputs.date }}
-        env:
-          MATRIXONE_IMAGE: matrixorigin/matrixone:latest
-
-      - name: Get date for cache key
-        id: date
-        run: echo "date=$(date +%Y-%m-%d)" >> $GITHUB_OUTPUT
-
-      - name: Load cached image
-        if: steps.mo-cache.outputs.cache-hit == 'true'
-        run: docker load -i /tmp/matrixone.tar
-
-      - name: Pull and save image
-        if: steps.mo-cache.outputs.cache-hit != 'true'
-        run: |
-          docker pull matrixorigin/matrixone:latest
-          docker save matrixorigin/matrixone:latest -o /tmp/matrixone.tar
-
-      - name: Install dependencies
-        run: pip install -e ".[dev,openai-embedding]"
-
-      - name: Create .env
-        run: |
-          cat > .env << EOF
-          MEMORIA_MASTER_KEY=ci-master-key-memoria-test
-          MEMORIA_EMBEDDING_PROVIDER=openai
-          MEMORIA_EMBEDDING_MODEL=${{ vars.EMBEDDING_MODEL || 'BAAI/bge-m3' }}
-          MEMORIA_EMBEDDING_DIM=${{ vars.EMBEDDING_DIM || '1024' }}
-          MEMORIA_EMBEDDING_API_KEY=${{ secrets.EMBEDDING_API_KEY }}
-          MEMORIA_EMBEDDING_BASE_URL=${{ vars.EMBEDDING_BASE_URL || '' }}
-          EOF
-
-      - name: Build and start services
-        run: make start
-
-      - name: Wait for API
+          workspaces: memoria_rs
+      - name: Wait for MatrixOne
         run: |
           for i in $(seq 1 30); do
-            curl -sf --noproxy localhost http://localhost:8100/health && break
-            echo "Waiting... ($i/30)"
-            sleep 3
+            bash -c 'echo > /dev/tcp/127.0.0.1/6001' 2>/dev/null && break
+            echo "Waiting... ($i/30)" && sleep 3
           done
-
-      - name: Run Docker tests
-        env:
-          MEMORIA_URL: http://localhost:8100
-        run: make test-docker
-
-      - name: Logs on failure
-        if: failure()
-        run: docker compose logs
-
-      - name: Stop services
-        if: always()
-        run: make stop
+      - name: All tests
+        run: cd memoria_rs && cargo test -- --test-threads=1

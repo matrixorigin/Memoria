@@ -22,10 +22,18 @@ fn db_url() -> String {
 }
 fn uid() -> String { format!("ct_{}", &Uuid::new_v4().simple().to_string()[..8]) }
 
+/// Returns LlmClient if LLM_API_KEY is set, else None.
+fn try_llm() -> Option<Arc<memoria_embedding::LlmClient>> {
+    let key = std::env::var("LLM_API_KEY").ok().filter(|s| !s.is_empty())?;
+    let base = std::env::var("LLM_BASE_URL").unwrap_or_else(|_| "https://api.openai.com/v1".into());
+    let model = std::env::var("LLM_MODEL").unwrap_or_else(|_| "gpt-4o-mini".into());
+    Some(Arc::new(memoria_embedding::LlmClient::new(key, base, model)))
+}
+
 async fn setup() -> (Arc<MemoryService>, String) {
     let store = SqlMemoryStore::connect(&db_url(), test_dim()).await.expect("connect");
     store.migrate().await.expect("migrate");
-    let svc = Arc::new(MemoryService::new_sql(Arc::new(store), None));
+    let svc = Arc::new(MemoryService::new_sql_with_llm(Arc::new(store), None, None));
     (svc, uid())
 }
 
@@ -590,21 +598,12 @@ async fn test_extract_entities_internal_no_llm_returns_error() {
 
 #[tokio::test]
 async fn test_reflect_with_llm_if_configured() {
-    let llm_key = match std::env::var("LLM_API_KEY").ok().filter(|s| !s.is_empty()) {
-        Some(k) => k,
-        None => {
-            println!("⏭️  test_reflect_with_llm skipped (LLM_API_KEY not set)");
-            return;
-        }
+    let Some(llm) = try_llm() else {
+        println!("⏭️  test_reflect_with_llm skipped (LLM_API_KEY not set)");
+        return;
     };
-    let base_url = std::env::var("LLM_BASE_URL")
-        .unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
-    let model = std::env::var("LLM_MODEL")
-        .unwrap_or_else(|_| "gpt-4o-mini".to_string());
-    let llm = Arc::new(memoria_embedding::LlmClient::new(llm_key, base_url, model));
     let (svc, uid) = setup_with_llm(Some(llm)).await;
 
-    // Store memories across two sessions
     for i in 0..4 {
         let sid = if i < 2 { "llm_s1" } else { "llm_s2" };
         call("memory_store", json!({
@@ -615,7 +614,6 @@ async fn test_reflect_with_llm_if_configured() {
 
     let r = call("memory_reflect", json!({"mode": "auto", "force": true}), &svc, &uid).await;
     let t = text(&r);
-    // With LLM: should either create scenes or return candidates
     assert!(
         t.contains("scenes_created") || t.contains("cluster") || t.contains("No memory"),
         "with LLM should return reflect result, got: {t}"
@@ -627,18 +625,10 @@ async fn test_reflect_with_llm_if_configured() {
 
 #[tokio::test]
 async fn test_extract_entities_with_llm_if_configured() {
-    let llm_key = match std::env::var("LLM_API_KEY").ok().filter(|s| !s.is_empty()) {
-        Some(k) => k,
-        None => {
-            println!("⏭️  test_extract_entities_with_llm skipped (LLM_API_KEY not set)");
-            return;
-        }
+    let Some(llm) = try_llm() else {
+        println!("⏭️  test_extract_entities_with_llm skipped (LLM_API_KEY not set)");
+        return;
     };
-    let base_url = std::env::var("LLM_BASE_URL")
-        .unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
-    let model = std::env::var("LLM_MODEL")
-        .unwrap_or_else(|_| "gpt-4o-mini".to_string());
-    let llm = Arc::new(memoria_embedding::LlmClient::new(llm_key, base_url, model));
     let (svc, uid) = setup_with_llm(Some(llm)).await;
 
     call("memory_store", json!({"content": "Project uses Rust and MatrixOne database"}), &svc, &uid).await;

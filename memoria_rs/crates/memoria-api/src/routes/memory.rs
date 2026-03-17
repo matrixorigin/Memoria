@@ -377,7 +377,7 @@ pub async fn run_pipeline(
 ) -> ApiResult<serde_json::Value> {
     use memoria_service::MemoryPipeline;
     use crate::models::{parse_memory_type, parse_trust_tier};
-    use memoria_core::{MemoryType, TrustTier};
+    use memoria_core::MemoryType;
 
     let candidates = req.candidates.into_iter().map(|c| {
         let mt = c.memory_type.as_deref()

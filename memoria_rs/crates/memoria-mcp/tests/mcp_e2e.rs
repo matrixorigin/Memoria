@@ -147,7 +147,7 @@ async fn make_git_service() -> (Arc<MemoryService>, Arc<memoria_git::GitForDataS
     let pool = sqlx::mysql::MySqlPool::connect(&db_url).await.expect("pool");
     let db_name = db_url.rsplit('/').next().unwrap_or("memoria_rs");
     let git = Arc::new(memoria_git::GitForDataService::new(pool, db_name));
-    let svc = Arc::new(MemoryService::new_sql(Arc::new(store), embedder));
+    let svc = Arc::new(MemoryService::new_sql_with_llm(Arc::new(store), embedder, None));
     let uid = format!("e2e_{}", Uuid::new_v4().simple());
     (svc, git, uid)
 }

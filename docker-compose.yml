@@ -1,11 +1,7 @@
 # Memoria — All-in-One
 #
-# Build context is the project root (Memoria depends on core/ and api/ shared files).
-# Both invocation styles work — context: .. is always relative to this file's location.
-#
 # Usage:
-#   cd memoria && docker compose up -d
-#   # or: docker compose -f memoria/docker-compose.yml up -d
+#   docker compose up -d
 
 services:
 
@@ -27,7 +23,6 @@ services:
         condition: service_completed_successfully
     ports:
       - "${MATRIXONE_PORT:-6001}:6001"
-      # Debug HTTP port (pprof) — disabled by default, set MATRIXONE_DEBUG_PORT to enable
       - "${MATRIXONE_DEBUG_PORT:-}:6060"
     volumes:
       - ${MATRIXONE_DATA_DIR:-./data/matrixone}:/mo-data
@@ -46,47 +41,12 @@ services:
   api:
     build:
       context: .
-      dockerfile: Dockerfile
-      args:
-        # Set INSTALL_EXTRAS=local-embedding to bundle sentence-transformers (~500MB).
-        # Default is empty — use an external embedding provider via MEMORIA_EMBEDDING_* env vars.
-        INSTALL_EXTRAS: ${INSTALL_EXTRAS:-}
+      dockerfile: memoria_rs/Dockerfile
     hostname: memoria-api
     ports:
       - "${API_PORT:-8100}:8100"
     environment:
-      - MEMORIA_DB_HOST=matrixone
-      - MEMORIA_DB_PORT=6001
-      - MEMORIA_DB_USER=${MEMORIA_DB_USER:-root}
-      - MEMORIA_DB_PASSWORD=${MEMORIA_DB_PASSWORD:-111}
-      - MEMORIA_DB_NAME=${MEMORIA_DB_NAME:-memoria}
-      - MEMORIA_MASTER_KEY=${MEMORIA_MASTER_KEY:?Set MEMORIA_MASTER_KEY in .env (min 16 chars)}
-      - MEMORIA_EMBEDDING_PROVIDER=${MEMORIA_EMBEDDING_PROVIDER:-local}
-      - MEMORIA_EMBEDDING_MODEL=${MEMORIA_EMBEDDING_MODEL:-all-MiniLM-L6-v2}
-      - MEMORIA_EMBEDDING_API_KEY=${MEMORIA_EMBEDDING_API_KEY:-}
-      - MEMORIA_EMBEDDING_BASE_URL=${MEMORIA_EMBEDDING_BASE_URL:-}
-      # Rate limits — override for testing: MEMORIA_RATE_LIMIT_AUTH_KEYS=1000,60
-      - MEMORIA_RATE_LIMIT_AUTH_KEYS=${MEMORIA_RATE_LIMIT_AUTH_KEYS:-20,60}
-      - MEMORIA_RATE_LIMIT_DEFAULT=${MEMORIA_RATE_LIMIT_DEFAULT:-1000,60}
-      - MEMORIA_LLM_API_KEY=${MEMORIA_LLM_API_KEY:-}
-      - MEMORIA_LLM_BASE_URL=${MEMORIA_LLM_BASE_URL:-}
-      - MEMORIA_LLM_MODEL=${MEMORIA_LLM_MODEL:-gpt-4o-mini}
-    depends_on:
-      matrixone:
-        condition: service_healthy
-    networks:
-      - memoria-net
-    restart: unless-stopped
-
-  api-rs:
-    build:
-      context: .
-      dockerfile: memoria_rs/Dockerfile
-    hostname: memoria-api-rs
-    ports:
-      - "${API_RS_PORT:-8200}:8100"
-    environment:
-      - DATABASE_URL=mysql://root:${MEMORIA_DB_PASSWORD:-111}@matrixone:6001/${MEMORIA_RS_DB_NAME:-memoria_rs}
+      - DATABASE_URL=mysql://root:${MEMORIA_DB_PASSWORD:-111}@matrixone:6001/${MEMORIA_DB_NAME:-memoria}
       - MASTER_KEY=${MEMORIA_MASTER_KEY:?Set MEMORIA_MASTER_KEY in .env (min 16 chars)}
       - EMBEDDING_PROVIDER=${MEMORIA_EMBEDDING_PROVIDER:-openai}
       - EMBEDDING_MODEL=${MEMORIA_EMBEDDING_MODEL:-BAAI/bge-m3}

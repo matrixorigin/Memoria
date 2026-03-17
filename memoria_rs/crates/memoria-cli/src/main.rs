@@ -4,6 +4,9 @@
 ///   memoria-rs init       — detect tools, write MCP config + steering rules
 ///   memoria-rs status     — show configuration status
 ///   memoria-rs update-rules — update steering rules to latest version
+///   memoria-rs benchmark  — run benchmark against a Memoria API server
+
+mod benchmark;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -360,40 +363,80 @@ fn cmd_update_rules(project_dir: &Path) {
 }
 
 fn cmd_benchmark(api_url: &str, token: &str, dataset: &str, out: Option<&str>, validate_only: bool) {
-    // Delegate to Python benchmark runner (benchmarks/run_rust.py)
-    // which uses the shared benchmark framework
-    let script = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../../benchmarks/run_rust.py");
-    if !script.exists() {
-        println!("Benchmark script not found: {}", script.display());
-        println!("Run from the Memoria project root.");
-        return;
-    }
-    let mut cmd = std::process::Command::new("python3");
-    cmd.arg(&script);
+    // Resolve dataset path: try as-is, then benchmarks/datasets/{name}.json
+    let dataset_path = {
+        let p = Path::new(dataset);
+        if p.exists() { p.to_path_buf() }
+        else {
+            let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+            let candidates = [
+                manifest.join("../../../benchmarks/datasets").join(format!("{dataset}.json")),
+                manifest.join("../../../memoria/datasets").join(format!("{dataset}.json")),
+            ];
+            candidates.into_iter().find(|c| c.exists()).unwrap_or_else(|| {
+                eprintln!("Dataset not found: {dataset}");
+                eprintln!("Looked in: benchmarks/datasets/{dataset}.json");
+                std::process::exit(1);
+            })
+        }
+    };
+
+    let content = std::fs::read_to_string(&dataset_path).unwrap_or_else(|e| {
+        eprintln!("Failed to read {}: {e}", dataset_path.display());
+        std::process::exit(1);
+    });
+
     if validate_only {
-        // Validate-only: use the Python CLI's validate path
-        cmd.arg("--dataset").arg(dataset);
-        println!("Validating dataset: {dataset}");
-    } else {
-        cmd.arg("--api-url").arg(api_url)
-            .arg("--token").arg(token)
-            .arg("--dataset").arg(dataset);
-        if let Some(o) = out {
-            cmd.arg("--out").arg(o);
-        }
-    }
-    match cmd.status() {
-        Ok(status) => {
-            if !status.success() {
-                std::process::exit(status.code().unwrap_or(1));
-            }
-        }
-        Err(e) => {
-            println!("Failed to run benchmark: {e}");
-            println!("Ensure python3 and mo-memoria are installed.");
+        let errors = benchmark::validate_dataset(&content);
+        if errors.is_empty() {
+            println!("✅ Dataset is valid.");
+        } else {
+            println!("Validation failed ({} errors):", errors.len());
+            for e in &errors { println!("  ❌ {e}"); }
             std::process::exit(1);
         }
+        return;
+    }
+
+    let ds: benchmark::ScenarioDataset = serde_json::from_str(&content).unwrap_or_else(|e| {
+        eprintln!("Failed to parse dataset: {e}");
+        std::process::exit(1);
+    });
+    println!("Dataset: {} {} ({} scenarios)", ds.dataset_id, ds.version, ds.scenarios.len());
+
+    let executor = benchmark::BenchmarkExecutor::new(api_url, token);
+    let mut executions = std::collections::HashMap::new();
+
+    for scenario in &ds.scenarios {
+        print!("  Running {}...", scenario.scenario_id);
+        let exec = executor.execute(scenario);
+        let result = benchmark::score_scenario(scenario, &exec);
+        let icon = match result.grade.as_str() { "S" | "A" => "✅", "B" => "⚠️", _ => "❌" };
+        println!(" {icon} {:.1} ({})", result.total_score, result.grade);
+        executions.insert(scenario.scenario_id.clone(), exec);
+    }
+
+    let report = benchmark::score_dataset(&ds, &executions);
+    println!("\nOverall: {:.1} ({})", report.overall_score, report.overall_grade);
+    if !report.by_difficulty.is_empty() {
+        let mut items: Vec<_> = report.by_difficulty.iter().collect();
+        items.sort_by_key(|(k, _)| k.to_string());
+        print!("  By difficulty:");
+        for (k, v) in &items { print!(" {k}={v:.1}"); }
+        println!();
+    }
+    if !report.by_tag.is_empty() {
+        let mut items: Vec<_> = report.by_tag.iter().collect();
+        items.sort_by_key(|(k, _)| k.to_string());
+        print!("  By tag:");
+        for (k, v) in &items { print!(" {k}={v:.1}"); }
+        println!();
+    }
+
+    if let Some(path) = out {
+        let json = serde_json::to_string_pretty(&report).unwrap();
+        std::fs::write(path, &json).unwrap_or_else(|e| eprintln!("Failed to write {path}: {e}"));
+        println!("  Saved: {path}");
     }
 }
 

@@ -1,19 +1,9 @@
 # Data
 data/
 
-# Benchmark outputs (reports, results) — datasets are tracked
-/tmp/
+# Benchmark outputs
 benchmark-result*.json
 benchmark-*.html
-
-# Python
-__pycache__/
-*.pyc
-*.pyo
-*.egg-info/
-dist/
-build/
-.pytest_cache/
 
 # Environment
 .env
@@ -22,11 +12,8 @@ build/
 .vscode/
 .idea/
 
-.coverage
-
-# Kiro local settings (contains personal paths and tokens)
+# Kiro local settings
 .kiro/settings/mcp.json
-spacy_models/
 
 # Claude
 .claude
@@ -36,3 +23,15 @@ CLAUDE.md
 # Rust
 memoria_rs/target/
 memoria_rs/.env
+
+# Python (legacy)
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.coverage
+.mypy_cache/
+.ruff_cache/
+htmlcov/
