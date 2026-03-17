@@ -10,7 +10,7 @@
   [![Git for Data](https://img.shields.io/badge/Git%20for%20Data-Enabled-00A3CC?style=flat-square)](https://github.com/matrixorigin/matrixone)
   [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg?style=flat-square)](LICENSE)
   
-  [See It In Action](#see-it-in-action) · [Quick Start](#quick-start) · [Modifying Config](#modifying-the-mcp-config) · [Architecture](#architecture) · [API Reference](#api-reference) · [Why Memoria?](#why-memoria)
+  [Quick Start](#quick-start) · [Why Memoria?](#why-memoria) · [Architecture](#architecture) · [API Reference](#api-reference) · [Documentation](#documentation)
   
 </div>
 
@@ -76,6 +76,17 @@ graph TD
 
 ---
 
+## Documentation
+
+| Audience | Guide | Description |
+|----------|-------|-------------|
+| 📖 **Humans** | [User Guide](docs/user-guide.md) | Full setup, configuration, REST API, MCP config, examples |
+| 🤖 **AI Agents** | [Agent Integration Guide](docs/agent-integration-guide.md) | Step-by-step protocol for AI agents helping users install Memoria |
+| 🚀 **Operators** | [Deployment Guide](docs/deployment.md) | Docker Compose, env vars, security, production setup |
+| 📡 **Developers** | [API Reference](docs/api-reference.md) | REST API endpoints, request/response formats |
+
+---
+
 ## Why Memoria?
 
 | Capability | Memoria | Letta / Mem0 / Traditional RAG |
@@ -89,9 +100,73 @@ graph TD
 
 ---
 
+## Quick Start
+
+### 1. Start MatrixOne
+
+```bash
+git clone https://github.com/matrixorigin/Memoria.git
+cd Memoria
+docker compose up -d
+# Wait ~30-60s for first-time initialization
+```
+
+Don't want Docker? Use [MatrixOne Cloud](https://cloud.matrixorigin.cn) (free tier).
+
+### 2. Install Memoria
+
+Download from [GitHub Releases](https://github.com/matrixorigin/Memoria/releases):
+
+```bash
+# Linux (x86_64)
+curl -LO https://github.com/matrixorigin/Memoria/releases/latest/download/memoria-x86_64-unknown-linux-gnu.tar.gz
+tar xzf memoria-x86_64-unknown-linux-gnu.tar.gz
+sudo mv memoria /usr/local/bin/
+
+# macOS (Apple Silicon)
+curl -LO https://github.com/matrixorigin/Memoria/releases/latest/download/memoria-aarch64-apple-darwin.tar.gz
+tar xzf memoria-aarch64-apple-darwin.tar.gz
+sudo mv memoria /usr/local/bin/
+```
+
+### 3. Configure your AI tool
+
+```bash
+cd your-project
+memoria init    # auto-detects Kiro / Cursor / Claude, writes MCP config + steering rules
+```
+
+With an embedding service (recommended):
+```bash
+memoria init --embedding-provider openai \
+             --embedding-base-url https://api.siliconflow.cn/v1 \
+             --embedding-api-key sk-... \
+             --embedding-model BAAI/bge-m3 \
+             --embedding-dim 1024
+```
+
+Or connect to an existing Memoria server (no DB needed):
+```bash
+memoria init --api-url "https://your-server:8100" --token "sk-your-key..."
+```
+
+⚠️ **Configure embedding BEFORE the MCP server starts for the first time.** Tables are created on first startup with the configured dimension.
+
+### 4. Restart & verify
+
+Restart your AI tool, then ask: *"Do you have memory tools available?"*
+
+```bash
+memoria status   # check config files and rule versions
+```
+
+For detailed setup options, see the [User Guide](docs/user-guide.md).
+
+---
+
 ## See It In Action
 
-Here's a real setup conversation in Cursor — just tell the agent what you want, it handles the rest:
+A real setup conversation in Cursor — tell the agent what you want, it handles the rest:
 
 ```
 You:     I want to set up Memoria for persistent memory.
@@ -102,7 +177,7 @@ Cursor:  Before I start, a few quick questions:
            2. Do you have a MatrixOne database running? If not, I can start one with
               Docker, or you can use MatrixOne Cloud (free tier, no Docker needed).
            3. Do you have an embedding service? (OpenAI, SiliconFlow, Ollama, etc.)
-              If not, I'll use a local model — but it downloads ~900MB on first use.
+              If not, I can use a local model — requires building from source.
 
 You:     Cursor. No database yet. I have a SiliconFlow API key.
 
@@ -110,273 +185,13 @@ Cursor:  Got it. I'll start MatrixOne with Docker first — running:
 
            docker compose up -d
 
-You:     [output] Container memoria-matrixone started
+         ...
 
-Cursor:  MatrixOne is initializing, takes about 30 seconds on first start.
-         While we wait — what's your SiliconFlow API key and which model do you use?
-         (e.g. BAAI/bge-m3)
-
-You:     key is sk-xxxx, model BAAI/bge-m3
-
-Cursor:  Database is ready. Installing Memoria now:
-
-           pip install mo-memoria
-
-You:     [output] Successfully installed memoria-0.1.0
-
-Cursor:  Now I'll create the MCP config for Cursor. Edit .cursor/mcp.json:
-
-           {
-             "mcpServers": {
-               "memoria": {
-                 "command": "memoria",
-                 "args": ["mcp", "--db-url", "mysql+pymysql://root:111@localhost:6001/memoria",
-                          "--user", "alice"],
-                 "env": {
-                   "EMBEDDING_PROVIDER": "openai",
-                   "EMBEDDING_BASE_URL": "https://api.siliconflow.cn/v1",
-                   "EMBEDDING_API_KEY": "sk-xxxx",
-                   "EMBEDDING_MODEL": "BAAI/bge-m3",
-                   "EMBEDDING_DIM": "1024"
-                 }
-               }
-             }
-           }
-
-         Please restart Cursor to load the MCP server, then come back.
-
-You:     Restarted. Does it work?
-
-Cursor:  Let me check by calling memory_retrieve("test"):
-
-         ← No relevant memories found.
-
-         Everything looks good. Try telling me a preference — like your test framework
+Cursor:  Everything's configured. Try telling me a preference — like your test framework
          or code style — and I'll remember it across all future conversations.
 ```
 
----
-
-## Quick Start
-
-`memoria mcp` runs in two modes — pick one before starting:
-
-| | Embedded mode | Remote mode |
-|---|---|---|
-| **Flag** | `--db-url` | `--api-url` + `--token` |
-| **You run** | MatrixOne DB (Docker or cloud) | Nothing — connect to existing server |
-| **Embedding** | Configure in `env` block | Server handles it |
-| **When** | Personal setup, local dev, self-hosted | Team/SaaS — admin gives you a URL + token |
-
-### Prerequisites (embedded mode only)
-
-- Python 3.11+
-- [MatrixOne](https://github.com/matrixorigin/matrixone) database (local Docker or [cloud](https://cloud.matrixorigin.cn))
-
-### 1. Start MatrixOne (database)
-
-```bash
-git clone https://github.com/matrixorigin/Memoria.git
-cd Memoria
-docker compose up -d
-# Wait ~30-60s for first-time initialization
-```
-
-Or use `docker run` directly:
-```bash
-docker run -d --name matrixone -p 6001:6001 -v ./data/matrixone:/mo-data --memory=2g matrixorigin/matrixone:latest
-```
-
-See [docker-compose.yml](docker-compose.yml) for configuration options. Don't want Docker? Use [MatrixOne Cloud](https://cloud.matrixorigin.cn) (free tier).
-
-### 2. Install Memoria
-
-```bash
-pip install mo-memoria
-
-# Only needed if using local embedding model (no external API):
-pip install "mo-memoria[local-embedding]"    # Local sentence-transformers (~900MB download)
-
-# If no NVIDIA GPU available, install CPU-only PyTorch first to avoid large CUDA dependencies:
-pip install torch --index-url https://download.pytorch.org/whl/cpu
-pip install "mo-memoria[local-embedding]"
-```
-
-**⚠️ Configure embedding BEFORE the MCP server starts for the first time.** Tables are created on first startup with the configured embedding dimension. Changing it later requires re-creating the embedding column.
-
-### 3. Configure your AI tool
-
-Run `memoria init` in your project directory — it auto-detects Kiro / Cursor / Claude and writes the MCP config + steering rules:
-
-```bash
-cd your-project
-
-# Local DB (default)
-memoria init
-
-# With custom DB URL
-memoria init --db-url "mysql+pymysql://root:111@localhost:6001/memoria"
-
-# Remote Memoria server (SaaS / team deployment)
-memoria init --api-url "https://your-server:8100" --token "sk-your-key..."
-
-# With OpenAI-compatible embedding
-memoria init --embedding-provider openai \
-             --embedding-base-url https://api.siliconflow.cn/v1 \
-             --embedding-api-key sk-... \
-             --embedding-model BAAI/bge-m3 \
-             --embedding-dim 1024
-```
-
-This creates:
-- **Kiro**: `.kiro/settings/mcp.json` + `.kiro/steering/memory.md`
-- **Cursor**: `.cursor/mcp.json` + `.cursor/rules/memory.mdc`
-- **Claude**: `.mcp.json` + `CLAUDE.md`
-
-Then restart your AI tool — database tables are created automatically when the MCP server starts.
-
-### 4. Verify
-
-```bash
-memoria status   # check config files and rule versions
-```
-
-Or ask your AI tool: *"Do you have memory tools available?"* — it should list `memory_store`, `memory_retrieve`, etc.
-
----
-
-## Modifying the MCP Config
-
-`memoria init` generates the config once. To change settings afterwards, edit the config file directly:
-
-- **Kiro**: `.kiro/settings/mcp.json`
-- **Cursor**: `.cursor/mcp.json`
-- **Claude**: `.mcp.json`
-
-**Switch from local DB to remote server:**
-```json
-{
-  "mcpServers": {
-    "memoria": {
-      "command": "memoria",
-      "args": ["mcp", "--api-url", "https://your-server:8100", "--token", "sk-your-key..."]
-    }
-  }
-}
-```
-
-**Change embedding provider** (edit the `env` block):
-```json
-{
-  "mcpServers": {
-    "memoria": {
-      "command": "memoria",
-      "args": ["mcp", "--db-url", "mysql+pymysql://root:111@localhost:6001/memoria", "--user", "alice"],
-      "env": {
-        "EMBEDDING_PROVIDER": "openai",
-        "EMBEDDING_BASE_URL": "https://api.siliconflow.cn/v1",
-        "EMBEDDING_API_KEY": "sk-...",
-        "EMBEDDING_MODEL": "BAAI/bge-m3",
-        "EMBEDDING_DIM": "1024"
-      }
-    }
-  }
-}
-```
-
-**Re-run init to overwrite** (use `--force` to also overwrite customized steering rules):
-```bash
-memoria init --api-url "https://new-server:8100" --token "sk-new-key..."
-# steering rules are preserved unless --force is passed
-```
-
-**Update steering rules only** (after upgrading Memoria):
-```bash
-pip install --upgrade mo-memoria
-memoria update-rules
-# restart your AI tool
-```
-
-Restart your AI tool after any config change.
-
----
-
-## Setup by Tool
-
-### Kiro
-
-```bash
-cd your-project
-memoria init --tool kiro
-```
-
-Or manually create `.kiro/settings/mcp.json`:
-```json
-{
-  "mcpServers": {
-    "memoria": {
-      "command": "memoria",
-      "args": ["mcp", "--db-url", "mysql+pymysql://root:111@localhost:6001/memoria", "--user", "alice"]
-    }
-  }
-}
-```
-
-Copy `.kiro/steering/memory.md` from [docs/steering/memory.md](docs/steering/memory.md) into your project's `.kiro/steering/` directory. Restart Kiro.
-
-### Cursor
-
-```bash
-cd your-project
-memoria init --tool cursor
-```
-
-Or manually create `.cursor/mcp.json` (same structure as above). Restart Cursor.
-
-### Claude Desktop
-
-```bash
-cd your-project
-memoria init --tool claude
-```
-
-Or manually edit `claude_desktop_config.json` (same structure). Restart Claude Desktop.
-
----
-
-## Configuration Options
-
-### Embedding providers
-
-Memoria needs an embedding model to vectorize memories for semantic search.
-
-| Provider | Quality | Privacy | Cost | First-use latency | Ongoing latency |
-|----------|---------|---------|------|-------------------|-----------------|
-| **Local** (default) | Good | ✅ Data never leaves machine | Free | ~900MB download + a few seconds to load on first query | Fast (in-process) |
-| **OpenAI / SiliconFlow** | Better | ⚠️ Text sent to API | API key required | None | Network round-trip |
-| **Custom service** | Varies | Depends on host | Self-hosted | None | Network round-trip |
-
-Configure via environment variables in the MCP config `env` block:
-
-```json
-"env": {
-  "EMBEDDING_PROVIDER": "openai",
-  "EMBEDDING_BASE_URL": "https://api.siliconflow.cn/v1",
-  "EMBEDDING_API_KEY": "sk-...",
-  "EMBEDDING_MODEL": "BAAI/bge-m3",
-  "EMBEDDING_DIM": "1024"
-}
-```
-
-Leave all empty to use local embedding (all-MiniLM-L6-v2, dim=384).
-
-**💡 Local Embedding Tips:**
-If you are using the `local` provider (default), Memoria will download the model from Hugging Face on the first run.
-- **Mirroring:** If `huggingface.co` is slow or blocked, set `HF_ENDPOINT=https://hf-mirror.com`.
-- **Offline Mode:** To run completely offline, first run Memoria once with internet access to cache the model, then set `HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1`. *Do not set these before the model is cached, or it will fail.*
-
-**⚠️ CRITICAL: Configure embedding BEFORE the MCP server starts for the first time.**
- Tables are created on first startup with the configured dimension. Changing it later requires re-creating the embedding column (destructive).
+This guided flow is powered by the [Agent Integration Guide](docs/agent-integration-guide.md).
 
 ---
 
@@ -395,7 +210,7 @@ If you are using the `local` provider (default), Memoria will download the model
 
 ## API Reference
 
-Memoria exposes MCP tools that your AI tool calls automatically based on steering rules. You can also invoke them directly.
+Memoria exposes MCP tools that your AI tool calls automatically based on steering rules.
 
 ### Core CRUD
 
@@ -438,7 +253,8 @@ Memoria exposes MCP tools that your AI tool calls automatically based on steerin
 | `memory_extract_entities` | Extract named entities and build entity graph (proactive) |
 | `memory_link_entities` | Write entity links from your own extraction results |
 | `memory_rebuild_index` | Rebuild IVF vector index for a table |
-| `memory_snapshot_delete` | Delete snapshots by name(s), prefix, or age. Supports batch deletion |
+
+For REST API details, see the [API Reference](docs/api-reference.md).
 
 ---
 
@@ -478,7 +294,6 @@ AI:  → calls memory_retrieve("format python file")
 ```
 You: "Actually, I switched to ruff instead of black"
 AI:  → calls memory_correct(query="formatting tool", new_content="User uses ruff for formatting", reason="switched from black")
-     (finds the memory about black via semantic search, corrects it — no memory_id needed)
 ```
 
 ### Snapshots: Save and Restore State
@@ -486,13 +301,11 @@ AI:  → calls memory_correct(query="formatting tool", new_content="User uses ru
 ```
 You: "Take a snapshot before we refactor the database layer"
 AI:  → calls memory_snapshot(name="before_db_refactor", description="pre-refactor state")
-     ← "Snapshot 'before_db_refactor' created."
 
 ... refactoring goes wrong ...
 
 You: "Roll back to before the refactor"
 AI:  → calls memory_rollback(name="before_db_refactor")
-     ← "Rolled back to snapshot 'before_db_refactor'."
 ```
 
 ### Branches: Isolated Experimentation
@@ -501,7 +314,6 @@ AI:  → calls memory_rollback(name="before_db_refactor")
 You: "Create a memory branch to evaluate switching from PostgreSQL to SQLite"
 AI:  → calls memory_branch(name="eval_sqlite")
      → calls memory_checkout(name="eval_sqlite")
-     ← "Switched to branch 'eval_sqlite'. 42 memories on this branch."
 
 You: "We're now using SQLite instead of PostgreSQL"
 AI:  → calls memory_store("Project uses SQLite for persistence", type="semantic")
@@ -510,14 +322,6 @@ AI:  → calls memory_store("Project uses SQLite for persistence", type="semanti
 You: "Merge it"
 AI:  → calls memory_diff(source="eval_sqlite")   ← preview first
      → calls memory_merge(source="eval_sqlite", strategy="replace")
-     ← "Merged 3 memories from 'eval_sqlite' (skipped 0)."
-```
-
-`memory_branch` also supports branching from a past point in time:
-
-```
-AI:  → calls memory_branch(name="debug", from_timestamp="2026-03-11 10:00:00")
-     (must be within the last 30 minutes)
 ```
 
 ---
@@ -526,101 +330,14 @@ AI:  → calls memory_branch(name="debug", from_timestamp="2026-03-11 10:00:00")
 
 | Command | Description |
 |---------|-------------|
+| `memoria init` | Auto-detect AI tool, write MCP config + steering rules |
+| `memoria status` | Show config files, rule versions, bundled version |
+| `memoria update-rules` | Update steering rules to match current binary version |
 | `memoria mcp --db-url <url> --user <id>` | Start MCP server in embedded mode (direct DB) |
 | `memoria mcp --api-url <url> --token <key>` | Start MCP server in remote mode (proxy to REST API) |
 | `memoria mcp --transport sse` | Start with SSE transport instead of stdio |
-
----
-
-## Manual Tuning & Optimization
-
-Integration quality depends on your AI agent's reasoning ability and steering rules. Out-of-the-box behavior may not be optimal.
-
-**If memory usage feels suboptimal**, edit the steering rules in `.kiro/steering/memory.md`, `.cursor/rules/memory.mdc`, or `CLAUDE.md` to be more explicit. For example, if your agent forgets to retrieve memories at conversation start:
-
-```markdown
-CRITICAL: At the start of EVERY conversation, call memory_retrieve with the user's first message.
-```
-
-## Adapting to Other Agents
-
-Memoria uses the [Model Context Protocol (MCP)](https://modelcontextprotocol.io) standard. Any MCP-compatible agent can integrate by pointing to the server:
-
-```json
-{
-  "mcpServers": {
-    "memoria": {
-      "command": "memoria",
-      "args": ["mcp", "--db-url", "mysql+pymysql://root:111@localhost:6001/memoria", "--user", "alice"],
-      "env": {
-        "EMBEDDING_PROVIDER": "openai",
-        "EMBEDDING_API_KEY": "sk-...",
-        "EMBEDDING_MODEL": "BAAI/bge-m3",
-        "EMBEDDING_DIM": "1024"
-      }
-    }
-  }
-}
-```
-
-Or in remote mode (proxy to a deployed Memoria REST API):
-
-```json
-{
-  "mcpServers": {
-    "memoria": {
-      "command": "memoria",
-      "args": ["mcp", "--api-url", "https://memoria-host:8100", "--token", "sk-your-key..."]
-    }
-  }
-}
-```
-
----
-
-## Troubleshooting
-
-### "Cannot connect to database"
-
-```bash
-docker ps | grep matrixone
-# If not running:
-docker start matrixone
-```
-
-### "sentence-transformers not installed"
-
-```bash
-pip install "mo-memoria[local-embedding]"
-```
-
-### First query is slow
-
-Expected with local embedding — model loads into memory on first query (~3-5s). Use an embedding service to avoid this by setting `EMBEDDING_PROVIDER=openai` in the MCP config `env` block.
-
-### AI tool doesn't seem to use memory
-
-1. Verify `memoria` is in PATH: `which memoria`
-2. Restart the AI tool after editing the MCP config
-3. Test the server directly: `memoria mcp --db-url "mysql+pymysql://root:111@localhost:6001/memoria"`
-
-### `memory_reflect` / `memory_extract_entities` returns "LLM not configured"
-
-These tools require an LLM to synthesize insights. Configure via environment variables in the MCP config `env` block:
-
-```json
-"env": {
-  "LLM_API_KEY": "sk-...",
-  "LLM_BASE_URL": "https://api.openai.com/v1",
-  "LLM_MODEL": "gpt-4o-mini"
-}
-```
-
-Any OpenAI-compatible endpoint works. Without LLM, these tools return a degraded response (HTTP 200 with an error/note field) — all other memory tools work normally. Use `memory_reflect(mode="candidates")` or `memory_extract_entities(mode="candidates")` as LLM-free alternatives.
-
-### Episodic memory returns HTTP 503
-
-`POST /v1/sessions/{id}/summary` requires LLM configuration. Set `LLM_API_KEY` in the MCP config `env` block (see above).
+| `memoria serve` | Start REST API server |
+| `memoria benchmark --api-url <url> --token <key> --dataset <name>` | Run benchmark against API |
 
 ---
 
@@ -630,7 +347,7 @@ Any OpenAI-compatible endpoint works. Without LLM, these tools return a degraded
 
 ```bash
 # Start MatrixOne + API
-make start
+make up
 
 # In another terminal, configure your AI tool for remote mode:
 cd your-project
@@ -650,42 +367,16 @@ memoria init --db-url "mysql+pymysql://root:111@localhost:6001/memoria"
 ```bash
 make test-unit          # Unit tests (no DB)
 make test               # All tests (needs DB)
-make test-mcp           # MCP server tests
-make test-all-cov       # All tests with coverage
+make test-e2e           # E2E API tests (needs DB)
 ```
 
 ### Bump version and publish
 
 ```bash
-make bump-version BUMP=patch   # 0.1.1 → 0.1.2
-git add -A && git commit -m "chore: release v0.1.2"
-git tag v0.1.2
-git push && git push --tags    # Triggers PyPI publish
+make release VERSION=0.2.0      # Bump version, generate CHANGELOG, tag, push
+                                 # CI builds binaries + Docker image automatically
+make release-rc VERSION=0.2.0-rc1  # Pre-release
 ```
-
-To test the published package from TestPyPI before the official release:
-
-```bash
-pip install --index-url https://mirrors.aliyun.com/pypi/simple/ \
-            --extra-index-url https://test.pypi.org/simple/ \
-            -U mo-memoria
-```
-
-> Note: `--index-url` points to a mirror for dependencies (TestPyPI doesn't host all deps), `--extra-index-url` pulls `mo-memoria` itself from TestPyPI.
-
----
-
-## For AI Agents
-
-If you're an AI agent helping a user set up Memoria, **ask before acting**:
-
-1. **Which AI tool?** Kiro / Cursor / Claude Desktop?
-2. **MatrixOne database?** Already have one → get URL. Local Docker → `docker compose up -d`. [MatrixOne Cloud](https://cloud.matrixorigin.cn) → no Docker needed.
-3. **Embedding?** ⚠️ **Ask BEFORE installation.** Once the MCP server starts, the embedding dimension is locked into the database schema. Already have a service (OpenAI/SiliconFlow/Ollama)? Use it. Otherwise local is fine.
-4. **Install**: `pip install mo-memoria` (add `[local-embedding]` if no external embedding service)
-5. **Configure**: Run `memoria init` in the user's project directory (see [Quick Start](#quick-start) for flags). It auto-detects the tool and writes MCP config + steering rules.
-6. Tell user to **restart their AI tool**
-7. **Verify**: Ask the AI tool to call `memory_retrieve("test")` — should return "No relevant memories found"
 
 ---
 

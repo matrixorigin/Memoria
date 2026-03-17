@@ -44,7 +44,7 @@ synchronously on the write hot path, adding latency to every `store()` call.
 **Why:** ~~`ENTITY_LINK` edges with weight 0.8/0.9/1.0 are stored but not yet used in
 activation retrieval scoring.~~
 
-**Status:** ✅ Already works — `activation.py::_edge_weight()` computes
+**Status:** ✅ Already works — `_edge_weight()` computes
 `edge.weight × EDGE_TYPE_MULTIPLIER`, so regex edges propagate at 0.8×1.2=0.96,
 LLM at 0.9×1.2=1.08, manual at 1.0×1.2=1.2. Added clarifying comment.
 

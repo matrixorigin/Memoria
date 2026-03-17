@@ -23,7 +23,7 @@ This starts two services:
 
 | Service | Port | Description |
 |---------|------|-------------|
-| API | 8100 | Memoria REST API (FastAPI + Uvicorn) |
+| API | 8100 | Memoria REST API |
 | MatrixOne | 6001 | HTAP database (memory storage, vector search, snapshots) |
 
 Verify:
@@ -96,10 +96,11 @@ MEMORIA_EMBEDDING_BASE_URL=https://api.siliconflow.cn/v1
 
 ### Local (no API key)
 
-Requires bundling `sentence-transformers` at build time (~500MB extra):
+Requires building from source with the `local-embedding` feature:
 
 ```bash
-INSTALL_EXTRAS=local-embedding docker compose build
+cd Memoria/memoria
+cargo build --release -p memoria-cli --features local-embedding
 ```
 
 ```bash
@@ -128,7 +129,7 @@ MEMORIA_RATE_LIMIT_CONSOLIDATE=100,60
 MEMORIA_RATE_LIMIT_REFLECT=100,60
 ```
 
-See `middleware.py` for all configurable keys and defaults.
+See the rate limit configuration in the API server source for all configurable keys and defaults.
 
 ## Automated Governance
 

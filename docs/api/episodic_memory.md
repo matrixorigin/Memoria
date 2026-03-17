@@ -89,24 +89,11 @@ Authorization: Bearer <token>
 
 ## Auto-Trigger (Phase 2)
 
-When using `observe_turn` with `session_id` and `turn_count`, Memoria can automatically generate lightweight summaries at configurable intervals:
+When using `POST /v1/observe` with `session_id` and `turn_count`, Memoria can automatically generate lightweight summaries at configurable intervals.
 
-```python
-service.observe_turn(
-    user_id="alice",
-    messages=[...],
-    session_id="sess_123",
-    turn_count=20,  # triggers lightweight summary if 20 % auto_trigger_threshold == 0
-)
-```
-
-Configure via `MemoryGovernanceConfig`:
-```python
-config = MemoryGovernanceConfig(
-    auto_trigger_threshold=20,       # trigger every N turns (0 = disabled, default: 20)
-    max_lightweight_per_session=3,   # max auto-triggered summaries per session (default: 3)
-)
-```
+Configure via environment variables:
+- `MEMORIA_AUTO_TRIGGER_THRESHOLD=20` — trigger every N turns (0 = disabled, default: 20)
+- `MEMORIA_MAX_LIGHTWEIGHT_PER_SESSION=3` — max auto-triggered summaries per session (default: 3)
 
 Auto-triggered summaries are stored with `extra_metadata.auto_triggered=True`.
 

@@ -50,36 +50,67 @@ curl -X DELETE https://memoria-host:8100/auth/keys/KEY_ID \
 
 ## For AI Assistants (MCP)
 
-Install the package, then add Memoria as an MCP server in your assistant's config.
-
 ### Install
 
+Download the latest binary from [GitHub Releases](https://github.com/matrixorigin/Memoria/releases):
+
 ```bash
-pip install mo-memoria
+# Linux (x86_64)
+curl -LO https://github.com/matrixorigin/Memoria/releases/latest/download/memoria-x86_64-unknown-linux-gnu.tar.gz
+tar xzf memoria-x86_64-unknown-linux-gnu.tar.gz
+sudo mv memoria /usr/local/bin/
 
-# Only needed if using local embedding model (no external API):
-pip install "mo-memoria[local-embedding]"    # Local sentence-transformers (~900MB download)
-
-# If no NVIDIA GPU available, install CPU-only PyTorch first to avoid large CUDA dependencies:
-pip install torch --index-url https://download.pytorch.org/whl/cpu
-pip install "mo-memoria[local-embedding]"
+# macOS (Apple Silicon)
+curl -LO https://github.com/matrixorigin/Memoria/releases/latest/download/memoria-aarch64-apple-darwin.tar.gz
+tar xzf memoria-aarch64-apple-darwin.tar.gz
+sudo mv memoria /usr/local/bin/
 ```
 
-### Start the MCP server
+### Quick setup with `memoria init`
 
-`memoria-mcp` supports two modes selected by whether `--api-url` is provided:
+Run `memoria init` in your project directory — it auto-detects Kiro / Cursor / Claude and writes the MCP config + steering rules:
+
+```bash
+cd your-project
+
+# Embedded mode (direct DB)
+memoria init --db-url "mysql+pymysql://root:111@localhost:6001/memoria"
+
+# Remote mode (connect to existing server)
+memoria init --api-url "https://memoria-host:8100" --token "sk-your-key..."
+
+# With embedding config
+memoria init --embedding-provider openai \
+             --embedding-base-url https://api.siliconflow.cn/v1 \
+             --embedding-api-key sk-... \
+             --embedding-model BAAI/bge-m3 \
+             --embedding-dim 1024
+```
+
+This creates MCP config + steering rules for your detected AI tool. Restart the tool afterwards.
+
+### Check status and update rules
+
+```bash
+memoria status          # show config files, rule versions, bundled version
+memoria update-rules    # update steering rules to match current binary version
+```
+
+After upgrading the Memoria binary, run `memoria update-rules` to sync the steering rules, then restart your AI tool.
+
+### MCP server modes
+
+`memoria mcp` supports two modes:
 
 **Embedded mode** — direct DB access, no separate server needed:
 ```bash
-memoria-mcp --db-url "mysql+pymysql://root:111@localhost:6001/memoria" --user alice
+memoria mcp --db-url "mysql+pymysql://root:111@localhost:6001/memoria" --user alice
 ```
 
 **Remote mode** — proxy to a deployed Memoria REST API:
 ```bash
-memoria-mcp --api-url "https://memoria-host:8100" --token "sk-your-key..."
+memoria mcp --api-url "https://memoria-host:8100" --token "sk-your-key..."
 ```
-
-Remote mode supports all tools available in embedded mode. The actual tool set depends on the server tier — shared instances may have fewer features than dedicated instances.
 
 All options:
 ```
@@ -90,47 +121,23 @@ All options:
 --transport stdio | sse  (default: stdio)
 ```
 
-### Kiro
+### Manual MCP config (if not using `memoria init`)
 
-`.kiro/settings/mcp.json`:
+**Kiro** — `.kiro/settings/mcp.json`:
 ```json
 {
   "mcpServers": {
     "memoria": {
-      "command": "memoria-mcp",
-      "args": ["--api-url", "https://memoria-host:8100", "--token", "sk-your-key..."]
+      "command": "memoria",
+      "args": ["mcp", "--api-url", "https://memoria-host:8100", "--token", "sk-your-key..."]
     }
   }
 }
 ```
 
-### Cursor
+**Cursor** — `.cursor/mcp.json`: same structure as above.
 
-`.cursor/mcp.json`:
-```json
-{
-  "mcpServers": {
-    "memoria": {
-      "command": "memoria-mcp",
-      "args": ["--api-url", "https://memoria-host:8100", "--token", "sk-your-key..."]
-    }
-  }
-}
-```
-
-### Claude Desktop
-
-`claude_desktop_config.json`:
-```json
-{
-  "mcpServers": {
-    "memoria": {
-      "command": "memoria-mcp",
-      "args": ["--api-url", "https://memoria-host:8100", "--token", "sk-your-key..."]
-    }
-  }
-}
-```
+**Claude Desktop** — `claude_desktop_config.json`: same structure as above.
 
 ### Available MCP Tools
 

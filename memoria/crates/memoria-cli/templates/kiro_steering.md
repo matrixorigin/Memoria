@@ -2,7 +2,7 @@
 inclusion: always
 ---
 
-<!-- memoria-version: 0.1.23-->
+<!-- memoria-version: 0.1.0-->
 
 # Memory Integration (Memoria Lite)
 

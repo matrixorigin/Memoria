@@ -1,6 +1,6 @@
-# memoria — Rust Rewrite
+# memoria — Rust workspace
 
-Rust workspace for Memoria. Python implementation in `../memoria/` is untouched.
+Rust workspace for Memoria. Single unified binary `memoria` with subcommands.
 
 ## Quick start
 
@@ -11,25 +11,28 @@ cd memoria
 cp .env.example .env
 # Edit .env with your DB URL
 
-# Build (sqlx offline mode — no live DB needed for compilation)
-SQLX_OFFLINE=true cargo build
+# Build
+SQLX_OFFLINE=true cargo build -p memoria-cli
 
-# Run tests (unit only, no DB)
-cargo test --lib
-
-# Run tests with live DB
-cargo test
+# Run the binary
+./target/debug/memoria --help
+./target/debug/memoria serve          # REST API server
+./target/debug/memoria mcp --help     # MCP server
+./target/debug/memoria init           # Configure AI tools
 ```
 
-## Phases
+## Crates
 
-| Phase | Status | Deliverable |
-|-------|--------|-------------|
-| 1 | 🚧 IN PROGRESS | Core types + DB CRUD (sqlx offline) |
-| 2 | ⏳ | HTTP embedding + REST API + 8 MCP tools |
-| 3 | ⏳ | Git-for-Data RFC |
-| 4 | ⏳ | Candle embedding + 22 MCP tools, binary < 15MB |
-| 5 | ⏳ | Full Git-for-Data implementation |
+| Crate | Description |
+|-------|-------------|
+| `memoria-cli` | Unified binary entry point (`memoria serve`, `memoria mcp`, `memoria init`, etc.) |
+| `memoria-api` | Axum REST API (lib) |
+| `memoria-mcp` | MCP stdio/SSE server (lib) |
+| `memoria-service` | Business logic, governance, scheduling |
+| `memoria-storage` | sqlx-based MatrixOne storage |
+| `memoria-embedding` | HTTP + local (fastembed) embedding providers |
+| `memoria-core` | Shared types and interfaces |
+| `memoria-git` | Git-for-Data (snapshots, branches, merge) |
 
 ## CRITICAL rules
 

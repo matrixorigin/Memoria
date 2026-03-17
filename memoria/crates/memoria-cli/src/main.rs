@@ -390,9 +390,11 @@ fn regex_version(content: &str) -> Option<String> {
 
 fn write_rule(path: &Path, content: &str, force: bool, project_dir: &Path) -> String {
     let relative = path.strip_prefix(project_dir).unwrap_or(path);
+    // Replace template version placeholder with actual binary version
+    let content = content.replace("memoria-version: 0.1.0", &format!("memoria-version: {}", VERSION));
     if path.exists() && !force {
         let installed = installed_version(path);
-        let bundled = regex_version(content);
+        let bundled = regex_version(&content);
         match (&installed, &bundled) {
             (Some(i), Some(b)) if i == b => {
                 return format!("  ✓ {} (v{}, up to date)", relative.display(), i);
@@ -411,8 +413,8 @@ fn write_rule(path: &Path, content: &str, force: bool, project_dir: &Path) -> St
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).ok();
     }
-    std::fs::write(path, content).ok();
-    let ver = regex_version(content).map(|v| format!(" (v{})", v)).unwrap_or_default();
+    std::fs::write(path, &content).ok();
+    let ver = regex_version(&content).map(|v| format!(" (v{})", v)).unwrap_or_default();
     format!("  ✓ {}{}", relative.display(), ver)
 }
 
@@ -454,19 +456,20 @@ fn configure_claude(project_dir: &Path, entry: &serde_json::Value, _force: bool)
     let mut results = vec![
         write_mcp_json(&project_dir.join(".mcp.json"), entry, project_dir),
     ];
+    let claude_rule = CLAUDE_RULE.replace("memoria-version: 0.1.0", &format!("memoria-version: {}", VERSION));
     let claude_md = project_dir.join("CLAUDE.md");
     if claude_md.exists() {
         let content = std::fs::read_to_string(&claude_md).unwrap_or_default();
         if !content.contains("memory_retrieve") {
             let mut f = std::fs::OpenOptions::new().append(true).open(&claude_md).unwrap();
             use std::io::Write;
-            writeln!(f, "\n\n{}", CLAUDE_RULE).ok();
+            writeln!(f, "\n\n{}", claude_rule).ok();
             results.push(format!("  ✓ CLAUDE.md (appended memory rules)"));
         } else {
             results.push(format!("  ✓ CLAUDE.md (already has memory rules)"));
         }
     } else {
-        std::fs::write(&claude_md, CLAUDE_RULE).ok();
+        std::fs::write(&claude_md, &claude_rule).ok();
         results.push(format!("  ✓ CLAUDE.md (created)"));
     }
     results
@@ -539,7 +542,7 @@ fn cmd_status(project_dir: &Path) {
             println!("  ✗ {} (missing)", rule_path);
         }
     }
-    let bundled = regex_version(KIRO_STEERING).unwrap_or_else(|| "unknown".into());
+    let bundled = VERSION;
     println!("\nBundled rule version: {}", bundled);
 }
 

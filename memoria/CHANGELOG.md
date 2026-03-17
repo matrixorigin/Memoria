@@ -79,6 +79,5 @@
 - `memoria-core`: types (`Memory`, `MemoryType`, `TrustTier`, `MemoriaError`)
 - `memoria-storage`: `SqlMemoryStore` — CRUD, vector search, fulltext search, hybrid retrieval
 - `memoria-service`: `MemoryService` — business logic layer
-- `memoria-api`: Axum REST API with `X-User-Id` auth
-- `memoria-mcp`: MCP stdio server (all tools from Python version)
+- `memoria`: Unified binary — `memoria serve` (REST API), `memoria mcp` (MCP stdio server), `memoria init/status/update-rules/benchmark` (CLI tools)
 - `memoria-git`: snapshot/branch/merge service

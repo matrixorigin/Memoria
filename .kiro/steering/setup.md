@@ -4,6 +4,9 @@ inclusion: always
 
 # Memoria Local Setup
 
+> This steering rule is for the coding agent working on this repo.
+> For the AI agent protocol that helps end-users install Memoria, see [docs/agent-integration-guide.md](../../docs/agent-integration-guide.md).
+
 When the user wants to set up Memoria, **do NOT jump straight into installation**. First ask key questions to determine the right path.
 
 ## Two MCP Modes — Ask First
@@ -44,7 +47,7 @@ Based on the answer:
 
 Ask: "For memory search quality, Memoria needs an embedding model. Do you already have an OpenAI-compatible embedding endpoint? (OpenAI, SiliconFlow, Ollama, or any custom service)
 - **Yes** → use it directly. No download, no cold-start. Best choice.
-- **No** → use local model. ⚠️ downloads ~900MB (torch + sentence-transformers) on first install. Avoid on slow/proxied networks."
+- **No** → use local model. ⚠️ requires building from source with `--features local-embedding`. Pre-built binaries don't include it. Consider SiliconFlow (free tier) or Ollama instead."
 
 **If user has an existing embedding service**, ask:
 - "What is the API base URL? (e.g. `https://api.siliconflow.cn/v1`, `http://localhost:11434/v1`, or leave blank for OpenAI official)"
@@ -54,7 +57,7 @@ Ask: "For memory search quality, Memoria needs an embedding model. Do you alread
 
 These values get written into the `env` block of `mcp.json` automatically — no manual editing needed.
 
-**If user chooses local embedding, explicitly warn**: "This will download ~900MB. If you're on a slow or proxied network, consider using an OpenAI-compatible service instead. Proceed?"
+**If user chooses local embedding, explicitly warn**: "Local embedding requires building from source with `--features local-embedding`. The pre-built binaries use an OpenAI-compatible embedding service. Consider using SiliconFlow (free tier) or Ollama instead."
 
 **After collecting embedding config, remind user**: "Once your AI tool starts, the database tables will be created with this embedding dimension. Changing it later requires re-creating the embedding column (destructive). Make sure this configuration is correct before proceeding."
 
@@ -66,9 +69,38 @@ These values get written into the `env` block of `mcp.json` automatically — no
 - If a command fails, stop and diagnose before continuing
 - Never chain install + configure + verify into one shell call
 
+## Install Memoria Binary
+
+This step is the same for all paths. Pick one method:
+
+```bash
+# Option A: Download pre-built binary (recommended)
+# Linux x86_64:
+curl -LO https://github.com/matrixorigin/Memoria/releases/latest/download/memoria-x86_64-unknown-linux-gnu.tar.gz
+tar xzf memoria-x86_64-unknown-linux-gnu.tar.gz
+sudo mv memoria /usr/local/bin/
+
+# macOS Apple Silicon:
+curl -LO https://github.com/matrixorigin/Memoria/releases/latest/download/memoria-aarch64-apple-darwin.tar.gz
+tar xzf memoria-aarch64-apple-darwin.tar.gz
+sudo mv memoria /usr/local/bin/
+```
+```bash
+# Option B: Build from source (needed for local embedding)
+git clone https://github.com/matrixorigin/Memoria.git
+cd Memoria/memoria
+cargo build --release -p memoria-cli              # without local embedding
+# cargo build --release -p memoria-cli --features local-embedding  # with local embedding
+sudo cp target/release/memoria /usr/local/bin/
+```
+```bash
+# Verify
+memoria --version
+```
+
 ## Execution Paths
 
-### Path A: Local Docker + Local Embedding (most common)
+### Path A: Local Docker (most common)
 
 ```bash
 # Step 1: Start MatrixOne (run alone, check output)
@@ -83,36 +115,10 @@ docker ps --filter name=matrixone
 ```
 Wait ~30-60s on first start, then:
 ```bash
-# Step 3: Create virtual environment (run alone)
-python3 -m venv .venv
-```
-```bash
-# Step 4: Activate it (run alone)
-source .venv/bin/activate
-```
-```bash
-# Step 5: Install Memoria (run alone)
-# If using local embedding:
-# - With NVIDIA GPU:
-pip install 'mo-memoria[local-embedding]'
-# - Without GPU (CPU-only, avoids large CUDA dependencies):
-pip install torch --index-url https://download.pytorch.org/whl/cpu
-pip install 'mo-memoria[local-embedding]'
-# If using an existing embedding service (no 900MB download):
-pip install mo-memoria
-```
-```bash
-# Step 6: Configure (in user's project directory)
+# Step 3: Configure (in user's project directory)
 # Add embedding flags based on Question 3 answer — see "Embedding provider flags" section below
 cd <user-project>
 memoria init  # + embedding flags if applicable
-
-# If user didn't provide embedding config via flags, remind them:
-# "The config file has been created with all environment variables (even empty ones).
-# If you need to customize (database URL, embedding settings), edit the file now before restarting:
-# - Kiro: .kiro/settings/mcp.json
-# - Cursor: .cursor/mcp.json
-# - Claude Code: .mcp.json"
 ```
 
 ### Path B: MatrixOne Cloud
@@ -121,25 +127,7 @@ memoria init  # + embedding flags if applicable
 # 1. User registers at https://cloud.matrixorigin.cn (free tier)
 # 2. Get connection info from cloud console: host, port, user, password
 
-# 3. Virtual environment
-python3 -m venv .venv
-```
-```bash
-source .venv/bin/activate
-```
-```bash
-# 4. Install
-# If using local embedding:
-# - With NVIDIA GPU:
-pip install 'mo-memoria[local-embedding]'
-# - Without GPU (CPU-only):
-pip install torch --index-url https://download.pytorch.org/whl/cpu
-pip install 'mo-memoria[local-embedding]'
-# If using an existing embedding service:
-pip install mo-memoria
-```
-```bash
-# 5. Configure with cloud URL
+# 3. Configure with cloud URL
 cd <user-project>
 memoria init --db-url 'mysql+pymysql://<user>:<password>@<host>:<port>/<database>'
 # + embedding flags if applicable (see "Embedding provider flags" section)
@@ -148,25 +136,7 @@ memoria init --db-url 'mysql+pymysql://<user>:<password>@<host>:<port>/<database
 ### Path C: Existing MatrixOne
 
 ```bash
-# 1. Virtual environment
-python3 -m venv .venv
-```
-```bash
-source .venv/bin/activate
-```
-```bash
-# 2. Install
-# If using local embedding:
-# - With NVIDIA GPU:
-pip install 'mo-memoria[local-embedding]'
-# - Without GPU (CPU-only):
-pip install torch --index-url https://download.pytorch.org/whl/cpu
-pip install 'mo-memoria[local-embedding]'
-# If using an existing embedding service:
-pip install mo-memoria
-```
-```bash
-# 3. Configure with existing DB
+# 1. Configure with existing DB
 cd <user-project>
 memoria init --db-url 'mysql+pymysql://<user>:<password>@<host>:<port>/<database>'
 # + embedding flags if applicable (see "Embedding provider flags" section)
@@ -177,18 +147,7 @@ memoria init --db-url 'mysql+pymysql://<user>:<password>@<host>:<port>/<database
 Use this when the user has been given a server URL and API token by an admin — no DB setup, no embedding config needed.
 
 ```bash
-# 1. Virtual environment
-python3 -m venv .venv
-```
-```bash
-source .venv/bin/activate
-```
-```bash
-# 2. Install (no embedding extras needed — server handles embedding)
-pip install mo-memoria
-```
-```bash
-# 3. Configure with remote server
+# 1. Configure with remote server
 cd <user-project>
 memoria init --api-url 'https://memoria-host:8100' --token 'sk-your-key...'
 ```

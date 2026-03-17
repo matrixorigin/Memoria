@@ -13,8 +13,8 @@ build:
 	$(CARGO) build
 
 build-release:
-	$(CARGO) build --release -p memoria-mcp
-	@echo "Binary: target/release/memoria-mcp-rs ($(shell du -sh target/release/memoria-mcp-rs | cut -f1))"
+	$(CARGO) build --release -p memoria-cli
+	@echo "Binary: target/release/memoria ($(shell du -sh target/release/memoria | cut -f1))"
 
 # Unit tests only (no DB needed)
 test-unit:

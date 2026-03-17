@@ -224,22 +224,8 @@
 ## 运行 Benchmark
 
 ```bash
-# 验证数据集
-python -c "
-from memoria.core.memory.benchmark.loader import validate_dataset
-errors = validate_dataset('memoria/datasets/graph-entity-v1.json')
-print('Valid!' if not errors else errors)
-"
-
-# 执行 benchmark（需要实现 executor）
-python -c "
-from memoria.core.memory.benchmark.executor import run_benchmark
-from memoria.core.memory.benchmark.loader import load_dataset
-
-ds = load_dataset('memoria/datasets/graph-entity-v1.json')
-results = run_benchmark(ds, backend='graph')
-results.print_summary()
-"
+# Run benchmark
+memoria benchmark --api-url http://localhost:8100 --token sk-... --dataset graph-entity-v1
 ```
 
 ---
