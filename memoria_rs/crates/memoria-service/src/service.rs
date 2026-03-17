@@ -168,8 +168,10 @@ impl MemoryService {
         if let Some(sql) = &self.sql_store {
             let table = sql.active_table(user_id).await?;
             if let Some(ref emb) = memory.embedding {
-                // L2 threshold from cosine similarity 0.85: sqrt(2*(1-0.85)) ≈ 0.5477
-                let l2_threshold = 0.5477;
+                // L2 threshold from cosine similarity 0.95: sqrt(2*(1-0.95)) ≈ 0.3162
+                // Only supersede near-identical memories, not contradictions.
+                // Assumes normalized embeddings (bge-m3, text-embedding-3-* all output unit vectors).
+                let l2_threshold = 0.3162;
                 let mtype = memory.memory_type.to_string();
                 if let Ok(Some((old_id, old_content, _dist))) = sql
                     .find_near_duplicate(&table, user_id, emb, &mtype, &memory.memory_id, l2_threshold)

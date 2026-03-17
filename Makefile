@@ -2,7 +2,7 @@
         cloud-start cloud-stop cloud-logs cloud-status cloud-health cloud-clean cloud-rebuild \
         install dev build-wheel publish publish-test bump-version check lint format type-check \
         new-key list-keys revoke-keys bench bench-compare \
-        test-rust test-rust-unit test-rust-integration
+        test-rust test-rust-unit test-rust-integration build-rust run-rust
 
 # Load environment variables from .env file if it exists
 ifneq (,$(wildcard .env))
@@ -283,11 +283,25 @@ test-rust-e2e:
 		EMBEDDING_DIM=$(MEMORIA_EMBEDDING_DIM) \
 		SQLX_OFFLINE=true cargo test -p memoria-mcp --test mcp_e2e -- --nocapture
 
+RUST_API_PORT ?= 8200
+
 build-rust:
-	@echo "Building memoria-mcp-rs (release)..."
-	@cd memoria_rs && SQLX_OFFLINE=true cargo build --release -p memoria-mcp
-	@echo "Binary: memoria_rs/target/release/memoria-mcp-rs"
-	@ls -lh memoria_rs/target/release/memoria-mcp-rs
+	@echo "Building memoria-api (release)..."
+	@cd memoria_rs && . "$$HOME/.cargo/env" && SQLX_OFFLINE=true cargo build --release -p memoria-api
+	@echo "Binary: memoria_rs/target/release/memoria-api"
+	@ls -lh memoria_rs/target/release/memoria-api
+
+run-rust: build-rust
+	@echo "Starting Rust API on port $(RUST_API_PORT)..."
+	cd memoria_rs && . "$$HOME/.cargo/env" && DATABASE_URL=$(RUST_DB_URL) \
+		EMBEDDING_PROVIDER=$(MEMORIA_EMBEDDING_PROVIDER) \
+		EMBEDDING_BASE_URL=$(MEMORIA_EMBEDDING_BASE_URL) \
+		EMBEDDING_API_KEY=$(MEMORIA_EMBEDDING_API_KEY) \
+		EMBEDDING_MODEL=$(MEMORIA_EMBEDDING_MODEL) \
+		EMBEDDING_DIM=$(MEMORIA_EMBEDDING_DIM) \
+		API_TOKEN=$(MEMORIA_MASTER_KEY) \
+		SQLX_OFFLINE=true \
+		./target/release/memoria-api --port $(RUST_API_PORT)
 
 test-rust-unit:
 	@echo "Running Rust unit tests (no DB)..."

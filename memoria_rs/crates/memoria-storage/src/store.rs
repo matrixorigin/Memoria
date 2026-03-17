@@ -570,6 +570,10 @@ impl SqlMemoryStore {
 
     /// Find the nearest active memory by embedding distance.
     /// Returns (memory_id, content, l2_distance) if within threshold.
+    ///
+    /// NOTE: l2_threshold assumes normalized embeddings (unit vectors).
+    /// For normalized vectors: L2 = sqrt(2 * (1 - cosine_similarity)).
+    /// The IVF index uses vector_l2_ops, so this query benefits from the index.
     pub async fn find_near_duplicate(
         &self, table: &str, user_id: &str, embedding: &[f32],
         memory_type: &str, exclude_id: &str, l2_threshold: f64,
@@ -580,7 +584,8 @@ impl SqlMemoryStore {
              l2_distance(embedding, '{vec_literal}') AS l2_dist \
              FROM {table} \
              WHERE user_id = ? AND is_active = 1 AND memory_type = ? \
-               AND embedding IS NOT NULL AND memory_id != ? \
+               AND embedding IS NOT NULL AND vector_dims(embedding) > 0 \
+               AND memory_id != ? \
              ORDER BY l2_dist ASC LIMIT 1"
         );
         let row = sqlx::query(&sql)

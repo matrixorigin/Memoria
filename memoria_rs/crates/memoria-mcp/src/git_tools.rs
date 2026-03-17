@@ -378,7 +378,9 @@ pub async fn call(
                 )));
             }
 
-            const COSINE_THRESHOLD: f64 = 0.9;
+            // Cosine 0.9 → L2 for normalized vectors: sqrt(2*(1-0.9)) ≈ 0.4472
+            // Uses l2_distance instead of cosine_similarity to leverage IVF vector_l2_ops index.
+            const L2_CONFLICT: f64 = 0.4472;
 
             if strategy != "replace" {
                 // append: use native branch merge (kernel-level, no cosine scan needed)
@@ -411,7 +413,7 @@ pub async fn call(
                        WHERE m.user_id = ? AND m.is_active = 1 \
                          AND m.embedding IS NOT NULL AND vector_dims(m.embedding) > 0 \
                          AND m.memory_type = b.memory_type \
-                         AND cosine_similarity(m.embedding, b.embedding) > {COSINE_THRESHOLD} \
+                         AND l2_distance(m.embedding, b.embedding) < {L2_CONFLICT} \
                      ) \
                    )"
             );
@@ -431,7 +433,7 @@ pub async fn call(
                      WHERE m.user_id = ? AND m.is_active = 1 \
                        AND m.embedding IS NOT NULL AND vector_dims(m.embedding) > 0 \
                        AND m.memory_type = b.memory_type \
-                       AND cosine_similarity(m.embedding, b.embedding) > {COSINE_THRESHOLD} \
+                       AND l2_distance(m.embedding, b.embedding) < {L2_CONFLICT} \
                    )"
             );
             let conflict_count: i64 = sqlx::query(&format!("SELECT COUNT(*) as cnt {conflict_where}"))
@@ -449,7 +451,7 @@ pub async fn call(
                        AND b.memory_type = m.memory_type \
                        AND b.embedding IS NOT NULL AND vector_dims(b.embedding) > 0 \
                        AND NOT EXISTS (SELECT 1 FROM mem_memories m2 WHERE m2.memory_id = b.memory_id AND m2.is_active = 1) \
-                       AND cosine_similarity(m.embedding, b.embedding) > {COSINE_THRESHOLD} \
+                       AND l2_distance(m.embedding, b.embedding) < {L2_CONFLICT} \
                        LIMIT 1 \
                      ), \
                      m.updated_at = NOW() \
@@ -461,7 +463,7 @@ pub async fn call(
                        AND b.memory_type = m.memory_type \
                        AND b.embedding IS NOT NULL AND vector_dims(b.embedding) > 0 \
                        AND NOT EXISTS (SELECT 1 FROM mem_memories m2 WHERE m2.memory_id = b.memory_id AND m2.is_active = 1) \
-                       AND cosine_similarity(m.embedding, b.embedding) > {COSINE_THRESHOLD} \
+                       AND l2_distance(m.embedding, b.embedding) < {L2_CONFLICT} \
                      )"
                 );
                 sqlx::query(&update_sql).bind(user_id).bind(user_id).bind(user_id)

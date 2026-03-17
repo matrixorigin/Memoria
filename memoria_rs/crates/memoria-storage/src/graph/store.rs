@@ -410,10 +410,11 @@ impl GraphStore {
             embedding.iter().map(|f| f.to_string()).collect::<Vec<_>>().join(",")
         );
         let sql = format!(
-            "SELECT *, cosine_similarity(embedding, '{vec_lit}') AS cos_sim \
+            "SELECT *, l2_distance(embedding, '{vec_lit}') AS l2_dist \
              FROM memory_graph_nodes \
-             WHERE user_id = ? AND is_active = 1 AND embedding IS NOT NULL \
-             ORDER BY l2_distance(embedding, '{vec_lit}') ASC \
+             WHERE user_id = ? AND is_active = 1 \
+               AND embedding IS NOT NULL AND vector_dims(embedding) > 0 \
+             ORDER BY l2_dist ASC \
              LIMIT ?"
         );
         let rows = sqlx::query(&sql)
@@ -425,7 +426,12 @@ impl GraphStore {
         Ok(rows
             .iter()
             .map(|r| {
-                let sim: f32 = r.try_get("cos_sim").unwrap_or(0.0);
+                // Convert L2 distance to cosine similarity for normalized vectors:
+                // cos = 1 - L2² / 2
+                let l2: f32 = r.try_get::<f32, _>("l2_dist")
+                    .or_else(|_| r.try_get::<f64, _>("l2_dist").map(|v| v as f32))
+                    .unwrap_or(f32::MAX);
+                let sim = (1.0 - l2 * l2 / 2.0).max(0.0);
                 (row_to_node(r), sim)
             })
             .collect())
