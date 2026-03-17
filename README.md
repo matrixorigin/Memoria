@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="assets/logo.jpg" alt="Memoria Logo" width="300"/>
+  <img src="assets/logo.png" alt="Memoria Logo" width="300"/>
   
   # Memoria
   

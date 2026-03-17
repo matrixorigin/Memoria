@@ -134,7 +134,7 @@ release:
 	@git diff --quiet || (echo "❌ Uncommitted changes — commit first"; exit 1)
 	@echo "==> Bumping version to $(VERSION)..."
 	@sed -i 's/^version = ".*"/version = "$(VERSION)"/' memoria/Cargo.toml
-	@cd memoria && cargo check 2>/dev/null
+	@cd memoria && SQLX_OFFLINE=true cargo check 2>/dev/null
 	@echo "==> Generating CHANGELOG..."
 	@if command -v git-cliff >/dev/null 2>&1; then \
 		git-cliff --tag "v$(VERSION)" -o CHANGELOG.md; \
@@ -153,7 +153,7 @@ release-rc:
 	@if [ -z "$(VERSION)" ]; then echo "❌ Usage: make release-rc VERSION=x.y.z-rcN"; exit 1; fi
 	@git diff --quiet || (echo "❌ Uncommitted changes — commit first"; exit 1)
 	@sed -i 's/^version = ".*"/version = "$(VERSION)"/' memoria/Cargo.toml
-	@cd memoria && cargo check 2>/dev/null
+	@cd memoria && SQLX_OFFLINE=true cargo check 2>/dev/null
 	@git add memoria/Cargo.toml memoria/Cargo.lock 2>/dev/null
 	@git commit -m "chore(release): v$(VERSION)"
 	@git tag -a "v$(VERSION)" -m "Pre-release v$(VERSION)"
@@ -170,7 +170,7 @@ release-docker:
 	@echo "✅ Pushed to Docker Hub"
 
 check:
-	@cd memoria && cargo check && cargo clippy -- -D warnings
+	@cd memoria && SQLX_OFFLINE=true cargo check && SQLX_OFFLINE=true cargo clippy -- -D warnings
 
 # ── Tests ───────────────────────────────────────────────────────────
 
