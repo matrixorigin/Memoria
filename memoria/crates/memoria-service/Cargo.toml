@@ -16,7 +16,7 @@ async-trait = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
 sqlx = { workspace = true, features = ["mysql", "runtime-tokio-native-tls"] }
-memoria-git = { version = "0.1.0", path = "../memoria-git" }
+memoria-git = { path = "../memoria-git" }
 
 [dev-dependencies]
 tokio = { workspace = true }
