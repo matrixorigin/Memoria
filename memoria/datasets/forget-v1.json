@@ -210,7 +210,7 @@
       "assertions": [
         {
           "query": "What does Alice's team work on?",
-          "top_k": 5,
+          "top_k": 3,
           "expected_contents": [
             "payment team",
             "billing-service"

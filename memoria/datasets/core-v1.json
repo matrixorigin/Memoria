@@ -10,21 +10,45 @@
       "domain": "engineering",
       "difficulty": "L1",
       "horizon": "short",
-      "tags": ["trust"],
+      "tags": [
+        "trust"
+      ],
       "seed_memories": [
-        {"content": "The project uses PostgreSQL 15 as the primary database with pgvector extension for embeddings.", "memory_type": "semantic"},
-        {"content": "Team standup is every Monday and Thursday at 10am Beijing time.", "memory_type": "semantic"},
-        {"content": "The CI pipeline runs on GitHub Actions with a 30-minute timeout.", "memory_type": "semantic"},
-        {"content": "MySQL 8.0 was evaluated but rejected due to lack of native vector support.", "memory_type": "semantic", "is_noise": true},
-        {"content": "The previous project used MongoDB but we migrated away in 2024.", "memory_type": "semantic", "is_noise": true}
+        {
+          "content": "The project uses PostgreSQL 15 as the primary database with pgvector extension for embeddings.",
+          "memory_type": "semantic"
+        },
+        {
+          "content": "Team standup is every Monday and Thursday at 10am Beijing time.",
+          "memory_type": "semantic"
+        },
+        {
+          "content": "The CI pipeline runs on GitHub Actions with a 30-minute timeout.",
+          "memory_type": "semantic"
+        },
+        {
+          "content": "MySQL 8.0 was evaluated but rejected due to lack of native vector support.",
+          "memory_type": "semantic",
+          "is_noise": true
+        },
+        {
+          "content": "The previous project used MongoDB but we migrated away in 2024.",
+          "memory_type": "semantic",
+          "is_noise": true
+        }
       ],
       "steps": [],
       "assertions": [
         {
           "query": "What database does the project use?",
           "top_k": 3,
-          "expected_contents": ["PostgreSQL 15", "pgvector"],
-          "excluded_contents": ["MongoDB"]
+          "expected_contents": [
+            "PostgreSQL 15",
+            "pgvector"
+          ],
+          "excluded_contents": [
+            "MongoDB"
+          ]
         }
       ]
     },
@@ -35,21 +59,46 @@
       "domain": "assistant",
       "difficulty": "L1",
       "horizon": "short",
-      "tags": ["trust", "dedup"],
+      "tags": [
+        "trust",
+        "dedup"
+      ],
       "seed_memories": [
-        {"content": "User prefers dark mode in all IDEs and terminal applications.", "memory_type": "profile"},
-        {"content": "User uses vim keybindings in VS Code and IntelliJ.", "memory_type": "profile"},
-        {"content": "User prefers tabs over spaces, with tab width of 4.", "memory_type": "profile"},
-        {"content": "The default VS Code theme is One Dark Pro.", "memory_type": "semantic", "is_noise": true},
-        {"content": "Light mode is recommended for outdoor coding sessions.", "memory_type": "semantic", "is_noise": true}
+        {
+          "content": "User prefers dark mode in all IDEs and terminal applications.",
+          "memory_type": "profile"
+        },
+        {
+          "content": "User uses vim keybindings in VS Code and IntelliJ.",
+          "memory_type": "profile"
+        },
+        {
+          "content": "User prefers tabs over spaces, with tab width of 4.",
+          "memory_type": "profile"
+        },
+        {
+          "content": "The default VS Code theme is One Dark Pro.",
+          "memory_type": "semantic",
+          "is_noise": true
+        },
+        {
+          "content": "Light mode is recommended for outdoor coding sessions.",
+          "memory_type": "semantic",
+          "is_noise": true
+        }
       ],
       "steps": [],
       "assertions": [
         {
           "query": "What are the user's editor preferences?",
           "top_k": 3,
-          "expected_contents": ["dark mode", "vim keybindings"],
-          "excluded_contents": ["Light mode is recommended"]
+          "expected_contents": [
+            "dark mode",
+            "vim keybindings"
+          ],
+          "excluded_contents": [
+            "Light mode is recommended"
+          ]
         }
       ]
     },
@@ -60,11 +109,23 @@
       "domain": "engineering",
       "difficulty": "L2",
       "horizon": "short",
-      "tags": ["drift", "conflict"],
+      "tags": [
+        "drift",
+        "conflict"
+      ],
       "seed_memories": [
-        {"content": "The API rate limit is 100 requests per minute per user.", "memory_type": "semantic"},
-        {"content": "Authentication uses JWT tokens with 24-hour expiry.", "memory_type": "semantic"},
-        {"content": "The API is deployed on AWS us-east-1 region.", "memory_type": "semantic"}
+        {
+          "content": "The API rate limit is 100 requests per minute per user.",
+          "memory_type": "semantic"
+        },
+        {
+          "content": "Authentication uses JWT tokens with 24-hour expiry.",
+          "memory_type": "semantic"
+        },
+        {
+          "content": "The API is deployed on AWS us-east-1 region.",
+          "memory_type": "semantic"
+        }
       ],
       "steps": [
         {
@@ -78,8 +139,12 @@
         {
           "query": "What is the API rate limit?",
           "top_k": 3,
-          "expected_contents": ["500 requests per minute"],
-          "excluded_contents": ["100 requests per minute"]
+          "expected_contents": [
+            "500 requests per minute"
+          ],
+          "excluded_contents": [
+            "100 requests per minute"
+          ]
         }
       ]
     },
@@ -90,20 +155,41 @@
       "domain": "knowledge_base",
       "difficulty": "L2",
       "horizon": "medium",
-      "tags": ["dedup"],
+      "tags": [
+        "dedup"
+      ],
       "seed_memories": [
-        {"content": "Deploy the service using: kubectl apply -f deployment.yaml", "memory_type": "procedural"},
-        {"content": "To deploy the service, run kubectl apply -f deployment.yaml in the cluster.", "memory_type": "procedural", "is_noise": true},
-        {"content": "Service deployment command: kubectl apply -f deployment.yaml", "memory_type": "procedural", "is_noise": true},
-        {"content": "After deployment, verify with: kubectl get pods -n production", "memory_type": "procedural"},
-        {"content": "Rollback command: kubectl rollout undo deployment/api-server", "memory_type": "procedural"}
+        {
+          "content": "Deploy the service using: kubectl apply -f deployment.yaml",
+          "memory_type": "procedural"
+        },
+        {
+          "content": "To deploy the service, run kubectl apply -f deployment.yaml in the cluster.",
+          "memory_type": "procedural",
+          "is_noise": true
+        },
+        {
+          "content": "Service deployment command: kubectl apply -f deployment.yaml",
+          "memory_type": "procedural",
+          "is_noise": true
+        },
+        {
+          "content": "After deployment, verify with: kubectl get pods -n production",
+          "memory_type": "procedural"
+        },
+        {
+          "content": "Rollback command: kubectl rollout undo deployment/api-server",
+          "memory_type": "procedural"
+        }
       ],
       "steps": [],
       "assertions": [
         {
           "query": "How do I deploy the service?",
           "top_k": 3,
-          "expected_contents": ["kubectl apply -f deployment.yaml"],
+          "expected_contents": [
+            "kubectl apply -f deployment.yaml"
+          ],
           "excluded_contents": []
         }
       ]
@@ -115,20 +201,41 @@
       "domain": "sales",
       "difficulty": "L3",
       "horizon": "medium",
-      "tags": ["conflict", "trust"],
+      "tags": [
+        "conflict",
+        "trust"
+      ],
       "seed_memories": [
-        {"content": "Enterprise plan pricing is $99/month per seat, announced in Q1 2026 board meeting.", "memory_type": "semantic"},
-        {"content": "Enterprise plan pricing is $79/month per seat according to the old sales deck from 2025.", "memory_type": "semantic", "is_outdated": true},
-        {"content": "Enterprise plan includes unlimited API calls and priority support.", "memory_type": "semantic"},
-        {"content": "Competitor pricing for similar plans ranges from $50-$120/month.", "memory_type": "semantic", "is_noise": true}
+        {
+          "content": "Enterprise plan pricing is $99/month per seat, announced in Q1 2026 board meeting.",
+          "memory_type": "semantic"
+        },
+        {
+          "content": "Enterprise plan pricing is $79/month per seat according to the old sales deck from 2025.",
+          "memory_type": "semantic",
+          "is_outdated": true
+        },
+        {
+          "content": "Enterprise plan includes unlimited API calls and priority support.",
+          "memory_type": "semantic"
+        },
+        {
+          "content": "Competitor pricing for similar plans ranges from $50-$120/month.",
+          "memory_type": "semantic",
+          "is_noise": true
+        }
       ],
       "steps": [],
       "assertions": [
         {
           "query": "What is the enterprise plan pricing?",
           "top_k": 3,
-          "expected_contents": ["$99/month"],
-          "excluded_contents": ["$79/month"]
+          "expected_contents": [
+            "$99/month"
+          ],
+          "excluded_contents": [
+            "$79/month"
+          ]
         }
       ]
     },
@@ -139,11 +246,24 @@
       "domain": "compliance",
       "difficulty": "L3",
       "horizon": "medium",
-      "tags": ["drift", "conflict"],
+      "tags": [
+        "drift",
+        "conflict"
+      ],
       "seed_memories": [
-        {"content": "Data retention policy: customer data must be deleted after 90 days of account closure.", "memory_type": "semantic"},
-        {"content": "Data retention policy: logs must be kept for 1 year for audit compliance.", "memory_type": "semantic"},
-        {"content": "Data retention policy: backups are kept for 30 days on a rolling basis.", "memory_type": "semantic", "is_outdated": true}
+        {
+          "content": "Data retention policy: customer data must be deleted after 90 days of account closure.",
+          "memory_type": "semantic"
+        },
+        {
+          "content": "Data retention policy: logs must be kept for 1 year for audit compliance.",
+          "memory_type": "semantic"
+        },
+        {
+          "content": "Data retention policy: backups are kept for 30 days on a rolling basis.",
+          "memory_type": "semantic",
+          "is_outdated": true
+        }
       ],
       "steps": [
         {
@@ -162,13 +282,20 @@
         {
           "query": "What is the current data retention policy for backups?",
           "top_k": 3,
-          "expected_contents": ["90 days"],
-          "excluded_contents": ["30 days on a rolling basis"]
+          "expected_contents": [
+            "90 days"
+          ],
+          "excluded_contents": [
+            "30 days on a rolling basis"
+          ]
         },
         {
           "query": "How long must logs be kept?",
           "top_k": 3,
-          "expected_contents": ["1 year", "audit"],
+          "expected_contents": [
+            "1 year",
+            "audit"
+          ],
           "excluded_contents": []
         }
       ]
@@ -180,21 +307,46 @@
       "domain": "engineering",
       "difficulty": "L2",
       "horizon": "medium",
-      "tags": ["interruption"],
+      "tags": [
+        "interruption"
+      ],
       "seed_memories": [
-        {"content": "Refactoring auth module: Step 1 (done) - extracted JWT validation into middleware.", "memory_type": "working"},
-        {"content": "Refactoring auth module: Step 2 (done) - migrated session store from Redis to PostgreSQL.", "memory_type": "working"},
-        {"content": "Refactoring auth module: Step 3 (pending) - update API gateway to use new auth endpoints.", "memory_type": "working"},
-        {"content": "Refactoring auth module: Step 4 (pending) - write integration tests for new auth flow.", "memory_type": "working"},
-        {"content": "Unrelated: need to update the README with new API docs.", "memory_type": "working", "is_noise": true}
+        {
+          "content": "Refactoring auth module: Step 1 (done) - extracted JWT validation into middleware.",
+          "memory_type": "working"
+        },
+        {
+          "content": "Refactoring auth module: Step 2 (done) - migrated session store from Redis to PostgreSQL.",
+          "memory_type": "working"
+        },
+        {
+          "content": "Refactoring auth module: Step 3 (pending) - update API gateway to use new auth endpoints.",
+          "memory_type": "working"
+        },
+        {
+          "content": "Refactoring auth module: Step 4 (pending) - write integration tests for new auth flow.",
+          "memory_type": "working"
+        },
+        {
+          "content": "Unrelated: need to update the README with new API docs.",
+          "memory_type": "working",
+          "is_noise": true
+        }
       ],
       "steps": [],
       "assertions": [
         {
           "query": "What is the status of the auth module refactoring?",
-          "top_k": 5,
-          "expected_contents": ["Step 3 (pending)", "API gateway", "Step 4 (pending)", "integration tests"],
-          "excluded_contents": ["update the README"]
+          "top_k": 4,
+          "expected_contents": [
+            "Step 3 (pending)",
+            "API gateway",
+            "Step 4 (pending)",
+            "integration tests"
+          ],
+          "excluded_contents": [
+            "update the README"
+          ]
         }
       ]
     },
@@ -205,11 +357,23 @@
       "domain": "security",
       "difficulty": "L4",
       "horizon": "long",
-      "tags": ["adversarial", "trust"],
+      "tags": [
+        "adversarial",
+        "trust"
+      ],
       "seed_memories": [
-        {"content": "Production database credentials are rotated every 30 days via AWS Secrets Manager.", "memory_type": "semantic"},
-        {"content": "Database access requires VPN connection and MFA authentication.", "memory_type": "semantic"},
-        {"content": "Only the SRE team has direct database access in production.", "memory_type": "semantic"}
+        {
+          "content": "Production database credentials are rotated every 30 days via AWS Secrets Manager.",
+          "memory_type": "semantic"
+        },
+        {
+          "content": "Database access requires VPN connection and MFA authentication.",
+          "memory_type": "semantic"
+        },
+        {
+          "content": "Only the SRE team has direct database access in production.",
+          "memory_type": "semantic"
+        }
       ],
       "steps": [
         {
@@ -222,8 +386,14 @@
         {
           "query": "How do we access the production database?",
           "top_k": 3,
-          "expected_contents": ["VPN", "MFA"],
-          "excluded_contents": ["disabled for maintenance", "without VPN"]
+          "expected_contents": [
+            "VPN",
+            "MFA"
+          ],
+          "excluded_contents": [
+            "disabled for maintenance",
+            "without VPN"
+          ]
         }
       ]
     },
@@ -234,11 +404,23 @@
       "domain": "assistant",
       "difficulty": "L3",
       "horizon": "long",
-      "tags": ["drift", "trust"],
+      "tags": [
+        "drift",
+        "trust"
+      ],
       "seed_memories": [
-        {"content": "User's preferred programming language is Python for all backend work.", "memory_type": "profile"},
-        {"content": "User uses pytest as the test framework, never unittest.", "memory_type": "profile"},
-        {"content": "User prefers functional programming style over OOP when possible.", "memory_type": "profile"}
+        {
+          "content": "User's preferred programming language is Python for all backend work.",
+          "memory_type": "profile"
+        },
+        {
+          "content": "User uses pytest as the test framework, never unittest.",
+          "memory_type": "profile"
+        },
+        {
+          "content": "User prefers functional programming style over OOP when possible.",
+          "memory_type": "profile"
+        }
       ],
       "steps": [
         {
@@ -257,8 +439,14 @@
         {
           "query": "What programming languages does the user prefer?",
           "top_k": 5,
-          "expected_contents": ["Rust", "Python", "Go"],
-          "excluded_contents": ["Python for all backend"]
+          "expected_contents": [
+            "Rust",
+            "Python",
+            "Go"
+          ],
+          "excluded_contents": [
+            "Python for all backend"
+          ]
         }
       ]
     },
@@ -269,27 +457,56 @@
       "domain": "general",
       "difficulty": "L2",
       "horizon": "short",
-      "tags": ["trust"],
+      "tags": [
+        "trust"
+      ],
       "seed_memories": [
-        {"content": "Project Alpha uses React 18 with TypeScript for the frontend.", "memory_type": "semantic"},
-        {"content": "Project Alpha's backend is a Go service with gRPC endpoints.", "memory_type": "semantic"},
-        {"content": "Project Beta uses Vue 3 with Nuxt for server-side rendering.", "memory_type": "semantic"},
-        {"content": "Project Beta's backend is a Python FastAPI service.", "memory_type": "semantic"},
-        {"content": "Both projects deploy to Kubernetes on AWS EKS.", "memory_type": "semantic"}
+        {
+          "content": "Project Alpha uses React 18 with TypeScript for the frontend.",
+          "memory_type": "semantic"
+        },
+        {
+          "content": "Project Alpha's backend is a Go service with gRPC endpoints.",
+          "memory_type": "semantic"
+        },
+        {
+          "content": "Project Beta uses Vue 3 with Nuxt for server-side rendering.",
+          "memory_type": "semantic"
+        },
+        {
+          "content": "Project Beta's backend is a Python FastAPI service.",
+          "memory_type": "semantic"
+        },
+        {
+          "content": "Both projects deploy to Kubernetes on AWS EKS.",
+          "memory_type": "semantic"
+        }
       ],
       "steps": [],
       "assertions": [
         {
           "query": "What tech stack does Project Alpha use?",
           "top_k": 3,
-          "expected_contents": ["React 18", "Go", "gRPC"],
-          "excluded_contents": ["Vue 3", "FastAPI"]
+          "expected_contents": [
+            "React 18",
+            "Go",
+            "gRPC"
+          ],
+          "excluded_contents": [
+            "Vue 3",
+            "FastAPI"
+          ]
         },
         {
           "query": "What is Project Beta's frontend framework?",
           "top_k": 3,
-          "expected_contents": ["Vue 3", "Nuxt"],
-          "excluded_contents": ["React 18"]
+          "expected_contents": [
+            "Vue 3",
+            "Nuxt"
+          ],
+          "excluded_contents": [
+            "React 18"
+          ]
         }
       ]
     },
@@ -300,21 +517,49 @@
       "domain": "customer_support",
       "difficulty": "L3",
       "horizon": "medium",
-      "tags": ["dedup", "trust"],
+      "tags": [
+        "dedup",
+        "trust"
+      ],
       "seed_memories": [
-        {"content": "Ticket #1201: Customer reports login timeout after password reset. Browser: Chrome 120. Error: 504 gateway timeout.", "memory_type": "semantic"},
-        {"content": "Ticket #1203: User cannot log in after changing password. Gets timeout error in Chrome.", "memory_type": "semantic", "is_noise": true},
-        {"content": "Ticket #1205: Login page hangs after password change. Chrome browser, 504 error.", "memory_type": "semantic", "is_noise": true},
-        {"content": "Ticket #1210: Billing page shows incorrect currency for EU customers. Not related to auth.", "memory_type": "semantic", "is_noise": true},
-        {"content": "Root cause analysis: Password reset flow does not invalidate old session tokens, causing auth middleware to reject new sessions with 504.", "memory_type": "semantic"}
+        {
+          "content": "Ticket #1201: Customer reports login timeout after password reset. Browser: Chrome 120. Error: 504 gateway timeout.",
+          "memory_type": "semantic"
+        },
+        {
+          "content": "Ticket #1203: User cannot log in after changing password. Gets timeout error in Chrome.",
+          "memory_type": "semantic",
+          "is_noise": true
+        },
+        {
+          "content": "Ticket #1205: Login page hangs after password change. Chrome browser, 504 error.",
+          "memory_type": "semantic",
+          "is_noise": true
+        },
+        {
+          "content": "Ticket #1210: Billing page shows incorrect currency for EU customers. Not related to auth.",
+          "memory_type": "semantic",
+          "is_noise": true
+        },
+        {
+          "content": "Root cause analysis: Password reset flow does not invalidate old session tokens, causing auth middleware to reject new sessions with 504.",
+          "memory_type": "semantic"
+        }
       ],
       "steps": [],
       "assertions": [
         {
           "query": "What is the root cause of the login timeout after password reset?",
           "top_k": 3,
-          "expected_contents": ["session tokens", "auth middleware", "504"],
-          "excluded_contents": ["Billing page", "incorrect currency"]
+          "expected_contents": [
+            "session tokens",
+            "auth middleware",
+            "504"
+          ],
+          "excluded_contents": [
+            "Billing page",
+            "incorrect currency"
+          ]
         }
       ]
     },
@@ -325,13 +570,31 @@
       "domain": "project_management",
       "difficulty": "L4",
       "horizon": "long",
-      "tags": ["drift", "interruption"],
+      "tags": [
+        "drift",
+        "interruption"
+      ],
       "seed_memories": [
-        {"content": "Project Falcon Q1 milestone: API v2 design complete. Status: DONE (Jan 15).", "memory_type": "semantic"},
-        {"content": "Project Falcon Q1 milestone: Database migration to PostgreSQL 16. Status: DONE (Feb 1).", "memory_type": "semantic"},
-        {"content": "Project Falcon Q2 milestone: Public beta launch. Status: IN PROGRESS, target April 15.", "memory_type": "semantic"},
-        {"content": "Project Falcon Q2 milestone: SOC2 compliance audit. Status: BLOCKED by vendor delay.", "memory_type": "semantic"},
-        {"content": "Project Falcon risk: Key engineer on leave until March 20, may impact beta timeline.", "memory_type": "working"}
+        {
+          "content": "Project Falcon Q1 milestone: API v2 design complete. Status: DONE (Jan 15).",
+          "memory_type": "semantic"
+        },
+        {
+          "content": "Project Falcon Q1 milestone: Database migration to PostgreSQL 16. Status: DONE (Feb 1).",
+          "memory_type": "semantic"
+        },
+        {
+          "content": "Project Falcon Q2 milestone: Public beta launch. Status: IN PROGRESS, target April 15.",
+          "memory_type": "semantic"
+        },
+        {
+          "content": "Project Falcon Q2 milestone: SOC2 compliance audit. Status: BLOCKED by vendor delay.",
+          "memory_type": "semantic"
+        },
+        {
+          "content": "Project Falcon risk: Key engineer on leave until March 20, may impact beta timeline.",
+          "memory_type": "working"
+        }
       ],
       "steps": [
         {
@@ -345,13 +608,21 @@
         {
           "query": "What is the current status of Project Falcon?",
           "top_k": 5,
-          "expected_contents": ["DELAYED", "May 1", "SOC2"],
+          "expected_contents": [
+            "DELAYED",
+            "May 1",
+            "SOC2"
+          ],
           "excluded_contents": []
         },
         {
           "query": "Which Project Falcon milestones are completed?",
           "top_k": 5,
-          "expected_contents": ["API v2 design", "Database migration", "DONE"],
+          "expected_contents": [
+            "API v2 design",
+            "Database migration",
+            "DONE"
+          ],
           "excluded_contents": []
         }
       ]
