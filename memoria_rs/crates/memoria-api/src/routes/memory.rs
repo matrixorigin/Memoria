@@ -169,11 +169,7 @@ pub async fn purge_memories(
             purged += 1;
         }
     } else if let Some(topic) = &req.topic {
-        let results = state.service.retrieve(&user_id, topic, 100).await.map_err(api_err)?;
-        for m in &results {
-            state.service.purge(&m.memory_id).await.map_err(api_err)?;
-            purged += 1;
-        }
+        purged = state.service.purge_by_topic(&user_id, topic).await.map_err(api_err)?;
     }
     Ok(Json(PurgeResponse { purged }))
 }

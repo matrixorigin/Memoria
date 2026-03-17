@@ -162,6 +162,24 @@ impl GraphStore {
 
     // ── Node writes ──────────────────────────────────────────────────────────
 
+    /// Get all active nodes for a user, including embeddings.
+    pub async fn get_user_nodes_with_embeddings(
+        &self, user_id: &str, limit: i64,
+    ) -> Result<Vec<GraphNode>, MemoriaError> {
+        // Must alias embedding to force MO to return vecf32 as text
+        let sql = "SELECT node_id, user_id, node_type, content, entity_type, \
+                   embedding AS embedding, memory_id, session_id, confidence, trust_tier, importance, \
+                   source_nodes, conflicts_with, conflict_resolution, \
+                   access_count, cross_session_count, is_active, superseded_by, created_at \
+                   FROM memory_graph_nodes \
+                   WHERE user_id = ? AND is_active = 1 \
+                     AND embedding IS NOT NULL AND vector_dims(embedding) > 0 \
+                   LIMIT ?";
+        let rows = sqlx::query(sql).bind(user_id).bind(limit)
+            .fetch_all(&self.pool).await.map_err(db_err)?;
+        Ok(rows.iter().map(|r| row_to_node(r)).collect())
+    }
+
     pub async fn create_node(&self, node: &GraphNode) -> Result<(), MemoriaError> {
         let source_nodes_str = if node.source_nodes.is_empty() {
             None
@@ -169,14 +187,28 @@ impl GraphStore {
             Some(node.source_nodes.join(","))
         };
         let now = node.created_at.unwrap_or_else(|| chrono::Utc::now().naive_utc());
-        sqlx::query(
+        let emb_lit = node.embedding.as_ref().map(|v|
+            format!("[{}]", v.iter().map(|f| f.to_string()).collect::<Vec<_>>().join(","))
+        );
+        let sql = if emb_lit.is_some() {
+            format!(
+                "INSERT INTO memory_graph_nodes \
+                 (node_id, user_id, node_type, content, entity_type, embedding, \
+                  memory_id, session_id, confidence, trust_tier, importance, \
+                  source_nodes, conflicts_with, conflict_resolution, \
+                  access_count, cross_session_count, is_active, superseded_by, created_at) \
+                 VALUES (?,?,?,?,?,'{}',?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                emb_lit.as_ref().unwrap()
+            )
+        } else {
             "INSERT INTO memory_graph_nodes \
              (node_id, user_id, node_type, content, entity_type, \
               memory_id, session_id, confidence, trust_tier, importance, \
               source_nodes, conflicts_with, conflict_resolution, \
               access_count, cross_session_count, is_active, superseded_by, created_at) \
-             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
-        )
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)".to_string()
+        };
+        sqlx::query(&sql)
         .bind(&node.node_id).bind(&node.user_id).bind(node.node_type.as_str())
         .bind(&node.content).bind(&node.entity_type)
         .bind(&node.memory_id).bind(&node.session_id)

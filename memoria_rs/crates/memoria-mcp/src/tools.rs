@@ -310,15 +310,8 @@ pub async fn call(
                 }
                 Ok(mcp_text(&format!("Purged {count} memory(s)")))
             } else if !topic.is_empty() {
-                // Bulk by keyword: search then purge all matches
-                let results = service.retrieve(user_id, topic, 100).await?;
-                let count = results.len();
-                for m in &results {
-                    service.purge(&m.memory_id).await?;
-                    if let Some(sql) = &service.sql_store {
-                        let _ = sql.graph_store().deactivate_by_memory_id(&m.memory_id).await;
-                    }
-                }
+                // Bulk by keyword: exact text match then purge
+                let count = service.purge_by_topic(user_id, topic).await?;
                 Ok(mcp_text(&format!("Purged {count} memory(s) matching '{topic}'")))
             } else {
                 Ok(mcp_text("Provide memory_id or topic"))

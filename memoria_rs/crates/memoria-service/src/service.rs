@@ -472,6 +472,21 @@ impl MemoryService {
         self.store.soft_delete(memory_id).await
     }
 
+    /// Purge memories whose content contains `topic` (exact text match).
+    pub async fn purge_by_topic(&self, user_id: &str, topic: &str) -> Result<usize, MemoriaError> {
+        if let Some(sql) = &self.sql_store {
+            let table = sql.active_table(user_id).await?;
+            let ids = sql.find_ids_by_topic(&table, user_id, topic).await?;
+            for id in &ids {
+                self.store.soft_delete(id).await?;
+                let _ = sql.graph_store().deactivate_by_memory_id(id).await;
+            }
+            Ok(ids.len())
+        } else {
+            Ok(0)
+        }
+    }
+
     pub async fn get(&self, memory_id: &str) -> Result<Option<Memory>, MemoriaError> {
         self.store.get(memory_id).await
     }

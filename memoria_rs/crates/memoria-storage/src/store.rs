@@ -660,6 +660,36 @@ impl SqlMemoryStore {
         rows.iter().map(row_to_memory).collect()
     }
 
+    /// Find memory IDs whose content contains `topic` (exact substring match).
+    /// Uses fulltext boolean MUST first, falls back to LIKE.
+    pub async fn find_ids_by_topic(&self, table: &str, user_id: &str, topic: &str) -> Result<Vec<String>, MemoriaError> {
+        let safe = topic.replace('\'', "").replace('\\', "");
+        // Try fulltext boolean MUST (+word) first
+        let sql = format!(
+            "SELECT memory_id FROM {table} \
+             WHERE user_id = ? AND is_active = 1 \
+               AND MATCH(content) AGAINST('+{safe}' IN BOOLEAN MODE) \
+               AND content LIKE ?"
+        );
+        let like_pat = format!("%{safe}%");
+        let rows: Vec<(String,)> = sqlx::query_as(&sql)
+            .bind(user_id).bind(&like_pat)
+            .fetch_all(&self.pool).await
+            .unwrap_or_default();
+        if !rows.is_empty() {
+            return Ok(rows.into_iter().map(|r| r.0).collect());
+        }
+        // Fallback: LIKE only (handles short tokens that fulltext ignores)
+        let sql2 = format!(
+            "SELECT memory_id FROM {table} \
+             WHERE user_id = ? AND is_active = 1 AND content LIKE ?"
+        );
+        let rows2: Vec<(String,)> = sqlx::query_as(&sql2)
+            .bind(user_id).bind(&like_pat)
+            .fetch_all(&self.pool).await.map_err(db_err)?;
+        Ok(rows2.into_iter().map(|r| r.0).collect())
+    }
+
     pub async fn search_fulltext_from(&self, table: &str, user_id: &str, query: &str, limit: i64) -> Result<Vec<Memory>, MemoriaError> {
         let safe = query.replace('\'', "").replace('\\', "").replace('+', " ").replace('-', " ");
         // Use OR semantics (no + prefix) — AND is too strict for natural language queries

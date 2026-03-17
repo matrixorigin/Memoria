@@ -184,13 +184,21 @@ pub async fn trigger_governance(
             let r = consolidator.consolidate(&user_id).await;
             Ok(Json(serde_json::json!({"op": op, "user_id": user_id, "conflicts_detected": r.conflicts_detected, "orphaned_scenes": r.orphaned_scenes})))
         }
+        "extract_entities" => {
+            let r = memoria_storage::graph::backfill::backfill_graph(sql, &user_id).await.map_err(db_err)?;
+            Ok(Json(serde_json::json!({
+                "op": op, "user_id": user_id,
+                "processed": r.processed, "skipped": r.skipped,
+                "edges_created": r.edges_created, "entities_linked": r.entities_linked,
+            })))
+        }
         "weekly" => {
             let cleaned_snapshots = sql.cleanup_snapshots(5).await.map_err(db_err)?;
             let cleaned_branches = sql.cleanup_orphan_branches().await.map_err(db_err)?;
             let _ = sql.rebuild_vector_index("mem_memories").await;
             Ok(Json(serde_json::json!({"op": op, "user_id": user_id, "cleaned_snapshots": cleaned_snapshots, "cleaned_branches": cleaned_branches})))
         }
-        _ => Err((StatusCode::BAD_REQUEST, format!("Invalid op: {op}. Must be governance|consolidate|weekly"))),
+        _ => Err((StatusCode::BAD_REQUEST, format!("Invalid op: {op}. Must be governance|consolidate|extract_entities|weekly"))),
     }
 }
 
