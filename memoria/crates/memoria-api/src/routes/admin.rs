@@ -1,5 +1,5 @@
-/// Admin endpoints — system stats, user management, governance triggers.
-/// All routes require master key auth (same Bearer token).
+//! Admin endpoints — system stats, user management, governance triggers.
+//! All routes require master key auth (same Bearer token).
 
 use axum::{
     extract::{Path, Query, State},

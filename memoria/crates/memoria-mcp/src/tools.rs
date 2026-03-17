@@ -1,5 +1,5 @@
-/// 8 core MCP tools for Phase 2.
-/// Phase 4 will add 14 more (Git-for-Data, admin, graph).
+//! 8 core MCP tools for Phase 2.
+//! Phase 4 will add 14 more (Git-for-Data, admin, graph).
 
 use anyhow::Result;
 use memoria_core::{MemoryType, TrustTier};
@@ -415,7 +415,7 @@ pub async fn call(
                 Some(s) => s.clone(),
                 None => return Ok(mcp_text("Rebuild index requires SQL store")),
             };
-            let total_rows = sql.rebuild_vector_index(&table).await
+            let total_rows = sql.rebuild_vector_index(table).await
                 .map_err(|e| anyhow::anyhow!("rebuild index failed: {e}"))?;
             Ok(mcp_text(&format!(
                 "Rebuilt IVF index for {table}: rows={total_rows}"
@@ -595,8 +595,8 @@ pub async fn call(
             }
 
             // auto with LLM: extract via LLM and write directly
-            if mode != "candidates" && service.llm.is_some() {
-                let llm = service.llm.as_ref().unwrap();
+            if mode != "candidates" {
+              if let Some(llm) = service.llm.as_ref() {
                 let mut total_created = 0usize;
                 let mut total_edges = 0usize;
 
@@ -634,6 +634,7 @@ pub async fn call(
                     "entities_found": total_created,
                     "edges_created": total_edges
                 }))?));
+              }
             }
 
             // candidates mode (or auto without LLM): return for agent to process

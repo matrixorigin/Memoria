@@ -1,12 +1,12 @@
-/// memoria — unified CLI for Memoria persistent memory service.
-///
-/// Commands:
-///   memoria serve         — start REST API server
-///   memoria mcp           — start MCP server (embedded or remote mode)
-///   memoria init          — detect tools, write MCP config + steering rules
-///   memoria status        — show configuration status
-///   memoria update-rules  — update steering rules to latest version
-///   memoria benchmark     — run benchmark against a Memoria API server
+//! memoria — unified CLI for Memoria persistent memory service.
+//!
+//! Commands:
+//!   memoria serve         — start REST API server
+//!   memoria mcp           — start MCP server (embedded or remote mode)
+//!   memoria init          — detect tools, write MCP config + steering rules
+//!   memoria status        — show configuration status
+//!   memoria update-rules  — update steering rules to latest version
+//!   memoria benchmark     — run benchmark against a Memoria API server
 
 mod benchmark;
 
@@ -201,6 +201,7 @@ async fn cmd_serve(db_url: Option<String>, port: u16, master_key: String) -> Res
 
 // ── MCP server ────────────────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 async fn cmd_mcp(
     api_url: Option<String>, token: Option<String>,
     db_url: Option<String>, user: Option<String>,
@@ -308,6 +309,7 @@ fn build_llm(cfg: &memoria_service::Config) -> Option<Arc<memoria_embedding::Llm
 
 // ── Init / Status / UpdateRules (unchanged logic) ─────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 fn mcp_entry(
     db_url: Option<&str>,
     api_url: Option<&str>,
@@ -476,17 +478,18 @@ fn configure_claude(project_dir: &Path, entry: &serde_json::Value, _force: bool)
             let mut f = std::fs::OpenOptions::new().append(true).open(&claude_md).unwrap();
             use std::io::Write;
             writeln!(f, "\n\n{}", claude_rule).ok();
-            results.push(format!("  ✓ CLAUDE.md (appended memory rules)"));
+            results.push("  ✓ CLAUDE.md (appended memory rules)".to_string());
         } else {
-            results.push(format!("  ✓ CLAUDE.md (already has memory rules)"));
+            results.push("  ✓ CLAUDE.md (already has memory rules)".to_string());
         }
     } else {
         std::fs::write(&claude_md, &claude_rule).ok();
-        results.push(format!("  ✓ CLAUDE.md (created)"));
+        results.push("  ✓ CLAUDE.md (created)".to_string());
     }
     results
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_init(
     project_dir: &Path, tools: Vec<ToolName>,
     db_url: Option<String>, api_url: Option<String>, token: Option<String>,

@@ -1,5 +1,5 @@
-/// Remote mode: proxy all MCP tool calls to a Memoria REST API server.
-/// Mirrors Python's HTTPBackend.
+//! Remote mode: proxy all MCP tool calls to a Memoria REST API server.
+//! Mirrors Python's HTTPBackend.
 
 use anyhow::Result;
 use reqwest::Client;

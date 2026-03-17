@@ -1,8 +1,8 @@
-/// Pluggable retrieval strategy registry.
-/// Mirrors Python's strategy/protocol.py + strategy/registry.py.
-///
-/// Strategies are identified by "type:version" keys (e.g. "vector:v1", "activation:v1").
-/// The registry maps keys to factory functions that produce boxed strategy instances.
+//! Pluggable retrieval strategy registry.
+//! Mirrors Python's strategy/protocol.py + strategy/registry.py.
+//!
+//! Strategies are identified by "type:version" keys (e.g. "vector:v1", "activation:v1").
+//! The registry maps keys to factory functions that produce boxed strategy instances.
 
 use async_trait::async_trait;
 use memoria_core::{Memory, MemoriaError};

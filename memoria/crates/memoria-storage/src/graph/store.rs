@@ -1,5 +1,5 @@
-/// GraphStore — CRUD for memory_graph_nodes and memory_graph_edges.
-/// Mirrors Python's graph/graph_store.py core methods needed for consolidation.
+//! GraphStore — CRUD for memory_graph_nodes and memory_graph_edges.
+//! Mirrors Python's graph/graph_store.py core methods needed for consolidation.
 
 use crate::store::db_err;
 use crate::graph::types::{GraphEdge, GraphNode, NodeType, edge_type};
@@ -126,7 +126,7 @@ impl GraphStore {
         let mut q = sqlx::query(&sql);
         for id in ids { q = q.bind(id); }
         let rows = q.fetch_all(&self.pool).await.map_err(db_err)?;
-        Ok(rows.iter().map(|r| row_to_node(r)).collect())
+        Ok(rows.iter().map(row_to_node).collect())
     }
 
     pub async fn get_node_by_memory_id(&self, memory_id: &str) -> Result<Option<GraphNode>, MemoriaError> {
@@ -157,7 +157,7 @@ impl GraphStore {
         let rows = sqlx::query(&sql)
             .bind(user_id).bind(node_type.as_str())
             .fetch_all(&self.pool).await.map_err(db_err)?;
-        Ok(rows.iter().map(|r| row_to_node_no_emb(r)).collect())
+        Ok(rows.iter().map(row_to_node_no_emb).collect())
     }
 
     // ── Node writes ──────────────────────────────────────────────────────────
@@ -177,7 +177,7 @@ impl GraphStore {
                    LIMIT ?";
         let rows = sqlx::query(sql).bind(user_id).bind(limit)
             .fetch_all(&self.pool).await.map_err(db_err)?;
-        Ok(rows.iter().map(|r| row_to_node(r)).collect())
+        Ok(rows.iter().map(row_to_node).collect())
     }
 
     pub async fn create_node(&self, node: &GraphNode) -> Result<(), MemoriaError> {
@@ -190,7 +190,7 @@ impl GraphStore {
         let emb_lit = node.embedding.as_ref().map(|v|
             format!("[{}]", v.iter().map(|f| f.to_string()).collect::<Vec<_>>().join(","))
         );
-        let sql = if emb_lit.is_some() {
+        let sql = if let Some(emb) = &emb_lit {
             format!(
                 "INSERT INTO memory_graph_nodes \
                  (node_id, user_id, node_type, content, entity_type, embedding, \
@@ -198,7 +198,7 @@ impl GraphStore {
                   source_nodes, conflicts_with, conflict_resolution, \
                   access_count, cross_session_count, is_active, superseded_by, created_at) \
                  VALUES (?,?,?,?,?,'{}',?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                emb_lit.as_ref().unwrap()
+                emb
             )
         } else {
             "INSERT INTO memory_graph_nodes \
@@ -669,7 +669,7 @@ fn row_to_node_inner(r: &sqlx::mysql::MySqlRow, embedding: Option<Vec<f32>>) -> 
     GraphNode {
         node_id: r.try_get("node_id").unwrap_or_default(),
         user_id: r.try_get("user_id").unwrap_or_default(),
-        node_type: NodeType::from_str(&node_type_str),
+        node_type: node_type_str.parse().unwrap(),
         content: r.try_get("content").unwrap_or_default(),
         entity_type: r.try_get("entity_type").ok().flatten(),
         embedding,

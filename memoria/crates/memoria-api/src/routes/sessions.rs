@@ -1,6 +1,6 @@
-/// Episodic memory generation from session memories.
-/// POST /v1/sessions/{session_id}/summary
-/// GET  /v1/tasks/{task_id}
+//! Episodic memory generation from session memories.
+//! POST /v1/sessions/{session_id}/summary
+//! GET  /v1/tasks/{task_id}
 
 use axum::{
     extract::{Path, State},

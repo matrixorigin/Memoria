@@ -218,11 +218,11 @@ pub async fn get_profile(
             if let Ok(c) = r.try_get::<f64, _>("avg_conf") { conf_sum += c * cnt as f64; conf_n += cnt; }
             if let Ok(Some(d)) = r.try_get::<Option<chrono::NaiveDateTime>, _>("oldest") {
                 let s = d.to_string();
-                if oldest.as_ref().map_or(true, |o| s < *o) { oldest = Some(s); }
+                if oldest.as_ref().is_none_or(|o| s < *o) { oldest = Some(s); }
             }
             if let Ok(Some(d)) = r.try_get::<Option<chrono::NaiveDateTime>, _>("newest") {
                 let s = d.to_string();
-                if newest.as_ref().map_or(true, |n| s > *n) { newest = Some(s); }
+                if newest.as_ref().is_none_or(|n| s > *n) { newest = Some(s); }
             }
         }
         let avg_conf = if conf_n > 0 { ((conf_sum / conf_n as f64) * 100.0).round() / 100.0 } else { 0.0 };

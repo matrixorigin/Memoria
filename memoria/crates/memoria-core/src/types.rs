@@ -44,13 +44,14 @@ impl std::str::FromStr for MemoryType {
 }
 
 /// Trust tier — T1 (verified) → T4 (unverified).
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum TrustTier {
     #[serde(rename = "T1")]
     T1Verified,
     #[serde(rename = "T2")]
     T2Curated,
     #[serde(rename = "T3")]
+    #[default]
     T3Inferred,
     #[serde(rename = "T4")]
     T4Unverified,
@@ -73,12 +74,6 @@ impl TrustTier {
             TrustTier::T3Inferred => 0.65,
             TrustTier::T4Unverified => 0.40,
         }
-    }
-}
-
-impl Default for TrustTier {
-    fn default() -> Self {
-        TrustTier::T3Inferred
     }
 }
 

@@ -145,7 +145,7 @@ pub async fn diff_snapshot(
         .ok_or((StatusCode::SERVICE_UNAVAILABLE, "SQL store required".into()))?;
 
     let snap_name = format!("mem_snap_{name}");
-    let limit = q.limit.unwrap_or(50).min(200) as i64;
+    let limit = q.limit.unwrap_or(50).min(200);
 
     // Counts
     let snap_count: i64 = sqlx::query_scalar(&format!(

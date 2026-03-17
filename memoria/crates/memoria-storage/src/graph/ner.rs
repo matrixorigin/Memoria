@@ -1,5 +1,5 @@
-/// Lightweight regex-based entity extraction — mirrors Python's entity_extractor.py
-/// No LLM, no network. Runs on every memory_store automatically.
+//! Lightweight regex-based entity extraction — mirrors Python's entity_extractor.py
+//! No LLM, no network. Runs on every memory_store automatically.
 
 /// Known tech terms (lowercase) that are common English words needing explicit listing.
 const TECH_TERMS: &[&str] = &[

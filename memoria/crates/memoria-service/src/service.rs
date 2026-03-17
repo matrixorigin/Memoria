@@ -124,6 +124,7 @@ impl MemoryService {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     #[tracing::instrument(skip(self, content), fields(user_id))]
     pub async fn store_memory(
         &self,

@@ -1,5 +1,5 @@
-/// Minimal OpenAI-compatible LLM client.
-/// Reads LLM_API_KEY, LLM_BASE_URL, LLM_MODEL from environment.
+//! Minimal OpenAI-compatible LLM client.
+//! Reads LLM_API_KEY, LLM_BASE_URL, LLM_MODEL from environment.
 
 use serde::{Deserialize, Serialize};
 

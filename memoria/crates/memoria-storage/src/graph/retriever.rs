@@ -1,7 +1,7 @@
-/// ActivationRetriever — graph-based memory retrieval via spreading activation.
-///
-/// Mirrors Python's graph/retriever.py: dual-trigger anchor selection (vector + BM25),
-/// entity recall, spreading activation, multi-factor scoring.
+//! ActivationRetriever — graph-based memory retrieval via spreading activation.
+//!
+//! Mirrors Python's graph/retriever.py: dual-trigger anchor selection (vector + BM25),
+//! entity recall, spreading activation, multi-factor scoring.
 
 use std::collections::{HashMap, HashSet};
 

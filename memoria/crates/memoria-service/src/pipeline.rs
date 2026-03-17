@@ -1,10 +1,10 @@
-/// Typed memory pipeline: Sensitivity → Sandbox → Persist.
-///
-/// Simplified Rust version (no LLM-based observer — caller provides candidates).
-/// Pipeline phases:
-///   Phase 1: Sensitivity filter — block HIGH, redact MEDIUM
-///   Phase 2: Sandbox validation (optional, requires git service)
-///   Phase 3: Persist validated memories
+//! Typed memory pipeline: Sensitivity → Sandbox → Persist.
+//!
+//! Simplified Rust version (no LLM-based observer — caller provides candidates).
+//! Pipeline phases:
+//!   Phase 1: Sensitivity filter — block HIGH, redact MEDIUM
+//!   Phase 2: Sandbox validation (optional, requires git service)
+//!   Phase 3: Persist validated memories
 
 use std::sync::Arc;
 

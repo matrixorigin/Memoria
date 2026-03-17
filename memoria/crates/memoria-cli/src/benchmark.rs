@@ -197,6 +197,7 @@ impl BenchmarkExecutor {
         exec
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn store(&self, client: &Client, content: &str, memory_type: &str, session_id: &str,
         age_days: Option<f64>, confidence: Option<f64>, trust_tier: Option<&str>,
     ) -> anyhow::Result<String> {

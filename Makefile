@@ -170,7 +170,7 @@ release-docker:
 	@echo "✅ Pushed to Docker Hub"
 
 check:
-	@cd memoria && cargo check && cargo clippy -- -D warnings 2>/dev/null || cargo check
+	@cd memoria && cargo check && cargo clippy -- -D warnings
 
 # ── Tests ───────────────────────────────────────────────────────────
 

@@ -1,12 +1,12 @@
-/// Memory governance scheduler — runs periodic governance tasks.
-///
-/// Tasks:
-///   hourly  (3600s)  — cleanup tool_results, archive stale working memories
-///   daily   (86400s) — quarantine low-confidence, cleanup stale memories
-///   weekly  (604800s)— cleanup old branches and snapshots
-///
-/// Uses existing cooldown mechanism to avoid duplicate runs across restarts.
-/// Enable via MEMORIA_GOVERNANCE_ENABLED=true (default: false in scheduler, opt-in).
+//! Memory governance scheduler — runs periodic governance tasks.
+//!
+//! Tasks:
+//!   hourly  (3600s)  — cleanup tool_results, archive stale working memories
+//!   daily   (86400s) — quarantine low-confidence, cleanup stale memories
+//!   weekly  (604800s)— cleanup old branches and snapshots
+//!
+//! Uses existing cooldown mechanism to avoid duplicate runs across restarts.
+//! Enable via MEMORIA_GOVERNANCE_ENABLED=true (default: false in scheduler, opt-in).
 
 use std::sync::Arc;
 use tokio::time::{interval, Duration};

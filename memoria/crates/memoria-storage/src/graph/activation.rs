@@ -1,7 +1,7 @@
-/// Spreading Activation engine — DB-backed iterative expansion.
-///
-/// Mirrors Python's graph/activation.py: each propagation round fetches
-/// only the edges needed from DB, not the full graph.
+//! Spreading Activation engine — DB-backed iterative expansion.
+//!
+//! Mirrors Python's graph/activation.py: each propagation round fetches
+//! only the edges needed from DB, not the full graph.
 
 use std::collections::HashMap;
 

@@ -1,9 +1,9 @@
-/// Sensitivity filter — tiered PII/credential detection for long-term memory.
-///
-/// Three tiers:
-///   HIGH   (passwords, API keys, private keys) → block entire memory
-///   MEDIUM (email, phone, SSN, credit card)    → redact in-place, keep memory
-///   LOW    (usernames)                          → allow through unchanged
+//! Sensitivity filter — tiered PII/credential detection for long-term memory.
+//!
+//! Three tiers:
+//!   HIGH   (passwords, API keys, private keys) → block entire memory
+//!   MEDIUM (email, phone, SSN, credit card)    → redact in-place, keep memory
+//!   LOW    (usernames)                          → allow through unchanged
 
 use std::borrow::Cow;
 

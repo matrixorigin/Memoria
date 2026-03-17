@@ -437,7 +437,7 @@ impl SqlMemoryStore {
         let mut deactivated_ids: std::collections::HashSet<String> = Default::default();
         let mut pairs_checked = 0;
 
-        'outer: for (_mtype, group) in &by_type {
+        'outer: for group in by_type.values() {
             if group.len() < 2 { continue; }
             for i in 0..group.len() {
                 if deactivated_ids.contains(&group[i].id) { continue; }
@@ -490,7 +490,7 @@ impl SqlMemoryStore {
                 .execute(&self.pool).await;
             return Ok(total_rows);
         }
-        let lists = (total_rows / 50).max(1).min(1024);
+        let lists = (total_rows / 50).clamp(1, 1024);
         let _ = sqlx::raw_sql(&format!("DROP INDEX {idx_name} ON {table}"))
             .execute(&self.pool).await;
         sqlx::raw_sql(&format!(

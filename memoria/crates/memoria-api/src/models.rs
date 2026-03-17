@@ -1,5 +1,5 @@
-/// Request/Response types for the REST API.
-/// Mirrors Python's api/models.py and api/_model_types.py.
+//! Request/Response types for the REST API.
+//! Mirrors Python's api/models.py and api/_model_types.py.
 
 use memoria_core::{Memory, MemoryType, TrustTier};
 use serde::{Deserialize, Serialize};

@@ -1,5 +1,5 @@
-/// API key management: POST/GET/DELETE /auth/keys, PUT /auth/keys/:id/rotate
-/// Master key required for create. Users can list/revoke their own keys.
+//! API key management: POST/GET/DELETE /auth/keys, PUT /auth/keys/:id/rotate
+//! Master key required for create. Users can list/revoke their own keys.
 
 use axum::{
     extract::{Path, State},

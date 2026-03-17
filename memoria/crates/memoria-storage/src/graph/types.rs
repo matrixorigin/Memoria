@@ -17,13 +17,17 @@ impl NodeType {
             NodeType::Entity => "entity",
         }
     }
-    pub fn from_str(s: &str) -> Self {
-        match s {
+}
+
+impl std::str::FromStr for NodeType {
+    type Err = std::convert::Infallible;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(match s {
             "episodic" => NodeType::Episodic,
             "scene" => NodeType::Scene,
             "entity" => NodeType::Entity,
             _ => NodeType::Semantic,
-        }
+        })
     }
 }
 

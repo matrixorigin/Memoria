@@ -1,6 +1,6 @@
-/// Bearer token auth extractor.
-/// Extracts user_id from X-User-Id header (or query param).
-/// Validates Bearer token against master key.
+//! Bearer token auth extractor.
+//! Extracts user_id from X-User-Id header (or query param).
+//! Validates Bearer token against master key.
 
 use axum::{
     extract::FromRequestParts,

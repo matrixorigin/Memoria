@@ -1,15 +1,15 @@
-/// Git-for-Data MCP tools: snapshot, branch, merge, rollback, diff.
-/// 9 tools — brings total to 17 (8 core + 9 git).
-///
-/// Parity with Python version:
-/// - snapshot names prefixed with "mem_snap_", sanitized to 40 chars
-/// - snapshot list filters to mem_snap_/mem_milestone_ only, strips prefix for display
-/// - snapshot delete supports names, prefix, older_than
-/// - snapshot limit: 1000
-/// - rollback restores mem_memories + graph tables
-/// - branch limit: 20 (global)
-/// - branch duplicate name rejected (including deleted)
-/// - branch name sanitized to 40 chars
+//! Git-for-Data MCP tools: snapshot, branch, merge, rollback, diff.
+//! 9 tools — brings total to 17 (8 core + 9 git).
+//!
+//! Parity with Python version:
+//! - snapshot names prefixed with "mem_snap_", sanitized to 40 chars
+//! - snapshot list filters to mem_snap_/mem_milestone_ only, strips prefix for display
+//! - snapshot delete supports names, prefix, older_than
+//! - snapshot limit: 1000
+//! - rollback restores mem_memories + graph tables
+//! - branch limit: 20 (global)
+//! - branch duplicate name rejected (including deleted)
+//! - branch name sanitized to 40 chars
 
 use anyhow::Result;
 use chrono::NaiveDateTime;
@@ -48,10 +48,10 @@ fn snap_internal(name: &str) -> String {
 
 /// Convert internal snapshot name → user-facing display name.
 fn snap_display(internal: &str) -> String {
-    if internal.starts_with(SNAP_PREFIX) {
-        internal[SNAP_PREFIX.len()..].to_string()
-    } else if internal.starts_with("mem_milestone_") {
-        format!("auto:{}", &internal["mem_milestone_".len()..])
+    if let Some(rest) = internal.strip_prefix(SNAP_PREFIX) {
+        rest.to_string()
+    } else if let Some(rest) = internal.strip_prefix("mem_milestone_") {
+        format!("auto:{rest}")
     } else {
         internal.to_string()
     }

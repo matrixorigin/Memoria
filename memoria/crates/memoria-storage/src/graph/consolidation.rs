@@ -1,8 +1,8 @@
-/// Graph consolidation — mirrors Python's graph/consolidation.py
-///
-/// 1. Detect cross-session contradictions via association edges + cosine sim drop
-/// 2. Check scene node source integrity (orphaned scenes)
-/// 3. Trust tier lifecycle: T4→T3, T3→T2, T3→T4, T2→T3
+//! Graph consolidation — mirrors Python's graph/consolidation.py
+//!
+//! 1. Detect cross-session contradictions via association edges + cosine sim drop
+//! 2. Check scene node source integrity (orphaned scenes)
+//! 3. Trust tier lifecycle: T4→T3, T3→T2, T3→T4, T2→T3
 
 use crate::graph::store::GraphStore;
 use crate::graph::types::NodeType;
