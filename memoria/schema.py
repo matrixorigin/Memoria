@@ -36,7 +36,7 @@ def _infer_default_dim() -> int:
     val = int(raw) if raw.strip() else 0
     if val > 0:
         return val
-    model = os.environ.get("EMBEDDING_MODEL") or ""
+    model = os.environ.get("EMBEDDING_MODEL") or "all-MiniLM-L6-v2"
     # Keys use both short and fully-qualified names (users may configure either).
     # Canonical source: core.embedding.client.KNOWN_DIMENSIONS (not imported
     # here — schema.py must stay self-contained with no core/ dependency).
