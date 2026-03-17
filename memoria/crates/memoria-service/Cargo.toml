@@ -15,7 +15,7 @@ uuid = { workspace = true }
 async-trait = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
-sqlx = { workspace = true, features = ["mysql", "runtime-tokio-native-tls"] }
+sqlx = { workspace = true, features = ["mysql", "runtime-tokio-rustls"] }
 memoria-git = { path = "../memoria-git" }
 
 [dev-dependencies]

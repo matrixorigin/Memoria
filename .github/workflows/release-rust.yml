@@ -67,8 +67,6 @@ jobs:
         working-directory: memoria
         env:
           SQLX_OFFLINE: "true"
-          # Cross image has libssl-dev 1.0.2 (Xenial); openssl-sys requires 1.1+ or 3.x. Force vendored.
-          OPENSSL_NO_PKG_CONFIG: "1"
         run: cross build --release -p memoria-cli --target ${{ matrix.target }}
 
       - name: Build (native)

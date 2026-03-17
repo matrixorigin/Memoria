@@ -29,6 +29,4 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 tower-http = { workspace = true }
 sqlx = { workspace = true }
-reqwest = { version = "0.12", features = ["json", "blocking"] }
-# Vendored OpenSSL for cross-compilation (aarch64-linux has no system OpenSSL in CI)
-openssl = { version = "0.10", features = ["vendored"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking"] }
