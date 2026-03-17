@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use memoria_core::{check_sensitivity, Memory, MemoriaError, MemoryType, TrustTier};
+use memoria_core::{check_sensitivity, Memory, MemoryType, TrustTier};
 use memoria_git::GitForDataService;
 use uuid::Uuid;
 use chrono::Utc;

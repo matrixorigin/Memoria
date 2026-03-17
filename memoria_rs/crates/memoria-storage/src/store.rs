@@ -337,7 +337,6 @@ impl SqlMemoryStore {
     /// Uses L2² ≈ 2(1 - cos_sim) for normalized embeddings.
     /// Returns count of deactivated memories.
     pub async fn compress_redundant(&self, user_id: &str, similarity_threshold: f64, window_days: i64, max_pairs: usize) -> Result<i64, MemoriaError> {
-        // Fetch active memories with embeddings within window
         let rows: Vec<(String, String, chrono::NaiveDateTime, String)> = sqlx::query_as(
             "SELECT memory_id, memory_type, observed_at, embedding \
              FROM mem_memories \
@@ -352,35 +351,42 @@ impl SqlMemoryStore {
 
         let l2_sq_threshold = 2.0 * (1.0 - similarity_threshold);
 
-        // Group by memory_type
-        let mut by_type: std::collections::HashMap<String, Vec<(String, chrono::NaiveDateTime, Vec<f32>)>> = Default::default();
+        // Group by memory_type with flat embedding storage for cache locality
+        struct Entry { id: String, ts: chrono::NaiveDateTime, emb_offset: usize, dim: usize }
+        let mut by_type: std::collections::HashMap<String, Vec<Entry>> = Default::default();
+        let mut flat_embs: Vec<f32> = Vec::new();
+
         for (mid, mtype, ts, emb_str) in &rows {
             if let Ok(emb) = mo_to_vec(emb_str) {
-                by_type.entry(mtype.clone()).or_default().push((mid.clone(), *ts, emb));
+                let offset = flat_embs.len();
+                let dim = emb.len();
+                flat_embs.extend_from_slice(&emb);
+                by_type.entry(mtype.clone()).or_default().push(Entry { id: mid.clone(), ts: *ts, emb_offset: offset, dim });
             }
         }
 
-        let mut to_deactivate: Vec<(String, String)> = vec![]; // (older_id, newer_id)
+        let mut to_deactivate: Vec<(String, String)> = vec![];
         let mut deactivated_ids: std::collections::HashSet<String> = Default::default();
         let mut pairs_checked = 0;
 
         'outer: for (_mtype, group) in &by_type {
             if group.len() < 2 { continue; }
             for i in 0..group.len() {
-                if deactivated_ids.contains(&group[i].0) { continue; }
+                if deactivated_ids.contains(&group[i].id) { continue; }
+                let emb_i = &flat_embs[group[i].emb_offset..group[i].emb_offset + group[i].dim];
+                // Vectorized: compute L2² from i to all j > i
                 for j in (i+1)..group.len() {
                     if pairs_checked >= max_pairs { break 'outer; }
-                    if deactivated_ids.contains(&group[j].0) { continue; }
+                    if deactivated_ids.contains(&group[j].id) { continue; }
                     pairs_checked += 1;
-                    // L2² between embeddings
-                    let dist_sq: f32 = group[i].2.iter().zip(&group[j].2)
-                        .map(|(a, b)| (a - b).powi(2)).sum();
+                    let emb_j = &flat_embs[group[j].emb_offset..group[j].emb_offset + group[j].dim];
+                    let dist_sq: f32 = emb_i.iter().zip(emb_j)
+                        .map(|(a, b)| { let d = a - b; d * d }).sum();
                     if (dist_sq as f64) < l2_sq_threshold {
-                        // group is ordered DESC by observed_at: i is newer
-                        let (older, newer) = if group[i].1 >= group[j].1 {
-                            (group[j].0.clone(), group[i].0.clone())
+                        let (older, newer) = if group[i].ts >= group[j].ts {
+                            (group[j].id.clone(), group[i].id.clone())
                         } else {
-                            (group[i].0.clone(), group[j].0.clone())
+                            (group[i].id.clone(), group[j].id.clone())
                         };
                         deactivated_ids.insert(older.clone());
                         to_deactivate.push((older, newer));
@@ -770,7 +776,16 @@ impl SqlMemoryStore {
     }
 
     pub async fn search_vector_from(&self, table: &str, user_id: &str, embedding: &[f32], limit: i64) -> Result<Vec<Memory>, MemoriaError> {
+        self.search_vector_from_filtered(table, user_id, embedding, limit, None).await
+    }
+
+    /// Vector search with optional memory_type pre-filter to reduce scan set.
+    pub async fn search_vector_from_filtered(&self, table: &str, user_id: &str, embedding: &[f32], limit: i64, memory_type: Option<&str>) -> Result<Vec<Memory>, MemoriaError> {
         let vec_literal = vec_to_mo(embedding);
+        let type_clause = match memory_type {
+            Some(mt) => format!(" AND memory_type = '{}'", sanitize_sql_literal(mt)),
+            None => String::new(),
+        };
         let sql = format!(
             "SELECT memory_id, user_id, memory_type, content, \
              embedding AS emb_str, session_id, \
@@ -780,7 +795,7 @@ impl SqlMemoryStore {
              observed_at, created_at, updated_at, \
              l2_distance(embedding, '{vec_literal}') AS l2_dist \
              FROM {table} \
-             WHERE user_id = ? AND is_active = 1 AND embedding IS NOT NULL \
+             WHERE user_id = ? AND is_active = 1 AND embedding IS NOT NULL{type_clause} \
              ORDER BY l2_dist ASC \
              LIMIT ?"
         );
