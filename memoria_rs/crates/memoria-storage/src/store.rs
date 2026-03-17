@@ -8,6 +8,47 @@ pub(crate) fn db_err(e: sqlx::Error) -> MemoriaError {
     MemoriaError::Database(e.to_string())
 }
 
+/// Sanitize a string for safe interpolation inside a SQL single-quoted literal.
+/// Escapes `'`, `\`, and strips NUL bytes.
+#[allow(dead_code)]
+fn sanitize_sql_literal(s: &str) -> String {
+    s.chars()
+        .filter(|c| *c != '\0')
+        .map(|c| match c {
+            '\'' => ' ',
+            '\\' => ' ',
+            _ => c,
+        })
+        .collect()
+}
+
+/// Sanitize a string for use inside MATCH ... AGAINST('...' IN BOOLEAN MODE).
+/// Strips boolean-mode operators and SQL-injection characters.
+fn sanitize_fulltext_query(s: &str) -> String {
+    s.chars()
+        .filter(|c| *c != '\0')
+        .map(|c| match c {
+            '\'' | '\\' | '"' | '+' | '-' | '<' | '>' | '(' | ')' | '~' | '*' | '@' => ' ',
+            _ => c,
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Sanitize a string for use in a LIKE pattern (escapes `%`).
+fn sanitize_like_pattern(s: &str) -> String {
+    s.chars()
+        .filter(|c| *c != '\0')
+        .map(|c| match c {
+            '\'' | '\\' => ' ',
+            '%' => ' ',
+            _ => c,
+        })
+        .collect()
+}
+
 fn vec_to_mo(v: &[f32]) -> String {
     format!("[{}]", v.iter().map(|f| f.to_string()).collect::<Vec<_>>().join(","))
 }
@@ -663,23 +704,28 @@ impl SqlMemoryStore {
     /// Find memory IDs whose content contains `topic` (exact substring match).
     /// Uses fulltext boolean MUST first, falls back to LIKE.
     pub async fn find_ids_by_topic(&self, table: &str, user_id: &str, topic: &str) -> Result<Vec<String>, MemoriaError> {
-        let safe = topic.replace('\'', "").replace('\\', "");
+        let ft_safe = sanitize_fulltext_query(topic);
+        let like_safe = sanitize_like_pattern(topic);
         // Try fulltext boolean MUST (+word) first
-        let sql = format!(
-            "SELECT memory_id FROM {table} \
-             WHERE user_id = ? AND is_active = 1 \
-               AND MATCH(content) AGAINST('+{safe}' IN BOOLEAN MODE) \
-               AND content LIKE ?"
-        );
-        let like_pat = format!("%{safe}%");
-        let rows: Vec<(String,)> = sqlx::query_as(&sql)
-            .bind(user_id).bind(&like_pat)
-            .fetch_all(&self.pool).await
-            .unwrap_or_default();
-        if !rows.is_empty() {
-            return Ok(rows.into_iter().map(|r| r.0).collect());
+        if !ft_safe.is_empty() {
+            let ft_terms: String = ft_safe.split_whitespace().map(|w| format!("+{w}")).collect::<Vec<_>>().join(" ");
+            let sql = format!(
+                "SELECT memory_id FROM {table} \
+                 WHERE user_id = ? AND is_active = 1 \
+                   AND MATCH(content) AGAINST('{ft_terms}' IN BOOLEAN MODE) \
+                   AND content LIKE ?"
+            );
+            let like_pat = format!("%{like_safe}%");
+            let rows: Vec<(String,)> = sqlx::query_as(&sql)
+                .bind(user_id).bind(&like_pat)
+                .fetch_all(&self.pool).await
+                .unwrap_or_default();
+            if !rows.is_empty() {
+                return Ok(rows.into_iter().map(|r| r.0).collect());
+            }
         }
         // Fallback: LIKE only (handles short tokens that fulltext ignores)
+        let like_pat = format!("%{like_safe}%");
         let sql2 = format!(
             "SELECT memory_id FROM {table} \
              WHERE user_id = ? AND is_active = 1 AND content LIKE ?"
@@ -691,7 +737,8 @@ impl SqlMemoryStore {
     }
 
     pub async fn search_fulltext_from(&self, table: &str, user_id: &str, query: &str, limit: i64) -> Result<Vec<Memory>, MemoriaError> {
-        let safe = query.replace('\'', "").replace('\\', "").replace('+', " ").replace('-', " ");
+        let safe = sanitize_fulltext_query(query);
+        if safe.is_empty() { return Ok(vec![]); }
         // Use OR semantics (no + prefix) — AND is too strict for natural language queries
         // because stopwords are removed from the index but +stopword still requires a match.
         let sql = format!(

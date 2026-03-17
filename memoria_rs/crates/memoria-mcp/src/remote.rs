@@ -166,7 +166,8 @@ impl RemoteClient {
                 "Available tools: memory_store, memory_retrieve, memory_search, \
                  memory_correct, memory_purge, memory_profile, memory_list, \
                  memory_capabilities, memory_governance, memory_rebuild_index, \
-                 memory_consolidate, memory_reflect, memory_extract_entities, memory_link_entities \
+                 memory_consolidate, memory_reflect, memory_extract_entities, \
+                 memory_link_entities, memory_observe \
                  [remote mode — connected to Memoria API server]"
             )),
 
@@ -363,6 +364,17 @@ impl RemoteClient {
                 self.client.delete(self.url(&format!("/v1/branches/{name}")))
                     .send().await?;
                 Ok(Self::mcp_text(&format!("Branch '{name}' deleted.")))
+            }
+
+            "memory_observe" => {
+                let r = self.client.post(self.url("/v1/memories/observe"))
+                    .json(&json!({
+                        "messages": args["messages"],
+                        "session_id": args["session_id"],
+                    }))
+                    .send().await?;
+                let body: Value = r.json().await?;
+                Ok(Self::mcp_json(&body))
             }
 
             _ => Ok(Self::mcp_text(&format!("Unknown tool: {name}"))),

@@ -2,12 +2,13 @@
 /// Phase 4 will add 14 more (Git-for-Data, admin, graph).
 
 use anyhow::Result;
-use memoria_core::{MemoryType, TrustTier};
+use memoria_core::{MemoriaError, MemoryType, TrustTier};
 use memoria_service::MemoryService;
 use serde_json::{json, Value};
 use sqlx::Row;
 use std::str::FromStr;
 use std::sync::Arc;
+use uuid::Uuid;
 
 pub fn list() -> Value {
     json!([
@@ -158,6 +159,22 @@ pub fn list() -> Value {
                     "entities": {"type": "string"}
                 },
                 "required": ["entities"]
+            }
+        },
+        {
+            "name": "memory_observe",
+            "description": "Observe a conversation turn and extract memories from messages. Stores assistant/user messages as semantic memories.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "messages": {
+                        "type": "array",
+                        "items": {"type": "object"},
+                        "description": "Array of {role, content} message objects"
+                    },
+                    "session_id": {"type": "string"}
+                },
+                "required": ["messages"]
             }
         }
     ])
@@ -348,7 +365,8 @@ pub async fn call(
             "Available tools: memory_store, memory_retrieve, memory_search, \
              memory_correct, memory_purge, memory_profile, memory_list, \
              memory_capabilities, memory_governance, memory_rebuild_index, \
-             memory_consolidate, memory_reflect, memory_extract_entities, memory_link_entities"
+             memory_consolidate, memory_reflect, memory_extract_entities, \
+             memory_link_entities, memory_observe"
         )),
 
         "memory_governance" => {
@@ -687,6 +705,76 @@ pub async fn call(
                 "entities_reused": total_reused,
                 "edges_created": total_edges
             }))?))
+        }
+
+        "memory_observe" => {
+            let messages = args["messages"].as_array().cloned().unwrap_or_default();
+            let session_id = args["session_id"].as_str().map(String::from);
+            let mut stored = Vec::new();
+
+            for msg in &messages {
+                let role = msg["role"].as_str().unwrap_or("");
+                let content = msg["content"].as_str().unwrap_or("").trim();
+                if content.is_empty() { continue; }
+                if role == "assistant" || role == "user" {
+                    match service.store_memory(
+                        user_id, content, MemoryType::Semantic,
+                        session_id.clone(), None, None, None,
+                    ).await {
+                        Ok(m) => {
+                            // Graph sync (best-effort)
+                            if let Some(sql) = &service.sql_store {
+                                let graph = sql.graph_store();
+                                let node = memoria_storage::GraphNode {
+                                    node_id: Uuid::new_v4().simple().to_string()[..32].to_string(),
+                                    user_id: user_id.to_string(),
+                                    node_type: memoria_storage::NodeType::Semantic,
+                                    content: m.content.clone(),
+                                    entity_type: None,
+                                    embedding: None,
+                                    memory_id: Some(m.memory_id.clone()),
+                                    session_id: session_id.clone(),
+                                    confidence: m.initial_confidence as f32,
+                                    trust_tier: format!("{}", m.trust_tier),
+                                    importance: 0.5,
+                                    source_nodes: vec![],
+                                    conflicts_with: None,
+                                    conflict_resolution: None,
+                                    access_count: 0,
+                                    cross_session_count: 0,
+                                    is_active: true,
+                                    superseded_by: None,
+                                    created_at: m.created_at.map(|dt| dt.naive_utc()),
+                                };
+                                let _ = graph.create_node(&node).await;
+                                let entities = memoria_storage::extract_entities(&m.content);
+                                for ent in &entities {
+                                    if let Ok((entity_id, _)) = graph.upsert_entity(
+                                        user_id, &ent.name, &ent.display, &ent.entity_type
+                                    ).await {
+                                        let _ = graph.upsert_memory_entity_link(
+                                            &m.memory_id, &entity_id, user_id, "regex"
+                                        ).await;
+                                    }
+                                }
+                            }
+                            stored.push(json!({
+                                "memory_id": m.memory_id,
+                                "content": m.content,
+                                "memory_type": m.memory_type.to_string(),
+                            }));
+                        }
+                        Err(MemoriaError::Blocked(_)) => continue,
+                        Err(e) => return Err(e.into()),
+                    }
+                }
+            }
+
+            let mut result = json!({ "memories": stored });
+            if service.llm.is_none() {
+                result["warning"] = json!("LLM not configured — storing messages as-is without extraction");
+            }
+            Ok(mcp_text(&serde_json::to_string_pretty(&result)?))
         }
 
         _ => Err(anyhow::anyhow!("Unknown tool: {name}")),

@@ -479,12 +479,13 @@ impl GraphStore {
         if query.trim().is_empty() {
             return Ok(vec![]);
         }
-        // Sanitize query for MATCH AGAINST
+        // Sanitize query for MATCH AGAINST — strip boolean-mode operators and SQL chars
         let safe: String = query
             .chars()
-            .map(|c| if "+-<>()~*\"@".contains(c) { ' ' } else { c })
+            .filter(|c| *c != '\0')
+            .map(|c| if "+-<>()~*\"@'\\".contains(c) { ' ' } else { c })
             .collect();
-        let safe = safe.trim();
+        let safe: String = safe.split_whitespace().collect::<Vec<_>>().join(" ");
         if safe.is_empty() {
             return Ok(vec![]);
         }

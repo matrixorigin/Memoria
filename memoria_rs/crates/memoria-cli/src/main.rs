@@ -73,6 +73,24 @@ enum Commands {
     Status,
     /// Update steering rules to latest version
     UpdateRules,
+    /// Run benchmark against a Memoria API server
+    Benchmark {
+        /// API URL of the Memoria server
+        #[arg(long, default_value = "http://127.0.0.1:8100")]
+        api_url: String,
+        /// API token
+        #[arg(long, default_value = "test-master-key-for-docker-compose")]
+        token: String,
+        /// Dataset name (under benchmarks/datasets/)
+        #[arg(long, default_value = "core-v1")]
+        dataset: String,
+        /// Output JSON report path
+        #[arg(long)]
+        out: Option<String>,
+        /// Validate dataset only (no execution)
+        #[arg(long)]
+        validate_only: bool,
+    },
 }
 
 // ── MCP entry builder ─────────────────────────────────────────────────────────
@@ -341,6 +359,44 @@ fn cmd_update_rules(project_dir: &Path) {
     }
 }
 
+fn cmd_benchmark(api_url: &str, token: &str, dataset: &str, out: Option<&str>, validate_only: bool) {
+    // Delegate to Python benchmark runner (benchmarks/run_rust.py)
+    // which uses the shared benchmark framework
+    let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../../benchmarks/run_rust.py");
+    if !script.exists() {
+        println!("Benchmark script not found: {}", script.display());
+        println!("Run from the Memoria project root.");
+        return;
+    }
+    let mut cmd = std::process::Command::new("python3");
+    cmd.arg(&script);
+    if validate_only {
+        // Validate-only: use the Python CLI's validate path
+        cmd.arg("--dataset").arg(dataset);
+        println!("Validating dataset: {dataset}");
+    } else {
+        cmd.arg("--api-url").arg(api_url)
+            .arg("--token").arg(token)
+            .arg("--dataset").arg(dataset);
+        if let Some(o) = out {
+            cmd.arg("--out").arg(o);
+        }
+    }
+    match cmd.status() {
+        Ok(status) => {
+            if !status.success() {
+                std::process::exit(status.code().unwrap_or(1));
+            }
+        }
+        Err(e) => {
+            println!("Failed to run benchmark: {e}");
+            println!("Ensure python3 and mo-memoria are installed.");
+            std::process::exit(1);
+        }
+    }
+}
+
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 fn main() -> Result<()> {
@@ -361,6 +417,9 @@ fn main() -> Result<()> {
         }
         Commands::Status => cmd_status(&project_dir),
         Commands::UpdateRules => cmd_update_rules(&project_dir),
+        Commands::Benchmark { api_url, token, dataset, out, validate_only } => {
+            cmd_benchmark(&api_url, &token, &dataset, out.as_deref(), validate_only);
+        }
     }
     Ok(())
 }
