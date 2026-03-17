@@ -142,10 +142,18 @@ impl<'a> ActivationRetriever<'a> {
 
         // 4. Collect candidate IDs
         let mut candidate_ids: HashSet<String> = anchors.keys().cloned().collect();
+        let anchor_count = candidate_ids.len();
         let mut sorted_activated: Vec<_> = activation_map.iter().collect();
         sorted_activated.sort_by(|a, b| b.1.partial_cmp(a.1).unwrap_or(std::cmp::Ordering::Equal));
         for (nid, _) in sorted_activated.iter().take((top_k * 3) as usize) {
             candidate_ids.insert((*nid).clone());
+        }
+
+        // If spreading activation didn't discover any new nodes beyond anchors
+        // and entity recall found nothing, graph adds no value — let hybrid handle it.
+        let new_from_activation = candidate_ids.len() - anchor_count;
+        if new_from_activation == 0 && entity_memory_ids.is_empty() {
+            return Ok(vec![]);
         }
 
         // Add graph nodes for entity-recalled memories
