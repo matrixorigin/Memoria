@@ -137,6 +137,39 @@ pub async fn list_keys(
     Ok(Json(keys))
 }
 
+/// GET /auth/keys/:id — get a single API key by ID
+pub async fn get_key(
+    State(state): State<AppState>,
+    AuthUser(user_id): AuthUser,
+    Path(key_id): Path<String>,
+) -> Result<Json<KeyResponse>, (StatusCode, String)> {
+    let sql = state.service.sql_store.as_ref()
+        .ok_or_else(|| (StatusCode::SERVICE_UNAVAILABLE, "SQL store required".to_string()))?;
+    migrate_api_keys(sql.pool()).await.map_err(api_err)?;
+
+    let row = sqlx::query(
+        "SELECT key_id, user_id, name, key_prefix, created_at, expires_at, last_used_at \
+         FROM mem_api_keys WHERE key_id = ? AND is_active = 1"
+    ).bind(&key_id).fetch_optional(sql.pool()).await.map_err(api_err)?;
+
+    let r = row.ok_or_else(|| (StatusCode::NOT_FOUND, "Key not found".to_string()))?;
+    let owner: String = r.try_get("user_id").unwrap_or_default();
+    // Non-admin can only see own keys
+    if user_id != "admin" && owner != user_id {
+        return Err((StatusCode::FORBIDDEN, "Not your key".to_string()));
+    }
+    Ok(Json(KeyResponse {
+        key_id: r.try_get("key_id").unwrap_or_default(),
+        user_id: owner,
+        name: r.try_get("name").unwrap_or_default(),
+        key_prefix: r.try_get("key_prefix").unwrap_or_default(),
+        created_at: r.try_get::<chrono::NaiveDateTime, _>("created_at").map(|d| d.to_string()).unwrap_or_default(),
+        expires_at: r.try_get::<Option<chrono::NaiveDateTime>, _>("expires_at").ok().flatten().map(|d| d.to_string()),
+        last_used_at: r.try_get::<Option<chrono::NaiveDateTime>, _>("last_used_at").ok().flatten().map(|d| d.to_string()),
+        raw_key: None,
+    }))
+}
+
 /// PUT /auth/keys/:id/rotate — revoke old key, issue new one
 pub async fn rotate_key(
     State(state): State<AppState>,

@@ -9,7 +9,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use sqlx::{MySqlPool, Row};
 
-use crate::{auth::AuthUser, state::AppState};
+use crate::{auth::AuthUser, state::AppState, routes::memory::api_err};
 
 fn get_pool(state: &AppState) -> Result<&MySqlPool, (StatusCode, String)> {
     state.service.sql_store.as_ref()
@@ -138,12 +138,15 @@ pub async fn delete_user(
 }
 
 /// POST /admin/users/:user_id/reset-access-counts
-/// No-op in Rust version (access_count not yet in schema). Returns OK for API compat.
 pub async fn reset_access_counts(
+    State(state): State<AppState>,
     _auth: AuthUser,
     Path(user_id): Path<String>,
-) -> Json<serde_json::Value> {
-    Json(serde_json::json!({"user_id": user_id, "status": "ok"}))
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let sql = state.service.sql_store.as_ref()
+        .ok_or_else(|| (StatusCode::SERVICE_UNAVAILABLE, "SQL store required".to_string()))?;
+    let reset = sql.reset_access_counts(&user_id).await.map_err(api_err)?;
+    Ok(Json(serde_json::json!({"user_id": user_id, "reset": reset})))
 }
 
 /// POST /admin/governance/:user_id/trigger?op=governance|consolidate

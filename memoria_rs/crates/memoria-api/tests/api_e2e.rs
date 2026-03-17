@@ -214,13 +214,13 @@ async fn test_api_profile() {
         .json(&json!({"content": "Prefers Rust", "memory_type": "profile"}))
         .send().await.unwrap();
 
-    let r = client.get(format!("{base}/v1/profiles"))
+    let r = client.get(format!("{base}/v1/profiles/me"))
         .header("X-User-Id", &uid)
         .send().await.expect("get");
     assert_eq!(r.status(), 200);
     let body: Value = r.json().await.unwrap();
     assert!(body["profile"].as_str().unwrap().contains("Prefers Rust"));
-    println!("✅ GET /v1/profiles");
+    println!("✅ GET /v1/profiles/me");
 }
 
 // ── 9. governance ─────────────────────────────────────────────────────────────

@@ -24,7 +24,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/memories/:id/correct", put(routes::memory::correct_memory))
         .route("/v1/memories/:id/history", get(routes::memory::get_memory_history))
         .route("/v1/memories/:id", delete(routes::memory::delete_memory))
-        .route("/v1/profiles", get(routes::memory::get_profile))
+        .route("/v1/profiles/:target_user_id", get(routes::memory::get_profile))
         .route("/v1/observe", post(routes::memory::observe_turn))
         // Governance
         .route("/v1/governance", post(routes::governance::governance))
@@ -54,6 +54,7 @@ pub fn build_router(state: AppState) -> Router {
         // API key management
         .route("/auth/keys", post(routes::auth::create_key))
         .route("/auth/keys", get(routes::auth::list_keys))
+        .route("/auth/keys/:id", get(routes::auth::get_key))
         .route("/auth/keys/:id/rotate", put(routes::auth::rotate_key))
         .route("/auth/keys/:id", delete(routes::auth::revoke_key))
         // Admin

@@ -1226,7 +1226,7 @@ async fn test_full_user_workflow() {
     assert!(active >= 4, "should have at least 4 active memories, got {active}");
 
     // Profile should work
-    let r = client.get(format!("{base}/v1/profiles"))
+    let r = client.get(format!("{base}/v1/profiles/me"))
         .header("X-User-Id", &uid).send().await.unwrap();
     assert_eq!(r.status(), 200);
     let body: Value = r.json().await.unwrap();

@@ -242,17 +242,31 @@ impl MemoryService {
     }
 
     pub async fn retrieve(&self, user_id: &str, query: &str, top_k: i64) -> Result<Vec<Memory>, MemoriaError> {
-        self.retrieve_inner(user_id, query, top_k, ExplainLevel::None).await.map(|(mems, _)| mems)
+        let (mems, _) = self.retrieve_inner(user_id, query, top_k, ExplainLevel::None).await?;
+        self.bump_access_counts(&mems).await;
+        Ok(mems)
     }
 
     /// Retrieve with explain stats at the given level.
     pub async fn retrieve_explain(&self, user_id: &str, query: &str, top_k: i64) -> Result<(Vec<Memory>, RetrievalExplain), MemoriaError> {
-        self.retrieve_inner(user_id, query, top_k, ExplainLevel::Basic).await
+        let (mems, explain) = self.retrieve_inner(user_id, query, top_k, ExplainLevel::Basic).await?;
+        self.bump_access_counts(&mems).await;
+        Ok((mems, explain))
     }
 
     /// Retrieve with explicit explain level (none/basic/verbose/analyze).
     pub async fn retrieve_explain_level(&self, user_id: &str, query: &str, top_k: i64, level: ExplainLevel) -> Result<(Vec<Memory>, RetrievalExplain), MemoriaError> {
-        self.retrieve_inner(user_id, query, top_k, level).await
+        let (mems, explain) = self.retrieve_inner(user_id, query, top_k, level).await?;
+        self.bump_access_counts(&mems).await;
+        Ok((mems, explain))
+    }
+
+    /// Fire-and-forget bump of access counts for retrieved memories.
+    async fn bump_access_counts(&self, mems: &[Memory]) {
+        if let Some(sql) = &self.sql_store {
+            let ids: Vec<String> = mems.iter().map(|m| m.memory_id.clone()).collect();
+            let _ = sql.bump_access_counts(&ids).await;
+        }
     }
 
     #[tracing::instrument(skip(self), fields(user_id, top_k))]
@@ -403,6 +417,16 @@ impl MemoryService {
             explain.fulltext_ms = ft_start.elapsed().as_secs_f64() * 1000.0;
             explain.fulltext_hit = !results.is_empty();
             explain.path = if explain.fulltext_hit { "fulltext" } else { "none" };
+            if level.at_least(ExplainLevel::Verbose) {
+                explain.candidate_scores = results.iter().enumerate().map(|(i, m)| {
+                    let fs = m.retrieval_score.unwrap_or(0.0);
+                    CandidateScore {
+                        memory_id: m.memory_id.clone(), rank: i + 1,
+                        final_score: round4(fs), vector_score: 0.0,
+                        keyword_score: round4(fs), temporal_score: 0.0, confidence_score: 0.0,
+                    }
+                }).collect();
+            }
             explain.result_count = results.len();
             explain.total_ms = total_start.elapsed().as_secs_f64() * 1000.0;
             return Ok((results, explain));

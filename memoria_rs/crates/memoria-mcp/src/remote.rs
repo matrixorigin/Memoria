@@ -138,7 +138,7 @@ impl RemoteClient {
             }
 
             "memory_profile" => {
-                let r = self.client.get(self.url("/v1/profiles")).send().await?;
+                let r = self.client.get(self.url("/v1/profiles/me")).send().await?;
                 let body: Value = r.json().await?;
                 let profile = body["profile"].as_str().unwrap_or("");
                 if profile.is_empty() {

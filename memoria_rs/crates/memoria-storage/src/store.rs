@@ -162,6 +162,15 @@ impl SqlMemoryStore {
             )"#,
         ).execute(&self.pool).await.map_err(db_err)?;
 
+        // mem_memories_stats — access_count tracking (separated to reduce write contention)
+        sqlx::query(
+            r#"CREATE TABLE IF NOT EXISTS mem_memories_stats (
+                memory_id       VARCHAR(64)  PRIMARY KEY,
+                access_count    INT          NOT NULL DEFAULT 0,
+                last_accessed_at DATETIME(6)
+            )"#,
+        ).execute(&self.pool).await.map_err(db_err)?;
+
         // Graph tables
         self.graph_store().migrate().await?;
 
@@ -502,6 +511,56 @@ impl SqlMemoryStore {
             cleaned += 1;
         }
         Ok(cleaned)
+    }
+
+    /// Bump access_count for retrieved memories (fire-and-forget style).
+    pub async fn bump_access_counts(&self, memory_ids: &[String]) -> Result<(), MemoriaError> {
+        if memory_ids.is_empty() { return Ok(()); }
+        for chunk in memory_ids.chunks(100) {
+            let placeholders: Vec<&str> = chunk.iter().map(|_| "(?, 1, NOW())").collect();
+            let sql = format!(
+                "INSERT INTO mem_memories_stats (memory_id, access_count, last_accessed_at) VALUES {} \
+                 ON DUPLICATE KEY UPDATE access_count = access_count + 1, last_accessed_at = NOW()",
+                placeholders.join(", ")
+            );
+            let mut q = sqlx::query(&sql);
+            for id in chunk { q = q.bind(id); }
+            q.execute(&self.pool).await.map_err(db_err)?;
+        }
+        Ok(())
+    }
+
+    /// Reset access_count to 0 for all memories of a user.
+    pub async fn reset_access_counts(&self, user_id: &str) -> Result<i64, MemoriaError> {
+        let result = sqlx::query(
+            "UPDATE mem_memories_stats s \
+             JOIN mem_memories m ON s.memory_id = m.memory_id \
+             SET s.access_count = 0 \
+             WHERE m.user_id = ?"
+        ).bind(user_id).execute(&self.pool).await.map_err(db_err)?;
+        Ok(result.rows_affected() as i64)
+    }
+
+    /// Get access_count for a set of memory IDs.
+    pub async fn get_access_counts(&self, memory_ids: &[String]) -> Result<std::collections::HashMap<String, i32>, MemoriaError> {
+        let mut map = std::collections::HashMap::new();
+        if memory_ids.is_empty() { return Ok(map); }
+        for chunk in memory_ids.chunks(500) {
+            let placeholders: Vec<&str> = chunk.iter().map(|_| "?").collect();
+            let sql = format!(
+                "SELECT memory_id, access_count FROM mem_memories_stats WHERE memory_id IN ({})",
+                placeholders.join(", ")
+            );
+            let mut q = sqlx::query(&sql);
+            for id in chunk { q = q.bind(id); }
+            let rows = q.fetch_all(&self.pool).await.map_err(db_err)?;
+            for row in &rows {
+                let id: String = row.try_get("memory_id").map_err(db_err)?;
+                let count: i32 = row.try_get("access_count").map_err(db_err)?;
+                map.insert(id, count);
+            }
+        }
+        Ok(map)
     }
 
     /// Detect pollution: high supersede ratio in recent changes (threshold=0.3).
@@ -858,6 +917,10 @@ impl SqlMemoryStore {
 
         let mut score_breakdown: Vec<(String, f64, f64, f64, f64, f64)> = Vec::new();
 
+        // Fetch access counts for frequency boost
+        let ac_ids: Vec<String> = candidates.iter().map(|m| m.memory_id.clone()).collect();
+        let ac_map = self.get_access_counts(&ac_ids).await.unwrap_or_default();
+
         for m in &mut candidates {
             let vec_score = m.retrieval_score.unwrap_or(0.0);
             let raw_ft = ft_map.get(&m.memory_id).copied().unwrap_or(0.0);
@@ -872,7 +935,13 @@ impl SqlMemoryStore {
             } else {
                 (0.0, m.initial_confidence)
             };
-            let final_score = W_VEC * vec_score + W_KW * kw_score + W_TIME * time_score + W_CONF * conf_score;
+            let mut final_score = W_VEC * vec_score + W_KW * kw_score + W_TIME * time_score + W_CONF * conf_score;
+            // Frequency boost: log(1 + access_count) — mild boost for frequently retrieved memories
+            let ac = ac_map.get(&m.memory_id).copied().unwrap_or(0);
+            if ac > 0 {
+                final_score *= 1.0 + 0.1 * ((1 + ac) as f64).ln();
+            }
+            m.access_count = ac;
             m.retrieval_score = Some(final_score);
             score_breakdown.push((m.memory_id.clone(), vec_score, kw_score, time_score, conf_score, final_score));
         }

@@ -4,6 +4,7 @@ use axum::{
     Json,
 };
 use serde::Deserialize;
+use sqlx::Row;
 
 use crate::{auth::AuthUser, models::*, state::AppState};
 
@@ -184,13 +185,51 @@ pub async fn purge_memories(
 pub async fn get_profile(
     State(state): State<AppState>,
     AuthUser(user_id): AuthUser,
+    Path(target): Path<String>,
 ) -> ApiResult<serde_json::Value> {
-    let memories = state.service.list_active(&user_id, 50).await.map_err(api_err)?;
+    let resolved = if target == "me" { user_id } else { target };
+    let sql = state.service.sql_store.as_ref()
+        .ok_or_else(|| api_err("SQL store required"))?;
+    let memories = state.service.list_active(&resolved, 50).await.map_err(api_err)?;
     let profile: Vec<_> = memories.iter()
         .filter(|m| m.memory_type == memoria_core::MemoryType::Profile)
         .map(|m| m.content.as_str())
         .collect();
-    Ok(Json(serde_json::json!({ "profile": profile.join("\n") })))
+
+    // Stats enrichment (matches Python)
+    let stats: serde_json::Value = sqlx::query(
+        "SELECT memory_type, COUNT(*) as cnt, \
+         ROUND(AVG(initial_confidence), 2) as avg_conf, \
+         MIN(observed_at) as oldest, MAX(observed_at) as newest \
+         FROM mem_memories WHERE user_id = ? AND is_active = 1 GROUP BY memory_type"
+    ).bind(&resolved).fetch_all(sql.pool()).await
+    .map(|rows| {
+        let mut by_type = serde_json::Map::new();
+        let mut total = 0i64;
+        let mut oldest: Option<String> = None;
+        let mut newest: Option<String> = None;
+        let mut conf_sum = 0.0f64;
+        let mut conf_n = 0i64;
+        for r in &rows {
+            let mt: String = r.try_get("memory_type").unwrap_or_default();
+            let cnt: i64 = r.try_get("cnt").unwrap_or(0);
+            by_type.insert(mt, serde_json::json!(cnt));
+            total += cnt;
+            if let Ok(c) = r.try_get::<f64, _>("avg_conf") { conf_sum += c * cnt as f64; conf_n += cnt; }
+            if let Ok(Some(d)) = r.try_get::<Option<chrono::NaiveDateTime>, _>("oldest") {
+                let s = d.to_string();
+                if oldest.as_ref().map_or(true, |o| s < *o) { oldest = Some(s); }
+            }
+            if let Ok(Some(d)) = r.try_get::<Option<chrono::NaiveDateTime>, _>("newest") {
+                let s = d.to_string();
+                if newest.as_ref().map_or(true, |n| s > *n) { newest = Some(s); }
+            }
+        }
+        let avg_conf = if conf_n > 0 { ((conf_sum / conf_n as f64) * 100.0).round() / 100.0 } else { 0.0 };
+        serde_json::json!({"by_type": by_type, "total": total, "avg_confidence": avg_conf, "oldest": oldest, "newest": newest})
+    }).unwrap_or_else(|_| serde_json::json!({}));
+
+    Ok(Json(serde_json::json!({"user_id": resolved, "profile": profile.join("\n"), "stats": stats})))
 }
 
 #[derive(serde::Deserialize)]
