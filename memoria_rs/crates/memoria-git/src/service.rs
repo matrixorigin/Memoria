@@ -118,6 +118,10 @@ impl GitForDataService {
         // MO#23860: concurrent snapshot restore causes w-w conflict
         // MO#23861: concurrent snapshot restore loses FULLTEXT INDEX secondary tables
         // Callers must serialize snapshot operations until these are fixed.
+        //
+        // Note: ideally this would be transactional, but MatrixOne does not
+        // support {SNAPSHOT = '...'} syntax inside transactions. The DELETE+INSERT
+        // is non-atomic; callers should create a safety snapshot before rollback.
         exec_ddl(&self.pool, &format!("DELETE FROM {safe_table}")).await?;
         exec_ddl(&self.pool, &format!(
             "INSERT INTO {safe_table} SELECT * FROM {safe_table} {{SNAPSHOT = '{safe_snap}'}}"

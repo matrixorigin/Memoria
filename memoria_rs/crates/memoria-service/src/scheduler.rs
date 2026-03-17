@@ -74,24 +74,23 @@ impl GovernanceScheduler {
         for (user_id,) in &users {
             match task {
                 "hourly" => {
-                    // Cleanup expired tool_results (TTL=72h) + archive stale working (>24h)
-                    let _ = sql.cleanup_tool_results(72).await;
-                    let _ = sql.archive_stale_working(24).await;
+                    if let Err(e) = sql.cleanup_tool_results(72).await { error!("cleanup_tool_results: {e}"); }
+                    if let Err(e) = sql.archive_stale_working(24).await { error!("archive_stale_working: {e}"); }
                     let cleaned = sql.cleanup_stale(user_id).await.unwrap_or(0);
                     total_cleaned += cleaned;
                 }
                 "daily" => {
                     let quarantined = sql.quarantine_low_confidence(user_id).await.unwrap_or(0);
                     let cleaned = sql.cleanup_stale(user_id).await.unwrap_or(0);
-                    let _ = sql.compress_redundant(user_id, 0.95, 30, 10_000).await;
-                    let _ = sql.cleanup_orphaned_incrementals(user_id, 24).await;
+                    if let Err(e) = sql.compress_redundant(user_id, 0.95, 30, 10_000).await { error!("compress_redundant: {e}"); }
+                    if let Err(e) = sql.cleanup_orphaned_incrementals(user_id, 24).await { error!("cleanup_orphaned_incrementals: {e}"); }
                     total_quarantined += quarantined;
                     total_cleaned += cleaned;
                 }
                 "weekly" => {
-                    let _ = sql.rebuild_vector_index("mem_memories").await;
-                    let _ = sql.cleanup_snapshots(5).await;
-                    let _ = sql.cleanup_orphan_branches().await;
+                    if let Err(e) = sql.rebuild_vector_index("mem_memories").await { error!("rebuild_vector_index: {e}"); }
+                    if let Err(e) = sql.cleanup_snapshots(5).await { error!("cleanup_snapshots: {e}"); }
+                    if let Err(e) = sql.cleanup_orphan_branches().await { error!("cleanup_orphan_branches: {e}"); }
                 }
                 _ => {}
             }

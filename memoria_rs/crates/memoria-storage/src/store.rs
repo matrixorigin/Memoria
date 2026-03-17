@@ -80,7 +80,11 @@ impl SqlMemoryStore {
     }
 
     pub async fn connect(database_url: &str, embedding_dim: usize) -> Result<Self, MemoriaError> {
-        let pool = MySqlPool::connect(database_url).await.map_err(db_err)?;
+        let pool = sqlx::mysql::MySqlPoolOptions::new()
+            .max_connections(10)
+            .idle_timeout(std::time::Duration::from_secs(300))
+            .acquire_timeout(std::time::Duration::from_secs(10))
+            .connect(database_url).await.map_err(db_err)?;
         Ok(Self::new(pool, embedding_dim))
     }
 
@@ -590,25 +594,28 @@ impl SqlMemoryStore {
         if ids.is_empty() {
             return Ok(Default::default());
         }
-        let ph = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-        let sql = format!(
-            "SELECT memory_id, user_id, memory_type, content, \
-             embedding AS emb_str, session_id, \
-             CAST(source_event_ids AS CHAR) AS src_ids, \
-             CAST(extra_metadata AS CHAR) AS extra_meta, \
-             is_active, superseded_by, trust_tier, initial_confidence, \
-             observed_at, created_at, updated_at \
-             FROM mem_memories WHERE memory_id IN ({ph}) AND is_active = 1"
-        );
-        let mut q = sqlx::query(&sql);
-        for id in ids {
-            q = q.bind(id);
-        }
-        let rows = q.fetch_all(&self.pool).await.map_err(db_err)?;
         let mut map = std::collections::HashMap::new();
-        for r in &rows {
-            let m = row_to_memory(r)?;
-            map.insert(m.memory_id.clone(), m);
+        // Batch in chunks of 500 to avoid SQL length limits
+        for chunk in ids.chunks(500) {
+            let ph = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let sql = format!(
+                "SELECT memory_id, user_id, memory_type, content, \
+                 embedding AS emb_str, session_id, \
+                 CAST(source_event_ids AS CHAR) AS src_ids, \
+                 CAST(extra_metadata AS CHAR) AS extra_meta, \
+                 is_active, superseded_by, trust_tier, initial_confidence, \
+                 observed_at, created_at, updated_at \
+                 FROM mem_memories WHERE memory_id IN ({ph}) AND is_active = 1"
+            );
+            let mut q = sqlx::query(&sql);
+            for id in chunk {
+                q = q.bind(id);
+            }
+            let rows = q.fetch_all(&self.pool).await.map_err(db_err)?;
+            for r in &rows {
+                let m = row_to_memory(r)?;
+                map.insert(m.memory_id.clone(), m);
+            }
         }
         Ok(map)
     }

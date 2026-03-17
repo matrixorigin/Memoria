@@ -5,7 +5,7 @@ pub mod state;
 
 pub use state::AppState;
 
-use axum::{routing::{delete, get, post, put}, Router};
+use axum::{extract::DefaultBodyLimit, routing::{delete, get, post, put}, Router};
 
 /// Build the full API router with all routes.
 pub fn build_router(state: AppState) -> Router {
@@ -74,4 +74,5 @@ pub fn build_router(state: AppState) -> Router {
         // Pipeline
         .route("/v1/pipeline/run", post(routes::memory::run_pipeline))
         .with_state(state)
+        .layer(DefaultBodyLimit::max(2 * 1024 * 1024)) // 2 MB
 }
