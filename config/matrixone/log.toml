@@ -1,0 +1,17 @@
+service-type = "LOG"
+data-dir = "./mo-data"
+
+[log]
+level = "info"
+format = "console"
+max-size = 512
+filename = "/logs/matrixone.log"
+
+[malloc]
+check-fraction = 65536
+enable-metrics = true
+
+[observability]
+disableMetric = false
+enable-metric-to-prom = true
+status-port = 7001

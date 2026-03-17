@@ -10,6 +10,7 @@ env:
   CARGO_TERM_COLOR: always
   SQLX_OFFLINE: "true"
   DATABASE_URL: mysql://root:111@localhost:6001/memoria_test
+  EMBEDDING_PROVIDER: ${{ secrets.EMBEDDING_API_KEY != '' && 'openai' || 'mock' }}
   EMBEDDING_API_KEY: ${{ secrets.EMBEDDING_API_KEY }}
   EMBEDDING_BASE_URL: ${{ vars.EMBEDDING_BASE_URL || '' }}
   EMBEDDING_MODEL: ${{ vars.EMBEDDING_MODEL || 'BAAI/bge-m3' }}
@@ -24,7 +25,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.85.0
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
@@ -40,7 +41,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.85.0
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: memoria
@@ -59,7 +60,7 @@ jobs:
         options: --memory=2g
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.85.0
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: memoria

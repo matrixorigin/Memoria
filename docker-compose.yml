@@ -8,16 +8,17 @@ services:
   matrixone-init:
     image: ${MATRIXONE_IMAGE:-matrixorigin/matrixone:latest}
     user: root
-    entrypoint: ["sh", "-c", "chown -R 1000:1000 /mo-data"]
+    entrypoint: ["sh", "-c", "chown -R ${DOCKER_UID:-1000}:${DOCKER_GID:-1000} /mo-data && mkdir -p /logs && chown -R ${DOCKER_UID:-1000}:${DOCKER_GID:-1000} /logs"]
     volumes:
       - ${MATRIXONE_DATA_DIR:-./data/matrixone}:/mo-data
+      - ./data/logs/matrixone:/logs
     networks:
       - memoria-net
 
   matrixone:
     image: ${MATRIXONE_IMAGE:-matrixorigin/matrixone:latest}
     hostname: matrixone
-    user: "1000:1000"
+    user: "${DOCKER_UID:-1000}:${DOCKER_GID:-1000}"
     depends_on:
       matrixone-init:
         condition: service_completed_successfully
@@ -26,6 +27,10 @@ services:
       - "${MATRIXONE_DEBUG_PORT:-}:6060"
     volumes:
       - ${MATRIXONE_DATA_DIR:-./data/matrixone}:/mo-data
+      - ./data/logs/matrixone:/logs
+      - ./config/matrixone:/etc/memoria:ro
+    entrypoint: ["/mo-service"]
+    command: ["-debug-http=:12345", "-launch", "/etc/memoria/launch.toml"]
     environment:
       - TZ=Asia/Shanghai
     networks:
@@ -37,15 +42,28 @@ services:
       retries: 12
       start_period: 30s
     restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
 
   api:
     build:
       context: .
       dockerfile: memoria/Dockerfile
+      args:
+        - http_proxy=${http_proxy:-}
+        - https_proxy=${https_proxy:-}
+        - no_proxy=${no_proxy:-}
     hostname: memoria-api
     ports:
       - "${API_PORT:-8100}:8100"
+    user: "${DOCKER_UID:-1000}:${DOCKER_GID:-1000}"
+    volumes:
+      - ${MEMORIA_LOG_DIR:-./data/logs/api}:/var/log/memoria
     environment:
+      - RUST_LOG=${RUST_LOG:-info,memoria_api=info,memoria_service=info,tower_http=info}
       - DATABASE_URL=mysql://root:${MEMORIA_DB_PASSWORD:-111}@matrixone:6001/${MEMORIA_DB_NAME:-memoria}
       - MASTER_KEY=${MEMORIA_MASTER_KEY:?Set MEMORIA_MASTER_KEY in .env (min 16 chars)}
       - EMBEDDING_PROVIDER=${MEMORIA_EMBEDDING_PROVIDER:-openai}
@@ -61,6 +79,11 @@ services:
         condition: service_healthy
     networks:
       - memoria-net
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
     restart: unless-stopped
 
 volumes: {}

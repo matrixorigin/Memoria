@@ -1,0 +1,11 @@
+logservices = [
+    "/etc/memoria/log.toml",
+]
+
+tnservices = [
+    "/etc/memoria/tn.toml",
+]
+
+cnservices = [
+    "/etc/memoria/cn.toml",
+]

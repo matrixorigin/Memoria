@@ -3,3 +3,8 @@ memoria/target/
 .git/
 .env
 *.md
+benchmarks/
+assets/
+.github/
+.kiro/
+docs/
