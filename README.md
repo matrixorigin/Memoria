@@ -472,7 +472,7 @@ Configure via environment variables in the MCP config `env` block:
 Leave all empty to use local embedding (all-MiniLM-L6-v2, dim=384).
 
 **💡 Local Embedding Tips:**
-Local embedding requires building from source with `--features local-embedding` (pre-built binaries don't include it). The model is downloaded automatically on first use to `~/.cache/fastembed/`.
+Local embedding requires building from source with `--features local-embedding` (pre-built binaries don't include it). See [Local Embedding Guide](docs/local-embedding.md) for build instructions, supported models, and troubleshooting.
 
 **⚠️ CRITICAL: Configure embedding BEFORE the MCP server starts for the first time.**
  Tables are created on first startup with the configured dimension. Changing it later requires re-creating the embedding column (destructive).

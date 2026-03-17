@@ -1,0 +1,47 @@
+name: Test Gate
+
+on:
+  workflow_call:
+
+jobs:
+  test:
+    name: Check & Test
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TERM_COLOR: always
+      SQLX_OFFLINE: "true"
+      DATABASE_URL: mysql://root:111@localhost:6001/memoria_test
+      EMBEDDING_PROVIDER: ${{ secrets.EMBEDDING_API_KEY != '' && 'openai' || 'mock' }}
+      EMBEDDING_API_KEY: ${{ secrets.EMBEDDING_API_KEY }}
+      EMBEDDING_BASE_URL: ${{ vars.EMBEDDING_BASE_URL || '' }}
+      EMBEDDING_MODEL: ${{ vars.EMBEDDING_MODEL || 'BAAI/bge-m3' }}
+      EMBEDDING_DIM: ${{ vars.EMBEDDING_DIM || '1024' }}
+      LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+      LLM_BASE_URL: ${{ vars.LLM_BASE_URL || '' }}
+      LLM_MODEL: ${{ vars.LLM_MODEL || '' }}
+    services:
+      matrixone:
+        image: matrixorigin/matrixone:latest
+        ports:
+          - 6001:6001
+        options: --memory=2g
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85.0
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: memoria
+      - name: Check & Clippy
+        run: cd memoria && cargo check && cargo clippy -- -D warnings
+      - name: Unit tests
+        run: cd memoria && cargo test --lib -p memoria-core -p memoria-service -p memoria-mcp
+      - name: Wait for MatrixOne
+        run: |
+          for i in $(seq 1 30); do
+            bash -c 'echo > /dev/tcp/127.0.0.1/6001' 2>/dev/null && break
+            echo "Waiting... ($i/30)" && sleep 3
+          done
+      - name: All tests
+        run: cd memoria && cargo test -- --test-threads=1

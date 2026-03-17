@@ -89,6 +89,8 @@ memoria init --tool kiro --embedding-provider openai \
 
 This creates MCP config + steering rules for your detected AI tool. Restart the tool afterwards.
 
+For local (on-device) embedding without an API key, see the [Local Embedding Guide](local-embedding.md).
+
 ### Check status and update rules
 
 ```bash

@@ -6,8 +6,14 @@ on:
       - 'v*.*.*'
 
 jobs:
+  test:
+    name: Test gate
+    uses: ./.github/workflows/test-gate.yml
+    secrets: inherit
+
   build:
     name: Build ${{ matrix.target }}
+    needs: test
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:

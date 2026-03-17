@@ -9,8 +9,14 @@ env:
   IMAGE_NAME: matrixorigin/memoria
 
 jobs:
+  test:
+    name: Test gate
+    uses: ./.github/workflows/test-gate.yml
+    secrets: inherit
+
   docker:
     name: Build & Push Docker Image
+    needs: test
     runs-on: ubuntu-latest
 
     steps:

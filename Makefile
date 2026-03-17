@@ -1,6 +1,6 @@
 .PHONY: help check-env up down status logs logs-db \
         up-db down-db up-api down-api rebuild-api health \
-        dev build check \
+        dev build build-local check \
         test test-unit test-integration test-e2e bench \
         new-key list-keys revoke-keys \
         clean reset
@@ -39,7 +39,8 @@ help:
 	@echo ""
 	@echo "Local dev (no Docker for API):"
 	@echo "  make dev                Run API locally (RUST_LOG=debug make dev)"
-	@echo "  make build              Build release binaries"
+	@echo "  make build              Build release binary"
+	@echo "  make build-local        Build with local embedding support"
 	@echo "  make check              cargo check + clippy"
 	@echo ""
 	@echo "Tests:"
@@ -119,6 +120,11 @@ build:
 	@echo "Building release binary..."
 	@cd memoria && SQLX_OFFLINE=true cargo build --release -p memoria-cli
 	@echo "Binary: memoria/target/release/memoria"
+
+build-local:
+	@echo "Building release binary with local embedding..."
+	@cd memoria && SQLX_OFFLINE=true cargo build --release -p memoria-cli --features local-embedding
+	@echo "Binary: memoria/target/release/memoria (with local embedding)"
 
 # ── Release ─────────────────────────────────────────────────────────
 
