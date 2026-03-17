@@ -57,13 +57,23 @@ pub async fn backfill_graph(
         graph.create_node(&node).await?;
         result.processed += 1;
 
-        // Entity linking via NER
+        // Entity linking via NER + graph edges for spreading activation
         let entities = ner::extract_entities(&mem.content);
         for ent in &entities {
             let name = ent.name.to_lowercase();
-            if let Ok((entity_id, _)) = graph.upsert_entity(user_id, &name, &ent.name, &ent.entity_type).await {
+            if let Ok((entity_id, _created)) = graph.upsert_entity(user_id, &name, &ent.name, &ent.entity_type).await {
                 let _ = graph.upsert_memory_entity_link(&mem.memory_id, &entity_id, user_id, "ner").await;
                 result.entities_linked += 1;
+
+                // Create entity graph node if new (so spreading activation can reach it)
+                // NOTE: disabled — entity graph nodes without proper edges
+                // can interfere with graph retrieval scoring
+
+                // Add entity_link edge (skip person/time — too generic for activation)
+                // NOTE: disabled — entity_link edges hurt some scenarios more than they help
+                // if ent.entity_type != "person" && ent.entity_type != "time" {
+                //     ...
+                // }
             }
         }
     }

@@ -14,6 +14,7 @@ const SERVICE_SUFFIXES: &[&str] = &[
     "service", "server", "api", "gateway", "proxy", "mesh",
     "pipeline", "worker", "queue", "cache", "store", "db",
     "manager", "controller", "handler", "client", "sdk", "cli", "ui", "app",
+    "serving", "engine", "agent", "daemon", "scheduler", "monitor",
 ];
 
 /// Common English words to exclude from capitalized-word extraction.
@@ -46,6 +47,12 @@ pub struct ExtractedEntity {
 }
 
 pub fn extract_entities(text: &str) -> Vec<ExtractedEntity> {
+    fn trim_trailing_punct(s: &str) -> &str {
+        s.trim_end_matches(|c: char| !c.is_alphanumeric())
+    }
+    fn trim_trailing_punct_keep_hyphen(s: &str) -> &str {
+        s.trim_end_matches(|c: char| !c.is_alphanumeric() && c != '-')
+    }
     let mut seen = std::collections::HashSet::new();
     let mut entities = Vec::new();
 
@@ -76,10 +83,14 @@ pub fn extract_entities(text: &str) -> Vec<ExtractedEntity> {
 
     // 2. Capitalized words (likely tech proper nouns): CamelCase or Title Case
     // Pattern: word starting with uppercase, 2+ chars
-    let words: Vec<&str> = text.split_whitespace().collect();
+    // Normalize CJK punctuation to spaces so "Server，最近" splits correctly
+    let normalized: String = text.chars().map(|c| {
+        if matches!(c, '，'|'。'|'！'|'？'|'；'|'：'|'、'|'（'|'）'|'【'|'】'|'「'|'」'|'『'|'』'|'\u{201c}'|'\u{201d}'|'\u{2018}'|'\u{2019}') { ' ' } else { c }
+    }).collect();
+    let words: Vec<String> = normalized.split_whitespace().map(String::from).collect();
     for word in &words {
         // Strip trailing punctuation
-        let w = word.trim_end_matches(|c: char| !c.is_alphanumeric());
+        let w = trim_trailing_punct(word);
         if w.len() < 2 { continue; }
         let first = w.chars().next().unwrap_or_default();
         if !first.is_uppercase() { continue; }
@@ -87,9 +98,9 @@ pub fn extract_entities(text: &str) -> Vec<ExtractedEntity> {
         if COMMON_ENGLISH.contains(&lower.as_str()) { continue; }
         if TECH_TERMS.contains(&lower.as_str()) { continue; } // already added
         // Must have at least one lowercase letter (not pure acronym like "THE")
-        if w.chars().all(|c| c.is_uppercase() || !c.is_alphabetic()) {
+        if w.chars().all(|c: char| c.is_uppercase() || !c.is_alphabetic()) {
             // Pure acronym: 2-8 chars
-            if w.len() >= 2 && w.len() <= 8 && w.chars().all(|c| c.is_ascii_uppercase()) {
+            if w.len() >= 2 && w.len() <= 8 && w.chars().all(|c: char| c.is_ascii_uppercase()) {
                 add(&lower, w, "tech");
             }
             continue;
@@ -128,11 +139,11 @@ pub fn extract_entities(text: &str) -> Vec<ExtractedEntity> {
 
     // 5. CamelCase identifiers (2+ humps)
     for word in &words {
-        let w = word.trim_end_matches(|c: char| !c.is_alphanumeric());
+        let w = trim_trailing_punct(word);
         if w.len() < 4 { continue; }
         // Must have at least 2 uppercase letters not at start
-        let upper_count = w.chars().skip(1).filter(|c| c.is_uppercase()).count();
-        if upper_count >= 1 && w.chars().next().map(|c| c.is_uppercase()).unwrap_or(false) {
+        let upper_count = w.chars().skip(1).filter(|c: &char| c.is_uppercase()).count();
+        if upper_count >= 1 && w.chars().next().map(|c: char| c.is_uppercase()).unwrap_or(false) {
             let lower = w.to_lowercase();
             if !COMMON_ENGLISH.contains(&lower.as_str()) {
                 add(&lower, w, "project");
@@ -142,7 +153,7 @@ pub fn extract_entities(text: &str) -> Vec<ExtractedEntity> {
 
     // 6. Hyphenated service names (auth-service, payment-api, etc.)
     for word in &words {
-        let w = word.trim_end_matches(|c: char| !c.is_alphanumeric() && c != '-');
+        let w = trim_trailing_punct_keep_hyphen(word);
         if !w.contains('-') { continue; }
         let parts: Vec<&str> = w.split('-').collect();
         if parts.len() < 2 { continue; }
@@ -271,5 +282,24 @@ mod tests {
         assert!(!names.contains(&"the"), "should exclude common: {names:?}");
         assert!(!names.contains(&"first"), "should exclude common: {names:?}");
         assert!(!names.contains(&"step"), "should exclude common: {names:?}");
+    }
+
+    #[test]
+    fn test_chinese_text_with_service_names() {
+        let e = extract_entities("@陈磊 是平台组的 tech lead，负责 data-pipeline 和 ml-serving 两个项目。");
+        let names: Vec<&str> = e.iter().map(|x| x.name.as_str()).collect();
+        assert!(names.contains(&"陈磊"), "should find @mention: {names:?}");
+        assert!(names.contains(&"data-pipeline"), "should find data-pipeline: {names:?}");
+        assert!(names.contains(&"ml-serving"), "should find ml-serving: {names:?}");
+    }
+
+    #[test]
+    fn test_cjk_punctuation_split() {
+        let e = extract_entities("ml-serving 使用 Triton Inference Server，最近发现内存泄漏问题。");
+        let names: Vec<&str> = e.iter().map(|x| x.name.as_str()).collect();
+        assert!(names.contains(&"triton"), "should find Triton: {names:?}");
+        assert!(names.contains(&"ml-serving"), "should find ml-serving: {names:?}");
+        // "Server" should be extracted separately, not "Server，最近发现..."
+        assert!(names.contains(&"server"), "should find Server: {names:?}");
     }
 }

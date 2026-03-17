@@ -319,10 +319,17 @@ impl MemoryService {
                         explain.vector_ms = vs_start.elapsed().as_secs_f64() * 1000.0;
                         explain.vector_hit = !vec_results.is_empty();
 
-                        // Merge: dedup, sort by score
+                        // Merge: dedup (keep higher score), sort by score
                         for m in vec_results {
                             if seen.insert(m.memory_id.clone()) {
                                 graph_memories.push(m);
+                            } else {
+                                // Memory exists from graph — use higher score
+                                if let Some(existing) = graph_memories.iter_mut().find(|g| g.memory_id == m.memory_id) {
+                                    if m.retrieval_score > existing.retrieval_score {
+                                        existing.retrieval_score = m.retrieval_score;
+                                    }
+                                }
                             }
                         }
                         graph_memories.sort_by(|a, b| {
