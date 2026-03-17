@@ -55,14 +55,14 @@ jobs:
         working-directory: memoria
         env:
           SQLX_OFFLINE: "true"
-        run: cross build --release --target ${{ matrix.target }}
+        run: cross build --release -p memoria-cli --target ${{ matrix.target }}
 
       - name: Build (native)
         if: ${{ !matrix.cross }}
         working-directory: memoria
         env:
           SQLX_OFFLINE: "true"
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release -p memoria-cli --target ${{ matrix.target }}
 
       - name: Package
         run: |
