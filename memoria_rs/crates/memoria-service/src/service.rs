@@ -509,4 +509,71 @@ impl MemoryService {
     pub async fn embed(&self, text: &str) -> Option<Vec<f32>> {
         self.embedder.as_ref()?.embed(text).await.ok()
     }
+
+    pub async fn embed_batch(&self, texts: &[String]) -> Option<Vec<Vec<f32>>> {
+        self.embedder.as_ref()?.embed_batch(texts).await.ok()
+    }
+
+    /// Batch store with single embedding API call for all memories.
+    pub async fn store_batch(
+        &self,
+        user_id: &str,
+        items: Vec<(String, MemoryType, Option<String>, Option<TrustTier>)>,
+    ) -> Result<Vec<Memory>, MemoriaError> {
+        if items.is_empty() {
+            return Ok(vec![]);
+        }
+
+        // Sensitivity check + collect contents
+        let mut contents = Vec::with_capacity(items.len());
+        let mut checked_items = Vec::with_capacity(items.len());
+        for (content, mt, session_id, tier) in items {
+            let sensitivity = check_sensitivity(&content);
+            if sensitivity.blocked {
+                return Err(MemoriaError::Blocked(format!(
+                    "Memory blocked: contains sensitive content ({})",
+                    sensitivity.matched_labels.join(", ")
+                )));
+            }
+            let final_content = sensitivity.redacted_content.unwrap_or(content);
+            contents.push(final_content.clone());
+            checked_items.push((final_content, mt, session_id, tier));
+        }
+
+        // Batch embed
+        let embeddings = self.embed_batch(&contents).await;
+
+        let mut results = Vec::with_capacity(checked_items.len());
+        for (i, (content, mt, session_id, tier)) in checked_items.into_iter().enumerate() {
+            let effective_tier = tier.unwrap_or(TrustTier::T1Verified);
+            let embedding = embeddings.as_ref().map(|v| v[i].clone());
+            let memory = Memory {
+                memory_id: Uuid::new_v4().simple().to_string(),
+                user_id: user_id.to_string(),
+                memory_type: mt,
+                content,
+                initial_confidence: effective_tier.initial_confidence(),
+                embedding,
+                source_event_ids: vec![],
+                superseded_by: None,
+                is_active: true,
+                access_count: 0,
+                session_id,
+                observed_at: Some(Utc::now()),
+                created_at: None,
+                updated_at: None,
+                extra_metadata: None,
+                trust_tier: effective_tier,
+                retrieval_score: None,
+            };
+            if let Some(sql) = &self.sql_store {
+                let table = sql.active_table(user_id).await?;
+                sql.insert_into(&table, &memory).await?;
+            } else {
+                self.store.insert(&memory).await?;
+            }
+            results.push(memory);
+        }
+        Ok(results)
+    }
 }

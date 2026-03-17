@@ -7,7 +7,7 @@ use axum::{
     Json,
 };
 use serde::{Deserialize, Serialize};
-use sqlx::MySqlPool;
+use sqlx::{MySqlPool, Row};
 
 use crate::{auth::AuthUser, state::AppState};
 
@@ -250,4 +250,57 @@ pub async fn set_user_strategy(
         "previous": "vector:v1",
         "status": "ok",
     }))
+}
+
+/// GET /admin/users/:user_id/keys — list all active API keys for a user (admin only)
+pub async fn list_user_keys(
+    _auth: AuthUser,
+    State(state): State<AppState>,
+    Path(user_id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let pool = get_pool(&state)?;
+    let rows = sqlx::query(
+        "SELECT key_id, name, key_prefix, created_at, expires_at, last_used_at \
+         FROM mem_api_keys WHERE user_id = ? AND is_active = 1 ORDER BY created_at DESC"
+    ).bind(&user_id).fetch_all(pool).await.map_err(db_err)?;
+
+    let keys: Vec<serde_json::Value> = rows.iter().map(|r| {
+        serde_json::json!({
+            "key_id": r.try_get::<String, _>("key_id").unwrap_or_default(),
+            "name": r.try_get::<String, _>("name").unwrap_or_default(),
+            "key_prefix": r.try_get::<String, _>("key_prefix").unwrap_or_default(),
+            "created_at": r.try_get::<chrono::NaiveDateTime, _>("created_at").map(|d| d.to_string()).unwrap_or_default(),
+            "expires_at": r.try_get::<Option<chrono::NaiveDateTime>, _>("expires_at").ok().flatten().map(|d| d.to_string()),
+            "last_used_at": r.try_get::<Option<chrono::NaiveDateTime>, _>("last_used_at").ok().flatten().map(|d| d.to_string()),
+        })
+    }).collect();
+
+    Ok(Json(serde_json::json!({"user_id": user_id, "keys": keys})))
+}
+
+/// DELETE /admin/users/:user_id/keys — revoke all active API keys for a user (admin only)
+pub async fn revoke_all_user_keys(
+    _auth: AuthUser,
+    State(state): State<AppState>,
+    Path(user_id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let pool = get_pool(&state)?;
+    let result = sqlx::query("UPDATE mem_api_keys SET is_active = 0 WHERE user_id = ? AND is_active = 1")
+        .bind(&user_id).execute(pool).await.map_err(db_err)?;
+    Ok(Json(serde_json::json!({"user_id": user_id, "revoked": result.rows_affected()})))
+}
+
+/// POST /admin/users/:user_id/params — set per-user activation param overrides
+pub async fn set_user_params(
+    _auth: AuthUser,
+    State(state): State<AppState>,
+    Path(user_id): Path<String>,
+    Json(params): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let pool = get_pool(&state)?;
+    let pj = serde_json::to_string(&params).map_err(db_err)?;
+    sqlx::query(
+        "UPDATE mem_user_memory_config SET params_json = ?, updated_at = NOW() WHERE user_id = ?"
+    ).bind(&pj).bind(&user_id).execute(pool).await.map_err(db_err)?;
+    Ok(Json(serde_json::json!({"user_id": user_id, "params": params})))
 }

@@ -124,6 +124,18 @@ async fn main() -> Result<()> {
             &cfg.embedding_base_url, &cfg.embedding_api_key,
             &cfg.embedding_model, cfg.embedding_dim,
         )) as Arc<dyn memoria_core::interfaces::EmbeddingProvider>)
+    } else if cfg.embedding_provider == "local" {
+        #[cfg(feature = "local-embedding")]
+        {
+            let local = memoria_embedding::LocalEmbedder::new(&cfg.embedding_model)
+                .expect("Failed to load local embedding model");
+            Some(Arc::new(local) as Arc<dyn memoria_core::interfaces::EmbeddingProvider>)
+        }
+        #[cfg(not(feature = "local-embedding"))]
+        {
+            tracing::error!("EMBEDDING_PROVIDER=local but compiled without local-embedding feature");
+            None
+        }
     } else { None };
 
     let llm = cfg.llm_api_key.as_ref().map(|key| {

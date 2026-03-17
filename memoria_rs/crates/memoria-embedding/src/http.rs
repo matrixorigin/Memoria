@@ -3,7 +3,6 @@ use memoria_core::{interfaces::EmbeddingProvider, MemoriaError};
 use serde::{Deserialize, Serialize};
 
 /// HTTP-based embedding client — OpenAI-compatible API.
-/// Phase 2 implementation; Phase 4 will add Candle local embedding.
 pub struct HttpEmbedder {
     client: reqwest::Client,
     base_url: String,
@@ -14,8 +13,15 @@ pub struct HttpEmbedder {
 
 #[derive(Serialize)]
 struct EmbedRequest<'a> {
-    input: &'a str,
+    input: EmbedInput<'a>,
     model: &'a str,
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+enum EmbedInput<'a> {
+    Single(&'a str),
+    Batch(&'a [String]),
 }
 
 #[derive(Deserialize)]
@@ -54,7 +60,7 @@ impl EmbeddingProvider for HttpEmbedder {
             .post(&url)
             .bearer_auth(&self.api_key)
             .json(&EmbedRequest {
-                input: text,
+                input: EmbedInput::Single(text),
                 model: &self.model,
             })
             .send()
@@ -79,6 +85,43 @@ impl EmbeddingProvider for HttpEmbedder {
             .next()
             .map(|d| d.embedding)
             .ok_or_else(|| MemoriaError::Embedding("Empty embedding response".into()))
+    }
+
+    async fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, MemoriaError> {
+        if texts.is_empty() {
+            return Ok(vec![]);
+        }
+        if texts.len() == 1 {
+            return Ok(vec![self.embed(&texts[0]).await?]);
+        }
+
+        let url = format!("{}/embeddings", self.base_url.trim_end_matches('/'));
+        let resp = self
+            .client
+            .post(&url)
+            .bearer_auth(&self.api_key)
+            .json(&EmbedRequest {
+                input: EmbedInput::Batch(texts),
+                model: &self.model,
+            })
+            .send()
+            .await
+            .map_err(|e| MemoriaError::Embedding(e.to_string()))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(MemoriaError::Embedding(format!(
+                "HTTP {status}: {body}"
+            )));
+        }
+
+        let data: EmbedResponse = resp
+            .json()
+            .await
+            .map_err(|e| MemoriaError::Embedding(e.to_string()))?;
+
+        Ok(data.data.into_iter().map(|d| d.embedding).collect())
     }
 
     fn dimension(&self) -> usize {

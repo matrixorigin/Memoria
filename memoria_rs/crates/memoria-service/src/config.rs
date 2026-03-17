@@ -83,8 +83,11 @@ impl Config {
         self.llm_api_key.is_some()
     }
 
-    /// Returns true if embedding is configured (non-mock provider with base URL).
+    /// Returns true if embedding is configured (non-mock provider with base URL, or local).
     pub fn has_embedding(&self) -> bool {
+        if self.embedding_provider == "local" {
+            return false; // local is handled separately, not via HttpEmbedder
+        }
         self.embedding_provider != "mock" && !self.embedding_base_url.is_empty()
     }
 }

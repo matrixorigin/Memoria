@@ -62,17 +62,24 @@ pub async fn batch_store(
     AuthUser(user_id): AuthUser,
     Json(req): Json<BatchStoreRequest>,
 ) -> Result<(StatusCode, Json<Vec<MemoryResponse>>), (StatusCode, String)> {
-    let mut results = Vec::new();
-    for r in req.memories {
-        let mt = parse_memory_type(&r.memory_type).map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e))?;
+    let items: Vec<_> = req.memories.into_iter().map(|r| {
+        let mt = parse_memory_type(&r.memory_type).map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e));
         let tier = r.trust_tier.as_deref()
             .map(parse_trust_tier).transpose()
-            .map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e))?;
-        let m = state.service.store_memory(&user_id, &r.content, mt, r.session_id, tier, None, None)
-            .await.map_err(api_err)?;
-        results.push(m.into());
+            .map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e));
+        (r.content, mt, tier, r.session_id)
+    }).collect();
+
+    // Validate all types upfront
+    let mut validated = Vec::with_capacity(items.len());
+    for (content, mt_result, tier_result, session_id) in items {
+        let mt = mt_result?;
+        let tier = tier_result?;
+        validated.push((content, mt, session_id, tier));
     }
-    Ok((StatusCode::CREATED, Json(results)))
+
+    let results = state.service.store_batch(&user_id, validated).await.map_err(api_err)?;
+    Ok((StatusCode::CREATED, Json(results.into_iter().map(Into::into).collect())))
 }
 
 pub async fn retrieve(

@@ -3,6 +3,10 @@ name = "memoria-mcp"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = []
+local-embedding = ["memoria-embedding/local-embedding"]
+
 [[bin]]
 name = "memoria-mcp-rs"
 path = "src/main.rs"

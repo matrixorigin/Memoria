@@ -3,6 +3,10 @@ name = "memoria-embedding"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = []
+local-embedding = ["fastembed"]
+
 [dependencies]
 memoria-core = { workspace = true }
 reqwest = { workspace = true }
@@ -11,3 +15,4 @@ serde_json = { workspace = true }
 async-trait = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
+fastembed = { version = "5", optional = true }

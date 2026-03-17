@@ -78,6 +78,31 @@ services:
       - memoria-net
     restart: unless-stopped
 
+  api-rs:
+    build:
+      context: .
+      dockerfile: memoria_rs/Dockerfile
+    hostname: memoria-api-rs
+    ports:
+      - "${API_RS_PORT:-8200}:8100"
+    environment:
+      - DATABASE_URL=mysql://root:${MEMORIA_DB_PASSWORD:-111}@matrixone:6001/${MEMORIA_RS_DB_NAME:-memoria_rs}
+      - MASTER_KEY=${MEMORIA_MASTER_KEY:?Set MEMORIA_MASTER_KEY in .env (min 16 chars)}
+      - EMBEDDING_PROVIDER=${MEMORIA_EMBEDDING_PROVIDER:-openai}
+      - EMBEDDING_MODEL=${MEMORIA_EMBEDDING_MODEL:-BAAI/bge-m3}
+      - EMBEDDING_DIM=${MEMORIA_EMBEDDING_DIM:-1024}
+      - EMBEDDING_API_KEY=${MEMORIA_EMBEDDING_API_KEY:-}
+      - EMBEDDING_BASE_URL=${MEMORIA_EMBEDDING_BASE_URL:-}
+      - LLM_API_KEY=${MEMORIA_LLM_API_KEY:-}
+      - LLM_BASE_URL=${MEMORIA_LLM_BASE_URL:-}
+      - LLM_MODEL=${MEMORIA_LLM_MODEL:-gpt-4o-mini}
+    depends_on:
+      matrixone:
+        condition: service_healthy
+    networks:
+      - memoria-net
+    restart: unless-stopped
+
 volumes: {}
 
 networks:
