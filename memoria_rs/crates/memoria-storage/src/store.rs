@@ -744,11 +744,15 @@ impl SqlMemoryStore {
 
         let now = chrono::Utc::now();
         const DECAY_HOURS: f64 = 168.0;
-        const HALF_LIFE_DAYS: f64 = 30.0;
         const W_VEC: f64 = 0.3;
         const W_KW: f64 = 0.2;
         const W_TIME: f64 = 0.2;
         const W_CONF: f64 = 0.3;
+
+        // Per-tier half-life (days) — higher-trust memories decay slower.
+        fn half_life_for(tier: &memoria_core::TrustTier) -> f64 {
+            tier.default_half_life_days()
+        }
 
         let mut score_breakdown: Vec<(String, f64, f64, f64, f64, f64)> = Vec::new();
 
@@ -760,7 +764,8 @@ impl SqlMemoryStore {
                 let age_hours = (now - obs).num_seconds() as f64 / 3600.0;
                 let age_days = age_hours / 24.0;
                 let ts = (-age_hours / DECAY_HOURS).max(-500.0).exp();
-                let cs = m.initial_confidence * (-age_days / HALF_LIFE_DAYS).max(-500.0).exp();
+                let hl = half_life_for(&m.trust_tier);
+                let cs = m.initial_confidence * (-age_days / hl).max(-500.0).exp();
                 (ts, cs)
             } else {
                 (0.0, m.initial_confidence)
@@ -769,6 +774,15 @@ impl SqlMemoryStore {
             m.retrieval_score = Some(final_score);
             score_breakdown.push((m.memory_id.clone(), vec_score, kw_score, time_score, conf_score, final_score));
         }
+
+        // Drop memories whose effective confidence has decayed to near-zero.
+        // This prevents long-expired facts from appearing in results.
+        const MIN_CONF: f64 = 0.05;
+        let live: std::collections::HashSet<String> = score_breakdown.iter()
+            .filter(|(_, _, _, _, cs, _)| *cs >= MIN_CONF)
+            .map(|(id, ..)| id.clone()).collect();
+        candidates.retain(|m| live.contains(&m.memory_id));
+        score_breakdown.retain(|(id, ..)| live.contains(id));
 
         candidates.sort_by(|a, b| b.retrieval_score.partial_cmp(&a.retrieval_score).unwrap_or(std::cmp::Ordering::Equal));
         // Re-sort score_breakdown to match candidate order
