@@ -1,19 +1,29 @@
 name: Release Rust Binaries
 
+# Trigger: push a tag v*.*.* or v*.*.*-* (e.g. v0.1.0, v0.1.0-rc1), or run manually from Actions tab.
 on:
   push:
     tags:
       - 'v*.*.*'
+      - 'v*.*.*-*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v0.1.0-rc1); must already exist'
+        required: true
+        type: string
 
 jobs:
   test:
     name: Test gate
+    if: github.event_name != 'workflow_dispatch'
     uses: ./.github/workflows/test-gate.yml
     secrets: inherit
 
   build:
     name: Build ${{ matrix.target }}
-    needs: test
+    needs: [test]
+    if: always() && (needs.test.result == 'success' || needs.test.result == 'skipped')
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
@@ -30,6 +40,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
 
       - uses: dtolnay/rust-toolchain@1.85.0
         with:
@@ -97,8 +109,9 @@ jobs:
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
           files: |
             artifacts/*.tar.gz
             artifacts/SHA256SUMS.txt
           generate_release_notes: true
-          prerelease: ${{ contains(github.ref, '-rc') || contains(github.ref, '-beta') || contains(github.ref, '-alpha') }}
+          prerelease: ${{ contains(github.ref_name, '-rc') || contains(github.ref_name, '-beta') || contains(github.ref_name, '-alpha') }}

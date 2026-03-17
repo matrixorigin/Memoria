@@ -115,7 +115,15 @@ Don't want Docker? Use [MatrixOne Cloud](https://cloud.matrixorigin.cn) (free ti
 
 ### 2. Install Memoria
 
-Download from [GitHub Releases](https://github.com/matrixorigin/Memoria/releases):
+**Option A — Install script (detects OS/arch, verifies checksum):**
+
+```bash
+curl -sSL https://raw.githubusercontent.com/matrixorigin/Memoria/main/scripts/install.sh | bash
+# Or install a specific version:
+curl -sSL https://raw.githubusercontent.com/matrixorigin/Memoria/main/scripts/install.sh | bash -s -- -v v0.1.0-rc1
+```
+
+**Option B — Manual download** from [GitHub Releases](https://github.com/matrixorigin/Memoria/releases):
 
 ```bash
 # Linux (x86_64)
