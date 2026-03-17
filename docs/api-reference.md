@@ -213,6 +213,20 @@ POST /v1/memories/purge
 
 All fields are optional. Combine to narrow scope.
 
+Response:
+
+```json
+{
+  "purged": 2,
+  "snapshot_name": "mem_snap_pre_purge_a1b2c3d4",
+  "warning": null
+}
+```
+
+A safety snapshot is automatically created before purge. Use `POST /v1/snapshots/{snapshot_name}/rollback` to undo. `snapshot_name` and `warning` are omitted from the response when null.
+
+If snapshot quota is exhausted, the system auto-deletes the 10 oldest safety snapshots and retries. If still unable to create a snapshot, `warning` contains a message and `snapshot_name` is omitted — the purge still proceeds.
+
 ### Observe Turn
 
 ```
@@ -526,6 +540,25 @@ Per API key, sliding window.
 | `POST /v1/reflect` | 10/min |
 
 Exceeding the limit returns `429 Too Many Requests`.
+
+---
+
+## Audit Trail
+
+Every mutation (inject, correct, purge, governance) is logged to the `mem_edit_log` table with:
+
+| Column | Description |
+|--------|-------------|
+| `edit_id` | Unique ID |
+| `user_id` | User who performed the operation |
+| `operation` | `inject`, `correct`, `purge`, `governance:quarantine`, `governance:cleanup_stale`, `governance:archive_working`, `governance:compress_redundant`, `governance:cleanup_orphaned_incrementals` |
+| `target_ids` | JSON array of affected memory IDs |
+| `reason` | Human-readable reason |
+| `snapshot_before` | Safety snapshot name (purge operations only) |
+| `created_at` | Timestamp |
+| `created_by` | Same as user_id |
+
+Purge operations automatically create a safety snapshot (`mem_snap_pre_purge_*`) before deleting memories. This enables rollback via `POST /v1/snapshots/{name}/rollback`.
 
 ---
 

@@ -1956,6 +1956,7 @@ dependencies = [
  "chrono",
  "clap",
  "futures",
+ "memoria-api",
  "memoria-core",
  "memoria-embedding",
  "memoria-git",

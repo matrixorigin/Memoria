@@ -71,19 +71,48 @@ impl GovernanceScheduler {
         let mut total_quarantined = 0i64;
         let mut total_cleaned = 0i64;
 
+        // Global (non-per-user) tasks first
+        if task == "hourly" {
+            if let Err(e) = sql.cleanup_tool_results(72).await { error!("cleanup_tool_results: {e}"); }
+            match sql.archive_stale_working(24).await {
+                Ok(per_user) => {
+                    for (uid, count) in &per_user {
+                        sql.log_edit(uid, "governance:archive_working", &[], &format!("archived {count} stale working memories (>24h)"), None).await;
+                        total_cleaned += count;
+                    }
+                }
+                Err(e) => error!("archive_stale_working: {e}"),
+            }
+        }
+
         for (user_id,) in &users {
             match task {
                 "hourly" => {
-                    if let Err(e) = sql.cleanup_tool_results(72).await { error!("cleanup_tool_results: {e}"); }
-                    if let Err(e) = sql.archive_stale_working(24).await { error!("archive_stale_working: {e}"); }
                     let cleaned = sql.cleanup_stale(user_id).await.unwrap_or(0);
+                    if cleaned > 0 {
+                        sql.log_edit(user_id, "governance:cleanup_stale", &[], &format!("cleaned {cleaned}"), None).await;
+                    }
                     total_cleaned += cleaned;
                 }
                 "daily" => {
                     let quarantined = sql.quarantine_low_confidence(user_id).await.unwrap_or(0);
+                    if quarantined > 0 {
+                        sql.log_edit(user_id, "governance:quarantine", &[], &format!("quarantined {quarantined}"), None).await;
+                    }
                     let cleaned = sql.cleanup_stale(user_id).await.unwrap_or(0);
-                    if let Err(e) = sql.compress_redundant(user_id, 0.95, 30, 10_000).await { error!("compress_redundant: {e}"); }
-                    if let Err(e) = sql.cleanup_orphaned_incrementals(user_id, 24).await { error!("cleanup_orphaned_incrementals: {e}"); }
+                    if cleaned > 0 {
+                        sql.log_edit(user_id, "governance:cleanup_stale", &[], &format!("cleaned {cleaned}"), None).await;
+                    }
+                    match sql.compress_redundant(user_id, 0.95, 30, 10_000).await {
+                        Ok(n) if n > 0 => sql.log_edit(user_id, "governance:compress_redundant", &[], &format!("compressed {n}"), None).await,
+                        Err(e) => error!("compress_redundant: {e}"),
+                        _ => {}
+                    }
+                    match sql.cleanup_orphaned_incrementals(user_id, 24).await {
+                        Ok(n) if n > 0 => sql.log_edit(user_id, "governance:cleanup_orphaned_incrementals", &[], &format!("cleaned {n}"), None).await,
+                        Err(e) => error!("cleanup_orphaned_incrementals: {e}"),
+                        _ => {}
+                    }
                     total_quarantined += quarantined;
                     total_cleaned += cleaned;
                 }

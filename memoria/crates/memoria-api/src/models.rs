@@ -115,6 +115,10 @@ pub struct ListResponse {
 #[derive(Serialize)]
 pub struct PurgeResponse {
     pub purged: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snapshot_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
 }
 
 // ── Governance ────────────────────────────────────────────────────────────────

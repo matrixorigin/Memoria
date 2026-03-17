@@ -158,10 +158,10 @@ pub async fn correct_by_query(
 
 pub async fn delete_memory(
     State(state): State<AppState>,
-    AuthUser(_): AuthUser,
+    AuthUser(user_id): AuthUser,
     Path(id): Path<String>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    state.service.purge(&id).await.map_err(api_err)?;
+    let _ = state.service.purge(&user_id, &id).await.map_err(api_err)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -170,16 +170,15 @@ pub async fn purge_memories(
     AuthUser(user_id): AuthUser,
     Json(req): Json<PurgeRequest>,
 ) -> ApiResult<PurgeResponse> {
-    let mut purged = 0usize;
-    if let Some(ids) = &req.memory_ids {
-        for id in ids {
-            state.service.purge(id).await.map_err(api_err)?;
-            purged += 1;
-        }
+    let result = if let Some(ids) = &req.memory_ids {
+        let id_refs: Vec<&str> = ids.iter().map(|s| s.as_str()).collect();
+        state.service.purge_batch(&user_id, &id_refs).await.map_err(api_err)?
     } else if let Some(topic) = &req.topic {
-        purged = state.service.purge_by_topic(&user_id, topic).await.map_err(api_err)?;
-    }
-    Ok(Json(PurgeResponse { purged }))
+        state.service.purge_by_topic(&user_id, topic).await.map_err(api_err)?
+    } else {
+        memoria_service::PurgeResult { purged: 0, snapshot_name: None, warning: None }
+    };
+    Ok(Json(PurgeResponse { purged: result.purged, snapshot_name: result.snapshot_name, warning: result.warning }))
 }
 
 pub async fn get_profile(

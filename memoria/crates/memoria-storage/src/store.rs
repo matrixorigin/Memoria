@@ -183,6 +183,22 @@ impl SqlMemoryStore {
             )"#,
         ).execute(&self.pool).await.map_err(db_err)?;
 
+        // mem_edit_log — audit log for inject/correct/purge/governance operations
+        sqlx::query(
+            r#"CREATE TABLE IF NOT EXISTS mem_edit_log (
+                edit_id         VARCHAR(64)  PRIMARY KEY,
+                user_id         VARCHAR(64)  NOT NULL,
+                operation       VARCHAR(64)  NOT NULL,
+                target_ids      JSON         DEFAULT NULL,
+                reason          TEXT         DEFAULT NULL,
+                snapshot_before VARCHAR(64)  DEFAULT NULL,
+                created_at      DATETIME(6)  NOT NULL DEFAULT NOW(),
+                created_by      VARCHAR(64)  NOT NULL,
+                INDEX idx_edit_user (user_id),
+                INDEX idx_edit_operation (operation)
+            )"#,
+        ).execute(&self.pool).await.map_err(db_err)?;
+
         // Graph tables
         self.graph_store().migrate().await?;
 
@@ -230,6 +246,86 @@ impl SqlMemoryStore {
         }
 
         Ok(())
+    }
+
+    // ── Audit log ─────────────────────────────────────────────────────────────
+
+    /// Create a safety snapshot before destructive operations. Best-effort.
+    /// If creation fails (e.g. quota exhausted), tries to drop the 10 oldest
+    /// `pre_` safety snapshots and retries once.
+    /// Returns `(snapshot_name_or_none, warning_message_or_none)`.
+    pub async fn create_safety_snapshot(&self, operation: &str) -> (Option<String>, Option<String>) {
+        let name = format!("mem_snap_pre_{}_{}", operation, &uuid::Uuid::new_v4().simple().to_string()[..8]);
+        let sql = format!("CREATE SNAPSHOT {name} FOR ACCOUNT sys");
+
+        // First attempt
+        if sqlx::raw_sql(&sql).execute(&self.pool).await.is_ok() {
+            return (Some(name), None);
+        }
+
+        // Failed — try to reclaim space by dropping oldest pre_ snapshots
+        let dropped = self.cleanup_oldest_safety_snapshots(10).await;
+        if dropped > 0 {
+            // Retry
+            if sqlx::raw_sql(&sql).execute(&self.pool).await.is_ok() {
+                return (Some(name), Some(format!(
+                    "⚠️ Snapshot quota was full. Auto-deleted {dropped} oldest safety snapshots to make room. \
+                     Consider running memory_snapshot_delete(prefix=\"pre_\") to free more space."
+                )));
+            }
+        }
+
+        // Still failed
+        (None, Some(
+            "⚠️ Safety snapshot could not be created (snapshot quota exhausted). \
+             Purge proceeded without rollback protection. \
+             Run memory_snapshot_delete(prefix=\"pre_\") or memory_snapshot_delete(older_than=\"...\") to free quota."
+            .to_string()
+        ))
+    }
+
+    /// Drop the N oldest `mem_snap_pre_` snapshots. Returns count dropped.
+    async fn cleanup_oldest_safety_snapshots(&self, n: usize) -> usize {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT sname FROM mo_catalog.mo_snapshots \
+             WHERE prefix_eq(sname, 'mem_snap_pre_') ORDER BY ts ASC"
+        ).fetch_all(&self.pool).await.unwrap_or_default();
+
+        let mut dropped = 0;
+        for (name,) in rows.iter().take(n) {
+            if sqlx::raw_sql(&format!("DROP SNAPSHOT {name}"))
+                .execute(&self.pool).await.is_ok()
+            {
+                dropped += 1;
+            }
+        }
+        dropped
+    }
+
+    /// Write an audit record to mem_edit_log. Best-effort — never fails the caller.
+    pub async fn log_edit(
+        &self,
+        user_id: &str,
+        operation: &str,
+        target_ids: &[&str],
+        reason: &str,
+        snapshot_before: Option<&str>,
+    ) {
+        let tids = serde_json::to_string(target_ids).unwrap_or_else(|_| "[]".to_string());
+        let edit_id = uuid::Uuid::new_v4().simple().to_string();
+        let _ = sqlx::query(
+            "INSERT INTO mem_edit_log (edit_id, user_id, operation, target_ids, reason, snapshot_before, created_by) \
+             VALUES (?, ?, ?, ?, ?, ?, ?)"
+        )
+        .bind(&edit_id)
+        .bind(user_id)
+        .bind(operation)
+        .bind(&tids)
+        .bind(reason)
+        .bind(snapshot_before)
+        .bind(user_id)
+        .execute(&self.pool)
+        .await;
     }
 
     // ── Branch state ──────────────────────────────────────────────────────────
@@ -391,14 +487,32 @@ impl SqlMemoryStore {
     }
 
     /// Soft-delete working memories inactive for more than `stale_hours`.
-    pub async fn archive_stale_working(&self, stale_hours: i64) -> Result<i64, MemoriaError> {
-        let res = sqlx::query(
+    /// Returns per-user counts for audit logging.
+    pub async fn archive_stale_working(&self, stale_hours: i64) -> Result<Vec<(String, i64)>, MemoriaError> {
+        // Fetch affected user_ids before updating
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT user_id FROM mem_memories \
+             WHERE memory_type = 'working' AND is_active = 1 \
+               AND TIMESTAMPDIFF(HOUR, observed_at, NOW()) > ?"
+        )
+        .bind(stale_hours).fetch_all(&self.pool).await.map_err(db_err)?;
+
+        if rows.is_empty() {
+            return Ok(vec![]);
+        }
+
+        sqlx::query(
             "UPDATE mem_memories SET is_active = 0, updated_at = NOW() \
              WHERE memory_type = 'working' AND is_active = 1 \
                AND TIMESTAMPDIFF(HOUR, observed_at, NOW()) > ?"
         )
         .bind(stale_hours).execute(&self.pool).await.map_err(db_err)?;
-        Ok(res.rows_affected() as i64)
+
+        let mut by_user: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+        for (uid,) in rows {
+            *by_user.entry(uid).or_insert(0) += 1;
+        }
+        Ok(by_user.into_iter().collect())
     }
 
     /// Deactivate near-duplicate memories (same user, same type, cosine sim > threshold).

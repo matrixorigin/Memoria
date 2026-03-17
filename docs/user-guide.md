@@ -151,7 +151,7 @@ Once connected, your AI assistant can use these tools:
 | `memory_retrieve` | Retrieve relevant memories for a query |
 | `memory_search` | Semantic search over all memories |
 | `memory_correct` | Correct an existing memory (by ID or semantic search) |
-| `memory_purge` | Delete a memory or bulk-delete by topic |
+| `memory_purge` | Delete a memory or bulk-delete by topic. Auto-creates safety snapshot for rollback |
 | `memory_profile` | Get memory-derived profile summary |
 | `memory_snapshot` | Create a named snapshot |
 | `memory_snapshots` | List all snapshots |

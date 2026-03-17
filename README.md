@@ -233,7 +233,7 @@ Memoria exposes MCP tools that your AI tool calls automatically based on steerin
 | `memory_store` | Store a new memory |
 | `memory_retrieve` | Retrieve relevant memories for a query (call at conversation start) |
 | `memory_correct` | Update an existing memory with new content (by ID or semantic search) |
-| `memory_purge` | Delete by ID, comma-separated batch IDs, or bulk-delete by topic keyword |
+| `memory_purge` | Delete by ID, comma-separated batch IDs, or bulk-delete by topic keyword. Auto-creates safety snapshot for rollback |
 | `memory_search` | Semantic search across all memories |
 | `memory_profile` | Get user's memory-derived profile summary |
 

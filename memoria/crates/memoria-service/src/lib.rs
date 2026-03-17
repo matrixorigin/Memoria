@@ -6,6 +6,6 @@ pub mod strategy;
 pub use config::Config;
 pub use pipeline::{MemoryPipeline, PipelineResult};
 pub use scheduler::GovernanceScheduler;
-pub use service::{MemoryService, RetrievalExplain, ExplainLevel, CandidateScore};
+pub use service::{MemoryService, RetrievalExplain, ExplainLevel, CandidateScore, PurgeResult};
 pub use strategy::{RetrievalStrategy, StrategyRegistry};
 pub use memoria_core::MemoriaError;

@@ -318,19 +318,18 @@ pub async fn call(
             if !memory_id.is_empty() {
                 // Batch: comma-separated IDs
                 let ids: Vec<&str> = memory_id.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
-                let count = ids.len();
+                let result = service.purge_batch(user_id, &ids).await?;
                 for id in &ids {
-                    service.purge(id).await?;
                     // Graph sync: deactivate graph node (best-effort)
                     if let Some(sql) = &service.sql_store {
                         let _ = sql.graph_store().deactivate_by_memory_id(id).await;
                     }
                 }
-                Ok(mcp_text(&format!("Purged {count} memory(s)")))
+                Ok(mcp_text(&format_purge_msg(&format!("Purged {} memory(s)", result.purged), &result)))
             } else if !topic.is_empty() {
                 // Bulk by keyword: exact text match then purge
-                let count = service.purge_by_topic(user_id, topic).await?;
-                Ok(mcp_text(&format!("Purged {count} memory(s) matching '{topic}'")))
+                let result = service.purge_by_topic(user_id, topic).await?;
+                Ok(mcp_text(&format_purge_msg(&format!("Purged {} memory(s) matching '{topic}'", result.purged), &result)))
             } else {
                 Ok(mcp_text("Provide memory_id or topic"))
             }
@@ -773,6 +772,17 @@ pub async fn call(
 
 fn mcp_text(text: &str) -> Value {
     json!({"content": [{"type": "text", "text": text}]})
+}
+
+fn format_purge_msg(base: &str, result: &memoria_service::PurgeResult) -> String {
+    let mut msg = base.to_string();
+    if let Some(snap) = &result.snapshot_name {
+        msg.push_str(&format!("\nSafety snapshot: {snap} (use memory_rollback to undo)"));
+    }
+    if let Some(warning) = &result.warning {
+        msg.push_str(&format!("\n{warning}"));
+    }
+    msg
 }
 
 // ── Graph-based reflection helpers ───────────────────────────────────────────

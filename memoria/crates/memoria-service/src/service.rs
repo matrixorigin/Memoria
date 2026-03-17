@@ -75,6 +75,15 @@ pub struct RetrievalExplain {
     pub candidate_scores: Vec<CandidateScore>,
 }
 
+/// Result of a purge operation.
+pub struct PurgeResult {
+    pub purged: usize,
+    /// Safety snapshot created before purge. None if snapshot creation failed.
+    pub snapshot_name: Option<String>,
+    /// Warning message if snapshot creation had issues (quota full, auto-cleanup, etc.)
+    pub warning: Option<String>,
+}
+
 pub struct MemoryService {
     /// Trait-based store for generic ops (used by tests with MockStore)
     pub store: Arc<dyn MemoryStore>,
@@ -184,6 +193,7 @@ impl MemoryService {
                     if old_content.trim() != memory.content.trim() {
                         sql.insert_into(&table, &memory).await?;
                         sql.supersede_memory(&table, &old_id, &memory.memory_id).await?;
+                        sql.log_edit(user_id, "inject", &[memory.memory_id.as_str()], "store_memory:supersede", None).await;
                         return Ok(memory);
                     }
                     // Same content — skip storing duplicate
@@ -191,6 +201,7 @@ impl MemoryService {
                 }
             }
             sql.insert_into(&table, &memory).await?;
+            sql.log_edit(user_id, "inject", &[memory.memory_id.as_str()], "store_memory", None).await;
         } else {
             self.store.insert(&memory).await?;
         }
@@ -497,29 +508,57 @@ impl MemoryService {
 
         // Deactivate old and link to new via superseded_by
         self.store.soft_delete(memory_id).await?;
+        let user_id = old.user_id.clone();
         let mut old_updated = old;
         old_updated.superseded_by = Some(new_mem.memory_id.clone());
         self.store.update(&old_updated).await?;
 
+        if let Some(sql) = &self.sql_store {
+            sql.log_edit(&user_id, "correct", &[memory_id, new_mem.memory_id.as_str()], "", None).await;
+        }
+
         Ok(new_mem)
     }
 
-    pub async fn purge(&self, memory_id: &str) -> Result<(), MemoriaError> {
-        self.store.soft_delete(memory_id).await
+    pub async fn purge(&self, user_id: &str, memory_id: &str) -> Result<PurgeResult, MemoriaError> {
+        let (snap, warning) = if let Some(sql) = &self.sql_store {
+            let (s, w) = sql.create_safety_snapshot("purge").await;
+            sql.log_edit(user_id, "purge", &[memory_id], "", s.as_deref()).await;
+            (s, w)
+        } else { (None, None) };
+        self.store.soft_delete(memory_id).await?;
+        Ok(PurgeResult { purged: 1, snapshot_name: snap, warning })
+    }
+
+    /// Purge multiple memories by IDs with a single audit log entry.
+    pub async fn purge_batch(&self, user_id: &str, ids: &[&str]) -> Result<PurgeResult, MemoriaError> {
+        let (snap, warning) = if let Some(sql) = &self.sql_store {
+            sql.create_safety_snapshot("purge").await
+        } else { (None, None) };
+        for id in ids {
+            self.store.soft_delete(id).await?;
+        }
+        if let Some(sql) = &self.sql_store {
+            sql.log_edit(user_id, "purge", ids, "", snap.as_deref()).await;
+        }
+        Ok(PurgeResult { purged: ids.len(), snapshot_name: snap, warning })
     }
 
     /// Purge memories whose content contains `topic` (exact text match).
-    pub async fn purge_by_topic(&self, user_id: &str, topic: &str) -> Result<usize, MemoriaError> {
+    pub async fn purge_by_topic(&self, user_id: &str, topic: &str) -> Result<PurgeResult, MemoriaError> {
         if let Some(sql) = &self.sql_store {
+            let (snap, warning) = sql.create_safety_snapshot("purge").await;
             let table = sql.active_table(user_id).await?;
             let ids = sql.find_ids_by_topic(&table, user_id, topic).await?;
             for id in &ids {
                 self.store.soft_delete(id).await?;
                 let _ = sql.graph_store().deactivate_by_memory_id(id).await;
             }
-            Ok(ids.len())
+            let id_refs: Vec<&str> = ids.iter().map(|s| s.as_str()).collect();
+            sql.log_edit(user_id, "purge", &id_refs, &format!("topic:{topic}"), snap.as_deref()).await;
+            Ok(PurgeResult { purged: ids.len(), snapshot_name: snap, warning })
         } else {
-            Ok(0)
+            Ok(PurgeResult { purged: 0, snapshot_name: None, warning: None })
         }
     }
 
@@ -602,6 +641,10 @@ impl MemoryService {
                 self.store.insert(&memory).await?;
             }
             results.push(memory);
+        }
+        if let Some(sql) = &self.sql_store {
+            let ids: Vec<&str> = results.iter().map(|m| m.memory_id.as_str()).collect();
+            sql.log_edit(user_id, "inject", &ids, "store_batch", None).await;
         }
         Ok(results)
     }

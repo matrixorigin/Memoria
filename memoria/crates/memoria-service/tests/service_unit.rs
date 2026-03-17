@@ -106,7 +106,7 @@ async fn test_correct() {
 async fn test_purge() {
     let svc = make_service();
     let m = svc.store_memory("u1", "to delete", MemoryType::Working, None, None, None, None).await.unwrap();
-    svc.purge(&m.memory_id).await.unwrap();
+    svc.purge("u1", &m.memory_id).await.unwrap();
     let got = svc.get(&m.memory_id).await.unwrap();
     assert!(got.is_none());
     println!("✅ purge");
@@ -117,7 +117,7 @@ async fn test_list_active_excludes_deleted() {
     let svc = make_service();
     svc.store_memory("u1", "keep this", MemoryType::Semantic, None, None, None, None).await.unwrap();
     let del = svc.store_memory("u1", "delete this", MemoryType::Working, None, None, None, None).await.unwrap();
-    svc.purge(&del.memory_id).await.unwrap();
+    svc.purge("u1", &del.memory_id).await.unwrap();
 
     let list = svc.list_active("u1", 10).await.unwrap();
     assert_eq!(list.len(), 1);

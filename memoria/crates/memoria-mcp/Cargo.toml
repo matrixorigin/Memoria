@@ -33,6 +33,10 @@ async-trait = { workspace = true }
 memoria-core = { workspace = true }
 memoria-storage = { workspace = true }
 memoria-embedding = { workspace = true }
+memoria-api = { path = "../memoria-api" }
 serde_json = { workspace = true }
 uuid = { workspace = true }
+sqlx = { workspace = true }
+reqwest = { workspace = true }
+axum = { workspace = true }
 serial_test = "3.4.0"

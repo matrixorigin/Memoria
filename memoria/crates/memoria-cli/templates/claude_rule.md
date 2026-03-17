@@ -71,6 +71,8 @@ Before storing a new memory, consider:
 | `memory_correct` | User says a stored memory is wrong | `memory_id` or `query` (one required), `new_content`, `reason` |
 | `memory_purge` | User asks to forget something | `memory_id` (single or comma-separated batch, e.g. `"id1,id2"`) or `topic` (bulk keyword match), `reason` |
 
+`memory_purge` automatically creates a safety snapshot before deleting. The response includes the snapshot name — tell the user they can `memory_rollback` to undo. If the response contains a ⚠️ warning about snapshot quota, relay it and suggest `memory_snapshot_delete(prefix="pre_")`.
+
 ### Read tools
 | Tool | When to use | Key params |
 |------|-------------|------------|

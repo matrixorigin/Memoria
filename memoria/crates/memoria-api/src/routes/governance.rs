@@ -20,6 +20,12 @@ pub async fn governance(
     }
     let quarantined = sql.quarantine_low_confidence(&user_id).await.map_err(api_err)?;
     let cleaned = sql.cleanup_stale(&user_id).await.map_err(api_err)?;
+    if quarantined > 0 {
+        sql.log_edit(&user_id, "governance:quarantine", &[], &format!("quarantined {quarantined}"), None).await;
+    }
+    if cleaned > 0 {
+        sql.log_edit(&user_id, "governance:cleanup_stale", &[], &format!("cleaned {cleaned}"), None).await;
+    }
     sql.set_cooldown(&user_id, "governance").await.map_err(api_err)?;
     Ok(Json(json!({ "quarantined": quarantined, "cleaned_stale": cleaned })))
 }
