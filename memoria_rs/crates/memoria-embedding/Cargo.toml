@@ -15,4 +15,5 @@ serde_json = { workspace = true }
 async-trait = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
+tokio = { workspace = true }
 fastembed = { version = "5", optional = true }

@@ -1,5 +1,6 @@
 use axum::{extract::State, http::StatusCode, Json};
 use serde_json::json;
+use tracing::warn;
 
 use crate::{auth::AuthUser, models::*, routes::memory::api_err, state::AppState};
 
@@ -96,13 +97,13 @@ pub async fn reflect(
         let prompt = memoria_mcp::tools::reflection_prompt(&experiences, "");
         let msgs = vec![memoria_embedding::ChatMessage { role: "user".to_string(), content: prompt }];
         let raw = match llm.chat(&msgs, 0.3, Some(400)).await {
-            Ok(r) => r, Err(_) => continue,
+            Ok(r) => r, Err(e) => { warn!("reflect LLM chat failed: {e}"); continue },
         };
         let start = raw.find('[').unwrap_or(raw.len());
         let end = raw.rfind(']').map(|i| i + 1).unwrap_or(raw.len());
         if start >= end { continue; }
         let items: Vec<serde_json::Value> = match serde_json::from_str(&raw[start..end]) {
-            Ok(v) => v, Err(_) => continue,
+            Ok(v) => v, Err(e) => { warn!("reflect LLM response parse failed: {e}"); continue },
         };
         for item in &items {
             let content = item["content"].as_str().unwrap_or("").trim().to_string();
@@ -151,11 +152,11 @@ pub async fn extract_entities(
     for (memory_id, content) in &unlinked {
         let prompt = memoria_mcp::tools::entity_extract_prompt(content);
         let msgs = vec![memoria_embedding::ChatMessage { role: "user".to_string(), content: prompt }];
-        let raw = match llm.chat(&msgs, 0.0, Some(300)).await { Ok(r) => r, Err(_) => continue };
+        let raw = match llm.chat(&msgs, 0.0, Some(300)).await { Ok(r) => r, Err(e) => { warn!("entity extract LLM failed: {e}"); continue } };
         let start = raw.find('[').unwrap_or(raw.len());
         let end = raw.rfind(']').map(|i| i + 1).unwrap_or(raw.len());
         if start >= end { continue; }
-        let items: Vec<serde_json::Value> = match serde_json::from_str(&raw[start..end]) { Ok(v) => v, Err(_) => continue };
+        let items: Vec<serde_json::Value> = match serde_json::from_str(&raw[start..end]) { Ok(v) => v, Err(e) => { warn!("entity extract parse failed: {e}"); continue } };
         for item in &items {
             let name = item["name"].as_str().unwrap_or("").trim().to_lowercase();
             if name.is_empty() { continue; }

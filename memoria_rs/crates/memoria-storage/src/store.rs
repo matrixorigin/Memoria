@@ -107,7 +107,7 @@ impl SqlMemoryStore {
                 observed_at     DATETIME(6)  NOT NULL,
                 created_at      DATETIME(6)  NOT NULL,
                 updated_at      DATETIME(6),
-                INDEX idx_user_active (user_id, is_active),
+                INDEX idx_user_active (user_id, is_active, memory_type),
                 INDEX idx_user_session (user_id, session_id),
                 FULLTEXT INDEX ft_content (content) WITH PARSER ngram -- MO#23861: breaks on concurrent snapshot restore
             )"#,
@@ -173,6 +173,19 @@ impl SqlMemoryStore {
 
         // Graph tables
         self.graph_store().migrate().await?;
+
+        // Migrate idx_user_active to include memory_type (idempotent)
+        let needs_upgrade: bool = sqlx::query_scalar(
+            "SELECT COUNT(*) = 0 FROM information_schema.statistics \
+             WHERE table_schema = DATABASE() AND table_name = 'mem_memories' \
+             AND index_name = 'idx_user_active' AND column_name = 'memory_type'"
+        ).fetch_one(&self.pool).await.unwrap_or(false);
+        if needs_upgrade {
+            let _ = sqlx::query("ALTER TABLE mem_memories DROP INDEX idx_user_active")
+                .execute(&self.pool).await;
+            let _ = sqlx::query("ALTER TABLE mem_memories ADD INDEX idx_user_active (user_id, is_active, memory_type)")
+                .execute(&self.pool).await;
+        }
 
         Ok(())
     }
@@ -691,19 +704,34 @@ impl SqlMemoryStore {
         &self, table: &str, user_id: &str, embedding: &[f32],
         memory_type: &str, exclude_id: &str, l2_threshold: f64,
     ) -> Result<Option<(String, String, f64)>, MemoriaError> {
+        // Same-type first, then cross-type fallback
+        if let Some(hit) = self.find_near_duplicate_inner(table, user_id, embedding, Some(memory_type), exclude_id, l2_threshold).await? {
+            return Ok(Some(hit));
+        }
+        self.find_near_duplicate_inner(table, user_id, embedding, None, exclude_id, l2_threshold).await
+    }
+
+    async fn find_near_duplicate_inner(
+        &self, table: &str, user_id: &str, embedding: &[f32],
+        memory_type: Option<&str>, exclude_id: &str, l2_threshold: f64,
+    ) -> Result<Option<(String, String, f64)>, MemoriaError> {
         let vec_literal = vec_to_mo(embedding);
+        let type_filter = match memory_type {
+            Some(_) => "AND memory_type = ? ",
+            None => "",
+        };
         let sql = format!(
             "SELECT memory_id, content, \
              l2_distance(embedding, '{vec_literal}') AS l2_dist \
              FROM {table} \
-             WHERE user_id = ? AND is_active = 1 AND memory_type = ? \
+             WHERE user_id = ? AND is_active = 1 {type_filter}\
                AND embedding IS NOT NULL AND vector_dims(embedding) > 0 \
                AND memory_id != ? \
              ORDER BY l2_dist ASC LIMIT 1"
         );
-        let row = sqlx::query(&sql)
-            .bind(user_id).bind(memory_type).bind(exclude_id)
-            .fetch_optional(&self.pool).await.map_err(db_err)?;
+        let mut q = sqlx::query(&sql).bind(user_id);
+        if let Some(mt) = memory_type { q = q.bind(mt); }
+        let row = q.bind(exclude_id).fetch_optional(&self.pool).await.map_err(db_err)?;
         if let Some(r) = row {
             let dist: f64 = r.try_get::<f64, _>("l2_dist")
                 .or_else(|_| r.try_get::<f32, _>("l2_dist").map(|v| v as f64))

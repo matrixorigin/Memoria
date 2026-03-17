@@ -76,9 +76,15 @@ impl GitForDataService {
             .await
             .map_err(db_err)?;
         rows.iter().map(|r| {
-            let ts_str: Option<String> = r.try_get("TIMESTAMP").ok();
-            let timestamp = ts_str.as_deref()
-                .and_then(|s| NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f").ok());
+            // Try NaiveDateTime directly first, then fall back to string parsing
+            let timestamp = r.try_get::<NaiveDateTime, _>("TIMESTAMP").ok()
+                .or_else(|| {
+                    r.try_get::<String, _>("TIMESTAMP").ok()
+                        .and_then(|s| {
+                            NaiveDateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S%.f").ok()
+                                .or_else(|| NaiveDateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S").ok())
+                        })
+                });
             Ok(Snapshot {
                 snapshot_name: r.try_get("SNAPSHOT_NAME").map_err(db_err)?,
                 timestamp,

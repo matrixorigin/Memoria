@@ -54,7 +54,11 @@ impl LlmClient {
 
     /// Create from explicit config values.
     pub fn new(api_key: String, base_url: String, model: String) -> Self {
-        Self { api_key, base_url, model, client: reqwest::Client::new() }
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(60))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+        Self { api_key, base_url, model, client }
     }
 
     pub fn model(&self) -> &str { &self.model }
