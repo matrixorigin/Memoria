@@ -103,20 +103,20 @@ rebuild-api: check-env
 # ── Local dev ───────────────────────────────────────────────────────
 
 dev: check-env
-	@cd memoria_rs && RUST_LOG=$${RUST_LOG:-info} DATABASE_URL=$(DB_URL) SQLX_OFFLINE=true cargo run -p memoria-api
+	@cd memoria && RUST_LOG=$${RUST_LOG:-info} DATABASE_URL=$(DB_URL) SQLX_OFFLINE=true cargo run -p memoria-api
 
 build:
 	@echo "Building release binaries..."
-	@cd memoria_rs && SQLX_OFFLINE=true cargo build --release
-	@echo "Binaries: memoria_rs/target/release/{memoria-api,memoria-mcp-rs,memoria-rs}"
+	@cd memoria && SQLX_OFFLINE=true cargo build --release
+	@echo "Binaries: memoria/target/release/{memoria-api,memoria-mcp-rs,memoria-rs}"
 
 check:
-	@cd memoria_rs && cargo check && cargo clippy -- -D warnings 2>/dev/null || cargo check
+	@cd memoria && cargo check && cargo clippy -- -D warnings 2>/dev/null || cargo check
 
 # ── Tests ───────────────────────────────────────────────────────────
 
 test:
-	@cd memoria_rs && DATABASE_URL=$(TEST_DB_URL) SQLX_OFFLINE=true \
+	@cd memoria && DATABASE_URL=$(TEST_DB_URL) SQLX_OFFLINE=true \
 		EMBEDDING_API_KEY=$${MEMORIA_EMBEDDING_API_KEY:-} \
 		EMBEDDING_BASE_URL=$${MEMORIA_EMBEDDING_BASE_URL:-} \
 		EMBEDDING_MODEL=$${MEMORIA_EMBEDDING_MODEL:-BAAI/bge-m3} \
@@ -127,13 +127,13 @@ test:
 		cargo test -- --test-threads=1
 
 test-unit:
-	@cd memoria_rs && SQLX_OFFLINE=true cargo test --lib -p memoria-core -p memoria-service -p memoria-mcp
+	@cd memoria && SQLX_OFFLINE=true cargo test --lib -p memoria-core -p memoria-service -p memoria-mcp
 
 test-integration:
-	@cd memoria_rs && DATABASE_URL=$(TEST_DB_URL) SQLX_OFFLINE=true cargo test -p memoria-storage -- --test-threads=1
+	@cd memoria && DATABASE_URL=$(TEST_DB_URL) SQLX_OFFLINE=true cargo test -p memoria-storage -- --test-threads=1
 
 test-e2e:
-	@cd memoria_rs && DATABASE_URL=$(TEST_DB_URL) SQLX_OFFLINE=true \
+	@cd memoria && DATABASE_URL=$(TEST_DB_URL) SQLX_OFFLINE=true \
 		EMBEDDING_API_KEY=$${MEMORIA_EMBEDDING_API_KEY:-} \
 		EMBEDDING_BASE_URL=$${MEMORIA_EMBEDDING_BASE_URL:-} \
 		EMBEDDING_MODEL=$${MEMORIA_EMBEDDING_MODEL:-BAAI/bge-m3} \
@@ -149,7 +149,7 @@ BENCH_URL   ?= http://localhost:$${API_PORT:-8100}
 BENCH_TOKEN ?= $${MEMORIA_MASTER_KEY:-test-master-key-for-docker-compose}
 
 bench: check-env
-	@cd memoria_rs && SQLX_OFFLINE=true cargo run -p memoria-cli -- benchmark \
+	@cd memoria && SQLX_OFFLINE=true cargo run -p memoria-cli -- benchmark \
 		--api-url "$(BENCH_URL)" --token "$(BENCH_TOKEN)"
 
 # ── API Keys ────────────────────────────────────────────────────────
@@ -189,7 +189,7 @@ revoke-keys: check-env
 clean:
 	@docker compose down
 	@rm -rf data/
-	@cd memoria_rs && cargo clean
+	@cd memoria && cargo clean
 	@echo "All cleaned"
 
 reset: check-env

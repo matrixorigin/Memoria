@@ -29,11 +29,11 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: memoria_rs
+          workspaces: memoria
       - name: Check
-        run: cd memoria_rs && cargo check
+        run: cd memoria && cargo check
       - name: Clippy
-        run: cd memoria_rs && cargo clippy -- -D warnings
+        run: cd memoria && cargo clippy -- -D warnings
 
   test-unit:
     name: Unit Tests
@@ -43,9 +43,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: memoria_rs
+          workspaces: memoria
       - name: Unit tests
-        run: cd memoria_rs && cargo test --lib -p memoria-core -p memoria-service -p memoria-mcp
+        run: cd memoria && cargo test --lib -p memoria-core -p memoria-service -p memoria-mcp
 
   test-db:
     name: DB Tests
@@ -62,7 +62,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: memoria_rs
+          workspaces: memoria
       - name: Wait for MatrixOne
         run: |
           for i in $(seq 1 30); do
@@ -70,4 +70,4 @@ jobs:
             echo "Waiting... ($i/30)" && sleep 3
           done
       - name: All tests
-        run: cd memoria_rs && cargo test -- --test-threads=1
+        run: cd memoria && cargo test -- --test-threads=1

@@ -35,7 +35,7 @@ jobs:
           sudo apt-get install -y gcc-aarch64-linux-gnu
 
       - name: Build
-        working-directory: memoria_rs
+        working-directory: memoria
         env:
           SQLX_OFFLINE: "true"
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
@@ -45,7 +45,7 @@ jobs:
         run: |
           mkdir -p dist
           for bin in memoria-api memoria-mcp-rs memoria-rs; do
-            cp memoria_rs/target/${{ matrix.target }}/release/$bin dist/ 2>/dev/null || true
+            cp memoria/target/${{ matrix.target }}/release/$bin dist/ 2>/dev/null || true
           done
           cd dist && tar czf ../memoria-${{ matrix.target }}.tar.gz *
 

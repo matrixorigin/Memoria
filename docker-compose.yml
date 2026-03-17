@@ -41,7 +41,7 @@ services:
   api:
     build:
       context: .
-      dockerfile: memoria_rs/Dockerfile
+      dockerfile: memoria/Dockerfile
     hostname: memoria-api
     ports:
       - "${API_PORT:-8100}:8100"

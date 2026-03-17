@@ -21,8 +21,8 @@ benchmark-*.html
 CLAUDE.md
 
 # Rust
-memoria_rs/target/
-memoria_rs/.env
+memoria/target/
+memoria/.env
 
 # Python (legacy)
 __pycache__/
