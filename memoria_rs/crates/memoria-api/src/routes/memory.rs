@@ -201,42 +201,27 @@ pub struct ObserveRequest {
 }
 
 /// Extract and store memories from a conversation turn.
-/// Without LLM: stores each non-empty assistant message as a semantic memory.
-/// With LLM: (future) extract facts from the conversation.
+/// With LLM: uses structured extraction (type, content, confidence).
+/// Without LLM: stores each non-empty assistant/user message as a semantic memory.
 pub async fn observe_turn(
     State(state): State<AppState>,
     AuthUser(user_id): AuthUser,
     Json(req): Json<ObserveRequest>,
 ) -> ApiResult<serde_json::Value> {
-    let mut stored = Vec::new();
-    let mut warning: Option<&str> = None;
+    let (memories, has_llm) = state.service
+        .observe_turn(&user_id, &req.messages, req.session_id)
+        .await
+        .map_err(api_err)?;
 
-    if state.service.llm.is_none() {
-        warning = Some("LLM not configured — storing assistant messages as-is");
-    }
-
-    for msg in &req.messages {
-        let role = msg["role"].as_str().unwrap_or("");
-        let content = msg["content"].as_str().unwrap_or("").trim();
-        if content.is_empty() { continue; }
-        // Store assistant messages as semantic memories
-        if role == "assistant" || role == "user" {
-            let m = state.service.store_memory(
-                &user_id, content,
-                memoria_core::MemoryType::Semantic,
-                req.session_id.clone(), None, None, None,
-            ).await.map_err(api_err)?;
-            stored.push(serde_json::json!({
-                "memory_id": m.memory_id,
-                "content": m.content,
-                "memory_type": m.memory_type.to_string(),
-            }));
-        }
-    }
+    let stored: Vec<_> = memories.iter().map(|m| serde_json::json!({
+        "memory_id": m.memory_id,
+        "content": m.content,
+        "memory_type": m.memory_type.to_string(),
+    })).collect();
 
     let mut result = serde_json::json!({ "memories": stored });
-    if let Some(w) = warning {
-        result["warning"] = serde_json::json!(w);
+    if !has_llm {
+        result["warning"] = serde_json::json!("LLM not configured — storing messages as-is");
     }
     Ok(Json(result))
 }

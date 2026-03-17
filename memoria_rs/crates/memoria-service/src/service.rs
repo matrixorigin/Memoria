@@ -3,11 +3,13 @@ use memoria_core::{
     interfaces::{EmbeddingProvider, MemoryStore},
     Memory, MemoriaError, MemoryType, TrustTier,
 };
+use memoria_embedding::llm::ChatMessage;
 use memoria_embedding::LlmClient;
 use memoria_storage::SqlMemoryStore;
 use std::sync::Arc;
 use uuid::Uuid;
 use chrono::{DateTime, Utc};
+use tracing::{info, warn};
 
 #[inline]
 fn round4(v: f64) -> f64 { (v * 10000.0).round() / 10000.0 }
@@ -122,6 +124,7 @@ impl MemoryService {
         }
     }
 
+    #[tracing::instrument(skip(self, content), fields(user_id))]
     pub async fn store_memory(
         &self,
         user_id: &str,
@@ -252,6 +255,7 @@ impl MemoryService {
         self.retrieve_inner(user_id, query, top_k, level).await
     }
 
+    #[tracing::instrument(skip(self), fields(user_id, top_k))]
     async fn retrieve_inner(&self, user_id: &str, query: &str, top_k: i64, level: ExplainLevel) -> Result<(Vec<Memory>, RetrievalExplain), MemoriaError> {
         let total_start = std::time::Instant::now();
         let mut explain = RetrievalExplain { level, ..Default::default() };
@@ -576,4 +580,245 @@ impl MemoryService {
         }
         Ok(results)
     }
+
+    // ── TypedObserver: LLM-based memory extraction ──────────────────────────
+
+    /// Extract and persist memories from a conversation turn.
+    /// When LLM is configured, uses structured extraction (type, content, confidence).
+    /// Falls back to storing raw assistant/user messages as semantic memories.
+    pub async fn observe_turn(
+        &self,
+        user_id: &str,
+        messages: &[serde_json::Value],
+        session_id: Option<String>,
+    ) -> Result<(Vec<Memory>, bool), MemoriaError> {
+        let has_llm = self.llm.is_some();
+
+        let candidates = if let Some(llm) = &self.llm {
+            match self.extract_via_llm(llm, messages).await {
+                Ok(ref items) if !items.is_empty() => {
+                    info!(count = items.len(), "LLM extracted memory candidates");
+                    self.build_candidates(user_id, items, session_id.clone()).await
+                }
+                Ok(_) => vec![],
+                Err(e) => {
+                    warn!(error = %e, "LLM extraction failed, falling back to raw storage");
+                    self.raw_candidates(user_id, messages, session_id.clone())
+                }
+            }
+        } else {
+            self.raw_candidates(user_id, messages, session_id.clone())
+        };
+
+        let mut stored = Vec::with_capacity(candidates.len());
+        for mem in candidates {
+            match self.persist_with_dedup(user_id, mem).await {
+                Ok(m) => stored.push(m),
+                Err(MemoriaError::Blocked(_)) => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        info!(user_id, count = stored.len(), llm = has_llm, "observe_turn complete");
+        Ok((stored, has_llm))
+    }
+
+    /// Build Memory objects from LLM-extracted items.
+    async fn build_candidates(
+        &self,
+        user_id: &str,
+        items: &[serde_json::Value],
+        session_id: Option<String>,
+    ) -> Vec<Memory> {
+        let now = Utc::now();
+        let mut result = Vec::new();
+        for item in items {
+            let content = match item["content"].as_str() {
+                Some(s) if !s.trim().is_empty() => s.trim(),
+                _ => continue,
+            };
+            let sensitivity = check_sensitivity(content);
+            if sensitivity.blocked { continue; }
+            let content = sensitivity.redacted_content.as_deref().unwrap_or(content);
+
+            let mtype = match item["type"].as_str().unwrap_or("semantic") {
+                "profile" => MemoryType::Profile,
+                "procedural" => MemoryType::Procedural,
+                "episodic" => MemoryType::Episodic,
+                _ => MemoryType::Semantic,
+            };
+            let confidence = item["confidence"].as_f64()
+                .map(|c| c.clamp(0.0, 1.0))
+                .unwrap_or(0.7);
+
+            result.push(Memory {
+                memory_id: Uuid::new_v4().simple().to_string(),
+                user_id: user_id.to_string(),
+                memory_type: mtype,
+                content: content.to_string(),
+                initial_confidence: confidence,
+                embedding: self.embed(content).await,
+                source_event_ids: vec![],
+                superseded_by: None,
+                is_active: true,
+                access_count: 0,
+                session_id: session_id.clone(),
+                observed_at: Some(now),
+                created_at: None,
+                updated_at: None,
+                extra_metadata: None,
+                trust_tier: TrustTier::T3Inferred,
+                retrieval_score: None,
+            });
+        }
+        result
+    }
+
+    /// Fallback: store raw assistant/user messages as semantic memories.
+    fn raw_candidates(
+        &self,
+        user_id: &str,
+        messages: &[serde_json::Value],
+        session_id: Option<String>,
+    ) -> Vec<Memory> {
+        let now = Utc::now();
+        messages.iter().enumerate().filter_map(|(i, msg)| {
+            let role = msg["role"].as_str().unwrap_or("");
+            let content = msg["content"].as_str().unwrap_or("").trim();
+            if content.is_empty() || (role != "assistant" && role != "user") {
+                return None;
+            }
+            Some(Memory {
+                memory_id: Uuid::new_v4().simple().to_string(),
+                user_id: user_id.to_string(),
+                memory_type: MemoryType::Semantic,
+                content: content.to_string(),
+                initial_confidence: 0.7,
+                embedding: None, // will be embedded in persist_with_dedup
+                source_event_ids: vec![],
+                superseded_by: None,
+                is_active: true,
+                access_count: 0,
+                session_id: session_id.clone(),
+                observed_at: Some(now + chrono::Duration::milliseconds(i as i64)),
+                created_at: None,
+                updated_at: None,
+                extra_metadata: None,
+                trust_tier: TrustTier::T1Verified,
+                retrieval_score: None,
+            })
+        }).collect()
+    }
+
+    /// Persist a memory with dedup (near-duplicate detection + supersede).
+    async fn persist_with_dedup(&self, user_id: &str, mut mem: Memory) -> Result<Memory, MemoriaError> {
+        let sensitivity = check_sensitivity(&mem.content);
+        if sensitivity.blocked {
+            return Err(MemoriaError::Blocked("blocked by sensitivity filter".into()));
+        }
+        if let Some(redacted) = &sensitivity.redacted_content {
+            mem.content = redacted.clone();
+        }
+        if mem.embedding.is_none() {
+            mem.embedding = self.embed(&mem.content).await;
+        }
+
+        if let Some(sql) = &self.sql_store {
+            let table = sql.active_table(user_id).await?;
+            if let Some(ref emb) = mem.embedding {
+                let l2_threshold = 0.3162;
+                let mtype = mem.memory_type.to_string();
+                if let Ok(Some((old_id, old_content, _))) = sql
+                    .find_near_duplicate(&table, user_id, emb, &mtype, &mem.memory_id, l2_threshold)
+                    .await
+                {
+                    if old_content.trim() != mem.content.trim() {
+                        sql.insert_into(&table, &mem).await?;
+                        sql.supersede_memory(&table, &old_id, &mem.memory_id).await?;
+                        info!(old_id, new_id = %mem.memory_id, "superseded near-duplicate");
+                        return Ok(mem);
+                    }
+                    return Ok(mem); // exact dup — skip
+                }
+            }
+            sql.insert_into(&table, &mem).await?;
+        } else {
+            self.store.insert(&mem).await?;
+        }
+        Ok(mem)
+    }
+
+    const MAX_EXTRACT_MESSAGES: usize = 20;
+    const MAX_EXTRACT_CHARS: usize = 6000;
+
+    async fn extract_via_llm(
+        &self,
+        llm: &LlmClient,
+        messages: &[serde_json::Value],
+    ) -> Result<Vec<serde_json::Value>, MemoriaError> {
+        let recent = if messages.len() > Self::MAX_EXTRACT_MESSAGES {
+            &messages[messages.len() - Self::MAX_EXTRACT_MESSAGES..]
+        } else {
+            messages
+        };
+        let mut conv_text = String::new();
+        for m in recent {
+            let role = m["role"].as_str().unwrap_or("unknown");
+            let content = m["content"].as_str().unwrap_or("");
+            let truncated: String = content.chars().take(500).collect();
+            if !truncated.is_empty() {
+                conv_text.push_str(&format!("[{role}]: {truncated}\n"));
+            }
+        }
+        // Trim to last MAX_EXTRACT_CHARS
+        if conv_text.len() > Self::MAX_EXTRACT_CHARS {
+            let start = conv_text.len() - Self::MAX_EXTRACT_CHARS;
+            conv_text = conv_text[start..].to_string();
+        }
+
+        let result = llm.chat(
+            &[
+                ChatMessage { role: "system".into(), content: OBSERVER_EXTRACTION_PROMPT.into() },
+                ChatMessage { role: "user".into(), content: conv_text },
+            ],
+            0.0,
+            Some(2048),
+        ).await.map_err(|e| MemoriaError::Internal(format!("LLM extraction: {e}")))?;
+
+        parse_json_array(&result)
+    }
 }
+
+/// Parse a JSON array from LLM output, tolerating markdown fences.
+fn parse_json_array(s: &str) -> Result<Vec<serde_json::Value>, MemoriaError> {
+    let trimmed = s.trim();
+    // Strip markdown code fences
+    let json_str = if trimmed.starts_with("```") {
+        let inner = trimmed.trim_start_matches("```json").trim_start_matches("```");
+        inner.trim_end_matches("```").trim()
+    } else {
+        trimmed
+    };
+    let arr: Vec<serde_json::Value> = serde_json::from_str(json_str)?;
+    Ok(arr)
+}
+
+const OBSERVER_EXTRACTION_PROMPT: &str = r#"Extract structured memories from this conversation turn.
+Return a JSON array ONLY, no other text. Each item:
+{"type": "profile|semantic|procedural|episodic",
+ "content": "concise factual statement",
+ "confidence": 0.0-1.0}
+
+Types (choose the MOST SPECIFIC type):
+- profile: user identity, preferences, environment, habits, tools, language, role.
+- semantic: general knowledge or facts NOT about the user themselves.
+- procedural: repeated action patterns the user follows.
+- episodic: what the user DID or ASKED ABOUT — activities, tasks, topics explored.
+
+Confidence guide:
+- 1.0: user explicitly stated
+- 0.7: strongly implied by context
+- 0.4: weakly inferred
+
+Do NOT extract: greetings, pure meta-conversation.
+If nothing worth remembering, return [].
+"#;

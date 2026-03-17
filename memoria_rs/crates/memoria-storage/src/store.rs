@@ -654,6 +654,7 @@ impl SqlMemoryStore {
         Ok(())
     }
 
+    #[tracing::instrument(skip(self, memory), fields(memory_id = %memory.memory_id))]
     pub async fn insert_into(&self, table: &str, memory: &Memory) -> Result<(), MemoriaError> {
         let now = Utc::now().naive_utc();
         let observed_at = memory.observed_at.map(|dt| dt.naive_utc()).unwrap_or(now);
@@ -736,6 +737,7 @@ impl SqlMemoryStore {
         Ok(rows2.into_iter().map(|r| r.0).collect())
     }
 
+    #[tracing::instrument(skip(self))]
     pub async fn search_fulltext_from(&self, table: &str, user_id: &str, query: &str, limit: i64) -> Result<Vec<Memory>, MemoriaError> {
         let safe = sanitize_fulltext_query(query);
         if safe.is_empty() { return Ok(vec![]); }
@@ -795,6 +797,7 @@ impl SqlMemoryStore {
 
     /// Hybrid search: vector + fulltext, merged with 4-dimension weighted scoring.
     /// Weights: vector=0.3, keyword=0.2, temporal=0.2, confidence=0.3 (matches Python "default")
+    #[tracing::instrument(skip(self, embedding))]
     pub async fn search_hybrid_from(&self, table: &str, user_id: &str, embedding: &[f32], query: &str, limit: i64) -> Result<Vec<Memory>, MemoriaError> {
         let (mems, _) = self.search_hybrid_from_scored(table, user_id, embedding, query, limit).await?;
         Ok(mems)
