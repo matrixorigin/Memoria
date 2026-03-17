@@ -146,6 +146,7 @@ impl BenchmarkExecutor {
         let user_id = format!("bench-{}-{}", self.run_id, scenario_suffix);
         Client::builder()
             .timeout(std::time::Duration::from_secs(30))
+            .no_proxy()
             .default_headers({
                 let mut h = reqwest::header::HeaderMap::new();
                 h.insert("Authorization", format!("Bearer {}", self.token).parse().unwrap());

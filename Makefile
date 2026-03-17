@@ -103,7 +103,17 @@ rebuild-api: check-env
 # ── Local dev ───────────────────────────────────────────────────────
 
 dev: check-env
-	@cd memoria && RUST_LOG=$${RUST_LOG:-info} DATABASE_URL=$(DB_URL) SQLX_OFFLINE=true cargo run -p memoria-api
+	@cd memoria && RUST_LOG=$${RUST_LOG:-info} DATABASE_URL=$(DB_URL) SQLX_OFFLINE=true \
+		EMBEDDING_PROVIDER=$${MEMORIA_EMBEDDING_PROVIDER:-openai} \
+		EMBEDDING_API_KEY=$${MEMORIA_EMBEDDING_API_KEY:-} \
+		EMBEDDING_BASE_URL=$${MEMORIA_EMBEDDING_BASE_URL:-} \
+		EMBEDDING_MODEL=$${MEMORIA_EMBEDDING_MODEL:-BAAI/bge-m3} \
+		EMBEDDING_DIM=$${MEMORIA_EMBEDDING_DIM:-1024} \
+		LLM_API_KEY=$${MEMORIA_LLM_API_KEY:-} \
+		LLM_BASE_URL=$${MEMORIA_LLM_BASE_URL:-} \
+		LLM_MODEL=$${MEMORIA_LLM_MODEL:-} \
+		MASTER_KEY=$${MEMORIA_MASTER_KEY:-} \
+		cargo run -p memoria-api
 
 build:
 	@echo "Building release binaries..."
@@ -149,8 +159,11 @@ BENCH_URL   ?= http://localhost:$${API_PORT:-8100}
 BENCH_TOKEN ?= $${MEMORIA_MASTER_KEY:-test-master-key-for-docker-compose}
 
 bench: check-env
-	@cd memoria && SQLX_OFFLINE=true cargo run -p memoria-cli -- benchmark \
-		--api-url "$(BENCH_URL)" --token "$(BENCH_TOKEN)"
+	@cd memoria && for ds in core-v1 core-v2 forget-v1 graph-entity-v1 graph-entity-v2 large-graph-v1 large-graph-v2; do \
+		echo ""; \
+		SQLX_OFFLINE=true cargo run -p memoria-cli -- benchmark \
+			--api-url "$(BENCH_URL)" --token "$(BENCH_TOKEN)" --dataset $$ds || true; \
+	done
 
 # ── API Keys ────────────────────────────────────────────────────────
 
