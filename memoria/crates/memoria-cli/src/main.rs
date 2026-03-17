@@ -11,7 +11,7 @@
 mod benchmark;
 
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -26,8 +26,25 @@ const CLAUDE_RULE: &str = include_str!("../templates/claude_rule.md");
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
 
+#[derive(Clone, ValueEnum)]
+enum ToolName {
+    Kiro,
+    Cursor,
+    Claude,
+}
+
+impl std::fmt::Display for ToolName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ToolName::Kiro => write!(f, "kiro"),
+            ToolName::Cursor => write!(f, "cursor"),
+            ToolName::Claude => write!(f, "claude"),
+        }
+    }
+}
+
 #[derive(Parser)]
-#[command(name = "memoria", version = VERSION, about = "Memoria — persistent memory for AI agents")]
+#[command(name = "memoria", version = VERSION, propagate_version = true, about = "Memoria — persistent memory for AI agents")]
 struct Cli {
     /// Project directory (default: current)
     #[arg(long, default_value = ".")]
@@ -95,8 +112,9 @@ enum Commands {
     },
     /// Write MCP config + steering rules
     Init {
-        #[arg(long, value_name = "TOOL")]
-        tool: Vec<String>,
+        /// AI tool to configure (required)
+        #[arg(long, required = true, value_name = "kiro|cursor|claude")]
+        tool: Vec<ToolName>,
         #[arg(long)]
         db_url: Option<String>,
         #[arg(long)]
@@ -305,7 +323,7 @@ fn mcp_entry(
     let mut env = serde_json::Map::new();
 
     if let Some(url) = api_url {
-        // Remote mode
+        // Remote mode — embedding handled server-side
         args.push("--api-url".to_string());
         args.push(url.to_string());
         if let Some(t) = token {
@@ -320,22 +338,15 @@ fn mcp_entry(
         args.push("--user".to_string());
         args.push(user.to_string());
 
-        // Embedding config → env block
-        if let Some(p) = embedding_provider {
-            env.insert("EMBEDDING_PROVIDER".into(), p.into());
-        }
-        if let Some(u) = embedding_base_url {
-            env.insert("EMBEDDING_BASE_URL".into(), u.into());
-        }
-        if let Some(k) = embedding_api_key {
-            env.insert("EMBEDDING_API_KEY".into(), k.into());
-        }
-        if let Some(m) = embedding_model {
-            env.insert("EMBEDDING_MODEL".into(), m.into());
-        }
-        if let Some(d) = embedding_dim {
-            env.insert("EMBEDDING_DIM".into(), d.into());
-        }
+        // Always include all embedding env vars — empty string means "not configured, edit me"
+        env.insert("EMBEDDING_PROVIDER".into(), embedding_provider.unwrap_or("").into());
+        env.insert("EMBEDDING_BASE_URL".into(), embedding_base_url.unwrap_or("").into());
+        env.insert("EMBEDDING_API_KEY".into(), embedding_api_key.unwrap_or("").into());
+        env.insert("EMBEDDING_MODEL".into(), embedding_model.unwrap_or("").into());
+        env.insert("EMBEDDING_DIM".into(), embedding_dim.unwrap_or("").into());
+        env.insert("_README".into(), serde_json::Value::String(
+            "EMBEDDING_*: required for semantic search. Use 'openai' provider with any OpenAI-compatible API (SiliconFlow, Ollama, etc). Empty values = not configured.".to_string()
+        ));
     }
 
     // Use subcommand: memoria mcp [args]
@@ -345,6 +356,7 @@ fn mcp_entry(
     let mut entry = serde_json::json!({
         "command": "memoria",
         "args": full_args,
+        "_version": VERSION,
     });
     if !env.is_empty() {
         entry["env"] = serde_json::Value::Object(env);
@@ -476,7 +488,7 @@ fn configure_claude(project_dir: &Path, entry: &serde_json::Value, _force: bool)
 }
 
 fn cmd_init(
-    project_dir: &Path, tools: Vec<String>,
+    project_dir: &Path, tools: Vec<ToolName>,
     db_url: Option<String>, api_url: Option<String>, token: Option<String>,
     user: String, force: bool,
     embedding_provider: Option<String>, embedding_model: Option<String>,
@@ -490,32 +502,30 @@ fn cmd_init(
         embedding_base_url.as_deref(),
     );
 
-    let targets = if tools.is_empty() {
-        let detected = detect_tools(project_dir);
-        if detected.is_empty() {
-            println!("No AI tools detected. Use --tool kiro|cursor|claude");
-            return;
-        }
-        println!("Auto-detected: {}", detected.join(", "));
-        detected
-    } else {
-        tools
-    };
-
-    for tool in &targets {
+    for tool in &tools {
         println!("\n[{}]", tool);
-        let results = match tool.as_str() {
-            "kiro" => configure_kiro(project_dir, &entry, force),
-            "cursor" => configure_cursor(project_dir, &entry, force),
-            "claude" => configure_claude(project_dir, &entry, force),
-            _ => {
-                println!("  ⚠ Unknown tool: {}", tool);
-                continue;
-            }
+        let results = match tool {
+            ToolName::Kiro => configure_kiro(project_dir, &entry, force),
+            ToolName::Cursor => configure_cursor(project_dir, &entry, force),
+            ToolName::Claude => configure_claude(project_dir, &entry, force),
         };
         for r in results { println!("{}", r); }
     }
-    println!("\nRestart your AI tool to load the new configuration.");
+
+    // Post-init guidance
+    if api_url.is_none() {
+        // Embedded mode checks
+        if embedding_provider.is_none() {
+            #[cfg(feature = "local-embedding")]
+            println!("\n💡 No --embedding-provider specified. Using local embedding (all-MiniLM-L6-v2, dim=384).\n   Model will be downloaded on first query (~30MB to ~/.cache/fastembed/).");
+            #[cfg(not(feature = "local-embedding"))]
+            println!("\n⚠️  No --embedding-provider specified and this binary was built WITHOUT local-embedding.\n   Edit the env block in the generated mcp.json to configure an embedding service,\n   or re-run with: memoria init --tool {} --embedding-provider openai --embedding-api-key sk-...", tools.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(","));
+        }
+        println!("\n📝 Generated config includes all environment variables (empty = not configured).\n   Edit the env block in the mcp.json file to fill in your values.");
+    }
+
+    println!("\n📄 Steering rules teach your AI tool how to use memory effectively.\n   They are written alongside the MCP config and versioned with the binary.\n   After upgrading Memoria, run: memoria update-rules");
+    println!("\n✅ Restart your AI tool to load the new configuration.");
 }
 
 fn cmd_status(project_dir: &Path) {
@@ -647,7 +657,13 @@ fn cmd_benchmark(api_url: &str, token: &str, dataset: &str, out: Option<&str>, v
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 fn main() -> Result<()> {
-    let cli = Cli::parse();
+    let cli = match Cli::try_parse() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("memoria {}", VERSION);
+            e.exit();
+        }
+    };
     let project_dir = cli.dir.canonicalize().unwrap_or(cli.dir);
 
     match cli.command {

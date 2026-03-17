@@ -68,19 +68,19 @@ sudo mv memoria /usr/local/bin/
 
 ### Quick setup with `memoria init`
 
-Run `memoria init` in your project directory — it auto-detects Kiro / Cursor / Claude and writes the MCP config + steering rules:
+Run `memoria init --tool <name>` in your project directory to write the MCP config + steering rules:
 
 ```bash
 cd your-project
 
 # Embedded mode (direct DB)
-memoria init --db-url "mysql+pymysql://root:111@localhost:6001/memoria"
+memoria init --tool kiro --db-url "mysql+pymysql://root:111@localhost:6001/memoria"
 
 # Remote mode (connect to existing server)
-memoria init --api-url "https://memoria-host:8100" --token "sk-your-key..."
+memoria init --tool kiro --api-url "https://memoria-host:8100" --token "sk-your-key..."
 
 # With embedding config
-memoria init --embedding-provider openai \
+memoria init --tool kiro --embedding-provider openai \
              --embedding-base-url https://api.siliconflow.cn/v1 \
              --embedding-api-key sk-... \
              --embedding-model BAAI/bge-m3 \

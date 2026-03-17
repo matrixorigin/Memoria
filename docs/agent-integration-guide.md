@@ -100,7 +100,7 @@ docker ps --filter name=matrixone
 
 # 3. Configure (in user's project directory)
 cd <user-project>
-memoria init  # + embedding flags, see below
+memoria init --tool <tool>  # + embedding flags, see below
 ```
 
 ### Path B: MatrixOne Cloud
@@ -111,7 +111,7 @@ memoria init  # + embedding flags, see below
 
 # 3. Configure
 cd <user-project>
-memoria init --db-url 'mysql+pymysql://<user>:<password>@<host>:<port>/<database>'
+memoria init --tool <tool> --db-url 'mysql+pymysql://<user>:<password>@<host>:<port>/<database>'
 # + embedding flags, see below
 ```
 
@@ -119,7 +119,7 @@ memoria init --db-url 'mysql+pymysql://<user>:<password>@<host>:<port>/<database
 
 ```bash
 cd <user-project>
-memoria init --db-url 'mysql+pymysql://<user>:<password>@<host>:<port>/<database>'
+memoria init --tool <tool> --db-url 'mysql+pymysql://<user>:<password>@<host>:<port>/<database>'
 # + embedding flags, see below
 ```
 
@@ -129,17 +129,17 @@ No DB setup, no embedding config needed — the server handles everything.
 
 ```bash
 cd <user-project>
-memoria init --api-url 'https://memoria-host:8100' --token 'sk-your-key...'
+memoria init --tool <tool> --api-url 'https://memoria-host:8100' --token 'sk-your-key...'
 ```
 
 ### Embedding Flags (for Paths A/B/C)
 
 ```bash
 # Local (default) — no extra flags
-memoria init
+memoria init --tool <tool>
 
 # OpenAI-compatible service (SiliconFlow, Ollama, etc.)
-memoria init \
+memoria init --tool <tool> \
   --embedding-provider openai \
   --embedding-base-url https://api.siliconflow.cn/v1 \
   --embedding-api-key sk-... \

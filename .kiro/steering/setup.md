@@ -118,7 +118,7 @@ Wait ~30-60s on first start, then:
 # Step 3: Configure (in user's project directory)
 # Add embedding flags based on Question 3 answer — see "Embedding provider flags" section below
 cd <user-project>
-memoria init  # + embedding flags if applicable
+memoria init --tool <tool>  # + embedding flags if applicable
 ```
 
 ### Path B: MatrixOne Cloud
@@ -129,7 +129,7 @@ memoria init  # + embedding flags if applicable
 
 # 3. Configure with cloud URL
 cd <user-project>
-memoria init --db-url 'mysql+pymysql://<user>:<password>@<host>:<port>/<database>'
+memoria init --tool <tool> --db-url 'mysql+pymysql://<user>:<password>@<host>:<port>/<database>'
 # + embedding flags if applicable (see "Embedding provider flags" section)
 ```
 
@@ -138,7 +138,7 @@ memoria init --db-url 'mysql+pymysql://<user>:<password>@<host>:<port>/<database
 ```bash
 # 1. Configure with existing DB
 cd <user-project>
-memoria init --db-url 'mysql+pymysql://<user>:<password>@<host>:<port>/<database>'
+memoria init --tool <tool> --db-url 'mysql+pymysql://<user>:<password>@<host>:<port>/<database>'
 # + embedding flags if applicable (see "Embedding provider flags" section)
 ```
 
@@ -149,7 +149,7 @@ Use this when the user has been given a server URL and API token by an admin —
 ```bash
 # 1. Configure with remote server
 cd <user-project>
-memoria init --api-url 'https://memoria-host:8100' --token 'sk-your-key...'
+memoria init --tool <tool> --api-url 'https://memoria-host:8100' --token 'sk-your-key...'
 ```
 
 The resulting `mcp.json` will be:
@@ -176,14 +176,14 @@ memoria status
 
 ```bash
 # Local (default) — no extra flags needed
-memoria init
+memoria init --tool <tool>
 
 # OpenAI
-memoria init --embedding-provider openai --embedding-api-key sk-...
+memoria init --tool <tool> --embedding-provider openai --embedding-api-key sk-...
 
 # Existing service (Ollama, SiliconFlow, custom endpoint, etc.)
 # All of these get written into the env block of mcp.json automatically
-memoria init \
+memoria init --tool <tool> \
   --embedding-provider openai \
   --embedding-base-url https://api.siliconflow.cn/v1 \
   --embedding-api-key sk-... \
