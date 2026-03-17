@@ -33,6 +33,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: memoria
+          shared-key: memoria-check
+          save-if: false
       - name: Check & Clippy
         run: cd memoria && cargo check && cargo clippy -- -D warnings
       - name: Unit tests

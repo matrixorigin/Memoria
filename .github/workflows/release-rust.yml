@@ -38,6 +38,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: memoria
+          shared-key: release-${{ matrix.target }}
 
       - name: Install build deps (x86_64-linux)
         if: matrix.target == 'x86_64-unknown-linux-gnu'
@@ -47,7 +48,7 @@ jobs:
 
       - name: Install cross
         if: matrix.cross
-        run: cargo install cross --locked
+        uses: taiki-e/install-action@cross
 
       - name: Build (cross)
         if: matrix.cross

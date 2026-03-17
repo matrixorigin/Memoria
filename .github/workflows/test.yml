@@ -31,10 +31,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: memoria
-      - name: Check
-        run: cd memoria && cargo check
-      - name: Clippy
-        run: cd memoria && cargo clippy -- -D warnings
+          shared-key: memoria-check
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Check & Clippy
+        run: cd memoria && cargo check && cargo clippy -- -D warnings
 
   test-unit:
     name: Unit Tests
@@ -45,6 +45,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: memoria
+          shared-key: memoria-check
+          save-if: false
       - name: Unit tests
         run: cd memoria && cargo test --lib -p memoria-core -p memoria-service -p memoria-mcp
 
@@ -64,6 +66,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: memoria
+          shared-key: memoria-check
+          save-if: false
       - name: Wait for MatrixOne
         run: |
           for i in $(seq 1 30); do
