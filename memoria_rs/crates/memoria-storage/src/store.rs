@@ -568,6 +568,46 @@ impl SqlMemoryStore {
 
     // ── Table-aware CRUD ──────────────────────────────────────────────────────
 
+    /// Find the nearest active memory by embedding distance.
+    /// Returns (memory_id, content, l2_distance) if within threshold.
+    pub async fn find_near_duplicate(
+        &self, table: &str, user_id: &str, embedding: &[f32],
+        memory_type: &str, exclude_id: &str, l2_threshold: f64,
+    ) -> Result<Option<(String, String, f64)>, MemoriaError> {
+        let vec_literal = vec_to_mo(embedding);
+        let sql = format!(
+            "SELECT memory_id, content, \
+             l2_distance(embedding, '{vec_literal}') AS l2_dist \
+             FROM {table} \
+             WHERE user_id = ? AND is_active = 1 AND memory_type = ? \
+               AND embedding IS NOT NULL AND memory_id != ? \
+             ORDER BY l2_dist ASC LIMIT 1"
+        );
+        let row = sqlx::query(&sql)
+            .bind(user_id).bind(memory_type).bind(exclude_id)
+            .fetch_optional(&self.pool).await.map_err(db_err)?;
+        if let Some(r) = row {
+            let dist: f64 = r.try_get::<f64, _>("l2_dist")
+                .or_else(|_| r.try_get::<f32, _>("l2_dist").map(|v| v as f64))
+                .unwrap_or(f64::MAX);
+            if dist <= l2_threshold {
+                let mid: String = r.try_get("memory_id").map_err(db_err)?;
+                let content: String = r.try_get("content").map_err(db_err)?;
+                return Ok(Some((mid, content, dist)));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Mark a memory as superseded by another.
+    pub async fn supersede_memory(&self, table: &str, old_id: &str, new_id: &str) -> Result<(), MemoriaError> {
+        sqlx::query(&format!(
+            "UPDATE {table} SET is_active = 0, superseded_by = ?, updated_at = NOW() WHERE memory_id = ?"
+        )).bind(new_id).bind(old_id)
+        .execute(&self.pool).await.map_err(db_err)?;
+        Ok(())
+    }
+
     pub async fn insert_into(&self, table: &str, memory: &Memory) -> Result<(), MemoriaError> {
         let now = Utc::now().naive_utc();
         let observed_at = memory.observed_at.map(|dt| dt.naive_utc()).unwrap_or(now);

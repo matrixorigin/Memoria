@@ -16,6 +16,10 @@ use sqlx::mysql::MySqlPool;
 use std::sync::Arc;
 use uuid::Uuid;
 
+fn test_dim() -> usize {
+    std::env::var("EMBEDDING_DIM").ok().and_then(|s| s.parse().ok()).unwrap_or(1024)
+}
+
 fn db_url() -> String {
     std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "mysql://root:111@localhost:6001/memoria_rs".to_string())
@@ -26,7 +30,7 @@ fn bname(suffix: &str) -> String { format!("b{}_{suffix}", &Uuid::new_v4().simpl
 async fn setup() -> (Arc<MemoryService>, Arc<GitForDataService>, String) {
     let pool = MySqlPool::connect(&db_url()).await.expect("pool");
     let db_name = db_url().rsplit('/').next().unwrap_or("memoria_rs").to_string();
-    let store = SqlMemoryStore::connect(&db_url(), 4).await.expect("store");
+    let store = SqlMemoryStore::connect(&db_url(), test_dim()).await.expect("store");
     store.migrate().await.expect("migrate");
     let git = Arc::new(GitForDataService::new(pool, &db_name));
     let svc = Arc::new(MemoryService::new_sql(Arc::new(store), None));

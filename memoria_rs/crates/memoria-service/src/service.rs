@@ -164,9 +164,26 @@ impl MemoryService {
             trust_tier: effective_tier,
             retrieval_score: None,
         };
-        // Write to active branch table if sql_store available, else use trait
+        // Dedup: if embedding exists, check for near-duplicate and supersede
         if let Some(sql) = &self.sql_store {
             let table = sql.active_table(user_id).await?;
+            if let Some(ref emb) = memory.embedding {
+                // L2 threshold from cosine similarity 0.85: sqrt(2*(1-0.85)) ≈ 0.5477
+                let l2_threshold = 0.5477;
+                let mtype = memory.memory_type.to_string();
+                if let Ok(Some((old_id, old_content, _dist))) = sql
+                    .find_near_duplicate(&table, user_id, emb, &mtype, &memory.memory_id, l2_threshold)
+                    .await
+                {
+                    if old_content.trim() != memory.content.trim() {
+                        sql.insert_into(&table, &memory).await?;
+                        sql.supersede_memory(&table, &old_id, &memory.memory_id).await?;
+                        return Ok(memory);
+                    }
+                    // Same content — skip storing duplicate
+                    return Ok(memory);
+                }
+            }
             sql.insert_into(&table, &memory).await?;
         } else {
             self.store.insert(&memory).await?;

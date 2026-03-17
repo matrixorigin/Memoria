@@ -3,6 +3,10 @@
 
 use std::sync::Arc;
 use serde_json::{json, Value};
+
+fn test_dim() -> usize {
+    std::env::var("EMBEDDING_DIM").ok().and_then(|s| s.parse().ok()).unwrap_or(1024)
+}
 fn db_url() -> String {
     std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "mysql://root:111@localhost:6001/memoria_rs".to_string())
@@ -22,7 +26,7 @@ async fn spawn_server() -> (String, reqwest::Client) {
     let cfg = Config::from_env();
     let db = db_url();
 
-    let store = SqlMemoryStore::connect(&db, 4).await.expect("connect");
+    let store = SqlMemoryStore::connect(&db, test_dim()).await.expect("connect");
     store.migrate().await.expect("migrate");
     let pool = MySqlPool::connect(&db).await.expect("pool");
     let git = Arc::new(GitForDataService::new(pool, &cfg.db_name));
@@ -246,7 +250,7 @@ async fn spawn_server_with_master_key(master_key: &str) -> (String, reqwest::Cli
 
     let cfg = Config::from_env();
     let db = db_url();
-    let store = SqlMemoryStore::connect(&db, 4).await.expect("connect");
+    let store = SqlMemoryStore::connect(&db, test_dim()).await.expect("connect");
     store.migrate().await.expect("migrate");
     let pool = MySqlPool::connect(&db).await.expect("pool");
     let git = Arc::new(GitForDataService::new(pool, &cfg.db_name));
@@ -1021,7 +1025,7 @@ async fn spawn_server_with_llm(llm_key: String) -> (String, reqwest::Client) {
 
     let cfg = Config::from_env();
     let db = db_url();
-    let store = SqlMemoryStore::connect(&db, 4).await.expect("connect");
+    let store = SqlMemoryStore::connect(&db, test_dim()).await.expect("connect");
     store.migrate().await.expect("migrate");
     let pool = MySqlPool::connect(&db).await.expect("pool");
     let git = Arc::new(GitForDataService::new(pool, &cfg.db_name));

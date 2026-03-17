@@ -4,11 +4,15 @@
 use memoria_storage::{GraphConsolidator, GraphStore};
 use memoria_storage::graph::types::{GraphEdge, GraphNode, NodeType, edge_type};
 
+fn test_dim() -> usize {
+    std::env::var("EMBEDDING_DIM").ok().and_then(|s| s.parse().ok()).unwrap_or(1024)
+}
+
 async fn setup_graph() -> (GraphStore, String) {
     let db_url = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "mysql://root:111@localhost:6001/memoria_rs".to_string());
     let pool = sqlx::MySqlPool::connect(&db_url).await.expect("connect");
-    let store = GraphStore::new(pool, 4); // dim=4 for tests
+    let store = GraphStore::new(pool, test_dim()); // dim=4 for tests
     store.migrate().await.expect("migrate");
     let uid = format!("graph_test_{}", uuid::Uuid::new_v4().simple());
     (store, uid)
@@ -338,7 +342,7 @@ async fn test_store_creates_graph_node() {
 
     let db_url = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "mysql://root:111@localhost:6001/memoria_rs".to_string());
-    let sql = SqlMemoryStore::connect(&db_url, 4).await.expect("connect");
+    let sql = SqlMemoryStore::connect(&db_url, test_dim()).await.expect("connect");
     sql.migrate().await.expect("migrate");
     let uid = format!("gsync_{}", uuid::Uuid::new_v4().simple());
     let svc = Arc::new(MemoryService::new_sql(Arc::new(sql.clone()), None));
@@ -382,7 +386,7 @@ async fn test_correct_updates_graph_node() {
 
     let db_url = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "mysql://root:111@localhost:6001/memoria_rs".to_string());
-    let sql = SqlMemoryStore::connect(&db_url, 4).await.expect("connect");
+    let sql = SqlMemoryStore::connect(&db_url, test_dim()).await.expect("connect");
     sql.migrate().await.expect("migrate");
     let uid = format!("gcorr_{}", uuid::Uuid::new_v4().simple());
     let svc = Arc::new(MemoryService::new_sql(Arc::new(sql.clone()), None));
@@ -426,7 +430,7 @@ async fn test_purge_deactivates_graph_node() {
 
     let db_url = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "mysql://root:111@localhost:6001/memoria_rs".to_string());
-    let sql = SqlMemoryStore::connect(&db_url, 4).await.expect("connect");
+    let sql = SqlMemoryStore::connect(&db_url, test_dim()).await.expect("connect");
     sql.migrate().await.expect("migrate");
     let uid = format!("gpurge_{}", uuid::Uuid::new_v4().simple());
     let svc = Arc::new(MemoryService::new_sql(Arc::new(sql.clone()), None));
@@ -480,7 +484,7 @@ async fn test_entity_link_weights_by_source() {
 
     let db_url = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "mysql://root:111@localhost:6001/memoria_rs".to_string());
-    let sql = SqlMemoryStore::connect(&db_url, 4).await.expect("connect");
+    let sql = SqlMemoryStore::connect(&db_url, test_dim()).await.expect("connect");
     sql.migrate().await.expect("migrate");
     let uid = format!("elw_{}", uuid::Uuid::new_v4().simple());
     let graph = sql.graph_store();

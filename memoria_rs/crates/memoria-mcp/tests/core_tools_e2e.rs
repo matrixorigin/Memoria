@@ -12,6 +12,10 @@ use serde_json::{json, Value};
 use sqlx::Row;
 use std::sync::Arc;
 use uuid::Uuid;
+
+fn test_dim() -> usize {
+    std::env::var("EMBEDDING_DIM").ok().and_then(|s| s.parse().ok()).unwrap_or(1024)
+}
 fn db_url() -> String {
     std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "mysql://root:111@localhost:6001/memoria_rs".to_string())
@@ -19,7 +23,7 @@ fn db_url() -> String {
 fn uid() -> String { format!("ct_{}", &Uuid::new_v4().simple().to_string()[..8]) }
 
 async fn setup() -> (Arc<MemoryService>, String) {
-    let store = SqlMemoryStore::connect(&db_url(), 4).await.expect("connect");
+    let store = SqlMemoryStore::connect(&db_url(), test_dim()).await.expect("connect");
     store.migrate().await.expect("migrate");
     let svc = Arc::new(MemoryService::new_sql(Arc::new(store), None));
     (svc, uid())
@@ -489,7 +493,7 @@ async fn test_link_entities_invalid_json() {
 
 /// Helper: create service with explicit LLM client (for testing LLM paths).
 async fn setup_with_llm(llm: Option<Arc<memoria_embedding::LlmClient>>) -> (Arc<MemoryService>, String) {
-    let store = SqlMemoryStore::connect(&db_url(), 4).await.expect("connect");
+    let store = SqlMemoryStore::connect(&db_url(), test_dim()).await.expect("connect");
     store.migrate().await.expect("migrate");
     let svc = Arc::new(MemoryService::new_sql_with_llm(Arc::new(store), None, llm));
     (svc, uid())

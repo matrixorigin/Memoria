@@ -38,9 +38,15 @@ fn make_memory(user_id: &str, content: &str) -> Memory {
     }
 }
 
+fn test_dim() -> usize {
+    std::env::var("EMBEDDING_DIM")
+        .ok().and_then(|s| s.parse().ok())
+        .unwrap_or(1024)
+}
+
 async fn setup() -> SqlMemoryStore {
     let pool = MySqlPool::connect(&db_url()).await.expect("connect");
-    let store = SqlMemoryStore::new(pool, 384);
+    let store = SqlMemoryStore::new(pool, test_dim());
     store.migrate().await.expect("migrate");
     store
 }
@@ -335,7 +341,7 @@ async fn test_merge_not_insert_ignore_select_star() {
 
     // Write a memory WITH embedding (vecf32) — this is what triggers the MO bug
     let mut mem = make_memory(&user, "memory with embedding");
-    mem.embedding = Some(vec![0.1_f32; 4]);
+    mem.embedding = Some(vec![0.1_f32; test_dim()]);
     store.insert_into(&branch_table, &mem).await.expect("insert with embedding");
 
     // Correct merge SQL: explicit columns + NOT EXISTS

@@ -9,12 +9,23 @@ use memoria_core::{interfaces::MemoryStore, Memory, MemoryType, TrustTier};
 use memoria_storage::SqlMemoryStore;
 use uuid::Uuid;
 
-const DIM: usize = 4;
+fn test_dim() -> usize {
+    std::env::var("EMBEDDING_DIM")
+        .ok().and_then(|s| s.parse().ok())
+        .unwrap_or(1024)
+}
+
+/// Make a test-dim-length vector with `val` at position `idx`, rest zeros.
+fn dim_vec(idx: usize, val: f32) -> Vec<f32> {
+    let mut v = vec![0.0f32; test_dim()];
+    v[idx] = val;
+    v
+}
 
 async fn setup() -> (SqlMemoryStore, String) {
     let url = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "mysql://root:111@localhost:6001/memoria_rs".to_string());
-    let store = SqlMemoryStore::connect(&url, DIM).await.expect("connect");
+    let store = SqlMemoryStore::connect(&url, test_dim()).await.expect("connect");
     store.migrate().await.expect("migrate");
     // Unique user_id per test — no cleanup needed, no interference between parallel tests
     let user_id = format!("test_{}", Uuid::new_v4().simple());
@@ -28,7 +39,7 @@ fn make_memory(id: &str, content: &str, user_id: &str) -> Memory {
         memory_type: MemoryType::Semantic,
         content: content.to_string(),
         initial_confidence: 0.8,
-        embedding: Some(vec![0.1, 0.2, 0.3, 0.4]),
+        embedding: Some(vec![0.1; test_dim()]),
         source_event_ids: vec!["evt-1".to_string()],
         superseded_by: None,
         is_active: true,
@@ -134,13 +145,13 @@ async fn test_search_vector() {
     let (store, uid) = setup().await;
 
     let mut m1 = make_memory(&format!("vec-1-{uid}"), "close to query", &uid);
-    m1.embedding = Some(vec![1.0, 0.0, 0.0, 0.0]);
+    m1.embedding = Some(dim_vec(0, 1.0));
     let mut m2 = make_memory(&format!("vec-2-{uid}"), "far from query", &uid);
-    m2.embedding = Some(vec![0.0, 1.0, 0.0, 0.0]);
+    m2.embedding = Some(dim_vec(1, 1.0));
     store.insert(&m1).await.unwrap();
     store.insert(&m2).await.unwrap();
 
-    let query = vec![1.0f32, 0.0, 0.0, 0.0];
+    let query = dim_vec(0, 1.0);
     let results = store.search_vector(&uid, &query, 2).await.expect("vector search");
     assert!(!results.is_empty());
     assert!(results[0].memory_id.contains("vec-1"));
@@ -165,7 +176,7 @@ async fn test_all_fields_round_trip() {
         memory_type: MemoryType::Profile,
         content: "full field test".to_string(),
         initial_confidence: 0.91,
-        embedding: Some(vec![0.1, 0.2, 0.3, 0.4]),
+        embedding: Some(vec![0.1; test_dim()]),
         source_event_ids: vec!["e1".to_string(), "e2".to_string()],
         superseded_by: Some("other-id".to_string()),
         is_active: true,
@@ -191,7 +202,7 @@ async fn test_all_fields_round_trip() {
 
     let emb = got.embedding.as_ref().expect("embedding");
     assert!((emb[0] - 0.1).abs() < 1e-4);
-    assert!((emb[3] - 0.4).abs() < 1e-4);
+    assert!((emb[test_dim() - 1] - 0.1).abs() < 1e-4);
 
     let meta = got.extra_metadata.as_ref().expect("extra_metadata");
     assert_eq!(meta["key"], serde_json::json!("value"));

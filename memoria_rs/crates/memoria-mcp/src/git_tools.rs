@@ -382,8 +382,10 @@ pub async fn call(
 
             if strategy != "replace" {
                 // append: use native branch merge (kernel-level, no cosine scan needed)
-                git.merge_branch(&table_name, "mem_memories").await
-                    .map_err(|e| anyhow::anyhow!("merge failed: {e}"))?;
+                if new_count > 0 {
+                    git.merge_branch(&table_name, "mem_memories").await
+                        .map_err(|e| anyhow::anyhow!("merge failed: {e}"))?;
+                }
                 return Ok(mcp_text(&format!(
                     "Merged branch '{source_branch}' into main ({new_count} new, 0 replaced, 0 skipped)"
                 )));

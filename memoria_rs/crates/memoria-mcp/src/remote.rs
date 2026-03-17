@@ -341,7 +341,12 @@ impl RemoteClient {
                 let r = self.client.post(self.url(&format!("/v1/branches/{source}/merge")))
                     .json(&json!({"strategy": args["strategy"].as_str().unwrap_or("append")}))
                     .send().await?;
-                let body: Value = r.json().await?;
+                let status = r.status();
+                let text = r.text().await?;
+                if !status.is_success() {
+                    return Ok(Self::mcp_text(&format!("Merge failed: {text}")));
+                }
+                let body: Value = serde_json::from_str(&text).unwrap_or(json!({"result": text}));
                 Ok(Self::mcp_json(&body))
             }
 
