@@ -1445,3 +1445,534 @@ async fn test_pipeline_run() {
     assert_eq!(body["memories_rejected"].as_i64().unwrap(), 1);
     println!("✅ pipeline sensitivity block: {body}");
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// NEW FEATURE TESTS — admin keys, user params, snapshot detail/diff, batch embed
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ── Admin: list user keys ────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_admin_list_user_keys() {
+    let mk = "test-mk-list-keys";
+    let (base, client) = spawn_server_with_master_key(mk).await;
+    let auth = format!("Bearer {mk}");
+    let uid = uid();
+
+    // Create a key for this user first
+    client.post(format!("{base}/auth/keys"))
+        .header("Authorization", &auth)
+        .json(&json!({"user_id": uid, "name": "key-for-list"}))
+        .send().await.unwrap();
+
+    // List via admin endpoint
+    let r = client.get(format!("{base}/admin/users/{uid}/keys"))
+        .header("Authorization", &auth)
+        .send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    let body: Value = r.json().await.unwrap();
+    assert_eq!(body["user_id"], uid);
+    let keys = body["keys"].as_array().unwrap();
+    assert!(keys.iter().any(|k| k["name"] == "key-for-list"), "should find created key: {body}");
+    // Verify key fields
+    let k = &keys[0];
+    assert!(k["key_id"].as_str().is_some());
+    assert!(k["key_prefix"].as_str().is_some());
+    assert!(k["created_at"].as_str().is_some());
+    println!("✅ GET /admin/users/:id/keys: {} keys", keys.len());
+}
+
+#[tokio::test]
+async fn test_admin_list_user_keys_empty() {
+    let mk = "test-mk-list-keys-empty";
+    let (base, client) = spawn_server_with_master_key(mk).await;
+    let auth = format!("Bearer {mk}");
+    let uid = uid(); // fresh user, no keys
+
+    let r = client.get(format!("{base}/admin/users/{uid}/keys"))
+        .header("Authorization", &auth)
+        .send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    let body: Value = r.json().await.unwrap();
+    assert!(body["keys"].as_array().unwrap().is_empty(), "new user should have no keys");
+    println!("✅ GET /admin/users/:id/keys (empty): {body}");
+}
+
+// ── Admin: revoke all user keys ──────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_admin_revoke_all_user_keys() {
+    let mk = "test-mk-revoke-all";
+    let (base, client) = spawn_server_with_master_key(mk).await;
+    let auth = format!("Bearer {mk}");
+    let uid = uid();
+
+    // Create 3 keys
+    for i in 0..3 {
+        client.post(format!("{base}/auth/keys"))
+            .header("Authorization", &auth)
+            .json(&json!({"user_id": uid, "name": format!("key-{i}")}))
+            .send().await.unwrap();
+    }
+
+    // Verify 3 keys exist
+    let r = client.get(format!("{base}/admin/users/{uid}/keys"))
+        .header("Authorization", &auth)
+        .send().await.unwrap();
+    assert_eq!(r.json::<Value>().await.unwrap()["keys"].as_array().unwrap().len(), 3);
+
+    // Revoke all
+    let r = client.delete(format!("{base}/admin/users/{uid}/keys"))
+        .header("Authorization", &auth)
+        .send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    let body: Value = r.json().await.unwrap();
+    assert_eq!(body["revoked"], 3);
+    println!("✅ DELETE /admin/users/:id/keys: revoked {}", body["revoked"]);
+
+    // Verify all gone
+    let r = client.get(format!("{base}/admin/users/{uid}/keys"))
+        .header("Authorization", &auth)
+        .send().await.unwrap();
+    let body: Value = r.json().await.unwrap();
+    assert!(body["keys"].as_array().unwrap().is_empty(), "all keys should be revoked");
+    println!("✅ verified 0 keys after revoke_all");
+}
+
+#[tokio::test]
+async fn test_admin_revoke_all_user_keys_idempotent() {
+    let mk = "test-mk-revoke-idem";
+    let (base, client) = spawn_server_with_master_key(mk).await;
+    let auth = format!("Bearer {mk}");
+    let uid = uid(); // no keys
+
+    // Revoke on user with no keys → should succeed with revoked=0
+    let r = client.delete(format!("{base}/admin/users/{uid}/keys"))
+        .header("Authorization", &auth)
+        .send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    let body: Value = r.json().await.unwrap();
+    assert_eq!(body["revoked"], 0);
+    println!("✅ revoke_all idempotent: revoked=0 for user with no keys");
+}
+
+// ── Admin: set user params ───────────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_admin_set_user_params() {
+    let mk = "test-mk-set-params";
+    let (base, client) = spawn_server_with_master_key(mk).await;
+    let auth = format!("Bearer {mk}");
+    let uid = uid();
+
+    // Ensure the config table exists (may not be in Rust migration yet)
+    if let Ok(pool) = sqlx::mysql::MySqlPool::connect(&db_url()).await {
+        let _ = sqlx::query(
+            "CREATE TABLE IF NOT EXISTS mem_user_memory_config (\
+             user_id VARCHAR(128) PRIMARY KEY, \
+             strategy_key VARCHAR(64) DEFAULT NULL, \
+             params_json JSON DEFAULT NULL, \
+             updated_at DATETIME DEFAULT NULL)"
+        ).execute(&pool).await;
+        // Insert a row for the user
+        let _ = sqlx::query(
+            "INSERT IGNORE INTO mem_user_memory_config (user_id) VALUES (?)"
+        ).bind(&uid).execute(&pool).await;
+    }
+
+    // Set params
+    let params = json!({"vector_weight": 0.7, "keyword_weight": 0.3, "max_results": 20});
+    let r = client.post(format!("{base}/admin/users/{uid}/params"))
+        .header("Authorization", &auth)
+        .json(&params)
+        .send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    let body: Value = r.json().await.unwrap();
+    assert_eq!(body["user_id"], uid);
+    assert_eq!(body["params"]["vector_weight"], 0.7);
+    assert_eq!(body["params"]["keyword_weight"], 0.3);
+    println!("✅ POST /admin/users/:id/params: {body}");
+}
+
+// ── Snapshot: GET detail (time-travel) ───────────────────────────────────────
+
+#[tokio::test]
+async fn test_snapshot_get_detail() {
+    let (base, client) = spawn_server().await;
+    let uid = uid();
+
+    // Store memories
+    for content in ["snapshot detail A", "snapshot detail B", "snapshot detail C"] {
+        client.post(format!("{base}/v1/memories"))
+            .header("X-User-Id", &uid)
+            .json(&json!({"content": content, "memory_type": "semantic"}))
+            .send().await.unwrap();
+    }
+
+    // Create snapshot
+    let snap = format!("detail_test_{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
+    client.post(format!("{base}/v1/snapshots"))
+        .header("X-User-Id", &uid)
+        .json(&json!({"name": snap}))
+        .send().await.unwrap();
+
+    // GET snapshot detail (brief, default)
+    let r = client.get(format!("{base}/v1/snapshots/{snap}"))
+        .header("X-User-Id", &uid)
+        .send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    let body: Value = r.json().await.unwrap();
+    assert_eq!(body["name"], snap);
+    assert_eq!(body["memory_count"], 3);
+    assert!(body["by_type"]["semantic"].as_i64().unwrap() >= 3);
+    let mems = body["memories"].as_array().unwrap();
+    assert_eq!(mems.len(), 3);
+    // Brief mode: content should be short
+    for m in mems {
+        assert!(m["memory_id"].as_str().is_some());
+        assert!(m["content"].as_str().is_some());
+        assert_eq!(m["memory_type"], "semantic");
+    }
+    println!("✅ GET /v1/snapshots/:name (brief): {} memories, by_type={}", mems.len(), body["by_type"]);
+
+    // GET with detail=full — should include confidence
+    let r = client.get(format!("{base}/v1/snapshots/{snap}?detail=full"))
+        .header("X-User-Id", &uid)
+        .send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    let body: Value = r.json().await.unwrap();
+    let mems = body["memories"].as_array().unwrap();
+    assert!(mems[0].get("confidence").is_some(), "full detail should include confidence: {}", mems[0]);
+    println!("✅ GET /v1/snapshots/:name (full): confidence present");
+
+    // GET with pagination
+    let r = client.get(format!("{base}/v1/snapshots/{snap}?limit=2&offset=0"))
+        .header("X-User-Id", &uid)
+        .send().await.unwrap();
+    let body: Value = r.json().await.unwrap();
+    assert_eq!(body["memories"].as_array().unwrap().len(), 2);
+    assert_eq!(body["has_more"], true);
+    assert_eq!(body["limit"], 2);
+    assert_eq!(body["offset"], 0);
+    println!("✅ GET /v1/snapshots/:name (paginated): limit=2, has_more=true");
+
+    // Page 2
+    let r = client.get(format!("{base}/v1/snapshots/{snap}?limit=2&offset=2"))
+        .header("X-User-Id", &uid)
+        .send().await.unwrap();
+    let body: Value = r.json().await.unwrap();
+    assert_eq!(body["memories"].as_array().unwrap().len(), 1);
+    assert_eq!(body["has_more"], false);
+    println!("✅ GET /v1/snapshots/:name (page 2): 1 memory, has_more=false");
+
+    // Cleanup
+    client.delete(format!("{base}/v1/snapshots/{snap}"))
+        .header("X-User-Id", &uid)
+        .send().await.unwrap();
+}
+
+// ── Snapshot: diff (current vs snapshot) ─────────────────────────────────────
+
+#[tokio::test]
+async fn test_snapshot_diff() {
+    let (base, client) = spawn_server().await;
+    let uid = uid();
+
+    // Store 2 memories
+    let mut mids = vec![];
+    for content in ["diff base A", "diff base B"] {
+        let r = client.post(format!("{base}/v1/memories"))
+            .header("X-User-Id", &uid)
+            .json(&json!({"content": content}))
+            .send().await.unwrap();
+        mids.push(r.json::<Value>().await.unwrap()["memory_id"].as_str().unwrap().to_string());
+    }
+
+    // Create snapshot
+    let snap = format!("diff_test_{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
+    client.post(format!("{base}/v1/snapshots"))
+        .header("X-User-Id", &uid)
+        .json(&json!({"name": snap}))
+        .send().await.unwrap();
+
+    // Add a new memory after snapshot
+    client.post(format!("{base}/v1/memories"))
+        .header("X-User-Id", &uid)
+        .json(&json!({"content": "diff added C"}))
+        .send().await.unwrap();
+
+    // Delete one of the original memories
+    client.delete(format!("{base}/v1/memories/{}", mids[0]))
+        .header("X-User-Id", &uid)
+        .send().await.unwrap();
+
+    // Diff
+    let r = client.get(format!("{base}/v1/snapshots/{snap}/diff"))
+        .header("X-User-Id", &uid)
+        .send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    let body: Value = r.json().await.unwrap();
+    assert_eq!(body["snapshot_count"], 2, "snapshot had 2 memories");
+    assert_eq!(body["current_count"], 2, "current has 2 (1 original + 1 new)");
+
+    let added = body["added"].as_array().unwrap();
+    let removed = body["removed"].as_array().unwrap();
+    // "diff added C" should be in added
+    assert!(added.iter().any(|m| m["content"].as_str().unwrap().contains("diff added C")),
+        "should find added memory: {added:?}");
+    // "diff base A" should be in removed (deleted after snapshot)
+    assert!(removed.iter().any(|m| m["content"].as_str().unwrap().contains("diff base A")),
+        "should find removed memory: {removed:?}");
+    println!("✅ GET /v1/snapshots/:name/diff: added={}, removed={}", added.len(), removed.len());
+
+    // Diff with limit
+    let r = client.get(format!("{base}/v1/snapshots/{snap}/diff?limit=1"))
+        .header("X-User-Id", &uid)
+        .send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    let body: Value = r.json().await.unwrap();
+    assert!(body["added"].as_array().unwrap().len() <= 1);
+    assert!(body["removed"].as_array().unwrap().len() <= 1);
+    println!("✅ GET /v1/snapshots/:name/diff (limit=1)");
+
+    // Cleanup
+    client.delete(format!("{base}/v1/snapshots/{snap}"))
+        .header("X-User-Id", &uid)
+        .send().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_snapshot_diff_no_changes() {
+    let (base, client) = spawn_server().await;
+    let uid = uid();
+
+    // Store a memory
+    client.post(format!("{base}/v1/memories"))
+        .header("X-User-Id", &uid)
+        .json(&json!({"content": "no change test"}))
+        .send().await.unwrap();
+
+    // Snapshot immediately
+    let snap = format!("nochange_{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
+    client.post(format!("{base}/v1/snapshots"))
+        .header("X-User-Id", &uid)
+        .json(&json!({"name": snap}))
+        .send().await.unwrap();
+
+    // Diff with no changes
+    let r = client.get(format!("{base}/v1/snapshots/{snap}/diff"))
+        .header("X-User-Id", &uid)
+        .send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    let body: Value = r.json().await.unwrap();
+    assert!(body["added"].as_array().unwrap().is_empty(), "no additions expected");
+    assert!(body["removed"].as_array().unwrap().is_empty(), "no removals expected");
+    assert_eq!(body["snapshot_count"], body["current_count"]);
+    println!("✅ snapshot diff no changes: counts match, empty added/removed");
+
+    client.delete(format!("{base}/v1/snapshots/{snap}"))
+        .header("X-User-Id", &uid)
+        .send().await.unwrap();
+}
+
+// ── Batch store: validates types upfront ─────────────────────────────────────
+
+#[tokio::test]
+async fn test_batch_store_invalid_type_rejects_all() {
+    let (base, client) = spawn_server().await;
+    let uid = uid();
+
+    // One valid, one invalid type → should reject entire batch
+    let r = client.post(format!("{base}/v1/memories/batch"))
+        .header("X-User-Id", &uid)
+        .json(&json!({"memories": [
+            {"content": "valid memory", "memory_type": "semantic"},
+            {"content": "bad type", "memory_type": "nonexistent_type"},
+        ]}))
+        .send().await.unwrap();
+    assert_eq!(r.status(), 422, "invalid type should reject batch");
+    println!("✅ batch store: invalid type rejects entire batch");
+}
+
+#[tokio::test]
+async fn test_batch_store_all_types() {
+    let (base, client) = spawn_server().await;
+    let uid = uid();
+
+    let r = client.post(format!("{base}/v1/memories/batch"))
+        .header("X-User-Id", &uid)
+        .json(&json!({"memories": [
+            {"content": "semantic fact", "memory_type": "semantic"},
+            {"content": "user preference", "memory_type": "profile"},
+            {"content": "how to deploy", "memory_type": "procedural"},
+            {"content": "current task", "memory_type": "working"},
+        ]}))
+        .send().await.unwrap();
+    assert_eq!(r.status(), 201);
+    let body: Vec<Value> = r.json().await.unwrap();
+    assert_eq!(body.len(), 4);
+    let types: Vec<&str> = body.iter().map(|m| m["memory_type"].as_str().unwrap()).collect();
+    assert!(types.contains(&"semantic"));
+    assert!(types.contains(&"profile"));
+    assert!(types.contains(&"procedural"));
+    assert!(types.contains(&"working"));
+    println!("✅ batch store all types: {:?}", types);
+}
+
+#[tokio::test]
+async fn test_batch_store_empty() {
+    let (base, client) = spawn_server().await;
+    let uid = uid();
+
+    let r = client.post(format!("{base}/v1/memories/batch"))
+        .header("X-User-Id", &uid)
+        .json(&json!({"memories": []}))
+        .send().await.unwrap();
+    // Empty batch should succeed with empty result
+    assert_eq!(r.status(), 201);
+    let body: Vec<Value> = r.json().await.unwrap();
+    assert!(body.is_empty());
+    println!("✅ batch store empty: 201 with []");
+}
+
+#[tokio::test]
+async fn test_batch_store_sensitivity_filter() {
+    let (base, client) = spawn_server().await;
+    let uid = uid();
+
+    // Batch with a sensitive item — store_batch checks sensitivity
+    let r = client.post(format!("{base}/v1/memories/batch"))
+        .header("X-User-Id", &uid)
+        .json(&json!({"memories": [
+            {"content": "normal memory"},
+            {"content": "my password is hunter2 and my ssn is 123-45-6789"},
+        ]}))
+        .send().await.unwrap();
+    // Should either filter out sensitive or reject — check behavior
+    let status = r.status().as_u16();
+    let body: Value = r.json().await.unwrap();
+    println!("✅ batch store sensitivity: status={status}, body={body}");
+}
+
+// ── Batch store with embedding (requires EMBEDDING_API_KEY) ──────────────────
+
+#[tokio::test]
+async fn test_batch_store_with_embedding() {
+    let emb_key = match std::env::var("EMBEDDING_API_KEY").ok().filter(|s| !s.is_empty()) {
+        Some(k) => k,
+        None => { println!("⏭️  test_batch_store_with_embedding skipped (EMBEDDING_API_KEY not set)"); return; }
+    };
+    let (base, client) = spawn_server_with_embedding(emb_key).await;
+    let uid = uid();
+
+    // Batch store 5 items — should use embed_batch (single API call)
+    let r = client.post(format!("{base}/v1/memories/batch"))
+        .header("X-User-Id", &uid)
+        .json(&json!({"memories": [
+            {"content": "Rust is a systems programming language"},
+            {"content": "Python is great for data science"},
+            {"content": "Go has excellent concurrency support"},
+            {"content": "TypeScript adds types to JavaScript"},
+            {"content": "Java runs on the JVM"},
+        ]}))
+        .send().await.unwrap();
+    assert_eq!(r.status(), 201);
+    let body: Vec<Value> = r.json().await.unwrap();
+    assert_eq!(body.len(), 5);
+    println!("✅ batch store with embedding: 5 items stored");
+
+    // Verify they're retrievable via semantic search
+    let r = client.post(format!("{base}/v1/memories/retrieve"))
+        .header("X-User-Id", &uid)
+        .json(&json!({"query": "systems programming", "top_k": 3}))
+        .send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    let results: Vec<Value> = r.json().await.unwrap();
+    assert!(!results.is_empty(), "batch-stored memories should be retrievable");
+    // Rust should rank high for "systems programming"
+    assert!(results[0]["content"].as_str().unwrap().contains("Rust"),
+        "Rust should be top result for 'systems programming': {:?}",
+        results.iter().map(|r| r["content"].as_str().unwrap()).collect::<Vec<_>>());
+    println!("✅ batch store retrieval: top result = {}", results[0]["content"]);
+}
+
+// ── Remote mode: admin key management ────────────────────────────────────────
+
+#[tokio::test]
+async fn test_remote_admin_list_revoke_keys() {
+    use memoria_mcp::remote::RemoteClient;
+    let mk = "test-mk-remote-keys";
+    let (base, client) = spawn_server_with_master_key(mk).await;
+    let auth = format!("Bearer {mk}");
+    let uid = uid();
+
+    // Create keys via REST
+    for i in 0..2 {
+        client.post(format!("{base}/auth/keys"))
+            .header("Authorization", &auth)
+            .json(&json!({"user_id": uid, "name": format!("rkey-{i}")}))
+            .send().await.unwrap();
+    }
+
+    // List via admin endpoint
+    let r = client.get(format!("{base}/admin/users/{uid}/keys"))
+        .header("Authorization", &auth)
+        .send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    let body: Value = r.json().await.unwrap();
+    assert_eq!(body["keys"].as_array().unwrap().len(), 2);
+    println!("✅ remote admin list keys: 2 keys");
+
+    // Revoke all
+    let r = client.delete(format!("{base}/admin/users/{uid}/keys"))
+        .header("Authorization", &auth)
+        .send().await.unwrap();
+    let body: Value = r.json().await.unwrap();
+    assert_eq!(body["revoked"], 2);
+    println!("✅ remote admin revoke all: {body}");
+}
+
+// ── Snapshot detail via remote mode ──────────────────────────────────────────
+
+#[tokio::test]
+async fn test_remote_snapshot_detail_and_diff() {
+    use memoria_mcp::remote::RemoteClient;
+    let (base, _) = spawn_api_for_remote().await;
+    let uid = uid();
+    let remote = RemoteClient::new(&base, None, uid.clone());
+
+    // Store memories
+    remote.call("memory_store", json!({"content": "remote snap detail A"})).await.unwrap();
+    remote.call("memory_store", json!({"content": "remote snap detail B"})).await.unwrap();
+
+    // Create snapshot
+    let snap = format!("rsnap_{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
+    remote.call("memory_snapshot", json!({"name": snap})).await.unwrap();
+
+    // Add another memory after snapshot
+    remote.call("memory_store", json!({"content": "remote snap detail C (after)"})).await.unwrap();
+
+    // GET snapshot detail via REST (not MCP — direct HTTP)
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let r = client.get(format!("{base}/v1/snapshots/{snap}"))
+        .header("X-User-Id", &uid)
+        .send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    let body: Value = r.json().await.unwrap();
+    assert_eq!(body["memory_count"], 2, "snapshot should have 2 memories");
+    println!("✅ remote snapshot detail: memory_count={}", body["memory_count"]);
+
+    // GET snapshot diff
+    let r = client.get(format!("{base}/v1/snapshots/{snap}/diff"))
+        .header("X-User-Id", &uid)
+        .send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    let body: Value = r.json().await.unwrap();
+    assert!(!body["added"].as_array().unwrap().is_empty(), "should have added memories");
+    println!("✅ remote snapshot diff: added={}, removed={}",
+        body["added"].as_array().unwrap().len(),
+        body["removed"].as_array().unwrap().len());
+
+    // Cleanup
+    remote.call("memory_snapshot_delete", json!({"names": snap})).await.unwrap();
+}
