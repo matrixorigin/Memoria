@@ -1,15 +1,11 @@
 [package]
 name = "memoria-mcp"
-version = "0.1.0"
+version.workspace = true
 edition = "2021"
 
 [features]
 default = []
 local-embedding = ["memoria-embedding/local-embedding"]
-
-[[bin]]
-name = "memoria-mcp-rs"
-path = "src/main.rs"
 
 [dependencies]
 memoria-core = { workspace = true }

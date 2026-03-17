@@ -1,18 +1,21 @@
-/// memoria-rs CLI — configure AI tools to use Memoria memory service.
+/// memoria — unified CLI for Memoria persistent memory service.
 ///
 /// Commands:
-///   memoria-rs init       — detect tools, write MCP config + steering rules
-///   memoria-rs status     — show configuration status
-///   memoria-rs update-rules — update steering rules to latest version
-///   memoria-rs benchmark  — run benchmark against a Memoria API server
+///   memoria serve         — start REST API server
+///   memoria mcp           — start MCP server (embedded or remote mode)
+///   memoria init          — detect tools, write MCP config + steering rules
+///   memoria status        — show configuration status
+///   memoria update-rules  — update steering rules to latest version
+///   memoria benchmark     — run benchmark against a Memoria API server
 
 mod benchmark;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-const VERSION: &str = "0.1.23";
+const VERSION: &str = env!("CARGO_PKG_VERSION");
 const MCP_KEY: &str = "memoria";
 
 // ── Embedded steering templates ───────────────────────────────────────────────
@@ -24,7 +27,7 @@ const CLAUDE_RULE: &str = include_str!("../templates/claude_rule.md");
 // ── CLI ───────────────────────────────────────────────────────────────────────
 
 #[derive(Parser)]
-#[command(name = "memoria-rs", version = VERSION, about = "Configure AI tools for Memoria persistent memory")]
+#[command(name = "memoria", version = VERSION, about = "Memoria — persistent memory for AI agents")]
 struct Cli {
     /// Project directory (default: current)
     #[arg(long, default_value = ".")]
@@ -36,39 +39,82 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Start REST API server
+    Serve {
+        #[arg(long, env = "DATABASE_URL")]
+        db_url: Option<String>,
+        #[arg(long, env = "PORT", default_value = "8100")]
+        port: u16,
+        #[arg(long, env = "MASTER_KEY", default_value = "")]
+        master_key: String,
+    },
+    /// Start MCP server (embedded or remote mode)
+    Mcp {
+        /// Remote Memoria API URL (remote mode)
+        #[arg(long, env = "MEMORIA_API_URL")]
+        api_url: Option<String>,
+        /// Auth token for remote mode
+        #[arg(long, env = "MEMORIA_TOKEN")]
+        token: Option<String>,
+        /// MySQL connection URL (embedded mode)
+        #[arg(long, env = "DATABASE_URL")]
+        db_url: Option<String>,
+        /// Default user ID
+        #[arg(long, env = "MEMORIA_USER")]
+        user: Option<String>,
+        /// Embedding dimension
+        #[arg(long, env = "EMBEDDING_DIM")]
+        embedding_dim: Option<usize>,
+        /// Embedding base URL
+        #[arg(long, env = "EMBEDDING_BASE_URL")]
+        embedding_base_url: Option<String>,
+        /// Embedding API key
+        #[arg(long, env = "EMBEDDING_API_KEY")]
+        embedding_api_key: Option<String>,
+        /// Embedding model name
+        #[arg(long, env = "EMBEDDING_MODEL")]
+        embedding_model: Option<String>,
+        /// LLM API key
+        #[arg(long, env = "LLM_API_KEY")]
+        llm_api_key: Option<String>,
+        /// LLM base URL
+        #[arg(long, env = "LLM_BASE_URL")]
+        llm_base_url: Option<String>,
+        /// LLM model name
+        #[arg(long, env = "LLM_MODEL")]
+        llm_model: Option<String>,
+        /// Database name for git-for-data
+        #[arg(long, env = "MEMORIA_DB_NAME")]
+        db_name: Option<String>,
+        /// Transport: stdio (default) or sse
+        #[arg(long, default_value = "stdio")]
+        transport: String,
+        /// Port for SSE transport
+        #[arg(long, env = "MCP_PORT", default_value = "8200")]
+        mcp_port: u16,
+    },
     /// Write MCP config + steering rules
     Init {
-        /// Target tool: kiro, cursor, claude (repeatable; default: auto-detect)
         #[arg(long, value_name = "TOOL")]
         tool: Vec<String>,
-        /// Database URL for embedded mode
         #[arg(long)]
         db_url: Option<String>,
-        /// Memoria REST API URL for remote mode
         #[arg(long)]
         api_url: Option<String>,
-        /// API token for remote mode
         #[arg(long)]
         token: Option<String>,
-        /// Default user ID
         #[arg(long, default_value = "default")]
         user: String,
-        /// Overwrite customized rule files
         #[arg(long)]
         force: bool,
-        /// Embedding provider (openai, local)
         #[arg(long)]
         embedding_provider: Option<String>,
-        /// Embedding model name
         #[arg(long)]
         embedding_model: Option<String>,
-        /// Embedding dimension
         #[arg(long)]
         embedding_dim: Option<String>,
-        /// Embedding API key
         #[arg(long)]
         embedding_api_key: Option<String>,
-        /// Embedding API base URL
         #[arg(long)]
         embedding_base_url: Option<String>,
     },
@@ -78,25 +124,171 @@ enum Commands {
     UpdateRules,
     /// Run benchmark against a Memoria API server
     Benchmark {
-        /// API URL of the Memoria server
         #[arg(long, default_value = "http://127.0.0.1:8100")]
         api_url: String,
-        /// API token
         #[arg(long, default_value = "test-master-key-for-docker-compose")]
         token: String,
-        /// Dataset name (under benchmarks/datasets/)
         #[arg(long, default_value = "core-v1")]
         dataset: String,
-        /// Output JSON report path
         #[arg(long)]
         out: Option<String>,
-        /// Validate dataset only (no execution)
         #[arg(long)]
         validate_only: bool,
     },
 }
 
-// ── MCP entry builder ─────────────────────────────────────────────────────────
+// ── Serve (API server) ────────────────────────────────────────────────────────
+
+async fn cmd_serve(db_url: Option<String>, port: u16, master_key: String) -> Result<()> {
+    use memoria_api::{build_router, AppState};
+    use memoria_git::GitForDataService;
+    use memoria_service::{Config, MemoryService};
+    use memoria_storage::SqlMemoryStore;
+    use sqlx::mysql::MySqlPool;
+    use tower_http::trace::TraceLayer;
+    use tracing_subscriber::EnvFilter;
+
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::from_default_env())
+        .init();
+
+    let mut cfg = Config::from_env();
+    if let Some(v) = db_url { cfg.db_url = v; }
+
+    tracing::info!(
+        db_url = %cfg.db_url, port = port,
+        has_llm = cfg.has_llm(), has_embedding = cfg.has_embedding(),
+        "Starting Memoria API server"
+    );
+
+    let store = SqlMemoryStore::connect(&cfg.db_url, cfg.embedding_dim).await?;
+    store.migrate().await?;
+
+    let pool = MySqlPool::connect(&cfg.db_url).await?;
+    let git = Arc::new(GitForDataService::new(pool, &cfg.db_name));
+
+    let embedder = build_embedder(&cfg);
+    let llm = build_llm(&cfg);
+
+    let service = Arc::new(MemoryService::new_sql_with_llm(Arc::new(store), embedder, llm));
+    let state = AppState::new(service, git, master_key);
+
+    let app = build_router(state).layer(TraceLayer::new_for_http());
+    let addr = format!("0.0.0.0:{}", port);
+    tracing::info!("Listening on {addr}");
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
+// ── MCP server ────────────────────────────────────────────────────────────────
+
+async fn cmd_mcp(
+    api_url: Option<String>, token: Option<String>,
+    db_url: Option<String>, user: Option<String>,
+    embedding_dim: Option<usize>, embedding_base_url: Option<String>,
+    embedding_api_key: Option<String>, embedding_model: Option<String>,
+    llm_api_key: Option<String>, llm_base_url: Option<String>,
+    llm_model: Option<String>, db_name: Option<String>,
+    transport: String, mcp_port: u16,
+) -> Result<()> {
+    use memoria_git::GitForDataService;
+    use memoria_service::{Config, MemoryService};
+    use memoria_storage::SqlMemoryStore;
+    use sqlx::mysql::MySqlPool;
+
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .init();
+
+    // Remote mode
+    if let Some(api_url) = &api_url {
+        let user = user.clone().unwrap_or_else(|| "default".to_string());
+        tracing::info!(api_url = %api_url, user = %user, "Starting Memoria MCP (remote mode)");
+        let remote = memoria_mcp::remote::RemoteClient::new(
+            api_url,
+            token.as_deref(),
+            user.clone(),
+        );
+        return memoria_mcp::run_stdio_remote(remote, user).await;
+    }
+
+    // Embedded mode
+    let mut cfg = Config::from_env();
+    if let Some(v) = db_url { cfg.db_url = v; }
+    if let Some(v) = user { cfg.user = v; }
+    if let Some(v) = embedding_dim { cfg.embedding_dim = v; }
+    if let Some(v) = embedding_base_url { cfg.embedding_base_url = v; }
+    if let Some(v) = embedding_api_key { cfg.embedding_api_key = v; }
+    if let Some(v) = embedding_model { cfg.embedding_model = v; }
+    if let Some(v) = llm_api_key { cfg.llm_api_key = Some(v); }
+    if let Some(v) = llm_base_url { cfg.llm_base_url = v; }
+    if let Some(v) = llm_model { cfg.llm_model = v; }
+    if let Some(v) = db_name { cfg.db_name = v; }
+
+    tracing::info!(
+        db_url = %cfg.db_url,
+        embedding_provider = %cfg.embedding_provider,
+        has_llm = cfg.has_llm(),
+        user = %cfg.user,
+        "Starting Memoria MCP (embedded mode)"
+    );
+
+    let store = SqlMemoryStore::connect(&cfg.db_url, cfg.embedding_dim).await?;
+    store.migrate().await?;
+
+    let pool = MySqlPool::connect(&cfg.db_url).await?;
+    let git = Arc::new(GitForDataService::new(pool, &cfg.db_name));
+
+    let embedder = build_embedder(&cfg);
+    let llm = build_llm(&cfg);
+
+    let service = Arc::new(MemoryService::new_sql_with_llm(Arc::new(store), embedder, llm));
+    Arc::new(memoria_service::GovernanceScheduler::new(service.clone())).start();
+
+    if transport == "sse" {
+        memoria_mcp::run_sse(service, git, cfg.user, mcp_port).await
+    } else {
+        memoria_mcp::run_stdio(service, git, cfg.user).await
+    }
+}
+
+// ── Shared helpers ────────────────────────────────────────────────────────────
+
+fn build_embedder(cfg: &memoria_service::Config) -> Option<Arc<dyn memoria_core::interfaces::EmbeddingProvider>> {
+    use memoria_embedding::HttpEmbedder;
+
+    if cfg.has_embedding() {
+        Some(Arc::new(HttpEmbedder::new(
+            &cfg.embedding_base_url, &cfg.embedding_api_key,
+            &cfg.embedding_model, cfg.embedding_dim,
+        )) as Arc<dyn memoria_core::interfaces::EmbeddingProvider>)
+    } else if cfg.embedding_provider == "local" {
+        #[cfg(feature = "local-embedding")]
+        {
+            let local = memoria_embedding::LocalEmbedder::new(&cfg.embedding_model)
+                .expect("Failed to load local embedding model");
+            Some(Arc::new(local) as Arc<dyn memoria_core::interfaces::EmbeddingProvider>)
+        }
+        #[cfg(not(feature = "local-embedding"))]
+        {
+            tracing::error!("EMBEDDING_PROVIDER=local but compiled without local-embedding feature");
+            None
+        }
+    } else {
+        None
+    }
+}
+
+fn build_llm(cfg: &memoria_service::Config) -> Option<Arc<memoria_embedding::LlmClient>> {
+    cfg.llm_api_key.as_ref().map(|key| {
+        Arc::new(memoria_embedding::LlmClient::new(
+            key.clone(), cfg.llm_base_url.clone(), cfg.llm_model.clone(),
+        ))
+    })
+}
+
+// ── Init / Status / UpdateRules (unchanged logic) ─────────────────────────────
 
 fn mcp_entry(
     db_url: Option<&str>,
@@ -109,133 +301,139 @@ fn mcp_entry(
     embedding_api_key: Option<&str>,
     embedding_base_url: Option<&str>,
 ) -> serde_json::Value {
-    let cmd = which_cmd("memoria-mcp-rs").unwrap_or_else(|| "memoria-mcp-rs".to_string());
+    let mut args = vec![];
+    let mut env = serde_json::Map::new();
 
     if let Some(url) = api_url {
-        let mut args = vec![serde_json::json!("--api-url"), serde_json::json!(url)];
+        // Remote mode
+        args.push("--api-url".to_string());
+        args.push(url.to_string());
         if let Some(t) = token {
-            args.push(serde_json::json!("--token"));
-            args.push(serde_json::json!(t));
+            args.push("--token".to_string());
+            args.push(t.to_string());
         }
-        if user != "default" {
-            args.push(serde_json::json!("--user"));
-            args.push(serde_json::json!(user));
+    } else {
+        // Embedded mode
+        let url = db_url.unwrap_or("mysql://root:111@localhost:6001/memoria");
+        args.push("--db-url".to_string());
+        args.push(url.to_string());
+        args.push("--user".to_string());
+        args.push(user.to_string());
+
+        // Embedding config → env block
+        if let Some(p) = embedding_provider {
+            env.insert("EMBEDDING_PROVIDER".into(), p.into());
         }
-        return serde_json::json!({"command": cmd, "args": args});
-    }
-
-    let db = db_url.unwrap_or("mysql://root:111@localhost:6001/memoria");
-    let mut args = vec![
-        serde_json::json!("--db-url"), serde_json::json!(db),
-    ];
-    if user != "default" {
-        args.push(serde_json::json!("--user"));
-        args.push(serde_json::json!(user));
-    }
-
-    // Only include env vars the user actually provided; placeholder the rest
-    let mut env = serde_json::Map::new();
-    let fields: &[(&str, Option<&str>)] = &[
-        ("EMBEDDING_PROVIDER", embedding_provider),
-        ("EMBEDDING_BASE_URL", embedding_base_url),
-        ("EMBEDDING_API_KEY", embedding_api_key),
-        ("EMBEDDING_MODEL", embedding_model),
-        ("EMBEDDING_DIM", embedding_dim),
-    ];
-    for &(key, val) in fields {
-        if let Some(v) = val {
-            env.insert(key.to_string(), serde_json::json!(v));
+        if let Some(u) = embedding_base_url {
+            env.insert("EMBEDDING_BASE_URL".into(), u.into());
+        }
+        if let Some(k) = embedding_api_key {
+            env.insert("EMBEDDING_API_KEY".into(), k.into());
+        }
+        if let Some(m) = embedding_model {
+            env.insert("EMBEDDING_MODEL".into(), m.into());
+        }
+        if let Some(d) = embedding_dim {
+            env.insert("EMBEDDING_DIM".into(), d.into());
         }
     }
-    let env = serde_json::Value::Object(env);
 
-    let mut entry = serde_json::json!({"command": cmd, "args": args});
-    if !env.as_object().unwrap().is_empty() {
-        entry["env"] = env;
+    // Use subcommand: memoria mcp [args]
+    let mut full_args = vec!["mcp".to_string()];
+    full_args.extend(args);
+
+    let mut entry = serde_json::json!({
+        "command": "memoria",
+        "args": full_args,
+    });
+    if !env.is_empty() {
+        entry["env"] = serde_json::Value::Object(env);
     }
     entry
 }
 
 fn which_cmd(name: &str) -> Option<String> {
-    std::env::var("PATH").ok().and_then(|path| {
-        for dir in path.split(':') {
-            let p = Path::new(dir).join(name);
-            if p.exists() { return Some(p.to_string_lossy().to_string()); }
-        }
-        None
-    })
+    std::process::Command::new("which")
+        .arg(name)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
 }
-
-// ── Detection ─────────────────────────────────────────────────────────────────
 
 fn detect_tools(project_dir: &Path) -> Vec<String> {
-    let mut found = Vec::new();
-    if project_dir.join(".kiro").is_dir() { found.push("kiro".to_string()); }
-    if project_dir.join(".cursor").is_dir() || project_dir.join(".cursorrc").exists() {
-        found.push("cursor".to_string());
+    let mut tools = vec![];
+    if project_dir.join(".kiro").exists() || which_cmd("kiro").is_some() {
+        tools.push("kiro".to_string());
     }
-    if project_dir.join("CLAUDE.md").exists() || project_dir.join(".claude").is_dir() {
-        found.push("claude".to_string());
+    if project_dir.join(".cursor").exists() || which_cmd("cursor").is_some() {
+        tools.push("cursor".to_string());
     }
-    found
+    if project_dir.join(".mcp.json").exists() || which_cmd("claude").is_some() {
+        tools.push("claude".to_string());
+    }
+    tools
 }
-
-// ── Write helpers ─────────────────────────────────────────────────────────────
 
 fn installed_version(path: &Path) -> Option<String> {
     let content = std::fs::read_to_string(path).ok()?;
-    let re = regex_version(&content)?;
-    Some(re)
+    regex_version(&content)
 }
 
 fn regex_version(content: &str) -> Option<String> {
-    let marker = "memoria-version:";
-    let pos = content.find(marker)?;
-    let rest = content[pos + marker.len()..].trim();
-    let end = rest.find(|c: char| !c.is_ascii_digit() && c != '.').unwrap_or(rest.len());
-    Some(rest[..end].trim().to_string())
+    content
+        .lines()
+        .find(|l| l.contains("memoria-version:"))
+        .and_then(|l| l.split("memoria-version:").nth(1))
+        .map(|v| v.trim().trim_end_matches("-->").trim().to_string())
 }
 
 fn write_rule(path: &Path, content: &str, force: bool, project_dir: &Path) -> String {
-    let rel = path.strip_prefix(project_dir).unwrap_or(path).display().to_string();
-    if !path.exists() {
-        std::fs::create_dir_all(path.parent().unwrap()).ok();
-        std::fs::write(path, content).ok();
-        return format!("  ✅ {rel} (created)");
-    }
-    let installed = installed_version(path);
-    let new_ver = regex_version(&content[..content.len().min(500)]);
-    if installed.as_deref() == new_ver.as_deref() {
-        return format!("  ⏭️  {rel} (up to date)");
-    }
-    if !force {
-        if let Some(ref _iv) = installed {
-            let bak = path.with_extension(format!("{}.bak", path.extension().and_then(|e| e.to_str()).unwrap_or("")));
-            if let Ok(existing) = std::fs::read_to_string(path) {
-                std::fs::write(&bak, existing).ok();
+    let relative = path.strip_prefix(project_dir).unwrap_or(path);
+    if path.exists() && !force {
+        let installed = installed_version(path);
+        let bundled = regex_version(content);
+        match (&installed, &bundled) {
+            (Some(i), Some(b)) if i == b => {
+                return format!("  ✓ {} (v{}, up to date)", relative.display(), i);
+            }
+            (Some(i), Some(b)) => {
+                return format!(
+                    "  ⚠ {} (v{} installed, v{} available — run update-rules or use --force)",
+                    relative.display(), i, b
+                );
+            }
+            _ => {
+                return format!("  ⚠ {} (exists, skipped — use --force to overwrite)", relative.display());
             }
         }
     }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
     std::fs::write(path, content).ok();
-    let from = installed.as_deref().unwrap_or("?");
-    let to = new_ver.as_deref().unwrap_or("?");
-    format!("  ✅ {rel} (updated {from} → {to})")
+    let ver = regex_version(content).map(|v| format!(" (v{})", v)).unwrap_or_default();
+    format!("  ✓ {}{}", relative.display(), ver)
 }
 
 fn write_mcp_json(path: &Path, entry: &serde_json::Value, project_dir: &Path) -> String {
-    let rel = path.strip_prefix(project_dir).unwrap_or(path).display().to_string();
-    let mut config: serde_json::Value = if path.exists() {
-        std::fs::read_to_string(path).ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_else(|| serde_json::json!({"mcpServers": {}}))
-    } else {
-        serde_json::json!({"mcpServers": {}})
-    };
-    config["mcpServers"][MCP_KEY] = entry.clone();
-    std::fs::create_dir_all(path.parent().unwrap()).ok();
-    let content = serde_json::to_string_pretty(&config).unwrap_or_default() + "\n";
-    std::fs::write(path, content).ok();
-    format!("  ✅ {rel}")
+    let relative = path.strip_prefix(project_dir).unwrap_or(path);
+    let wrapper = serde_json::json!({ "mcpServers": { MCP_KEY: entry } });
+
+    if path.exists() {
+        if let Ok(content) = std::fs::read_to_string(path) {
+            if let Ok(mut existing) = serde_json::from_str::<serde_json::Value>(&content) {
+                existing["mcpServers"][MCP_KEY] = entry.clone();
+                std::fs::write(path, serde_json::to_string_pretty(&existing).unwrap()).ok();
+                return format!("  ✓ {} (updated memoria entry)", relative.display());
+            }
+        }
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    std::fs::write(path, serde_json::to_string_pretty(&wrapper).unwrap()).ok();
+    format!("  ✓ {} (created)", relative.display())
 }
 
 fn configure_kiro(project_dir: &Path, entry: &serde_json::Value, force: bool) -> Vec<String> {
@@ -253,117 +451,120 @@ fn configure_cursor(project_dir: &Path, entry: &serde_json::Value, force: bool) 
 }
 
 fn configure_claude(project_dir: &Path, entry: &serde_json::Value, _force: bool) -> Vec<String> {
-    let mut actions = vec![
+    let mut results = vec![
         write_mcp_json(&project_dir.join(".mcp.json"), entry, project_dir),
     ];
     let claude_md = project_dir.join("CLAUDE.md");
     if claude_md.exists() {
-        let existing = std::fs::read_to_string(&claude_md).unwrap_or_default();
-        if existing.contains("memoria-version:") {
-            actions.push("  ⏭️  CLAUDE.md (already configured)".to_string());
+        let content = std::fs::read_to_string(&claude_md).unwrap_or_default();
+        if !content.contains("memory_retrieve") {
+            let mut f = std::fs::OpenOptions::new().append(true).open(&claude_md).unwrap();
+            use std::io::Write;
+            writeln!(f, "\n\n{}", CLAUDE_RULE).ok();
+            results.push(format!("  ✓ CLAUDE.md (appended memory rules)"));
         } else {
-            let new_content = format!("{}\n\n{}", existing.trim_end(), CLAUDE_RULE);
-            std::fs::write(&claude_md, new_content).ok();
-            actions.push("  ✅ CLAUDE.md (appended)".to_string());
+            results.push(format!("  ✓ CLAUDE.md (already has memory rules)"));
         }
     } else {
         std::fs::write(&claude_md, CLAUDE_RULE).ok();
-        actions.push("  ✅ CLAUDE.md (created)".to_string());
+        results.push(format!("  ✓ CLAUDE.md (created)"));
     }
-    actions
+    results
 }
 
-// ── Commands ──────────────────────────────────────────────────────────────────
-
 fn cmd_init(
-    project_dir: &Path,
-    tools: Vec<String>,
-    db_url: Option<String>,
-    api_url: Option<String>,
-    token: Option<String>,
-    user: String,
-    force: bool,
-    embedding_provider: Option<String>,
-    embedding_model: Option<String>,
-    embedding_dim: Option<String>,
-    embedding_api_key: Option<String>,
+    project_dir: &Path, tools: Vec<String>,
+    db_url: Option<String>, api_url: Option<String>, token: Option<String>,
+    user: String, force: bool,
+    embedding_provider: Option<String>, embedding_model: Option<String>,
+    embedding_dim: Option<String>, embedding_api_key: Option<String>,
     embedding_base_url: Option<String>,
 ) {
-    let detected = if tools.is_empty() { detect_tools(project_dir) } else { tools };
-    if detected.is_empty() {
-        println!("No AI tools detected. Use --tool kiro|cursor|claude to specify.");
-        return;
-    }
-
     let entry = mcp_entry(
         db_url.as_deref(), api_url.as_deref(), token.as_deref(), &user,
         embedding_provider.as_deref(), embedding_model.as_deref(),
-        embedding_dim.as_deref(), embedding_api_key.as_deref(), embedding_base_url.as_deref(),
+        embedding_dim.as_deref(), embedding_api_key.as_deref(),
+        embedding_base_url.as_deref(),
     );
 
-    for tool in &detected {
-        println!("{tool}:");
-        let actions = match tool.as_str() {
+    let targets = if tools.is_empty() {
+        let detected = detect_tools(project_dir);
+        if detected.is_empty() {
+            println!("No AI tools detected. Use --tool kiro|cursor|claude");
+            return;
+        }
+        println!("Auto-detected: {}", detected.join(", "));
+        detected
+    } else {
+        tools
+    };
+
+    for tool in &targets {
+        println!("\n[{}]", tool);
+        let results = match tool.as_str() {
             "kiro" => configure_kiro(project_dir, &entry, force),
             "cursor" => configure_cursor(project_dir, &entry, force),
             "claude" => configure_claude(project_dir, &entry, force),
-            _ => { println!("  ⚠️  Unknown tool: {tool}"); continue; }
+            _ => {
+                println!("  ⚠ Unknown tool: {}", tool);
+                continue;
+            }
         };
-        for line in actions { println!("{line}"); }
+        for r in results { println!("{}", r); }
     }
-    println!("\nDone! Restart your AI tool to load the MCP server.");
+    println!("\nRestart your AI tool to load the new configuration.");
 }
 
 fn cmd_status(project_dir: &Path) {
-    let configs = [
-        ("kiro",   ".kiro/settings/mcp.json",    ".kiro/steering/memory.md"),
-        ("cursor", ".cursor/mcp.json",            ".cursor/rules/memory.mdc"),
-        ("claude", ".mcp.json",                   "CLAUDE.md"),
-    ];
-    let mut found_any = false;
-    for (tool, mcp_path, rule_path) in &configs {
-        let mcp = project_dir.join(mcp_path);
-        if !mcp.exists() { continue; }
-        found_any = true;
-        let has_mcp = std::fs::read_to_string(&mcp).ok()
-            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-            .map(|v| v["mcpServers"].get(MCP_KEY).is_some())
-            .unwrap_or(false);
-        let ver = installed_version(&project_dir.join(rule_path));
-        let mcp_status = if has_mcp { "✅" } else { "❌ not configured" };
-        let rule_status = match ver.as_deref() {
-            Some(v) if v == VERSION => format!("✅ v{v}"),
-            Some(v) => format!("⚠️  outdated ({v})"),
-            None => "❌ missing".to_string(),
+    println!("Memoria status ({})\n", project_dir.display());
+    let tools = detect_tools(project_dir);
+    if tools.is_empty() {
+        println!("No AI tool configs found.");
+    }
+    for tool in &tools {
+        let (mcp_path, rule_path) = match tool.as_str() {
+            "kiro" => (".kiro/settings/mcp.json", ".kiro/steering/memory.md"),
+            "cursor" => (".cursor/mcp.json", ".cursor/rules/memory.mdc"),
+            "claude" => (".mcp.json", "CLAUDE.md"),
+            _ => continue,
         };
-        println!("  {tool}: mcp={mcp_status}  rules={rule_status}");
+        println!("[{}]", tool);
+        let mcp = project_dir.join(mcp_path);
+        if mcp.exists() { println!("  ✓ {}", mcp_path); } else { println!("  ✗ {} (missing)", mcp_path); }
+        let rule = project_dir.join(rule_path);
+        if rule.exists() {
+            let ver = installed_version(&rule).map(|v| format!(" (v{})", v)).unwrap_or_default();
+            println!("  ✓ {}{}", rule_path, ver);
+        } else {
+            println!("  ✗ {} (missing)", rule_path);
+        }
     }
-    if !found_any {
-        println!("No configuration found. Run 'memoria-rs init' first.");
-    }
+    let bundled = regex_version(KIRO_STEERING).unwrap_or_else(|| "unknown".into());
+    println!("\nBundled rule version: {}", bundled);
 }
 
 fn cmd_update_rules(project_dir: &Path) {
-    let rules = [
-        ("kiro",   project_dir.join(".kiro/steering/memory.md"),    KIRO_STEERING),
-        ("cursor", project_dir.join(".cursor/rules/memory.mdc"),    CURSOR_RULE),
-        ("claude", project_dir.join("CLAUDE.md"),                   CLAUDE_RULE),
-    ];
-    let mut updated = 0;
-    for (tool, path, content) in &rules {
-        if path.exists() {
-            std::fs::write(path, content).ok();
-            println!("  ✅ {tool}: rules updated to v{VERSION}");
-            updated += 1;
-        }
+    let tools = detect_tools(project_dir);
+    if tools.is_empty() {
+        println!("No AI tool configs found. Run 'memoria init' first.");
+        return;
     }
-    if updated == 0 {
-        println!("No rule files found. Run 'memoria-rs init' first.");
+    for tool in &tools {
+        println!("[{}]", tool);
+        let result = match tool.as_str() {
+            "kiro" => write_rule(&project_dir.join(".kiro/steering/memory.md"), KIRO_STEERING, true, project_dir),
+            "cursor" => write_rule(&project_dir.join(".cursor/rules/memory.mdc"), CURSOR_RULE, true, project_dir),
+            "claude" => {
+                println!("  ⚠ CLAUDE.md — manual update recommended");
+                continue;
+            }
+            _ => continue,
+        };
+        println!("{}", result);
     }
 }
 
 fn cmd_benchmark(api_url: &str, token: &str, dataset: &str, out: Option<&str>, validate_only: bool) {
-    // Resolve dataset path: try as-is, then benchmarks/datasets/{name}.json
     let dataset_path = {
         let p = Path::new(dataset);
         if p.exists() { p.to_path_buf() }
@@ -447,6 +648,28 @@ fn main() -> Result<()> {
     let project_dir = cli.dir.canonicalize().unwrap_or(cli.dir);
 
     match cli.command {
+        Commands::Serve { db_url, port, master_key } => {
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?
+                .block_on(cmd_serve(db_url, port, master_key))?;
+        }
+        Commands::Mcp {
+            api_url, token, db_url, user,
+            embedding_dim, embedding_base_url, embedding_api_key, embedding_model,
+            llm_api_key, llm_base_url, llm_model, db_name,
+            transport, mcp_port,
+        } => {
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?
+                .block_on(cmd_mcp(
+                    api_url, token, db_url, user,
+                    embedding_dim, embedding_base_url, embedding_api_key, embedding_model,
+                    llm_api_key, llm_base_url, llm_model, db_name,
+                    transport, mcp_port,
+                ))?;
+        }
         Commands::Init {
             tool, db_url, api_url, token, user, force,
             embedding_provider, embedding_model, embedding_dim,

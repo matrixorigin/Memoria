@@ -16,6 +16,7 @@ jobs:
             os: ubuntu-latest
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
+            cross: true
           - target: x86_64-apple-darwin
             os: macos-latest
           - target: aarch64-apple-darwin
@@ -32,31 +33,34 @@ jobs:
         with:
           workspaces: memoria
 
-      - name: Install cross-compilation tools (aarch64-linux)
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu pkg-config libssl-dev
-
       - name: Install build deps (x86_64-linux)
         if: matrix.target == 'x86_64-unknown-linux-gnu'
         run: |
           sudo apt-get update
           sudo apt-get install -y pkg-config libssl-dev
 
-      - name: Build
+      - name: Install cross
+        if: matrix.cross
+        run: cargo install cross --locked
+
+      - name: Build (cross)
+        if: matrix.cross
         working-directory: memoria
         env:
           SQLX_OFFLINE: "true"
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+        run: cross build --release --target ${{ matrix.target }}
+
+      - name: Build (native)
+        if: ${{ !matrix.cross }}
+        working-directory: memoria
+        env:
+          SQLX_OFFLINE: "true"
         run: cargo build --release --target ${{ matrix.target }}
 
       - name: Package
         run: |
           mkdir -p dist
-          for bin in memoria-api memoria-mcp-rs memoria-rs; do
-            cp memoria/target/${{ matrix.target }}/release/$bin dist/ 2>/dev/null || true
-          done
+          cp memoria/target/${{ matrix.target }}/release/memoria dist/ 2>/dev/null || true
           cd dist && tar czf ../memoria-${{ matrix.target }}.tar.gz *
 
       - uses: actions/upload-artifact@v4
@@ -76,8 +80,18 @@ jobs:
         with:
           path: artifacts
 
+      - name: Generate checksums
+        run: |
+          cd artifacts
+          find . -name '*.tar.gz' -exec cp {} . \;
+          sha256sum *.tar.gz > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          files: artifacts/**/*.tar.gz
+          files: |
+            artifacts/*.tar.gz
+            artifacts/SHA256SUMS.txt
           generate_release_notes: true
+          prerelease: ${{ contains(github.ref, '-rc') || contains(github.ref, '-beta') || contains(github.ref, '-alpha') }}

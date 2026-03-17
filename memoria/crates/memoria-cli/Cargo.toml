@@ -1,15 +1,32 @@
 [package]
 name = "memoria-cli"
-version = "0.1.0"
+version.workspace = true
 edition = "2021"
 
+[features]
+default = []
+local-embedding = ["memoria-embedding/local-embedding"]
+
 [[bin]]
-name = "memoria-rs"
+name = "memoria"
 path = "src/main.rs"
 
 [dependencies]
+memoria-core = { workspace = true }
+memoria-storage = { workspace = true }
+memoria-embedding = { workspace = true }
+memoria-service = { workspace = true }
+memoria-git = { workspace = true }
+memoria-mcp = { workspace = true }
+memoria-api = { workspace = true }
+axum = { workspace = true }
+tokio = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tower-http = { workspace = true }
+sqlx = { workspace = true }
 reqwest = { version = "0.12", features = ["json", "blocking"] }

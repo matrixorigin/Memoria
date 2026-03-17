@@ -129,8 +129,8 @@ Cursor:  Now I'll create the MCP config for Cursor. Edit .cursor/mcp.json:
            {
              "mcpServers": {
                "memoria": {
-                 "command": "memoria-mcp",
-                 "args": ["--db-url", "mysql+pymysql://root:111@localhost:6001/memoria",
+                 "command": "memoria",
+                 "args": ["mcp", "--db-url", "mysql+pymysql://root:111@localhost:6001/memoria",
                           "--user", "alice"],
                  "env": {
                    "EMBEDDING_PROVIDER": "openai",
@@ -159,7 +159,7 @@ Cursor:  Let me check by calling memory_retrieve("test"):
 
 ## Quick Start
 
-`memoria-mcp` runs in two modes — pick one before starting:
+`memoria mcp` runs in two modes — pick one before starting:
 
 | | Embedded mode | Remote mode |
 |---|---|---|
@@ -258,8 +258,8 @@ Or ask your AI tool: *"Do you have memory tools available?"* — it should list 
 {
   "mcpServers": {
     "memoria": {
-      "command": "memoria-mcp",
-      "args": ["--api-url", "https://your-server:8100", "--token", "sk-your-key..."]
+      "command": "memoria",
+      "args": ["mcp", "--api-url", "https://your-server:8100", "--token", "sk-your-key..."]
     }
   }
 }
@@ -270,8 +270,8 @@ Or ask your AI tool: *"Do you have memory tools available?"* — it should list 
 {
   "mcpServers": {
     "memoria": {
-      "command": "memoria-mcp",
-      "args": ["--db-url", "mysql+pymysql://root:111@localhost:6001/memoria", "--user", "alice"],
+      "command": "memoria",
+      "args": ["mcp", "--db-url", "mysql+pymysql://root:111@localhost:6001/memoria", "--user", "alice"],
       "env": {
         "EMBEDDING_PROVIDER": "openai",
         "EMBEDDING_BASE_URL": "https://api.siliconflow.cn/v1",
@@ -315,8 +315,8 @@ Or manually create `.kiro/settings/mcp.json`:
 {
   "mcpServers": {
     "memoria": {
-      "command": "memoria-mcp",
-      "args": ["--db-url", "mysql+pymysql://root:111@localhost:6001/memoria", "--user", "alice"]
+      "command": "memoria",
+      "args": ["mcp", "--db-url", "mysql+pymysql://root:111@localhost:6001/memoria", "--user", "alice"]
     }
   }
 }
@@ -526,9 +526,9 @@ AI:  → calls memory_branch(name="debug", from_timestamp="2026-03-11 10:00:00")
 
 | Command | Description |
 |---------|-------------|
-| `memoria-mcp --db-url <url> --user <id>` | Start MCP server in embedded mode (direct DB) |
-| `memoria-mcp --api-url <url> --token <key>` | Start MCP server in remote mode (proxy to REST API) |
-| `memoria-mcp --transport sse` | Start with SSE transport instead of stdio |
+| `memoria mcp --db-url <url> --user <id>` | Start MCP server in embedded mode (direct DB) |
+| `memoria mcp --api-url <url> --token <key>` | Start MCP server in remote mode (proxy to REST API) |
+| `memoria mcp --transport sse` | Start with SSE transport instead of stdio |
 
 ---
 
@@ -550,8 +550,8 @@ Memoria uses the [Model Context Protocol (MCP)](https://modelcontextprotocol.io)
 {
   "mcpServers": {
     "memoria": {
-      "command": "memoria-mcp",
-      "args": ["--db-url", "mysql+pymysql://root:111@localhost:6001/memoria", "--user", "alice"],
+      "command": "memoria",
+      "args": ["mcp", "--db-url", "mysql+pymysql://root:111@localhost:6001/memoria", "--user", "alice"],
       "env": {
         "EMBEDDING_PROVIDER": "openai",
         "EMBEDDING_API_KEY": "sk-...",
@@ -569,8 +569,8 @@ Or in remote mode (proxy to a deployed Memoria REST API):
 {
   "mcpServers": {
     "memoria": {
-      "command": "memoria-mcp",
-      "args": ["--api-url", "https://memoria-host:8100", "--token", "sk-your-key..."]
+      "command": "memoria",
+      "args": ["mcp", "--api-url", "https://memoria-host:8100", "--token", "sk-your-key..."]
     }
   }
 }
@@ -600,9 +600,9 @@ Expected with local embedding — model loads into memory on first query (~3-5s)
 
 ### AI tool doesn't seem to use memory
 
-1. Verify `memoria-mcp` is in PATH: `which memoria-mcp`
+1. Verify `memoria` is in PATH: `which memoria`
 2. Restart the AI tool after editing the MCP config
-3. Test the server directly: `memoria-mcp --db-url "mysql+pymysql://root:111@localhost:6001/memoria"`
+3. Test the server directly: `memoria mcp --db-url "mysql+pymysql://root:111@localhost:6001/memoria"`
 
 ### `memory_reflect` / `memory_extract_entities` returns "LLM not configured"
 

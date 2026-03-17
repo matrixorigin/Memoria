@@ -12,6 +12,7 @@ members = [
 ]
 
 [workspace.package]
+version = "0.1.0"
 rust-version = "1.85"
 
 [workspace.dependencies]
@@ -39,6 +40,7 @@ memoria-storage = { path = "crates/memoria-storage" }
 memoria-embedding = { path = "crates/memoria-embedding" }
 memoria-service = { path = "crates/memoria-service" }
 memoria-git = { path = "crates/memoria-git" }
+memoria-api = { path = "crates/memoria-api" }
 memoria-mcp = { path = "crates/memoria-mcp" }
 
 [patch.crates-io]

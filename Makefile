@@ -113,12 +113,55 @@ dev: check-env
 		LLM_BASE_URL=$${MEMORIA_LLM_BASE_URL:-} \
 		LLM_MODEL=$${MEMORIA_LLM_MODEL:-} \
 		MASTER_KEY=$${MEMORIA_MASTER_KEY:-} \
-		cargo run -p memoria-api
+		cargo run -p memoria-cli -- serve
 
 build:
-	@echo "Building release binaries..."
-	@cd memoria && SQLX_OFFLINE=true cargo build --release
-	@echo "Binaries: memoria/target/release/{memoria-api,memoria-mcp-rs,memoria-rs}"
+	@echo "Building release binary..."
+	@cd memoria && SQLX_OFFLINE=true cargo build --release -p memoria-cli
+	@echo "Binary: memoria/target/release/memoria"
+
+# ── Release ─────────────────────────────────────────────────────────
+
+# Usage: make release VERSION=0.2.0
+release:
+	@if [ -z "$(VERSION)" ]; then echo "❌ Usage: make release VERSION=x.y.z"; exit 1; fi
+	@git diff --quiet || (echo "❌ Uncommitted changes — commit first"; exit 1)
+	@echo "==> Bumping version to $(VERSION)..."
+	@sed -i 's/^version = ".*"/version = "$(VERSION)"/' memoria/Cargo.toml
+	@cd memoria && cargo check 2>/dev/null
+	@echo "==> Generating CHANGELOG..."
+	@if command -v git-cliff >/dev/null 2>&1; then \
+		git-cliff --tag "v$(VERSION)" -o CHANGELOG.md; \
+	else \
+		echo "⚠️  git-cliff not installed — skipping CHANGELOG (cargo install git-cliff)"; \
+	fi
+	@git add memoria/Cargo.toml memoria/Cargo.lock CHANGELOG.md 2>/dev/null
+	@git commit -m "chore(release): v$(VERSION)"
+	@git tag -a "v$(VERSION)" -m "Release v$(VERSION)"
+	@echo "==> Pushing..."
+	@git push && git push origin "v$(VERSION)"
+	@echo "✅ v$(VERSION) released — CI will build binaries + Docker image"
+
+# Pre-release: make release-rc VERSION=0.2.0-rc1
+release-rc:
+	@if [ -z "$(VERSION)" ]; then echo "❌ Usage: make release-rc VERSION=x.y.z-rcN"; exit 1; fi
+	@git diff --quiet || (echo "❌ Uncommitted changes — commit first"; exit 1)
+	@sed -i 's/^version = ".*"/version = "$(VERSION)"/' memoria/Cargo.toml
+	@cd memoria && cargo check 2>/dev/null
+	@git add memoria/Cargo.toml memoria/Cargo.lock 2>/dev/null
+	@git commit -m "chore(release): v$(VERSION)"
+	@git tag -a "v$(VERSION)" -m "Pre-release v$(VERSION)"
+	@git push && git push origin "v$(VERSION)"
+	@echo "✅ Pre-release v$(VERSION) pushed"
+
+# Push Docker image locally (without CI)
+release-docker:
+	@docker compose build api
+	@docker tag memoria-api:latest matrixorigin/memoria:latest
+	@if [ -n "$(VERSION)" ]; then docker tag memoria-api:latest matrixorigin/memoria:$(VERSION); fi
+	@docker push matrixorigin/memoria:latest
+	@if [ -n "$(VERSION)" ]; then docker push matrixorigin/memoria:$(VERSION); fi
+	@echo "✅ Pushed to Docker Hub"
 
 check:
 	@cd memoria && cargo check && cargo clippy -- -D warnings 2>/dev/null || cargo check

@@ -8,7 +8,7 @@ When the user wants to set up Memoria, **do NOT jump straight into installation*
 
 ## Two MCP Modes — Ask First
 
-`memoria-mcp` has two distinct modes. **Determine which one applies before doing anything else.**
+`memoria mcp` has two distinct modes. **Determine which one applies before doing anything else.**
 
 | | Embedded mode | Remote mode |
 |---|---|---|
@@ -198,8 +198,8 @@ The resulting `mcp.json` will be:
 {
   "mcpServers": {
     "memoria": {
-      "command": "memoria-mcp",
-      "args": ["--api-url", "https://memoria-host:8100", "--token", "sk-your-key..."]
+      "command": "memoria",
+      "args": ["mcp", "--api-url", "https://memoria-host:8100", "--token", "sk-your-key..."]
     }
   }
 }

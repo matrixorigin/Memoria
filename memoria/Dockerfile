@@ -40,7 +40,7 @@ RUN cargo build --release || true
 
 # Now copy real source and build
 COPY memoria/ .
-RUN cargo build --release --bin memoria-api --bin memoria-mcp-rs --bin memoria-rs
+RUN cargo build --release --bin memoria
 
 # ── Stage 2: runtime ───────────────────────────────────────────────────────
 FROM debian:bookworm-slim
@@ -49,9 +49,7 @@ RUN sed -i 's|deb.debian.org|mirrors.aliyun.com|g' /etc/apt/sources.list.d/debia
 RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/* && \
     useradd -m -u 1000 appuser && \
     mkdir -p /var/log/memoria && chown appuser:appuser /var/log/memoria
-COPY --from=builder /build/target/release/memoria-api /usr/local/bin/
-COPY --from=builder /build/target/release/memoria-mcp-rs /usr/local/bin/
-COPY --from=builder /build/target/release/memoria-rs /usr/local/bin/
+COPY --from=builder /build/target/release/memoria /usr/local/bin/
 USER appuser
 EXPOSE 8100
-CMD ["sh", "-c", "memoria-api 2>&1 | tee -a /var/log/memoria/api.log"]
+CMD ["sh", "-c", "memoria serve 2>&1 | tee -a /var/log/memoria/api.log"]

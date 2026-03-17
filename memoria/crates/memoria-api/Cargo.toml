@@ -1,15 +1,11 @@
 [package]
 name = "memoria-api"
-version = "0.1.0"
+version.workspace = true
 edition = "2021"
 
 [features]
 default = []
 local-embedding = ["memoria-embedding/local-embedding"]
-
-[[bin]]
-name = "memoria-api"
-path = "src/main.rs"
 
 [lib]
 name = "memoria_api"
