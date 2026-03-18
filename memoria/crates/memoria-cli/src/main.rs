@@ -874,11 +874,9 @@ fn cmd_init_interactive(project_dir: &Path, force: bool) {
     let db_ok = check_db(&db_url);
     let emb_ok = check_embedding(&emb_base_url, &emb_api_key, &emb_model);
 
-    if !db_ok || !emb_ok {
-        if !prompt_confirm("Continue anyway?") {
-            println!("  Aborted.");
-            return;
-        }
+    if (!db_ok || !emb_ok) && !prompt_confirm("Continue anyway?") {
+        println!("  Aborted.");
+        return;
     }
 
     println!();
