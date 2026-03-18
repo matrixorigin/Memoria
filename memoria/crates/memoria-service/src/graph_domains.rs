@@ -151,8 +151,7 @@ impl GraphDomainStore for GraphStore {
         confidence_factor: f32,
         old_confidence: f32,
     ) -> Result<(), MemoriaError> {
-        GraphStore::mark_conflict(self, older_id, newer_id, confidence_factor, old_confidence)
-            .await
+        GraphStore::mark_conflict(self, older_id, newer_id, confidence_factor, old_confidence).await
     }
 
     async fn deactivate_node(&self, node_id: &str) -> Result<(), MemoriaError> {
@@ -244,8 +243,10 @@ impl ConflictDetector for DefaultConflictDetector {
             .into_iter()
             .collect();
         let nodes = store.get_nodes_by_ids(&candidate_ids).await?;
-        let node_map: HashMap<String, GraphNode> =
-            nodes.into_iter().map(|node| (node.node_id.clone(), node)).collect();
+        let node_map: HashMap<String, GraphNode> = nodes
+            .into_iter()
+            .map(|node| (node.node_id.clone(), node))
+            .collect();
 
         let mut conflicts = Vec::new();
         for (src_id, tgt_id, edge_weight, current_similarity) in candidates {
@@ -275,7 +276,12 @@ impl ConflictDetector for DefaultConflictDetector {
             };
             let memory_ids = [older, newer]
                 .iter()
-                .map(|entry| entry.memory_id.clone().unwrap_or_else(|| entry.node_id.clone()))
+                .map(|entry| {
+                    entry
+                        .memory_id
+                        .clone()
+                        .unwrap_or_else(|| entry.node_id.clone())
+                })
                 .collect();
 
             conflicts.push(Conflict {
@@ -354,7 +360,9 @@ impl DefaultConsolidationStrategy {
         store: &dyn GraphDomainStore,
         user_id: &str,
     ) -> Result<(Vec<StrategyDecision>, usize, usize), MemoriaError> {
-        let scenes = store.get_user_nodes(user_id, &NodeType::Scene, true).await?;
+        let scenes = store
+            .get_user_nodes(user_id, &NodeType::Scene, true)
+            .await?;
         let mut decisions = Vec::new();
         let mut deactivated = 0usize;
         let mut downgraded = 0usize;
@@ -451,8 +459,10 @@ impl ConsolidationStrategy for DefaultConsolidationStrategy {
                 .into_iter()
                 .collect();
             let nodes = store.get_nodes_by_ids(&node_ids).await?;
-            let node_map: HashMap<String, GraphNode> =
-                nodes.into_iter().map(|node| (node.node_id.clone(), node)).collect();
+            let node_map: HashMap<String, GraphNode> = nodes
+                .into_iter()
+                .map(|node| (node.node_id.clone(), node))
+                .collect();
 
             for conflict in &conflicts {
                 if conflict.node_ids.len() != 2 {
@@ -475,9 +485,8 @@ impl ConsolidationStrategy for DefaultConsolidationStrategy {
                 decisions.push(StrategyDecision {
                     action: "mark_conflict".to_string(),
                     confidence: Some(conflict.severity),
-                    rationale:
-                        "Conflicting semantic memories were flagged for later resolution"
-                            .to_string(),
+                    rationale: "Conflicting semantic memories were flagged for later resolution"
+                        .to_string(),
                     evidence: conflict.evidence.clone(),
                     rollback_hint: None,
                 });
@@ -727,9 +736,7 @@ mod tests {
             cross_session_count: 3,
             is_active: true,
             superseded_by: None,
-            created_at: Some(
-                chrono::Utc::now().naive_utc() - chrono::Duration::days(age_days),
-            ),
+            created_at: Some(chrono::Utc::now().naive_utc() - chrono::Duration::days(age_days)),
         }
     }
 

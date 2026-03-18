@@ -14,12 +14,15 @@ use tokio::time::{interval, Duration};
 use tracing::{error, info, warn};
 
 use crate::{
+    config::Config,
     governance::{
         DefaultGovernanceStrategy, GovernanceExecution, GovernanceStore, GovernanceStrategy,
         GovernanceTask,
     },
+    plugin::load_active_governance_plugin,
+    plugin_registry::PluginRegistry,
     strategy_domain::StrategyStatus,
-    MemoryService,
+    MemoriaError, MemoryService,
 };
 
 pub struct GovernanceScheduler {
@@ -27,21 +30,91 @@ pub struct GovernanceScheduler {
     strategy: Arc<dyn GovernanceStrategy>,
     fallback_strategy: Arc<dyn GovernanceStrategy>,
     enabled: bool,
+    breaker_threshold: usize,
+    breaker_cooldown: Duration,
 }
+
+const DEFAULT_BREAKER_THRESHOLD: usize = 3;
+const DEFAULT_BREAKER_COOLDOWN_SECS: u64 = 300;
 
 impl GovernanceScheduler {
     pub fn new(service: Arc<MemoryService>) -> Self {
+        let default_strategy: Arc<dyn GovernanceStrategy> = Arc::new(DefaultGovernanceStrategy);
+        Self::from_parts(service, default_strategy.clone(), default_strategy)
+    }
+
+    pub async fn from_config(
+        service: Arc<MemoryService>,
+        config: &Config,
+    ) -> Result<Self, MemoriaError> {
+        let delegate: Arc<dyn GovernanceStrategy> = Arc::new(DefaultGovernanceStrategy);
+        if let Some(store) = &service.sql_store {
+            if let Some(active_plugin) = load_active_governance_plugin(
+                store.as_ref(),
+                &config.governance_plugin_binding,
+                delegate.clone(),
+            )
+            .await?
+            {
+                info!(
+                    plugin_key = %active_plugin.plugin_key,
+                    plugin_version = %active_plugin.version,
+                    binding_key = %active_plugin.binding_key,
+                    "Loaded governance plugin from shared repository binding"
+                );
+                return Ok(Self::from_parts(
+                    service,
+                    Arc::new(active_plugin.strategy),
+                    delegate,
+                ));
+            }
+        }
+
+        Ok(Self::from_parts(service, delegate.clone(), delegate))
+    }
+
+    pub fn new_with_registry(
+        service: Arc<MemoryService>,
+        registry: &PluginRegistry,
+        governance_key: &str,
+    ) -> Result<Self, MemoriaError> {
         let store = service
             .sql_store
             .clone()
             .map(|store| -> Arc<dyn GovernanceStore> { store });
-        let default_strategy: Arc<dyn GovernanceStrategy> = Arc::new(DefaultGovernanceStrategy);
-        Self::new_with_components(
+        Self::from_store_with_registry(store, registry, governance_key, read_enabled_flag())
+    }
+
+    pub fn from_store_with_registry(
+        store: Option<Arc<dyn GovernanceStore>>,
+        registry: &PluginRegistry,
+        governance_key: &str,
+        enabled: bool,
+    ) -> Result<Self, MemoriaError> {
+        let strategy = registry.create_governance(governance_key).ok_or_else(|| {
+            MemoriaError::Blocked(format!(
+                "Governance plugin `{governance_key}` is not registered"
+            ))
+        })?;
+        let fallback_strategy: Arc<dyn GovernanceStrategy> = Arc::new(DefaultGovernanceStrategy);
+        Ok(Self::new_with_components(
             store,
-            default_strategy.clone(),
-            default_strategy,
-            read_enabled_flag(),
-        )
+            strategy,
+            fallback_strategy,
+            enabled,
+        ))
+    }
+
+    fn from_parts(
+        service: Arc<MemoryService>,
+        strategy: Arc<dyn GovernanceStrategy>,
+        fallback_strategy: Arc<dyn GovernanceStrategy>,
+    ) -> Self {
+        let store = service
+            .sql_store
+            .clone()
+            .map(|store| -> Arc<dyn GovernanceStore> { store });
+        Self::new_with_components(store, strategy, fallback_strategy, read_enabled_flag())
     }
 
     fn new_with_components(
@@ -50,12 +123,40 @@ impl GovernanceScheduler {
         fallback_strategy: Arc<dyn GovernanceStrategy>,
         enabled: bool,
     ) -> Self {
+        Self::new_with_components_and_breaker(
+            store,
+            strategy,
+            fallback_strategy,
+            enabled,
+            DEFAULT_BREAKER_THRESHOLD,
+            Duration::from_secs(DEFAULT_BREAKER_COOLDOWN_SECS),
+        )
+    }
+
+    fn new_with_components_and_breaker(
+        store: Option<Arc<dyn GovernanceStore>>,
+        strategy: Arc<dyn GovernanceStrategy>,
+        fallback_strategy: Arc<dyn GovernanceStrategy>,
+        enabled: bool,
+        breaker_threshold: usize,
+        breaker_cooldown: Duration,
+    ) -> Self {
         Self {
             store,
             strategy,
             fallback_strategy,
             enabled,
+            breaker_threshold,
+            breaker_cooldown,
         }
+    }
+
+    pub fn strategy_key(&self) -> &str {
+        self.strategy.strategy_key()
+    }
+
+    pub fn fallback_strategy_key(&self) -> &str {
+        self.fallback_strategy.strategy_key()
     }
 
     /// Spawn background tasks. Returns immediately; tasks run in background.
@@ -91,37 +192,85 @@ impl GovernanceScheduler {
         }
     }
 
-    async fn run_task(&self, task: GovernanceTask) -> Result<GovernanceExecution, crate::MemoriaError> {
+    async fn run_task(
+        &self,
+        task: GovernanceTask,
+    ) -> Result<GovernanceExecution, crate::MemoriaError> {
         let Some(store) = &self.store else {
             return Ok(GovernanceExecution::default());
         };
 
         let primary_key = self.strategy.strategy_key();
-        let mut execution = match self.strategy.run(store.as_ref(), task).await {
-            Ok(execution) => execution,
-            Err(primary_err) => {
-                let fallback_key = self.fallback_strategy.strategy_key();
-                if primary_key == fallback_key {
-                    return Err(primary_err);
+        let fallback_key = self.fallback_strategy.strategy_key();
+        let breaker_remaining = store.check_shared_breaker(primary_key, task).await?;
+        let mut execution = if let Some(remaining_secs) =
+            breaker_remaining.filter(|_| primary_key != fallback_key)
+        {
+            warn!(
+                task = task.as_str(),
+                strategy = primary_key,
+                fallback = fallback_key,
+                remaining_secs,
+                "Primary governance strategy circuit breaker is open; using fallback"
+            );
+            self.run_degraded_fallback(
+                store.as_ref(),
+                task,
+                primary_key,
+                fallback_key,
+                format!(
+                    "Primary strategy {primary_key} circuit breaker is open for another {remaining_secs}s. Fell back to {fallback_key}."
+                ),
+                true,
+            )
+            .await?
+        } else {
+            match self.strategy.run(store.as_ref(), task).await {
+                Ok(execution) => {
+                    store.clear_shared_breaker(primary_key, task).await?;
+                    execution
                 }
-                warn!(
-                    task = task.as_str(),
-                    strategy = primary_key,
-                    fallback = fallback_key,
-                    %primary_err,
-                    "Primary governance strategy failed; degrading to fallback"
-                );
+                Err(primary_err) => {
+                    if primary_key == fallback_key {
+                        return Err(primary_err);
+                    }
+                    let breaker_remaining = store
+                        .record_shared_breaker_failure(
+                            primary_key,
+                            task,
+                            self.breaker_threshold,
+                            self.breaker_cooldown.as_secs() as i64,
+                        )
+                        .await?;
+                    let breaker_opened = breaker_remaining.is_some();
+                    warn!(
+                        task = task.as_str(),
+                        strategy = primary_key,
+                        fallback = fallback_key,
+                        %primary_err,
+                        breaker_opened,
+                        "Primary governance strategy failed; degrading to fallback"
+                    );
 
-                let mut fallback_execution = self.fallback_strategy.run(store.as_ref(), task).await?;
-                fallback_execution.report.status = StrategyStatus::Degraded;
-                fallback_execution.report.warnings.push(format!(
-                    "Primary strategy {primary_key} failed: {primary_err}. Fell back to {fallback_key}."
-                ));
-                fallback_execution
-                    .report
-                    .metrics
-                    .insert("governance.degraded".to_string(), 1.0);
-                fallback_execution
+                    let reason = if breaker_opened {
+                        format!(
+                            "Primary strategy {primary_key} failed: {primary_err}. Fell back to {fallback_key} and opened circuit breaker."
+                        )
+                    } else {
+                        format!(
+                            "Primary strategy {primary_key} failed: {primary_err}. Fell back to {fallback_key}."
+                        )
+                    };
+                    self.run_degraded_fallback(
+                        store.as_ref(),
+                        task,
+                        primary_key,
+                        fallback_key,
+                        reason,
+                        breaker_opened,
+                    )
+                    .await?
+                }
             }
         };
 
@@ -153,6 +302,34 @@ impl GovernanceScheduler {
         );
         Ok(execution)
     }
+
+    async fn run_degraded_fallback(
+        &self,
+        store: &dyn GovernanceStore,
+        task: GovernanceTask,
+        primary_key: &str,
+        fallback_key: &str,
+        warning: String,
+        circuit_open: bool,
+    ) -> Result<GovernanceExecution, crate::MemoriaError> {
+        let mut fallback_execution = self.fallback_strategy.run(store, task).await?;
+        fallback_execution.report.status = StrategyStatus::Degraded;
+        fallback_execution.report.warnings.push(warning);
+        fallback_execution
+            .report
+            .metrics
+            .insert("governance.degraded".to_string(), 1.0);
+        if circuit_open {
+            fallback_execution
+                .report
+                .metrics
+                .insert("governance.circuit_open".to_string(), 1.0);
+            fallback_execution.report.warnings.push(format!(
+                "Primary strategy {primary_key} remains fenced off until the scheduler breaker cools down; fallback {fallback_key} handled this run."
+            ));
+        }
+        Ok(fallback_execution)
+    }
 }
 
 fn read_enabled_flag() -> bool {
@@ -167,9 +344,15 @@ pub type SchedulerHandle = Arc<GovernanceScheduler>;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        Config, GovernancePlan, GovernanceRunSummary, HostPluginPolicy, PluginRegistry,
+        StrategyReport,
+    };
     use async_trait::async_trait;
+    use memoria_core::{interfaces::MemoryStore, Memory};
+    use std::fs;
     use std::sync::Mutex;
-    use crate::{GovernancePlan, GovernanceRunSummary, StrategyReport};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[derive(Default)]
     struct NoopStore;
@@ -279,13 +462,113 @@ mod tests {
     }
 
     #[derive(Default)]
+    struct SharedBreakerStore {
+        state: Mutex<TestBreakerState>,
+    }
+
+    #[derive(Default)]
+    struct TestBreakerState {
+        consecutive_failures: usize,
+        remaining_secs: Option<i64>,
+    }
+
+    #[async_trait]
+    impl GovernanceStore for SharedBreakerStore {
+        async fn list_active_users(&self) -> Result<Vec<String>, crate::MemoriaError> {
+            Ok(vec![])
+        }
+        async fn cleanup_tool_results(&self, _: i64) -> Result<i64, crate::MemoriaError> {
+            Ok(0)
+        }
+        async fn archive_stale_working(
+            &self,
+            _: i64,
+        ) -> Result<Vec<(String, i64)>, crate::MemoriaError> {
+            Ok(vec![])
+        }
+        async fn cleanup_stale(&self, _: &str) -> Result<i64, crate::MemoriaError> {
+            Ok(0)
+        }
+        async fn quarantine_low_confidence(&self, _: &str) -> Result<i64, crate::MemoriaError> {
+            Ok(0)
+        }
+        async fn compress_redundant(
+            &self,
+            _: &str,
+            _: f64,
+            _: i64,
+            _: usize,
+        ) -> Result<i64, crate::MemoriaError> {
+            Ok(0)
+        }
+        async fn cleanup_orphaned_incrementals(
+            &self,
+            _: &str,
+            _: i64,
+        ) -> Result<i64, crate::MemoriaError> {
+            Ok(0)
+        }
+        async fn rebuild_vector_index(&self, _: &str) -> Result<i64, crate::MemoriaError> {
+            Ok(0)
+        }
+        async fn cleanup_snapshots(&self, _: usize) -> Result<i64, crate::MemoriaError> {
+            Ok(0)
+        }
+        async fn cleanup_orphan_branches(&self) -> Result<i64, crate::MemoriaError> {
+            Ok(0)
+        }
+        async fn create_safety_snapshot(&self, _: &str) -> (Option<String>, Option<String>) {
+            (None, None)
+        }
+        async fn log_edit(&self, _: &str, _: &str, _: &[&str], _: &str, _: Option<&str>) {}
+
+        async fn check_shared_breaker(
+            &self,
+            _: &str,
+            _: GovernanceTask,
+        ) -> Result<Option<i64>, crate::MemoriaError> {
+            Ok(self.state.lock().unwrap().remaining_secs)
+        }
+
+        async fn record_shared_breaker_failure(
+            &self,
+            _: &str,
+            _: GovernanceTask,
+            threshold: usize,
+            cooldown_secs: i64,
+        ) -> Result<Option<i64>, crate::MemoriaError> {
+            let mut state = self.state.lock().unwrap();
+            if state.remaining_secs.is_some() {
+                return Ok(state.remaining_secs);
+            }
+            state.consecutive_failures += 1;
+            if state.consecutive_failures >= threshold {
+                state.consecutive_failures = 0;
+                state.remaining_secs = Some(cooldown_secs);
+            }
+            Ok(state.remaining_secs)
+        }
+
+        async fn clear_shared_breaker(
+            &self,
+            _: &str,
+            _: GovernanceTask,
+        ) -> Result<(), crate::MemoriaError> {
+            let mut state = self.state.lock().unwrap();
+            state.consecutive_failures = 0;
+            state.remaining_secs = None;
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
     struct RecordingStrategy {
         tasks: Mutex<Vec<GovernanceTask>>,
     }
 
     #[async_trait]
     impl GovernanceStrategy for RecordingStrategy {
-        fn strategy_key(&self) -> &'static str {
+        fn strategy_key(&self) -> &str {
             "governance:test:v1"
         }
 
@@ -315,7 +598,7 @@ mod tests {
 
     #[async_trait]
     impl GovernanceStrategy for FailingStrategy {
-        fn strategy_key(&self) -> &'static str {
+        fn strategy_key(&self) -> &str {
             "governance:failing:v1"
         }
 
@@ -324,7 +607,9 @@ mod tests {
             _: &dyn GovernanceStore,
             _: GovernanceTask,
         ) -> Result<GovernancePlan, crate::MemoriaError> {
-            Err(crate::MemoriaError::Internal("primary strategy failed".into()))
+            Err(crate::MemoriaError::Internal(
+                "primary strategy failed".into(),
+            ))
         }
 
         async fn execute(
@@ -335,6 +620,158 @@ mod tests {
         ) -> Result<GovernanceExecution, crate::MemoriaError> {
             unreachable!("failing strategy never reaches execute")
         }
+    }
+
+    #[derive(Default)]
+    struct CountingFailingStrategy {
+        calls: Mutex<usize>,
+    }
+
+    #[async_trait]
+    impl GovernanceStrategy for CountingFailingStrategy {
+        fn strategy_key(&self) -> &str {
+            "governance:counting-failure:v1"
+        }
+
+        async fn plan(
+            &self,
+            _: &dyn GovernanceStore,
+            _: GovernanceTask,
+        ) -> Result<GovernancePlan, crate::MemoriaError> {
+            *self.calls.lock().unwrap() += 1;
+            Err(crate::MemoriaError::Internal(
+                "counting primary strategy failed".into(),
+            ))
+        }
+
+        async fn execute(
+            &self,
+            _: &dyn GovernanceStore,
+            _: GovernanceTask,
+            _: &GovernancePlan,
+        ) -> Result<GovernanceExecution, crate::MemoriaError> {
+            unreachable!("counting failure strategy never reaches execute")
+        }
+    }
+
+    #[derive(Default)]
+    struct FlakyStrategy {
+        calls: Mutex<usize>,
+    }
+
+    #[async_trait]
+    impl GovernanceStrategy for FlakyStrategy {
+        fn strategy_key(&self) -> &str {
+            "governance:flaky:v1"
+        }
+
+        async fn plan(
+            &self,
+            _: &dyn GovernanceStore,
+            _: GovernanceTask,
+        ) -> Result<GovernancePlan, crate::MemoriaError> {
+            let mut calls = self.calls.lock().unwrap();
+            *calls += 1;
+            if *calls == 1 {
+                Err(crate::MemoriaError::Internal("flaky primary failed".into()))
+            } else {
+                Ok(GovernancePlan::default())
+            }
+        }
+
+        async fn execute(
+            &self,
+            _: &dyn GovernanceStore,
+            _: GovernanceTask,
+            _: &GovernancePlan,
+        ) -> Result<GovernanceExecution, crate::MemoriaError> {
+            Ok(GovernanceExecution {
+                summary: GovernanceRunSummary::default(),
+                report: StrategyReport::default(),
+            })
+        }
+    }
+
+    #[derive(Default)]
+    struct NoopMemoryStore;
+
+    #[async_trait]
+    impl MemoryStore for NoopMemoryStore {
+        async fn insert(&self, _: &Memory) -> Result<(), crate::MemoriaError> {
+            Ok(())
+        }
+
+        async fn get(&self, _: &str) -> Result<Option<Memory>, crate::MemoriaError> {
+            Ok(None)
+        }
+
+        async fn update(&self, _: &Memory) -> Result<(), crate::MemoriaError> {
+            Ok(())
+        }
+
+        async fn soft_delete(&self, _: &str) -> Result<(), crate::MemoriaError> {
+            Ok(())
+        }
+
+        async fn list_active(&self, _: &str, _: i64) -> Result<Vec<Memory>, crate::MemoriaError> {
+            Ok(vec![])
+        }
+
+        async fn search_fulltext(
+            &self,
+            _: &str,
+            _: &str,
+            _: i64,
+        ) -> Result<Vec<Memory>, crate::MemoriaError> {
+            Ok(vec![])
+        }
+
+        async fn search_vector(
+            &self,
+            _: &str,
+            _: &[f32],
+            _: i64,
+        ) -> Result<Vec<Memory>, crate::MemoriaError> {
+            Ok(vec![])
+        }
+    }
+
+    fn temp_plugin_dir(name: &str) -> std::path::PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("memoria-scheduler-plugin-{name}-{nonce}"))
+    }
+
+    fn write_manifest(dir: &std::path::Path, script: &str, timeout_ms: u64) {
+        fs::create_dir_all(dir).unwrap();
+        fs::write(dir.join("plugin.rhai"), script).unwrap();
+        let mut manifest = serde_json::json!({
+            "name": "memoria-governance-scheduler-test",
+            "version": "1.0.0",
+            "api_version": "v1",
+            "runtime": "rhai",
+            "entry": { "rhai": { "script": "plugin.rhai", "entrypoint": "memoria_plugin" } },
+            "capabilities": ["governance.plan", "governance.execute"],
+            "compatibility": { "memoria": ">=0.1.0-rc1 <0.2.0" },
+            "permissions": { "network": false, "filesystem": false, "env": [] },
+            "limits": { "timeout_ms": timeout_ms, "max_memory_mb": 64, "max_output_bytes": 16384 },
+            "integrity": { "sha256": "", "signature": "dev-signature", "signer": "dev-signer" },
+            "metadata": { "display_name": "Scheduler Test Plugin" }
+        });
+        fs::write(
+            dir.join("manifest.json"),
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        let sha = crate::plugin::compute_package_sha256(dir).unwrap();
+        manifest["integrity"]["sha256"] = serde_json::Value::String(sha);
+        fs::write(
+            dir.join("manifest.json"),
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
     }
 
     #[tokio::test]
@@ -416,5 +853,188 @@ mod tests {
         assert_eq!(execution.summary.total_cleaned, 1);
         assert!(!execution.report.decisions.is_empty());
         assert_eq!(execution.report.metrics["governance.snapshot_created"], 1.0);
+    }
+
+    #[tokio::test]
+    async fn scheduler_opens_circuit_after_repeated_failures() {
+        let primary = Arc::new(CountingFailingStrategy::default());
+        let scheduler = GovernanceScheduler::new_with_components_and_breaker(
+            Some(Arc::new(SharedBreakerStore::default())),
+            primary.clone(),
+            Arc::new(DefaultGovernanceStrategy),
+            true,
+            2,
+            Duration::from_secs(60),
+        );
+
+        let first = scheduler.run_task(GovernanceTask::Daily).await.unwrap();
+        let second = scheduler.run_task(GovernanceTask::Daily).await.unwrap();
+        let third = scheduler.run_task(GovernanceTask::Daily).await.unwrap();
+
+        assert_eq!(*primary.calls.lock().unwrap(), 2);
+        assert_eq!(first.report.status, StrategyStatus::Degraded);
+        assert_eq!(second.report.status, StrategyStatus::Degraded);
+        assert_eq!(third.report.status, StrategyStatus::Degraded);
+        assert_eq!(
+            third.report.metrics.get("governance.circuit_open"),
+            Some(&1.0)
+        );
+        assert!(third
+            .report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("circuit breaker is open")));
+    }
+
+    #[tokio::test]
+    async fn scheduler_resets_circuit_after_primary_success() {
+        let primary = Arc::new(FlakyStrategy::default());
+        let scheduler = GovernanceScheduler::new_with_components_and_breaker(
+            Some(Arc::new(SharedBreakerStore::default())),
+            primary.clone(),
+            Arc::new(DefaultGovernanceStrategy),
+            true,
+            2,
+            Duration::from_secs(60),
+        );
+
+        let first = scheduler.run_task(GovernanceTask::Daily).await.unwrap();
+        let second = scheduler.run_task(GovernanceTask::Daily).await.unwrap();
+
+        assert_eq!(*primary.calls.lock().unwrap(), 2);
+        assert_eq!(first.report.status, StrategyStatus::Degraded);
+        assert_eq!(second.report.status, StrategyStatus::Success);
+        assert!(second
+            .report
+            .metrics
+            .get("governance.circuit_open")
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn scheduler_uses_registered_rhai_plugin() {
+        let dir = temp_plugin_dir("registry");
+        write_manifest(
+            &dir,
+            r#"
+                fn memoria_plugin(ctx) {
+                    if ctx["phase"] == "plan" {
+                        return #{
+                            requires_approval: true,
+                            actions: [ decision("plugin:scheduler", "scheduler loaded plugin", 0.8) ]
+                        };
+                    }
+                    return #{ "warnings": ["scheduler plugin executed"], "metrics": #{ "plugin.scheduler.executed": 1.0 } };
+                }
+            "#,
+            200,
+        );
+
+        let mut registry = PluginRegistry::new();
+        let key = registry
+            .register_rhai_governance_plugin(
+                &dir,
+                HostPluginPolicy::development(),
+                Arc::new(DefaultGovernanceStrategy),
+            )
+            .unwrap();
+
+        let scheduler = GovernanceScheduler::from_store_with_registry(
+            Some(Arc::new(NoopStore)),
+            &registry,
+            &key,
+            true,
+        )
+        .unwrap();
+        let execution = scheduler.run_task(GovernanceTask::Weekly).await.unwrap();
+
+        assert_eq!(execution.report.status, StrategyStatus::Success);
+        assert!(execution
+            .report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("scheduler plugin executed")));
+        assert_eq!(
+            execution.report.metrics.get("plugin.scheduler.executed"),
+            Some(&1.0)
+        );
+        assert!(registry.governance_metadata(&key).is_some());
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn scheduler_falls_back_when_registered_plugin_exceeds_limits() {
+        let dir = temp_plugin_dir("limit");
+        write_manifest(
+            &dir,
+            r#"
+                fn memoria_plugin(ctx) {
+                    if ctx["phase"] == "plan" {
+                        while true {}
+                    }
+                    return #{};
+                }
+            "#,
+            5,
+        );
+
+        let mut registry = PluginRegistry::new();
+        let key = registry
+            .register_rhai_governance_plugin(
+                &dir,
+                HostPluginPolicy::development(),
+                Arc::new(DefaultGovernanceStrategy),
+            )
+            .unwrap();
+
+        let scheduler = GovernanceScheduler::from_store_with_registry(
+            Some(Arc::new(FallbackStore)),
+            &registry,
+            &key,
+            true,
+        )
+        .unwrap();
+        let execution = scheduler.run_task(GovernanceTask::Daily).await.unwrap();
+
+        assert_eq!(execution.report.status, StrategyStatus::Degraded);
+        assert!(execution
+            .report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("Fell back")));
+        assert_eq!(
+            execution.report.metrics.get("governance.degraded"),
+            Some(&1.0)
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn scheduler_from_config_without_shared_store_uses_default_strategy() {
+        let config = Config {
+            db_url: "mysql://root:111@localhost:6001/memoria".into(),
+            db_name: "memoria".into(),
+            embedding_provider: "mock".into(),
+            embedding_model: "BAAI/bge-m3".into(),
+            embedding_dim: 1024,
+            embedding_api_key: String::new(),
+            embedding_base_url: String::new(),
+            llm_api_key: None,
+            llm_base_url: "https://api.openai.com/v1".into(),
+            llm_model: "gpt-4o-mini".into(),
+            user: "default".into(),
+            governance_plugin_binding: "default".into(),
+        };
+        let service = Arc::new(MemoryService::new(Arc::new(NoopMemoryStore), None));
+
+        let scheduler = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(GovernanceScheduler::from_config(service, &config))
+            .unwrap();
+
+        assert_eq!(scheduler.strategy.strategy_key(), "governance:default:v1");
+        assert_eq!(scheduler.fallback_strategy.strategy_key(), "governance:default:v1");
     }
 }

@@ -1,18 +1,20 @@
+use chrono::{DateTime, Utc};
 use memoria_core::{
     check_sensitivity,
     interfaces::{EmbeddingProvider, MemoryStore},
-    Memory, MemoriaError, MemoryType, TrustTier,
+    MemoriaError, Memory, MemoryType, TrustTier,
 };
 use memoria_embedding::llm::ChatMessage;
 use memoria_embedding::LlmClient;
 use memoria_storage::SqlMemoryStore;
 use std::sync::Arc;
-use uuid::Uuid;
-use chrono::{DateTime, Utc};
 use tracing::{info, warn};
+use uuid::Uuid;
 
 #[inline]
-fn round4(v: f64) -> f64 { (v * 10000.0).round() / 10000.0 }
+fn round4(v: f64) -> f64 {
+    (v * 10000.0).round() / 10000.0
+}
 
 /// Explain level — mirrors Python's ExplainLevel enum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
@@ -56,7 +58,7 @@ pub struct CandidateScore {
 #[derive(Debug, Default, serde::Serialize)]
 pub struct RetrievalExplain {
     pub level: ExplainLevel,
-    pub path: &'static str,           // "vector", "fulltext", "graph", "graph+vector", "none"
+    pub path: &'static str, // "vector", "fulltext", "graph", "graph+vector", "none"
     pub vector_attempted: bool,
     pub vector_hit: bool,
     pub fulltext_attempted: bool,
@@ -96,7 +98,10 @@ pub struct MemoryService {
 
 impl MemoryService {
     /// Production constructor — uses SqlMemoryStore for branch support
-    pub fn new_sql(store: Arc<SqlMemoryStore>, embedder: Option<Arc<dyn EmbeddingProvider>>) -> Self {
+    pub fn new_sql(
+        store: Arc<SqlMemoryStore>,
+        embedder: Option<Arc<dyn EmbeddingProvider>>,
+    ) -> Self {
         let llm = LlmClient::from_env().map(Arc::new);
         Self {
             store: store.clone(),
@@ -122,13 +127,21 @@ impl MemoryService {
 
     /// Test constructor — any MemoryStore, no branch support
     pub fn new(store: Arc<dyn MemoryStore>, embedder: Option<Arc<dyn EmbeddingProvider>>) -> Self {
-        Self { store, sql_store: None, embedder, llm: None }
+        Self {
+            store,
+            sql_store: None,
+            embedder,
+            llm: None,
+        }
     }
 
     #[allow(dead_code)]
     async fn active_table(&self, user_id: &str) -> String {
         match &self.sql_store {
-            Some(s) => s.active_table(user_id).await.unwrap_or_else(|_| "mem_memories".to_string()),
+            Some(s) => s
+                .active_table(user_id)
+                .await
+                .unwrap_or_else(|_| "mem_memories".to_string()),
             None => "mem_memories".to_string(),
         }
     }
@@ -187,13 +200,28 @@ impl MemoryService {
                 let l2_threshold = 0.3162;
                 let mtype = memory.memory_type.to_string();
                 if let Ok(Some((old_id, old_content, _dist))) = sql
-                    .find_near_duplicate(&table, user_id, emb, &mtype, &memory.memory_id, l2_threshold)
+                    .find_near_duplicate(
+                        &table,
+                        user_id,
+                        emb,
+                        &mtype,
+                        &memory.memory_id,
+                        l2_threshold,
+                    )
                     .await
                 {
                     if old_content.trim() != memory.content.trim() {
                         sql.insert_into(&table, &memory).await?;
-                        sql.supersede_memory(&table, &old_id, &memory.memory_id).await?;
-                        sql.log_edit(user_id, "inject", &[memory.memory_id.as_str()], "store_memory:supersede", None).await;
+                        sql.supersede_memory(&table, &old_id, &memory.memory_id)
+                            .await?;
+                        sql.log_edit(
+                            user_id,
+                            "inject",
+                            &[memory.memory_id.as_str()],
+                            "store_memory:supersede",
+                            None,
+                        )
+                        .await;
                         return Ok(memory);
                     }
                     // Same content — skip storing duplicate
@@ -201,7 +229,14 @@ impl MemoryService {
                 }
             }
             sql.insert_into(&table, &memory).await?;
-            sql.log_edit(user_id, "inject", &[memory.memory_id.as_str()], "store_memory", None).await;
+            sql.log_edit(
+                user_id,
+                "inject",
+                &[memory.memory_id.as_str()],
+                "store_memory",
+                None,
+            )
+            .await;
         } else {
             self.store.insert(&memory).await?;
         }
@@ -222,7 +257,9 @@ impl MemoryService {
             Some(s) => s,
             None => return true, // no SQL store — skip sandbox
         };
-        if candidates.is_empty() { return true; }
+        if candidates.is_empty() {
+            return true;
+        }
 
         let branch = format!("mem_sandbox_{}", &Uuid::new_v4().simple().to_string()[..16]);
 
@@ -237,15 +274,27 @@ impl MemoryService {
                 sql.insert_into(&branch, m).await?;
             }
             // Score main vs branch (top-5 fulltext score as proxy)
-            let main_results = sql.search_fulltext_from("mem_memories", user_id, query, 5).await.unwrap_or_default();
-            let branch_results = sql.search_fulltext_from(&branch, user_id, query, 5).await.unwrap_or_default();
+            let main_results = sql
+                .search_fulltext_from("mem_memories", user_id, query, 5)
+                .await
+                .unwrap_or_default();
+            let branch_results = sql
+                .search_fulltext_from(&branch, user_id, query, 5)
+                .await
+                .unwrap_or_default();
 
             let score = |mems: &[Memory]| -> f64 {
-                if mems.is_empty() { return 0.0; }
-                mems.iter().map(|m| m.retrieval_score.unwrap_or(0.5)).sum::<f64>() / mems.len() as f64
+                if mems.is_empty() {
+                    return 0.0;
+                }
+                mems.iter()
+                    .map(|m| m.retrieval_score.unwrap_or(0.5))
+                    .sum::<f64>()
+                    / mems.len() as f64
             };
             Ok::<bool, MemoriaError>(score(&branch_results) >= score(&main_results))
-        }.await;
+        }
+        .await;
 
         // Always drop branch
         let _ = git.drop_branch(&branch).await;
@@ -253,21 +302,41 @@ impl MemoryService {
         result.unwrap_or(true) // fail open on error
     }
 
-    pub async fn retrieve(&self, user_id: &str, query: &str, top_k: i64) -> Result<Vec<Memory>, MemoriaError> {
-        let (mems, _) = self.retrieve_inner(user_id, query, top_k, ExplainLevel::None).await?;
+    pub async fn retrieve(
+        &self,
+        user_id: &str,
+        query: &str,
+        top_k: i64,
+    ) -> Result<Vec<Memory>, MemoriaError> {
+        let (mems, _) = self
+            .retrieve_inner(user_id, query, top_k, ExplainLevel::None)
+            .await?;
         self.bump_access_counts(&mems).await;
         Ok(mems)
     }
 
     /// Retrieve with explain stats at the given level.
-    pub async fn retrieve_explain(&self, user_id: &str, query: &str, top_k: i64) -> Result<(Vec<Memory>, RetrievalExplain), MemoriaError> {
-        let (mems, explain) = self.retrieve_inner(user_id, query, top_k, ExplainLevel::Basic).await?;
+    pub async fn retrieve_explain(
+        &self,
+        user_id: &str,
+        query: &str,
+        top_k: i64,
+    ) -> Result<(Vec<Memory>, RetrievalExplain), MemoriaError> {
+        let (mems, explain) = self
+            .retrieve_inner(user_id, query, top_k, ExplainLevel::Basic)
+            .await?;
         self.bump_access_counts(&mems).await;
         Ok((mems, explain))
     }
 
     /// Retrieve with explicit explain level (none/basic/verbose/analyze).
-    pub async fn retrieve_explain_level(&self, user_id: &str, query: &str, top_k: i64, level: ExplainLevel) -> Result<(Vec<Memory>, RetrievalExplain), MemoriaError> {
+    pub async fn retrieve_explain_level(
+        &self,
+        user_id: &str,
+        query: &str,
+        top_k: i64,
+        level: ExplainLevel,
+    ) -> Result<(Vec<Memory>, RetrievalExplain), MemoriaError> {
         let (mems, explain) = self.retrieve_inner(user_id, query, top_k, level).await?;
         self.bump_access_counts(&mems).await;
         Ok((mems, explain))
@@ -282,9 +351,18 @@ impl MemoryService {
     }
 
     #[tracing::instrument(skip(self), fields(user_id, top_k))]
-    async fn retrieve_inner(&self, user_id: &str, query: &str, top_k: i64, level: ExplainLevel) -> Result<(Vec<Memory>, RetrievalExplain), MemoriaError> {
+    async fn retrieve_inner(
+        &self,
+        user_id: &str,
+        query: &str,
+        top_k: i64,
+        level: ExplainLevel,
+    ) -> Result<(Vec<Memory>, RetrievalExplain), MemoriaError> {
         let total_start = std::time::Instant::now();
-        let mut explain = RetrievalExplain { level, ..Default::default() };
+        let mut explain = RetrievalExplain {
+            level,
+            ..Default::default()
+        };
 
         if let Some(sql) = &self.sql_store {
             let table = sql.active_table(user_id).await?;
@@ -300,7 +378,10 @@ impl MemoryService {
                 let g_start = std::time::Instant::now();
                 let graph_store = sql.graph_store();
                 let retriever = memoria_storage::graph::ActivationRetriever::new(&graph_store);
-                match retriever.retrieve(user_id, query, embedding, top_k, None).await {
+                match retriever
+                    .retrieve(user_id, query, embedding, top_k, None)
+                    .await
+                {
                     Ok(scored_nodes) if !scored_nodes.is_empty() => {
                         explain.graph_ms = g_start.elapsed().as_secs_f64() * 1000.0;
                         explain.graph_hit = true;
@@ -342,9 +423,14 @@ impl MemoryService {
                         explain.vector_attempted = true;
                         let vs_start = std::time::Instant::now();
                         let (vec_results, scores) = if level.at_least(ExplainLevel::Verbose) {
-                            sql.search_hybrid_from_scored(&table, user_id, embedding, query, top_k).await?
+                            sql.search_hybrid_from_scored(&table, user_id, embedding, query, top_k)
+                                .await?
                         } else {
-                            (sql.search_hybrid_from(&table, user_id, embedding, query, top_k).await?, vec![])
+                            (
+                                sql.search_hybrid_from(&table, user_id, embedding, query, top_k)
+                                    .await?,
+                                vec![],
+                            )
                         };
                         explain.vector_ms = vs_start.elapsed().as_secs_f64() * 1000.0;
                         explain.vector_hit = !vec_results.is_empty();
@@ -355,7 +441,10 @@ impl MemoryService {
                                 graph_memories.push(m);
                             } else {
                                 // Memory exists from graph — use higher score
-                                if let Some(existing) = graph_memories.iter_mut().find(|g| g.memory_id == m.memory_id) {
+                                if let Some(existing) = graph_memories
+                                    .iter_mut()
+                                    .find(|g| g.memory_id == m.memory_id)
+                                {
                                     if m.retrieval_score > existing.retrieval_score {
                                         existing.retrieval_score = m.retrieval_score;
                                     }
@@ -370,13 +459,19 @@ impl MemoryService {
                         graph_memories.truncate(top_k as usize);
 
                         if level.at_least(ExplainLevel::Verbose) {
-                            explain.candidate_scores = scores.into_iter().enumerate()
+                            explain.candidate_scores = scores
+                                .into_iter()
+                                .enumerate()
                                 .map(|(i, (id, vs, ks, ts, cs, fs))| CandidateScore {
-                                    memory_id: id, rank: i + 1,
-                                    final_score: round4(fs), vector_score: round4(vs),
-                                    keyword_score: round4(ks), temporal_score: round4(ts),
+                                    memory_id: id,
+                                    rank: i + 1,
+                                    final_score: round4(fs),
+                                    vector_score: round4(vs),
+                                    keyword_score: round4(ks),
+                                    temporal_score: round4(ts),
                                     confidence_score: round4(cs),
-                                }).collect();
+                                })
+                                .collect();
                         }
                         explain.path = "graph+vector";
                         explain.result_count = graph_memories.len();
@@ -399,21 +494,32 @@ impl MemoryService {
                 explain.vector_attempted = true;
                 let vs_start = std::time::Instant::now();
                 let (results, scores) = if level.at_least(ExplainLevel::Verbose) {
-                    sql.search_hybrid_from_scored(&table, user_id, embedding, query, top_k).await?
+                    sql.search_hybrid_from_scored(&table, user_id, embedding, query, top_k)
+                        .await?
                 } else {
-                    (sql.search_hybrid_from(&table, user_id, embedding, query, top_k).await?, vec![])
+                    (
+                        sql.search_hybrid_from(&table, user_id, embedding, query, top_k)
+                            .await?,
+                        vec![],
+                    )
                 };
                 explain.vector_ms = vs_start.elapsed().as_secs_f64() * 1000.0;
                 if !results.is_empty() {
                     explain.vector_hit = true;
                     if level.at_least(ExplainLevel::Verbose) {
-                        explain.candidate_scores = scores.into_iter().enumerate()
+                        explain.candidate_scores = scores
+                            .into_iter()
+                            .enumerate()
                             .map(|(i, (id, vs, ks, ts, cs, fs))| CandidateScore {
-                                memory_id: id, rank: i + 1,
-                                final_score: round4(fs), vector_score: round4(vs),
-                                keyword_score: round4(ks), temporal_score: round4(ts),
+                                memory_id: id,
+                                rank: i + 1,
+                                final_score: round4(fs),
+                                vector_score: round4(vs),
+                                keyword_score: round4(ks),
+                                temporal_score: round4(ts),
                                 confidence_score: round4(cs),
-                            }).collect();
+                            })
+                            .collect();
                     }
                     explain.path = "hybrid";
                     explain.result_count = results.len();
@@ -425,19 +531,33 @@ impl MemoryService {
             // Phase 3: fulltext fallback
             explain.fulltext_attempted = true;
             let ft_start = std::time::Instant::now();
-            let results = sql.search_fulltext_from(&table, user_id, query, top_k).await?;
+            let results = sql
+                .search_fulltext_from(&table, user_id, query, top_k)
+                .await?;
             explain.fulltext_ms = ft_start.elapsed().as_secs_f64() * 1000.0;
             explain.fulltext_hit = !results.is_empty();
-            explain.path = if explain.fulltext_hit { "fulltext" } else { "none" };
+            explain.path = if explain.fulltext_hit {
+                "fulltext"
+            } else {
+                "none"
+            };
             if level.at_least(ExplainLevel::Verbose) {
-                explain.candidate_scores = results.iter().enumerate().map(|(i, m)| {
-                    let fs = m.retrieval_score.unwrap_or(0.0);
-                    CandidateScore {
-                        memory_id: m.memory_id.clone(), rank: i + 1,
-                        final_score: round4(fs), vector_score: 0.0,
-                        keyword_score: round4(fs), temporal_score: 0.0, confidence_score: 0.0,
-                    }
-                }).collect();
+                explain.candidate_scores = results
+                    .iter()
+                    .enumerate()
+                    .map(|(i, m)| {
+                        let fs = m.retrieval_score.unwrap_or(0.0);
+                        CandidateScore {
+                            memory_id: m.memory_id.clone(),
+                            rank: i + 1,
+                            final_score: round4(fs),
+                            vector_score: 0.0,
+                            keyword_score: round4(fs),
+                            temporal_score: 0.0,
+                            confidence_score: 0.0,
+                        }
+                    })
+                    .collect();
             }
             explain.result_count = results.len();
             explain.total_ms = total_start.elapsed().as_secs_f64() * 1000.0;
@@ -459,26 +579,54 @@ impl MemoryService {
         explain.fulltext_attempted = true;
         let results = self.store.search_fulltext(user_id, query, top_k).await?;
         explain.fulltext_hit = !results.is_empty();
-        explain.path = if explain.fulltext_hit { "fulltext" } else { "none" };
+        explain.path = if explain.fulltext_hit {
+            "fulltext"
+        } else {
+            "none"
+        };
         explain.result_count = results.len();
         explain.total_ms = total_start.elapsed().as_secs_f64() * 1000.0;
         Ok((results, explain))
     }
 
-    pub async fn search(&self, user_id: &str, query: &str, top_k: i64) -> Result<Vec<Memory>, MemoriaError> {
+    pub async fn search(
+        &self,
+        user_id: &str,
+        query: &str,
+        top_k: i64,
+    ) -> Result<Vec<Memory>, MemoriaError> {
         self.retrieve(user_id, query, top_k).await
     }
 
-    pub async fn search_explain(&self, user_id: &str, query: &str, top_k: i64) -> Result<(Vec<Memory>, RetrievalExplain), MemoriaError> {
-        self.retrieve_inner(user_id, query, top_k, ExplainLevel::Basic).await
+    pub async fn search_explain(
+        &self,
+        user_id: &str,
+        query: &str,
+        top_k: i64,
+    ) -> Result<(Vec<Memory>, RetrievalExplain), MemoriaError> {
+        self.retrieve_inner(user_id, query, top_k, ExplainLevel::Basic)
+            .await
     }
 
-    pub async fn search_explain_level(&self, user_id: &str, query: &str, top_k: i64, level: ExplainLevel) -> Result<(Vec<Memory>, RetrievalExplain), MemoriaError> {
+    pub async fn search_explain_level(
+        &self,
+        user_id: &str,
+        query: &str,
+        top_k: i64,
+        level: ExplainLevel,
+    ) -> Result<(Vec<Memory>, RetrievalExplain), MemoriaError> {
         self.retrieve_inner(user_id, query, top_k, level).await
     }
 
-    pub async fn correct(&self, memory_id: &str, new_content: &str) -> Result<Memory, MemoriaError> {
-        let old = self.store.get(memory_id).await?
+    pub async fn correct(
+        &self,
+        memory_id: &str,
+        new_content: &str,
+    ) -> Result<Memory, MemoriaError> {
+        let old = self
+            .store
+            .get(memory_id)
+            .await?
             .ok_or_else(|| MemoriaError::NotFound(memory_id.to_string()))?;
 
         // Create new memory with corrected content (proper superseded_by chain)
@@ -514,7 +662,14 @@ impl MemoryService {
         self.store.update(&old_updated).await?;
 
         if let Some(sql) = &self.sql_store {
-            sql.log_edit(&user_id, "correct", &[memory_id, new_mem.memory_id.as_str()], "", None).await;
+            sql.log_edit(
+                &user_id,
+                "correct",
+                &[memory_id, new_mem.memory_id.as_str()],
+                "",
+                None,
+            )
+            .await;
         }
 
         Ok(new_mem)
@@ -523,29 +678,51 @@ impl MemoryService {
     pub async fn purge(&self, user_id: &str, memory_id: &str) -> Result<PurgeResult, MemoriaError> {
         let (snap, warning) = if let Some(sql) = &self.sql_store {
             let (s, w) = sql.create_safety_snapshot("purge").await;
-            sql.log_edit(user_id, "purge", &[memory_id], "", s.as_deref()).await;
+            sql.log_edit(user_id, "purge", &[memory_id], "", s.as_deref())
+                .await;
             (s, w)
-        } else { (None, None) };
+        } else {
+            (None, None)
+        };
         self.store.soft_delete(memory_id).await?;
-        Ok(PurgeResult { purged: 1, snapshot_name: snap, warning })
+        Ok(PurgeResult {
+            purged: 1,
+            snapshot_name: snap,
+            warning,
+        })
     }
 
     /// Purge multiple memories by IDs with a single audit log entry.
-    pub async fn purge_batch(&self, user_id: &str, ids: &[&str]) -> Result<PurgeResult, MemoriaError> {
+    pub async fn purge_batch(
+        &self,
+        user_id: &str,
+        ids: &[&str],
+    ) -> Result<PurgeResult, MemoriaError> {
         let (snap, warning) = if let Some(sql) = &self.sql_store {
             sql.create_safety_snapshot("purge").await
-        } else { (None, None) };
+        } else {
+            (None, None)
+        };
         for id in ids {
             self.store.soft_delete(id).await?;
         }
         if let Some(sql) = &self.sql_store {
-            sql.log_edit(user_id, "purge", ids, "", snap.as_deref()).await;
+            sql.log_edit(user_id, "purge", ids, "", snap.as_deref())
+                .await;
         }
-        Ok(PurgeResult { purged: ids.len(), snapshot_name: snap, warning })
+        Ok(PurgeResult {
+            purged: ids.len(),
+            snapshot_name: snap,
+            warning,
+        })
     }
 
     /// Purge memories whose content contains `topic` (exact text match).
-    pub async fn purge_by_topic(&self, user_id: &str, topic: &str) -> Result<PurgeResult, MemoriaError> {
+    pub async fn purge_by_topic(
+        &self,
+        user_id: &str,
+        topic: &str,
+    ) -> Result<PurgeResult, MemoriaError> {
         if let Some(sql) = &self.sql_store {
             let (snap, warning) = sql.create_safety_snapshot("purge").await;
             let table = sql.active_table(user_id).await?;
@@ -555,10 +732,25 @@ impl MemoryService {
                 let _ = sql.graph_store().deactivate_by_memory_id(id).await;
             }
             let id_refs: Vec<&str> = ids.iter().map(|s| s.as_str()).collect();
-            sql.log_edit(user_id, "purge", &id_refs, &format!("topic:{topic}"), snap.as_deref()).await;
-            Ok(PurgeResult { purged: ids.len(), snapshot_name: snap, warning })
+            sql.log_edit(
+                user_id,
+                "purge",
+                &id_refs,
+                &format!("topic:{topic}"),
+                snap.as_deref(),
+            )
+            .await;
+            Ok(PurgeResult {
+                purged: ids.len(),
+                snapshot_name: snap,
+                warning,
+            })
         } else {
-            Ok(PurgeResult { purged: 0, snapshot_name: None, warning: None })
+            Ok(PurgeResult {
+                purged: 0,
+                snapshot_name: None,
+                warning: None,
+            })
         }
     }
 
@@ -566,7 +758,11 @@ impl MemoryService {
         self.store.get(memory_id).await
     }
 
-    pub async fn list_active(&self, user_id: &str, limit: i64) -> Result<Vec<Memory>, MemoriaError> {
+    pub async fn list_active(
+        &self,
+        user_id: &str,
+        limit: i64,
+    ) -> Result<Vec<Memory>, MemoriaError> {
         if let Some(sql) = &self.sql_store {
             let table = sql.active_table(user_id).await?;
             return sql.list_active_from(&table, user_id, limit).await;
@@ -644,7 +840,8 @@ impl MemoryService {
         }
         if let Some(sql) = &self.sql_store {
             let ids: Vec<&str> = results.iter().map(|m| m.memory_id.as_str()).collect();
-            sql.log_edit(user_id, "inject", &ids, "store_batch", None).await;
+            sql.log_edit(user_id, "inject", &ids, "store_batch", None)
+                .await;
         }
         Ok(results)
     }
@@ -666,7 +863,8 @@ impl MemoryService {
             match self.extract_via_llm(llm, messages).await {
                 Ok(ref items) if !items.is_empty() => {
                     info!(count = items.len(), "LLM extracted memory candidates");
-                    self.build_candidates(user_id, items, session_id.clone()).await
+                    self.build_candidates(user_id, items, session_id.clone())
+                        .await
                 }
                 Ok(_) => vec![],
                 Err(e) => {
@@ -686,7 +884,12 @@ impl MemoryService {
                 Err(e) => return Err(e),
             }
         }
-        info!(user_id, count = stored.len(), llm = has_llm, "observe_turn complete");
+        info!(
+            user_id,
+            count = stored.len(),
+            llm = has_llm,
+            "observe_turn complete"
+        );
         Ok((stored, has_llm))
     }
 
@@ -705,7 +908,9 @@ impl MemoryService {
                 _ => continue,
             };
             let sensitivity = check_sensitivity(content);
-            if sensitivity.blocked { continue; }
+            if sensitivity.blocked {
+                continue;
+            }
             let content = sensitivity.redacted_content.as_deref().unwrap_or(content);
 
             let mtype = match item["type"].as_str().unwrap_or("semantic") {
@@ -714,7 +919,8 @@ impl MemoryService {
                 "episodic" => MemoryType::Episodic,
                 _ => MemoryType::Semantic,
             };
-            let confidence = item["confidence"].as_f64()
+            let confidence = item["confidence"]
+                .as_f64()
                 .map(|c| c.clamp(0.0, 1.0))
                 .unwrap_or(0.7);
 
@@ -749,39 +955,49 @@ impl MemoryService {
         session_id: Option<String>,
     ) -> Vec<Memory> {
         let now = Utc::now();
-        messages.iter().enumerate().filter_map(|(i, msg)| {
-            let role = msg["role"].as_str().unwrap_or("");
-            let content = msg["content"].as_str().unwrap_or("").trim();
-            if content.is_empty() || (role != "assistant" && role != "user") {
-                return None;
-            }
-            Some(Memory {
-                memory_id: Uuid::new_v4().simple().to_string(),
-                user_id: user_id.to_string(),
-                memory_type: MemoryType::Semantic,
-                content: content.to_string(),
-                initial_confidence: 0.7,
-                embedding: None, // will be embedded in persist_with_dedup
-                source_event_ids: vec![],
-                superseded_by: None,
-                is_active: true,
-                access_count: 0,
-                session_id: session_id.clone(),
-                observed_at: Some(now + chrono::Duration::milliseconds(i as i64)),
-                created_at: None,
-                updated_at: None,
-                extra_metadata: None,
-                trust_tier: TrustTier::T1Verified,
-                retrieval_score: None,
+        messages
+            .iter()
+            .enumerate()
+            .filter_map(|(i, msg)| {
+                let role = msg["role"].as_str().unwrap_or("");
+                let content = msg["content"].as_str().unwrap_or("").trim();
+                if content.is_empty() || (role != "assistant" && role != "user") {
+                    return None;
+                }
+                Some(Memory {
+                    memory_id: Uuid::new_v4().simple().to_string(),
+                    user_id: user_id.to_string(),
+                    memory_type: MemoryType::Semantic,
+                    content: content.to_string(),
+                    initial_confidence: 0.7,
+                    embedding: None, // will be embedded in persist_with_dedup
+                    source_event_ids: vec![],
+                    superseded_by: None,
+                    is_active: true,
+                    access_count: 0,
+                    session_id: session_id.clone(),
+                    observed_at: Some(now + chrono::Duration::milliseconds(i as i64)),
+                    created_at: None,
+                    updated_at: None,
+                    extra_metadata: None,
+                    trust_tier: TrustTier::T1Verified,
+                    retrieval_score: None,
+                })
             })
-        }).collect()
+            .collect()
     }
 
     /// Persist a memory with dedup (near-duplicate detection + supersede).
-    async fn persist_with_dedup(&self, user_id: &str, mut mem: Memory) -> Result<Memory, MemoriaError> {
+    async fn persist_with_dedup(
+        &self,
+        user_id: &str,
+        mut mem: Memory,
+    ) -> Result<Memory, MemoriaError> {
         let sensitivity = check_sensitivity(&mem.content);
         if sensitivity.blocked {
-            return Err(MemoriaError::Blocked("blocked by sensitivity filter".into()));
+            return Err(MemoriaError::Blocked(
+                "blocked by sensitivity filter".into(),
+            ));
         }
         if let Some(redacted) = &sensitivity.redacted_content {
             mem.content = redacted.clone();
@@ -801,7 +1017,8 @@ impl MemoryService {
                 {
                     if old_content.trim() != mem.content.trim() {
                         sql.insert_into(&table, &mem).await?;
-                        sql.supersede_memory(&table, &old_id, &mem.memory_id).await?;
+                        sql.supersede_memory(&table, &old_id, &mem.memory_id)
+                            .await?;
                         info!(old_id, new_id = %mem.memory_id, "superseded near-duplicate");
                         return Ok(mem);
                     }
@@ -843,14 +1060,23 @@ impl MemoryService {
             conv_text = conv_text[start..].to_string();
         }
 
-        let result = llm.chat(
-            &[
-                ChatMessage { role: "system".into(), content: OBSERVER_EXTRACTION_PROMPT.into() },
-                ChatMessage { role: "user".into(), content: conv_text },
-            ],
-            0.0,
-            Some(2048),
-        ).await.map_err(|e| MemoriaError::Internal(format!("LLM extraction: {e}")))?;
+        let result = llm
+            .chat(
+                &[
+                    ChatMessage {
+                        role: "system".into(),
+                        content: OBSERVER_EXTRACTION_PROMPT.into(),
+                    },
+                    ChatMessage {
+                        role: "user".into(),
+                        content: conv_text,
+                    },
+                ],
+                0.0,
+                Some(2048),
+            )
+            .await
+            .map_err(|e| MemoriaError::Internal(format!("LLM extraction: {e}")))?;
 
         parse_json_array(&result)
     }
@@ -861,7 +1087,9 @@ fn parse_json_array(s: &str) -> Result<Vec<serde_json::Value>, MemoriaError> {
     let trimmed = s.trim();
     // Strip markdown code fences
     let json_str = if trimmed.starts_with("```") {
-        let inner = trimmed.trim_start_matches("```json").trim_start_matches("```");
+        let inner = trimmed
+            .trim_start_matches("```json")
+            .trim_start_matches("```");
         inner.trim_end_matches("```").trim()
     } else {
         trimmed

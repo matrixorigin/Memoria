@@ -111,6 +111,35 @@ pub trait GovernanceStore: Send + Sync {
         reason: &str,
         snapshot_before: Option<&str>,
     );
+
+    /// Returns remaining seconds if the shared governance breaker is open.
+    async fn check_shared_breaker(
+        &self,
+        _strategy_key: &str,
+        _task: GovernanceTask,
+    ) -> Result<Option<i64>, MemoriaError> {
+        Ok(None)
+    }
+
+    /// Records a primary strategy failure and returns remaining open time if the breaker is open.
+    async fn record_shared_breaker_failure(
+        &self,
+        _strategy_key: &str,
+        _task: GovernanceTask,
+        _threshold: usize,
+        _cooldown_secs: i64,
+    ) -> Result<Option<i64>, MemoriaError> {
+        Ok(None)
+    }
+
+    /// Clears any shared breaker state after a successful primary run.
+    async fn clear_shared_breaker(
+        &self,
+        _strategy_key: &str,
+        _task: GovernanceTask,
+    ) -> Result<(), MemoriaError> {
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -202,13 +231,46 @@ impl GovernanceStore for SqlMemoryStore {
         )
         .await;
     }
+
+    async fn check_shared_breaker(
+        &self,
+        strategy_key: &str,
+        task: GovernanceTask,
+    ) -> Result<Option<i64>, MemoriaError> {
+        SqlMemoryStore::check_governance_runtime_breaker(self, strategy_key, task.as_str()).await
+    }
+
+    async fn record_shared_breaker_failure(
+        &self,
+        strategy_key: &str,
+        task: GovernanceTask,
+        threshold: usize,
+        cooldown_secs: i64,
+    ) -> Result<Option<i64>, MemoriaError> {
+        SqlMemoryStore::record_governance_runtime_failure(
+            self,
+            strategy_key,
+            task.as_str(),
+            threshold,
+            cooldown_secs,
+        )
+        .await
+    }
+
+    async fn clear_shared_breaker(
+        &self,
+        strategy_key: &str,
+        task: GovernanceTask,
+    ) -> Result<(), MemoriaError> {
+        SqlMemoryStore::clear_governance_runtime_breaker(self, strategy_key, task.as_str()).await
+    }
 }
 
 /// Governance strategy contract for scheduler-driven maintenance work.
 #[async_trait]
 pub trait GovernanceStrategy: Send + Sync {
     /// Stable strategy key, e.g. `governance:default:v1`.
-    fn strategy_key(&self) -> &'static str;
+    fn strategy_key(&self) -> &str;
 
     /// Produce the execution plan and estimated impact for a governance task.
     async fn plan(
@@ -399,7 +461,11 @@ impl DefaultGovernanceStrategy {
                 state.summary.stale_cleaned,
                 cleaned_users.len()
             ),
-            Some(if state.summary.stale_cleaned > 0 { 1.0 } else { 0.0 }),
+            Some(if state.summary.stale_cleaned > 0 {
+                1.0
+            } else {
+                0.0
+            }),
             vec![task_evidence(
                 task,
                 &cleaned_users,
@@ -614,7 +680,8 @@ impl DefaultGovernanceStrategy {
                     "rebuild_vector_index",
                     format!(
                         "Rebuilt vector index for {} and touched {} rows",
-                        Self::VECTOR_INDEX_TABLE, value
+                        Self::VECTOR_INDEX_TABLE,
+                        value
                     ),
                     Some(if value > 0 { 1.0 } else { 0.0 }),
                     vec![task_evidence(
@@ -708,7 +775,8 @@ impl DefaultGovernanceStrategy {
         plan: &GovernancePlan,
         state: &mut ExecutionState,
     ) {
-        self.cleanup_tool_results_operation(plan, store, state).await;
+        self.cleanup_tool_results_operation(plan, store, state)
+            .await;
         self.archive_stale_working_operation(store, state).await;
         self.cleanup_stale_operation(GovernanceTask::Hourly, store, &plan.users, state)
             .await;
@@ -735,7 +803,8 @@ impl DefaultGovernanceStrategy {
         plan: &GovernancePlan,
         state: &mut ExecutionState,
     ) {
-        self.rebuild_vector_index_operation(plan, store, state).await;
+        self.rebuild_vector_index_operation(plan, store, state)
+            .await;
         self.cleanup_snapshots_operation(plan, store, state).await;
         self.cleanup_orphan_branches_operation(plan, store, state)
             .await;
@@ -744,7 +813,7 @@ impl DefaultGovernanceStrategy {
 
 #[async_trait]
 impl GovernanceStrategy for DefaultGovernanceStrategy {
-    fn strategy_key(&self) -> &'static str {
+    fn strategy_key(&self) -> &str {
         "governance:default:v1"
     }
 
@@ -891,7 +960,11 @@ impl GovernanceStrategy for DefaultGovernanceStrategy {
         );
         metrics.insert(
             "governance.snapshot_created".to_string(),
-            if state.snapshot_before.is_some() { 1.0 } else { 0.0 },
+            if state.snapshot_before.is_some() {
+                1.0
+            } else {
+                0.0
+            },
         );
 
         let status = if state.warnings.is_empty() {
@@ -922,7 +995,11 @@ fn governance_decision(
 ) -> StrategyDecision {
     let mut evidence = evidence;
     if evidence.is_empty() {
-        evidence.push(task_evidence(task, &[], "No additional evidence recorded".to_string()));
+        evidence.push(task_evidence(
+            task,
+            &[],
+            "No additional evidence recorded".to_string(),
+        ));
     }
     StrategyDecision {
         action: action.to_string(),
@@ -1139,7 +1216,10 @@ mod tests {
             Ok(self.cleanup_orphan_branches_result)
         }
 
-        async fn create_safety_snapshot(&self, operation: &str) -> (Option<String>, Option<String>) {
+        async fn create_safety_snapshot(
+            &self,
+            operation: &str,
+        ) -> (Option<String>, Option<String>) {
             self.record(format!("create_safety_snapshot:{operation}"));
             (self.snapshot_result.clone(), self.snapshot_warning.clone())
         }
@@ -1298,7 +1378,7 @@ mod tests {
 
     #[async_trait]
     impl GovernanceStrategy for StaticContractStrategy {
-        fn strategy_key(&self) -> &'static str {
+        fn strategy_key(&self) -> &str {
             "governance:contract:v1"
         }
 
@@ -1363,8 +1443,7 @@ mod tests {
             ..RecordingStore::default()
         };
 
-        assert_governance_contract(&DefaultGovernanceStrategy, &store, GovernanceTask::Daily)
-            .await;
+        assert_governance_contract(&DefaultGovernanceStrategy, &store, GovernanceTask::Daily).await;
     }
 
     #[tokio::test]

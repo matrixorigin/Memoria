@@ -18,6 +18,9 @@
 - Daily: consolidation
 - Weekly: reflection
 - Off by default; enable with `MEMORIA_GOVERNANCE_ENABLED=true`
+- `memoria serve` and embedded `memoria mcp` now both start the scheduler through shared startup config
+- `MEMORIA_GOVERNANCE_PLUGIN_BINDING` now resolves a validated Rhai governance plugin from the shared repository at startup
+- New shared plugin repository flow: trusted signer registration, signed package publish, and binding activation via `memoria plugin ...`
 
 **Health Endpoints**
 - `GET /v1/health/analyze` — detect contaminated/orphaned memories

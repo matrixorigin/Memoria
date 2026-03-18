@@ -8,10 +8,10 @@
 
 use std::sync::Arc;
 
+use chrono::Utc;
 use memoria_core::{check_sensitivity, Memory, MemoryType, TrustTier};
 use memoria_git::GitForDataService;
 use uuid::Uuid;
-use chrono::Utc;
 
 use crate::MemoryService;
 
@@ -34,7 +34,11 @@ impl MemoryPipeline {
         let sandbox_enabled = std::env::var("MEMORIA_SANDBOX_ENABLED")
             .map(|v| v.to_lowercase() == "true")
             .unwrap_or(false);
-        Self { service, git, sandbox_enabled }
+        Self {
+            service,
+            git,
+            sandbox_enabled,
+        }
     }
 
     /// Run pipeline for a list of (content, memory_type) candidates.
@@ -52,7 +56,9 @@ impl MemoryPipeline {
             let sensitivity = check_sensitivity(&content);
             if sensitivity.blocked {
                 result.memories_rejected += 1;
-                result.errors.push(format!("blocked: {}", sensitivity.matched_labels.join(",")));
+                result
+                    .errors
+                    .push(format!("blocked: {}", sensitivity.matched_labels.join(",")));
                 continue;
             }
             let content = sensitivity.redacted_content.unwrap_or(content);
@@ -66,7 +72,10 @@ impl MemoryPipeline {
                 user_id: user_id.to_string(),
                 memory_type: mtype,
                 content,
-                initial_confidence: tier.as_ref().map(|t| t.initial_confidence()).unwrap_or(0.75),
+                initial_confidence: tier
+                    .as_ref()
+                    .map(|t| t.initial_confidence())
+                    .unwrap_or(0.75),
                 embedding,
                 source_event_ids: vec![],
                 superseded_by: None,
@@ -85,7 +94,10 @@ impl MemoryPipeline {
         // Phase 2: Sandbox validation (optional)
         if self.sandbox_enabled {
             if let (Some(git), Some(query)) = (&self.git, sandbox_query) {
-                let passed = self.service.validate_in_sandbox(user_id, &validated, query, git).await;
+                let passed = self
+                    .service
+                    .validate_in_sandbox(user_id, &validated, query, git)
+                    .await;
                 if !passed {
                     result.memories_rejected += validated.len();
                     return result;
@@ -97,7 +109,10 @@ impl MemoryPipeline {
         if let Some(sql) = &self.service.sql_store {
             let table = match sql.active_table(user_id).await {
                 Ok(t) => t,
-                Err(e) => { result.errors.push(e.to_string()); return result; }
+                Err(e) => {
+                    result.errors.push(e.to_string());
+                    return result;
+                }
             };
             for mem in &validated {
                 match sql.insert_into(&table, mem).await {
