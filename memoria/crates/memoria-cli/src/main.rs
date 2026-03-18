@@ -1543,6 +1543,24 @@ fn cmd_benchmark(
     out: Option<&str>,
     validate_only: bool,
 ) {
+    fn print_category_breakdown(
+        heading: &str,
+        values: &std::collections::HashMap<String, benchmark::CategoryBreakdown>,
+    ) {
+        if values.is_empty() {
+            return;
+        }
+        let mut items: Vec<_> = values.iter().collect();
+        items.sort_by(|a, b| a.0.cmp(b.0));
+        println!("  {heading}:");
+        for (_key, item) in items {
+            println!(
+                "    {}: {:.1} ({}) [{}]",
+                item.label, item.score, item.grade, item.scenario_count
+            );
+        }
+    }
+
     let dataset_path = {
         let p = Path::new(dataset);
         if p.exists() {
@@ -1621,7 +1639,7 @@ fn cmd_benchmark(
     );
     if !report.by_difficulty.is_empty() {
         let mut items: Vec<_> = report.by_difficulty.iter().collect();
-        items.sort_by_key(|(k, _)| k.to_string());
+        items.sort_by(|a, b| a.0.cmp(b.0));
         print!("  By difficulty:");
         for (k, v) in &items {
             print!(" {k}={v:.1}");
@@ -1630,13 +1648,25 @@ fn cmd_benchmark(
     }
     if !report.by_tag.is_empty() {
         let mut items: Vec<_> = report.by_tag.iter().collect();
-        items.sort_by_key(|(k, _)| k.to_string());
+        items.sort_by(|a, b| a.0.cmp(b.0));
         print!("  By tag:");
         for (k, v) in &items {
             print!(" {k}={v:.1}");
         }
         println!();
     }
+    if !report.by_domain.is_empty() {
+        let mut items: Vec<_> = report.by_domain.iter().collect();
+        items.sort_by(|a, b| a.0.cmp(b.0));
+        print!("  By domain:");
+        for (k, v) in &items {
+            print!(" {k}={v:.1}");
+        }
+        println!();
+    }
+    print_category_breakdown("By source family", &report.by_source_family);
+    print_category_breakdown("LongMemEval official categories", &report.by_longmemeval_category);
+    print_category_breakdown("BEAM official abilities", &report.by_beam_ability);
 
     if let Some(path) = out {
         let json = serde_json::to_string_pretty(&report).unwrap();
