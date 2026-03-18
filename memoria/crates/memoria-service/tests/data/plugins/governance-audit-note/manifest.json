@@ -1,0 +1,38 @@
+{
+  "name": "memoria-governance-audit-note",
+  "version": "1.0.0",
+  "api_version": "v1",
+  "runtime": "rhai",
+  "entry": {
+    "rhai": {
+      "script": "plugin.rhai",
+      "entrypoint": "memoria_plugin"
+    }
+  },
+  "capabilities": [
+    "governance.plan",
+    "governance.execute"
+  ],
+  "compatibility": {
+    "memoria": ">=0.1.0-rc1 <0.2.0"
+  },
+  "permissions": {
+    "network": false,
+    "filesystem": false,
+    "env": []
+  },
+  "limits": {
+    "timeout_ms": 800,
+    "max_memory_mb": 64,
+    "max_output_bytes": 16384
+  },
+  "integrity": {
+    "sha256": "4215901c1077ca2a8dca13218c768ac66dcb1598e71368f4b8411e45a9c8853d",
+    "signature": "dev-signature",
+    "signer": "dev-signer"
+  },
+  "metadata": {
+    "display_name": "Governance Audit Note",
+    "description": "Adds a lightweight execution annotation in Rhai"
+  }
+}

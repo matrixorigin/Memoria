@@ -69,6 +69,7 @@ graph TD
 - **Audit trail** — every memory mutation has a snapshot + provenance chain
 - **Self-maintaining** — built-in governance detects contradictions, quarantines low-confidence memories
 - **Private by default** — local embedding model option, no data leaves your machine
+- **Multi-instance ready** — distributed lock + leader election, deploy multiple replicas behind a load balancer with zero external dependencies
 
 **Supported Agents:** [Kiro](https://kiro.dev) · [Cursor](https://cursor.sh) · [Claude Code](https://docs.anthropic.com/en/docs/claude-code) · Any MCP-compatible agent
 
@@ -78,12 +79,15 @@ graph TD
 
 ## Documentation
 
-| Audience | Guide | Description |
-|----------|-------|-------------|
-| 📖 **Humans** | [User Guide](docs/user-guide.md) | Full setup, configuration, REST API, MCP config, examples |
-| 🤖 **AI Agents** | [Agent Integration Guide](docs/agent-integration-guide.md) | Step-by-step protocol for AI agents helping users install Memoria |
-| 🚀 **Operators** | [Deployment Guide](docs/deployment.md) | Docker Compose, env vars, security, production setup |
-| 📡 **Developers** | [API Reference](docs/api-reference.md) | REST API endpoints, request/response formats |
+| Skill | Domain | Description |
+|-------|--------|-------------|
+| [Architecture](skills/architecture/SKILL.md) | Codebase | Workspace layout, traits, tables, config, testing |
+| [API Reference](skills/api-reference/SKILL.md) | REST API | Endpoints, request/response formats, rate limits |
+| [Deployment](skills/deployment/SKILL.md) | Operations | Docker Compose, K8s, env vars, multi-instance, security |
+| [Plugin Development](skills/plugin-development/SKILL.md) | Plugins | Scaffold, test, sign, publish governance plugins |
+| [Setup](skills/setup/SKILL.md) | Installation | Install Memoria, configure MCP for AI tools |
+| [Release](skills/release/SKILL.md) | CI/CD | Version bump, CI workflows, publish |
+| [Local Embedding](skills/local-embedding/SKILL.md) | Embedding | Build from source, model selection, offline mode |
 
 ---
 
@@ -172,7 +176,7 @@ Restart your AI tool, then ask: *"Do you have memory tools available?"*
 memoria status   # check config files and rule versions
 ```
 
-For detailed setup options, see the [User Guide](docs/user-guide.md).
+For detailed setup options, see the [Setup Guide](skills/setup/SKILL.md).
 
 ---
 
@@ -203,7 +207,7 @@ Cursor:  Everything's configured. Try telling me a preference — like your test
          or code style — and I'll remember it across all future conversations.
 ```
 
-This guided flow is powered by the [Agent Integration Guide](docs/agent-integration-guide.md).
+This guided flow is powered by the [Setup Skill](skills/setup/SKILL.md).
 
 ---
 
@@ -266,7 +270,7 @@ Memoria exposes MCP tools that your AI tool calls automatically based on steerin
 | `memory_link_entities` | Write entity links from your own extraction results |
 | `memory_rebuild_index` | Rebuild IVF vector index for a table |
 
-For REST API details, see the [API Reference](docs/api-reference.md).
+For REST API details, see the [API Reference](skills/api-reference/SKILL.md).
 
 ---
 
@@ -350,6 +354,9 @@ AI:  → calls memory_diff(source="eval_sqlite")   ← preview first
 | `memoria mcp --api-url <url> --token <key>` | Start MCP server in remote mode (proxy to REST API) |
 | `memoria mcp --transport sse` | Start with SSE transport instead of stdio |
 | `memoria serve` | Start REST API server |
+| `memoria plugin init --dir <dir> --name <name>` | Scaffold a new governance plugin project |
+| `memoria plugin publish --package-dir <dir>` | Publish plugin to shared repository |
+| `memoria plugin dev-keygen --dir <dir>` | Generate ed25519 dev signing keypair |
 | `memoria benchmark --api-url <url> --token <key> --dataset <name>` | Run benchmark against API |
 
 ---
@@ -479,7 +486,7 @@ Configure via environment variables in the MCP config `env` block:
 Leave all empty to use local embedding (all-MiniLM-L6-v2, dim=384).
 
 **💡 Local Embedding Tips:**
-Local embedding requires building from source with `--features local-embedding` (pre-built binaries don't include it). See [Local Embedding Guide](docs/local-embedding.md) for build instructions, supported models, and troubleshooting.
+Local embedding requires building from source with `--features local-embedding` (pre-built binaries don't include it). See [Local Embedding Guide](skills/local-embedding/SKILL.md) for build instructions, supported models, and troubleshooting.
 
 **⚠️ CRITICAL: Configure embedding BEFORE the MCP server starts for the first time.**
  Tables are created on first startup with the configured dimension. Changing it later requires re-creating the embedding column (destructive).

@@ -156,6 +156,155 @@ enum Commands {
         #[arg(long)]
         validate_only: bool,
     },
+    /// Manage shared plugin repository state
+    Plugin {
+        #[command(subcommand)]
+        command: PluginCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum PluginCommands {
+    /// Scaffold a new plugin project (manifest.json + template script)
+    Init {
+        /// Output directory (created if missing)
+        #[arg(long, default_value = ".")]
+        dir: PathBuf,
+        /// Plugin name (e.g. "my-policy")
+        #[arg(long)]
+        name: String,
+        /// Plugin domain capability (e.g. "governance.plan")
+        #[arg(long, default_value = "governance.plan,governance.execute")]
+        capabilities: String,
+        /// Runtime: rhai or grpc
+        #[arg(long, default_value = "rhai")]
+        runtime: String,
+    },
+    /// Generate a dev-only ed25519 signing keypair
+    DevKeygen {
+        /// Output directory for key files
+        #[arg(long, default_value = ".")]
+        dir: PathBuf,
+    },
+    /// Register or update a trusted plugin signer
+    SignerAdd {
+        #[arg(long, env = "DATABASE_URL")]
+        db_url: Option<String>,
+        #[arg(long)]
+        signer: String,
+        #[arg(long)]
+        public_key: String,
+        #[arg(long, default_value = "cli")]
+        actor: String,
+    },
+    /// List trusted plugin signers
+    SignerList {
+        #[arg(long, env = "DATABASE_URL")]
+        db_url: Option<String>,
+    },
+    /// Publish a signed plugin package into the shared repository
+    Publish {
+        #[arg(long, env = "DATABASE_URL")]
+        db_url: Option<String>,
+        #[arg(long)]
+        package_dir: PathBuf,
+        #[arg(long, default_value = "cli")]
+        actor: String,
+        /// Skip signature verification and auto-approve
+        #[arg(long)]
+        dev_mode: bool,
+    },
+    /// List shared plugin packages
+    List {
+        #[arg(long, env = "DATABASE_URL")]
+        db_url: Option<String>,
+        #[arg(long)]
+        domain: Option<String>,
+    },
+    /// Activate a shared plugin package for a runtime binding
+    Activate {
+        #[arg(long, env = "DATABASE_URL")]
+        db_url: Option<String>,
+        #[arg(long, default_value = "governance")]
+        domain: String,
+        #[arg(long, default_value = "default")]
+        binding: String,
+        #[arg(long, default_value = "*")]
+        subject: String,
+        #[arg(long, default_value_t = 100)]
+        priority: i64,
+        #[arg(long)]
+        plugin_key: String,
+        #[arg(long)]
+        version: Option<String>,
+        #[arg(long)]
+        version_req: Option<String>,
+        #[arg(long, default_value_t = 100)]
+        rollout: i64,
+        #[arg(long)]
+        endpoint: Option<String>,
+        #[arg(long, default_value = "cli")]
+        actor: String,
+    },
+    /// Review or take down a published plugin package
+    Review {
+        #[arg(long, env = "DATABASE_URL")]
+        db_url: Option<String>,
+        #[arg(long)]
+        plugin_key: String,
+        #[arg(long)]
+        version: String,
+        #[arg(long)]
+        status: String,
+        #[arg(long)]
+        notes: Option<String>,
+        #[arg(long, default_value = "cli")]
+        actor: String,
+    },
+    /// Set a plugin package score
+    Score {
+        #[arg(long, env = "DATABASE_URL")]
+        db_url: Option<String>,
+        #[arg(long)]
+        plugin_key: String,
+        #[arg(long)]
+        version: String,
+        #[arg(long)]
+        score: f64,
+        #[arg(long)]
+        notes: Option<String>,
+        #[arg(long, default_value = "cli")]
+        actor: String,
+    },
+    /// Show compatibility matrix entries
+    Matrix {
+        #[arg(long, env = "DATABASE_URL")]
+        db_url: Option<String>,
+        #[arg(long)]
+        domain: Option<String>,
+    },
+    /// Show audit events for shared plugins
+    Events {
+        #[arg(long, env = "DATABASE_URL")]
+        db_url: Option<String>,
+        #[arg(long)]
+        domain: Option<String>,
+        #[arg(long)]
+        plugin_key: Option<String>,
+        #[arg(long)]
+        binding: Option<String>,
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
+    /// Show binding rules for one binding
+    Rules {
+        #[arg(long, env = "DATABASE_URL")]
+        db_url: Option<String>,
+        #[arg(long, default_value = "governance")]
+        domain: String,
+        #[arg(long, default_value = "default")]
+        binding: String,
+    },
 }
 
 // ── Serve (API server) ────────────────────────────────────────────────────────
@@ -174,11 +323,15 @@ async fn cmd_serve(db_url: Option<String>, port: u16, master_key: String) -> Res
         .init();
 
     let mut cfg = Config::from_env();
-    if let Some(v) = db_url { cfg.db_url = v; }
+    if let Some(v) = db_url {
+        cfg.db_url = v;
+    }
 
     tracing::info!(
         db_url = %cfg.db_url, port = port,
+        instance_id = %cfg.instance_id,
         has_llm = cfg.has_llm(), has_embedding = cfg.has_embedding(),
+        governance_plugin_binding = %cfg.governance_plugin_binding,
         "Starting Memoria API server"
     );
 
@@ -191,8 +344,15 @@ async fn cmd_serve(db_url: Option<String>, port: u16, master_key: String) -> Res
     let embedder = build_embedder(&cfg);
     let llm = build_llm(&cfg);
 
-    let service = Arc::new(MemoryService::new_sql_with_llm(Arc::new(store), embedder, llm));
-    let state = AppState::new(service, git, master_key);
+    let service = Arc::new(MemoryService::new_sql_with_llm(
+        Arc::new(store),
+        embedder,
+        llm,
+    ));
+    Arc::new(memoria_service::GovernanceScheduler::from_config(service.clone(), &cfg).await?)
+    .start();
+    let state = AppState::new(service, git, master_key)
+        .with_instance_id(cfg.instance_id.clone());
 
     let app = build_router(state).layer(TraceLayer::new_for_http());
     let addr = format!("0.0.0.0:{}", port);
@@ -206,13 +366,20 @@ async fn cmd_serve(db_url: Option<String>, port: u16, master_key: String) -> Res
 
 #[allow(clippy::too_many_arguments)]
 async fn cmd_mcp(
-    api_url: Option<String>, token: Option<String>,
-    db_url: Option<String>, user: Option<String>,
-    embedding_dim: Option<usize>, embedding_base_url: Option<String>,
-    embedding_api_key: Option<String>, embedding_model: Option<String>,
-    llm_api_key: Option<String>, llm_base_url: Option<String>,
-    llm_model: Option<String>, db_name: Option<String>,
-    transport: String, mcp_port: u16,
+    api_url: Option<String>,
+    token: Option<String>,
+    db_url: Option<String>,
+    user: Option<String>,
+    embedding_dim: Option<usize>,
+    embedding_base_url: Option<String>,
+    embedding_api_key: Option<String>,
+    embedding_model: Option<String>,
+    llm_api_key: Option<String>,
+    llm_base_url: Option<String>,
+    llm_model: Option<String>,
+    db_name: Option<String>,
+    transport: String,
+    mcp_port: u16,
 ) -> Result<()> {
     use memoria_git::GitForDataService;
     use memoria_service::{Config, MemoryService};
@@ -227,31 +394,49 @@ async fn cmd_mcp(
     if let Some(api_url) = &api_url {
         let user = user.clone().unwrap_or_else(|| "default".to_string());
         tracing::info!(api_url = %api_url, user = %user, "Starting Memoria MCP (remote mode)");
-        let remote = memoria_mcp::remote::RemoteClient::new(
-            api_url,
-            token.as_deref(),
-            user.clone(),
-        );
+        let remote =
+            memoria_mcp::remote::RemoteClient::new(api_url, token.as_deref(), user.clone());
         return memoria_mcp::run_stdio_remote(remote, user).await;
     }
 
     // Embedded mode
     let mut cfg = Config::from_env();
-    if let Some(v) = db_url { cfg.db_url = v; }
-    if let Some(v) = user { cfg.user = v; }
-    if let Some(v) = embedding_dim { cfg.embedding_dim = v; }
-    if let Some(v) = embedding_base_url { cfg.embedding_base_url = v; }
-    if let Some(v) = embedding_api_key { cfg.embedding_api_key = v; }
-    if let Some(v) = embedding_model { cfg.embedding_model = v; }
-    if let Some(v) = llm_api_key { cfg.llm_api_key = Some(v); }
-    if let Some(v) = llm_base_url { cfg.llm_base_url = v; }
-    if let Some(v) = llm_model { cfg.llm_model = v; }
-    if let Some(v) = db_name { cfg.db_name = v; }
+    if let Some(v) = db_url {
+        cfg.db_url = v;
+    }
+    if let Some(v) = user {
+        cfg.user = v;
+    }
+    if let Some(v) = embedding_dim {
+        cfg.embedding_dim = v;
+    }
+    if let Some(v) = embedding_base_url {
+        cfg.embedding_base_url = v;
+    }
+    if let Some(v) = embedding_api_key {
+        cfg.embedding_api_key = v;
+    }
+    if let Some(v) = embedding_model {
+        cfg.embedding_model = v;
+    }
+    if let Some(v) = llm_api_key {
+        cfg.llm_api_key = Some(v);
+    }
+    if let Some(v) = llm_base_url {
+        cfg.llm_base_url = v;
+    }
+    if let Some(v) = llm_model {
+        cfg.llm_model = v;
+    }
+    if let Some(v) = db_name {
+        cfg.db_name = v;
+    }
 
     tracing::info!(
         db_url = %cfg.db_url,
         embedding_provider = %cfg.embedding_provider,
         has_llm = cfg.has_llm(),
+        governance_plugin_binding = %cfg.governance_plugin_binding,
         user = %cfg.user,
         "Starting Memoria MCP (embedded mode)"
     );
@@ -265,8 +450,13 @@ async fn cmd_mcp(
     let embedder = build_embedder(&cfg);
     let llm = build_llm(&cfg);
 
-    let service = Arc::new(MemoryService::new_sql_with_llm(Arc::new(store), embedder, llm));
-    Arc::new(memoria_service::GovernanceScheduler::new(service.clone())).start();
+    let service = Arc::new(MemoryService::new_sql_with_llm(
+        Arc::new(store),
+        embedder,
+        llm,
+    ));
+    Arc::new(memoria_service::GovernanceScheduler::from_config(service.clone(), &cfg).await?)
+    .start();
 
     if transport == "sse" {
         memoria_mcp::run_sse(service, git, cfg.user, mcp_port).await
@@ -275,16 +465,318 @@ async fn cmd_mcp(
     }
 }
 
+async fn cmd_plugin(command: PluginCommands) -> Result<()> {
+    use memoria_service::{
+        get_plugin_audit_events, list_binding_rules, list_plugin_compatibility_matrix,
+        list_plugin_repository_entries, list_trusted_plugin_signers, publish_plugin_package,
+        publish_plugin_package_dev, review_plugin_package, score_plugin_package,
+        upsert_plugin_binding_rule, upsert_trusted_plugin_signer, BindingRuleInput, Config,
+    };
+    use memoria_storage::SqlMemoryStore;
+
+    // Commands that don't need a DB connection
+    match &command {
+        PluginCommands::Init { dir, name, capabilities, runtime } => {
+            return cmd_plugin_init(dir, name, capabilities, runtime);
+        }
+        PluginCommands::DevKeygen { dir } => {
+            return cmd_plugin_dev_keygen(dir);
+        }
+        _ => {}
+    }
+
+    let cfg_db_url = match &command {
+        PluginCommands::SignerAdd { db_url, .. }
+        | PluginCommands::SignerList { db_url }
+        | PluginCommands::Publish { db_url, .. }
+        | PluginCommands::List { db_url, .. }
+        | PluginCommands::Activate { db_url, .. }
+        | PluginCommands::Review { db_url, .. }
+        | PluginCommands::Score { db_url, .. }
+        | PluginCommands::Matrix { db_url, .. }
+        | PluginCommands::Events { db_url, .. }
+        | PluginCommands::Rules { db_url, .. } => db_url.clone(),
+        PluginCommands::Init { .. } | PluginCommands::DevKeygen { .. } => unreachable!(),
+    };
+
+    let mut cfg = Config::from_env();
+    if let Some(db_url) = cfg_db_url {
+        cfg.db_url = db_url;
+    }
+    let store = SqlMemoryStore::connect(&cfg.db_url, cfg.embedding_dim).await?;
+    store.migrate().await?;
+
+    match command {
+        PluginCommands::SignerAdd {
+            signer,
+            public_key,
+            actor,
+            ..
+        } => {
+            upsert_trusted_plugin_signer(&store, &signer, &public_key, &actor).await?;
+            println!("trusted signer upserted: {signer}");
+        }
+        PluginCommands::SignerList { .. } => {
+            for signer in list_trusted_plugin_signers(&store).await? {
+                println!(
+                    "{}\t{}\tactive={}\t{}",
+                    signer.signer, signer.algorithm, signer.is_active, signer.public_key
+                );
+            }
+        }
+        PluginCommands::Publish {
+            package_dir, actor, dev_mode, ..
+        } => {
+            let published = if dev_mode {
+                publish_plugin_package_dev(&store, &package_dir, &actor).await?
+            } else {
+                publish_plugin_package(&store, &package_dir, &actor).await?
+            };
+            println!(
+                "published {}\t{}\t{}\t{}\tstatus={}{}",
+                published.plugin_key,
+                published.version,
+                published.domain,
+                published.signer,
+                published.status,
+                if dev_mode { " (dev mode)" } else { "" }
+            );
+        }
+        PluginCommands::List { domain, .. } => {
+            for entry in list_plugin_repository_entries(&store, domain.as_deref()).await? {
+                println!(
+                    "{}\t{}\t{}\t{}\treview={}\tscore={:.1}\t{}",
+                    entry.plugin_key,
+                    entry.version,
+                    entry.domain,
+                    entry.status,
+                    entry.review_status,
+                    entry.score,
+                    entry.signer
+                );
+            }
+        }
+        PluginCommands::Activate {
+            domain,
+            binding,
+            subject,
+            priority,
+            plugin_key,
+            version,
+            version_req,
+            rollout,
+            endpoint,
+            actor,
+            ..
+        } => {
+            let (selector_kind, selector_value) = match (version, version_req) {
+                (Some(version), None) => ("exact", version),
+                (None, Some(version_req)) => ("semver", version_req),
+                _ => anyhow::bail!("Specify exactly one of --version or --version-req"),
+            };
+            upsert_plugin_binding_rule(
+                &store,
+                BindingRuleInput {
+                    domain: &domain,
+                    binding_key: &binding,
+                    subject_key: &subject,
+                    priority,
+                    plugin_key: &plugin_key,
+                    selector_kind,
+                    selector_value: &selector_value,
+                    rollout_percent: rollout,
+                    transport_endpoint: endpoint.as_deref(),
+                    actor: &actor,
+                },
+            )
+            .await?;
+            println!(
+                "activated rule {}\t{}\tsubject={}\tpriority={}\t{}\t{}",
+                domain, binding, subject, priority, selector_kind, selector_value
+            );
+        }
+        PluginCommands::Review {
+            plugin_key,
+            version,
+            status,
+            notes,
+            actor,
+            ..
+        } => {
+            review_plugin_package(&store, &plugin_key, &version, &status, notes.as_deref(), &actor)
+                .await?;
+            println!("reviewed {plugin_key}@{version} -> {status}");
+        }
+        PluginCommands::Score {
+            plugin_key,
+            version,
+            score,
+            notes,
+            actor,
+            ..
+        } => {
+            score_plugin_package(&store, &plugin_key, &version, score, notes.as_deref(), &actor)
+                .await?;
+            println!("scored {plugin_key}@{version} -> {score}");
+        }
+        PluginCommands::Matrix { domain, .. } => {
+            for entry in list_plugin_compatibility_matrix(&store, domain.as_deref()).await? {
+                println!(
+                    "{}\t{}\t{}\tstatus={}\treview={}\tsupported={}\t{}\t{}",
+                    entry.plugin_key,
+                    entry.version,
+                    entry.runtime,
+                    entry.status,
+                    entry.review_status,
+                    entry.supported,
+                    entry.compatibility,
+                    entry.reason
+                );
+            }
+        }
+        PluginCommands::Events {
+            domain,
+            plugin_key,
+            binding,
+            limit,
+            ..
+        } => {
+            for event in get_plugin_audit_events(
+                &store,
+                domain.as_deref(),
+                plugin_key.as_deref(),
+                binding.as_deref(),
+                limit,
+            )
+            .await?
+            {
+                println!(
+                    "{}\t{}\tplugin={}\tversion={}\tbinding={}\tsubject={}\t{}\t{}",
+                    event.created_at,
+                    event.event_type,
+                    event.plugin_key.unwrap_or_default(),
+                    event.version.unwrap_or_default(),
+                    event.binding_key.unwrap_or_default(),
+                    event.subject_key.unwrap_or_default(),
+                    event.status,
+                    event.message
+                );
+            }
+        }
+        PluginCommands::Rules {
+            domain, binding, ..
+        } => {
+            for rule in list_binding_rules(&store, &domain, &binding).await? {
+                println!(
+                    "{}\tsubject={}\tpriority={}\t{}\t{} {}\trollout={}\tendpoint={}",
+                    rule.rule_id,
+                    rule.subject_key,
+                    rule.priority,
+                    rule.plugin_key,
+                    rule.selector_kind,
+                    rule.selector_value,
+                    rule.rollout_percent,
+                    rule.transport_endpoint.unwrap_or_default()
+                );
+            }
+        }
+        PluginCommands::Init { .. } | PluginCommands::DevKeygen { .. } => unreachable!(),
+    }
+    Ok(())
+}
+
+// ── Plugin scaffolding ────────────────────────────────────────────────────────
+
+fn cmd_plugin_init(dir: &Path, name: &str, capabilities: &str, runtime: &str) -> Result<()> {
+    use memoria_service::{GOVERNANCE_RHAI_TEMPLATE, GOVERNANCE_RHAI_TEMPLATE_ENTRYPOINT};
+    use serde_json::json;
+
+    std::fs::create_dir_all(dir)?;
+    let caps: Vec<&str> = capabilities.split(',').map(str::trim).collect();
+    let full_name = if name.starts_with("memoria-") {
+        name.to_string()
+    } else {
+        format!("memoria-{name}")
+    };
+
+    let script_file = "policy.rhai";
+    let manifest = json!({
+        "name": full_name,
+        "version": "0.1.0",
+        "api_version": "v1",
+        "runtime": runtime,
+        "entry": {
+            "rhai": if runtime == "rhai" { json!({"script": script_file, "entrypoint": GOVERNANCE_RHAI_TEMPLATE_ENTRYPOINT}) } else { json!(null) },
+            "grpc": if runtime == "grpc" { json!({"service": "memoria.plugin.v1.StrategyPlugin", "protocol": "grpc"}) } else { json!(null) }
+        },
+        "capabilities": caps,
+        "compatibility": { "memoria": format!(">={}",  env!("CARGO_PKG_VERSION")) },
+        "permissions": { "network": runtime == "grpc", "filesystem": false, "env": [] },
+        "limits": { "timeout_ms": 500, "max_memory_mb": 32, "max_output_bytes": 8192 },
+        "integrity": { "sha256": "", "signature": "", "signer": "" },
+        "metadata": { "display_name": name }
+    });
+
+    std::fs::write(
+        dir.join("manifest.json"),
+        serde_json::to_vec_pretty(&manifest)?,
+    )?;
+
+    if runtime == "rhai" {
+        std::fs::write(dir.join(script_file), GOVERNANCE_RHAI_TEMPLATE)?;
+    }
+
+    println!("Plugin scaffolded in {}", dir.display());
+    println!("  manifest.json");
+    if runtime == "rhai" {
+        println!("  {script_file}");
+    }
+    println!("\nNext steps:");
+    println!("  1. Edit the script/manifest");
+    println!("  2. memoria plugin dev-keygen --dir {}", dir.display());
+    println!("  3. Sign and publish:");
+    println!("     memoria plugin publish --package-dir {} --dev-mode", dir.display());
+    Ok(())
+}
+
+fn cmd_plugin_dev_keygen(dir: &Path) -> Result<()> {
+    use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+    use ed25519_dalek::SigningKey;
+
+    std::fs::create_dir_all(dir)?;
+    let mut secret = [0u8; 32];
+    getrandom::getrandom(&mut secret)?;
+    let key = SigningKey::from_bytes(&secret);
+    let secret_b64 = BASE64.encode(key.to_bytes());
+    let public_b64 = BASE64.encode(key.verifying_key().as_bytes());
+
+    std::fs::write(dir.join("dev-signing-key.b64"), &secret_b64)?;
+    std::fs::write(dir.join("dev-public-key.b64"), &public_b64)?;
+
+    println!("Generated dev signing keypair in {}", dir.display());
+    println!("  dev-signing-key.b64  (KEEP SECRET)");
+    println!("  dev-public-key.b64");
+    println!("\nTo register the signer:");
+    println!("  memoria plugin signer-add --signer dev --public-key {public_b64}");
+    println!("\n⚠️  Add dev-signing-key.b64 to .gitignore!");
+    Ok(())
+}
+
 // ── Shared helpers ────────────────────────────────────────────────────────────
 
-fn build_embedder(cfg: &memoria_service::Config) -> Option<Arc<dyn memoria_core::interfaces::EmbeddingProvider>> {
+fn build_embedder(
+    cfg: &memoria_service::Config,
+) -> Option<Arc<dyn memoria_core::interfaces::EmbeddingProvider>> {
     use memoria_embedding::HttpEmbedder;
 
     if cfg.has_embedding() {
         Some(Arc::new(HttpEmbedder::new(
-            &cfg.embedding_base_url, &cfg.embedding_api_key,
-            &cfg.embedding_model, cfg.embedding_dim,
-        )) as Arc<dyn memoria_core::interfaces::EmbeddingProvider>)
+            &cfg.embedding_base_url,
+            &cfg.embedding_api_key,
+            &cfg.embedding_model,
+            cfg.embedding_dim,
+        ))
+            as Arc<dyn memoria_core::interfaces::EmbeddingProvider>)
     } else if cfg.embedding_provider == "local" {
         #[cfg(feature = "local-embedding")]
         {
@@ -294,7 +786,9 @@ fn build_embedder(cfg: &memoria_service::Config) -> Option<Arc<dyn memoria_core:
         }
         #[cfg(not(feature = "local-embedding"))]
         {
-            tracing::error!("EMBEDDING_PROVIDER=local but compiled without local-embedding feature");
+            tracing::error!(
+                "EMBEDDING_PROVIDER=local but compiled without local-embedding feature"
+            );
             None
         }
     } else {
@@ -305,7 +799,9 @@ fn build_embedder(cfg: &memoria_service::Config) -> Option<Arc<dyn memoria_core:
 fn build_llm(cfg: &memoria_service::Config) -> Option<Arc<memoria_embedding::LlmClient>> {
     cfg.llm_api_key.as_ref().map(|key| {
         Arc::new(memoria_embedding::LlmClient::new(
-            key.clone(), cfg.llm_base_url.clone(), cfg.llm_model.clone(),
+            key.clone(),
+            cfg.llm_base_url.clone(),
+            cfg.llm_model.clone(),
         ))
     })
 }
@@ -344,13 +840,27 @@ fn mcp_entry(
         args.push(user.to_string());
 
         // Always include all embedding env vars — empty string means "not configured, edit me"
-        env.insert("EMBEDDING_PROVIDER".into(), embedding_provider.unwrap_or("").into());
-        env.insert("EMBEDDING_BASE_URL".into(), embedding_base_url.unwrap_or("").into());
-        env.insert("EMBEDDING_API_KEY".into(), embedding_api_key.unwrap_or("").into());
-        env.insert("EMBEDDING_MODEL".into(), embedding_model.unwrap_or("").into());
+        env.insert(
+            "EMBEDDING_PROVIDER".into(),
+            embedding_provider.unwrap_or("").into(),
+        );
+        env.insert(
+            "EMBEDDING_BASE_URL".into(),
+            embedding_base_url.unwrap_or("").into(),
+        );
+        env.insert(
+            "EMBEDDING_API_KEY".into(),
+            embedding_api_key.unwrap_or("").into(),
+        );
+        env.insert(
+            "EMBEDDING_MODEL".into(),
+            embedding_model.unwrap_or("").into(),
+        );
         env.insert("EMBEDDING_DIM".into(), embedding_dim.unwrap_or("").into());
+        env.insert("MEMORIA_GOVERNANCE_ENABLED".into(), "".into());
+        env.insert("MEMORIA_GOVERNANCE_PLUGIN_BINDING".into(), "default".into());
         env.insert("_README".into(), serde_json::Value::String(
-            "EMBEDDING_*: required for semantic search. Use 'openai' provider with any OpenAI-compatible API (SiliconFlow, Ollama, etc). Empty values = not configured.".to_string()
+            "EMBEDDING_*: required for semantic search. Use 'openai' provider with any OpenAI-compatible API (SiliconFlow, Ollama, etc). MEMORIA_GOVERNANCE_PLUGIN_BINDING selects the shared repository binding resolved at startup.".to_string()
         ));
     }
 
@@ -408,7 +918,10 @@ fn regex_version(content: &str) -> Option<String> {
 fn write_rule(path: &Path, content: &str, force: bool, project_dir: &Path) -> String {
     let relative = path.strip_prefix(project_dir).unwrap_or(path);
     // Replace template version placeholder with actual binary version
-    let content = content.replace("memoria-version: 0.1.0", &format!("memoria-version: {}", VERSION));
+    let content = content.replace(
+        "memoria-version: 0.1.0",
+        &format!("memoria-version: {}", VERSION),
+    );
     if path.exists() && !force {
         let installed = installed_version(path);
         let bundled = regex_version(&content);
@@ -419,11 +932,16 @@ fn write_rule(path: &Path, content: &str, force: bool, project_dir: &Path) -> St
             (Some(i), Some(b)) => {
                 return format!(
                     "  ⚠ {} (v{} installed, v{} available — run update-rules or use --force)",
-                    relative.display(), i, b
+                    relative.display(),
+                    i,
+                    b
                 );
             }
             _ => {
-                return format!("  ⚠ {} (exists, skipped — use --force to overwrite)", relative.display());
+                return format!(
+                    "  ⚠ {} (exists, skipped — use --force to overwrite)",
+                    relative.display()
+                );
             }
         }
     }
@@ -431,7 +949,9 @@ fn write_rule(path: &Path, content: &str, force: bool, project_dir: &Path) -> St
         std::fs::create_dir_all(parent).ok();
     }
     std::fs::write(path, &content).ok();
-    let ver = regex_version(&content).map(|v| format!(" (v{})", v)).unwrap_or_default();
+    let ver = regex_version(&content)
+        .map(|v| format!(" (v{})", v))
+        .unwrap_or_default();
     format!("  ✓ {}{}", relative.display(), ver)
 }
 
@@ -457,28 +977,50 @@ fn write_mcp_json(path: &Path, entry: &serde_json::Value, project_dir: &Path) ->
 
 fn configure_kiro(project_dir: &Path, entry: &serde_json::Value, force: bool) -> Vec<String> {
     vec![
-        write_mcp_json(&project_dir.join(".kiro/settings/mcp.json"), entry, project_dir),
-        write_rule(&project_dir.join(".kiro/steering/memory.md"), KIRO_STEERING, force, project_dir),
+        write_mcp_json(
+            &project_dir.join(".kiro/settings/mcp.json"),
+            entry,
+            project_dir,
+        ),
+        write_rule(
+            &project_dir.join(".kiro/steering/memory.md"),
+            KIRO_STEERING,
+            force,
+            project_dir,
+        ),
     ]
 }
 
 fn configure_cursor(project_dir: &Path, entry: &serde_json::Value, force: bool) -> Vec<String> {
     vec![
         write_mcp_json(&project_dir.join(".cursor/mcp.json"), entry, project_dir),
-        write_rule(&project_dir.join(".cursor/rules/memory.mdc"), CURSOR_RULE, force, project_dir),
+        write_rule(
+            &project_dir.join(".cursor/rules/memory.mdc"),
+            CURSOR_RULE,
+            force,
+            project_dir,
+        ),
     ]
 }
 
 fn configure_claude(project_dir: &Path, entry: &serde_json::Value, _force: bool) -> Vec<String> {
-    let mut results = vec![
-        write_mcp_json(&project_dir.join(".mcp.json"), entry, project_dir),
-    ];
-    let claude_rule = CLAUDE_RULE.replace("memoria-version: 0.1.0", &format!("memoria-version: {}", VERSION));
+    let mut results = vec![write_mcp_json(
+        &project_dir.join(".mcp.json"),
+        entry,
+        project_dir,
+    )];
+    let claude_rule = CLAUDE_RULE.replace(
+        "memoria-version: 0.1.0",
+        &format!("memoria-version: {}", VERSION),
+    );
     let claude_md = project_dir.join("CLAUDE.md");
     if claude_md.exists() {
         let content = std::fs::read_to_string(&claude_md).unwrap_or_default();
         if !content.contains("memory_retrieve") {
-            let mut f = std::fs::OpenOptions::new().append(true).open(&claude_md).unwrap();
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&claude_md)
+                .unwrap();
             use std::io::Write;
             writeln!(f, "\n\n{}", claude_rule).ok();
             results.push("  ✓ CLAUDE.md (appended memory rules)".to_string());
@@ -876,17 +1418,28 @@ fn cmd_init_interactive(project_dir: &Path, force: bool) {
 
 #[allow(clippy::too_many_arguments)]
 fn cmd_init(
-    project_dir: &Path, tools: Vec<ToolName>,
-    db_url: Option<String>, api_url: Option<String>, token: Option<String>,
-    user: String, force: bool,
-    embedding_provider: Option<String>, embedding_model: Option<String>,
-    embedding_dim: Option<String>, embedding_api_key: Option<String>,
+    project_dir: &Path,
+    tools: Vec<ToolName>,
+    db_url: Option<String>,
+    api_url: Option<String>,
+    token: Option<String>,
+    user: String,
+    force: bool,
+    embedding_provider: Option<String>,
+    embedding_model: Option<String>,
+    embedding_dim: Option<String>,
+    embedding_api_key: Option<String>,
     embedding_base_url: Option<String>,
 ) {
     let entry = mcp_entry(
-        db_url.as_deref(), api_url.as_deref(), token.as_deref(), &user,
-        embedding_provider.as_deref(), embedding_model.as_deref(),
-        embedding_dim.as_deref(), embedding_api_key.as_deref(),
+        db_url.as_deref(),
+        api_url.as_deref(),
+        token.as_deref(),
+        &user,
+        embedding_provider.as_deref(),
+        embedding_model.as_deref(),
+        embedding_dim.as_deref(),
+        embedding_api_key.as_deref(),
         embedding_base_url.as_deref(),
     );
 
@@ -897,7 +1450,9 @@ fn cmd_init(
             ToolName::Cursor => configure_cursor(project_dir, &entry, force),
             ToolName::Claude => configure_claude(project_dir, &entry, force),
         };
-        for r in results { println!("{}", r); }
+        for r in results {
+            println!("{}", r);
+        }
     }
 
     // Post-init guidance
@@ -931,10 +1486,16 @@ fn cmd_status(project_dir: &Path) {
         };
         println!("[{}]", tool);
         let mcp = project_dir.join(mcp_path);
-        if mcp.exists() { println!("  ✓ {}", mcp_path); } else { println!("  ✗ {} (missing)", mcp_path); }
+        if mcp.exists() {
+            println!("  ✓ {}", mcp_path);
+        } else {
+            println!("  ✗ {} (missing)", mcp_path);
+        }
         let rule = project_dir.join(rule_path);
         if rule.exists() {
-            let ver = installed_version(&rule).map(|v| format!(" (v{})", v)).unwrap_or_default();
+            let ver = installed_version(&rule)
+                .map(|v| format!(" (v{})", v))
+                .unwrap_or_default();
             println!("  ✓ {}{}", rule_path, ver);
         } else {
             println!("  ✗ {} (missing)", rule_path);
@@ -953,8 +1514,18 @@ fn cmd_update_rules(project_dir: &Path) {
     for tool in &tools {
         println!("[{}]", tool);
         let result = match tool.as_str() {
-            "kiro" => write_rule(&project_dir.join(".kiro/steering/memory.md"), KIRO_STEERING, true, project_dir),
-            "cursor" => write_rule(&project_dir.join(".cursor/rules/memory.mdc"), CURSOR_RULE, true, project_dir),
+            "kiro" => write_rule(
+                &project_dir.join(".kiro/steering/memory.md"),
+                KIRO_STEERING,
+                true,
+                project_dir,
+            ),
+            "cursor" => write_rule(
+                &project_dir.join(".cursor/rules/memory.mdc"),
+                CURSOR_RULE,
+                true,
+                project_dir,
+            ),
             "claude" => {
                 println!("  ⚠ CLAUDE.md — manual update recommended");
                 continue;
@@ -965,21 +1536,35 @@ fn cmd_update_rules(project_dir: &Path) {
     }
 }
 
-fn cmd_benchmark(api_url: &str, token: &str, dataset: &str, out: Option<&str>, validate_only: bool) {
+fn cmd_benchmark(
+    api_url: &str,
+    token: &str,
+    dataset: &str,
+    out: Option<&str>,
+    validate_only: bool,
+) {
     let dataset_path = {
         let p = Path::new(dataset);
-        if p.exists() { p.to_path_buf() }
-        else {
+        if p.exists() {
+            p.to_path_buf()
+        } else {
             let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
             let candidates = [
-                manifest.join("../../../benchmarks/datasets").join(format!("{dataset}.json")),
-                manifest.join("../../../memoria/datasets").join(format!("{dataset}.json")),
+                manifest
+                    .join("../../../benchmarks/datasets")
+                    .join(format!("{dataset}.json")),
+                manifest
+                    .join("../../../memoria/datasets")
+                    .join(format!("{dataset}.json")),
             ];
-            candidates.into_iter().find(|c| c.exists()).unwrap_or_else(|| {
-                eprintln!("Dataset not found: {dataset}");
-                eprintln!("Looked in: benchmarks/datasets/{dataset}.json");
-                std::process::exit(1);
-            })
+            candidates
+                .into_iter()
+                .find(|c| c.exists())
+                .unwrap_or_else(|| {
+                    eprintln!("Dataset not found: {dataset}");
+                    eprintln!("Looked in: benchmarks/datasets/{dataset}.json");
+                    std::process::exit(1);
+                })
         }
     };
 
@@ -994,7 +1579,9 @@ fn cmd_benchmark(api_url: &str, token: &str, dataset: &str, out: Option<&str>, v
             println!("✅ Dataset is valid.");
         } else {
             println!("Validation failed ({} errors):", errors.len());
-            for e in &errors { println!("  ❌ {e}"); }
+            for e in &errors {
+                println!("  ❌ {e}");
+            }
             std::process::exit(1);
         }
         return;
@@ -1004,7 +1591,12 @@ fn cmd_benchmark(api_url: &str, token: &str, dataset: &str, out: Option<&str>, v
         eprintln!("Failed to parse dataset: {e}");
         std::process::exit(1);
     });
-    println!("Dataset: {} {} ({} scenarios)", ds.dataset_id, ds.version, ds.scenarios.len());
+    println!(
+        "Dataset: {} {} ({} scenarios)",
+        ds.dataset_id,
+        ds.version,
+        ds.scenarios.len()
+    );
 
     let executor = benchmark::BenchmarkExecutor::new(api_url, token);
     let mut executions = std::collections::HashMap::new();
@@ -1013,25 +1605,36 @@ fn cmd_benchmark(api_url: &str, token: &str, dataset: &str, out: Option<&str>, v
         print!("  Running {}...", scenario.scenario_id);
         let exec = executor.execute(scenario);
         let result = benchmark::score_scenario(scenario, &exec);
-        let icon = match result.grade.as_str() { "S" | "A" => "✅", "B" => "⚠️", _ => "❌" };
+        let icon = match result.grade.as_str() {
+            "S" | "A" => "✅",
+            "B" => "⚠️",
+            _ => "❌",
+        };
         println!(" {icon} {:.1} ({})", result.total_score, result.grade);
         executions.insert(scenario.scenario_id.clone(), exec);
     }
 
     let report = benchmark::score_dataset(&ds, &executions);
-    println!("\nOverall: {:.1} ({})", report.overall_score, report.overall_grade);
+    println!(
+        "\nOverall: {:.1} ({})",
+        report.overall_score, report.overall_grade
+    );
     if !report.by_difficulty.is_empty() {
         let mut items: Vec<_> = report.by_difficulty.iter().collect();
         items.sort_by_key(|(k, _)| k.to_string());
         print!("  By difficulty:");
-        for (k, v) in &items { print!(" {k}={v:.1}"); }
+        for (k, v) in &items {
+            print!(" {k}={v:.1}");
+        }
         println!();
     }
     if !report.by_tag.is_empty() {
         let mut items: Vec<_> = report.by_tag.iter().collect();
         items.sort_by_key(|(k, _)| k.to_string());
         print!("  By tag:");
-        for (k, v) in &items { print!(" {k}={v:.1}"); }
+        for (k, v) in &items {
+            print!(" {k}={v:.1}");
+        }
         println!();
     }
 
@@ -1055,26 +1658,50 @@ fn main() -> Result<()> {
     let project_dir = cli.dir.canonicalize().unwrap_or(cli.dir);
 
     match cli.command {
-        Commands::Serve { db_url, port, master_key } => {
+        Commands::Serve {
+            db_url,
+            port,
+            master_key,
+        } => {
             tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?
                 .block_on(cmd_serve(db_url, port, master_key))?;
         }
         Commands::Mcp {
-            api_url, token, db_url, user,
-            embedding_dim, embedding_base_url, embedding_api_key, embedding_model,
-            llm_api_key, llm_base_url, llm_model, db_name,
-            transport, mcp_port,
+            api_url,
+            token,
+            db_url,
+            user,
+            embedding_dim,
+            embedding_base_url,
+            embedding_api_key,
+            embedding_model,
+            llm_api_key,
+            llm_base_url,
+            llm_model,
+            db_name,
+            transport,
+            mcp_port,
         } => {
             tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?
                 .block_on(cmd_mcp(
-                    api_url, token, db_url, user,
-                    embedding_dim, embedding_base_url, embedding_api_key, embedding_model,
-                    llm_api_key, llm_base_url, llm_model, db_name,
-                    transport, mcp_port,
+                    api_url,
+                    token,
+                    db_url,
+                    user,
+                    embedding_dim,
+                    embedding_base_url,
+                    embedding_api_key,
+                    embedding_model,
+                    llm_api_key,
+                    llm_base_url,
+                    llm_model,
+                    db_name,
+                    transport,
+                    mcp_port,
                 ))?;
         }
         Commands::Init {
@@ -1097,8 +1724,20 @@ fn main() -> Result<()> {
         }
         Commands::Status => cmd_status(&project_dir),
         Commands::UpdateRules => cmd_update_rules(&project_dir),
-        Commands::Benchmark { api_url, token, dataset, out, validate_only } => {
+        Commands::Benchmark {
+            api_url,
+            token,
+            dataset,
+            out,
+            validate_only,
+        } => {
             cmd_benchmark(&api_url, &token, &dataset, out.as_deref(), validate_only);
+        }
+        Commands::Plugin { command } => {
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?
+                .block_on(cmd_plugin(command))?;
         }
     }
     Ok(())

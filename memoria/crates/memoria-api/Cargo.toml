@@ -32,9 +32,14 @@ chrono = { workspace = true }
 uuid = { workspace = true }
 sqlx = { workspace = true }
 sha2 = "0.10"
+base64 = "0.22"
+tempfile = "3.14"
 
 [dev-dependencies]
 tokio = { workspace = true }
 serde_json = { workspace = true }
 reqwest = { workspace = true }
 memoria-mcp = { workspace = true }
+memoria-service = { workspace = true }
+ed25519-dalek = { version = "2.1", default-features = false, features = ["std"] }
+uuid = { workspace = true }

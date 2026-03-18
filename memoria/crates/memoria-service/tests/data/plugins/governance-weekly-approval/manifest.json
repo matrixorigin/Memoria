@@ -1,0 +1,38 @@
+{
+  "name": "memoria-governance-weekly-approval",
+  "version": "1.0.0",
+  "api_version": "v1",
+  "runtime": "rhai",
+  "entry": {
+    "rhai": {
+      "script": "plugin.rhai",
+      "entrypoint": "memoria_plugin"
+    }
+  },
+  "capabilities": [
+    "governance.plan",
+    "governance.execute"
+  ],
+  "compatibility": {
+    "memoria": ">=0.1.0-rc1 <0.2.0"
+  },
+  "permissions": {
+    "network": false,
+    "filesystem": false,
+    "env": []
+  },
+  "limits": {
+    "timeout_ms": 800,
+    "max_memory_mb": 64,
+    "max_output_bytes": 16384
+  },
+  "integrity": {
+    "sha256": "6f5ee424d52e7f6d8aefc46e28ecfe0d6e85b7dc7dd3622bd312d878e8f87479",
+    "signature": "dev-signature",
+    "signer": "dev-signer"
+  },
+  "metadata": {
+    "display_name": "Weekly Approval Governance",
+    "description": "Marks weekly governance runs for approval in Rhai"
+  }
+}

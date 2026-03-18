@@ -1,5 +1,6 @@
 # Data
 data/
+!**/tests/data/
 
 # Benchmark outputs
 benchmark-result*.json
@@ -36,3 +37,6 @@ build/
 .ruff_cache/
 htmlcov/
 scripts/migrate_embedding_dim.sh
+
+# Plugin dev keys
+dev-signing-key.b64

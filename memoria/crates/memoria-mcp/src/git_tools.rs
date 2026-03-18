@@ -141,7 +141,11 @@ pub fn list() -> Value {
                 "type": "object",
                 "properties": {
                     "source": {"type": "string"},
-                    "strategy": {"type": "string", "default": "append"}
+                    "strategy": {
+                        "type": "string",
+                        "default": "accept",
+                        "description": "accept | replace | append (accept is the default and an alias of replace / branch-wins on detected conflicts)"
+                    }
                 },
                 "required": ["source"]
             }
@@ -354,7 +358,16 @@ pub async fn call(
 
         "memory_merge" => {
             let source_branch = args["source"].as_str().unwrap_or("");
-            let strategy = args["strategy"].as_str().unwrap_or("append");
+            let strategy = args["strategy"].as_str().unwrap_or("accept");
+            let strategy = match strategy {
+                "append" => "append",
+                "replace" | "accept" => "replace",
+                other => {
+                    return Err(anyhow::anyhow!(
+                        "Unsupported merge strategy '{other}'. Use append, replace, or accept."
+                    ));
+                }
+            };
             let sql = svc.sql_store.as_ref()
                 .ok_or_else(|| anyhow::anyhow!("Branch ops require SQL store"))?;
             let branches = sql.list_branches(user_id).await?;
@@ -383,7 +396,16 @@ pub async fn call(
             const L2_CONFLICT: f64 = 0.4472;
 
             if strategy != "replace" {
-                // append: use native branch merge (kernel-level, no cosine scan needed)
+                // append currently means "native append-only branch merge with skip-on-conflict".
+                // MatrixOne v1.3.0 passes the current API/MCP regression suite with this path.
+                //
+                // Important semantic boundary:
+                // - this is not a full git-style reconcile/three-way merge;
+                // - native merge may also carry branch-only inactive rows (is_active = 0) into main
+                //   when their PK does not already exist there.
+                //
+                // We intentionally keep the native behavior here for now and leave richer
+                // reconcile/delete-propagation semantics for a future strategy.
                 if new_count > 0 {
                     git.merge_branch(&table_name, "mem_memories").await
                         .map_err(|e| anyhow::anyhow!("merge failed: {e}"))?;

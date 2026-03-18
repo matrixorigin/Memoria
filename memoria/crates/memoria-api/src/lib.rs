@@ -12,6 +12,7 @@ pub fn build_router(state: AppState) -> Router {
     Router::new()
         // Health
         .route("/health", get(routes::memory::health))
+        .route("/health/instance", get(routes::memory::health_instance))
         // Memory CRUD
         .route("/v1/memories", get(routes::memory::list_memories))
         .route("/v1/memories", post(routes::memory::store_memory))
@@ -74,6 +75,18 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/health/capacity", get(routes::admin::health_capacity))
         // Pipeline
         .route("/v1/pipeline/run", post(routes::memory::run_pipeline))
+        // Plugins
+        .route("/admin/plugins/signers", get(routes::plugins::list_signers))
+        .route("/admin/plugins/signers", post(routes::plugins::upsert_signer))
+        .route("/admin/plugins", get(routes::plugins::list_packages))
+        .route("/admin/plugins", post(routes::plugins::publish_package))
+        .route("/admin/plugins/:plugin_key/:version/review", post(routes::plugins::review_package))
+        .route("/admin/plugins/:plugin_key/:version/score", post(routes::plugins::score_package))
+        .route("/admin/plugins/domains/:domain/bindings", get(routes::plugins::list_binding_rules))
+        .route("/admin/plugins/domains/:domain/bindings", post(routes::plugins::upsert_binding_rule))
+        .route("/admin/plugins/domains/:domain/activate", post(routes::plugins::activate_binding))
+        .route("/admin/plugins/matrix", get(routes::plugins::list_compatibility_matrix))
+        .route("/admin/plugins/events", get(routes::plugins::list_audit_events))
         .with_state(state)
         .layer(DefaultBodyLimit::max(2 * 1024 * 1024)) // 2 MB
 }

@@ -43,7 +43,9 @@ pub struct SeedMemory {
     pub trust_tier: Option<String>,
 }
 
-fn default_semantic() -> String { "semantic".into() }
+fn default_semantic() -> String {
+    "semantic".into()
+}
 
 #[derive(Deserialize)]
 pub struct ScenarioStep {
@@ -69,7 +71,9 @@ pub struct MemoryAssertion {
     pub excluded_contents: Vec<String>,
 }
 
-fn default_top_k() -> i64 { 5 }
+fn default_top_k() -> i64 {
+    5
+}
 
 // ── Execution results ─────────────────────────────────────────────────────────
 
@@ -123,8 +127,17 @@ pub struct BenchmarkReport {
 }
 
 fn grade(score: f64) -> &'static str {
-    if score >= 90.0 { "S" } else if score >= 80.0 { "A" }
-    else if score >= 70.0 { "B" } else if score >= 60.0 { "C" } else { "D" }
+    if score >= 90.0 {
+        "S"
+    } else if score >= 80.0 {
+        "A"
+    } else if score >= 70.0 {
+        "B"
+    } else if score >= 60.0 {
+        "C"
+    } else {
+        "D"
+    }
 }
 
 // ── Executor ──────────────────────────────────────────────────────────────────
@@ -137,9 +150,15 @@ pub struct BenchmarkExecutor {
 
 impl BenchmarkExecutor {
     pub fn new(api_url: &str, token: &str) -> Self {
-        let run_id = SystemTime::now().duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs().to_string()).unwrap_or_default();
-        Self { base_url: api_url.trim_end_matches('/').into(), token: token.into(), run_id }
+        let run_id = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs().to_string())
+            .unwrap_or_default();
+        Self {
+            base_url: api_url.trim_end_matches('/').into(),
+            token: token.into(),
+            run_id,
+        }
     }
 
     fn client(&self, scenario_suffix: &str) -> Client {
@@ -149,11 +168,15 @@ impl BenchmarkExecutor {
             .no_proxy()
             .default_headers({
                 let mut h = reqwest::header::HeaderMap::new();
-                h.insert("Authorization", format!("Bearer {}", self.token).parse().unwrap());
+                h.insert(
+                    "Authorization",
+                    format!("Bearer {}", self.token).parse().unwrap(),
+                );
                 h.insert("X-Impersonate-User", user_id.parse().unwrap());
                 h
             })
-            .build().unwrap()
+            .build()
+            .unwrap()
     }
 
     pub fn execute(&self, scenario: &Scenario) -> ScenarioExecution {
@@ -163,70 +186,118 @@ impl BenchmarkExecutor {
         let user_id = format!("bench-{}-{}", self.run_id, sid);
         let mut exec = ScenarioExecution {
             _scenario_id: scenario.scenario_id.clone(),
-            step_results: vec![], assertion_results: vec![], error: None,
+            step_results: vec![],
+            assertion_results: vec![],
+            error: None,
         };
 
         // Phase 1: seed
         for seed in &scenario.seed_memories {
-            match self.store(&client, &seed.content, &seed.memory_type, &session_id,
-                seed.age_days, seed.initial_confidence, seed.trust_tier.as_deref()) {
+            match self.store(
+                &client,
+                &seed.content,
+                &seed.memory_type,
+                &session_id,
+                seed.age_days,
+                seed.initial_confidence,
+                seed.trust_tier.as_deref(),
+            ) {
                 Ok(mid) => {
                     if seed.is_outdated && !mid.is_empty() {
                         let _ = self.purge_ids(&client, &[mid], "seed is_outdated");
                     }
                 }
-                Err(e) => { exec.error = Some(format!("seed failed: {e}")); return exec; }
+                Err(e) => {
+                    exec.error = Some(format!("seed failed: {e}"));
+                    return exec;
+                }
             }
         }
 
         // Phase 2: maturation
         for op in &scenario.maturation {
-            let _ = client.post(format!("{}/admin/governance/{}/trigger", self.base_url, user_id))
-                .query(&[("op", op.as_str())]).send();
+            let _ = client
+                .post(format!(
+                    "{}/admin/governance/{}/trigger",
+                    self.base_url, user_id
+                ))
+                .query(&[("op", op.as_str())])
+                .send();
         }
 
         // Phase 3: steps
         for step in &scenario.steps {
-            exec.step_results.push(self.run_step(&client, step, &session_id));
+            exec.step_results
+                .push(self.run_step(&client, step, &session_id));
         }
 
         // Phase 4: assertions
         for assertion in &scenario.assertions {
-            exec.assertion_results.push(self.run_assertion(&client, assertion, &session_id));
+            exec.assertion_results
+                .push(self.run_assertion(&client, assertion, &session_id));
         }
         exec
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn store(&self, client: &Client, content: &str, memory_type: &str, session_id: &str,
-        age_days: Option<f64>, confidence: Option<f64>, trust_tier: Option<&str>,
+    fn store(
+        &self,
+        client: &Client,
+        content: &str,
+        memory_type: &str,
+        session_id: &str,
+        age_days: Option<f64>,
+        confidence: Option<f64>,
+        trust_tier: Option<&str>,
     ) -> anyhow::Result<String> {
         let mut body = json!({
             "content": content, "memory_type": memory_type,
             "session_id": session_id, "source": "benchmark",
         });
         if let Some(days) = age_days {
-            let secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs_f64()
+            let secs = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs_f64()
                 - days * 86400.0;
             let dt = chrono_like_iso(secs);
             body["observed_at"] = json!(dt);
         }
-        if let Some(c) = confidence { body["initial_confidence"] = json!(c); }
-        if let Some(t) = trust_tier { body["trust_tier"] = json!(t); }
+        if let Some(c) = confidence {
+            body["initial_confidence"] = json!(c);
+        }
+        if let Some(t) = trust_tier {
+            body["trust_tier"] = json!(t);
+        }
 
-        let resp = client.post(format!("{}/v1/memories", self.base_url))
-            .json(&body).send()?;
+        let resp = client
+            .post(format!("{}/v1/memories", self.base_url))
+            .json(&body)
+            .send()?;
         let data: Value = resp.json()?;
         Ok(data["memory_id"].as_str().unwrap_or("").to_string())
     }
 
     fn retrieve(&self, client: &Client, query: &str, session_id: &str, top_k: i64) -> Vec<String> {
-        let resp = client.post(format!("{}/v1/memories/retrieve", self.base_url))
+        let resp = client
+            .post(format!("{}/v1/memories/retrieve", self.base_url))
             .json(&json!({"query": query, "top_k": top_k, "session_id": session_id}))
             .send();
-        let data: Value = match resp.and_then(|r| r.json()) { Ok(v) => v, Err(_) => return vec![] };
-        let items = if data.is_array() { data.as_array() } else { data["results"].as_array() };
-        items.map(|arr| arr.iter().filter_map(|i| i["content"].as_str().map(String::from)).collect())
+        let data: Value = match resp.and_then(|r| r.json()) {
+            Ok(v) => v,
+            Err(_) => return vec![],
+        };
+        let items = if data.is_array() {
+            data.as_array()
+        } else {
+            data["results"].as_array()
+        };
+        items
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|i| i["content"].as_str().map(String::from))
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
@@ -235,49 +306,88 @@ impl BenchmarkExecutor {
         let result = (|| -> anyhow::Result<()> {
             match action.as_str() {
                 "store" => {
-                    self.store(client, step.content.as_deref().unwrap_or(""),
-                        step.memory_type.as_deref().unwrap_or("semantic"), session_id,
-                        step.age_days, step.initial_confidence, step.trust_tier.as_deref())?;
+                    self.store(
+                        client,
+                        step.content.as_deref().unwrap_or(""),
+                        step.memory_type.as_deref().unwrap_or("semantic"),
+                        session_id,
+                        step.age_days,
+                        step.initial_confidence,
+                        step.trust_tier.as_deref(),
+                    )?;
                 }
                 "retrieve" => {
-                    self.retrieve(client, step.query.as_deref().unwrap_or(""), session_id, step.top_k.unwrap_or(5));
+                    self.retrieve(
+                        client,
+                        step.query.as_deref().unwrap_or(""),
+                        session_id,
+                        step.top_k.unwrap_or(5),
+                    );
                 }
                 "search" => {
-                    client.post(format!("{}/v1/memories/search", self.base_url))
+                    client
+                        .post(format!("{}/v1/memories/search", self.base_url))
                         .json(&json!({"query": step.query, "top_k": step.top_k.unwrap_or(10)}))
-                        .send()?.error_for_status()?;
+                        .send()?
+                        .error_for_status()?;
                 }
                 "correct" => {
-                    client.post(format!("{}/v1/memories/correct", self.base_url))
+                    client
+                        .post(format!("{}/v1/memories/correct", self.base_url))
                         .json(&json!({"query": step.query, "new_content": step.content,
                             "reason": step.reason.as_deref().unwrap_or("benchmark")}))
-                        .send()?.error_for_status()?;
+                        .send()?
+                        .error_for_status()?;
                 }
                 "purge" => {
                     let mut body = json!({"reason": step.reason.as_deref().unwrap_or("benchmark")});
-                    if let Some(t) = &step.topic { body["topic"] = json!(t); }
-                    client.post(format!("{}/v1/memories/purge", self.base_url))
-                        .json(&body).send()?.error_for_status()?;
+                    if let Some(t) = &step.topic {
+                        body["topic"] = json!(t);
+                    }
+                    client
+                        .post(format!("{}/v1/memories/purge", self.base_url))
+                        .json(&body)
+                        .send()?
+                        .error_for_status()?;
                 }
                 _ => {}
             }
             Ok(())
         })();
         match result {
-            Ok(()) => StepResult { _action: action, success: true, _error: None },
-            Err(e) => StepResult { _action: action, success: false, _error: Some(e.to_string()) },
+            Ok(()) => StepResult {
+                _action: action,
+                success: true,
+                _error: None,
+            },
+            Err(e) => StepResult {
+                _action: action,
+                success: false,
+                _error: Some(e.to_string()),
+            },
         }
     }
 
-    fn run_assertion(&self, client: &Client, assertion: &MemoryAssertion, session_id: &str) -> AssertionResult {
+    fn run_assertion(
+        &self,
+        client: &Client,
+        assertion: &MemoryAssertion,
+        session_id: &str,
+    ) -> AssertionResult {
         let contents = self.retrieve(client, &assertion.query, session_id, assertion.top_k);
-        AssertionResult { _query: assertion.query.clone(), returned_contents: contents, _error: None }
+        AssertionResult {
+            _query: assertion.query.clone(),
+            returned_contents: contents,
+            _error: None,
+        }
     }
 
     fn purge_ids(&self, client: &Client, ids: &[String], reason: &str) -> anyhow::Result<()> {
-        client.post(format!("{}/v1/memories/purge", self.base_url))
+        client
+            .post(format!("{}/v1/memories/purge", self.base_url))
             .json(&json!({"memory_ids": ids, "reason": reason}))
-            .send()?.error_for_status()?;
+            .send()?
+            .error_for_status()?;
         Ok(())
     }
 }
@@ -295,31 +405,59 @@ fn chrono_like_iso(epoch_secs: f64) -> String {
     let month = if mp < 10 { mp + 3 } else { mp - 9 };
     let year = if month <= 2 { y + 1 } else { y };
     let rem = secs.rem_euclid(86400);
-    let h = rem / 3600; let m = (rem % 3600) / 60; let s = rem % 60;
+    let h = rem / 3600;
+    let m = (rem % 3600) / 60;
+    let s = rem % 60;
     format!("{year:04}-{month:02}-{day:02}T{h:02}:{m:02}:{s:02}Z")
 }
 
 // ── Scorer ────────────────────────────────────────────────────────────────────
 
 fn score_contents(assertion: &MemoryAssertion, returned: &[String]) -> (f64, f64, f64, bool) {
-    let hits = assertion.expected_contents.iter()
-        .filter(|exp| returned.iter().any(|c| c.to_lowercase().contains(&exp.to_lowercase())))
+    let hits = assertion
+        .expected_contents
+        .iter()
+        .filter(|exp| {
+            returned
+                .iter()
+                .any(|c| c.to_lowercase().contains(&exp.to_lowercase()))
+        })
         .count();
-    let recall = if assertion.expected_contents.is_empty() { 100.0 }
-        else { 100.0 * hits as f64 / assertion.expected_contents.len() as f64 };
+    let recall = if assertion.expected_contents.is_empty() {
+        100.0
+    } else {
+        100.0 * hits as f64 / assertion.expected_contents.len() as f64
+    };
 
-    let precision = if returned.is_empty() { 0.0 } else {
-        let relevant = returned.iter()
-            .filter(|c| assertion.expected_contents.iter().any(|exp| c.to_lowercase().contains(&exp.to_lowercase())))
+    let precision = if returned.is_empty() {
+        0.0
+    } else {
+        let relevant = returned
+            .iter()
+            .filter(|c| {
+                assertion
+                    .expected_contents
+                    .iter()
+                    .any(|exp| c.to_lowercase().contains(&exp.to_lowercase()))
+            })
             .count();
         100.0 * relevant as f64 / returned.len() as f64
     };
 
-    let noise_rejection = if assertion.excluded_contents.is_empty() { 100.0 } else {
-        let noise_hits = assertion.excluded_contents.iter()
-            .filter(|exc| returned.iter().any(|c| c.to_lowercase().contains(&exc.to_lowercase())))
+    let noise_rejection = if assertion.excluded_contents.is_empty() {
+        100.0
+    } else {
+        let noise_hits = assertion
+            .excluded_contents
+            .iter()
+            .filter(|exc| {
+                returned
+                    .iter()
+                    .any(|c| c.to_lowercase().contains(&exc.to_lowercase()))
+            })
             .count();
-        100.0 * (assertion.excluded_contents.len() - noise_hits) as f64 / assertion.excluded_contents.len() as f64
+        100.0 * (assertion.excluded_contents.len() - noise_hits) as f64
+            / assertion.excluded_contents.len() as f64
     };
 
     let passed = recall >= 80.0 && noise_rejection >= 80.0;
@@ -329,38 +467,71 @@ fn score_contents(assertion: &MemoryAssertion, returned: &[String]) -> (f64, f64
 pub fn score_scenario(scenario: &Scenario, exec: &ScenarioExecution) -> ScenarioResult {
     if let Some(_err) = &exec.error {
         return ScenarioResult {
-            scenario_id: scenario.scenario_id.clone(), title: scenario.title.clone(),
-            difficulty: scenario.difficulty.clone(), horizon: scenario.horizon.clone(),
-            tags: scenario.tags.clone(), total_score: 0.0, grade: "D".into(),
-            mqs_precision: 0.0, mqs_recall: 0.0, mqs_noise_rejection: 100.0,
-            aus_step_success: 0.0, aus_assertion_pass: 0.0,
+            scenario_id: scenario.scenario_id.clone(),
+            title: scenario.title.clone(),
+            difficulty: scenario.difficulty.clone(),
+            horizon: scenario.horizon.clone(),
+            tags: scenario.tags.clone(),
+            total_score: 0.0,
+            grade: "D".into(),
+            mqs_precision: 0.0,
+            mqs_recall: 0.0,
+            mqs_noise_rejection: 100.0,
+            aus_step_success: 0.0,
+            aus_assertion_pass: 0.0,
         };
     }
 
-    let mut precisions = vec![]; let mut recalls = vec![]; let mut noises = vec![];
+    let mut precisions = vec![];
+    let mut recalls = vec![];
+    let mut noises = vec![];
     let mut passed_count = 0usize;
     for (i, assertion) in scenario.assertions.iter().enumerate() {
-        let returned = exec.assertion_results.get(i)
-            .map(|r| r.returned_contents.as_slice()).unwrap_or(&[]);
+        let returned = exec
+            .assertion_results
+            .get(i)
+            .map(|r| r.returned_contents.as_slice())
+            .unwrap_or(&[]);
         let (p, r, n, ok) = score_contents(assertion, returned);
-        precisions.push(p); recalls.push(r); noises.push(n);
-        if ok { passed_count += 1; }
+        precisions.push(p);
+        recalls.push(r);
+        noises.push(n);
+        if ok {
+            passed_count += 1;
+        }
     }
 
-    let avg = |v: &[f64]| if v.is_empty() { 0.0 } else { v.iter().sum::<f64>() / v.len() as f64 };
-    let mqs_p = avg(&precisions); let mqs_r = avg(&recalls); let mqs_n = avg(&noises);
-    let assertion_pass = if scenario.assertions.is_empty() { 0.0 }
-        else { 100.0 * passed_count as f64 / scenario.assertions.len() as f64 };
-    let step_success = if exec.step_results.is_empty() { 100.0 }
-        else { 100.0 * exec.step_results.iter().filter(|s| s.success).count() as f64 / exec.step_results.len() as f64 };
+    let avg = |v: &[f64]| {
+        if v.is_empty() {
+            0.0
+        } else {
+            v.iter().sum::<f64>() / v.len() as f64
+        }
+    };
+    let mqs_p = avg(&precisions);
+    let mqs_r = avg(&recalls);
+    let mqs_n = avg(&noises);
+    let assertion_pass = if scenario.assertions.is_empty() {
+        0.0
+    } else {
+        100.0 * passed_count as f64 / scenario.assertions.len() as f64
+    };
+    let step_success = if exec.step_results.is_empty() {
+        100.0
+    } else {
+        100.0 * exec.step_results.iter().filter(|s| s.success).count() as f64
+            / exec.step_results.len() as f64
+    };
 
     let mqs = (mqs_p + mqs_r + mqs_n) / 3.0;
     let aus = (step_success + assertion_pass) / 2.0;
     let total = 0.65 * mqs + 0.35 * aus;
 
     ScenarioResult {
-        scenario_id: scenario.scenario_id.clone(), title: scenario.title.clone(),
-        difficulty: scenario.difficulty.clone(), horizon: scenario.horizon.clone(),
+        scenario_id: scenario.scenario_id.clone(),
+        title: scenario.title.clone(),
+        difficulty: scenario.difficulty.clone(),
+        horizon: scenario.horizon.clone(),
         tags: scenario.tags.clone(),
         total_score: (total * 100.0).round() / 100.0,
         grade: grade(total).into(),
@@ -372,7 +543,10 @@ pub fn score_scenario(scenario: &Scenario, exec: &ScenarioExecution) -> Scenario
     }
 }
 
-pub fn score_dataset(dataset: &ScenarioDataset, executions: &HashMap<String, ScenarioExecution>) -> BenchmarkReport {
+pub fn score_dataset(
+    dataset: &ScenarioDataset,
+    executions: &HashMap<String, ScenarioExecution>,
+) -> BenchmarkReport {
     let mut results = vec![];
     let mut by_diff: HashMap<String, Vec<f64>> = HashMap::new();
     let mut by_tag: HashMap<String, Vec<f64>> = HashMap::new();
@@ -380,27 +554,49 @@ pub fn score_dataset(dataset: &ScenarioDataset, executions: &HashMap<String, Sce
     for scenario in &dataset.scenarios {
         let empty = ScenarioExecution {
             _scenario_id: scenario.scenario_id.clone(),
-            step_results: vec![], assertion_results: vec![],
+            step_results: vec![],
+            assertion_results: vec![],
             error: Some("no execution".into()),
         };
         let exec = executions.get(&scenario.scenario_id).unwrap_or(&empty);
         let result = score_scenario(scenario, exec);
-        by_diff.entry(scenario.difficulty.clone()).or_default().push(result.total_score);
-        for tag in &scenario.tags { by_tag.entry(tag.clone()).or_default().push(result.total_score); }
+        by_diff
+            .entry(scenario.difficulty.clone())
+            .or_default()
+            .push(result.total_score);
+        for tag in &scenario.tags {
+            by_tag
+                .entry(tag.clone())
+                .or_default()
+                .push(result.total_score);
+        }
         results.push(result);
     }
 
-    let avg = |v: &[f64]| if v.is_empty() { 0.0 } else { v.iter().sum::<f64>() / v.len() as f64 };
+    let avg = |v: &[f64]| {
+        if v.is_empty() {
+            0.0
+        } else {
+            v.iter().sum::<f64>() / v.len() as f64
+        }
+    };
     let all: Vec<f64> = results.iter().map(|r| r.total_score).collect();
     let overall = avg(&all);
 
     BenchmarkReport {
-        dataset_id: dataset.dataset_id.clone(), version: dataset.version.clone(),
+        dataset_id: dataset.dataset_id.clone(),
+        version: dataset.version.clone(),
         scenario_count: results.len(),
         overall_score: (overall * 100.0).round() / 100.0,
         overall_grade: grade(overall).into(),
-        by_difficulty: by_diff.iter().map(|(k, v)| (k.clone(), (avg(v) * 100.0).round() / 100.0)).collect(),
-        by_tag: by_tag.iter().map(|(k, v)| (k.clone(), (avg(v) * 100.0).round() / 100.0)).collect(),
+        by_difficulty: by_diff
+            .iter()
+            .map(|(k, v)| (k.clone(), (avg(v) * 100.0).round() / 100.0))
+            .collect(),
+        by_tag: by_tag
+            .iter()
+            .map(|(k, v)| (k.clone(), (avg(v) * 100.0).round() / 100.0))
+            .collect(),
         results,
     }
 }
@@ -411,7 +607,10 @@ pub fn validate_dataset(content: &str) -> Vec<String> {
     let mut errors = vec![];
     let dataset: ScenarioDataset = match serde_json::from_str(content) {
         Ok(d) => d,
-        Err(e) => { errors.push(format!("JSON parse error: {e}")); return errors; }
+        Err(e) => {
+            errors.push(format!("JSON parse error: {e}"));
+            return errors;
+        }
     };
     let mut ids = std::collections::HashSet::new();
     for s in &dataset.scenarios {
@@ -426,17 +625,28 @@ pub fn validate_dataset(content: &str) -> Vec<String> {
         }
         for (i, a) in s.assertions.iter().enumerate() {
             if a.expected_contents.is_empty() {
-                errors.push(format!("{}: assertion[{i}] has no expected_contents", s.scenario_id));
+                errors.push(format!(
+                    "{}: assertion[{i}] has no expected_contents",
+                    s.scenario_id
+                ));
             }
         }
         for (i, step) in s.steps.iter().enumerate() {
             match step.action.as_str() {
-                "retrieve" | "search" if step.query.is_none() =>
-                    errors.push(format!("{}: step[{i}] {} requires query", s.scenario_id, step.action)),
-                "store" if step.content.is_none() =>
-                    errors.push(format!("{}: step[{i}] store requires content", s.scenario_id)),
-                "correct" if step.content.is_none() || step.query.is_none() =>
-                    errors.push(format!("{}: step[{i}] correct requires content+query", s.scenario_id)),
+                "retrieve" | "search" if step.query.is_none() => errors.push(format!(
+                    "{}: step[{i}] {} requires query",
+                    s.scenario_id, step.action
+                )),
+                "store" if step.content.is_none() => errors.push(format!(
+                    "{}: step[{i}] store requires content",
+                    s.scenario_id
+                )),
+                "correct" if step.content.is_none() || step.query.is_none() => {
+                    errors.push(format!(
+                        "{}: step[{i}] correct requires content+query",
+                        s.scenario_id
+                    ))
+                }
                 _ => {}
             }
         }

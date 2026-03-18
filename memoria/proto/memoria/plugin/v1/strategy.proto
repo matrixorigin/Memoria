@@ -1,0 +1,33 @@
+syntax = "proto3";
+
+package memoria.plugin.v1;
+
+service StrategyRuntime {
+  rpc Handshake(HandshakeRequest) returns (HandshakeResponse);
+  rpc ExecuteGovernance(GovernanceRequest) returns (GovernanceResponse);
+}
+
+message HandshakeRequest {
+  string api_version = 1;
+  repeated string capabilities = 2;
+  string runtime = 3;
+}
+
+message HandshakeResponse {
+  bool accepted = 1;
+  string reason = 2;
+  repeated string capabilities = 3;
+}
+
+message GovernanceRequest {
+  string strategy_key = 1;
+  string task = 2;
+  bytes payload_json = 3;
+}
+
+message GovernanceResponse {
+  string status = 1;
+  bytes report_json = 2;
+  string error_code = 3;
+  bool retryable = 4;
+}
