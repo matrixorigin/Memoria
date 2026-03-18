@@ -67,9 +67,10 @@ pub struct TriggerParams {
 
 /// GET /admin/stats
 pub async fn system_stats(
-    _auth: AuthUser,
+    auth: AuthUser,
     State(state): State<AppState>,
 ) -> Result<Json<SystemStats>, (StatusCode, String)> {
+    auth.require_master()?;
     let pool = get_pool(&state)?;
 
     let (total_users,): (i64,) =
@@ -95,10 +96,11 @@ pub async fn system_stats(
 
 /// GET /admin/users
 pub async fn list_users(
-    _auth: AuthUser,
+    auth: AuthUser,
     State(state): State<AppState>,
     Query(params): Query<CursorParams>,
 ) -> Result<Json<UserListResponse>, (StatusCode, String)> {
+    auth.require_master()?;
     let pool = get_pool(&state)?;
     let limit = params.limit.unwrap_or(100);
 
@@ -129,10 +131,11 @@ pub async fn list_users(
 
 /// GET /admin/users/:user_id/stats
 pub async fn user_stats(
-    _auth: AuthUser,
+    auth: AuthUser,
     State(state): State<AppState>,
     Path(user_id): Path<String>,
 ) -> Result<Json<UserStats>, (StatusCode, String)> {
+    auth.require_master()?;
     let pool = get_pool(&state)?;
 
     let (memory_count,): (i64,) =
@@ -153,10 +156,11 @@ pub async fn user_stats(
 
 /// DELETE /admin/users/:user_id
 pub async fn delete_user(
-    _auth: AuthUser,
+    auth: AuthUser,
     State(state): State<AppState>,
     Path(user_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    auth.require_master()?;
     let pool = get_pool(&state)?;
     sqlx::query("UPDATE mem_memories SET is_active = 0 WHERE user_id = ?")
         .bind(&user_id)
@@ -171,9 +175,10 @@ pub async fn delete_user(
 /// POST /admin/users/:user_id/reset-access-counts
 pub async fn reset_access_counts(
     State(state): State<AppState>,
-    _auth: AuthUser,
+    auth: AuthUser,
     Path(user_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    auth.require_master()?;
     let sql = state.service.sql_store.as_ref().ok_or_else(|| {
         (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -189,11 +194,12 @@ pub async fn reset_access_counts(
 /// POST /admin/governance/:user_id/trigger?op=governance|consolidate
 /// Skips cooldown checks (admin override).
 pub async fn trigger_governance(
-    _auth: AuthUser,
+    auth: AuthUser,
     State(state): State<AppState>,
     Path(user_id): Path<String>,
     Query(params): Query<TriggerParams>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    auth.require_master()?;
     let op = params.op.as_deref().unwrap_or("governance");
     let sql = state
         .service
@@ -276,7 +282,7 @@ pub async fn trigger_governance(
 
 /// GET /v1/health/analyze — per-type stats
 pub async fn health_analyze(
-    AuthUser(user_id): AuthUser,
+    AuthUser { user_id, .. }: AuthUser,
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let sql = state
@@ -290,7 +296,7 @@ pub async fn health_analyze(
 
 /// GET /v1/health/storage — storage stats
 pub async fn health_storage(
-    AuthUser(user_id): AuthUser,
+    AuthUser { user_id, .. }: AuthUser,
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let sql = state
@@ -304,7 +310,7 @@ pub async fn health_storage(
 
 /// GET /v1/health/capacity — IVF capacity estimate
 pub async fn health_capacity(
-    AuthUser(user_id): AuthUser,
+    AuthUser { user_id, .. }: AuthUser,
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let sql = state
@@ -318,28 +324,31 @@ pub async fn health_capacity(
 
 /// POST /admin/users/:id/strategy?strategy=... — set retrieval strategy (no-op stub for benchmark compat)
 pub async fn set_user_strategy(
+    auth: AuthUser,
     Path(user_id): Path<String>,
     Query(params): Query<std::collections::HashMap<String, String>>,
     _state: State<AppState>,
-) -> Json<serde_json::Value> {
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    auth.require_master()?;
     let strategy = params
         .get("strategy")
         .cloned()
         .unwrap_or_else(|| "vector:v1".to_string());
-    Json(serde_json::json!({
+    Ok(Json(serde_json::json!({
         "user_id": user_id,
         "strategy": strategy,
         "previous": "vector:v1",
         "status": "ok",
-    }))
+    })))
 }
 
 /// GET /admin/users/:user_id/keys — list all active API keys for a user (admin only)
 pub async fn list_user_keys(
-    _auth: AuthUser,
+    auth: AuthUser,
     State(state): State<AppState>,
     Path(user_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    auth.require_master()?;
     let pool = get_pool(&state)?;
     let rows = sqlx::query(
         "SELECT key_id, name, key_prefix, created_at, expires_at, last_used_at \
@@ -366,10 +375,11 @@ pub async fn list_user_keys(
 
 /// DELETE /admin/users/:user_id/keys — revoke all active API keys for a user (admin only)
 pub async fn revoke_all_user_keys(
-    _auth: AuthUser,
+    auth: AuthUser,
     State(state): State<AppState>,
     Path(user_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    auth.require_master()?;
     let pool = get_pool(&state)?;
     let result =
         sqlx::query("UPDATE mem_api_keys SET is_active = 0 WHERE user_id = ? AND is_active = 1")
@@ -384,11 +394,12 @@ pub async fn revoke_all_user_keys(
 
 /// POST /admin/users/:user_id/params — set per-user activation param overrides
 pub async fn set_user_params(
-    _auth: AuthUser,
+    auth: AuthUser,
     State(state): State<AppState>,
     Path(user_id): Path<String>,
     Json(params): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    auth.require_master()?;
     let pool = get_pool(&state)?;
     let pj = serde_json::to_string(&params).map_err(db_err)?;
     sqlx::query(

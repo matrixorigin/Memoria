@@ -52,7 +52,7 @@ async fn git_call(
 
 pub async fn create_snapshot(
     State(state): State<AppState>,
-    AuthUser(user_id): AuthUser,
+    AuthUser { user_id, .. }: AuthUser,
     Json(req): Json<CreateSnapshotRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, String)> {
     let r = git_call(
@@ -67,7 +67,7 @@ pub async fn create_snapshot(
 
 pub async fn list_snapshots(
     State(state): State<AppState>,
-    AuthUser(user_id): AuthUser,
+    AuthUser { user_id, .. }: AuthUser,
     Query(q): Query<ListSnapshotsQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let r = git_call(
@@ -83,7 +83,7 @@ pub async fn list_snapshots(
 /// GET /v1/snapshots/:name — read snapshot detail with time-travel query
 pub async fn get_snapshot(
     State(state): State<AppState>,
-    AuthUser(user_id): AuthUser,
+    AuthUser { user_id, .. }: AuthUser,
     Path(name): Path<String>,
     Query(q): Query<GetSnapshotQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
@@ -182,7 +182,7 @@ pub async fn get_snapshot(
 /// GET /v1/snapshots/:name/diff — compare snapshot vs current state
 pub async fn diff_snapshot(
     State(state): State<AppState>,
-    AuthUser(user_id): AuthUser,
+    AuthUser { user_id, .. }: AuthUser,
     Path(name): Path<String>,
     Query(q): Query<DiffSnapshotQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
@@ -257,7 +257,7 @@ pub async fn diff_snapshot(
 
 pub async fn delete_snapshot(
     State(state): State<AppState>,
-    AuthUser(user_id): AuthUser,
+    AuthUser { user_id, .. }: AuthUser,
     Path(name): Path<String>,
 ) -> Result<StatusCode, (StatusCode, String)> {
     git_call(
@@ -272,7 +272,7 @@ pub async fn delete_snapshot(
 
 pub async fn delete_snapshot_bulk(
     State(state): State<AppState>,
-    AuthUser(user_id): AuthUser,
+    AuthUser { user_id, .. }: AuthUser,
     Json(req): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let r = git_call(&state, &user_id, "memory_snapshot_delete", req).await?;
@@ -281,7 +281,7 @@ pub async fn delete_snapshot_bulk(
 
 pub async fn rollback(
     State(state): State<AppState>,
-    AuthUser(user_id): AuthUser,
+    AuthUser { user_id, .. }: AuthUser,
     Path(name): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let r = git_call(&state, &user_id, "memory_rollback", json!({ "name": name })).await?;
@@ -290,7 +290,7 @@ pub async fn rollback(
 
 pub async fn list_branches(
     State(state): State<AppState>,
-    AuthUser(user_id): AuthUser,
+    AuthUser { user_id, .. }: AuthUser,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let r = git_call(&state, &user_id, "memory_branches", json!({})).await?;
     Ok(Json(r))
@@ -298,7 +298,7 @@ pub async fn list_branches(
 
 pub async fn create_branch(
     State(state): State<AppState>,
-    AuthUser(user_id): AuthUser,
+    AuthUser { user_id, .. }: AuthUser,
     Json(req): Json<CreateBranchRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, String)> {
     let r = git_call(
@@ -317,7 +317,7 @@ pub async fn create_branch(
 
 pub async fn checkout_branch(
     State(state): State<AppState>,
-    AuthUser(user_id): AuthUser,
+    AuthUser { user_id, .. }: AuthUser,
     Path(name): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let r = git_call(&state, &user_id, "memory_checkout", json!({ "name": name })).await?;
@@ -326,7 +326,7 @@ pub async fn checkout_branch(
 
 pub async fn merge_branch(
     State(state): State<AppState>,
-    AuthUser(user_id): AuthUser,
+    AuthUser { user_id, .. }: AuthUser,
     Path(name): Path<String>,
     Json(req): Json<MergeRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
@@ -342,7 +342,7 @@ pub async fn merge_branch(
 
 pub async fn diff_branch(
     State(state): State<AppState>,
-    AuthUser(user_id): AuthUser,
+    AuthUser { user_id, .. }: AuthUser,
     Path(name): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let r = git_call(&state, &user_id, "memory_diff", json!({ "source": name })).await?;
@@ -351,7 +351,7 @@ pub async fn diff_branch(
 
 pub async fn delete_branch(
     State(state): State<AppState>,
-    AuthUser(user_id): AuthUser,
+    AuthUser { user_id, .. }: AuthUser,
     Path(name): Path<String>,
 ) -> Result<StatusCode, (StatusCode, String)> {
     git_call(

@@ -72,9 +72,10 @@ pub struct KeyResponse {
 /// POST /auth/keys — create API key (master key required)
 pub async fn create_key(
     State(state): State<AppState>,
-    AuthUser(_): AuthUser, // master key validated by AuthUser extractor
+    auth: AuthUser,
     Json(req): Json<CreateKeyRequest>,
 ) -> Result<(StatusCode, Json<KeyResponse>), (StatusCode, String)> {
+    auth.require_master()?;
     let sql = state.service.sql_store.as_ref().ok_or_else(|| {
         (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -116,7 +117,7 @@ pub async fn create_key(
 /// GET /auth/keys — list keys for current user
 pub async fn list_keys(
     State(state): State<AppState>,
-    AuthUser(user_id): AuthUser,
+    AuthUser { user_id, .. }: AuthUser,
 ) -> Result<Json<Vec<KeyResponse>>, (StatusCode, String)> {
     let sql = state.service.sql_store.as_ref().ok_or_else(|| {
         (
@@ -167,7 +168,7 @@ pub async fn list_keys(
 /// GET /auth/keys/:id — get a single API key by ID
 pub async fn get_key(
     State(state): State<AppState>,
-    AuthUser(user_id): AuthUser,
+    AuthUser { user_id, is_master }: AuthUser,
     Path(key_id): Path<String>,
 ) -> Result<Json<KeyResponse>, (StatusCode, String)> {
     let sql = state.service.sql_store.as_ref().ok_or_else(|| {
@@ -189,8 +190,7 @@ pub async fn get_key(
 
     let r = row.ok_or_else(|| (StatusCode::NOT_FOUND, "Key not found".to_string()))?;
     let owner: String = r.try_get("user_id").unwrap_or_default();
-    // Non-admin can only see own keys
-    if user_id != "admin" && owner != user_id {
+    if !is_master && owner != user_id {
         return Err((StatusCode::FORBIDDEN, "Not your key".to_string()));
     }
     Ok(Json(KeyResponse {
@@ -219,7 +219,7 @@ pub async fn get_key(
 /// PUT /auth/keys/:id/rotate — revoke old key, issue new one
 pub async fn rotate_key(
     State(state): State<AppState>,
-    AuthUser(user_id): AuthUser,
+    AuthUser { user_id, is_master }: AuthUser,
     Path(key_id): Path<String>,
 ) -> Result<(StatusCode, Json<KeyResponse>), (StatusCode, String)> {
     let sql = state.service.sql_store.as_ref().ok_or_else(|| {
@@ -229,7 +229,6 @@ pub async fn rotate_key(
         )
     })?;
 
-    // Get old key
     let old = sqlx::query(
         "SELECT user_id, name, expires_at FROM mem_api_keys WHERE key_id = ? AND is_active = 1",
     )
@@ -240,10 +239,7 @@ pub async fn rotate_key(
     .ok_or_else(|| (StatusCode::NOT_FOUND, "Key not found".to_string()))?;
 
     let old_user: String = old.try_get("user_id").map_err(api_err)?;
-    // Only owner or master key can rotate
-    if old_user != user_id && !state.master_key.is_empty() {
-        // master key user can rotate any key
-    } else if old_user != user_id {
+    if old_user != user_id && !is_master {
         return Err((StatusCode::FORBIDDEN, "Not your key".to_string()));
     }
 
@@ -289,7 +285,7 @@ pub async fn rotate_key(
 /// DELETE /auth/keys/:id — revoke key
 pub async fn revoke_key(
     State(state): State<AppState>,
-    AuthUser(user_id): AuthUser,
+    AuthUser { user_id, is_master }: AuthUser,
     Path(key_id): Path<String>,
 ) -> Result<StatusCode, (StatusCode, String)> {
     let sql = state.service.sql_store.as_ref().ok_or_else(|| {
@@ -307,7 +303,7 @@ pub async fn revoke_key(
         .ok_or_else(|| (StatusCode::NOT_FOUND, "Key not found".to_string()))?;
 
     let owner: String = row.try_get("user_id").map_err(api_err)?;
-    if owner != user_id && state.master_key.is_empty() {
+    if owner != user_id && !is_master {
         return Err((StatusCode::FORBIDDEN, "Not your key".to_string()));
     }
 

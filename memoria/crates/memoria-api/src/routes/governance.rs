@@ -7,7 +7,7 @@ use crate::{auth::AuthUser, models::*, routes::memory::api_err, state::AppState}
 
 pub async fn governance(
     State(state): State<AppState>,
-    AuthUser(user_id): AuthUser,
+    AuthUser { user_id, .. }: AuthUser,
     Json(req): Json<GovernanceRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let sql = state.service.sql_store.as_ref().ok_or_else(|| {
@@ -64,7 +64,7 @@ pub async fn governance(
 
 pub async fn consolidate(
     State(state): State<AppState>,
-    AuthUser(user_id): AuthUser,
+    AuthUser { user_id, .. }: AuthUser,
     Json(req): Json<GovernanceRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let sql = state.service.sql_store.as_ref().ok_or_else(|| {
@@ -107,7 +107,7 @@ pub async fn consolidate(
 
 pub async fn reflect(
     State(state): State<AppState>,
-    AuthUser(user_id): AuthUser,
+    AuthUser { user_id, .. }: AuthUser,
     Json(req): Json<ReflectRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let sql = state.service.sql_store.as_ref().ok_or_else(|| {
@@ -223,7 +223,7 @@ pub async fn reflect(
 
 pub async fn extract_entities(
     State(state): State<AppState>,
-    AuthUser(user_id): AuthUser,
+    AuthUser { user_id, .. }: AuthUser,
     Json(req): Json<ExtractEntitiesRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let sql = state.service.sql_store.as_ref().ok_or_else(|| {
@@ -312,7 +312,7 @@ pub async fn extract_entities(
 
 pub async fn link_entities(
     State(state): State<AppState>,
-    AuthUser(user_id): AuthUser,
+    AuthUser { user_id, .. }: AuthUser,
     Json(req): Json<LinkEntitiesRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let sql = state.service.sql_store.as_ref().ok_or_else(|| {
@@ -352,7 +352,7 @@ pub async fn link_entities(
 
 pub async fn get_entities(
     State(state): State<AppState>,
-    AuthUser(user_id): AuthUser,
+    AuthUser { user_id, .. }: AuthUser,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let sql = state.service.sql_store.as_ref().ok_or_else(|| {
         (

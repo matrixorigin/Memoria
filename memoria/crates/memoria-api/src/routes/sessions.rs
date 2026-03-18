@@ -225,7 +225,7 @@ async fn generate_and_store(
 
 pub async fn create_session_summary(
     State(state): State<AppState>,
-    AuthUser(user_id): AuthUser,
+    AuthUser { user_id, .. }: AuthUser,
     Path(session_id): Path<String>,
     Json(req): Json<SessionSummaryRequest>,
 ) -> Result<Json<SessionSummaryResponse>, (StatusCode, String)> {
@@ -312,7 +312,7 @@ pub async fn create_session_summary(
 
 pub async fn get_task_status(
     State(state): State<AppState>,
-    AuthUser(_): AuthUser,
+    AuthUser { .. }: AuthUser,
     Path(task_id): Path<String>,
 ) -> Result<Json<TaskStatus>, (StatusCode, String)> {
     let task_store = state.task_store.as_ref().ok_or((
