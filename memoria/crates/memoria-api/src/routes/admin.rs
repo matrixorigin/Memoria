@@ -324,10 +324,10 @@ pub async fn health_capacity(
 
 /// POST /admin/users/:id/strategy?strategy=... — set retrieval strategy (no-op stub for benchmark compat)
 pub async fn set_user_strategy(
+    State(_state): State<AppState>,
     auth: AuthUser,
     Path(user_id): Path<String>,
     Query(params): Query<std::collections::HashMap<String, String>>,
-    _state: State<AppState>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     auth.require_master()?;
     let strategy = params

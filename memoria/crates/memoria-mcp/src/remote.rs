@@ -54,6 +54,16 @@ impl RemoteClient {
         Self::mcp_text(&format!("Error: {e}"))
     }
 
+    async fn parse_response(r: reqwest::Response) -> Result<Value> {
+        let status = r.status();
+        if status.is_success() {
+            return Ok(r.json().await?);
+        }
+        let body = r.text().await.unwrap_or_default();
+        let msg = if body.is_empty() { status.to_string() } else { body };
+        anyhow::bail!("API error {status}: {msg}")
+    }
+
     pub async fn call(&self, name: &str, args: Value) -> Result<Value> {
         match name {
             "memory_store" => {
@@ -68,7 +78,7 @@ impl RemoteClient {
                     }))
                     .send()
                     .await?;
-                let body: Value = r.json().await?;
+                let body = Self::parse_response(r).await?;
                 Ok(Self::mcp_text(&format!(
                     "Stored memory {}: {}",
                     body["memory_id"].as_str().unwrap_or(""),
@@ -92,7 +102,7 @@ impl RemoteClient {
                     }))
                     .send()
                     .await?;
-                let body: Value = r.json().await?;
+                let body = Self::parse_response(r).await?;
                 let mems = body.as_array().cloned().unwrap_or_default();
                 if mems.is_empty() {
                     return Ok(Self::mcp_text("No relevant memories found."));
@@ -127,7 +137,7 @@ impl RemoteClient {
                         .json(&json!({"query": query, "new_content": new_content, "reason": args["reason"]}))
                         .send().await?
                 };
-                let body: Value = r.json().await?;
+                let body = Self::parse_response(r).await?;
                 if let Some(_err) = body.get("error") {
                     return Ok(Self::mcp_text(&format!(
                         "No matching memory found for query '{query}'"
@@ -156,7 +166,7 @@ impl RemoteClient {
                         .json(&json!({"memory_ids": ids}))
                         .send()
                         .await?;
-                    let body: Value = r.json().await?;
+                    let body = Self::parse_response(r).await?;
                     Ok(Self::mcp_text(&format!(
                         "Purged {} memory(s)",
                         body["purged"].as_i64().unwrap_or(count as i64)
@@ -168,7 +178,7 @@ impl RemoteClient {
                         .json(&json!({"topic": topic}))
                         .send()
                         .await?;
-                    let body: Value = r.json().await?;
+                    let body = Self::parse_response(r).await?;
                     Ok(Self::mcp_text(&format!(
                         "Purged {} memory(s) matching '{topic}'",
                         body["purged"].as_i64().unwrap_or(0)
@@ -180,7 +190,7 @@ impl RemoteClient {
 
             "memory_profile" => {
                 let r = self.client.get(self.url("/v1/profiles/me")).send().await?;
-                let body: Value = r.json().await?;
+                let body = Self::parse_response(r).await?;
                 let profile = body["profile"].as_str().unwrap_or("");
                 if profile.is_empty() {
                     Ok(Self::mcp_text("No profile memories found."))
@@ -196,7 +206,7 @@ impl RemoteClient {
                     .get(self.url(&format!("/v1/memories?limit={limit}")))
                     .send()
                     .await?;
-                let body: Value = r.json().await?;
+                let body = Self::parse_response(r).await?;
                 let items = body["items"].as_array().cloned().unwrap_or_default();
                 if items.is_empty() {
                     return Ok(Self::mcp_text("No memories found."));
@@ -232,7 +242,7 @@ impl RemoteClient {
                     .json(&json!({"force": args["force"].as_bool().unwrap_or(false)}))
                     .send()
                     .await?;
-                let body: Value = r.json().await?;
+                let body = Self::parse_response(r).await?;
                 if body["skipped"].as_bool().unwrap_or(false) {
                     return Ok(Self::mcp_text(&format!(
                         "Governance skipped (cooldown: {}s remaining).",
@@ -265,7 +275,7 @@ impl RemoteClient {
                     .json(&json!({"force": args["force"].as_bool().unwrap_or(false)}))
                     .send()
                     .await?;
-                let body: Value = r.json().await?;
+                let body = Self::parse_response(r).await?;
                 if body["skipped"].as_bool().unwrap_or(false) {
                     return Ok(Self::mcp_text(&format!(
                         "Consolidation skipped (cooldown: {}s remaining).",
@@ -289,14 +299,7 @@ impl RemoteClient {
                     }))
                     .send()
                     .await?;
-                let status = r.status();
-                let body: Value = r.json().await?;
-                if !status.is_success() {
-                    return Ok(Self::mcp_text(&format!(
-                        "Reflection failed: {}",
-                        body["error"].as_str().unwrap_or("unknown")
-                    )));
-                }
+                let body = Self::parse_response(r).await?;
                 if body["skipped"].as_bool().unwrap_or(false) {
                     return Ok(Self::mcp_text(&format!(
                         "Reflection skipped (cooldown: {}s remaining).",
@@ -344,14 +347,7 @@ impl RemoteClient {
                     .json(&json!({"mode": mode}))
                     .send()
                     .await?;
-                let status = r.status();
-                let body: Value = r.json().await?;
-                if !status.is_success() {
-                    return Ok(Self::mcp_text(&format!(
-                        "Entity extraction failed: {}",
-                        body["error"].as_str().unwrap_or("unknown")
-                    )));
-                }
+                let body = Self::parse_response(r).await?;
                 Ok(Self::mcp_text(&serde_json::to_string(&body)?))
             }
 
@@ -364,7 +360,7 @@ impl RemoteClient {
                     .json(&json!({"entities": entities}))
                     .send()
                     .await?;
-                let body: Value = r.json().await?;
+                let body = Self::parse_response(r).await?;
                 Ok(Self::mcp_text(&serde_json::to_string(&body)?))
             }
 
@@ -376,7 +372,7 @@ impl RemoteClient {
                     .json(&json!({"name": args["name"], "description": args["description"]}))
                     .send()
                     .await?;
-                let _body: Value = r.json().await?;
+                let _body = Self::parse_response(r).await?;
                 Ok(Self::mcp_text(&format!(
                     "Snapshot '{}' created.",
                     args["name"].as_str().unwrap_or("")
@@ -391,7 +387,7 @@ impl RemoteClient {
                     .get(self.url(&format!("/v1/snapshots?limit={limit}&offset={offset}")))
                     .send()
                     .await?;
-                let body: Value = r.json().await?;
+                let body = Self::parse_response(r).await?;
                 Ok(Self::mcp_json(&body))
             }
 
@@ -409,7 +405,7 @@ impl RemoteClient {
                     .json(&payload)
                     .send()
                     .await?;
-                let body: Value = r.json().await?;
+                let body = Self::parse_response(r).await?;
                 Ok(Self::mcp_text(&format!(
                     "Deleted {} snapshot(s).",
                     body["deleted"].as_i64().unwrap_or(0)
@@ -424,7 +420,7 @@ impl RemoteClient {
                     .json(&json!({}))
                     .send()
                     .await?;
-                let _body: Value = r.json().await?;
+                let _body = Self::parse_response(r).await?;
                 Ok(Self::mcp_text(&format!(
                     "Rolled back to snapshot '{name}'."
                 )))
@@ -441,7 +437,7 @@ impl RemoteClient {
                     }))
                     .send()
                     .await?;
-                let _body: Value = r.json().await?;
+                let _body = Self::parse_response(r).await?;
                 Ok(Self::mcp_text(&format!(
                     "Branch '{}' created.",
                     args["name"].as_str().unwrap_or("")
@@ -450,7 +446,7 @@ impl RemoteClient {
 
             "memory_branches" => {
                 let r = self.client.get(self.url("/v1/branches")).send().await?;
-                let body: Value = r.json().await?;
+                let body = Self::parse_response(r).await?;
                 Ok(Self::mcp_json(&body))
             }
 
@@ -462,7 +458,7 @@ impl RemoteClient {
                     .json(&json!({}))
                     .send()
                     .await?;
-                let body: Value = r.json().await?;
+                let body = Self::parse_response(r).await?;
                 Ok(Self::mcp_text(&format!(
                     "Switched to branch '{name}'. {} memories.",
                     body["memory_count"].as_i64().unwrap_or(0)
@@ -477,12 +473,7 @@ impl RemoteClient {
                     .json(&json!({"strategy": args["strategy"].as_str().unwrap_or("accept")}))
                     .send()
                     .await?;
-                let status = r.status();
-                let text = r.text().await?;
-                if !status.is_success() {
-                    return Ok(Self::mcp_text(&format!("Merge failed: {text}")));
-                }
-                let body: Value = serde_json::from_str(&text).unwrap_or(json!({"result": text}));
+                let body = Self::parse_response(r).await?;
                 Ok(Self::mcp_json(&body))
             }
 
@@ -493,7 +484,7 @@ impl RemoteClient {
                     .get(self.url(&format!("/v1/branches/{source}/diff")))
                     .send()
                     .await?;
-                let body: Value = r.json().await?;
+                let body = Self::parse_response(r).await?;
                 Ok(Self::mcp_json(&body))
             }
 
@@ -516,7 +507,7 @@ impl RemoteClient {
                     }))
                     .send()
                     .await?;
-                let body: Value = r.json().await?;
+                let body = Self::parse_response(r).await?;
                 Ok(Self::mcp_json(&body))
             }
 

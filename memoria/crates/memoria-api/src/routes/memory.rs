@@ -213,19 +213,35 @@ pub async fn search(
 
 pub async fn get_memory(
     State(state): State<AppState>,
-    AuthUser { .. }: AuthUser,
+    AuthUser { user_id, is_master }: AuthUser,
     Path(id): Path<String>,
 ) -> ApiResult<Option<MemoryResponse>> {
     let m = state.service.get(&id).await.map_err(api_err)?;
+    if let Some(ref mem) = m {
+        if !is_master && mem.user_id != user_id {
+            return Err((StatusCode::FORBIDDEN, "Not your memory".to_string()));
+        }
+    }
     Ok(Json(m.map(Into::into)))
 }
 
 pub async fn correct_memory(
     State(state): State<AppState>,
-    AuthUser { .. }: AuthUser,
+    AuthUser { user_id, is_master }: AuthUser,
     Path(id): Path<String>,
     Json(req): Json<CorrectRequest>,
 ) -> ApiResult<MemoryResponse> {
+    if !is_master {
+        let existing = state
+            .service
+            .get(&id)
+            .await
+            .map_err(api_err)?
+            .ok_or_else(|| (StatusCode::NOT_FOUND, "Memory not found".to_string()))?;
+        if existing.user_id != user_id {
+            return Err((StatusCode::FORBIDDEN, "Not your memory".to_string()));
+        }
+    }
     let m = state
         .service
         .correct(&id, &req.new_content)
@@ -260,19 +276,35 @@ pub async fn correct_by_query(
 
 pub async fn delete_memory(
     State(state): State<AppState>,
-    AuthUser { user_id, .. }: AuthUser,
+    AuthUser { user_id, is_master }: AuthUser,
     Path(id): Path<String>,
 ) -> Result<StatusCode, (StatusCode, String)> {
+    if !is_master {
+        let existing = state.service.get(&id).await.map_err(api_err)?
+            .ok_or_else(|| (StatusCode::NOT_FOUND, "Memory not found".to_string()))?;
+        if existing.user_id != user_id {
+            return Err((StatusCode::FORBIDDEN, "Not your memory".to_string()));
+        }
+    }
     let _ = state.service.purge(&user_id, &id).await.map_err(api_err)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 pub async fn purge_memories(
     State(state): State<AppState>,
-    AuthUser { user_id, .. }: AuthUser,
+    AuthUser { user_id, is_master }: AuthUser,
     Json(req): Json<PurgeRequest>,
 ) -> ApiResult<PurgeResponse> {
     let result = if let Some(ids) = &req.memory_ids {
+        if !is_master {
+            for id in ids {
+                let mem = state.service.get(id).await.map_err(api_err)?
+                    .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Memory not found: {id}")))?;
+                if mem.user_id != user_id {
+                    return Err((StatusCode::FORBIDDEN, format!("Not your memory: {id}")));
+                }
+            }
+        }
         let id_refs: Vec<&str> = ids.iter().map(|s| s.as_str()).collect();
         state
             .service
@@ -301,10 +333,19 @@ pub async fn purge_memories(
 
 pub async fn get_profile(
     State(state): State<AppState>,
-    AuthUser { user_id, .. }: AuthUser,
+    AuthUser { user_id, is_master }: AuthUser,
     Path(target): Path<String>,
 ) -> ApiResult<serde_json::Value> {
-    let resolved = if target == "me" { user_id } else { target };
+    let resolved = if target == "me" || target == user_id {
+        user_id
+    } else if is_master {
+        target
+    } else {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "Cannot access other users' profiles".to_string(),
+        ));
+    };
     let sql = state
         .service
         .sql_store

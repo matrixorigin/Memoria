@@ -1,6 +1,7 @@
 use memoria_git::GitForDataService;
 use memoria_service::{AsyncTaskStore, MemoryService};
 use std::sync::Arc;
+use tracing::warn;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -20,6 +21,9 @@ impl AppState {
         git: Arc<GitForDataService>,
         master_key: String,
     ) -> Self {
+        if master_key.is_empty() {
+            warn!("MASTER_KEY is not set — running in open mode: all admin endpoints are unauthenticated");
+        }
         let task_store: Option<Arc<dyn AsyncTaskStore>> = service
             .sql_store
             .as_ref()

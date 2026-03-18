@@ -9,6 +9,7 @@ use axum::{
 use serde::Deserialize;
 use sha2::{Sha256, Digest};
 use sqlx::Row;
+use tracing::warn;
 
 use crate::state::AppState;
 
@@ -96,14 +97,14 @@ async fn validate_api_key(token: &str, state: &AppState) -> Option<String> {
     .bind(&key_hash)
     .fetch_optional(sql.pool())
     .await
+    .map_err(|e| warn!("validate_api_key: DB query failed: {e}"))
     .ok()??;
 
     // Update last_used_at (fire-and-forget)
     let pool = sql.pool().clone();
-    let hash = key_hash.clone();
     tokio::spawn(async move {
         let _ = sqlx::query("UPDATE mem_api_keys SET last_used_at = NOW(6) WHERE key_hash = ?")
-            .bind(&hash)
+            .bind(&key_hash)
             .execute(&pool)
             .await;
     });
