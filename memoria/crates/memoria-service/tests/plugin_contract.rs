@@ -28,6 +28,9 @@ impl GovernanceStore for NoopStore {
     async fn cleanup_tool_results(&self, _: i64) -> Result<i64, MemoriaError> {
         Ok(0)
     }
+    async fn cleanup_async_tasks(&self, _: i64) -> Result<i64, MemoriaError> {
+        Ok(0)
+    }
     async fn archive_stale_working(&self, _: i64) -> Result<Vec<(String, i64)>, MemoriaError> {
         Ok(vec![])
     }

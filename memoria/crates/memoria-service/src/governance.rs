@@ -30,6 +30,7 @@ pub struct GovernanceRunSummary {
     pub total_quarantined: i64,
     pub total_cleaned: i64,
     pub tool_results_cleaned: i64,
+    pub async_tasks_cleaned: i64,
     pub archived_working: i64,
     pub stale_cleaned: i64,
     pub redundant_compressed: i64,
@@ -61,6 +62,9 @@ pub trait GovernanceStore: Send + Sync {
 
     /// Clean up expired tool-result rows and return the affected row count.
     async fn cleanup_tool_results(&self, ttl_hours: i64) -> Result<i64, MemoriaError>;
+
+    /// Clean up completed/failed async tasks older than `ttl_hours`.
+    async fn cleanup_async_tasks(&self, ttl_hours: i64) -> Result<i64, MemoriaError>;
 
     /// Archive stale working memories and return per-user affected counts.
     async fn archive_stale_working(
@@ -155,6 +159,18 @@ impl GovernanceStore for SqlMemoryStore {
 
     async fn cleanup_tool_results(&self, ttl_hours: i64) -> Result<i64, MemoriaError> {
         SqlMemoryStore::cleanup_tool_results(self, ttl_hours).await
+    }
+
+    async fn cleanup_async_tasks(&self, ttl_hours: i64) -> Result<i64, MemoriaError> {
+        let result = sqlx::query(
+            "DELETE FROM mem_async_tasks WHERE status IN ('completed', 'failed') \
+             AND updated_at < DATE_SUB(NOW(), INTERVAL ? HOUR)"
+        )
+        .bind(ttl_hours)
+        .execute(self.pool())
+        .await
+        .map_err(|e| MemoriaError::Database(e.to_string()))?;
+        Ok(result.rows_affected() as i64)
     }
 
     async fn archive_stale_working(
@@ -310,6 +326,7 @@ struct ExecutionState {
 
 impl DefaultGovernanceStrategy {
     const TOOL_RESULT_TTL_HOURS: i64 = 72;
+    const ASYNC_TASK_TTL_HOURS: i64 = 72;
     const STALE_WORKING_HOURS: i64 = 24;
     const REDUNDANCY_SIMILARITY_THRESHOLD: f64 = 0.95;
     const REDUNDANCY_WINDOW_DAYS: i64 = 30;
@@ -351,6 +368,39 @@ impl DefaultGovernanceStrategy {
                 GovernanceTask::Hourly,
                 None,
                 "cleanup_tool_results",
+                &err,
+                &mut state.warnings,
+            ),
+        }
+    }
+
+    async fn cleanup_async_tasks_operation(
+        &self,
+        store: &dyn GovernanceStore,
+        state: &mut ExecutionState,
+    ) {
+        match store
+            .cleanup_async_tasks(Self::ASYNC_TASK_TTL_HOURS)
+            .await
+        {
+            Ok(cleaned) => {
+                state.summary.async_tasks_cleaned = cleaned;
+                state.decisions.push(governance_decision(
+                    GovernanceTask::Daily,
+                    "cleanup_async_tasks",
+                    format!(
+                        "Removed {cleaned} completed/failed async tasks older than {} hours",
+                        Self::ASYNC_TASK_TTL_HOURS
+                    ),
+                    Some(if cleaned > 0 { 1.0 } else { 0.0 }),
+                    vec![],
+                    state.snapshot_before.as_deref(),
+                ));
+            }
+            Err(err) => record_warning(
+                GovernanceTask::Daily,
+                None,
+                "cleanup_async_tasks",
                 &err,
                 &mut state.warnings,
             ),
@@ -795,6 +845,7 @@ impl DefaultGovernanceStrategy {
             .await;
         self.cleanup_orphaned_incrementals_operation(&plan.users, store, state)
             .await;
+        self.cleanup_async_tasks_operation(store, state).await;
     }
 
     async fn run_weekly(
@@ -849,6 +900,7 @@ impl GovernanceStrategy for DefaultGovernanceStrategy {
                 "cleanup_stale",
                 "compress_redundant",
                 "cleanup_orphaned_incrementals",
+                "cleanup_async_tasks",
             ],
             GovernanceTask::Weekly => &[
                 "rebuild_vector_index",
@@ -1148,6 +1200,12 @@ mod tests {
             Ok(self.cleanup_tool_results_result)
         }
 
+        async fn cleanup_async_tasks(&self, ttl_hours: i64) -> Result<i64, MemoriaError> {
+            self.record(format!("cleanup_async_tasks:{ttl_hours}"));
+            self.fail_if_requested("cleanup_async_tasks")?;
+            Ok(0)
+        }
+
         async fn archive_stale_working(
             &self,
             stale_hours: i64,
@@ -1268,6 +1326,7 @@ mod tests {
                 total_quarantined: 0,
                 total_cleaned: 6,
                 tool_results_cleaned: 4,
+                async_tasks_cleaned: 0,
                 archived_working: 3,
                 stale_cleaned: 3,
                 redundant_compressed: 0,

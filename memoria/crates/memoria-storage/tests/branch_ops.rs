@@ -44,6 +44,30 @@ fn test_dim() -> usize {
         .unwrap_or(1024)
 }
 
+async fn create_branch_table(pool: &sqlx::MySqlPool, table: &str, dim: usize) {
+    let sql = format!(
+        r#"CREATE TABLE IF NOT EXISTS {table} (
+            memory_id       VARCHAR(64)  PRIMARY KEY,
+            user_id         VARCHAR(64)  NOT NULL,
+            memory_type     VARCHAR(20)  NOT NULL,
+            content         TEXT         NOT NULL,
+            embedding       vecf32({dim}),
+            session_id      VARCHAR(64),
+            source_event_ids JSON        NOT NULL,
+            extra_metadata  JSON,
+            is_active       TINYINT(1)   NOT NULL DEFAULT 1,
+            superseded_by   VARCHAR(64),
+            trust_tier      VARCHAR(10)  DEFAULT 'T1',
+            initial_confidence FLOAT     DEFAULT 0.95,
+            observed_at     DATETIME(6)  NOT NULL,
+            created_at      DATETIME(6)  NOT NULL,
+            updated_at      DATETIME(6),
+            INDEX idx_user_active (user_id, is_active, memory_type)
+        )"#
+    );
+    sqlx::query(&sql).execute(pool).await.expect("create branch table");
+}
+
 async fn setup() -> SqlMemoryStore {
     let pool = MySqlPool::connect(&db_url()).await.expect("connect");
     let store = SqlMemoryStore::new(pool, test_dim());
@@ -144,12 +168,7 @@ async fn test_insert_into_branch_table() {
 
     // Create a real branch table (copy of mem_memories schema)
     let branch_table = format!("mem_br_{}", &uid()[5..]);
-    sqlx::raw_sql(&format!(
-        "CREATE TABLE IF NOT EXISTS {branch_table} LIKE mem_memories"
-    ))
-    .execute(store.pool())
-    .await
-    .expect("create branch table");
+    create_branch_table(store.pool(), &branch_table, test_dim()).await;
 
     let mem = make_memory(&user, "branch-only fact");
     store.insert_into(&branch_table, &mem).await.expect("insert_into branch");
@@ -180,12 +199,7 @@ async fn test_merge_branch_into_main() {
     let user = uid();
 
     let branch_table = format!("mem_br_{}", &uid()[5..]);
-    sqlx::raw_sql(&format!(
-        "CREATE TABLE IF NOT EXISTS {branch_table} LIKE mem_memories"
-    ))
-    .execute(store.pool())
-    .await
-    .expect("create branch table");
+    create_branch_table(store.pool(), &branch_table, test_dim()).await;
 
     // Write 2 memories to branch
     let m1 = make_memory(&user, "branch memory A");
@@ -257,12 +271,7 @@ async fn test_full_branch_workflow() {
     store.insert_into("mem_memories", &main_mem).await.expect("insert main");
 
     // 2. Create branch table + register + checkout
-    sqlx::raw_sql(&format!(
-        "CREATE TABLE IF NOT EXISTS {branch_table} LIKE mem_memories"
-    ))
-    .execute(store.pool())
-    .await
-    .expect("create branch table");
+    create_branch_table(store.pool(), &branch_table, test_dim()).await;
     store.register_branch(&user, &branch_name, &branch_table).await.expect("register");
     store.set_active_branch(&user, &branch_name).await.expect("checkout");
 
@@ -332,12 +341,7 @@ async fn test_merge_not_insert_ignore_select_star() {
     let user = uid();
 
     let branch_table = format!("mem_br_{}", &uid()[5..]);
-    sqlx::raw_sql(&format!(
-        "CREATE TABLE IF NOT EXISTS {branch_table} LIKE mem_memories"
-    ))
-    .execute(store.pool())
-    .await
-    .expect("create branch table");
+    create_branch_table(store.pool(), &branch_table, test_dim()).await;
 
     // Write a memory WITH embedding (vecf32) — this is what triggers the MO bug
     let mut mem = make_memory(&user, "memory with embedding");
