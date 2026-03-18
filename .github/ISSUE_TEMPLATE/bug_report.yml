@@ -14,8 +14,8 @@ body:
   - type: input
     attributes:
       label: Environment (optional)
-      description: OS, Python version, Memoria version, embedding provider.
-      placeholder: e.g. macOS 14, Python 3.11, memoria 0.1.2, local embedding
+      description: OS, Memoria version, Rust version (if building from source), embedding provider.
+      placeholder: e.g. macOS 14, memoria 0.3.0, local embedding
     validations:
       required: false
   - type: textarea

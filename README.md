@@ -351,6 +351,9 @@ AI:  → calls memory_diff(source="eval_sqlite")   ← preview first
 | `memoria mcp --api-url <url> --token <key>` | Start MCP server in remote mode (proxy to REST API) |
 | `memoria mcp --transport sse` | Start with SSE transport instead of stdio |
 | `memoria serve` | Start REST API server |
+| `memoria plugin init --dir <dir> --name <name>` | Scaffold a new governance plugin project |
+| `memoria plugin publish --package-dir <dir>` | Publish plugin to shared repository |
+| `memoria plugin dev-keygen --dir <dir>` | Generate ed25519 dev signing keypair |
 | `memoria benchmark --api-url <url> --token <key> --dataset <name>` | Run benchmark against API |
 
 ---

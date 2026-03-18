@@ -579,3 +579,67 @@ All errors follow this format:
 | 409 | Conflict (e.g., snapshot name already exists) |
 | 429 | Rate limit exceeded |
 | 500 | Internal server error |
+
+---
+
+## Plugin Administration
+
+All plugin endpoints require admin-level Bearer token.
+
+### Signers
+
+```
+GET  /admin/plugins/signers
+POST /admin/plugins/signers   { "signer": "name", "public_key": "<base64 ed25519>" }
+```
+
+### Publish
+
+```
+POST /admin/plugins
+{
+  "files": {
+    "manifest.json": "<base64>",
+    "policy.rhai": "<base64>"
+  },
+  "actor": "admin"
+}
+```
+
+Returns `PluginRepositoryEntry`. Idempotent for same content; rejects different content for same version.
+
+### Review & Score
+
+```
+POST /admin/plugins/:plugin_key/:version/review   { "status": "active|rejected", "notes": "..." }
+POST /admin/plugins/:plugin_key/:version/score     { "score": 4.5, "notes": "..." }
+```
+
+### Binding Rules
+
+```
+GET  /admin/plugins/domains/:domain/bindings?binding=default
+POST /admin/plugins/domains/:domain/bindings
+{
+  "binding_key": "default",
+  "plugin_key": "governance:my-plugin:v0",
+  "selector_kind": "semver",
+  "selector_value": ">=0.1.0",
+  "rollout_percent": 100
+}
+POST /admin/plugins/domains/:domain/activate
+{
+  "plugin_key": "governance:my-plugin:v0",
+  "version": "0.1.0",
+  "binding_key": "default"
+}
+```
+
+### Query
+
+```
+GET /admin/plugins                              # List all packages
+GET /admin/plugins?domain=governance            # Filter by domain
+GET /admin/plugins/matrix                       # Compatibility matrix
+GET /admin/plugins/events?plugin_key=...&limit=20  # Audit events
+```

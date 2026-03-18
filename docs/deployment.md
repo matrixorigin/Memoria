@@ -50,6 +50,8 @@ curl http://localhost:8100/health
 | `MEMORIA_EMBEDDING_DIM` | No | `0` (auto) | Embedding dimension, 0 = auto-infer |
 | `MEMORIA_GOVERNANCE_ENABLED` | No | `false` | Enable background governance scheduler |
 | `MEMORIA_GOVERNANCE_PLUGIN_BINDING` | No | `default` | Shared repository binding name for the startup-loaded governance plugin |
+| `MEMORIA_GOVERNANCE_PLUGIN_SUBJECT` | No | `system` | Subject key for plugin binding resolution |
+| `MEMORIA_GOVERNANCE_PLUGIN_DIR` | No | — | Local plugin directory (dev mode, skips signature verification) |
 | `API_PORT` | No | `8100` | Host-side API port |
 | `MATRIXONE_PORT` | No | `6001` | Host-side MatrixOne port |
 | `MATRIXONE_DEBUG_PORT` | No | — | Expose MatrixOne pprof port (e.g. `6060`) |
@@ -81,6 +83,17 @@ memoria plugin activate --domain governance --binding default --plugin-key gover
 ```
 
 At startup, `memoria serve` and embedded `memoria mcp` resolve that binding from shared SQL state, verify the package signature against the trusted signer set, and fail fast if the binding points to an invalid or missing package.
+
+## Local Plugin Development
+
+For rapid iteration without publishing to the repository:
+
+```bash
+MEMORIA_GOVERNANCE_ENABLED=true
+MEMORIA_GOVERNANCE_PLUGIN_DIR=./my-plugin
+```
+
+This loads the plugin directly from the local filesystem with no signature verification. The scheduler checks `MEMORIA_GOVERNANCE_PLUGIN_DIR` first; if set and a valid `manifest.json` exists, it skips the shared repository entirely.
 
 ## External MatrixOne
 
