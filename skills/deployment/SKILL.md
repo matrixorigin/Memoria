@@ -39,7 +39,7 @@ Services: API on `:8100`, MatrixOne on `:6001`. Verify: `curl http://localhost:8
 | `MEMORIA_EMBEDDING_MODEL` | `all-MiniLM-L6-v2` | Model name |
 | `MEMORIA_EMBEDDING_API_KEY` | — | Required if provider is `openai` |
 | `MEMORIA_EMBEDDING_BASE_URL` | — | Custom endpoint (OpenAI-compatible) |
-| `MEMORIA_EMBEDDING_DIM` | `0` (auto) | Embedding dimension |
+| `MEMORIA_EMBEDDING_DIM` | `0` (auto) | Embedding dimension. `0` = auto-infer: Memoria probes the embedding service on startup and uses the returned vector length. Set explicitly (e.g. `768`, `1024`) to skip the probe or when the embedding service may be unavailable at boot time. |
 
 ### Distributed
 
