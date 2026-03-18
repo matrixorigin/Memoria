@@ -16,6 +16,7 @@ use tracing::{error, info, warn};
 
 use crate::{
     config::Config,
+    distributed::DistributedLock,
     governance::{
         DefaultGovernanceStrategy, GovernanceExecution, GovernanceStore, GovernanceStrategy,
         GovernanceTask,
@@ -38,6 +39,9 @@ pub struct GovernanceScheduler {
     breaker_threshold: usize,
     breaker_cooldown: Duration,
     observed_plugin: Option<ObservedPlugin>,
+    lock: Arc<dyn DistributedLock>,
+    instance_id: String,
+    lock_ttl: Duration,
 }
 
 #[derive(Clone)]
@@ -54,7 +58,15 @@ const DEFAULT_BREAKER_COOLDOWN_SECS: u64 = 300;
 impl GovernanceScheduler {
     pub fn new(service: Arc<MemoryService>) -> Self {
         let default_strategy: Arc<dyn GovernanceStrategy> = Arc::new(DefaultGovernanceStrategy);
-        Self::from_parts(service, default_strategy.clone(), default_strategy, None)
+        Self::from_parts(
+            service,
+            default_strategy.clone(),
+            default_strategy,
+            None,
+            Arc::new(crate::distributed::NoopDistributedLock),
+            "single".into(),
+            Duration::from_secs(120),
+        )
     }
 
     pub async fn from_config(
@@ -62,6 +74,14 @@ impl GovernanceScheduler {
         config: &Config,
     ) -> Result<Self, MemoriaError> {
         let delegate: Arc<dyn GovernanceStrategy> = Arc::new(DefaultGovernanceStrategy);
+        let lock_ttl = Duration::from_secs(config.lock_ttl_secs);
+        let instance_id = config.instance_id.clone();
+
+        // Build distributed lock: real SQL lock if we have a sql_store, noop otherwise
+        let lock: Arc<dyn DistributedLock> = match &service.sql_store {
+            Some(store) => store.clone(),
+            None => Arc::new(crate::distributed::NoopDistributedLock),
+        };
 
         // Dev mode: load plugin directly from local filesystem (hot-reload friendly)
         if let Some(ref dir) = config.governance_plugin_dir {
@@ -88,6 +108,9 @@ impl GovernanceScheduler {
                         plugin_key,
                         version,
                     }),
+                    lock,
+                    instance_id,
+                    lock_ttl,
                 ));
             }
             warn!(plugin_dir = %dir, "MEMORIA_GOVERNANCE_PLUGIN_DIR set but manifest.json not found, falling back");
@@ -118,11 +141,14 @@ impl GovernanceScheduler {
                         plugin_key: active_plugin.plugin_key,
                         version: active_plugin.version,
                     }),
+                    lock,
+                    instance_id,
+                    lock_ttl,
                 ));
             }
         }
 
-        Ok(Self::from_parts(service, delegate.clone(), delegate, None))
+        Ok(Self::from_parts(service, delegate.clone(), delegate, None, lock, instance_id, lock_ttl))
     }
 
     pub fn new_with_registry(
@@ -156,6 +182,9 @@ impl GovernanceScheduler {
             fallback_strategy,
             enabled,
             None,
+            Arc::new(crate::distributed::NoopDistributedLock),
+            "single".into(),
+            Duration::from_secs(120),
         ))
     }
 
@@ -164,6 +193,9 @@ impl GovernanceScheduler {
         strategy: Arc<dyn GovernanceStrategy>,
         fallback_strategy: Arc<dyn GovernanceStrategy>,
         observed_plugin: Option<ObservedPlugin>,
+        lock: Arc<dyn DistributedLock>,
+        instance_id: String,
+        lock_ttl: Duration,
     ) -> Self {
         let store = service
             .sql_store
@@ -176,9 +208,13 @@ impl GovernanceScheduler {
             fallback_strategy,
             read_enabled_flag(),
             observed_plugin,
+            lock,
+            instance_id,
+            lock_ttl,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn new_with_components(
         store: Option<Arc<dyn GovernanceStore>>,
         sql_store: Option<Arc<SqlMemoryStore>>,
@@ -186,6 +222,9 @@ impl GovernanceScheduler {
         fallback_strategy: Arc<dyn GovernanceStrategy>,
         enabled: bool,
         observed_plugin: Option<ObservedPlugin>,
+        lock: Arc<dyn DistributedLock>,
+        instance_id: String,
+        lock_ttl: Duration,
     ) -> Self {
         Self::new_with_components_and_breaker(
             store,
@@ -196,6 +235,9 @@ impl GovernanceScheduler {
             DEFAULT_BREAKER_THRESHOLD,
             Duration::from_secs(DEFAULT_BREAKER_COOLDOWN_SECS),
             observed_plugin,
+            lock,
+            instance_id,
+            lock_ttl,
         )
     }
 
@@ -209,6 +251,9 @@ impl GovernanceScheduler {
         breaker_threshold: usize,
         breaker_cooldown: Duration,
         observed_plugin: Option<ObservedPlugin>,
+        lock: Arc<dyn DistributedLock>,
+        instance_id: String,
+        lock_ttl: Duration,
     ) -> Self {
         Self {
             store,
@@ -219,6 +264,9 @@ impl GovernanceScheduler {
             breaker_threshold,
             breaker_cooldown,
             observed_plugin,
+            lock,
+            instance_id,
+            lock_ttl,
         }
     }
 
@@ -239,6 +287,7 @@ impl GovernanceScheduler {
         info!(
             strategy = self.strategy.strategy_key(),
             fallback = self.fallback_strategy.strategy_key(),
+            instance_id = %self.instance_id,
             "Governance scheduler starting"
         );
 
@@ -255,9 +304,50 @@ impl GovernanceScheduler {
     async fn run_loop(&self, task: GovernanceTask, interval_secs: u64) {
         let mut ticker = interval(Duration::from_secs(interval_secs));
         ticker.tick().await; // skip first immediate tick
+        let lock_key = format!("governance:{}", task.as_str());
         loop {
             ticker.tick().await;
-            if let Err(err) = self.run_task(task).await {
+            // Distributed leader election: only one instance runs each task
+            match self.lock.try_acquire(&lock_key, &self.instance_id, self.lock_ttl).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    info!(
+                        task = task.as_str(),
+                        instance_id = %self.instance_id,
+                        "Skipping governance task — another instance holds the lock"
+                    );
+                    continue;
+                }
+                Err(err) => {
+                    error!(task = task.as_str(), %err, "Failed to acquire governance lock, skipping");
+                    continue;
+                }
+            }
+            // Heartbeat: renew lock periodically while task runs
+            let hb_lock = Arc::clone(&self.lock);
+            let hb_key = lock_key.clone();
+            let hb_holder = self.instance_id.clone();
+            let hb_ttl = self.lock_ttl;
+            let (hb_stop_tx, mut hb_stop_rx) = tokio::sync::watch::channel(false);
+            tokio::spawn(async move {
+                let mut tick = interval(hb_ttl / 3);
+                tick.tick().await; // skip immediate
+                loop {
+                    tokio::select! {
+                        Ok(()) = hb_stop_rx.changed() => break,
+                        _ = tick.tick() => {
+                            if let Err(e) = hb_lock.renew(&hb_key, &hb_holder, hb_ttl).await {
+                                warn!(key = %hb_key, %e, "Lock heartbeat renew failed");
+                            }
+                        }
+                    }
+                }
+            });
+            let result = self.run_task(task).await;
+            let _ = hb_stop_tx.send(true);
+            // Release lock after task completes (best-effort)
+            let _ = self.lock.release(&lock_key, &self.instance_id).await;
+            if let Err(err) = result {
                 error!(task = task.as_str(), %err, "Governance task failed");
             }
         }
@@ -890,6 +980,9 @@ mod tests {
             fallback,
             true,
             None,
+            Arc::new(crate::distributed::NoopDistributedLock),
+            "test".into(),
+            Duration::from_secs(120),
         );
 
         let execution = scheduler
@@ -912,6 +1005,9 @@ mod tests {
             fallback,
             true,
             None,
+            Arc::new(crate::distributed::NoopDistributedLock),
+            "test".into(),
+            Duration::from_secs(120),
         );
 
         let execution = scheduler
@@ -932,6 +1028,9 @@ mod tests {
             Arc::new(DefaultGovernanceStrategy),
             true,
             None,
+            Arc::new(crate::distributed::NoopDistributedLock),
+            "test".into(),
+            Duration::from_secs(120),
         );
 
         let execution = scheduler
@@ -957,6 +1056,9 @@ mod tests {
             Arc::new(DefaultGovernanceStrategy),
             true,
             None,
+            Arc::new(crate::distributed::NoopDistributedLock),
+            "test".into(),
+            Duration::from_secs(120),
         );
 
         let execution = scheduler
@@ -984,6 +1086,9 @@ mod tests {
             2,
             Duration::from_secs(60),
             None,
+            Arc::new(crate::distributed::NoopDistributedLock),
+            "test".into(),
+            Duration::from_secs(120),
         );
 
         let first = scheduler.run_task(GovernanceTask::Daily).await.unwrap();
@@ -1017,6 +1122,9 @@ mod tests {
             2,
             Duration::from_secs(60),
             None,
+            Arc::new(crate::distributed::NoopDistributedLock),
+            "test".into(),
+            Duration::from_secs(120),
         );
 
         let first = scheduler.run_task(GovernanceTask::Daily).await.unwrap();
@@ -1149,6 +1257,8 @@ mod tests {
             governance_plugin_binding: "default".into(),
             governance_plugin_subject: "system".into(),
             governance_plugin_dir: None,
+            instance_id: "test-instance".into(),
+            lock_ttl_secs: 120,
         };
         let service = Arc::new(MemoryService::new(Arc::new(NoopMemoryStore), None));
 

@@ -1,4 +1,5 @@
 pub mod config;
+pub mod distributed;
 pub mod governance;
 pub mod graph_domains;
 pub mod pipeline;
@@ -34,6 +35,9 @@ pub use plugin::{
 };
 pub use plugin_registry::{GovernancePluginMetadata, PluginRegistry};
 pub use scheduler::GovernanceScheduler;
+pub use distributed::{
+    AsyncTask, AsyncTaskStore, DistributedLock, NoopDistributedLock,
+};
 pub use service::{CandidateScore, ExplainLevel, MemoryService, PurgeResult, RetrievalExplain};
 pub use strategy::{RetrievalStrategy, StrategyRegistry};
 pub use strategy_domain::{StrategyDecision, StrategyEvidence, StrategyReport, StrategyStatus};

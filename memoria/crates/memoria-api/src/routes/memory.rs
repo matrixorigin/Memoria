@@ -24,6 +24,15 @@ fn default_limit() -> i64 { 100 }
 
 pub async fn health() -> &'static str { "ok" }
 
+pub async fn health_instance(
+    State(state): State<AppState>,
+) -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "status": "ok",
+        "instance_id": state.instance_id,
+    }))
+}
+
 pub async fn list_memories(
     State(state): State<AppState>,
     AuthUser(user_id): AuthUser,

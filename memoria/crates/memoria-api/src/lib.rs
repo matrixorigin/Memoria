@@ -12,6 +12,7 @@ pub fn build_router(state: AppState) -> Router {
     Router::new()
         // Health
         .route("/health", get(routes::memory::health))
+        .route("/health/instance", get(routes::memory::health_instance))
         // Memory CRUD
         .route("/v1/memories", get(routes::memory::list_memories))
         .route("/v1/memories", post(routes::memory::store_memory))

@@ -422,6 +422,8 @@ async fn repository_requires_review_before_activation_and_startup_load() {
         governance_plugin_binding: "default".into(),
         governance_plugin_subject: "system".into(),
         governance_plugin_dir: None,
+        instance_id: "test-instance".into(),
+        lock_ttl_secs: 120,
     };
     let scheduler = GovernanceScheduler::from_config(service, &config).await.unwrap();
     assert_eq!(scheduler.strategy_key(), published.plugin_key);

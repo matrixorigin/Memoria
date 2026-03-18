@@ -329,6 +329,7 @@ async fn cmd_serve(db_url: Option<String>, port: u16, master_key: String) -> Res
 
     tracing::info!(
         db_url = %cfg.db_url, port = port,
+        instance_id = %cfg.instance_id,
         has_llm = cfg.has_llm(), has_embedding = cfg.has_embedding(),
         governance_plugin_binding = %cfg.governance_plugin_binding,
         "Starting Memoria API server"
@@ -350,7 +351,8 @@ async fn cmd_serve(db_url: Option<String>, port: u16, master_key: String) -> Res
     ));
     Arc::new(memoria_service::GovernanceScheduler::from_config(service.clone(), &cfg).await?)
     .start();
-    let state = AppState::new(service, git, master_key);
+    let state = AppState::new(service, git, master_key)
+        .with_instance_id(cfg.instance_id.clone());
 
     let app = build_router(state).layer(TraceLayer::new_for_http());
     let addr = format!("0.0.0.0:{}", port);

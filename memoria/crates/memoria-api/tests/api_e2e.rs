@@ -2296,3 +2296,233 @@ async fn test_plugin_empty_queries() {
 
     println!("✅ plugin empty queries return empty arrays");
 }
+
+// ── Distributed coordination tests ────────────────────────────────────────────
+
+/// Spawn a server with a specific instance_id, returning (base_url, client, instance_id).
+async fn spawn_server_with_instance(instance_id: &str) -> (String, reqwest::Client, String) {
+    use memoria_git::GitForDataService;
+    use memoria_service::{Config, MemoryService};
+    use memoria_storage::SqlMemoryStore;
+    use sqlx::mysql::MySqlPool;
+
+    let cfg = Config::from_env();
+    let db = db_url();
+
+    let store = SqlMemoryStore::connect(&db, test_dim()).await.expect("connect");
+    store.migrate().await.expect("migrate");
+    let pool = MySqlPool::connect(&db).await.expect("pool");
+    let git = Arc::new(GitForDataService::new(pool, &cfg.db_name));
+    let service = Arc::new(MemoryService::new_sql_with_llm(Arc::new(store), None, None));
+    let state = memoria_api::AppState::new(service, git, String::new())
+        .with_instance_id(instance_id.to_string());
+
+    let app = memoria_api::build_router(state);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move { axum::serve(listener, app).await });
+    tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+
+    let client = reqwest::Client::builder().no_proxy().build().expect("client");
+    let base = format!("http://127.0.0.1:{port}");
+    (base, client, instance_id.to_string())
+}
+
+#[tokio::test]
+async fn test_distributed_health_instance_returns_id() {
+    let iid = format!("inst_{}", uuid::Uuid::new_v4().simple());
+    let (base, c, _) = spawn_server_with_instance(&iid).await;
+
+    let r = c.get(format!("{base}/health/instance")).send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    let body: Value = r.json().await.unwrap();
+    assert_eq!(body["instance_id"], iid);
+    assert_eq!(body["status"], "ok");
+    println!("✅ /health/instance returns correct instance_id");
+}
+
+#[tokio::test]
+async fn test_distributed_two_instances_different_ids() {
+    let id_a = format!("inst_a_{}", uuid::Uuid::new_v4().simple());
+    let id_b = format!("inst_b_{}", uuid::Uuid::new_v4().simple());
+
+    let (base_a, c, _) = spawn_server_with_instance(&id_a).await;
+    let (base_b, c2, _) = spawn_server_with_instance(&id_b).await;
+
+    let ra: Value = c.get(format!("{base_a}/health/instance")).send().await.unwrap().json().await.unwrap();
+    let rb: Value = c2.get(format!("{base_b}/health/instance")).send().await.unwrap().json().await.unwrap();
+
+    assert_eq!(ra["instance_id"], id_a);
+    assert_eq!(rb["instance_id"], id_b);
+    assert_ne!(ra["instance_id"], rb["instance_id"]);
+    println!("✅ two instances report different instance_ids");
+}
+
+#[tokio::test]
+async fn test_distributed_cross_instance_memory_visibility() {
+    let id_a = format!("inst_a_{}", uuid::Uuid::new_v4().simple());
+    let id_b = format!("inst_b_{}", uuid::Uuid::new_v4().simple());
+    let user = uid();
+
+    let (base_a, c, _) = spawn_server_with_instance(&id_a).await;
+    let (base_b, c2, _) = spawn_server_with_instance(&id_b).await;
+
+    // Store on instance A
+    let r = c.post(format!("{base_a}/v1/memories"))
+        .header("x-user-id", &user)
+        .json(&json!({"content": "distributed test memory", "memory_type": "semantic"}))
+        .send().await.unwrap();
+    assert!(r.status().is_success(), "store should succeed, got {}", r.status());
+
+    // Read from instance B
+    let r = c2.get(format!("{base_b}/v1/memories"))
+        .header("x-user-id", &user)
+        .send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    let body: Value = r.json().await.unwrap();
+    let memories = body["items"].as_array().expect("response should have items array");
+    assert!(memories.iter().any(|m| m["content"] == "distributed test memory"),
+        "Memory stored on instance A should be visible from instance B");
+    println!("✅ memory stored on A is visible from B");
+}
+
+#[tokio::test]
+async fn test_distributed_lock_acquire_release() {
+    // Direct test of the distributed lock via SqlMemoryStore
+    use memoria_service::DistributedLock;
+    use memoria_storage::SqlMemoryStore;
+    use std::time::Duration;
+
+    let db = db_url();
+    let store = SqlMemoryStore::connect(&db, test_dim()).await.expect("connect");
+    store.migrate().await.expect("migrate");
+
+    let lock_key = format!("test_lock_{}", uuid::Uuid::new_v4().simple());
+
+    // Holder A acquires
+    let acquired = store.try_acquire(&lock_key, "holder_a", Duration::from_secs(60)).await.unwrap();
+    assert!(acquired, "holder_a should acquire the lock");
+
+    // Holder B cannot acquire
+    let acquired = store.try_acquire(&lock_key, "holder_b", Duration::from_secs(60)).await.unwrap();
+    assert!(!acquired, "holder_b should NOT acquire while holder_a holds it");
+
+    // Holder A re-entrant
+    let acquired = store.try_acquire(&lock_key, "holder_a", Duration::from_secs(60)).await.unwrap();
+    assert!(acquired, "holder_a should re-acquire (re-entrant)");
+
+    // Holder A releases
+    store.release(&lock_key, "holder_a").await.unwrap();
+
+    // Now holder B can acquire
+    let acquired = store.try_acquire(&lock_key, "holder_b", Duration::from_secs(60)).await.unwrap();
+    assert!(acquired, "holder_b should acquire after holder_a released");
+
+    // Cleanup
+    store.release(&lock_key, "holder_b").await.unwrap();
+    println!("✅ distributed lock acquire/release/re-entrant works");
+}
+
+#[tokio::test]
+async fn test_distributed_lock_expiry() {
+    use memoria_service::DistributedLock;
+    use memoria_storage::SqlMemoryStore;
+    use std::time::Duration;
+
+    let db = db_url();
+    let store = SqlMemoryStore::connect(&db, test_dim()).await.expect("connect");
+    store.migrate().await.expect("migrate");
+
+    let lock_key = format!("test_lock_exp_{}", uuid::Uuid::new_v4().simple());
+
+    // Acquire with 1-second TTL
+    let acquired = store.try_acquire(&lock_key, "holder_a", Duration::from_secs(1)).await.unwrap();
+    assert!(acquired);
+
+    // Wait for expiry
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // Holder B should now acquire (expired lock cleaned up)
+    let acquired = store.try_acquire(&lock_key, "holder_b", Duration::from_secs(60)).await.unwrap();
+    assert!(acquired, "holder_b should acquire after holder_a's lock expired");
+
+    store.release(&lock_key, "holder_b").await.unwrap();
+    println!("✅ distributed lock expires and can be taken over");
+}
+
+#[tokio::test]
+async fn test_distributed_lock_renew() {
+    use memoria_service::DistributedLock;
+    use memoria_storage::SqlMemoryStore;
+    use std::time::Duration;
+
+    let db = db_url();
+    let store = SqlMemoryStore::connect(&db, test_dim()).await.expect("connect");
+    store.migrate().await.expect("migrate");
+
+    let lock_key = format!("test_lock_renew_{}", uuid::Uuid::new_v4().simple());
+
+    // Acquire
+    store.try_acquire(&lock_key, "holder_a", Duration::from_secs(60)).await.unwrap();
+
+    // Renew by holder_a succeeds
+    let renewed = store.renew(&lock_key, "holder_a", Duration::from_secs(120)).await.unwrap();
+    assert!(renewed, "holder_a should renew its own lock");
+
+    // Renew by holder_b fails
+    let renewed = store.renew(&lock_key, "holder_b", Duration::from_secs(120)).await.unwrap();
+    assert!(!renewed, "holder_b should NOT renew holder_a's lock");
+
+    store.release(&lock_key, "holder_a").await.unwrap();
+    println!("✅ distributed lock renew works correctly");
+}
+
+#[tokio::test]
+async fn test_distributed_async_task_cross_instance() {
+    use memoria_service::AsyncTaskStore;
+    use memoria_storage::SqlMemoryStore;
+
+    let db = db_url();
+    let store = SqlMemoryStore::connect(&db, test_dim()).await.expect("connect");
+    store.migrate().await.expect("migrate");
+
+    let task_id = format!("task_{}", uuid::Uuid::new_v4().simple());
+
+    // Create task on "instance_a"
+    store.create_task(&task_id, "instance_a").await.unwrap();
+
+    // Read from "instance_b" perspective (same store, simulating different instance)
+    let task = store.get_task(&task_id).await.unwrap().expect("task should exist");
+    assert_eq!(task.task_id, task_id);
+    assert_eq!(task.instance_id, "instance_a");
+    assert_eq!(task.status, "processing");
+
+    // Complete task
+    store.complete_task(&task_id, json!({"memory_id": "m123"})).await.unwrap();
+    let task = store.get_task(&task_id).await.unwrap().expect("task should exist");
+    assert_eq!(task.status, "completed");
+    assert_eq!(task.result.unwrap()["memory_id"], "m123");
+
+    println!("✅ async task visible cross-instance and completable");
+}
+
+#[tokio::test]
+async fn test_distributed_async_task_fail() {
+    use memoria_service::AsyncTaskStore;
+    use memoria_storage::SqlMemoryStore;
+
+    let db = db_url();
+    let store = SqlMemoryStore::connect(&db, test_dim()).await.expect("connect");
+    store.migrate().await.expect("migrate");
+
+    let task_id = format!("task_{}", uuid::Uuid::new_v4().simple());
+    store.create_task(&task_id, "instance_x").await.unwrap();
+    store.fail_task(&task_id, json!({"code": "ERR", "message": "boom"})).await.unwrap();
+
+    let task = store.get_task(&task_id).await.unwrap().expect("task should exist");
+    assert_eq!(task.status, "failed");
+    assert_eq!(task.error.unwrap()["message"], "boom");
+
+    println!("✅ async task failure recorded correctly");
+}

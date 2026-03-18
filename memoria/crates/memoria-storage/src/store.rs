@@ -371,6 +371,39 @@ impl SqlMemoryStore {
         // Graph tables
         self.graph_store().migrate().await?;
 
+        // ── Distributed coordination tables ───────────────────────────────────
+
+        // mem_distributed_locks — DB-based mutual exclusion for multi-instance
+        sqlx::query(
+            r#"CREATE TABLE IF NOT EXISTS mem_distributed_locks (
+                lock_key    VARCHAR(128) PRIMARY KEY,
+                holder_id   VARCHAR(128) NOT NULL,
+                acquired_at DATETIME(6)  NOT NULL,
+                expires_at  DATETIME(6)  NOT NULL,
+                INDEX idx_lock_expires (expires_at)
+            )"#,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+
+        // mem_async_tasks — cross-instance async task tracking
+        sqlx::query(
+            r#"CREATE TABLE IF NOT EXISTS mem_async_tasks (
+                task_id     VARCHAR(64)  PRIMARY KEY,
+                instance_id VARCHAR(128) NOT NULL,
+                status      VARCHAR(16)  NOT NULL DEFAULT 'processing',
+                result_json JSON         DEFAULT NULL,
+                error_json  JSON         DEFAULT NULL,
+                created_at  DATETIME(6)  NOT NULL,
+                updated_at  DATETIME(6)  NOT NULL,
+                INDEX idx_task_status (status, created_at)
+            )"#,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+
         // Migrate idx_user_active to include memory_type (idempotent)
         let needs_upgrade: bool = sqlx::query_scalar(
             "SELECT COUNT(*) = 0 FROM information_schema.statistics \

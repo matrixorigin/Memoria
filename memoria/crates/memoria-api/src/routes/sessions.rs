@@ -10,8 +10,6 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sqlx::Row;
-use std::sync::Arc;
-use tokio::sync::Mutex;
 
 use crate::{auth::AuthUser, state::AppState};
 
@@ -43,19 +41,11 @@ pub struct SessionSummaryResponse {
 #[derive(Serialize, Clone)]
 pub struct TaskStatus {
     pub task_id: String,
-    pub status: String, // "processing" | "completed" | "failed"
+    pub status: String,
     pub created_at: String,
     pub updated_at: String,
     pub result: Option<serde_json::Value>,
     pub error: Option<serde_json::Value>,
-}
-
-// ── In-memory task store ──────────────────────────────────────────────────────
-
-type TaskStore = Arc<Mutex<std::collections::HashMap<String, TaskStatus>>>;
-
-pub fn new_task_store() -> TaskStore {
-    Arc::new(Mutex::new(std::collections::HashMap::new()))
 }
 
 // ── LLM prompts ───────────────────────────────────────────────────────────────
@@ -78,7 +68,6 @@ Respond with a JSON object: {\"points\": [\"point 1\", \"point 2\", ...]}";
 
 fn extract_json(text: &str) -> &str {
     let text = text.trim();
-    // Strip markdown fences
     let text = text.trim_start_matches("```json").trim_start_matches("```").trim_end_matches("```").trim();
     text
 }
@@ -97,7 +86,6 @@ async fn generate_and_store(
     let llm = state.service.llm.as_ref()
         .ok_or("LLM not configured — set LLM_API_KEY")?;
 
-    // Fetch session memories
     let rows = sqlx::query(
         "SELECT memory_id, content, memory_type FROM mem_memories \
          WHERE user_id = ? AND session_id = ? AND is_active = 1 \
@@ -111,7 +99,6 @@ async fn generate_and_store(
         return Err(format!("No memories found for session {session_id}"));
     }
 
-    // Build message text (truncate at 200 messages, 16k tokens)
     let messages: Vec<(String, String, String)> = rows.iter().filter_map(|r| {
         let mid: String = r.try_get("memory_id").ok()?;
         let content: String = r.try_get("content").ok()?;
@@ -175,7 +162,6 @@ pub async fn create_session_summary(
     }
 
     if req.sync {
-        // Synchronous: generate and return immediately
         let result = generate_and_store(
             &state, &user_id, &session_id, &req.mode,
             req.focus_topics.as_deref(),
@@ -191,21 +177,14 @@ pub async fn create_session_summary(
         }));
     }
 
-    // Async: spawn task
+    // Async: create task in DB
+    let task_store = state.task_store.as_ref()
+        .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "Task store not available".to_string()))?;
+
     let task_id = uuid::Uuid::new_v4().simple().to_string();
-    let now = chrono::Utc::now().to_rfc3339();
-    let task = TaskStatus {
-        task_id: task_id.clone(),
-        status: "processing".to_string(),
-        created_at: now.clone(),
-        updated_at: now,
-        result: None,
-        error: None,
-    };
+    task_store.create_task(&task_id, &state.instance_id).await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    state.tasks.lock().await.insert(task_id.clone(), task);
-
-    // Spawn background task
     let state_clone = state.clone();
     let tid = task_id.clone();
     let uid = user_id.clone();
@@ -215,21 +194,16 @@ pub async fn create_session_summary(
 
     tokio::spawn(async move {
         let result = generate_and_store(&state_clone, &uid, &sid, &mode, focus.as_deref()).await;
-        let now = chrono::Utc::now().to_rfc3339();
-        let mut tasks = state_clone.tasks.lock().await;
-        if let Some(task) = tasks.get_mut(&tid) {
-            task.updated_at = now;
+        if let Some(ts) = &state_clone.task_store {
             match result {
                 Ok((mid, content, truncated, metadata)) => {
-                    task.status = "completed".to_string();
-                    task.result = Some(json!({
+                    let _ = ts.complete_task(&tid, json!({
                         "memory_id": mid, "content": content,
                         "truncated": truncated, "metadata": metadata
-                    }));
+                    })).await;
                 }
                 Err(e) => {
-                    task.status = "failed".to_string();
-                    task.error = Some(json!({"code": "GENERATION_ERROR", "message": e}));
+                    let _ = ts.fail_task(&tid, json!({"code": "GENERATION_ERROR", "message": e})).await;
                 }
             }
         }
@@ -250,9 +224,21 @@ pub async fn get_task_status(
     AuthUser(_): AuthUser,
     Path(task_id): Path<String>,
 ) -> Result<Json<TaskStatus>, (StatusCode, String)> {
-    let tasks = state.tasks.lock().await;
-    tasks.get(&task_id)
-        .cloned()
-        .map(Json)
-        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Task {task_id} not found")))
+    let task_store = state.task_store.as_ref()
+        .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "Task store not available".to_string()))?;
+
+    let task = task_store.get_task(&task_id).await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    match task {
+        Some(t) => Ok(Json(TaskStatus {
+            task_id: t.task_id,
+            status: t.status,
+            created_at: t.created_at,
+            updated_at: t.updated_at,
+            result: t.result,
+            error: t.error,
+        })),
+        None => Err((StatusCode::NOT_FOUND, format!("Task {task_id} not found"))),
+    }
 }

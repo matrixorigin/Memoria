@@ -43,6 +43,12 @@ pub struct Config {
     /// Local plugin directory for dev hot-reload (skips publish/review).
     /// Set via MEMORIA_GOVERNANCE_PLUGIN_DIR.
     pub governance_plugin_dir: Option<String>,
+
+    // Distributed coordination
+    /// Unique instance identifier. Set via MEMORIA_INSTANCE_ID, defaults to random UUID.
+    pub instance_id: String,
+    /// Lock TTL in seconds for distributed leader election. Default: 120.
+    pub lock_ttl_secs: u64,
 }
 
 impl Config {
@@ -88,6 +94,14 @@ impl Config {
             governance_plugin_dir: std::env::var("MEMORIA_GOVERNANCE_PLUGIN_DIR")
                 .ok()
                 .filter(|s| !s.trim().is_empty()),
+            instance_id: std::env::var("MEMORIA_INSTANCE_ID")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string()),
+            lock_ttl_secs: std::env::var("MEMORIA_LOCK_TTL_SECS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(120),
         }
     }
 
