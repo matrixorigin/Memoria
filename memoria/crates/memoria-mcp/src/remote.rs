@@ -340,7 +340,7 @@ impl RemoteClient {
             "memory_merge" => {
                 let source = args["source"].as_str().unwrap_or("");
                 let r = self.client.post(self.url(&format!("/v1/branches/{source}/merge")))
-                    .json(&json!({"strategy": args["strategy"].as_str().unwrap_or("append")}))
+                    .json(&json!({"strategy": args["strategy"].as_str().unwrap_or("accept")}))
                     .send().await?;
                 let status = r.status();
                 let text = r.text().await?;

@@ -192,7 +192,7 @@ pub struct MergeRequest {
     #[serde(default = "default_strategy")]
     pub strategy: String,
 }
-fn default_strategy() -> String { "append".to_string() }
+fn default_strategy() -> String { "accept".to_string() }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 

@@ -77,6 +77,25 @@ async fn test_basic_branch_workflow() {
     gc("memory_branch_delete", json!({"name": branch}), &git, &svc, &uid).await;
 }
 
+#[tokio::test]
+async fn test_merge_accept_alias() {
+    let (svc, git, uid) = setup().await;
+    let branch = bname("accept");
+
+    store_mem("main memory", &svc, &uid).await;
+    gc("memory_branch", json!({"name": branch}), &git, &svc, &uid).await;
+    gc("memory_checkout", json!({"name": branch}), &git, &svc, &uid).await;
+    store_mem("branch memory", &svc, &uid).await;
+    gc("memory_checkout", json!({"name": "main"}), &git, &svc, &uid).await;
+
+    let r = gc("memory_merge", json!({"source": branch, "strategy": "accept"}), &git, &svc, &uid).await;
+    assert!(text(&r).contains("1 new"), "expected 1 new, got: {}", text(&r));
+    assert_eq!(svc.list_active(&uid, 10).await.unwrap().len(), 2);
+    println!("✅ accept alias: {}", text(&r));
+
+    gc("memory_branch_delete", json!({"name": branch}), &git, &svc, &uid).await;
+}
+
 // ── 2. memory_diff shows new/modified before merge ────────────────────────────
 
 #[tokio::test]
@@ -149,6 +168,23 @@ async fn test_checkout_nonexistent_branch() {
     ).await;
     assert!(result.is_err(), "should error on missing branch");
     println!("✅ checkout nonexistent → error");
+}
+
+#[tokio::test]
+async fn test_merge_unknown_strategy_rejected() {
+    let (svc, git, uid) = setup().await;
+    let branch = bname("badmerge");
+
+    store_mem("main memory", &svc, &uid).await;
+    gc("memory_branch", json!({"name": branch}), &git, &svc, &uid).await;
+
+    let result = memoria_mcp::git_tools::call(
+        "memory_merge", json!({"source": branch, "strategy": "bogus"}), &git, &svc, &uid
+    ).await;
+    assert!(result.is_err(), "unknown merge strategy should error");
+    println!("✅ unknown merge strategy rejected");
+
+    gc("memory_branch_delete", json!({"name": branch}), &git, &svc, &uid).await;
 }
 
 // ── 7. Duplicate branch name rejected (even after delete) ────────────────────

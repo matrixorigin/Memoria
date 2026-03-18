@@ -3,7 +3,9 @@
 
 use anyhow::Result;
 use memoria_core::{MemoryType, TrustTier};
-use memoria_service::MemoryService;
+use memoria_service::{
+    ConsolidationInput, ConsolidationStrategy, DefaultConsolidationStrategy, MemoryService,
+};
 use serde_json::{json, Value};
 use sqlx::Row;
 use std::str::FromStr;
@@ -437,17 +439,22 @@ pub async fn call(
             }
 
             let graph = sql.graph_store();
-            let consolidator = memoria_storage::GraphConsolidator::new(&graph);
-            let result = consolidator.consolidate(user_id).await;
+            let result = DefaultConsolidationStrategy::default()
+                .consolidate(&graph, &ConsolidationInput::for_user(user_id))
+                .await?;
 
             sql.set_cooldown(user_id, "consolidate").await?;
 
             let mut msg = format!(
-                "Consolidation complete: conflicts_detected={}, orphaned_scenes={}, promoted={}, demoted={}",
-                result.conflicts_detected, result.orphaned_scenes, result.promoted, result.demoted
+                "Consolidation complete: status={}, conflicts_detected={}, orphaned_scenes={}, promoted={}, demoted={}",
+                result.status.as_str(),
+                result.metrics.get("consolidation.conflicts_detected").copied().unwrap_or(0.0) as i64,
+                result.metrics.get("consolidation.orphaned_scenes").copied().unwrap_or(0.0) as i64,
+                result.metrics.get("trust.promoted_count").copied().unwrap_or(0.0) as i64,
+                result.metrics.get("trust.demoted_count").copied().unwrap_or(0.0) as i64
             );
-            if !result.errors.is_empty() {
-                msg.push_str(&format!(" (warnings: {})", result.errors.join("; ")));
+            if !result.warnings.is_empty() {
+                msg.push_str(&format!(" (warnings: {})", result.warnings.join("; ")));
             }
             Ok(mcp_text(&msg))
         }

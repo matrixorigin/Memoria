@@ -1,4 +1,5 @@
 use axum::{extract::State, http::StatusCode, Json};
+use memoria_service::{ConsolidationInput, ConsolidationStrategy, DefaultConsolidationStrategy};
 use serde_json::json;
 use tracing::warn;
 
@@ -45,15 +46,19 @@ pub async fn consolidate(
         }
     }
     let graph = sql.graph_store();
-    let consolidator = memoria_storage::GraphConsolidator::new(&graph);
-    let result = consolidator.consolidate(&user_id).await;
+    let result = DefaultConsolidationStrategy::default()
+        .consolidate(&graph, &ConsolidationInput::for_user(user_id.clone()))
+        .await
+        .map_err(api_err)?;
     sql.set_cooldown(&user_id, "consolidate").await.map_err(api_err)?;
     Ok(Json(json!({
-        "conflicts_detected": result.conflicts_detected,
-        "orphaned_scenes": result.orphaned_scenes,
-        "promoted": result.promoted,
-        "demoted": result.demoted,
-        "errors": result.errors,
+        "status": result.status.as_str(),
+        "conflicts_detected": result.metrics.get("consolidation.conflicts_detected").copied().unwrap_or(0.0) as i64,
+        "orphaned_scenes": result.metrics.get("consolidation.orphaned_scenes").copied().unwrap_or(0.0) as i64,
+        "promoted": result.metrics.get("trust.promoted_count").copied().unwrap_or(0.0) as i64,
+        "demoted": result.metrics.get("trust.demoted_count").copied().unwrap_or(0.0) as i64,
+        "warnings": result.warnings,
+        "decision_count": result.decisions.len(),
     })))
 }
 

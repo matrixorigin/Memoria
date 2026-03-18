@@ -6,6 +6,7 @@ use axum::{
     http::StatusCode,
     Json,
 };
+use memoria_service::{ConsolidationInput, ConsolidationStrategy, DefaultConsolidationStrategy};
 use serde::{Deserialize, Serialize};
 use sqlx::{MySqlPool, Row};
 
@@ -183,9 +184,20 @@ pub async fn trigger_governance(
         }
         "consolidate" => {
             let graph = sql.graph_store();
-            let consolidator = memoria_storage::GraphConsolidator::new(&graph);
-            let r = consolidator.consolidate(&user_id).await;
-            Ok(Json(serde_json::json!({"op": op, "user_id": user_id, "conflicts_detected": r.conflicts_detected, "orphaned_scenes": r.orphaned_scenes})))
+            let report = DefaultConsolidationStrategy::default()
+                .consolidate(&graph, &ConsolidationInput::for_user(user_id.clone()))
+                .await
+                .map_err(db_err)?;
+            Ok(Json(serde_json::json!({
+                "op": op,
+                "user_id": user_id,
+                "status": report.status.as_str(),
+                "conflicts_detected": report.metrics.get("consolidation.conflicts_detected").copied().unwrap_or(0.0) as i64,
+                "orphaned_scenes": report.metrics.get("consolidation.orphaned_scenes").copied().unwrap_or(0.0) as i64,
+                "promoted": report.metrics.get("trust.promoted_count").copied().unwrap_or(0.0) as i64,
+                "demoted": report.metrics.get("trust.demoted_count").copied().unwrap_or(0.0) as i64,
+                "warnings": report.warnings,
+            })))
         }
         "extract_entities" => {
             let r = memoria_storage::graph::backfill::backfill_graph(sql, &user_id).await.map_err(db_err)?;

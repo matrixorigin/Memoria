@@ -8,6 +8,8 @@ use async_trait::async_trait;
 use memoria_core::{Memory, MemoriaError};
 use std::collections::HashMap;
 
+use crate::plugin_registry::PluginRegistry;
+
 /// A retrieval strategy — only responsible for retrieve().
 #[async_trait]
 pub trait RetrievalStrategy: Send + Sync {
@@ -50,6 +52,15 @@ impl StrategyRegistry {
 
     pub fn list_available(&self) -> Vec<&'static str> {
         self.entries.keys().copied().collect()
+    }
+
+    /// Backward-compatible adapter into the Phase 1 multi-domain registry.
+    pub fn into_plugin_registry(self) -> PluginRegistry {
+        let mut registry = PluginRegistry::new();
+        for (key, factory) in self.entries {
+            registry.register_retrieval_factory(key, factory);
+        }
+        registry
     }
 }
 
