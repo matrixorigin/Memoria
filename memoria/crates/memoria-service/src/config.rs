@@ -14,6 +14,7 @@
 ///   MEMORIA_USER          — default user ID (default: "default")
 ///   MEMORIA_DB_NAME       — database name for git-for-data (default: "memoria")
 ///   MEMORIA_GOVERNANCE_PLUGIN_BINDING — shared governance plugin binding (default: "default")
+///   MEMORIA_GOVERNANCE_PLUGIN_SUBJECT — deterministic subject key for shared binding selection
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -38,6 +39,10 @@ pub struct Config {
 
     // Governance plugin runtime
     pub governance_plugin_binding: String,
+    pub governance_plugin_subject: String,
+    /// Local plugin directory for dev hot-reload (skips publish/review).
+    /// Set via MEMORIA_GOVERNANCE_PLUGIN_DIR.
+    pub governance_plugin_dir: Option<String>,
 }
 
 impl Config {
@@ -76,6 +81,13 @@ impl Config {
                 .ok()
                 .filter(|s| !s.trim().is_empty())
                 .unwrap_or_else(|| "default".to_string()),
+            governance_plugin_subject: std::env::var("MEMORIA_GOVERNANCE_PLUGIN_SUBJECT")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| "system".to_string()),
+            governance_plugin_dir: std::env::var("MEMORIA_GOVERNANCE_PLUGIN_DIR")
+                .ok()
+                .filter(|s| !s.trim().is_empty()),
         }
     }
 
@@ -111,16 +123,23 @@ mod tests {
             .get_or_init(|| Mutex::new(()))
             .lock()
             .expect("env test lock should not be poisoned");
-        let old = std::env::var_os("MEMORIA_GOVERNANCE_PLUGIN_BINDING");
+        let old_binding = std::env::var_os("MEMORIA_GOVERNANCE_PLUGIN_BINDING");
+        let old_subject = std::env::var_os("MEMORIA_GOVERNANCE_PLUGIN_SUBJECT");
         std::env::set_var("MEMORIA_GOVERNANCE_PLUGIN_BINDING", "governance/default");
+        std::env::set_var("MEMORIA_GOVERNANCE_PLUGIN_SUBJECT", "tenant-a");
 
         let cfg = Config::from_env();
         assert_eq!(cfg.governance_plugin_binding, "governance/default");
+        assert_eq!(cfg.governance_plugin_subject, "tenant-a");
         assert!(cfg.has_governance_plugin());
 
-        match old {
+        match old_binding {
             Some(value) => std::env::set_var("MEMORIA_GOVERNANCE_PLUGIN_BINDING", value),
             None => std::env::remove_var("MEMORIA_GOVERNANCE_PLUGIN_BINDING"),
+        }
+        match old_subject {
+            Some(value) => std::env::set_var("MEMORIA_GOVERNANCE_PLUGIN_SUBJECT", value),
+            None => std::env::remove_var("MEMORIA_GOVERNANCE_PLUGIN_SUBJECT"),
         }
     }
 }

@@ -10,6 +10,7 @@
 
 use std::sync::Arc;
 
+use memoria_storage::SqlMemoryStore;
 use tokio::time::{interval, Duration};
 use tracing::{error, info, warn};
 
@@ -19,7 +20,10 @@ use crate::{
         DefaultGovernanceStrategy, GovernanceExecution, GovernanceStore, GovernanceStrategy,
         GovernanceTask,
     },
-    plugin::load_active_governance_plugin,
+    plugin::{
+        build_local_governance_strategy, load_active_governance_plugin, load_plugin_package,
+        record_runtime_plugin_event, HostPluginPolicy,
+    },
     plugin_registry::PluginRegistry,
     strategy_domain::StrategyStatus,
     MemoriaError, MemoryService,
@@ -27,11 +31,21 @@ use crate::{
 
 pub struct GovernanceScheduler {
     store: Option<Arc<dyn GovernanceStore>>,
+    sql_store: Option<Arc<SqlMemoryStore>>,
     strategy: Arc<dyn GovernanceStrategy>,
     fallback_strategy: Arc<dyn GovernanceStrategy>,
     enabled: bool,
     breaker_threshold: usize,
     breaker_cooldown: Duration,
+    observed_plugin: Option<ObservedPlugin>,
+}
+
+#[derive(Clone)]
+struct ObservedPlugin {
+    binding_key: String,
+    subject_key: String,
+    plugin_key: String,
+    version: String,
 }
 
 const DEFAULT_BREAKER_THRESHOLD: usize = 3;
@@ -40,7 +54,7 @@ const DEFAULT_BREAKER_COOLDOWN_SECS: u64 = 300;
 impl GovernanceScheduler {
     pub fn new(service: Arc<MemoryService>) -> Self {
         let default_strategy: Arc<dyn GovernanceStrategy> = Arc::new(DefaultGovernanceStrategy);
-        Self::from_parts(service, default_strategy.clone(), default_strategy)
+        Self::from_parts(service, default_strategy.clone(), default_strategy, None)
     }
 
     pub async fn from_config(
@@ -48,10 +62,42 @@ impl GovernanceScheduler {
         config: &Config,
     ) -> Result<Self, MemoriaError> {
         let delegate: Arc<dyn GovernanceStrategy> = Arc::new(DefaultGovernanceStrategy);
+
+        // Dev mode: load plugin directly from local filesystem (hot-reload friendly)
+        if let Some(ref dir) = config.governance_plugin_dir {
+            let path = std::path::PathBuf::from(dir);
+            if path.join("manifest.json").exists() {
+                let policy = HostPluginPolicy::development();
+                let package = load_plugin_package(path.clone(), &policy)?;
+                let plugin_key = package.plugin_key.clone();
+                let version = package.manifest.version.clone();
+                let strategy = build_local_governance_strategy(&package, delegate.clone())?;
+                info!(
+                    plugin_dir = %dir,
+                    plugin_key = %plugin_key,
+                    plugin_version = %version,
+                    "Loaded governance plugin from local directory (dev mode)"
+                );
+                return Ok(Self::from_parts(
+                    service,
+                    strategy,
+                    delegate,
+                    Some(ObservedPlugin {
+                        binding_key: "local".into(),
+                        subject_key: "dev".into(),
+                        plugin_key,
+                        version,
+                    }),
+                ));
+            }
+            warn!(plugin_dir = %dir, "MEMORIA_GOVERNANCE_PLUGIN_DIR set but manifest.json not found, falling back");
+        }
+
         if let Some(store) = &service.sql_store {
             if let Some(active_plugin) = load_active_governance_plugin(
                 store.as_ref(),
                 &config.governance_plugin_binding,
+                &config.governance_plugin_subject,
                 delegate.clone(),
             )
             .await?
@@ -64,13 +110,19 @@ impl GovernanceScheduler {
                 );
                 return Ok(Self::from_parts(
                     service,
-                    Arc::new(active_plugin.strategy),
+                    active_plugin.strategy.clone(),
                     delegate,
+                    Some(ObservedPlugin {
+                        binding_key: active_plugin.binding_key,
+                        subject_key: active_plugin.subject_key,
+                        plugin_key: active_plugin.plugin_key,
+                        version: active_plugin.version,
+                    }),
                 ));
             }
         }
 
-        Ok(Self::from_parts(service, delegate.clone(), delegate))
+        Ok(Self::from_parts(service, delegate.clone(), delegate, None))
     }
 
     pub fn new_with_registry(
@@ -99,9 +151,11 @@ impl GovernanceScheduler {
         let fallback_strategy: Arc<dyn GovernanceStrategy> = Arc::new(DefaultGovernanceStrategy);
         Ok(Self::new_with_components(
             store,
+            None,
             strategy,
             fallback_strategy,
             enabled,
+            None,
         ))
     }
 
@@ -109,45 +163,61 @@ impl GovernanceScheduler {
         service: Arc<MemoryService>,
         strategy: Arc<dyn GovernanceStrategy>,
         fallback_strategy: Arc<dyn GovernanceStrategy>,
+        observed_plugin: Option<ObservedPlugin>,
     ) -> Self {
         let store = service
             .sql_store
             .clone()
             .map(|store| -> Arc<dyn GovernanceStore> { store });
-        Self::new_with_components(store, strategy, fallback_strategy, read_enabled_flag())
+        Self::new_with_components(
+            store,
+            service.sql_store.clone(),
+            strategy,
+            fallback_strategy,
+            read_enabled_flag(),
+            observed_plugin,
+        )
     }
 
     fn new_with_components(
         store: Option<Arc<dyn GovernanceStore>>,
+        sql_store: Option<Arc<SqlMemoryStore>>,
         strategy: Arc<dyn GovernanceStrategy>,
         fallback_strategy: Arc<dyn GovernanceStrategy>,
         enabled: bool,
+        observed_plugin: Option<ObservedPlugin>,
     ) -> Self {
         Self::new_with_components_and_breaker(
             store,
+            sql_store,
             strategy,
             fallback_strategy,
             enabled,
             DEFAULT_BREAKER_THRESHOLD,
             Duration::from_secs(DEFAULT_BREAKER_COOLDOWN_SECS),
+            observed_plugin,
         )
     }
 
     fn new_with_components_and_breaker(
         store: Option<Arc<dyn GovernanceStore>>,
+        sql_store: Option<Arc<SqlMemoryStore>>,
         strategy: Arc<dyn GovernanceStrategy>,
         fallback_strategy: Arc<dyn GovernanceStrategy>,
         enabled: bool,
         breaker_threshold: usize,
         breaker_cooldown: Duration,
+        observed_plugin: Option<ObservedPlugin>,
     ) -> Self {
         Self {
             store,
+            sql_store,
             strategy,
             fallback_strategy,
             enabled,
             breaker_threshold,
             breaker_cooldown,
+            observed_plugin,
         }
     }
 
@@ -328,7 +398,41 @@ impl GovernanceScheduler {
                 "Primary strategy {primary_key} remains fenced off until the scheduler breaker cools down; fallback {fallback_key} handled this run."
             ));
         }
+        self.record_runtime_event(
+            "governance.degraded",
+            "degraded",
+            &format!(
+                "Task {} degraded from {} to {}",
+                task.as_str(),
+                primary_key,
+                fallback_key
+            ),
+        )
+        .await?;
         Ok(fallback_execution)
+    }
+
+    async fn record_runtime_event(
+        &self,
+        event_type: &str,
+        status: &str,
+        message: &str,
+    ) -> Result<(), MemoriaError> {
+        let (Some(sql_store), Some(plugin)) = (&self.sql_store, &self.observed_plugin) else {
+            return Ok(());
+        };
+        record_runtime_plugin_event(
+            sql_store.as_ref(),
+            "governance",
+            Some(&plugin.binding_key),
+            Some(&plugin.subject_key),
+            Some(&plugin.plugin_key),
+            Some(&plugin.version),
+            event_type,
+            status,
+            message,
+        )
+        .await
     }
 }
 
@@ -780,9 +884,11 @@ mod tests {
         let fallback = Arc::new(DefaultGovernanceStrategy);
         let scheduler = GovernanceScheduler::new_with_components(
             Some(Arc::new(NoopStore)),
+            None,
             strategy.clone(),
             fallback,
             true,
+            None,
         );
 
         let execution = scheduler
@@ -798,8 +904,14 @@ mod tests {
     async fn scheduler_skips_task_when_store_is_missing() {
         let strategy = Arc::new(RecordingStrategy::default());
         let fallback = Arc::new(DefaultGovernanceStrategy);
-        let scheduler =
-            GovernanceScheduler::new_with_components(None, strategy.clone(), fallback, true);
+        let scheduler = GovernanceScheduler::new_with_components(
+            None,
+            None,
+            strategy.clone(),
+            fallback,
+            true,
+            None,
+        );
 
         let execution = scheduler
             .run_task(GovernanceTask::Weekly)
@@ -814,9 +926,11 @@ mod tests {
     async fn scheduler_falls_back_when_primary_strategy_fails() {
         let scheduler = GovernanceScheduler::new_with_components(
             Some(Arc::new(NoopStore)),
+            None,
             Arc::new(FailingStrategy),
             Arc::new(DefaultGovernanceStrategy),
             true,
+            None,
         );
 
         let execution = scheduler
@@ -837,9 +951,11 @@ mod tests {
     async fn scheduler_fallback_uses_default_strategy_results() {
         let scheduler = GovernanceScheduler::new_with_components(
             Some(Arc::new(FallbackStore)),
+            None,
             Arc::new(FailingStrategy),
             Arc::new(DefaultGovernanceStrategy),
             true,
+            None,
         );
 
         let execution = scheduler
@@ -860,11 +976,13 @@ mod tests {
         let primary = Arc::new(CountingFailingStrategy::default());
         let scheduler = GovernanceScheduler::new_with_components_and_breaker(
             Some(Arc::new(SharedBreakerStore::default())),
+            None,
             primary.clone(),
             Arc::new(DefaultGovernanceStrategy),
             true,
             2,
             Duration::from_secs(60),
+            None,
         );
 
         let first = scheduler.run_task(GovernanceTask::Daily).await.unwrap();
@@ -891,11 +1009,13 @@ mod tests {
         let primary = Arc::new(FlakyStrategy::default());
         let scheduler = GovernanceScheduler::new_with_components_and_breaker(
             Some(Arc::new(SharedBreakerStore::default())),
+            None,
             primary.clone(),
             Arc::new(DefaultGovernanceStrategy),
             true,
             2,
             Duration::from_secs(60),
+            None,
         );
 
         let first = scheduler.run_task(GovernanceTask::Daily).await.unwrap();
@@ -1026,6 +1146,8 @@ mod tests {
             llm_model: "gpt-4o-mini".into(),
             user: "default".into(),
             governance_plugin_binding: "default".into(),
+            governance_plugin_subject: "system".into(),
+            governance_plugin_dir: None,
         };
         let service = Arc::new(MemoryService::new(Arc::new(NoopMemoryStore), None));
 

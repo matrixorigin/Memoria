@@ -23,8 +23,14 @@ sha2 = "0.10"
 base64 = "0.22"
 ed25519-dalek = { version = "2.1", default-features = false, features = ["std"] }
 tempfile = "3.14"
+prost = "0.13"
+tonic = { version = "0.12", features = ["transport"] }
 
 [dev-dependencies]
 tokio = { workspace = true }
 async-trait = { workspace = true }
 memoria-core = { workspace = true }
+
+[build-dependencies]
+tonic-build = "0.12"
+protoc-bin-vendored = "3"

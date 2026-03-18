@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -13,13 +12,16 @@ use serde::{Deserialize, Serialize};
 use tokio::time::{timeout, Duration};
 
 use crate::governance::{
-    GovernanceExecution, GovernancePlan, GovernanceRunSummary, GovernanceStore, GovernanceStrategy,
-    GovernanceTask,
+    GovernanceExecution, GovernancePlan, GovernanceStore, GovernanceStrategy, GovernanceTask,
+};
+use crate::plugin::governance_hook::{
+    apply_execution_patch, apply_plan_patch, ExecuteHookContext, PlanHookContext,
+    PluginExecutionPatch, PluginPlanPatch,
 };
 use crate::plugin::manifest::{
     load_plugin_package, HostPluginPolicy, PluginPackage, PluginRuntimeKind,
 };
-use crate::strategy_domain::{StrategyDecision, StrategyEvidence, StrategyReport, StrategyStatus};
+use crate::strategy_domain::StrategyStatus;
 
 pub trait PluginRuntime: Send + Sync {
     fn runtime_kind(&self) -> PluginRuntimeKind;
@@ -167,8 +169,8 @@ impl GovernanceStrategy for RhaiGovernanceStrategy {
             return Ok(base_plan);
         }
 
-        let patch: RhaiPlanPatch = self
-            .call_plugin::<RhaiPlanPatch, _>(PlanHookContext::new(
+        let patch: PluginPlanPatch = self
+            .call_plugin::<PluginPlanPatch, _>(PlanHookContext::new(
                 self.strategy_key(),
                 task,
                 &base_plan,
@@ -189,7 +191,7 @@ impl GovernanceStrategy for RhaiGovernanceStrategy {
         }
 
         match self
-            .call_plugin::<RhaiExecutionPatch, _>(ExecuteHookContext::new(
+            .call_plugin::<PluginExecutionPatch, _>(ExecuteHookContext::new(
                 self.strategy_key(),
                 task,
                 plan,
@@ -214,255 +216,6 @@ impl GovernanceStrategy for RhaiGovernanceStrategy {
 
         Ok(execution)
     }
-}
-
-#[derive(Debug, Serialize)]
-struct PlanHookContext {
-    phase: &'static str,
-    task: &'static str,
-    strategy_key: String,
-    base_plan: SerializablePlan,
-}
-
-impl PlanHookContext {
-    fn new(strategy_key: &str, task: GovernanceTask, plan: &GovernancePlan) -> Self {
-        Self {
-            phase: "plan",
-            task: task.as_str(),
-            strategy_key: strategy_key.to_string(),
-            base_plan: SerializablePlan::from(plan),
-        }
-    }
-}
-
-#[derive(Debug, Serialize)]
-struct ExecuteHookContext {
-    phase: &'static str,
-    task: &'static str,
-    strategy_key: String,
-    plan: SerializablePlan,
-    summary: SerializableSummary,
-    report: SerializableReport,
-}
-
-impl ExecuteHookContext {
-    fn new(
-        strategy_key: &str,
-        task: GovernanceTask,
-        plan: &GovernancePlan,
-        execution: &GovernanceExecution,
-    ) -> Self {
-        Self {
-            phase: "execute",
-            task: task.as_str(),
-            strategy_key: strategy_key.to_string(),
-            plan: SerializablePlan::from(plan),
-            summary: SerializableSummary::from(&execution.summary),
-            report: SerializableReport::from(&execution.report),
-        }
-    }
-}
-
-#[derive(Debug, Serialize)]
-struct SerializablePlan {
-    actions: Vec<SerializableDecision>,
-    estimated_impact: HashMap<String, f64>,
-    requires_approval: bool,
-    users: Vec<String>,
-}
-
-impl From<&GovernancePlan> for SerializablePlan {
-    fn from(value: &GovernancePlan) -> Self {
-        Self {
-            actions: value
-                .actions
-                .iter()
-                .map(SerializableDecision::from)
-                .collect(),
-            estimated_impact: value.estimated_impact.clone(),
-            requires_approval: value.requires_approval,
-            users: value.users.clone(),
-        }
-    }
-}
-
-#[derive(Debug, Serialize)]
-struct SerializableSummary {
-    users_processed: usize,
-    total_quarantined: i64,
-    total_cleaned: i64,
-    tool_results_cleaned: i64,
-    archived_working: i64,
-    stale_cleaned: i64,
-    redundant_compressed: i64,
-    orphaned_incrementals_cleaned: i64,
-    vector_index_rows: i64,
-    snapshots_cleaned: i64,
-    orphan_branches_cleaned: i64,
-}
-
-impl From<&GovernanceRunSummary> for SerializableSummary {
-    fn from(value: &GovernanceRunSummary) -> Self {
-        Self {
-            users_processed: value.users_processed,
-            total_quarantined: value.total_quarantined,
-            total_cleaned: value.total_cleaned,
-            tool_results_cleaned: value.tool_results_cleaned,
-            archived_working: value.archived_working,
-            stale_cleaned: value.stale_cleaned,
-            redundant_compressed: value.redundant_compressed,
-            orphaned_incrementals_cleaned: value.orphaned_incrementals_cleaned,
-            vector_index_rows: value.vector_index_rows,
-            snapshots_cleaned: value.snapshots_cleaned,
-            orphan_branches_cleaned: value.orphan_branches_cleaned,
-        }
-    }
-}
-
-#[derive(Debug, Serialize)]
-struct SerializableReport {
-    status: &'static str,
-    decisions: Vec<SerializableDecision>,
-    metrics: HashMap<String, f64>,
-    warnings: Vec<String>,
-}
-
-impl From<&StrategyReport> for SerializableReport {
-    fn from(value: &StrategyReport) -> Self {
-        Self {
-            status: value.status.as_str(),
-            decisions: value
-                .decisions
-                .iter()
-                .map(SerializableDecision::from)
-                .collect(),
-            metrics: value.metrics.clone(),
-            warnings: value.warnings.clone(),
-        }
-    }
-}
-
-#[derive(Debug, Serialize)]
-struct SerializableDecision {
-    action: String,
-    confidence: Option<f32>,
-    rationale: String,
-    evidence: Vec<SerializableEvidence>,
-    rollback_hint: Option<String>,
-}
-
-impl From<&StrategyDecision> for SerializableDecision {
-    fn from(value: &StrategyDecision) -> Self {
-        Self {
-            action: value.action.clone(),
-            confidence: value.confidence,
-            rationale: value.rationale.clone(),
-            evidence: value
-                .evidence
-                .iter()
-                .map(SerializableEvidence::from)
-                .collect(),
-            rollback_hint: value.rollback_hint.clone(),
-        }
-    }
-}
-
-#[derive(Debug, Serialize)]
-struct SerializableEvidence {
-    source: String,
-    summary: String,
-    score: Option<f32>,
-    references: Vec<String>,
-}
-
-impl From<&StrategyEvidence> for SerializableEvidence {
-    fn from(value: &StrategyEvidence) -> Self {
-        Self {
-            source: value.source.clone(),
-            summary: value.summary.clone(),
-            score: value.score,
-            references: value.references.clone(),
-        }
-    }
-}
-
-#[derive(Debug, Default, Deserialize)]
-struct RhaiPlanPatch {
-    requires_approval: Option<bool>,
-    actions: Option<Vec<PluginDecision>>,
-    estimated_impact: Option<HashMap<String, f64>>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-struct RhaiExecutionPatch {
-    status: Option<String>,
-    decisions: Option<Vec<PluginDecision>>,
-    metrics: Option<HashMap<String, f64>>,
-    warnings: Option<Vec<String>>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct PluginDecision {
-    action: String,
-    rationale: String,
-    #[serde(default)]
-    confidence: Option<f32>,
-    #[serde(default)]
-    evidence: Vec<PluginEvidence>,
-    #[serde(default)]
-    rollback_hint: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct PluginEvidence {
-    source: String,
-    summary: String,
-    #[serde(default)]
-    score: Option<f32>,
-    #[serde(default)]
-    references: Vec<String>,
-}
-
-fn apply_plan_patch(mut plan: GovernancePlan, patch: RhaiPlanPatch) -> GovernancePlan {
-    if let Some(requires_approval) = patch.requires_approval {
-        plan.requires_approval = requires_approval;
-    }
-    if let Some(actions) = patch.actions {
-        plan.actions = actions.into_iter().map(Into::into).collect();
-    }
-    if let Some(estimated_impact) = patch.estimated_impact {
-        plan.estimated_impact = estimated_impact;
-    }
-    plan
-}
-
-fn apply_execution_patch(
-    execution: &mut GovernanceExecution,
-    patch: RhaiExecutionPatch,
-) -> Result<(), MemoriaError> {
-    if let Some(status) = patch.status {
-        execution.report.status = match status.as_str() {
-            "success" => StrategyStatus::Success,
-            "rejected" => StrategyStatus::Rejected,
-            "degraded" => StrategyStatus::Degraded,
-            "failed" => StrategyStatus::Failed,
-            other => {
-                return Err(MemoriaError::Blocked(format!(
-                    "Unsupported plugin status `{other}`"
-                )))
-            }
-        };
-    }
-    if let Some(decisions) = patch.decisions {
-        execution.report.decisions = decisions.into_iter().map(Into::into).collect();
-    }
-    if let Some(metrics) = patch.metrics {
-        execution.report.metrics.extend(metrics);
-    }
-    if let Some(warnings) = patch.warnings {
-        execution.report.warnings.extend(warnings);
-    }
-    Ok(())
 }
 
 fn register_helpers(engine: &mut Engine) {
@@ -512,33 +265,12 @@ fn configure_engine_limits(
         .set_max_map_size(max_map_size);
 }
 
-impl From<PluginDecision> for StrategyDecision {
-    fn from(value: PluginDecision) -> Self {
-        Self {
-            action: value.action,
-            confidence: value.confidence,
-            rationale: value.rationale,
-            evidence: value.evidence.into_iter().map(Into::into).collect(),
-            rollback_hint: value.rollback_hint,
-        }
-    }
-}
-
-impl From<PluginEvidence> for StrategyEvidence {
-    fn from(value: PluginEvidence) -> Self {
-        Self {
-            source: value.source,
-            summary: value.summary,
-            score: value.score,
-            references: value.references,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::governance::{GovernanceRunSummary, GovernanceStore};
+    use crate::strategy_domain::StrategyReport;
+    use std::collections::HashMap;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 

@@ -165,6 +165,27 @@ enum Commands {
 
 #[derive(Subcommand)]
 enum PluginCommands {
+    /// Scaffold a new plugin project (manifest.json + template script)
+    Init {
+        /// Output directory (created if missing)
+        #[arg(long, default_value = ".")]
+        dir: PathBuf,
+        /// Plugin name (e.g. "my-policy")
+        #[arg(long)]
+        name: String,
+        /// Plugin domain capability (e.g. "governance.plan")
+        #[arg(long, default_value = "governance.plan,governance.execute")]
+        capabilities: String,
+        /// Runtime: rhai or grpc
+        #[arg(long, default_value = "rhai")]
+        runtime: String,
+    },
+    /// Generate a dev-only ed25519 signing keypair
+    DevKeygen {
+        /// Output directory for key files
+        #[arg(long, default_value = ".")]
+        dir: PathBuf,
+    },
     /// Register or update a trusted plugin signer
     SignerAdd {
         #[arg(long, env = "DATABASE_URL")]
@@ -189,6 +210,9 @@ enum PluginCommands {
         package_dir: PathBuf,
         #[arg(long, default_value = "cli")]
         actor: String,
+        /// Skip signature verification and auto-approve
+        #[arg(long)]
+        dev_mode: bool,
     },
     /// List shared plugin packages
     List {
@@ -205,12 +229,81 @@ enum PluginCommands {
         domain: String,
         #[arg(long, default_value = "default")]
         binding: String,
+        #[arg(long, default_value = "*")]
+        subject: String,
+        #[arg(long, default_value_t = 100)]
+        priority: i64,
+        #[arg(long)]
+        plugin_key: String,
+        #[arg(long)]
+        version: Option<String>,
+        #[arg(long)]
+        version_req: Option<String>,
+        #[arg(long, default_value_t = 100)]
+        rollout: i64,
+        #[arg(long)]
+        endpoint: Option<String>,
+        #[arg(long, default_value = "cli")]
+        actor: String,
+    },
+    /// Review or take down a published plugin package
+    Review {
+        #[arg(long, env = "DATABASE_URL")]
+        db_url: Option<String>,
         #[arg(long)]
         plugin_key: String,
         #[arg(long)]
         version: String,
+        #[arg(long)]
+        status: String,
+        #[arg(long)]
+        notes: Option<String>,
         #[arg(long, default_value = "cli")]
         actor: String,
+    },
+    /// Set a plugin package score
+    Score {
+        #[arg(long, env = "DATABASE_URL")]
+        db_url: Option<String>,
+        #[arg(long)]
+        plugin_key: String,
+        #[arg(long)]
+        version: String,
+        #[arg(long)]
+        score: f64,
+        #[arg(long)]
+        notes: Option<String>,
+        #[arg(long, default_value = "cli")]
+        actor: String,
+    },
+    /// Show compatibility matrix entries
+    Matrix {
+        #[arg(long, env = "DATABASE_URL")]
+        db_url: Option<String>,
+        #[arg(long)]
+        domain: Option<String>,
+    },
+    /// Show audit events for shared plugins
+    Events {
+        #[arg(long, env = "DATABASE_URL")]
+        db_url: Option<String>,
+        #[arg(long)]
+        domain: Option<String>,
+        #[arg(long)]
+        plugin_key: Option<String>,
+        #[arg(long)]
+        binding: Option<String>,
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
+    /// Show binding rules for one binding
+    Rules {
+        #[arg(long, env = "DATABASE_URL")]
+        db_url: Option<String>,
+        #[arg(long, default_value = "governance")]
+        domain: String,
+        #[arg(long, default_value = "default")]
+        binding: String,
     },
 }
 
@@ -372,17 +465,36 @@ async fn cmd_mcp(
 
 async fn cmd_plugin(command: PluginCommands) -> Result<()> {
     use memoria_service::{
-        activate_plugin_binding, list_plugin_repository_entries, list_trusted_plugin_signers,
-        publish_plugin_package, upsert_trusted_plugin_signer, Config,
+        get_plugin_audit_events, list_binding_rules, list_plugin_compatibility_matrix,
+        list_plugin_repository_entries, list_trusted_plugin_signers, publish_plugin_package,
+        publish_plugin_package_dev, review_plugin_package, score_plugin_package,
+        upsert_plugin_binding_rule, upsert_trusted_plugin_signer, BindingRuleInput, Config,
     };
     use memoria_storage::SqlMemoryStore;
+
+    // Commands that don't need a DB connection
+    match &command {
+        PluginCommands::Init { dir, name, capabilities, runtime } => {
+            return cmd_plugin_init(dir, name, capabilities, runtime);
+        }
+        PluginCommands::DevKeygen { dir } => {
+            return cmd_plugin_dev_keygen(dir);
+        }
+        _ => {}
+    }
 
     let cfg_db_url = match &command {
         PluginCommands::SignerAdd { db_url, .. }
         | PluginCommands::SignerList { db_url }
         | PluginCommands::Publish { db_url, .. }
         | PluginCommands::List { db_url, .. }
-        | PluginCommands::Activate { db_url, .. } => db_url.clone(),
+        | PluginCommands::Activate { db_url, .. }
+        | PluginCommands::Review { db_url, .. }
+        | PluginCommands::Score { db_url, .. }
+        | PluginCommands::Matrix { db_url, .. }
+        | PluginCommands::Events { db_url, .. }
+        | PluginCommands::Rules { db_url, .. } => db_url.clone(),
+        PluginCommands::Init { .. } | PluginCommands::DevKeygen { .. } => unreachable!(),
     };
 
     let mut cfg = Config::from_env();
@@ -411,35 +523,239 @@ async fn cmd_plugin(command: PluginCommands) -> Result<()> {
             }
         }
         PluginCommands::Publish {
-            package_dir, actor, ..
+            package_dir, actor, dev_mode, ..
         } => {
-            let published = publish_plugin_package(&store, &package_dir, &actor).await?;
+            let published = if dev_mode {
+                publish_plugin_package_dev(&store, &package_dir, &actor).await?
+            } else {
+                publish_plugin_package(&store, &package_dir, &actor).await?
+            };
             println!(
-                "published {}\t{}\t{}\t{}",
-                published.plugin_key, published.version, published.domain, published.signer
+                "published {}\t{}\t{}\t{}\tstatus={}{}",
+                published.plugin_key,
+                published.version,
+                published.domain,
+                published.signer,
+                published.status,
+                if dev_mode { " (dev mode)" } else { "" }
             );
         }
         PluginCommands::List { domain, .. } => {
             for entry in list_plugin_repository_entries(&store, domain.as_deref()).await? {
                 println!(
-                    "{}\t{}\t{}\t{}\t{}",
-                    entry.plugin_key, entry.version, entry.domain, entry.status, entry.signer
+                    "{}\t{}\t{}\t{}\treview={}\tscore={:.1}\t{}",
+                    entry.plugin_key,
+                    entry.version,
+                    entry.domain,
+                    entry.status,
+                    entry.review_status,
+                    entry.score,
+                    entry.signer
                 );
             }
         }
         PluginCommands::Activate {
             domain,
             binding,
+            subject,
+            priority,
             plugin_key,
             version,
+            version_req,
+            rollout,
+            endpoint,
             actor,
             ..
         } => {
-            activate_plugin_binding(&store, &domain, &binding, &plugin_key, &version, &actor)
-                .await?;
-            println!("activated {plugin_key}@{version} for {domain}/{binding}");
+            let (selector_kind, selector_value) = match (version, version_req) {
+                (Some(version), None) => ("exact", version),
+                (None, Some(version_req)) => ("semver", version_req),
+                _ => anyhow::bail!("Specify exactly one of --version or --version-req"),
+            };
+            upsert_plugin_binding_rule(
+                &store,
+                BindingRuleInput {
+                    domain: &domain,
+                    binding_key: &binding,
+                    subject_key: &subject,
+                    priority,
+                    plugin_key: &plugin_key,
+                    selector_kind,
+                    selector_value: &selector_value,
+                    rollout_percent: rollout,
+                    transport_endpoint: endpoint.as_deref(),
+                    actor: &actor,
+                },
+            )
+            .await?;
+            println!(
+                "activated rule {}\t{}\tsubject={}\tpriority={}\t{}\t{}",
+                domain, binding, subject, priority, selector_kind, selector_value
+            );
         }
+        PluginCommands::Review {
+            plugin_key,
+            version,
+            status,
+            notes,
+            actor,
+            ..
+        } => {
+            review_plugin_package(&store, &plugin_key, &version, &status, notes.as_deref(), &actor)
+                .await?;
+            println!("reviewed {plugin_key}@{version} -> {status}");
+        }
+        PluginCommands::Score {
+            plugin_key,
+            version,
+            score,
+            notes,
+            actor,
+            ..
+        } => {
+            score_plugin_package(&store, &plugin_key, &version, score, notes.as_deref(), &actor)
+                .await?;
+            println!("scored {plugin_key}@{version} -> {score}");
+        }
+        PluginCommands::Matrix { domain, .. } => {
+            for entry in list_plugin_compatibility_matrix(&store, domain.as_deref()).await? {
+                println!(
+                    "{}\t{}\t{}\tstatus={}\treview={}\tsupported={}\t{}\t{}",
+                    entry.plugin_key,
+                    entry.version,
+                    entry.runtime,
+                    entry.status,
+                    entry.review_status,
+                    entry.supported,
+                    entry.compatibility,
+                    entry.reason
+                );
+            }
+        }
+        PluginCommands::Events {
+            domain,
+            plugin_key,
+            binding,
+            limit,
+            ..
+        } => {
+            for event in get_plugin_audit_events(
+                &store,
+                domain.as_deref(),
+                plugin_key.as_deref(),
+                binding.as_deref(),
+                limit,
+            )
+            .await?
+            {
+                println!(
+                    "{}\t{}\tplugin={}\tversion={}\tbinding={}\tsubject={}\t{}\t{}",
+                    event.created_at,
+                    event.event_type,
+                    event.plugin_key.unwrap_or_default(),
+                    event.version.unwrap_or_default(),
+                    event.binding_key.unwrap_or_default(),
+                    event.subject_key.unwrap_or_default(),
+                    event.status,
+                    event.message
+                );
+            }
+        }
+        PluginCommands::Rules {
+            domain, binding, ..
+        } => {
+            for rule in list_binding_rules(&store, &domain, &binding).await? {
+                println!(
+                    "{}\tsubject={}\tpriority={}\t{}\t{}\trollout={}\tendpoint={}",
+                    rule.rule_id,
+                    rule.subject_key,
+                    rule.priority,
+                    rule.plugin_key,
+                    format!("{} {}", rule.selector_kind, rule.selector_value),
+                    rule.rollout_percent,
+                    rule.transport_endpoint.unwrap_or_default()
+                );
+            }
+        }
+        PluginCommands::Init { .. } | PluginCommands::DevKeygen { .. } => unreachable!(),
     }
+    Ok(())
+}
+
+// ── Plugin scaffolding ────────────────────────────────────────────────────────
+
+fn cmd_plugin_init(dir: &Path, name: &str, capabilities: &str, runtime: &str) -> Result<()> {
+    use memoria_service::{GOVERNANCE_RHAI_TEMPLATE, GOVERNANCE_RHAI_TEMPLATE_ENTRYPOINT};
+    use serde_json::json;
+
+    std::fs::create_dir_all(dir)?;
+    let caps: Vec<&str> = capabilities.split(',').map(str::trim).collect();
+    let full_name = if name.starts_with("memoria-") {
+        name.to_string()
+    } else {
+        format!("memoria-{name}")
+    };
+
+    let script_file = "policy.rhai";
+    let manifest = json!({
+        "name": full_name,
+        "version": "0.1.0",
+        "api_version": "v1",
+        "runtime": runtime,
+        "entry": {
+            "rhai": if runtime == "rhai" { json!({"script": script_file, "entrypoint": GOVERNANCE_RHAI_TEMPLATE_ENTRYPOINT}) } else { json!(null) },
+            "grpc": if runtime == "grpc" { json!({"service": "memoria.plugin.v1.StrategyPlugin", "protocol": "grpc"}) } else { json!(null) }
+        },
+        "capabilities": caps,
+        "compatibility": { "memoria": format!(">={}",  env!("CARGO_PKG_VERSION")) },
+        "permissions": { "network": runtime == "grpc", "filesystem": false, "env": [] },
+        "limits": { "timeout_ms": 500, "max_memory_mb": 32, "max_output_bytes": 8192 },
+        "integrity": { "sha256": "", "signature": "", "signer": "" },
+        "metadata": { "display_name": name }
+    });
+
+    std::fs::write(
+        dir.join("manifest.json"),
+        serde_json::to_vec_pretty(&manifest)?,
+    )?;
+
+    if runtime == "rhai" {
+        std::fs::write(dir.join(script_file), GOVERNANCE_RHAI_TEMPLATE)?;
+    }
+
+    println!("Plugin scaffolded in {}", dir.display());
+    println!("  manifest.json");
+    if runtime == "rhai" {
+        println!("  {script_file}");
+    }
+    println!("\nNext steps:");
+    println!("  1. Edit the script/manifest");
+    println!("  2. memoria plugin dev-keygen --dir {}", dir.display());
+    println!("  3. Sign and publish:");
+    println!("     memoria plugin publish --package-dir {} --dev-mode", dir.display());
+    Ok(())
+}
+
+fn cmd_plugin_dev_keygen(dir: &Path) -> Result<()> {
+    use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+    use ed25519_dalek::SigningKey;
+
+    std::fs::create_dir_all(dir)?;
+    let mut secret = [0u8; 32];
+    getrandom::getrandom(&mut secret)?;
+    let key = SigningKey::from_bytes(&secret);
+    let secret_b64 = BASE64.encode(key.to_bytes());
+    let public_b64 = BASE64.encode(key.verifying_key().as_bytes());
+
+    std::fs::write(dir.join("dev-signing-key.b64"), &secret_b64)?;
+    std::fs::write(dir.join("dev-public-key.b64"), &public_b64)?;
+
+    println!("Generated dev signing keypair in {}", dir.display());
+    println!("  dev-signing-key.b64  (KEEP SECRET)");
+    println!("  dev-public-key.b64");
+    println!("\nTo register the signer:");
+    println!("  memoria plugin signer-add --signer dev --public-key {public_b64}");
+    println!("\n⚠️  Add dev-signing-key.b64 to .gitignore!");
     Ok(())
 }
 

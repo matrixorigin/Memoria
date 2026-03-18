@@ -260,6 +260,65 @@ impl SqlMemoryStore {
         .await
         .map_err(db_err)?;
 
+        sqlx::query(
+            r#"CREATE TABLE IF NOT EXISTS mem_plugin_reviews (
+                plugin_key    VARCHAR(128) NOT NULL,
+                version       VARCHAR(32)  NOT NULL,
+                review_status VARCHAR(16)  NOT NULL DEFAULT 'pending',
+                score         DOUBLE       NOT NULL DEFAULT 0,
+                review_notes  TEXT         NOT NULL,
+                reviewed_at   DATETIME(6)  NOT NULL,
+                reviewed_by   VARCHAR(64)  NOT NULL,
+                PRIMARY KEY (plugin_key, version)
+            )"#,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+
+        sqlx::query(
+            r#"CREATE TABLE IF NOT EXISTS mem_plugin_binding_rules (
+                rule_id             VARCHAR(64)  PRIMARY KEY,
+                domain              VARCHAR(32)  NOT NULL,
+                binding_key         VARCHAR(64)  NOT NULL,
+                subject_key         VARCHAR(128) NOT NULL,
+                priority            BIGINT       NOT NULL DEFAULT 100,
+                plugin_key          VARCHAR(128) NOT NULL,
+                selector_kind       VARCHAR(16)  NOT NULL,
+                selector_value      VARCHAR(64)  NOT NULL,
+                rollout_percent     BIGINT       NOT NULL DEFAULT 100,
+                transport_endpoint  TEXT         NOT NULL,
+                status              VARCHAR(16)  NOT NULL DEFAULT 'active',
+                updated_at          DATETIME(6)  NOT NULL,
+                updated_by          VARCHAR(64)  NOT NULL,
+                UNIQUE KEY uniq_binding_rule (domain, binding_key, subject_key, priority)
+            )"#,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+
+        sqlx::query(
+            r#"CREATE TABLE IF NOT EXISTS mem_plugin_audit_events (
+                event_id      VARCHAR(64)  PRIMARY KEY,
+                domain        VARCHAR(32)  NOT NULL,
+                binding_key   VARCHAR(64)  NOT NULL,
+                subject_key   VARCHAR(128) NOT NULL,
+                plugin_key    VARCHAR(128) NOT NULL,
+                version       VARCHAR(32)  NOT NULL,
+                event_type    VARCHAR(32)  NOT NULL,
+                status        VARCHAR(16)  NOT NULL,
+                message       TEXT         NOT NULL,
+                metadata_json JSON         NOT NULL,
+                created_at    DATETIME(6)  NOT NULL,
+                actor         VARCHAR(64)  NOT NULL,
+                INDEX idx_plugin_audit_lookup (domain, binding_key, plugin_key, created_at)
+            )"#,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+
         // mem_entity_links — entity graph (lightweight, no graph tables)
         sqlx::query(
             r#"CREATE TABLE IF NOT EXISTS mem_entity_links (

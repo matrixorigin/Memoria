@@ -144,7 +144,9 @@ impl HostPluginPolicy {
         Self {
             current_memoria_version: Version::parse(env!("CARGO_PKG_VERSION"))
                 .unwrap_or_else(|_| Version::new(0, 1, 0)),
-            supported_runtimes: [PluginRuntimeKind::Rhai].into_iter().collect(),
+            supported_runtimes: [PluginRuntimeKind::Rhai, PluginRuntimeKind::Grpc]
+                .into_iter()
+                .collect(),
             allowed_capabilities: [
                 "retrieval.rerank",
                 "retrieval.query_rewrite",
@@ -212,24 +214,34 @@ pub fn load_plugin_package(
         verify_manifest_signature(&manifest, policy)?;
     }
 
-    let rhai = manifest.entry.rhai.clone().ok_or_else(|| {
-        MemoriaError::Blocked("Rhai runtime selected but `entry.rhai` is missing".into())
-    })?;
-    let script_path = root_dir.join(&rhai.script);
-    if !script_path.is_file() {
-        return Err(MemoriaError::Blocked(format!(
-            "Rhai script not found: {}",
-            script_path.display()
-        )));
-    }
-
     let plugin_key = manifest.plugin_key()?;
+    let (script_path, entrypoint) = match manifest.runtime {
+        PluginRuntimeKind::Rhai => {
+            let rhai = manifest.entry.rhai.clone().ok_or_else(|| {
+                MemoriaError::Blocked("Rhai runtime selected but `entry.rhai` is missing".into())
+            })?;
+            let script_path = root_dir.join(&rhai.script);
+            if !script_path.is_file() {
+                return Err(MemoriaError::Blocked(format!(
+                    "Rhai script not found: {}",
+                    script_path.display()
+                )));
+            }
+            (script_path, rhai.entrypoint)
+        }
+        PluginRuntimeKind::Grpc => {
+            let grpc = manifest.entry.grpc.clone().ok_or_else(|| {
+                MemoriaError::Blocked("gRPC runtime selected but `entry.grpc` is missing".into())
+            })?;
+            (root_dir.join("manifest.json"), grpc.service)
+        }
+    };
     Ok(PluginPackage {
         root_dir,
         manifest,
         plugin_key,
         script_path,
-        entrypoint: rhai.entrypoint,
+        entrypoint,
     })
 }
 
@@ -265,9 +277,25 @@ fn validate_manifest(
             }
         }
         PluginRuntimeKind::Grpc => {
-            return Err(MemoriaError::Blocked(
-                "gRPC runtime is reserved for a later Phase 2 slice".into(),
-            ));
+            let grpc = manifest.entry.grpc.as_ref().ok_or_else(|| {
+                MemoriaError::Blocked("gRPC plugin entry must define `entry.grpc`".into())
+            })?;
+            if manifest.entry.rhai.is_some() {
+                return Err(MemoriaError::Blocked(
+                    "gRPC plugin entry must define `entry.grpc` only".into(),
+                ));
+            }
+            if grpc.protocol != "grpc" {
+                return Err(MemoriaError::Blocked(format!(
+                    "Unsupported gRPC protocol `{}`",
+                    grpc.protocol
+                )));
+            }
+            if grpc.service.trim().is_empty() {
+                return Err(MemoriaError::Blocked(
+                    "gRPC plugin entry service must not be empty".into(),
+                ));
+            }
         }
     }
 
@@ -341,19 +369,21 @@ fn validate_manifest(
         )));
     }
 
-    let script_path = root_dir.join(
-        manifest
-            .entry
-            .rhai
-            .as_ref()
-            .map(|entry| entry.script.as_str())
-            .unwrap_or_default(),
-    );
-    if !script_path.exists() {
-        return Err(MemoriaError::Blocked(format!(
-            "Plugin entry script does not exist: {}",
-            script_path.display()
-        )));
+    if manifest.runtime == PluginRuntimeKind::Rhai {
+        let script_path = root_dir.join(
+            manifest
+                .entry
+                .rhai
+                .as_ref()
+                .map(|entry| entry.script.as_str())
+                .unwrap_or_default(),
+        );
+        if !script_path.exists() {
+            return Err(MemoriaError::Blocked(format!(
+                "Plugin entry script does not exist: {}",
+                script_path.display()
+            )));
+        }
     }
 
     Ok(())
@@ -631,7 +661,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unsupported_runtime() {
+    fn accepts_supported_grpc_runtime() {
         let dir = temp_plugin_dir("grpc-runtime");
         let mut manifest = write_test_package(
             &dir,
@@ -645,6 +675,14 @@ mod tests {
             service: "memoria.plugin.v1.StrategyRuntime".into(),
             protocol: "grpc".into(),
         });
+        // Write manifest without integrity first, then recompute hash
+        manifest.integrity.sha256 = String::new();
+        fs::write(
+            dir.join("manifest.json"),
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        manifest.integrity.sha256 = compute_package_sha256(&dir).unwrap();
         fs::write(
             dir.join("manifest.json"),
             serde_json::to_vec_pretty(&manifest).unwrap(),
@@ -653,10 +691,9 @@ mod tests {
 
         let mut policy = HostPluginPolicy::development();
         policy.supported_runtimes.insert(PluginRuntimeKind::Grpc);
-        let err = load_plugin_package(&dir, &policy).unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("gRPC runtime is reserved for a later Phase 2 slice"));
+        let package = load_plugin_package(&dir, &policy).expect("grpc package should load");
+        assert_eq!(package.plugin_key, "governance:grpc-test:v1");
+        assert_eq!(package.entrypoint, "memoria.plugin.v1.StrategyRuntime");
 
         let _ = fs::remove_dir_all(dir);
     }

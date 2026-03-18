@@ -1,4 +1,6 @@
 mod contract;
+mod governance_hook;
+mod grpc_runtime;
 mod manifest;
 mod repository;
 mod rhai_runtime;
@@ -11,9 +13,13 @@ pub use manifest::{
     PluginPermissions, PluginRuntimeKind,
 };
 pub use repository::{
-    activate_plugin_binding, list_plugin_repository_entries, load_active_governance_plugin,
-    list_trusted_plugin_signers, publish_plugin_package, upsert_trusted_plugin_signer,
-    ActiveGovernancePlugin, PluginRepositoryEntry, TrustedPluginSignerEntry,
+    activate_plugin_binding, build_local_governance_strategy, get_plugin_audit_events, list_plugin_compatibility_matrix,
+    list_binding_rules, list_plugin_repository_entries, list_trusted_plugin_signers,
+    load_active_governance_plugin, publish_plugin_package, publish_plugin_package_dev, record_runtime_plugin_event,
+    review_plugin_package, score_plugin_package, upsert_plugin_binding_rule,
+    upsert_trusted_plugin_signer, ActiveGovernancePlugin, BindingRuleInput, PluginAuditEvent,
+    PluginBindingRule, PluginCompatibilityEntry, PluginRepositoryEntry, TrustedPluginSignerEntry,
 };
+pub use grpc_runtime::{proto as grpc_proto, GrpcGovernanceStrategy};
 pub use rhai_runtime::{PluginRuntime, RhaiGovernanceStrategy};
 pub use template::{GOVERNANCE_RHAI_TEMPLATE, GOVERNANCE_RHAI_TEMPLATE_ENTRYPOINT};

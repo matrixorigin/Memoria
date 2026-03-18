@@ -94,6 +94,15 @@ pub struct MemoryService {
     pub embedder: Option<Arc<dyn EmbeddingProvider>>,
     /// LLM client for reflect/extract (None if LLM_API_KEY not set)
     pub llm: Option<Arc<LlmClient>>,
+    /// Async entity extraction queue (None when sql_store is absent)
+    entity_tx: Option<tokio::sync::mpsc::UnboundedSender<EntityJob>>,
+}
+
+/// A pending entity-extraction job pushed from the write path.
+struct EntityJob {
+    user_id: String,
+    memory_id: String,
+    content: String,
 }
 
 impl MemoryService {
@@ -103,12 +112,16 @@ impl MemoryService {
         embedder: Option<Arc<dyn EmbeddingProvider>>,
     ) -> Self {
         let llm = LlmClient::from_env().map(Arc::new);
-        Self {
+        let (entity_tx, entity_rx) = tokio::sync::mpsc::unbounded_channel();
+        let svc = Self {
             store: store.clone(),
-            sql_store: Some(store),
+            sql_store: Some(store.clone()),
             embedder,
-            llm,
-        }
+            llm: llm.clone(),
+            entity_tx: Some(entity_tx),
+        };
+        Self::spawn_entity_worker(entity_rx, store, llm);
+        svc
     }
 
     /// Production constructor with explicit LLM client.
@@ -117,12 +130,16 @@ impl MemoryService {
         embedder: Option<Arc<dyn EmbeddingProvider>>,
         llm: Option<Arc<LlmClient>>,
     ) -> Self {
-        Self {
+        let (entity_tx, entity_rx) = tokio::sync::mpsc::unbounded_channel();
+        let svc = Self {
             store: store.clone(),
-            sql_store: Some(store),
+            sql_store: Some(store.clone()),
             embedder,
-            llm,
-        }
+            llm: llm.clone(),
+            entity_tx: Some(entity_tx),
+        };
+        Self::spawn_entity_worker(entity_rx, store, llm);
+        svc
     }
 
     /// Test constructor — any MemoryStore, no branch support
@@ -132,6 +149,93 @@ impl MemoryService {
             sql_store: None,
             embedder,
             llm: None,
+            entity_tx: None,
+        }
+    }
+
+    /// Enqueue a memory for async entity extraction (non-blocking).
+    fn enqueue_entity_extraction(&self, user_id: &str, memory_id: &str, content: &str) {
+        if let Some(tx) = &self.entity_tx {
+            let _ = tx.send(EntityJob {
+                user_id: user_id.to_string(),
+                memory_id: memory_id.to_string(),
+                content: content.to_string(),
+            });
+        }
+    }
+
+    /// Minimum content length to consider LLM entity extraction.
+    const ENTITY_LLM_MIN_CONTENT_LEN: usize = 80;
+    /// If regex extraction yields fewer entities than this, try LLM.
+    const ENTITY_LLM_THRESHOLD: usize = 2;
+
+    /// Spawn background task that drains the entity extraction queue.
+    fn spawn_entity_worker(
+        mut rx: tokio::sync::mpsc::UnboundedReceiver<EntityJob>,
+        store: Arc<SqlMemoryStore>,
+        llm: Option<Arc<LlmClient>>,
+    ) {
+        tokio::spawn(async move {
+            while let Some(job) = rx.recv().await {
+                let graph = store.graph_store();
+                // 1. Regex extraction
+                let entities = memoria_storage::extract_entities(&job.content);
+                for ent in &entities {
+                    if let Ok((eid, _)) = graph
+                        .upsert_entity(&job.user_id, &ent.name, &ent.display, &ent.entity_type)
+                        .await
+                    {
+                        let _ = graph
+                            .upsert_memory_entity_link(&job.memory_id, &eid, &job.user_id, "regex")
+                            .await;
+                    }
+                }
+                // 2. Hybrid: if regex found few entities and content is long, try LLM
+                if entities.len() < Self::ENTITY_LLM_THRESHOLD
+                    && job.content.len() >= Self::ENTITY_LLM_MIN_CONTENT_LEN
+                {
+                    if let Some(ref llm) = llm {
+                        Self::llm_extract_entities(llm, &graph, &job.user_id, &job.memory_id, &job.content).await;
+                    }
+                }
+            }
+        });
+    }
+
+    /// Run LLM entity extraction for a single memory and link results.
+    async fn llm_extract_entities(
+        llm: &LlmClient,
+        graph: &memoria_storage::graph::GraphStore,
+        user_id: &str,
+        memory_id: &str,
+        content: &str,
+    ) {
+        let prompt = format!(
+            "Extract named entities from the following text. Return a JSON array of objects.\n\
+             Each object: {{\"name\": \"canonical name\", \"type\": \"tech|person|repo|project|concept\"}}\n\
+             Rules: only specific named entities, max 10, deduplicate.\n\nText:\n{}\n\nJSON array:",
+            &content[..content.len().min(2000)]
+        );
+        let msgs = vec![ChatMessage { role: "user".into(), content: prompt }];
+        let raw = match llm.chat(&msgs, 0.0, Some(300)).await {
+            Ok(r) => r,
+            Err(e) => { warn!(error = %e, "entity worker LLM extraction failed"); return; }
+        };
+        let start = raw.find('[').unwrap_or(raw.len());
+        let end = raw.rfind(']').map(|i| i + 1).unwrap_or(raw.len());
+        if start >= end { return; }
+        let items: Vec<serde_json::Value> = match serde_json::from_str(&raw[start..end]) {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        for item in &items {
+            let name = item["name"].as_str().unwrap_or("").trim().to_lowercase();
+            if name.is_empty() { continue; }
+            let display = item["name"].as_str().unwrap_or("").trim().to_string();
+            let etype = item["type"].as_str().unwrap_or("concept").to_string();
+            if let Ok((eid, _)) = graph.upsert_entity(user_id, &name, &display, &etype).await {
+                let _ = graph.upsert_memory_entity_link(memory_id, &eid, user_id, "llm").await;
+            }
         }
     }
 
@@ -222,6 +326,7 @@ impl MemoryService {
                             None,
                         )
                         .await;
+                        self.enqueue_entity_extraction(user_id, &memory.memory_id, &memory.content);
                         return Ok(memory);
                     }
                     // Same content — skip storing duplicate
@@ -237,6 +342,7 @@ impl MemoryService {
                 None,
             )
             .await;
+            self.enqueue_entity_extraction(user_id, &memory.memory_id, &memory.content);
         } else {
             self.store.insert(&memory).await?;
         }
@@ -1020,12 +1126,14 @@ impl MemoryService {
                         sql.supersede_memory(&table, &old_id, &mem.memory_id)
                             .await?;
                         info!(old_id, new_id = %mem.memory_id, "superseded near-duplicate");
+                        self.enqueue_entity_extraction(user_id, &mem.memory_id, &mem.content);
                         return Ok(mem);
                     }
                     return Ok(mem); // exact dup — skip
                 }
             }
             sql.insert_into(&table, &mem).await?;
+            self.enqueue_entity_extraction(user_id, &mem.memory_id, &mem.content);
         } else {
             self.store.insert(&mem).await?;
         }

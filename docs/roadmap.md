@@ -16,29 +16,46 @@ Items are grouped by priority. Completed items are marked ✅.
 
 ---
 
+## ✅ Done (v0.2.9)
+
+- Async entity extraction: `store_memory` and `persist_with_dedup` enqueue entity jobs via
+  unbounded mpsc channel; background worker runs regex extraction + entity linking off the
+  write hot path
+- Hybrid entity extraction: after regex, if entity count < 2 AND content length ≥ 80 chars,
+  worker triggers LLM extraction automatically (when LLM is configured)
+
+---
+
 ## High Priority
 
-### Async entity extraction & association edges
+### ~~Async entity extraction & association edges~~ ✅
 **Why:** `graph_builder.ingest()` runs cosine similarity queries and entity extraction
 synchronously on the write hot path, adding latency to every `store()` call.
 
 **Plan:**
-- `ingest()` creates nodes + temporal/abstraction/causal edges only (fast, no vector queries)
-- Association edges and entity linking go into an async queue (e.g. background task or
-  governance drain)
-- `run_governance()` drains the queue in batch
+- ~~`ingest()` creates nodes + temporal/abstraction/causal edges only (fast, no vector queries)~~
+- ~~Association edges and entity linking go into an async queue (e.g. background task or
+  governance drain)~~
+- ~~`run_governance()` drains the queue in batch~~
+
+**Done:** Entity extraction moved to background worker via `tokio::sync::mpsc` channel in
+`MemoryService`. Write path is now non-blocking for entity work.
 
 ---
 
 ## Medium Priority
 
-### Hybrid entity extraction strategy (lightweight + LLM threshold)
+### ~~Hybrid entity extraction strategy (lightweight + LLM threshold)~~ ✅
 **Why:** Lightweight regex misses domain-specific terms; full LLM extraction is expensive.
 
 **Plan:**
-- After lightweight extraction, if entity count < threshold (e.g. 2) AND content length > N,
-  trigger LLM extraction automatically
-- Configurable via `MemoryGovernanceConfig.entity_llm_threshold`
+- ~~After lightweight extraction, if entity count < threshold (e.g. 2) AND content length > N,
+  trigger LLM extraction automatically~~
+- ~~Configurable via `MemoryGovernanceConfig.entity_llm_threshold`~~
+
+**Done:** Implemented in entity worker — constants `ENTITY_LLM_THRESHOLD=2` and
+`ENTITY_LLM_MIN_CONTENT_LEN=80` in `MemoryService`. LLM extraction triggers automatically
+when regex yields few results on substantial content.
 
 ### Entity source weight in retrieval scoring
 **Why:** ~~`ENTITY_LINK` edges with weight 0.8/0.9/1.0 are stored but not yet used in
