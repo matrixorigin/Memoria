@@ -35,3 +35,4 @@ build/
 .mypy_cache/
 .ruff_cache/
 htmlcov/
+scripts/migrate_embedding_dim.sh
