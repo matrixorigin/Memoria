@@ -12,6 +12,7 @@ use serde_json::json;
 use sqlx::Row;
 
 use crate::{auth::AuthUser, state::AppState};
+use memoria_core::truncate_utf8;
 
 // ── Request / Response ────────────────────────────────────────────────────────
 
@@ -108,7 +109,7 @@ async fn generate_and_store(
 
     let truncated = messages.len() < rows.len();
     let msg_text = messages.iter()
-        .map(|(_, c, t)| format!("user: [{t}] {}", &c[..c.len().min(500)]))
+        .map(|(_, c, t)| format!("user: [{t}] {}", truncate_utf8(c, 500)))
         .collect::<Vec<_>>().join("\n");
 
     if mode == "lightweight" {
@@ -240,5 +241,30 @@ pub async fn get_task_status(
             error: t.error,
         })),
         None => Err((StatusCode::NOT_FOUND, format!("Task {task_id} not found"))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncate_utf8_at_multibyte_boundary() {
+        // '，' is 3 bytes (0xEF 0xBC 0x8C). Place it so byte 500 lands inside it.
+        let prefix = "a".repeat(499); // 499 ASCII bytes
+        let s = format!("{prefix}，after");
+        // byte 500 is inside '，' (bytes 499..502), must round down to 499
+        assert_eq!(truncate_utf8(&s, 500), &prefix);
+    }
+
+    #[test]
+    fn truncate_utf8_ascii_exact() {
+        let s = "a".repeat(600);
+        assert_eq!(truncate_utf8(&s, 500).len(), 500);
+    }
+
+    #[test]
+    fn truncate_utf8_short_string() {
+        assert_eq!(truncate_utf8("hello", 500), "hello");
     }
 }

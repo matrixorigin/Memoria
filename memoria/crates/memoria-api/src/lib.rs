@@ -5,7 +5,8 @@ pub mod state;
 
 pub use state::AppState;
 
-use axum::{extract::DefaultBodyLimit, routing::{delete, get, post, put}, Router};
+use axum::{extract::DefaultBodyLimit, http::StatusCode, response::IntoResponse, routing::{delete, get, post, put}, Json, Router};
+use tower_http::catch_panic::CatchPanicLayer;
 
 /// Build the full API router with all routes.
 pub fn build_router(state: AppState) -> Router {
@@ -89,4 +90,12 @@ pub fn build_router(state: AppState) -> Router {
         .route("/admin/plugins/events", get(routes::plugins::list_audit_events))
         .with_state(state)
         .layer(DefaultBodyLimit::max(2 * 1024 * 1024)) // 2 MB
+        .layer(CatchPanicLayer::custom(|err: Box<dyn std::any::Any + Send>| {
+            let detail = err.downcast_ref::<String>().map(|s| s.as_str())
+                .or_else(|| err.downcast_ref::<&str>().copied())
+                .unwrap_or("unknown");
+            tracing::error!(panic = detail, "handler panicked");
+            let body = serde_json::json!({ "error": "Internal server error" });
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(body)).into_response()
+        }))
 }
