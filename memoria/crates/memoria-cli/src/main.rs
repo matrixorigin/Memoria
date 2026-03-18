@@ -617,15 +617,23 @@ fn prompt_secret(label: &str, existing: &str) -> String {
 fn read_password_line() -> String {
     #[cfg(unix)]
     {
+        use std::os::unix::io::AsRawFd;
+        let stdin = std::io::stdin();
+        let fd = stdin.as_raw_fd();
         unsafe {
             let mut termios: libc::termios = std::mem::zeroed();
-            libc::tcgetattr(0, &mut termios);
+            if libc::tcgetattr(fd, &mut termios) != 0 {
+                // Not a terminal (pipe/redirect) — fall back to normal read
+                let mut buf = String::new();
+                std::io::stdin().read_line(&mut buf).ok();
+                return buf.trim().to_string();
+            }
             let old = termios;
             termios.c_lflag &= !libc::ECHO;
-            libc::tcsetattr(0, libc::TCSANOW, &termios);
+            libc::tcsetattr(fd, libc::TCSANOW, &termios);
             let mut buf = String::new();
             std::io::stdin().read_line(&mut buf).ok();
-            libc::tcsetattr(0, libc::TCSANOW, &old);
+            libc::tcsetattr(fd, libc::TCSANOW, &old);
             buf.trim().to_string()
         }
     }
@@ -692,6 +700,72 @@ fn prompt_confirm(label: &str) -> bool {
     let mut buf = String::new();
     io::stdin().read_line(&mut buf).unwrap_or(0);
     !buf.trim().eq_ignore_ascii_case("n")
+}
+
+fn check_db(db_url: &str) -> bool {
+    use std::net::TcpStream;
+    use std::time::Duration;
+    // Parse host:port from mysql://user:pass@host:port/db
+    let addr = db_url
+        .strip_prefix("mysql://")
+        .and_then(|s| s.split_once('@'))
+        .and_then(|(_, hostdb)| hostdb.split_once('/'))
+        .map(|(hostport, _)| hostport.to_string())
+        .unwrap_or_default();
+    if addr.is_empty() {
+        println!("  ✗ Database: invalid URL");
+        return false;
+    }
+    match TcpStream::connect_timeout(
+        &addr.parse().unwrap_or_else(|_| {
+            // Resolve manually for host:port format
+            use std::net::ToSocketAddrs;
+            addr.to_socket_addrs()
+                .ok()
+                .and_then(|mut a| a.next())
+                .unwrap_or_else(|| ([127, 0, 0, 1], 6001).into())
+        }),
+        Duration::from_secs(3),
+    ) {
+        Ok(_) => { println!("  ✓ Database: {} reachable", addr); true }
+        Err(e) => { println!("  ✗ Database: {} — {}", addr, e); false }
+    }
+}
+
+fn check_embedding(base_url: &str, api_key: &str, model: &str) -> bool {
+    if base_url.is_empty() {
+        // OpenAI official — use default URL
+        return check_embedding_request("https://api.openai.com/v1", api_key, model);
+    }
+    check_embedding_request(base_url, api_key, model)
+}
+
+fn check_embedding_request(base_url: &str, api_key: &str, model: &str) -> bool {
+    let url = format!("{}/embeddings", base_url.trim_end_matches('/'));
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .unwrap();
+    let mut req = client.post(&url)
+        .header("Content-Type", "application/json")
+        .body(format!(r#"{{"model":"{}","input":"test"}}"#, model));
+    if !api_key.is_empty() {
+        req = req.header("Authorization", format!("Bearer {}", api_key));
+    }
+    match req.send() {
+        Ok(resp) if resp.status().is_success() => {
+            println!("  ✓ Embedding: {} OK", base_url);
+            true
+        }
+        Ok(resp) => {
+            println!("  ✗ Embedding: {} — HTTP {}", base_url, resp.status());
+            false
+        }
+        Err(e) => {
+            println!("  ✗ Embedding: {} — {}", base_url, e);
+            false
+        }
+    }
 }
 
 fn cmd_init_interactive(project_dir: &Path, force: bool) {
@@ -791,6 +865,20 @@ fn cmd_init_interactive(project_dir: &Path, force: bool) {
     if !prompt_confirm("Proceed?") {
         println!("  Aborted.");
         return;
+    }
+
+    // ── Connectivity checks ──
+    println!("\n━━━ Checking connections ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    println!();
+
+    let db_ok = check_db(&db_url);
+    let emb_ok = check_embedding(&emb_base_url, &emb_api_key, &emb_model);
+
+    if !db_ok || !emb_ok {
+        if !prompt_confirm("Continue anyway?") {
+            println!("  Aborted.");
+            return;
+        }
     }
 
     println!();
