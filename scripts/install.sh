@@ -1,20 +1,38 @@
-#!/usr/bin/env bash
+#!/usr/bin/env sh
 # Install memoria binary from GitHub releases.
 # Usage:
-#   curl -sSL https://raw.githubusercontent.com/matrixorigin/Memoria/main/scripts/install.sh | bash
-#   curl -sSL ... | bash -s -- -v v0.1.0-rc1
-#   MEMORIA_VERSION=v0.1.0-rc1 curl -sSL ... | bash
+#   curl -sSL https://raw.githubusercontent.com/matrixorigin/Memoria/main/scripts/install.sh | sh
+#   curl -sSL ... | sh -s -- -v v0.1.0-rc1
+#   curl -sSL ... | sh -s -- -y              # skip confirmation
+#   curl -sSL ... | sh -s -- -d ~/.local/bin  # custom directory
 #
 # Options:
 #   -v, --version TAG   Version to install (default: latest release)
-#   -d, --dir DIR       Install binary to DIR (default: /usr/local/bin or ~/.local/bin)
+#   -d, --dir DIR       Install directory (default: /usr/local/bin, sudo if needed)
+#   -y, --yes           Skip confirmation prompt
 #   -n, --dry-run       Print download URL and exit
 #
 # Env:
 #   MEMORIA_REPO        GitHub repo (default: matrixorigin/Memoria)
 #   MEMORIA_VERSION     Version tag (default: latest)
 
-set -e
+set -eu
+
+# ── Colors ──────────────────────────────────────────────────────────
+
+BOLD="$(tput bold 2>/dev/null || printf '')"
+GREEN="$(tput setaf 2 2>/dev/null || printf '')"
+YELLOW="$(tput setaf 3 2>/dev/null || printf '')"
+BLUE="$(tput setaf 4 2>/dev/null || printf '')"
+RED="$(tput setaf 1 2>/dev/null || printf '')"
+NC="$(tput sgr0 2>/dev/null || printf '')"
+
+info()  { printf '%s\n' "${BOLD}>${NC} $*"; }
+warn()  { printf '%s\n' "${YELLOW}! $*${NC}"; }
+error() { printf '%s\n' "${RED}x $*${NC}" >&2; }
+ok()    { printf '%s\n' "${GREEN}✓${NC} $*"; }
+
+# ── Banner ──────────────────────────────────────────────────────────
 
 cat << "EOF"
 
@@ -27,19 +45,24 @@ cat << "EOF"
             Memoria - Secure · Auditable · Programmable Memory
 EOF
 
+# ── Prerequisites ───────────────────────────────────────────────────
+
 if ! command -v curl >/dev/null 2>&1; then
-  echo "error: curl is required" >&2
+  error "curl is required but not found"
   exit 1
 fi
+
+# ── Defaults ────────────────────────────────────────────────────────
 
 REPO="${MEMORIA_REPO:-matrixorigin/Memoria}"
 VERSION="${MEMORIA_VERSION:-}"
 INSTALL_DIR=""
 DRY_RUN=false
+FORCE=false
 
-# Map (os, arch) -> Rust target triple used in release artifacts
-get_target() {
-  local os arch
+# ── Platform detection ──────────────────────────────────────────────
+
+detect_target() {
   os=$(uname -s | tr '[:upper:]' '[:lower:]')
   arch=$(uname -m)
   case "$arch" in
@@ -49,66 +72,206 @@ get_target() {
   esac
   case "$os" in
     linux)
-      [[ "$arch" == "x86_64" ]] && echo "x86_64-unknown-linux-gnu" && return
-      [[ "$arch" == "aarch64" ]] && echo "aarch64-unknown-linux-gnu" && return
+      [ "$arch" = "x86_64" ] && printf "x86_64-unknown-linux-gnu" && return
+      [ "$arch" = "aarch64" ] && printf "aarch64-unknown-linux-gnu" && return
       ;;
     darwin)
-      [[ "$arch" == "x86_64" ]] && echo "x86_64-apple-darwin" && return
-      [[ "$arch" == "aarch64" ]] && echo "aarch64-apple-darwin" && return
+      [ "$arch" = "x86_64" ] && printf "x86_64-apple-darwin" && return
+      [ "$arch" = "aarch64" ] && printf "aarch64-apple-darwin" && return
       ;;
   esac
-  echo ""
+  printf ""
 }
 
-while [[ $# -gt 0 ]]; do
+# ── Writability test ────────────────────────────────────────────────
+
+test_writeable() {
+  path="${1}/._memoria_write_test"
+  if touch "${path}" 2>/dev/null; then
+    rm -f "${path}"
+    return 0
+  fi
+  return 1
+}
+
+# ── Sudo elevation ─────────────────────────────────────────────────
+
+elevate_priv() {
+  if ! command -v sudo >/dev/null 2>&1; then
+    error "Need write access to ${INSTALL_DIR} but 'sudo' not found"
+    info "Either run as root, or use: -d ~/.local/bin"
+    exit 1
+  fi
+  warn "Elevated permissions required to install to ${INSTALL_DIR}"
+  if ! sudo -v; then
+    error "Superuser not granted, aborting"
+    exit 1
+  fi
+}
+
+# ── PATH detection & shell config hints ─────────────────────────────
+
+check_path() {
+  dir="$1"
+  case ":${PATH}:" in
+    *:"${dir}":*) return 0 ;;
+  esac
+  return 1
+}
+
+print_path_hint() {
+  dir="$1"
+  printf '\n'
+  warn "${dir} is not in your PATH"
+  info "Add it by running one of:"
+  printf '\n'
+
+  shell_name="$(basename "${SHELL:-sh}")"
+  case "$shell_name" in
+    zsh)
+      info "  ${BLUE}echo 'export PATH=\"${dir}:\$PATH\"' >> ~/.zshrc && source ~/.zshrc${NC}"
+      ;;
+    bash)
+      info "  ${BLUE}echo 'export PATH=\"${dir}:\$PATH\"' >> ~/.bashrc && source ~/.bashrc${NC}"
+      ;;
+    fish)
+      info "  ${BLUE}fish_add_path ${dir}${NC}"
+      ;;
+    *)
+      info "  ${BLUE}echo 'export PATH=\"${dir}:\$PATH\"' >> ~/.bashrc${NC}  (bash)"
+      info "  ${BLUE}echo 'export PATH=\"${dir}:\$PATH\"' >> ~/.zshrc${NC}   (zsh)"
+      info "  ${BLUE}fish_add_path ${dir}${NC}                              (fish)"
+      ;;
+  esac
+  printf '\n'
+  info "Then run ${BLUE}memoria init -i${NC} in your project directory to start the setup wizard"
+}
+
+# ── Confirmation ────────────────────────────────────────────────────
+
+confirm() {
+  if [ "$FORCE" = true ]; then return 0; fi
+  printf "%s " "$* ${BOLD}[y/N]${NC}"
+  read -r yn < /dev/tty || return 1
+  case "$yn" in
+    [Yy]*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# ── Parse args ──────────────────────────────────────────────────────
+
+while [ $# -gt 0 ]; do
   case "$1" in
     -v|--version) VERSION="$2"; shift 2 ;;
     -d|--dir)     INSTALL_DIR="$2"; shift 2 ;;
+    -y|--yes)     FORCE=true; shift ;;
     -n|--dry-run) DRY_RUN=true; shift ;;
+    -h|--help)
+      printf "Usage: install.sh [options]\n\n"
+      printf "  -v, --version TAG   Version to install (default: latest)\n"
+      printf "  -d, --dir DIR       Install directory (default: /usr/local/bin)\n"
+      printf "  -y, --yes           Skip confirmation prompt\n"
+      printf "  -n, --dry-run       Print download URL and exit\n"
+      printf "  -h, --help          Show this help\n"
+      exit 0
+      ;;
     *) shift ;;
   esac
 done
 
-TARGET=$(get_target)
-if [[ -z "$TARGET" ]]; then
-  echo "error: unsupported platform $(uname -s) $(uname -m)" >&2
+# ── Resolve target & URL ────────────────────────────────────────────
+
+TARGET=$(detect_target)
+if [ -z "$TARGET" ]; then
+  error "Unsupported platform: $(uname -s) $(uname -m)"
   exit 1
 fi
 
-# Use "latest" so GitHub redirects to the latest release; or a specific tag
 TAG="${VERSION:-latest}"
 ASSET="memoria-${TARGET}.tar.gz"
 URL="https://github.com/${REPO}/releases/download/${TAG}/${ASSET}"
 
-if $DRY_RUN; then
+if [ "$DRY_RUN" = true ]; then
   echo "URL: $URL"
   exit 0
 fi
 
-if [[ -z "$INSTALL_DIR" ]]; then
-  if [[ -w /usr/local/bin ]]; then
-    INSTALL_DIR=/usr/local/bin
+# ── Resolve install directory ───────────────────────────────────────
+
+if [ -z "$INSTALL_DIR" ]; then
+  INSTALL_DIR=/usr/local/bin
+fi
+
+# ── Show plan & confirm ────────────────────────────────────────────
+
+printf '\n'
+info "${BOLD}Version${NC}:   ${GREEN}${TAG}${NC}"
+info "${BOLD}Platform${NC}:  ${GREEN}${TARGET}${NC}"
+info "${BOLD}Directory${NC}: ${GREEN}${INSTALL_DIR}${NC}"
+printf '\n'
+
+if ! confirm "Install memoria?"; then
+  info "Aborted"
+  exit 0
+fi
+
+# ── Determine sudo requirement ──────────────────────────────────────
+
+SUDO=""
+if ! test_writeable "$INSTALL_DIR" 2>/dev/null; then
+  # Directory doesn't exist or isn't writeable
+  if [ ! -d "$INSTALL_DIR" ]; then
+    # Try to create it; if that fails, need sudo
+    if ! mkdir -p "$INSTALL_DIR" 2>/dev/null; then
+      elevate_priv
+      SUDO="sudo"
+      $SUDO mkdir -p "$INSTALL_DIR"
+    fi
   else
-    INSTALL_DIR="${HOME}/.local/bin"
-    mkdir -p "$INSTALL_DIR"
+    elevate_priv
+    SUDO="sudo"
   fi
 fi
 
-echo "Installing memoria ${TAG} (${TARGET}) to ${INSTALL_DIR}"
+# ── Download ────────────────────────────────────────────────────────
+
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
-echo "Downloading: $URL"
-curl -fL# -o "$TMP/$ASSET" "$URL"
-# Verify checksum if SHA256SUMS.txt exists for this release
+
+info "Downloading ${BLUE}${URL}${NC}"
+curl -fL# -o "$TMP/$ASSET" "$URL" || {
+  error "Download failed — check that version '${TAG}' exists"
+  info "Available releases: ${BLUE}https://github.com/${REPO}/releases${NC}"
+  exit 1
+}
+
+# ── Verify checksum ─────────────────────────────────────────────────
+
 SUM_URL="https://github.com/${REPO}/releases/download/${TAG}/SHA256SUMS.txt"
 if curl -sSLf -o "$TMP/SHA256SUMS.txt" "$SUM_URL" 2>/dev/null; then
-  (cd "$TMP" && grep -F "$ASSET" SHA256SUMS.txt | (sha256sum -c 2>/dev/null || shasum -a 256 -c 2>/dev/null)) || { echo "error: checksum verification failed" >&2; exit 1; }
+  if (cd "$TMP" && grep -F "$ASSET" SHA256SUMS.txt | (sha256sum -c 2>/dev/null || shasum -a 256 -c 2>/dev/null)); then
+    ok "Checksum verified"
+  else
+    error "Checksum verification failed"
+    exit 1
+  fi
 fi
+
+# ── Install ─────────────────────────────────────────────────────────
+
 tar -xzf "$TMP/$ASSET" -C "$TMP"
-mkdir -p "$INSTALL_DIR"
-cp "$TMP/memoria" "$INSTALL_DIR/memoria"
-chmod +x "$INSTALL_DIR/memoria"
-echo "Installed: $INSTALL_DIR/memoria"
-if ! command -v memoria >/dev/null 2>&1; then
-  echo "Note: ensure ${INSTALL_DIR} is in your PATH"
+$SUDO cp "$TMP/memoria" "$INSTALL_DIR/memoria"
+$SUDO chmod +x "$INSTALL_DIR/memoria"
+
+printf '\n'
+ok "Installed ${GREEN}memoria${NC} to ${GREEN}${INSTALL_DIR}/memoria${NC}"
+
+# ── PATH check ──────────────────────────────────────────────────────
+
+if ! check_path "$INSTALL_DIR"; then
+  print_path_hint "$INSTALL_DIR"
+else
+  printf '\n'
+  info "Next: run ${BLUE}memoria init -i${NC} in your project directory to start the setup wizard"
 fi
