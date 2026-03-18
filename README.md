@@ -119,8 +119,6 @@ Don't want Docker? Use [MatrixOne Cloud](https://cloud.matrixorigin.cn) (free ti
 
 ```bash
 curl -sSL https://raw.githubusercontent.com/matrixorigin/Memoria/main/scripts/install.sh | bash
-# Or install a specific version:
-curl -sSL https://raw.githubusercontent.com/matrixorigin/Memoria/main/scripts/install.sh | bash -s -- -v v0.1.0-rc1
 ```
 
 **Option B — Manual download** from [GitHub Releases](https://github.com/matrixorigin/Memoria/releases):
@@ -142,7 +140,10 @@ sudo mv memoria /usr/local/bin/
 ```bash
 cd your-project
 
-# With an embedding service (recommended for pre-built binaries):
+# Interactive mode (recommended) — guides you through DB and embedding setup:
+memoria init -i
+
+# Or specify everything on the command line:
 memoria init --tool kiro \
              --embedding-provider openai \
              --embedding-base-url https://api.siliconflow.cn/v1 \
@@ -152,9 +153,6 @@ memoria init --tool kiro \
 
 # Or connect to an existing Memoria server (no DB needed):
 memoria init --tool kiro --api-url "https://your-server:8100" --token "sk-your-key..."
-
-# Or bare (only if built from source with --features local-embedding):
-memoria init --tool kiro
 ```
 
 This creates:
@@ -344,7 +342,8 @@ AI:  → calls memory_diff(source="eval_sqlite")   ← preview first
 
 | Command | Description |
 |---------|-------------|
-| `memoria init --tool <name>` | Write MCP config + steering rules for specified AI tool |
+| `memoria init -i` | Interactive setup wizard — walks you through DB connection and embedding config |
+| `memoria init --tool <name>` | Write MCP config + steering rules for specified AI tool (CLI flags) |
 | `memoria status` | Show config files, rule versions, bundled version |
 | `memoria update-rules` | Update steering rules to match current binary version |
 | `memoria mcp --db-url <url> --user <id>` | Start MCP server in embedded mode (direct DB) |
