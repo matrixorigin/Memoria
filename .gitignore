@@ -1,5 +1,6 @@
 # Data
 data/
+!**/tests/data/
 
 # Benchmark outputs
 benchmark-result*.json
