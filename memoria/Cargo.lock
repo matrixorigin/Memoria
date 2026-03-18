@@ -1900,6 +1900,7 @@ dependencies = [
  "anyhow",
  "axum",
  "clap",
+ "libc",
  "memoria-api",
  "memoria-core",
  "memoria-embedding",

@@ -110,11 +110,14 @@ enum Commands {
         #[arg(long, env = "MCP_PORT", default_value = "8200")]
         mcp_port: u16,
     },
-    /// Write MCP config + steering rules
+    /// Write MCP config + steering rules (-i for interactive wizard)
     Init {
-        /// AI tool to configure (required)
-        #[arg(long, required = true, value_name = "kiro|cursor|claude")]
+        /// AI tool to configure
+        #[arg(long, value_name = "kiro|cursor|claude")]
         tool: Vec<ToolName>,
+        /// Interactive setup wizard
+        #[arg(short = 'i', long)]
+        interactive: bool,
         #[arg(long)]
         db_url: Option<String>,
         #[arg(long)]
@@ -489,6 +492,316 @@ fn configure_claude(project_dir: &Path, entry: &serde_json::Value, _force: bool)
     results
 }
 
+// ── Interactive wizard ─────────────────────────────────────────────────────────
+
+/// Existing config parsed from mcp.json for use as defaults.
+struct ExistingConfig {
+    tools: Vec<ToolName>,
+    db_host: String,
+    db_port: String,
+    db_user: String,
+    db_pass: String,
+    db_name: String,
+    emb_provider: String,
+    emb_base_url: String,
+    emb_api_key: String,
+    emb_model: String,
+    emb_dim: String,
+}
+
+impl Default for ExistingConfig {
+    fn default() -> Self {
+        Self {
+            tools: vec![],
+            db_host: "localhost".into(), db_port: "6001".into(),
+            db_user: "root".into(), db_pass: "111".into(), db_name: "memoria".into(),
+            emb_provider: String::new(), emb_base_url: String::new(),
+            emb_api_key: String::new(), emb_model: String::new(), emb_dim: String::new(),
+        }
+    }
+}
+
+fn load_existing_config(project_dir: &Path) -> ExistingConfig {
+    let mut cfg = ExistingConfig::default();
+    let candidates = [
+        ("kiro", ".kiro/settings/mcp.json"),
+        ("cursor", ".cursor/mcp.json"),
+        ("claude", ".mcp.json"),
+    ];
+    let mut found_entry: Option<serde_json::Value> = None;
+    for (tool, path) in &candidates {
+        let full = project_dir.join(path);
+        if let Ok(content) = std::fs::read_to_string(&full) {
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
+                if json.get("mcpServers").and_then(|s| s.get(MCP_KEY)).is_some() {
+                    match *tool {
+                        "kiro" => cfg.tools.push(ToolName::Kiro),
+                        "cursor" => cfg.tools.push(ToolName::Cursor),
+                        "claude" => cfg.tools.push(ToolName::Claude),
+                        _ => {}
+                    }
+                    if found_entry.is_none() {
+                        found_entry = Some(json["mcpServers"][MCP_KEY].clone());
+                    }
+                }
+            }
+        }
+    }
+    if let Some(entry) = &found_entry {
+        // Parse db_url from args: mysql://user:pass@host:port/db
+        if let Some(args) = entry["args"].as_array() {
+            for i in 0..args.len() {
+                if args[i].as_str() == Some("--db-url") {
+                    if let Some(url) = args.get(i + 1).and_then(|v| v.as_str()) {
+                        if let Some(rest) = url.strip_prefix("mysql://") {
+                            if let Some((userpass, hostdb)) = rest.split_once('@') {
+                                let (u, p) = userpass.split_once(':').unwrap_or((userpass, ""));
+                                cfg.db_user = u.to_string();
+                                cfg.db_pass = p.to_string();
+                                if let Some((hostport, db)) = hostdb.split_once('/') {
+                                    cfg.db_name = db.to_string();
+                                    let (h, port) = hostport.split_once(':').unwrap_or((hostport, "6001"));
+                                    cfg.db_host = h.to_string();
+                                    cfg.db_port = port.to_string();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(env) = entry["env"].as_object() {
+            let get = |k: &str| env.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+            cfg.emb_provider = get("EMBEDDING_PROVIDER");
+            cfg.emb_base_url = get("EMBEDDING_BASE_URL");
+            cfg.emb_api_key = get("EMBEDDING_API_KEY");
+            cfg.emb_model = get("EMBEDDING_MODEL");
+            cfg.emb_dim = get("EMBEDDING_DIM");
+        }
+    }
+    cfg
+}
+
+fn mask_key(key: &str) -> String {
+    if key.len() <= 9 { return "*".repeat(key.len()); }
+    format!("{}...{}", &key[..6], &key[key.len()-3..])
+}
+
+fn prompt(label: &str, default: &str) -> String {
+    use std::io::{self, Write};
+    if default.is_empty() {
+        print!("  {}: ", label);
+    } else {
+        print!("  {} [{}]: ", label, default);
+    }
+    io::stdout().flush().ok();
+    let mut buf = String::new();
+    io::stdin().read_line(&mut buf).unwrap_or(0);
+    let val = buf.trim().to_string();
+    if val.is_empty() { default.to_string() } else { val }
+}
+
+fn prompt_secret(label: &str, existing: &str) -> String {
+    use std::io::{self, Write};
+    if existing.is_empty() {
+        print!("  {}: ", label);
+    } else {
+        print!("  {} [{}]: ", label, mask_key(existing));
+    }
+    io::stdout().flush().ok();
+    let val = read_password_line();
+    println!();
+    if val.is_empty() { existing.to_string() } else { val }
+}
+
+fn read_password_line() -> String {
+    #[cfg(unix)]
+    {
+        unsafe {
+            let mut termios: libc::termios = std::mem::zeroed();
+            libc::tcgetattr(0, &mut termios);
+            let old = termios;
+            termios.c_lflag &= !libc::ECHO;
+            libc::tcsetattr(0, libc::TCSANOW, &termios);
+            let mut buf = String::new();
+            std::io::stdin().read_line(&mut buf).ok();
+            libc::tcsetattr(0, libc::TCSANOW, &old);
+            buf.trim().to_string()
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let mut buf = String::new();
+        std::io::stdin().read_line(&mut buf).ok();
+        buf.trim().to_string()
+    }
+}
+
+fn prompt_multi_choice(label: &str, options: &[&str], defaults: &[bool]) -> Vec<bool> {
+    use std::io::{self, Write};
+    println!("\n  {} (comma-separated, e.g. 1,2)", label);
+    println!();
+    for (i, opt) in options.iter().enumerate() {
+        let mark = if defaults.get(i).copied().unwrap_or(false) { "*" } else { " " };
+        println!("  [{}]{} {}", i + 1, mark, opt);
+    }
+    println!();
+    print!("  > ");
+    io::stdout().flush().ok();
+    let mut buf = String::new();
+    io::stdin().read_line(&mut buf).unwrap_or(0);
+    let input = buf.trim();
+    if input.is_empty() { return defaults.to_vec(); }
+    let mut result = vec![false; options.len()];
+    for part in input.split(',') {
+        if let Ok(n) = part.trim().parse::<usize>() {
+            if n >= 1 && n <= options.len() { result[n - 1] = true; }
+        }
+    }
+    if result.iter().all(|&v| !v) { defaults.to_vec() } else { result }
+}
+
+fn prompt_choice(label: &str, options: &[&str], default: usize) -> usize {
+    use std::io::{self, Write};
+    println!("\n  {}", label);
+    println!();
+    for (i, opt) in options.iter().enumerate() {
+        for (li, line) in opt.lines().enumerate() {
+            if li == 0 {
+                let mark = if i == default { ">" } else { " " };
+                println!("  {} [{}] {}", mark, i + 1, line);
+            } else {
+                println!("       {}", line);
+            }
+        }
+    }
+    println!();
+    print!("  > ");
+    io::stdout().flush().ok();
+    let mut buf = String::new();
+    io::stdin().read_line(&mut buf).unwrap_or(0);
+    let input = buf.trim();
+    if input.is_empty() { return default; }
+    input.parse::<usize>().unwrap_or(default + 1).saturating_sub(1).min(options.len() - 1)
+}
+
+fn prompt_confirm(label: &str) -> bool {
+    use std::io::{self, Write};
+    print!("\n  {} [Y/n] ", label);
+    io::stdout().flush().ok();
+    let mut buf = String::new();
+    io::stdin().read_line(&mut buf).unwrap_or(0);
+    !buf.trim().eq_ignore_ascii_case("n")
+}
+
+fn cmd_init_interactive(project_dir: &Path, force: bool) {
+    let existing = load_existing_config(project_dir);
+
+    println!("\n            Memoria Setup Wizard\n");
+    println!("  📁 Project: {}\n", project_dir.display());
+
+    // ── Step 1: AI Tool (multi-select) ──
+    println!("━━━ Step 1: AI Tool ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    let tool_options = ["Kiro", "Cursor", "Claude Code"];
+    let tool_defaults = if existing.tools.is_empty() {
+        vec![true, false, false]
+    } else {
+        vec![
+            existing.tools.iter().any(|t| matches!(t, ToolName::Kiro)),
+            existing.tools.iter().any(|t| matches!(t, ToolName::Cursor)),
+            existing.tools.iter().any(|t| matches!(t, ToolName::Claude)),
+        ]
+    };
+    let selected = prompt_multi_choice("Which AI tools?", &tool_options, &tool_defaults);
+    let mut tools = vec![];
+    if selected[0] { tools.push(ToolName::Kiro); }
+    if selected[1] { tools.push(ToolName::Cursor); }
+    if selected[2] { tools.push(ToolName::Claude); }
+    if tools.is_empty() {
+        eprintln!("  No tool selected, aborting.");
+        return;
+    }
+
+    // ── Step 2: Database ──
+    println!("\n━━━ Step 2: Database (MatrixOne) ━━━━━━━━━━━━━━━━━━━━━━");
+    println!();
+    let db_host = prompt("Host", &existing.db_host);
+    let db_port = prompt("Port", &existing.db_port);
+    let db_user = prompt("User", &existing.db_user);
+    let db_pass = prompt_secret("Password", &existing.db_pass);
+    let db_name = prompt("Database", &existing.db_name);
+    let db_url = format!("mysql://{}:{}@{}:{}/{}", db_user, db_pass, db_host, db_port, db_name);
+
+    // ── Step 3: Embedding ──
+    println!("\n━━━ Step 3: Embedding Service ━━━━━━━━━━━━━━━━━━━━━━━━━");
+    println!("\n  ⚠  Embedding dimension is locked on first startup.");
+    let emb_options = [
+        "SiliconFlow  (recommended, free tier)\n      BAAI/bge-m3, 1024d — https://siliconflow.cn",
+        "OpenAI\n      text-embedding-3-small, 1536d",
+        "Ollama  (local service)\n      nomic-embed-text, 768d",
+        "Custom  (OpenAI-compatible endpoint)",
+    ];
+    let emb_default = match existing.emb_provider.as_str() {
+        "openai" if existing.emb_base_url.contains("siliconflow") => 0,
+        "openai" if existing.emb_base_url.contains("localhost:11434") => 2,
+        "openai" if existing.emb_base_url.is_empty() => 1,
+        "openai" => 3,
+        _ => 0,
+    };
+    let emb_choice = prompt_choice("Which embedding service?", &emb_options, emb_default);
+
+    let (emb_provider, emb_base_url, emb_api_key, emb_model, emb_dim) = match emb_choice {
+        0 => {
+            let key = prompt_secret("SiliconFlow API Key", &existing.emb_api_key);
+            ("openai".into(), "https://api.siliconflow.cn/v1".into(), key, "BAAI/bge-m3".into(), "1024".into())
+        }
+        1 => {
+            let key = prompt_secret("OpenAI API Key", &existing.emb_api_key);
+            ("openai".into(), String::new(), key, "text-embedding-3-small".into(), "1536".into())
+        }
+        2 => {
+            let url = prompt("Ollama URL", if existing.emb_base_url.is_empty() { "http://localhost:11434/v1" } else { &existing.emb_base_url });
+            let model = prompt("Model", if existing.emb_model.is_empty() { "nomic-embed-text" } else { &existing.emb_model });
+            let dim = prompt("Dimension", if existing.emb_dim.is_empty() { "768" } else { &existing.emb_dim });
+            ("openai".into(), url, String::new(), model, dim)
+        }
+        _ => {
+            let url = prompt("Base URL", &existing.emb_base_url);
+            let key = prompt_secret("API Key (empty if none)", &existing.emb_api_key);
+            let model = prompt("Model", &existing.emb_model);
+            let dim = prompt("Dimension", &existing.emb_dim);
+            ("openai".into(), url, key, model, dim)
+        }
+    };
+
+    // ── Confirm ──
+    let tool_names: Vec<&str> = tools.iter().map(|t| match t {
+        ToolName::Kiro => "Kiro",
+        ToolName::Cursor => "Cursor",
+        ToolName::Claude => "Claude Code",
+    }).collect();
+    let emb_label = match emb_choice { 0 => "SiliconFlow", 1 => "OpenAI", 2 => "Ollama", _ => "Custom" };
+
+    println!("\n━━━ Confirm ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    println!();
+    println!("  Tools:      {}", tool_names.join(", "));
+    println!("  Database:   mysql://{}:***@{}:{}/{}", db_user, db_host, db_port, db_name);
+    println!("  Embedding:  {} / {} / {}d", emb_label, emb_model, emb_dim);
+
+    if !prompt_confirm("Proceed?") {
+        println!("  Aborted.");
+        return;
+    }
+
+    println!();
+    cmd_init(
+        project_dir, tools,
+        Some(db_url), None, None, "default".into(), force,
+        Some(emb_provider), Some(emb_model), Some(emb_dim),
+        Some(emb_api_key), Some(emb_base_url),
+    );
+}
+
 #[allow(clippy::too_many_arguments)]
 fn cmd_init(
     project_dir: &Path, tools: Vec<ToolName>,
@@ -693,15 +1006,22 @@ fn main() -> Result<()> {
                 ))?;
         }
         Commands::Init {
-            tool, db_url, api_url, token, user, force,
+            tool, interactive, db_url, api_url, token, user, force,
             embedding_provider, embedding_model, embedding_dim,
             embedding_api_key, embedding_base_url,
         } => {
-            cmd_init(
-                &project_dir, tool, db_url, api_url, token, user, force,
-                embedding_provider, embedding_model, embedding_dim,
-                embedding_api_key, embedding_base_url,
-            );
+            if interactive {
+                cmd_init_interactive(&project_dir, force);
+            } else if tool.is_empty() {
+                eprintln!("error: --tool is required (or use -i for interactive wizard)");
+                std::process::exit(1);
+            } else {
+                cmd_init(
+                    &project_dir, tool, db_url, api_url, token, user, force,
+                    embedding_provider, embedding_model, embedding_dim,
+                    embedding_api_key, embedding_base_url,
+                );
+            }
         }
         Commands::Status => cmd_status(&project_dir),
         Commands::UpdateRules => cmd_update_rules(&project_dir),
