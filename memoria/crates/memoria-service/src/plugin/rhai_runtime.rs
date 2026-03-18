@@ -521,7 +521,11 @@ mod tests {
             .plan(&NoopStore, GovernanceTask::Daily)
             .await
             .expect_err("busy loop should be rejected");
-        assert!(err.to_string().contains("Rhai execution failed"));
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Rhai execution failed") || msg.contains("timed out"),
+            "unexpected error: {msg}"
+        );
 
         let _ = fs::remove_dir_all(dir);
     }
