@@ -666,12 +666,13 @@ async fn cmd_plugin(command: PluginCommands) -> Result<()> {
         } => {
             for rule in list_binding_rules(&store, &domain, &binding).await? {
                 println!(
-                    "{}\tsubject={}\tpriority={}\t{}\t{}\trollout={}\tendpoint={}",
+                    "{}\tsubject={}\tpriority={}\t{}\t{} {}\trollout={}\tendpoint={}",
                     rule.rule_id,
                     rule.subject_key,
                     rule.priority,
                     rule.plugin_key,
-                    format!("{} {}", rule.selector_kind, rule.selector_value),
+                    rule.selector_kind,
+                    rule.selector_value,
                     rule.rollout_percent,
                     rule.transport_endpoint.unwrap_or_default()
                 );

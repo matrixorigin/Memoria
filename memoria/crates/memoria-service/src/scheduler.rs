@@ -199,6 +199,7 @@ impl GovernanceScheduler {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn new_with_components_and_breaker(
         store: Option<Arc<dyn GovernanceStore>>,
         sql_store: Option<Arc<SqlMemoryStore>>,

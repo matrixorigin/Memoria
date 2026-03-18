@@ -748,6 +748,7 @@ pub async fn load_active_governance_plugin(
     )))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn record_runtime_plugin_event(
     store: &SqlMemoryStore,
     domain: &str,

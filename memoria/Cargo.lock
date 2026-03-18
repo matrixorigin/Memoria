@@ -2010,6 +2010,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "clap",
+ "ed25519-dalek",
  "memoria-core",
  "memoria-embedding",
  "memoria-git",

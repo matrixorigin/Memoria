@@ -473,7 +473,7 @@ pub fn compute_package_sha256(root_dir: &Path) -> Result<String, MemoriaError> {
     let mut package_hasher = Sha256::new();
     for relative in files {
         let file_path = root_dir.join(&relative);
-        let bytes = if relative == PathBuf::from("manifest.json") {
+        let bytes = if relative == Path::new("manifest.json") {
             normalized_manifest_bytes(&file_path)?
         } else {
             fs::read(&file_path).map_err(|err| {
