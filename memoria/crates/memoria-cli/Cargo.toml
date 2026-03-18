@@ -33,6 +33,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 ed25519-dalek = { version = "2.1", default-features = false, features = ["std"] }
 base64 = "0.22"
 getrandom = "0.2"
+cliclack = "0.4"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

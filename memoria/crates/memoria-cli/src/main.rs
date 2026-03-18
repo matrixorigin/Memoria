@@ -1129,121 +1129,6 @@ fn mask_key(key: &str) -> String {
     format!("{}...{}", &key[..6], &key[key.len()-3..])
 }
 
-fn prompt(label: &str, default: &str) -> String {
-    use std::io::{self, Write};
-    if default.is_empty() {
-        print!("  {}: ", label);
-    } else {
-        print!("  {} [{}]: ", label, default);
-    }
-    io::stdout().flush().ok();
-    let mut buf = String::new();
-    io::stdin().read_line(&mut buf).unwrap_or(0);
-    let val = buf.trim().to_string();
-    if val.is_empty() { default.to_string() } else { val }
-}
-
-fn prompt_secret(label: &str, existing: &str) -> String {
-    use std::io::{self, Write};
-    if existing.is_empty() {
-        print!("  {}: ", label);
-    } else {
-        print!("  {} [{}]: ", label, mask_key(existing));
-    }
-    io::stdout().flush().ok();
-    let val = read_password_line();
-    println!();
-    if val.is_empty() { existing.to_string() } else { val }
-}
-
-fn read_password_line() -> String {
-    #[cfg(unix)]
-    {
-        use std::os::unix::io::AsRawFd;
-        let stdin = std::io::stdin();
-        let fd = stdin.as_raw_fd();
-        unsafe {
-            let mut termios: libc::termios = std::mem::zeroed();
-            if libc::tcgetattr(fd, &mut termios) != 0 {
-                // Not a terminal (pipe/redirect) — fall back to normal read
-                let mut buf = String::new();
-                std::io::stdin().read_line(&mut buf).ok();
-                return buf.trim().to_string();
-            }
-            let old = termios;
-            termios.c_lflag &= !libc::ECHO;
-            libc::tcsetattr(fd, libc::TCSANOW, &termios);
-            let mut buf = String::new();
-            std::io::stdin().read_line(&mut buf).ok();
-            libc::tcsetattr(fd, libc::TCSANOW, &old);
-            buf.trim().to_string()
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let mut buf = String::new();
-        std::io::stdin().read_line(&mut buf).ok();
-        buf.trim().to_string()
-    }
-}
-
-fn prompt_multi_choice(label: &str, options: &[&str], defaults: &[bool]) -> Vec<bool> {
-    use std::io::{self, Write};
-    println!("\n  {} (comma-separated, e.g. 1,2)", label);
-    println!();
-    for (i, opt) in options.iter().enumerate() {
-        let mark = if defaults.get(i).copied().unwrap_or(false) { "*" } else { " " };
-        println!("  [{}]{} {}", i + 1, mark, opt);
-    }
-    println!();
-    print!("  > ");
-    io::stdout().flush().ok();
-    let mut buf = String::new();
-    io::stdin().read_line(&mut buf).unwrap_or(0);
-    let input = buf.trim();
-    if input.is_empty() { return defaults.to_vec(); }
-    let mut result = vec![false; options.len()];
-    for part in input.split(',') {
-        if let Ok(n) = part.trim().parse::<usize>() {
-            if n >= 1 && n <= options.len() { result[n - 1] = true; }
-        }
-    }
-    if result.iter().all(|&v| !v) { defaults.to_vec() } else { result }
-}
-
-fn prompt_choice(label: &str, options: &[&str], default: usize) -> usize {
-    use std::io::{self, Write};
-    println!("\n  {}", label);
-    println!();
-    for (i, opt) in options.iter().enumerate() {
-        for (li, line) in opt.lines().enumerate() {
-            if li == 0 {
-                let mark = if i == default { ">" } else { " " };
-                println!("  {} [{}] {}", mark, i + 1, line);
-            } else {
-                println!("       {}", line);
-            }
-        }
-    }
-    println!();
-    print!("  > ");
-    io::stdout().flush().ok();
-    let mut buf = String::new();
-    io::stdin().read_line(&mut buf).unwrap_or(0);
-    let input = buf.trim();
-    if input.is_empty() { return default; }
-    input.parse::<usize>().unwrap_or(default + 1).saturating_sub(1).min(options.len() - 1)
-}
-
-fn prompt_confirm(label: &str) -> bool {
-    use std::io::{self, Write};
-    print!("\n  {} [Y/n] ", label);
-    io::stdout().flush().ok();
-    let mut buf = String::new();
-    io::stdin().read_line(&mut buf).unwrap_or(0);
-    !buf.trim().eq_ignore_ascii_case("n")
-}
-
 fn check_db(db_url: &str) -> bool {
     use std::net::TcpStream;
     use std::time::Duration;
@@ -1311,86 +1196,165 @@ fn check_embedding_request(base_url: &str, api_key: &str, model: &str) -> bool {
 }
 
 fn cmd_init_interactive(project_dir: &Path, force: bool) {
-    let existing = load_existing_config(project_dir);
+    cliclack::clear_screen().ok();
+    cliclack::intro("🧠 Memoria Setup").ok();
 
-    println!("\n            Memoria Setup Wizard\n");
-    println!("  📁 Project: {}\n", project_dir.display());
+    // ── Project directory ───────────────────────────────────────────
+    let default_dir = project_dir.to_string_lossy().to_string();
+    let project_input: String = cliclack::input("Project directory")
+        .default_input(&default_dir)
+        .validate_interactively(|input: &String| {
+            if input.is_empty() { return Ok(()); }
+            let p = std::path::Path::new(input.as_str());
+            let resolved = if p.is_absolute() { p.to_path_buf() } else {
+                std::env::current_dir().unwrap_or_default().join(p)
+            };
+            if resolved.is_dir() {
+                if !input.ends_with('/') { return Ok(()); }
+                // Trailing slash — show subdirectories
+                let mut subs: Vec<String> = std::fs::read_dir(&resolved).ok()
+                    .map(|rd| rd.filter_map(|e| e.ok())
+                        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+                        .filter(|e| !e.file_name().to_string_lossy().starts_with('.'))
+                        .map(|e| e.file_name().to_string_lossy().to_string())
+                        .collect())
+                    .unwrap_or_default();
+                subs.sort();
+                subs.truncate(8);
+                if subs.is_empty() { Ok(()) } else { Err(subs.join("  ")) }
+            } else {
+                // Partial path — match siblings
+                let parent = resolved.parent().unwrap_or(&resolved);
+                let prefix = resolved.file_name()
+                    .map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                let mut matches: Vec<String> = std::fs::read_dir(parent).ok()
+                    .map(|rd| rd.filter_map(|e| e.ok())
+                        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+                        .filter(|e| {
+                            let name = e.file_name().to_string_lossy().to_string();
+                            name.starts_with(&prefix) && !name.starts_with('.')
+                        })
+                        .map(|e| e.file_name().to_string_lossy().to_string())
+                        .collect())
+                    .unwrap_or_default();
+                matches.sort();
+                matches.truncate(8);
+                if matches.is_empty() {
+                    Err("(no match)".into())
+                } else {
+                    Err(matches.join("  "))
+                }
+            }
+        })
+        .interact()
+        .unwrap_or_else(|_| default_dir.clone());
+    let project_dir = std::path::Path::new(&project_input).canonicalize()
+        .unwrap_or_else(|_| std::path::PathBuf::from(&project_input));
 
-    // ── Step 1: AI Tool (multi-select) ──
-    println!("━━━ Step 1: AI Tool ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    let tool_options = ["Kiro", "Cursor", "Claude Code"];
-    let tool_defaults = if existing.tools.is_empty() {
-        vec![true, false, false]
+    let existing = load_existing_config(&project_dir);
+
+    // ── Step 1: AI Tool ─────────────────────────────────────────────
+    let tool_defaults: Vec<usize> = if existing.tools.is_empty() {
+        vec![0]
     } else {
-        vec![
-            existing.tools.iter().any(|t| matches!(t, ToolName::Kiro)),
-            existing.tools.iter().any(|t| matches!(t, ToolName::Cursor)),
-            existing.tools.iter().any(|t| matches!(t, ToolName::Claude)),
-        ]
+        let mut v = vec![];
+        if existing.tools.iter().any(|t| matches!(t, ToolName::Kiro)) { v.push(0); }
+        if existing.tools.iter().any(|t| matches!(t, ToolName::Cursor)) { v.push(1); }
+        if existing.tools.iter().any(|t| matches!(t, ToolName::Claude)) { v.push(2); }
+        v
     };
-    let selected = prompt_multi_choice("Which AI tools?", &tool_options, &tool_defaults);
+    let tool_sel: Vec<usize> = match cliclack::multiselect("Which AI tools?")
+        .item(0, "Kiro", "")
+        .item(1, "Cursor", "")
+        .item(2, "Claude Code", "")
+        .initial_values(tool_defaults)
+        .interact()
+    {
+        Ok(v) => v,
+        Err(_) => { cliclack::outro_cancel("Cancelled").ok(); return; }
+    };
     let mut tools = vec![];
-    if selected[0] { tools.push(ToolName::Kiro); }
-    if selected[1] { tools.push(ToolName::Cursor); }
-    if selected[2] { tools.push(ToolName::Claude); }
+    if tool_sel.contains(&0) { tools.push(ToolName::Kiro); }
+    if tool_sel.contains(&1) { tools.push(ToolName::Cursor); }
+    if tool_sel.contains(&2) { tools.push(ToolName::Claude); }
     if tools.is_empty() {
-        eprintln!("  No tool selected, aborting.");
+        cliclack::outro_cancel("No tool selected").ok();
         return;
     }
 
-    // ── Step 2: Database ──
-    println!("\n━━━ Step 2: Database (MatrixOne) ━━━━━━━━━━━━━━━━━━━━━━");
-    println!();
-    let db_host = prompt("Host", &existing.db_host);
-    let db_port = prompt("Port", &existing.db_port);
-    let db_user = prompt("User", &existing.db_user);
-    let db_pass = prompt_secret("Password", &existing.db_pass);
-    let db_name = prompt("Database", &existing.db_name);
+    // ── Step 2: Database ────────────────────────────────────────────
+    cliclack::note("Database (MatrixOne)", "Configure your MatrixOne connection").ok();
+
+    let db_host: String = cliclack::input("Host")
+        .default_input(&existing.db_host).interact().unwrap_or_else(|_| existing.db_host.clone());
+    let db_port: String = cliclack::input("Port")
+        .default_input(&existing.db_port).interact().unwrap_or_else(|_| existing.db_port.clone());
+    let db_user: String = cliclack::input("User")
+        .default_input(&existing.db_user).interact().unwrap_or_else(|_| existing.db_user.clone());
+    let db_pass: String = if existing.db_pass.is_empty() {
+        cliclack::password("Password").mask('▪').interact().unwrap_or_default()
+    } else {
+        let v: String = cliclack::password(format!("Password [{}]", mask_key(&existing.db_pass)))
+            .mask('▪').allow_empty().interact().unwrap_or_default();
+        if v.is_empty() { existing.db_pass.clone() } else { v }
+    };
+    let db_name: String = cliclack::input("Database")
+        .default_input(&existing.db_name).interact().unwrap_or_else(|_| existing.db_name.clone());
     let db_url = format!("mysql://{}:{}@{}:{}/{}", db_user, db_pass, db_host, db_port, db_name);
 
-    // ── Step 3: Embedding ──
-    println!("\n━━━ Step 3: Embedding Service ━━━━━━━━━━━━━━━━━━━━━━━━━");
-    println!("\n  ⚠  Embedding dimension is locked on first startup.");
-    let emb_options = [
-        "SiliconFlow  (recommended, free tier)\n      BAAI/bge-m3, 1024d — https://siliconflow.cn",
-        "OpenAI\n      text-embedding-3-small, 1536d",
-        "Ollama  (local service)\n      nomic-embed-text, 768d",
-        "Custom  (OpenAI-compatible endpoint)",
-    ];
-    let emb_default = match existing.emb_provider.as_str() {
+    // ── Step 3: Embedding ───────────────────────────────────────────
+    cliclack::note(
+        "Embedding Service",
+        "⚠ Dimension is locked on first startup. Choose a preset, then adjust any field.",
+    ).ok();
+
+    let emb_default: usize = match existing.emb_provider.as_str() {
         "openai" if existing.emb_base_url.contains("siliconflow") => 0,
         "openai" if existing.emb_base_url.contains("localhost:11434") => 2,
         "openai" if existing.emb_base_url.is_empty() => 1,
         "openai" => 3,
         _ => 0,
     };
-    let emb_choice = prompt_choice("Which embedding service?", &emb_options, emb_default);
+    let emb_choice: usize = cliclack::select("Preset")
+        .item(0, "SiliconFlow", "BAAI/bge-m3, 1024d — recommended, free tier")
+        .item(1, "OpenAI", "text-embedding-3-small, 1536d")
+        .item(2, "Ollama", "nomic-embed-text, 768d — local")
+        .item(3, "Custom", "enter all fields manually")
+        .initial_value(emb_default)
+        .interact()
+        .unwrap_or(emb_default);
 
-    let (emb_provider, emb_base_url, emb_api_key, emb_model, emb_dim) = match emb_choice {
-        0 => {
-            let key = prompt_secret("SiliconFlow API Key", &existing.emb_api_key);
-            ("openai".into(), "https://api.siliconflow.cn/v1".into(), key, "BAAI/bge-m3".into(), "1024".into())
-        }
-        1 => {
-            let key = prompt_secret("OpenAI API Key", &existing.emb_api_key);
-            ("openai".into(), String::new(), key, "text-embedding-3-small".into(), "1536".into())
-        }
-        2 => {
-            let url = prompt("Ollama URL", if existing.emb_base_url.is_empty() { "http://localhost:11434/v1" } else { &existing.emb_base_url });
-            let model = prompt("Model", if existing.emb_model.is_empty() { "nomic-embed-text" } else { &existing.emb_model });
-            let dim = prompt("Dimension", if existing.emb_dim.is_empty() { "768" } else { &existing.emb_dim });
-            ("openai".into(), url, String::new(), model, dim)
-        }
-        _ => {
-            let url = prompt("Base URL", &existing.emb_base_url);
-            let key = prompt_secret("API Key (empty if none)", &existing.emb_api_key);
-            let model = prompt("Model", &existing.emb_model);
-            let dim = prompt("Dimension", &existing.emb_dim);
-            ("openai".into(), url, key, model, dim)
-        }
+    let (pre_url, pre_model, pre_dim) = match emb_choice {
+        0 => ("https://api.siliconflow.cn/v1", "BAAI/bge-m3", "1024"),
+        1 => ("https://api.openai.com/v1", "text-embedding-3-small", "1536"),
+        2 => ("http://localhost:11434/v1", "nomic-embed-text", "768"),
+        _ => ("", "", ""),
     };
+    // Existing config wins over preset; preset fills blanks
+    let def_url = if !existing.emb_base_url.is_empty() { &existing.emb_base_url } else { pre_url };
+    let def_key = &existing.emb_api_key;
+    let def_model = if !existing.emb_model.is_empty() { &existing.emb_model } else { pre_model };
+    let def_dim = if !existing.emb_dim.is_empty() { &existing.emb_dim } else { pre_dim };
 
-    // ── Confirm ──
+    let mut url_input = cliclack::input("Base URL").default_input(def_url);
+    if def_url.is_empty() {
+        url_input = url_input.placeholder("https://api.openai.com/v1");
+    }
+    let emb_base_url: String = url_input.interact().unwrap_or_else(|_| def_url.to_string());
+    let emb_api_key: String = if def_key.is_empty() {
+        cliclack::password("API Key").mask('▪').interact().unwrap_or_default()
+    } else {
+        let v: String = cliclack::password(format!("API Key [{}]", mask_key(def_key)))
+            .mask('▪').allow_empty().interact().unwrap_or_default();
+        if v.is_empty() { def_key.clone() } else { v }
+    };
+    let emb_model: String = cliclack::input("Model")
+        .default_input(def_model).interact().unwrap_or_else(|_| def_model.to_string());
+    let emb_dim: String = cliclack::input("Dimension")
+        .default_input(def_dim).interact().unwrap_or_else(|_| def_dim.to_string());
+    let emb_provider = "openai".to_string();
+
+    // ── Summary ─────────────────────────────────────────────────────
     let tool_names: Vec<&str> = tools.iter().map(|t| match t {
         ToolName::Kiro => "Kiro",
         ToolName::Cursor => "Cursor",
@@ -1398,36 +1362,58 @@ fn cmd_init_interactive(project_dir: &Path, force: bool) {
     }).collect();
     let emb_label = match emb_choice { 0 => "SiliconFlow", 1 => "OpenAI", 2 => "Ollama", _ => "Custom" };
 
-    println!("\n━━━ Confirm ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    println!();
-    println!("  Tools:      {}", tool_names.join(", "));
-    println!("  Database:   mysql://{}:***@{}:{}/{}", db_user, db_host, db_port, db_name);
-    println!("  Embedding:  {} / {} / {}d", emb_label, emb_model, emb_dim);
+    cliclack::note(
+        "Summary",
+        format!(
+            "Tools:     {}\nDatabase:  mysql://{}:***@{}:{}/{}\nEmbedding: {} / {} / {}d",
+            tool_names.join(", "), db_user, db_host, db_port, db_name,
+            emb_label, emb_model, emb_dim,
+        ),
+    ).ok();
 
-    if !prompt_confirm("Proceed?") {
-        println!("  Aborted.");
+    let proceed: bool = cliclack::confirm("Proceed?")
+        .initial_value(true).interact().unwrap_or(false);
+    if !proceed {
+        cliclack::outro_cancel("Aborted").ok();
         return;
     }
 
-    // ── Connectivity checks ──
-    println!("\n━━━ Checking connections ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    println!();
-
+    // ── Connectivity checks ─────────────────────────────────────────
+    let spinner = cliclack::spinner();
+    spinner.start("Checking database connection...");
     let db_ok = check_db(&db_url);
-    let emb_ok = check_embedding(&emb_base_url, &emb_api_key, &emb_model);
-
-    if (!db_ok || !emb_ok) && !prompt_confirm("Continue anyway?") {
-        println!("  Aborted.");
-        return;
+    if db_ok {
+        spinner.stop("✔ Database reachable");
+    } else {
+        spinner.stop("✘ Database unreachable");
     }
 
-    println!();
+    let spinner = cliclack::spinner();
+    spinner.start("Checking embedding service...");
+    let emb_ok = check_embedding(&emb_base_url, &emb_api_key, &emb_model);
+    if emb_ok {
+        spinner.stop("✔ Embedding service OK");
+    } else {
+        spinner.stop("✘ Embedding service unreachable");
+    }
+
+    if !db_ok || !emb_ok {
+        let cont: bool = cliclack::confirm("Continue anyway?")
+            .initial_value(false).interact().unwrap_or(false);
+        if !cont {
+            cliclack::outro_cancel("Aborted").ok();
+            return;
+        }
+    }
+
     cmd_init(
-        project_dir, tools,
+        &project_dir, tools,
         Some(db_url), None, None, "default".into(), force,
         Some(emb_provider), Some(emb_model), Some(emb_dim),
         Some(emb_api_key), Some(emb_base_url),
     );
+
+    cliclack::outro("You're all set! Restart your AI tool to activate Memoria.").ok();
 }
 
 #[allow(clippy::too_many_arguments)]
