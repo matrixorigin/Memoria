@@ -164,10 +164,10 @@ async fn test_e2e_tools_list_has_8() {
     let tools = memoria_mcp::tools::list();
     assert_eq!(
         tools.as_array().unwrap().len(),
-        15,
-        "expected 15 core tools"
+        18,
+        "expected 18 core tools"
     );
-    println!("✅ tools_list: 15 tools");
+    println!("✅ tools_list: 18 tools");
 }
 
 // ── MCP branch → store → merge end-to-end ────────────────────────────────────

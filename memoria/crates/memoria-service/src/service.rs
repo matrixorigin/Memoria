@@ -491,6 +491,8 @@ impl MemoryService {
 
         if let Some(sql) = &self.sql_store {
             let table = sql.active_table(user_id).await?;
+            // Load per-user feedback_weight lazily — only when needed for scoring
+            // (avoids extra DB query when fulltext fallback has no feedback to apply)
 
             // Phase 0: embed query
             let p0_start = std::time::Instant::now();
@@ -548,7 +550,9 @@ impl MemoryService {
                         explain.vector_attempted = true;
                         let vs_start = std::time::Instant::now();
                         let (vec_results, scores) = if level.at_least(ExplainLevel::Verbose) {
-                            sql.search_hybrid_from_scored(&table, user_id, embedding, query, top_k)
+                            let fw = sql.get_user_retrieval_params(user_id).await
+                                .map(|p| p.feedback_weight).unwrap_or(0.1);
+                            sql.search_hybrid_from_scored(&table, user_id, embedding, query, top_k, fw)
                                 .await?
                         } else {
                             (
@@ -619,7 +623,9 @@ impl MemoryService {
                 explain.vector_attempted = true;
                 let vs_start = std::time::Instant::now();
                 let (results, scores) = if level.at_least(ExplainLevel::Verbose) {
-                    sql.search_hybrid_from_scored(&table, user_id, embedding, query, top_k)
+                    let fw = sql.get_user_retrieval_params(user_id).await
+                        .map(|p| p.feedback_weight).unwrap_or(0.1);
+                    sql.search_hybrid_from_scored(&table, user_id, embedding, query, top_k, fw)
                         .await?
                 } else {
                     (
@@ -666,6 +672,8 @@ impl MemoryService {
             if !results.is_empty() {
                 let ids: Vec<String> = results.iter().map(|m| m.memory_id.clone()).collect();
                 if let Ok(fb_map) = sql.get_feedback_batch(&ids).await {
+                    let feedback_weight = sql.get_user_retrieval_params(user_id).await
+                        .map(|p| p.feedback_weight).unwrap_or(0.1);
                     for m in &mut results {
                         if let Some(fb) = fb_map.get(&m.memory_id) {
                             let positive = fb.useful as f64;
@@ -673,7 +681,7 @@ impl MemoryService {
                             let feedback_delta = positive - 0.5 * negative;
                             if feedback_delta.abs() > 0.01 {
                                 if let Some(score) = m.retrieval_score.as_mut() {
-                                    *score *= (1.0 + 0.1 * feedback_delta).max(0.5).min(2.0);
+                                    *score *= (1.0 + feedback_weight * feedback_delta).clamp(0.5, 2.0);
                                 }
                             }
                         }

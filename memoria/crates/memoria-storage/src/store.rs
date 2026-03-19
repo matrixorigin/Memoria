@@ -114,6 +114,26 @@ pub struct MemoryFeedback {
     pub wrong: i32,
 }
 
+/// Per-user adaptive retrieval parameters.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct UserRetrievalParams {
+    pub user_id: String,
+    pub feedback_weight: f64,
+    pub temporal_decay_hours: f64,
+    pub confidence_weight: f64,
+}
+
+impl Default for UserRetrievalParams {
+    fn default() -> Self {
+        Self {
+            user_id: String::new(),
+            feedback_weight: 0.1,
+            temporal_decay_hours: 168.0,
+            confidence_weight: 0.1,
+        }
+    }
+}
+
 impl SqlMemoryStore {
     pub fn new(pool: MySqlPool, embedding_dim: usize) -> Self {
         Self {
@@ -568,6 +588,20 @@ impl SqlMemoryStore {
                 created_at  DATETIME(6)  NOT NULL,
                 INDEX idx_feedback_user (user_id, created_at),
                 INDEX idx_feedback_memory (memory_id)
+            )"#,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+
+        // mem_user_retrieval_params — per-user adaptive scoring parameters
+        sqlx::query(
+            r#"CREATE TABLE IF NOT EXISTS mem_user_retrieval_params (
+                user_id              VARCHAR(64)  PRIMARY KEY,
+                feedback_weight      DOUBLE       NOT NULL DEFAULT 0.1,
+                temporal_decay_hours DOUBLE       NOT NULL DEFAULT 168.0,
+                confidence_weight    DOUBLE       NOT NULL DEFAULT 0.1,
+                updated_at           DATETIME(6)  NOT NULL
             )"#,
         )
         .execute(&self.pool)
@@ -1573,6 +1607,121 @@ impl SqlMemoryStore {
         Ok(map)
     }
 
+    // ── Per-User Retrieval Parameters ─────────────────────────────────────────
+
+    /// Get user's retrieval parameters, or default if not set.
+    pub async fn get_user_retrieval_params(
+        &self,
+        user_id: &str,
+    ) -> Result<UserRetrievalParams, MemoriaError> {
+        let row = sqlx::query(
+            "SELECT feedback_weight, temporal_decay_hours, confidence_weight \
+             FROM mem_user_retrieval_params WHERE user_id = ?",
+        )
+        .bind(user_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+
+        match row {
+            Some(r) => Ok(UserRetrievalParams {
+                user_id: user_id.to_string(),
+                feedback_weight: r.try_get("feedback_weight").unwrap_or(0.1),
+                temporal_decay_hours: r.try_get("temporal_decay_hours").unwrap_or(168.0),
+                confidence_weight: r.try_get("confidence_weight").unwrap_or(0.1),
+            }),
+            None => Ok(UserRetrievalParams {
+                user_id: user_id.to_string(),
+                ..Default::default()
+            }),
+        }
+    }
+
+    /// Update user's retrieval parameters.
+    pub async fn set_user_retrieval_params(
+        &self,
+        params: &UserRetrievalParams,
+    ) -> Result<(), MemoriaError> {
+        let now = Utc::now().format("%Y-%m-%d %H:%M:%S%.6f").to_string();
+        sqlx::query(
+            "INSERT INTO mem_user_retrieval_params \
+             (user_id, feedback_weight, temporal_decay_hours, confidence_weight, updated_at) \
+             VALUES (?, ?, ?, ?, ?) \
+             ON DUPLICATE KEY UPDATE \
+             feedback_weight = VALUES(feedback_weight), \
+             temporal_decay_hours = VALUES(temporal_decay_hours), \
+             confidence_weight = VALUES(confidence_weight), \
+             updated_at = VALUES(updated_at)",
+        )
+        .bind(&params.user_id)
+        .bind(params.feedback_weight)
+        .bind(params.temporal_decay_hours)
+        .bind(params.confidence_weight)
+        .bind(&now)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// Get feedback history for a user (for auto-tuning analysis).
+    pub async fn get_user_feedback_history(
+        &self,
+        user_id: &str,
+        limit: i64,
+    ) -> Result<Vec<(String, String, i64)>, MemoriaError> {
+        // Returns (memory_id, signal, count) grouped by memory and signal
+        let rows = sqlx::query(
+            "SELECT memory_id, signal, COUNT(*) as cnt \
+             FROM mem_retrieval_feedback \
+             WHERE user_id = ? \
+             GROUP BY memory_id, signal \
+             ORDER BY cnt DESC \
+             LIMIT ?",
+        )
+        .bind(user_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+
+        rows.iter()
+            .map(|r| {
+                Ok((
+                    r.try_get::<String, _>("memory_id").map_err(db_err)?,
+                    r.try_get::<String, _>("signal").map_err(db_err)?,
+                    r.try_get::<i64, _>("cnt").map_err(db_err)?,
+                ))
+            })
+            .collect()
+    }
+
+    /// Get total feedback counts for a user (aggregated by signal type).
+    pub async fn get_user_feedback_totals(
+        &self,
+        user_id: &str,
+    ) -> Result<(i64, i64, i64, i64), MemoriaError> {
+        let row = sqlx::query(
+            "SELECT \
+             SUM(CASE WHEN signal = 'useful' THEN 1 ELSE 0 END) as useful, \
+             SUM(CASE WHEN signal = 'irrelevant' THEN 1 ELSE 0 END) as irrelevant, \
+             SUM(CASE WHEN signal = 'outdated' THEN 1 ELSE 0 END) as outdated, \
+             SUM(CASE WHEN signal = 'wrong' THEN 1 ELSE 0 END) as wrong \
+             FROM mem_retrieval_feedback WHERE user_id = ?",
+        )
+        .bind(user_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(db_err)?;
+
+        Ok((
+            row.try_get::<i64, _>("useful").unwrap_or(0),
+            row.try_get::<i64, _>("irrelevant").unwrap_or(0),
+            row.try_get::<i64, _>("outdated").unwrap_or(0),
+            row.try_get::<i64, _>("wrong").unwrap_or(0),
+        ))
+    }
+
     /// Get access_count for a set of memory IDs.
     pub async fn get_access_counts(
         &self,
@@ -2084,8 +2233,9 @@ impl SqlMemoryStore {
         query: &str,
         limit: i64,
     ) -> Result<Vec<Memory>, MemoriaError> {
+        let params = self.get_user_retrieval_params(user_id).await.unwrap_or_default();
         let (mems, _) = self
-            .search_hybrid_from_scored(table, user_id, embedding, query, limit)
+            .search_hybrid_from_scored(table, user_id, embedding, query, limit, params.feedback_weight)
             .await?;
         Ok(mems)
     }
@@ -2099,6 +2249,7 @@ impl SqlMemoryStore {
         embedding: &[f32],
         query: &str,
         limit: i64,
+        feedback_weight: f64,
     ) -> Result<(Vec<Memory>, Vec<(String, f64, f64, f64, f64, f64)>), MemoriaError> {
         let fetch_k = (limit * 3).max(20);
         let vec_results = self
@@ -2175,13 +2326,10 @@ impl SqlMemoryStore {
                 let positive = fb.useful as f64;
                 let negative = (fb.irrelevant + fb.outdated + fb.wrong) as f64;
                 // Net feedback score: positive boosts, negative penalizes
-                // Formula: multiplier = 1 + 0.1 * (useful - 0.5 * negative)
-                // - 2 useful, 0 negative → 1.2x boost
-                // - 0 useful, 2 wrong → 0.9x penalty
-                // - 1 useful, 1 wrong → 1.05x (slight boost, useful outweighs)
+                // Formula: multiplier = 1 + feedback_weight * (useful - 0.5 * negative)
                 let feedback_delta = positive - 0.5 * negative;
                 if feedback_delta.abs() > 0.01 {
-                    final_score *= (1.0 + 0.1 * feedback_delta).max(0.5).min(2.0);
+                    final_score *= (1.0 + feedback_weight * feedback_delta).clamp(0.5, 2.0);
                 }
             }
 

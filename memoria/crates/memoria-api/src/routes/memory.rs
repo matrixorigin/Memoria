@@ -660,3 +660,91 @@ pub async fn get_feedback_by_tier(
         .map_err(api_err)?;
     Ok(Json(serde_json::json!({"breakdown": breakdown})))
 }
+
+/// GET /v1/retrieval-params — get user's adaptive retrieval parameters.
+pub async fn get_retrieval_params(
+    State(state): State<AppState>,
+    AuthUser { user_id, .. }: AuthUser,
+) -> ApiResult<serde_json::Value> {
+    let sql = state
+        .service
+        .sql_store
+        .as_ref()
+        .ok_or_else(|| (StatusCode::SERVICE_UNAVAILABLE, "SQL store not available".to_string()))?;
+    let params = sql
+        .get_user_retrieval_params(&user_id)
+        .await
+        .map_err(api_err)?;
+    Ok(Json(serde_json::to_value(params).unwrap()))
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct SetRetrievalParamsRequest {
+    pub feedback_weight: Option<f64>,
+    pub temporal_decay_hours: Option<f64>,
+    pub confidence_weight: Option<f64>,
+}
+
+/// PUT /v1/retrieval-params — update user's adaptive retrieval parameters.
+pub async fn set_retrieval_params(
+    State(state): State<AppState>,
+    AuthUser { user_id, .. }: AuthUser,
+    Json(req): Json<SetRetrievalParamsRequest>,
+) -> ApiResult<serde_json::Value> {
+    let sql = state
+        .service
+        .sql_store
+        .as_ref()
+        .ok_or_else(|| (StatusCode::SERVICE_UNAVAILABLE, "SQL store not available".to_string()))?;
+
+    let mut params = sql
+        .get_user_retrieval_params(&user_id)
+        .await
+        .map_err(api_err)?;
+
+    if let Some(v) = req.feedback_weight {
+        params.feedback_weight = v.clamp(0.01, 0.5);
+    }
+    if let Some(v) = req.temporal_decay_hours {
+        params.temporal_decay_hours = v.clamp(1.0, 720.0);
+    }
+    if let Some(v) = req.confidence_weight {
+        params.confidence_weight = v.clamp(0.0, 0.5);
+    }
+
+    sql.set_user_retrieval_params(&params).await.map_err(api_err)?;
+    Ok(Json(serde_json::to_value(params).unwrap()))
+}
+
+/// POST /v1/retrieval-params/tune — trigger auto-tuning of retrieval parameters.
+pub async fn tune_retrieval_params(
+    State(state): State<AppState>,
+    AuthUser { user_id, .. }: AuthUser,
+) -> ApiResult<serde_json::Value> {
+    use memoria_service::scoring::{DefaultScoringPlugin, ScoringPlugin};
+
+    let sql = state
+        .service
+        .sql_store
+        .as_ref()
+        .ok_or_else(|| (StatusCode::SERVICE_UNAVAILABLE, "SQL store not available".to_string()))?;
+
+    let old_params = sql
+        .get_user_retrieval_params(&user_id)
+        .await
+        .map_err(api_err)?;
+
+    let plugin = DefaultScoringPlugin;
+    match plugin.tune_params(sql.as_ref(), &user_id).await.map_err(api_err)? {
+        Some(new_params) => Ok(Json(serde_json::json!({
+            "tuned": true,
+            "old_params": old_params,
+            "new_params": new_params
+        }))),
+        None => Ok(Json(serde_json::json!({
+            "tuned": false,
+            "message": "Not enough feedback to tune parameters (minimum 10 feedback signals required)",
+            "current_params": old_params
+        }))),
+    }
+}

@@ -1,0 +1,207 @@
+//! Scoring plugin system for extensible retrieval ranking.
+//!
+//! This module provides:
+//! - `ScoringPlugin` trait for custom scoring logic
+//! - `ScoringStore` trait for storage operations needed by scoring
+//! - `DefaultScoringPlugin` with feedback-based score adjustment
+//! - `AdaptiveTuner` for auto-tuning user parameters from feedback history
+
+use async_trait::async_trait;
+use memoria_core::MemoriaError;
+use memoria_storage::{MemoryFeedback, SqlMemoryStore, UserRetrievalParams};
+
+/// Storage operations needed by scoring plugins.
+#[async_trait]
+pub trait ScoringStore: Send + Sync {
+    /// Get user's retrieval parameters.
+    async fn get_user_params(&self, user_id: &str) -> Result<UserRetrievalParams, MemoriaError>;
+
+    /// Update user's retrieval parameters.
+    async fn set_user_params(&self, params: &UserRetrievalParams) -> Result<(), MemoriaError>;
+
+    /// Get feedback history for tuning: (memory_id, signal, count).
+    async fn get_feedback_history(
+        &self,
+        user_id: &str,
+        limit: i64,
+    ) -> Result<Vec<(String, String, i64)>, MemoriaError>;
+
+    /// Get total feedback counts for a user.
+    async fn get_feedback_totals(&self, user_id: &str) -> Result<FeedbackTotals, MemoriaError>;
+}
+
+#[async_trait]
+impl ScoringStore for SqlMemoryStore {
+    async fn get_user_params(&self, user_id: &str) -> Result<UserRetrievalParams, MemoriaError> {
+        self.get_user_retrieval_params(user_id).await
+    }
+
+    async fn set_user_params(&self, params: &UserRetrievalParams) -> Result<(), MemoriaError> {
+        self.set_user_retrieval_params(params).await
+    }
+
+    async fn get_feedback_history(
+        &self,
+        user_id: &str,
+        limit: i64,
+    ) -> Result<Vec<(String, String, i64)>, MemoriaError> {
+        self.get_user_feedback_history(user_id, limit).await
+    }
+
+    async fn get_feedback_totals(&self, user_id: &str) -> Result<FeedbackTotals, MemoriaError> {
+        let (useful, irrelevant, outdated, wrong) = self.get_user_feedback_totals(user_id).await?;
+        Ok(FeedbackTotals { useful, irrelevant, outdated, wrong })
+    }
+}
+
+/// Aggregated feedback totals for a user.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct FeedbackTotals {
+    pub useful: i64,
+    pub irrelevant: i64,
+    pub outdated: i64,
+    pub wrong: i64,
+}
+
+/// Scoring plugin trait for extensible retrieval ranking.
+#[async_trait]
+pub trait ScoringPlugin: Send + Sync {
+    /// Plugin identifier.
+    fn plugin_key(&self) -> &str;
+
+    /// Adjust a base score using feedback and user parameters.
+    fn adjust_score(
+        &self,
+        base_score: f64,
+        feedback: &MemoryFeedback,
+        params: &UserRetrievalParams,
+    ) -> f64;
+
+    /// Auto-tune user parameters based on feedback history.
+    /// Returns updated params if tuning was performed, None if insufficient data.
+    async fn tune_params(
+        &self,
+        store: &dyn ScoringStore,
+        user_id: &str,
+    ) -> Result<Option<UserRetrievalParams>, MemoriaError>;
+}
+
+/// Default scoring plugin with feedback-based adjustment.
+#[derive(Debug, Default)]
+pub struct DefaultScoringPlugin;
+
+impl DefaultScoringPlugin {
+    /// Minimum feedback count before auto-tuning kicks in.
+    const MIN_FEEDBACK_FOR_TUNING: i64 = 10;
+}
+
+#[async_trait]
+impl ScoringPlugin for DefaultScoringPlugin {
+    fn plugin_key(&self) -> &str {
+        "scoring:default:v1"
+    }
+
+    fn adjust_score(
+        &self,
+        base_score: f64,
+        feedback: &MemoryFeedback,
+        params: &UserRetrievalParams,
+    ) -> f64 {
+        let positive = feedback.useful as f64;
+        let negative = (feedback.irrelevant + feedback.outdated + feedback.wrong) as f64;
+        let feedback_delta = positive - 0.5 * negative;
+
+        if feedback_delta.abs() > 0.01 {
+            base_score * (1.0 + params.feedback_weight * feedback_delta).clamp(0.5, 2.0)
+        } else {
+            base_score
+        }
+    }
+
+    async fn tune_params(
+        &self,
+        store: &dyn ScoringStore,
+        user_id: &str,
+    ) -> Result<Option<UserRetrievalParams>, MemoriaError> {
+        let totals = store.get_feedback_totals(user_id).await?;
+        let total = totals.useful + totals.irrelevant + totals.outdated + totals.wrong;
+
+        if total < Self::MIN_FEEDBACK_FOR_TUNING {
+            return Ok(None);
+        }
+
+        let mut params = store.get_user_params(user_id).await?;
+
+        // Adaptive tuning logic:
+        // - High useful ratio → increase feedback_weight (trust feedback more)
+        // - High negative ratio → decrease feedback_weight (be more conservative)
+        let useful_ratio = totals.useful as f64 / total as f64;
+        let negative_ratio = (totals.irrelevant + totals.wrong) as f64 / total as f64;
+
+        // Adjust feedback_weight: range [0.05, 0.2]
+        if useful_ratio > 0.7 {
+            // User gives mostly positive feedback → trust it more
+            params.feedback_weight = (params.feedback_weight * 1.1).min(0.2);
+        } else if negative_ratio > 0.5 {
+            // User gives mostly negative feedback → be more conservative
+            params.feedback_weight = (params.feedback_weight * 0.9).max(0.05);
+        }
+
+        // Round to 3 decimal places for cleaner storage
+        params.feedback_weight = (params.feedback_weight * 1000.0).round() / 1000.0;
+
+        store.set_user_params(&params).await?;
+        Ok(Some(params))
+    }
+}
+
+/// Result of an auto-tuning run.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TuningResult {
+    pub user_id: String,
+    pub tuned: bool,
+    pub old_params: Option<UserRetrievalParams>,
+    pub new_params: Option<UserRetrievalParams>,
+    pub feedback_count: i64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_default_scoring_adjustment() {
+        let plugin = DefaultScoringPlugin;
+        let params = UserRetrievalParams::default();
+
+        // No feedback → no change
+        let fb_none = MemoryFeedback::default();
+        assert!((plugin.adjust_score(1.0, &fb_none, &params) - 1.0).abs() < 0.001);
+
+        // 2 useful → 1.2x boost (0.1 * 2 = 0.2)
+        let fb_useful = MemoryFeedback { useful: 2, ..Default::default() };
+        assert!((plugin.adjust_score(1.0, &fb_useful, &params) - 1.2).abs() < 0.001);
+
+        // 2 wrong → 0.9x penalty (0.1 * -1 = -0.1)
+        let fb_wrong = MemoryFeedback { wrong: 2, ..Default::default() };
+        assert!((plugin.adjust_score(1.0, &fb_wrong, &params) - 0.9).abs() < 0.001);
+
+        // 2 useful, 3 wrong → 1.05x (2 - 1.5 = 0.5, 0.1 * 0.5 = 0.05)
+        let fb_mixed = MemoryFeedback { useful: 2, wrong: 3, ..Default::default() };
+        assert!((plugin.adjust_score(1.0, &fb_mixed, &params) - 1.05).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_scoring_clamp() {
+        let plugin = DefaultScoringPlugin;
+        let params = UserRetrievalParams::default();
+
+        // Extreme positive → clamped to 2.0
+        let fb_extreme = MemoryFeedback { useful: 100, ..Default::default() };
+        assert!((plugin.adjust_score(1.0, &fb_extreme, &params) - 2.0).abs() < 0.001);
+
+        // Extreme negative → clamped to 0.5
+        let fb_extreme_neg = MemoryFeedback { wrong: 100, ..Default::default() };
+        assert!((plugin.adjust_score(1.0, &fb_extreme_neg, &params) - 0.5).abs() < 0.001);
+    }
+}

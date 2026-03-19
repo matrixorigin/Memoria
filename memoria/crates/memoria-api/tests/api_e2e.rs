@@ -4307,3 +4307,130 @@ async fn test_api_feedback_by_tier() {
 
     println!("✅ GET /v1/feedback/by-tier: {} entries", breakdown.len());
 }
+
+
+// ── Retrieval Params API Tests ────────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_api_get_retrieval_params() {
+    let (base, client) = spawn_server().await;
+    let uid = uid();
+
+    let r = client
+        .get(format!("{base}/v1/retrieval-params"))
+        .header("X-User-Id", &uid)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let body: Value = r.json().await.unwrap();
+
+    // Should return default params
+    assert_eq!(body["feedback_weight"], 0.1);
+    assert_eq!(body["temporal_decay_hours"], 168.0);
+    assert_eq!(body["confidence_weight"], 0.1);
+
+    println!("✅ GET /v1/retrieval-params: {body}");
+}
+
+#[tokio::test]
+async fn test_api_set_retrieval_params() {
+    let (base, client) = spawn_server().await;
+    let uid = uid();
+
+    // Set custom params
+    let r = client
+        .put(format!("{base}/v1/retrieval-params"))
+        .header("X-User-Id", &uid)
+        .json(&json!({
+            "feedback_weight": 0.15,
+            "temporal_decay_hours": 200.0
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let body: Value = r.json().await.unwrap();
+
+    assert!((body["feedback_weight"].as_f64().unwrap() - 0.15).abs() < 0.001);
+    assert!((body["temporal_decay_hours"].as_f64().unwrap() - 200.0).abs() < 0.1);
+
+    // Verify persisted
+    let r = client
+        .get(format!("{base}/v1/retrieval-params"))
+        .header("X-User-Id", &uid)
+        .send()
+        .await
+        .unwrap();
+    let body: Value = r.json().await.unwrap();
+    assert!((body["feedback_weight"].as_f64().unwrap() - 0.15).abs() < 0.001);
+
+    println!("✅ PUT /v1/retrieval-params: params updated and persisted");
+}
+
+#[tokio::test]
+async fn test_api_tune_retrieval_params() {
+    let (base, client) = spawn_server().await;
+    let uid = uid();
+
+    // Without enough feedback, should not tune
+    let r = client
+        .post(format!("{base}/v1/retrieval-params/tune"))
+        .header("X-User-Id", &uid)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let body: Value = r.json().await.unwrap();
+    assert_eq!(body["tuned"], false);
+
+    println!("✅ POST /v1/retrieval-params/tune: {}", body["message"]);
+}
+
+#[tokio::test]
+async fn test_api_tune_with_feedback() {
+    let (base, client) = spawn_server().await;
+    let uid = uid();
+
+    // Create a memory
+    let r = client
+        .post(format!("{base}/v1/memories"))
+        .header("X-User-Id", &uid)
+        .json(&json!({
+            "content": "Test memory for tuning API",
+            "memory_type": "semantic"
+        }))
+        .send()
+        .await
+        .unwrap();
+    let body: Value = r.json().await.unwrap();
+    let memory_id = body["memory_id"].as_str().unwrap();
+
+    // Add 12 useful feedback signals
+    for _ in 0..12 {
+        client
+            .post(format!("{base}/v1/memories/{memory_id}/feedback"))
+            .header("X-User-Id", &uid)
+            .json(&json!({"signal": "useful"}))
+            .send()
+            .await
+            .unwrap();
+    }
+
+    // Now tune should work
+    let r = client
+        .post(format!("{base}/v1/retrieval-params/tune"))
+        .header("X-User-Id", &uid)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let body: Value = r.json().await.unwrap();
+    assert_eq!(body["tuned"], true);
+
+    let old_weight = body["old_params"]["feedback_weight"].as_f64().unwrap();
+    let new_weight = body["new_params"]["feedback_weight"].as_f64().unwrap();
+    assert!(new_weight >= old_weight, "feedback_weight should increase with positive feedback");
+
+    println!("✅ POST /v1/retrieval-params/tune: {:.3} → {:.3}", old_weight, new_weight);
+}

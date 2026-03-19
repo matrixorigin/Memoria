@@ -38,6 +38,7 @@ pub struct GovernanceRunSummary {
     pub vector_index_rows: i64,
     pub snapshots_cleaned: i64,
     pub orphan_branches_cleaned: i64,
+    pub users_tuned: i64,
 }
 
 #[derive(Debug, Default, Clone, PartialEq)]
@@ -143,6 +144,12 @@ pub trait GovernanceStore: Send + Sync {
         _task: GovernanceTask,
     ) -> Result<(), MemoriaError> {
         Ok(())
+    }
+
+    /// Auto-tune retrieval parameters for a user based on feedback history.
+    /// Returns true if parameters were updated.
+    async fn tune_user_retrieval_params(&self, _user_id: &str) -> Result<bool, MemoriaError> {
+        Ok(false)
     }
 }
 
@@ -279,6 +286,16 @@ impl GovernanceStore for SqlMemoryStore {
         task: GovernanceTask,
     ) -> Result<(), MemoriaError> {
         SqlMemoryStore::clear_governance_runtime_breaker(self, strategy_key, task.as_str()).await
+    }
+
+    async fn tune_user_retrieval_params(&self, user_id: &str) -> Result<bool, MemoriaError> {
+        use crate::scoring::{DefaultScoringPlugin, ScoringPlugin};
+
+        let plugin = DefaultScoringPlugin;
+        match plugin.tune_params(self, user_id).await? {
+            Some(_) => Ok(true),
+            None => Ok(false),
+        }
     }
 }
 
@@ -816,6 +833,39 @@ impl DefaultGovernanceStrategy {
         }
     }
 
+    async fn tune_retrieval_params_operation(
+        &self,
+        users: &[String],
+        store: &dyn GovernanceStore,
+        state: &mut ExecutionState,
+    ) {
+        let mut tuned_count = 0i64;
+        for user_id in users {
+            match store.tune_user_retrieval_params(user_id).await {
+                Ok(true) => tuned_count += 1,
+                Ok(false) => {} // Not enough feedback, skip
+                Err(err) => record_warning(
+                    GovernanceTask::Daily,
+                    Some(user_id),
+                    "tune_retrieval_params",
+                    &err,
+                    &mut state.warnings,
+                ),
+            }
+        }
+        state.summary.users_tuned = tuned_count;
+        if tuned_count > 0 {
+            state.decisions.push(governance_decision(
+                GovernanceTask::Daily,
+                "tune_retrieval_params",
+                format!("Auto-tuned retrieval parameters for {tuned_count} users"),
+                Some(1.0),
+                vec![],
+                state.snapshot_before.as_deref(),
+            ));
+        }
+    }
+
     async fn run_hourly(
         &self,
         store: &dyn GovernanceStore,
@@ -843,6 +893,8 @@ impl DefaultGovernanceStrategy {
         self.cleanup_orphaned_incrementals_operation(&plan.users, store, state)
             .await;
         self.cleanup_async_tasks_operation(store, state).await;
+        self.tune_retrieval_params_operation(&plan.users, store, state)
+            .await;
     }
 
     async fn run_weekly(
@@ -1006,6 +1058,10 @@ impl GovernanceStrategy for DefaultGovernanceStrategy {
         metrics.insert(
             "governance.orphan_branches_cleaned".to_string(),
             state.summary.orphan_branches_cleaned as f64,
+        );
+        metrics.insert(
+            "governance.users_tuned".to_string(),
+            state.summary.users_tuned as f64,
         );
         metrics.insert(
             "governance.snapshot_created".to_string(),
@@ -1331,6 +1387,7 @@ mod tests {
                 vector_index_rows: 0,
                 snapshots_cleaned: 0,
                 orphan_branches_cleaned: 0,
+                users_tuned: 0,
             }
         );
         assert_eq!(execution.report.status, StrategyStatus::Success);

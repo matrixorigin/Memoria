@@ -177,6 +177,24 @@ pub fn list() -> Value {
             }
         },
         {
+            "name": "memory_get_retrieval_params",
+            "description": "Get user's adaptive retrieval parameters (feedback_weight, temporal_decay_hours, confidence_weight).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
+                "required": []
+            }
+        },
+        {
+            "name": "memory_tune_params",
+            "description": "Manually trigger auto-tuning of retrieval parameters based on feedback history. Returns updated params if tuning was performed.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
+                "required": []
+            }
+        },
+        {
             "name": "memory_observe",
             "description": "Observe a conversation turn and extract memories from messages. Stores assistant/user messages as semantic memories.",
             "inputSchema": {
@@ -429,7 +447,8 @@ pub async fn call(
              memory_correct, memory_purge, memory_profile, memory_list, \
              memory_capabilities, memory_governance, memory_rebuild_index, \
              memory_consolidate, memory_reflect, memory_extract_entities, \
-             memory_link_entities, memory_feedback, memory_observe",
+             memory_link_entities, memory_feedback, memory_get_retrieval_params, \
+             memory_tune_params, memory_observe",
         )),
 
         "memory_governance" => {
@@ -869,6 +888,38 @@ pub async fn call(
                 "Recorded feedback: memory={}, signal={}, feedback_id={}",
                 memory_id, signal, feedback_id
             )))
+        }
+
+        "memory_get_retrieval_params" => {
+            let sql = service
+                .sql_store
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("SQL store not available"))?;
+            let params = sql.get_user_retrieval_params(user_id).await?;
+            Ok(mcp_text(&serde_json::to_string_pretty(&params)?))
+        }
+
+        "memory_tune_params" => {
+            use memoria_service::scoring::{DefaultScoringPlugin, ScoringPlugin};
+
+            let sql = service
+                .sql_store
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("SQL store not available"))?;
+
+            let old_params = sql.get_user_retrieval_params(user_id).await?;
+            let plugin = DefaultScoringPlugin;
+            match plugin.tune_params(sql.as_ref(), user_id).await? {
+                Some(new_params) => Ok(mcp_text(&format!(
+                    "Parameters tuned:\n  feedback_weight: {:.3} → {:.3}\n  temporal_decay_hours: {:.1} → {:.1}\n  confidence_weight: {:.3} → {:.3}",
+                    old_params.feedback_weight, new_params.feedback_weight,
+                    old_params.temporal_decay_hours, new_params.temporal_decay_hours,
+                    old_params.confidence_weight, new_params.confidence_weight
+                ))),
+                None => Ok(mcp_text(
+                    "Not enough feedback to tune parameters (minimum 10 feedback signals required)"
+                )),
+            }
         }
 
         "memory_observe" => {

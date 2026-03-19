@@ -231,9 +231,42 @@ impl RemoteClient {
                  memory_correct, memory_purge, memory_profile, memory_list, \
                  memory_capabilities, memory_governance, memory_rebuild_index, \
                  memory_consolidate, memory_reflect, memory_extract_entities, \
-                 memory_link_entities, memory_feedback, memory_observe \
+                 memory_link_entities, memory_feedback, memory_get_retrieval_params, \
+                 memory_tune_params, memory_observe \
                  [remote mode — connected to Memoria API server]",
             )),
+
+            "memory_get_retrieval_params" => {
+                let r = self.client.get(self.url("/v1/retrieval-params")).send().await?;
+                let body = Self::parse_response(r).await?;
+                Ok(Self::mcp_text(&serde_json::to_string_pretty(&body)?))
+            }
+
+            "memory_tune_params" => {
+                let r = self
+                    .client
+                    .post(self.url("/v1/retrieval-params/tune"))
+                    .send()
+                    .await?;
+                let body = Self::parse_response(r).await?;
+                if body["tuned"].as_bool().unwrap_or(false) {
+                    let old = &body["old_params"];
+                    let new = &body["new_params"];
+                    Ok(Self::mcp_text(&format!(
+                        "Parameters tuned:\n  feedback_weight: {:.3} → {:.3}\n  temporal_decay_hours: {:.1} → {:.1}\n  confidence_weight: {:.3} → {:.3}",
+                        old["feedback_weight"].as_f64().unwrap_or(0.0),
+                        new["feedback_weight"].as_f64().unwrap_or(0.0),
+                        old["temporal_decay_hours"].as_f64().unwrap_or(0.0),
+                        new["temporal_decay_hours"].as_f64().unwrap_or(0.0),
+                        old["confidence_weight"].as_f64().unwrap_or(0.0),
+                        new["confidence_weight"].as_f64().unwrap_or(0.0)
+                    )))
+                } else {
+                    Ok(Self::mcp_text(
+                        body["message"].as_str().unwrap_or("Not enough feedback to tune parameters")
+                    ))
+                }
+            }
 
             "memory_governance" => {
                 let r = self

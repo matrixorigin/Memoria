@@ -938,3 +938,198 @@ async fn test_feedback_score_multiplier_db_verification() {
 
     println!("✅ test_feedback_score_multiplier_db_verification: feedback affects scores correctly");
 }
+
+
+// ── 16. memory_get_retrieval_params: get default params ───────────────────────
+
+#[tokio::test]
+async fn test_get_retrieval_params_default() {
+    let (svc, _store, uid) = setup().await;
+
+    let result = call("memory_get_retrieval_params", json!({}), &svc, &uid).await;
+    let text = text(&result);
+
+    // Should return default params
+    assert!(text.contains("feedback_weight"), "Should show feedback_weight");
+    assert!(text.contains("0.1"), "Default feedback_weight should be 0.1");
+    assert!(text.contains("temporal_decay_hours"), "Should show temporal_decay_hours");
+    assert!(text.contains("168"), "Default temporal_decay_hours should be 168");
+
+    println!("✅ test_get_retrieval_params_default: {}", text);
+}
+
+// ── 17. memory_tune_params: insufficient feedback ─────────────────────────────
+
+#[tokio::test]
+async fn test_tune_params_insufficient_feedback() {
+    let (svc, _store, uid) = setup().await;
+
+    // No feedback yet, should not tune
+    let result = call("memory_tune_params", json!({}), &svc, &uid).await;
+    let text = text(&result);
+
+    assert!(
+        text.contains("Not enough feedback") || text.contains("minimum 10"),
+        "Should indicate insufficient feedback: {}",
+        text
+    );
+
+    println!("✅ test_tune_params_insufficient_feedback: {}", text);
+}
+
+// ── 18. memory_tune_params: auto-tuning with sufficient feedback ──────────────
+
+#[tokio::test]
+async fn test_tune_params_with_feedback() {
+    let (svc, store, uid) = setup().await;
+
+    // Create a memory via MCP tool
+    let result = call(
+        "memory_store",
+        json!({"content": "Test memory for tuning", "memory_type": "semantic"}),
+        &svc,
+        &uid,
+    )
+    .await;
+    let result_text = text(&result);
+    // Extract memory_id from "Stored memory <id>: ..."
+    let mem_id = result_text
+        .strip_prefix("Stored memory ")
+        .and_then(|s| s.split(':').next())
+        .unwrap_or("unknown");
+
+    // Add 12 useful feedback signals (above threshold of 10)
+    for _ in 0..12 {
+        store
+            .record_feedback(&uid, mem_id, "useful", None)
+            .await
+            .unwrap();
+    }
+
+    // Get params before tuning
+    let before = store.get_user_retrieval_params(&uid).await.unwrap();
+    println!("Before tuning: feedback_weight={:.3}", before.feedback_weight);
+
+    // Trigger tuning
+    let result = call("memory_tune_params", json!({}), &svc, &uid).await;
+    let text = text(&result);
+
+    // Should indicate tuning happened
+    assert!(
+        text.contains("tuned") || text.contains("→"),
+        "Should indicate parameters were tuned: {}",
+        text
+    );
+
+    // Verify DB was updated
+    let after = store.get_user_retrieval_params(&uid).await.unwrap();
+    println!("After tuning: feedback_weight={:.3}", after.feedback_weight);
+
+    // With 100% useful feedback, feedback_weight should increase
+    assert!(
+        after.feedback_weight >= before.feedback_weight,
+        "feedback_weight should increase with positive feedback: {} -> {}",
+        before.feedback_weight,
+        after.feedback_weight
+    );
+
+    println!("✅ test_tune_params_with_feedback: {}", text);
+}
+
+// ── 19. Tuning DB verification: params stored correctly ───────────────────────
+
+#[tokio::test]
+async fn test_tuning_db_verification() {
+    let (_svc, store, uid) = setup().await;
+
+    // Set custom params
+    let custom = memoria_storage::UserRetrievalParams {
+        user_id: uid.clone(),
+        feedback_weight: 0.15,
+        temporal_decay_hours: 200.0,
+        confidence_weight: 0.2,
+    };
+    store.set_user_retrieval_params(&custom).await.unwrap();
+
+    // Verify stored correctly
+    let loaded = store.get_user_retrieval_params(&uid).await.unwrap();
+    assert!((loaded.feedback_weight - 0.15).abs() < 0.001, "feedback_weight mismatch");
+    assert!((loaded.temporal_decay_hours - 200.0).abs() < 0.1, "temporal_decay_hours mismatch");
+    assert!((loaded.confidence_weight - 0.2).abs() < 0.001, "confidence_weight mismatch");
+
+    println!("✅ test_tuning_db_verification: params stored and loaded correctly");
+    println!("   feedback_weight={:.3}, temporal_decay_hours={:.1}, confidence_weight={:.3}",
+        loaded.feedback_weight, loaded.temporal_decay_hours, loaded.confidence_weight);
+}
+
+// ── 20. Tuning affects scoring: verify end-to-end ─────────────────────────────
+
+#[tokio::test]
+async fn test_tuning_affects_scoring() {
+    let (svc, store, uid) = setup().await;
+
+    // Use highly unique content to avoid cross-test interference
+    let unique = format!("xyzzy_tuning_test_{}", uid);
+    let result = call(
+        "memory_store",
+        json!({"content": unique, "memory_type": "semantic"}),
+        &svc,
+        &uid,
+    )
+    .await;
+    let result_text = text(&result);
+    let mem_id = result_text
+        .strip_prefix("Stored memory ")
+        .and_then(|s| s.split(':').next())
+        .unwrap_or("unknown");
+
+    // Add feedback
+    store.record_feedback(&uid, mem_id, "useful", None).await.unwrap();
+    store.record_feedback(&uid, mem_id, "useful", None).await.unwrap();
+
+    // MatrixOne fulltext index needs time to become consistent after INSERT
+    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+    // Get score with default params (feedback_weight=0.1)
+    let default_mems = svc.retrieve(&uid, &unique, 10).await.unwrap();
+    let default_score = default_mems
+        .iter()
+        .find(|m| m.memory_id == mem_id)
+        .and_then(|m| m.retrieval_score)
+        .unwrap_or(0.0);
+    assert!(default_score > 0.0, "Should have positive default score");
+
+    // Verify scoring math directly via ScoringPlugin trait to avoid
+    // MatrixOne fulltext index flakiness on consecutive retrieves
+    use memoria_service::scoring::{DefaultScoringPlugin, ScoringPlugin};
+    let plugin = DefaultScoringPlugin;
+    let fb = memoria_storage::MemoryFeedback { useful: 2, ..Default::default() };
+
+    let default_params = memoria_storage::UserRetrievalParams::default();
+    let custom_params = memoria_storage::UserRetrievalParams {
+        feedback_weight: 0.2, ..Default::default()
+    };
+
+    let base = 1.0;
+    let score_default = plugin.adjust_score(base, &fb, &default_params);
+    let score_custom = plugin.adjust_score(base, &fb, &custom_params);
+
+    assert!((score_default - 1.2).abs() < 0.001, "Default: {}", score_default);
+    assert!((score_custom - 1.4).abs() < 0.001, "Custom: {}", score_custom);
+    assert!(score_custom > score_default, "Custom params should produce higher score");
+
+    // Verify per-user params round-trip through DB
+    let high_weight = memoria_storage::UserRetrievalParams {
+        user_id: uid.clone(),
+        feedback_weight: 0.2,
+        temporal_decay_hours: 168.0,
+        confidence_weight: 0.1,
+    };
+    store.set_user_retrieval_params(&high_weight).await.unwrap();
+    let loaded = store.get_user_retrieval_params(&uid).await.unwrap();
+    assert!((loaded.feedback_weight - 0.2).abs() < 0.001);
+
+    println!("Default score: {:.4}, adjust(0.1)={:.4}, adjust(0.2)={:.4}",
+        default_score, score_default, score_custom);
+    println!("✅ test_tuning_affects_scoring: per-user params affect scoring math");
+}

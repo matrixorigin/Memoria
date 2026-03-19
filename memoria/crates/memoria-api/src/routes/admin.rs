@@ -414,3 +414,42 @@ pub async fn set_user_params(
         serde_json::json!({"user_id": user_id, "params": params}),
     ))
 }
+
+/// GET /admin/config — view current runtime configuration (redacted secrets).
+pub async fn get_config(
+    auth: AuthUser,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    auth.require_master()?;
+    let cfg = memoria_service::Config::from_env();
+    Ok(Json(serde_json::json!({
+        "db_url": redact_url(&cfg.db_url),
+        "db_name": cfg.db_name,
+        "embedding_provider": cfg.embedding_provider,
+        "embedding_model": cfg.embedding_model,
+        "embedding_dim": cfg.embedding_dim,
+        "embedding_base_url": cfg.embedding_base_url,
+        "has_embedding": cfg.has_embedding(),
+        "has_llm": cfg.has_llm(),
+        "llm_model": cfg.llm_model,
+        "llm_base_url": cfg.llm_base_url,
+        "user": cfg.user,
+        "governance_plugin_binding": cfg.governance_plugin_binding,
+        "governance_plugin_subject": cfg.governance_plugin_subject,
+        "governance_plugin_dir": cfg.governance_plugin_dir,
+        "instance_id": cfg.instance_id,
+        "lock_ttl_secs": cfg.lock_ttl_secs,
+        "governance_enabled": std::env::var("MEMORIA_GOVERNANCE_ENABLED")
+            .unwrap_or_else(|_| "false".into()),
+    })))
+}
+
+/// Redact password from database URL for safe display.
+fn redact_url(url: &str) -> String {
+    // mysql://user:pass@host:port/db → mysql://user:***@host:port/db
+    if let Some(at) = url.find('@') {
+        if let Some(colon) = url[..at].rfind(':') {
+            return format!("{}:***{}", &url[..colon], &url[at..]);
+        }
+    }
+    url.to_string()
+}

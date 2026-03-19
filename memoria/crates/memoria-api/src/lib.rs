@@ -20,6 +20,8 @@ pub fn build_router(state: AppState) -> Router {
         // Health
         .route("/health", get(routes::memory::health))
         .route("/health/instance", get(routes::memory::health_instance))
+        // Metrics
+        .route("/metrics", get(routes::metrics::prometheus_metrics))
         // Memory CRUD
         .route("/v1/memories", get(routes::memory::list_memories))
         .route("/v1/memories", post(routes::memory::store_memory))
@@ -55,6 +57,15 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/v1/feedback/by-tier",
             get(routes::memory::get_feedback_by_tier),
+        )
+        // Retrieval params
+        .route(
+            "/v1/retrieval-params",
+            get(routes::memory::get_retrieval_params).put(routes::memory::set_retrieval_params),
+        )
+        .route(
+            "/v1/retrieval-params/tune",
+            post(routes::memory::tune_retrieval_params),
         )
         // Governance
         .route("/v1/governance", post(routes::governance::governance))
@@ -122,6 +133,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/auth/keys/:id", delete(routes::auth::revoke_key))
         // Admin
         .route("/admin/stats", get(routes::admin::system_stats))
+        .route("/admin/config", get(routes::admin::get_config))
         .route("/admin/users", get(routes::admin::list_users))
         .route(
             "/admin/users/:user_id/stats",
