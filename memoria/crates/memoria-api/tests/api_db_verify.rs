@@ -40,10 +40,10 @@ async fn spawn_server() -> (String, reqwest::Client, MySqlPool) {
         .expect("bind");
     let port = listener.local_addr().unwrap().port();
     tokio::spawn(async move { axum::serve(listener, app).await });
-    tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
 
     let client = reqwest::Client::builder().no_proxy().build().unwrap();
     let base = format!("http://127.0.0.1:{port}");
+    wait_for_server(&client, &base, &pool).await;
     (base, client, pool)
 }
 
@@ -67,9 +67,28 @@ async fn spawn_server_with_master_key(master_key: &str) -> (String, reqwest::Cli
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
     let client = reqwest::Client::builder().no_proxy().build().unwrap();
-    (format!("http://127.0.0.1:{port}"), client, pool)
+    let base = format!("http://127.0.0.1:{port}");
+    wait_for_server(&client, &base, &pool).await;
+    (base, client, pool)
+}
+
+async fn wait_for_server(client: &reqwest::Client, base: &str, pool: &MySqlPool) {
+    // Wait for axum to accept connections
+    for _ in 0..20 {
+        if client.get(format!("{base}/health")).send().await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+    }
+    // Verify DB is reachable via the pool
+    for _ in 0..20 {
+        if sqlx::query("SELECT 1").execute(pool).await.is_ok() {
+            return;
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+    }
+    panic!("DB not ready after 1s");
 }
 
 /// Query a single memory row from DB by memory_id.
