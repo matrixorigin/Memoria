@@ -143,7 +143,8 @@ EOF
 
 normalize_bool() {
   local raw="${1:-}"
-  case "${raw,,}" in
+  raw="$(printf '%s' "${raw}" | tr '[:upper:]' '[:lower:]')"
+  case "${raw}" in
     1|true|yes|on)
       printf 'true'
       ;;
