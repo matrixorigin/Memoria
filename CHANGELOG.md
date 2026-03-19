@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.0-rc] - 2026-03-19
+
+### 🐛 Bug Fixes
+
+- Update README logo to new memoria-logo asset (#52) ([7d1245f](https://github.com/matrixorigin/Memoria/commit/7d1245faa3e5b867016c91e0b3dd1363df8e8187))
+- UTF-8 string truncation panic with multi-byte characters (#48) ([f774499](https://github.com/matrixorigin/Memoria/commit/f774499caa6c6b981d0a8eaa1b4f3d46d831e3ae))
+- Install.sh Text file busy error when upgrading (#46) ([a79f971](https://github.com/matrixorigin/Memoria/commit/a79f97120b33ce1f91aef42518073fdc806be472))
+
+### 🚀 Features
+
+- **benchmark**: Separate official LongMemEval and BEAM reporting (#50) ([72998fe](https://github.com/matrixorigin/Memoria/commit/72998fe38676209c6a75de2da606998d8da26414))
+- Add OpenClaw-native Memoria onboarding (#49) ([7560190](https://github.com/matrixorigin/Memoria/commit/75601906907079417f6756b86ee538d8085df14e))
+- Implement plugin framework (#45) ([4301f97](https://github.com/matrixorigin/Memoria/commit/4301f976e0757b9d465b43891bd20745aea17a28))
+- Replace hand-rolled prompts with cliclack TUI wizard (#44) ([ef071bd](https://github.com/matrixorigin/Memoria/commit/ef071bd33be262154fee23903edaa33fbe81d4b6))
 ## [0.1.0] - 2026-03-18
 
 ### 🐛 Bug Fixes
