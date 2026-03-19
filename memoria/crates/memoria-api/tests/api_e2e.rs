@@ -361,6 +361,27 @@ async fn spawn_server_with_master_key(master_key: &str) -> (String, reqwest::Cli
     (format!("http://127.0.0.1:{port}"), client)
 }
 
+async fn create_api_key_for_user(
+    client: &reqwest::Client,
+    base: &str,
+    master_auth: &str,
+    user_id: &str,
+    name: &str,
+) -> String {
+    let r = client
+        .post(format!("{base}/auth/keys"))
+        .header("Authorization", master_auth)
+        .json(&json!({ "user_id": user_id, "name": name }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 201, "create key for {user_id}");
+    r.json::<Value>().await.unwrap()["raw_key"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
 // ── 10. auth: missing token returns 401 ──────────────────────────────────────
 
 #[tokio::test]
@@ -531,6 +552,310 @@ async fn test_api_key_crud() {
         .unwrap();
     assert_eq!(r.status(), 404, "revoke nonexistent");
     println!("✅ revoke nonexistent → 404");
+}
+
+#[tokio::test]
+async fn test_api_key_cannot_get_other_users_memory() {
+    let mk = "test-master-key-memory-read";
+    let (base, client) = spawn_server_with_master_key(mk).await;
+    let auth = format!("Bearer {mk}");
+    let owner_id = uid();
+    let attacker_id = uid();
+    let owner_key = create_api_key_for_user(&client, &base, &auth, &owner_id, "owner-read").await;
+    let attacker_key =
+        create_api_key_for_user(&client, &base, &auth, &attacker_id, "attacker-read").await;
+
+    let r = client
+        .post(format!("{base}/v1/memories"))
+        .header("Authorization", format!("Bearer {owner_key}"))
+        .json(&json!({ "content": "owner private memory", "memory_type": "semantic" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 201);
+    let memory_id = r.json::<Value>().await.unwrap()["memory_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let r = client
+        .get(format!("{base}/v1/memories/{memory_id}"))
+        .header("Authorization", format!("Bearer {attacker_key}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 403, "non-owner API key must get 403");
+}
+
+#[tokio::test]
+async fn test_api_key_cannot_correct_other_users_memory() {
+    let mk = "test-master-key-memory-correct";
+    let (base, client) = spawn_server_with_master_key(mk).await;
+    let auth = format!("Bearer {mk}");
+    let owner_id = uid();
+    let attacker_id = uid();
+    let owner_key =
+        create_api_key_for_user(&client, &base, &auth, &owner_id, "owner-correct").await;
+    let attacker_key =
+        create_api_key_for_user(&client, &base, &auth, &attacker_id, "attacker-correct").await;
+
+    let r = client
+        .post(format!("{base}/v1/memories"))
+        .header("Authorization", format!("Bearer {owner_key}"))
+        .json(&json!({ "content": "unchanged owner memory", "memory_type": "semantic" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 201);
+    let memory_id = r.json::<Value>().await.unwrap()["memory_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let r = client
+        .put(format!("{base}/v1/memories/{memory_id}/correct"))
+        .header("Authorization", format!("Bearer {attacker_key}"))
+        .json(&json!({ "new_content": "attacker overwrite" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 403, "non-owner API key must get 403");
+}
+
+#[tokio::test]
+async fn test_api_key_cannot_get_other_users_task_status() {
+    use memoria_service::AsyncTaskStore;
+    use memoria_storage::SqlMemoryStore;
+
+    let mk = "test-master-key-task-status";
+    let (base, client) = spawn_server_with_master_key(mk).await;
+    let auth = format!("Bearer {mk}");
+    let owner_id = uid();
+    let attacker_id = uid();
+    let attacker_key =
+        create_api_key_for_user(&client, &base, &auth, &attacker_id, "attacker-task").await;
+
+    let store = SqlMemoryStore::connect(&db_url(), test_dim())
+        .await
+        .expect("connect");
+    store.migrate().await.expect("migrate");
+
+    let task_id = format!("task_{}", uuid::Uuid::new_v4().simple());
+    store
+        .create_task(&task_id, "instance_authz", &owner_id)
+        .await
+        .unwrap();
+
+    let r = client
+        .get(format!("{base}/v1/tasks/{task_id}"))
+        .header("Authorization", format!("Bearer {attacker_key}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 403, "non-owner API key must get 403");
+}
+
+// ── 10b-4. cross-user delete ──────────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_api_key_cannot_delete_other_users_memory() {
+    let mk = "test-master-key-memory-delete";
+    let (base, client) = spawn_server_with_master_key(mk).await;
+    let auth = format!("Bearer {mk}");
+    let owner_id = uid();
+    let attacker_id = uid();
+    let owner_key =
+        create_api_key_for_user(&client, &base, &auth, &owner_id, "owner-del").await;
+    let attacker_key =
+        create_api_key_for_user(&client, &base, &auth, &attacker_id, "attacker-del").await;
+
+    // Owner creates memory
+    let r = client
+        .post(format!("{base}/v1/memories"))
+        .header("Authorization", format!("Bearer {owner_key}"))
+        .json(&json!({ "content": "owner secret", "memory_type": "semantic" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 201);
+    let memory_id = r.json::<Value>().await.unwrap()["memory_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Attacker tries to delete
+    let r = client
+        .delete(format!("{base}/v1/memories/{memory_id}"))
+        .header("Authorization", format!("Bearer {attacker_key}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 403, "non-owner API key must get 403 on delete");
+}
+
+// ── 10b-5. cross-user list isolation ─────────────────────────────────────────
+
+#[tokio::test]
+async fn test_api_key_list_only_own_memories() {
+    let mk = "test-master-key-list-isolation";
+    let (base, client) = spawn_server_with_master_key(mk).await;
+    let auth = format!("Bearer {mk}");
+    let user_a = uid();
+    let user_b = uid();
+    let key_a = create_api_key_for_user(&client, &base, &auth, &user_a, "list-a").await;
+    let key_b = create_api_key_for_user(&client, &base, &auth, &user_b, "list-b").await;
+
+    // User A stores a memory
+    let r = client
+        .post(format!("{base}/v1/memories"))
+        .header("Authorization", format!("Bearer {key_a}"))
+        .json(&json!({ "content": "user_a private data", "memory_type": "semantic" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 201);
+
+    // User B lists — should see nothing from A
+    let r = client
+        .get(format!("{base}/v1/memories"))
+        .header("Authorization", format!("Bearer {key_b}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let body: Value = r.json().await.unwrap();
+    let items = body["items"].as_array().unwrap();
+    for item in items {
+        assert_ne!(
+            item["content"].as_str().unwrap_or(""),
+            "user_a private data",
+            "user B must not see user A's memories in list"
+        );
+    }
+}
+
+// ── 10b-6. master key impersonation boundary ─────────────────────────────────
+
+#[tokio::test]
+async fn test_master_key_can_impersonate_and_access_any_user() {
+    let mk = "test-master-key-impersonate";
+    let (base, client) = spawn_server_with_master_key(mk).await;
+    let auth = format!("Bearer {mk}");
+    let user_a = uid();
+    let key_a = create_api_key_for_user(&client, &base, &auth, &user_a, "imp-a").await;
+
+    // User A stores a memory
+    let r = client
+        .post(format!("{base}/v1/memories"))
+        .header("Authorization", format!("Bearer {key_a}"))
+        .json(&json!({ "content": "impersonation test data", "memory_type": "semantic" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 201);
+    let memory_id = r.json::<Value>().await.unwrap()["memory_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Master key can read any user's memory
+    let r = client
+        .get(format!("{base}/v1/memories/{memory_id}"))
+        .header("Authorization", &auth)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200, "master key should read any memory");
+
+    // Master key can correct any user's memory
+    let r = client
+        .put(format!("{base}/v1/memories/{memory_id}/correct"))
+        .header("Authorization", &auth)
+        .json(&json!({ "new_content": "master corrected" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200, "master key should correct any memory");
+
+    // Master key can delete any user's memory
+    let r = client
+        .delete(format!("{base}/v1/memories/{memory_id}"))
+        .header("Authorization", &auth)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 204, "master key should delete any memory");
+
+    // API key (non-master) cannot access admin routes
+    let r = client
+        .get(format!("{base}/admin/stats"))
+        .header("Authorization", format!("Bearer {key_a}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 403, "API key must not access admin routes");
+}
+
+// ── 10b-7. revoked API key returns 401 ───────────────────────────────────────
+
+#[tokio::test]
+async fn test_revoked_api_key_returns_401() {
+    let mk = "test-master-key-revoked";
+    let (base, client) = spawn_server_with_master_key(mk).await;
+    let auth = format!("Bearer {mk}");
+    let uid = uid();
+
+    // Create and get raw key + key_id
+    let r = client
+        .post(format!("{base}/auth/keys"))
+        .header("Authorization", &auth)
+        .json(&json!({"user_id": uid, "name": "to-revoke"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 201);
+    let body: Value = r.json().await.unwrap();
+    let key_id = body["key_id"].as_str().unwrap().to_string();
+    let raw_key = body["raw_key"].as_str().unwrap().to_string();
+
+    // Verify key works before revoke
+    let r = client
+        .get(format!("{base}/v1/memories"))
+        .header("Authorization", format!("Bearer {raw_key}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200, "key should work before revoke");
+
+    // Revoke
+    let r = client
+        .delete(format!("{base}/auth/keys/{key_id}"))
+        .header("Authorization", &auth)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 204);
+
+    // Revoked key must be rejected
+    let r = client
+        .get(format!("{base}/v1/memories"))
+        .header("Authorization", format!("Bearer {raw_key}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 401, "revoked key must return 401");
+
+    // Also rejected on write endpoints
+    let r = client
+        .post(format!("{base}/v1/memories"))
+        .header("Authorization", format!("Bearer {raw_key}"))
+        .json(&json!({"content": "should fail", "memory_type": "semantic"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 401, "revoked key must return 401 on store");
+
+    println!("✅ revoked API key returns 401 on all endpoints");
 }
 
 // ── 10c. observe endpoint ────────────────────────────────────────────────────
@@ -3293,6 +3618,40 @@ async fn test_plugin_empty_queries() {
     println!("✅ plugin empty queries return empty arrays");
 }
 
+#[tokio::test]
+async fn test_plugin_admin_routes_require_master_key() {
+    let mk = "test-mk-plugin-admin";
+    let (base, client) = spawn_server_with_master_key(mk).await;
+    let auth = format!("Bearer {mk}");
+    let uid = uid();
+    let user_key = create_api_key_for_user(&client, &base, &auth, &uid, "plugin-user").await;
+    let user_auth = format!("Bearer {user_key}");
+
+    let r = client
+        .get(format!("{base}/admin/plugins"))
+        .header("Authorization", &user_auth)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 403, "API key must not list admin plugins");
+
+    let r = client
+        .post(format!("{base}/admin/plugins/signers"))
+        .header("Authorization", &user_auth)
+        .json(&json!({
+            "signer": format!("forbidden-{}", uuid::Uuid::new_v4().simple()),
+            "public_key": test_signer_public_b64()
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        r.status(),
+        403,
+        "API key must not mutate admin plugin state"
+    );
+}
+
 // ── Distributed coordination tests ────────────────────────────────────────────
 
 /// Spawn a server with a specific instance_id, returning (base_url, client, instance_id).
@@ -3568,7 +3927,10 @@ async fn test_distributed_async_task_cross_instance() {
     let task_id = format!("task_{}", uuid::Uuid::new_v4().simple());
 
     // Create task on "instance_a"
-    store.create_task(&task_id, "instance_a", "test_user").await.unwrap();
+    store
+        .create_task(&task_id, "instance_a", "test_user")
+        .await
+        .unwrap();
 
     // Read from "instance_b" perspective (same store, simulating different instance)
     let task = store
@@ -3608,7 +3970,10 @@ async fn test_distributed_async_task_fail() {
     store.migrate().await.expect("migrate");
 
     let task_id = format!("task_{}", uuid::Uuid::new_v4().simple());
-    store.create_task(&task_id, "instance_x", "test_user").await.unwrap();
+    store
+        .create_task(&task_id, "instance_x", "test_user")
+        .await
+        .unwrap();
     store
         .fail_task(&task_id, json!({"code": "ERR", "message": "boom"}))
         .await
