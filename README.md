@@ -29,7 +29,7 @@ Every memory change is tracked, auditable, and reversible — snapshots, branche
 - **Self-maintaining** — built-in governance detects contradictions, quarantines low-confidence memories
 - **Private by default** — local embedding model option, no data leaves your machine
 
-**Supported Agents:** [Kiro](https://kiro.dev) · [Cursor](https://cursor.sh) · [Claude Code](https://docs.anthropic.com/en/docs/claude-code) · Any MCP-compatible agent
+**Supported Agents:** [Kiro](https://kiro.dev) · [Cursor](https://cursor.sh) · [Claude Code](https://docs.anthropic.com/en/docs/claude-code) · [OpenClaw](plugins/openclaw/README.md) · Any MCP-compatible agent
 
 **Storage Backend:** [MatrixOne](https://github.com/matrixorigin/matrixone) — Distributed database with native vector indexing
 
