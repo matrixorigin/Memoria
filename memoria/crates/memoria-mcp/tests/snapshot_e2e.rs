@@ -944,3 +944,154 @@ async fn test_branch_from_snapshot() {
     )
     .await;
 }
+
+// ── 15. Milestone snapshots do not count towards user limit ───────────────────
+
+#[tokio::test]
+#[serial]
+async fn test_milestone_snapshot_not_counted_towards_limit() {
+    let (svc, git, _) = setup().await;
+    let uid_a = uid();
+
+    // Create 20 user snapshots (at the limit)
+    let names: Vec<String> = (0..20).map(|i| snap(&format!("ms_{i}"))).collect();
+    for name in &names {
+        let r = git_call("memory_snapshot", json!({"name": name}), &git, &svc, &uid_a).await;
+        assert!(text(&r).contains("created"), "A create failed: {}", text(&r));
+    }
+
+    // Create a milestone snapshot directly via git (simulating system-created milestone)
+    let milestone_name = "mem_milestone_test_milestone";
+    git.create_snapshot(milestone_name).await.expect("create milestone");
+
+    // User should still be able to create one more snapshot (milestone doesn't count)
+    let extra = snap("after_milestone");
+    let r = git_call("memory_snapshot", json!({"name": extra}), &git, &svc, &uid_a).await;
+    assert!(
+        text(&r).contains("Snapshot limit reached"),
+        "user should be at limit, got: {}",
+        text(&r)
+    );
+
+    // But user B should see the milestone in their list
+    let uid_b = uid();
+    let r = git_call("memory_snapshots", json!({"limit": 50}), &git, &svc, &uid_b).await;
+    let t = text(&r);
+    assert!(t.contains("auto:test_milestone"), "B should see milestone: {}", t);
+
+    // Cleanup
+    git.drop_snapshot(milestone_name).await.expect("drop milestone");
+    git_call(
+        "memory_snapshot_delete",
+        json!({"names": names.join(",")}),
+        &git,
+        &svc,
+        &uid_a,
+    )
+    .await;
+}
+
+// ── 16. Deleting snapshots releases quota for new snapshots ───────────────────
+
+#[tokio::test]
+#[serial]
+async fn test_delete_releases_quota() {
+    let (svc, git, _) = setup().await;
+    let uid_a = uid();
+
+    // Create 20 snapshots (at limit)
+    let names: Vec<String> = (0..20).map(|i| snap(&format!("quota_{i}"))).collect();
+    for name in &names {
+        let r = git_call("memory_snapshot", json!({"name": name}), &git, &svc, &uid_a).await;
+        assert!(text(&r).contains("created"), "create failed: {}", text(&r));
+    }
+
+    // Verify at limit
+    let overflow = snap("overflow");
+    let r = git_call("memory_snapshot", json!({"name": overflow}), &git, &svc, &uid_a).await;
+    assert!(text(&r).contains("Snapshot limit reached"), "should be at limit");
+
+    // Delete 5 snapshots
+    let to_delete: Vec<String> = names.iter().take(5).cloned().collect();
+    git_call(
+        "memory_snapshot_delete",
+        json!({"names": to_delete.join(",")}),
+        &git,
+        &svc,
+        &uid_a,
+    )
+    .await;
+
+    // Now should be able to create 5 new snapshots
+    for i in 0..5 {
+        let new_snap = snap(&format!("new_{i}"));
+        let r = git_call("memory_snapshot", json!({"name": new_snap}), &git, &svc, &uid_a).await;
+        assert!(
+            text(&r).contains("created"),
+            "should create after delete, got: {}",
+            text(&r)
+        );
+    }
+
+    // 6th should fail again
+    let r = git_call("memory_snapshot", json!({"name": overflow}), &git, &svc, &uid_a).await;
+    assert!(text(&r).contains("Snapshot limit reached"), "should be at limit again");
+
+    // Cleanup remaining
+    let remaining: Vec<String> = names.iter().skip(5).cloned().collect();
+    let new_names: Vec<String> = (0..5).map(|i| snap(&format!("new_{i}"))).collect();
+    git_call(
+        "memory_snapshot_delete",
+        json!({"names": remaining.join(",")}),
+        &git,
+        &svc,
+        &uid_a,
+    )
+    .await;
+    git_call(
+        "memory_snapshot_delete",
+        json!({"names": new_names.join(",")}),
+        &git,
+        &svc,
+        &uid_a,
+    )
+    .await;
+}
+
+// ── 17. Safety snapshots (mem_snap_pre_*) are globally visible ─────────────────
+
+#[tokio::test]
+#[serial]
+async fn test_safety_snapshot_globally_visible() {
+    let (svc, git, _) = setup().await;
+    let uid_a = uid();
+    let uid_b = uid();
+
+    // Create a safety snapshot directly via git (use unique name)
+    let unique_id = &Uuid::new_v4().simple().to_string()[..6];
+    let safety_name = format!("mem_snap_pre_safety_{unique_id}");
+    let display_name = format!("pre_safety_{unique_id}"); // snap_display strips mem_snap_ prefix
+    git.create_snapshot(&safety_name).await.expect("create safety");
+
+    // Both users should see it in their list (by display name)
+    let r_a = git_call("memory_snapshots", json!({"limit": 50}), &git, &svc, &uid_a).await;
+    let t_a = text(&r_a);
+    assert!(t_a.contains(&display_name), "A should see safety snapshot: {}", t_a);
+
+    let r_b = git_call("memory_snapshots", json!({"limit": 50}), &git, &svc, &uid_b).await;
+    let t_b = text(&r_b);
+    assert!(t_b.contains(&display_name), "B should see safety snapshot: {}", t_b);
+
+    // Safety snapshots are globally visible and can be deleted by any user
+    // (they are not protected, just not registered to any specific user)
+    let r = git_call(
+        "memory_snapshot_delete",
+        json!({"names": &display_name}),
+        &git,
+        &svc,
+        &uid_a,
+    )
+    .await;
+    assert!(text(&r).contains("Deleted 1"), "should delete safety snapshot: {}", text(&r));
+    println!("✅ safety snapshot deleted by user: {}", text(&r));
+}
