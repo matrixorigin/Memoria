@@ -327,9 +327,17 @@ async fn cmd_serve(db_url: Option<String>, port: u16, master_key: String) -> Res
         cfg.db_url = v;
     }
 
+    // Auto-infer embedding dimension when EMBEDDING_DIM=0 (or unset).
+    // Probes the embedding service with a test call and uses the returned
+    // vector length as the actual dimension.
+    if cfg.embedding_dim == 0 && cfg.has_embedding() {
+        cfg.embedding_dim = probe_embedding_dim(&cfg).await?;
+    }
+
     tracing::info!(
         db_url = %cfg.db_url, port = port,
         instance_id = %cfg.instance_id,
+        embedding_dim = cfg.embedding_dim,
         has_llm = cfg.has_llm(), has_embedding = cfg.has_embedding(),
         governance_plugin_binding = %cfg.governance_plugin_binding,
         "Starting Memoria API server"
@@ -337,6 +345,7 @@ async fn cmd_serve(db_url: Option<String>, port: u16, master_key: String) -> Res
 
     let store = SqlMemoryStore::connect(&cfg.db_url, cfg.embedding_dim).await?;
     store.migrate().await?;
+    store.check_embedding_dim_compat().await?;
 
     let pool = MySqlPool::connect(&cfg.db_url).await?;
     let git = Arc::new(GitForDataService::new(pool, &cfg.db_name));
@@ -431,9 +440,15 @@ async fn cmd_mcp(
         cfg.db_name = v;
     }
 
+    // Auto-infer embedding dimension when EMBEDDING_DIM=0 (or unset).
+    if cfg.embedding_dim == 0 && cfg.has_embedding() {
+        cfg.embedding_dim = probe_embedding_dim(&cfg).await?;
+    }
+
     tracing::info!(
         db_url = %cfg.db_url,
         embedding_provider = %cfg.embedding_provider,
+        embedding_dim = cfg.embedding_dim,
         has_llm = cfg.has_llm(),
         governance_plugin_binding = %cfg.governance_plugin_binding,
         user = %cfg.user,
@@ -442,6 +457,7 @@ async fn cmd_mcp(
 
     let store = SqlMemoryStore::connect(&cfg.db_url, cfg.embedding_dim).await?;
     store.migrate().await?;
+    store.check_embedding_dim_compat().await?;
 
     let pool = MySqlPool::connect(&cfg.db_url).await?;
     let git = Arc::new(GitForDataService::new(pool, &cfg.db_name));
@@ -787,6 +803,56 @@ fn cmd_plugin_dev_keygen(dir: &Path) -> Result<()> {
 }
 
 // ── Shared helpers ────────────────────────────────────────────────────────────
+
+/// Probe the configured embedding service to determine the vector dimension.
+///
+/// Called when `EMBEDDING_DIM=0` (the default). Makes a single embedding
+/// request with a short probe string and returns `vec.len()` as the
+/// actual dimension, which is then used to create or validate the database
+/// schema.
+///
+/// # Errors
+/// Returns an error if the embedding service is unreachable or returns an
+/// empty vector, with a suggestion to set `EMBEDDING_DIM` explicitly.
+async fn probe_embedding_dim(cfg: &memoria_service::Config) -> Result<usize> {
+    use memoria_core::interfaces::EmbeddingProvider;
+    use memoria_embedding::HttpEmbedder;
+
+    // Build a temporary embedder with dim=0 (dim is not used by embed()).
+    let embedder = HttpEmbedder::new(
+        &cfg.embedding_base_url,
+        &cfg.embedding_api_key,
+        &cfg.embedding_model,
+        0,
+    );
+
+    tracing::info!(
+        model = %cfg.embedding_model,
+        base_url = %cfg.embedding_base_url,
+        "EMBEDDING_DIM=0: probing embedding service to auto-infer dimension"
+    );
+
+    let vec = embedder
+        .embed("dimension probe")
+        .await
+        .map_err(|e| anyhow::anyhow!(
+            "EMBEDDING_DIM=0 but the embedding probe failed: {e}. \
+             Set EMBEDDING_DIM explicitly (e.g. EMBEDDING_DIM=768 for \
+             nomic-embed-text, EMBEDDING_DIM=1024 for BAAI/bge-m3) or \
+             check that your embedding service is reachable."
+        ))?;
+
+    if vec.is_empty() {
+        return Err(anyhow::anyhow!(
+            "EMBEDDING_DIM=0: embedding service returned an empty vector. \
+             Set EMBEDDING_DIM explicitly."
+        ));
+    }
+
+    let dim = vec.len();
+    tracing::info!(embedding_dim = dim, "Auto-inferred embedding dimension");
+    Ok(dim)
+}
 
 fn build_embedder(
     cfg: &memoria_service::Config,

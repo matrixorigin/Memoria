@@ -166,7 +166,7 @@ This creates:
 
 The generated `mcp.json` includes all environment variables (empty = not configured). Edit the file to fill in your values.
 
-⚠️ **Configure embedding BEFORE the MCP server starts for the first time.** Tables are created on first startup with the configured dimension.
+💡 **Embedding dimension** defaults to `EMBEDDING_DIM=0` (auto-infer): Memoria probes your embedding service on first startup and uses the returned vector length. Set `EMBEDDING_DIM` explicitly if the service may be unavailable at boot time. Either way, the dimension is locked into the database schema on first run — changing it later requires dropping the schema.
 
 ### 4. Restart & verify
 
@@ -529,8 +529,7 @@ Leave all empty to use local embedding (all-MiniLM-L6-v2, dim=384).
 **💡 Local Embedding Tips:**
 Local embedding requires building from source with `--features local-embedding` (pre-built binaries don't include it). See [Local Embedding Guide](skills/local-embedding/SKILL.md) for build instructions, supported models, and troubleshooting.
 
-**⚠️ CRITICAL: Configure embedding BEFORE the MCP server starts for the first time.**
- Tables are created on first startup with the configured dimension. Changing it later requires re-creating the embedding column (destructive).
+**💡 Embedding dimension is auto-inferred by default** (`EMBEDDING_DIM=0`): Memoria probes your embedding service on startup to detect the correct dimension. The dimension is then locked into the database schema — changing models later requires dropping the schema (destructive). Set `EMBEDDING_DIM` explicitly if you need deterministic startup without a probe call.
 
 ---
 
