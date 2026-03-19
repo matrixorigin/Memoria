@@ -108,7 +108,7 @@ Tell user to restart their AI tool. Verify: `memory_retrieve("test")` → "No re
 ## Post-Setup
 
 ```bash
-memoria update-rules    # After upgrading binary, sync steering rules
+memoria rules --force   # After upgrading binary, sync steering rules
 ```
 
 ## MCP Server Modes

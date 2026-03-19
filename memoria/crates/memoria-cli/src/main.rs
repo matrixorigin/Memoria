@@ -5,7 +5,7 @@
 //!   memoria mcp           — start MCP server (embedded or remote mode)
 //!   memoria init          — detect tools, write MCP config + steering rules
 //!   memoria status        — show configuration status
-//!   memoria update-rules  — update steering rules to latest version
+//!   memoria rules         — write/update steering rules (auto-detect or --tool)
 //!   memoria benchmark     — run benchmark against a Memoria API server
 
 mod benchmark;
@@ -21,8 +21,20 @@ const MCP_KEY: &str = "memoria";
 // ── Embedded steering templates ───────────────────────────────────────────────
 
 const KIRO_STEERING: &str = include_str!("../templates/kiro_steering.md");
+const KIRO_SESSION_LIFECYCLE: &str = include_str!("../templates/kiro_session_lifecycle.md");
+const KIRO_MEMORY_HYGIENE: &str = include_str!("../templates/kiro_memory_hygiene.md");
+const KIRO_MEMORY_BRANCHING: &str = include_str!("../templates/kiro_memory_branching.md");
+const KIRO_GOAL_EVOLUTION: &str = include_str!("../templates/kiro_goal_evolution.md");
 const CURSOR_RULE: &str = include_str!("../templates/cursor_rule.md");
+const CURSOR_SESSION_LIFECYCLE: &str = include_str!("../templates/cursor_session_lifecycle.md");
+const CURSOR_MEMORY_HYGIENE: &str = include_str!("../templates/cursor_memory_hygiene.md");
+const CURSOR_MEMORY_BRANCHING: &str = include_str!("../templates/cursor_memory_branching.md");
+const CURSOR_GOAL_EVOLUTION: &str = include_str!("../templates/cursor_goal_evolution.md");
 const CLAUDE_RULE: &str = include_str!("../templates/claude_rule.md");
+const CLAUDE_SESSION_LIFECYCLE: &str = include_str!("../templates/claude_session_lifecycle.md");
+const CLAUDE_MEMORY_HYGIENE: &str = include_str!("../templates/claude_memory_hygiene.md");
+const CLAUDE_MEMORY_BRANCHING: &str = include_str!("../templates/claude_memory_branching.md");
+const CLAUDE_GOAL_EVOLUTION: &str = include_str!("../templates/claude_goal_evolution.md");
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
 
@@ -141,8 +153,18 @@ enum Commands {
     },
     /// Show MCP config and rule version status
     Status,
-    /// Update steering rules to latest version
-    UpdateRules,
+    /// Write/update steering rules (auto-detect or specify --tool, --force to overwrite)
+    Rules {
+        /// AI tool to write rules for (auto-detected if omitted)
+        #[arg(long, value_name = "kiro|cursor|claude")]
+        tool: Vec<ToolName>,
+        /// Interactive tool selection
+        #[arg(short = 'i', long)]
+        interactive: bool,
+        /// Overwrite existing rules even if up to date
+        #[arg(long)]
+        force: bool,
+    },
     /// Run benchmark against a Memoria API server
     Benchmark {
         #[arg(long, default_value = "http://127.0.0.1:8100")]
@@ -830,7 +852,7 @@ fn build_llm(cfg: &memoria_service::Config) -> Option<Arc<memoria_embedding::Llm
     })
 }
 
-// ── Init / Status / UpdateRules (unchanged logic) ─────────────────────────────
+// ── Init / Status / Rules ─────────────────────────────────────────────────
 
 #[allow(clippy::too_many_arguments)]
 fn mcp_entry(
@@ -920,7 +942,7 @@ fn detect_tools(project_dir: &Path) -> Vec<String> {
     if project_dir.join(".cursor").exists() || which_cmd("cursor").is_some() {
         tools.push("cursor".to_string());
     }
-    if project_dir.join(".mcp.json").exists() || which_cmd("claude").is_some() {
+    if project_dir.join(".mcp.json").exists() || project_dir.join(".claude").exists() || which_cmd("claude").is_some() {
         tools.push("claude".to_string());
     }
     tools
@@ -955,7 +977,7 @@ fn write_rule(path: &Path, content: &str, force: bool, project_dir: &Path) -> St
             }
             (Some(i), Some(b)) => {
                 return format!(
-                    "  ⚠ {} (v{} installed, v{} available — run update-rules or use --force)",
+                    "  ⚠ {} (v{} installed, v{} available — run 'memoria rules --force' to update)",
                     relative.display(),
                     i,
                     b
@@ -1000,60 +1022,53 @@ fn write_mcp_json(path: &Path, entry: &serde_json::Value, project_dir: &Path) ->
 }
 
 fn configure_kiro(project_dir: &Path, entry: &serde_json::Value, force: bool) -> Vec<String> {
+    let steering = project_dir.join(".kiro/steering");
     vec![
         write_mcp_json(
             &project_dir.join(".kiro/settings/mcp.json"),
             entry,
             project_dir,
         ),
-        write_rule(
-            &project_dir.join(".kiro/steering/memory.md"),
-            KIRO_STEERING,
-            force,
-            project_dir,
-        ),
+        write_rule(&steering.join("memory.md"), KIRO_STEERING, force, project_dir),
+        write_rule(&steering.join("session-lifecycle.md"), KIRO_SESSION_LIFECYCLE, force, project_dir),
+        write_rule(&steering.join("memory-hygiene.md"), KIRO_MEMORY_HYGIENE, force, project_dir),
+        write_rule(&steering.join("memory-branching-patterns.md"), KIRO_MEMORY_BRANCHING, force, project_dir),
+        write_rule(&steering.join("goal-driven-evolution.md"), KIRO_GOAL_EVOLUTION, force, project_dir),
     ]
 }
 
 fn configure_cursor(project_dir: &Path, entry: &serde_json::Value, force: bool) -> Vec<String> {
+    let rules = project_dir.join(".cursor/rules");
     vec![
         write_mcp_json(&project_dir.join(".cursor/mcp.json"), entry, project_dir),
-        write_rule(
-            &project_dir.join(".cursor/rules/memory.mdc"),
-            CURSOR_RULE,
-            force,
-            project_dir,
-        ),
+        write_rule(&rules.join("memory.mdc"), CURSOR_RULE, force, project_dir),
+        write_rule(&rules.join("session-lifecycle.mdc"), CURSOR_SESSION_LIFECYCLE, force, project_dir),
+        write_rule(&rules.join("memory-hygiene.mdc"), CURSOR_MEMORY_HYGIENE, force, project_dir),
+        write_rule(&rules.join("memory-branching-patterns.mdc"), CURSOR_MEMORY_BRANCHING, force, project_dir),
+        write_rule(&rules.join("goal-driven-evolution.mdc"), CURSOR_GOAL_EVOLUTION, force, project_dir),
     ]
 }
 
-fn configure_claude(project_dir: &Path, entry: &serde_json::Value, _force: bool) -> Vec<String> {
+fn configure_claude(project_dir: &Path, entry: &serde_json::Value, force: bool) -> Vec<String> {
+    let rules = project_dir.join(".claude/rules");
     let mut results = vec![write_mcp_json(
         &project_dir.join(".mcp.json"),
         entry,
         project_dir,
     )];
-    let claude_rule = CLAUDE_RULE.replace(
-        "memoria-version: 0.1.0",
-        &format!("memoria-version: {}", VERSION),
-    );
+    results.push(write_rule(&rules.join("memory.md"), CLAUDE_RULE, force, project_dir));
+    results.push(write_rule(&rules.join("session-lifecycle.md"), CLAUDE_SESSION_LIFECYCLE, force, project_dir));
+    results.push(write_rule(&rules.join("memory-hygiene.md"), CLAUDE_MEMORY_HYGIENE, force, project_dir));
+    results.push(write_rule(&rules.join("memory-branching-patterns.md"), CLAUDE_MEMORY_BRANCHING, force, project_dir));
+    results.push(write_rule(&rules.join("goal-driven-evolution.md"), CLAUDE_GOAL_EVOLUTION, force, project_dir));
+    // Warn if legacy CLAUDE.md contains memoria rules
     let claude_md = project_dir.join("CLAUDE.md");
     if claude_md.exists() {
-        let content = std::fs::read_to_string(&claude_md).unwrap_or_default();
-        if !content.contains("memory_retrieve") {
-            let mut f = std::fs::OpenOptions::new()
-                .append(true)
-                .open(&claude_md)
-                .unwrap();
-            use std::io::Write;
-            writeln!(f, "\n\n{}", claude_rule).ok();
-            results.push("  ✓ CLAUDE.md (appended memory rules)".to_string());
-        } else {
-            results.push("  ✓ CLAUDE.md (already has memory rules)".to_string());
+        if let Ok(content) = std::fs::read_to_string(&claude_md) {
+            if content.contains("memory_retrieve") {
+                results.push("  ⚠ CLAUDE.md contains legacy memoria rules — consider removing them (now in .claude/rules/)".to_string());
+            }
         }
-    } else {
-        std::fs::write(&claude_md, &claude_rule).ok();
-        results.push("  ✓ CLAUDE.md (created)".to_string());
     }
     results
 }
@@ -1385,21 +1400,15 @@ fn cmd_init_interactive(project_dir: &Path, force: bool) {
         .interact()
         .unwrap_or_else(|_| existing.db_user.clone());
     let db_pass: String = if existing.db_pass.is_empty() {
-        cliclack::password("Password")
-            .mask('▪')
+        cliclack::input("Password")
+            .default_input("111")
             .interact()
-            .unwrap_or_default()
+            .unwrap_or_else(|_| "111".into())
     } else {
-        let v: String = cliclack::password(format!("Password [{}]", mask_key(&existing.db_pass)))
-            .mask('▪')
-            .allow_empty()
+        cliclack::input("Password")
+            .default_input(&existing.db_pass)
             .interact()
-            .unwrap_or_default();
-        if v.is_empty() {
-            existing.db_pass.clone()
-        } else {
-            v
-        }
+            .unwrap_or_else(|_| existing.db_pass.clone())
     };
     let db_name: String = cliclack::input("Database")
         .default_input(&existing.db_name)
@@ -1637,7 +1646,7 @@ fn cmd_init(
         println!("\n📝 Generated config includes all environment variables (empty = not configured).\n   Edit the env block in the mcp.json file to fill in your values.");
     }
 
-    println!("\n📄 Steering rules teach your AI tool how to use memory effectively.\n   They are written alongside the MCP config and versioned with the binary.\n   After upgrading Memoria, run: memoria update-rules");
+    println!("\n📄 Steering rules teach your AI tool how to use memory effectively.\n   They are written alongside the MCP config and versioned with the binary.\n   After upgrading Memoria, run: memoria rules --force");
     println!("\n✅ Restart your AI tool to load the new configuration.");
 }
 
@@ -1648,62 +1657,175 @@ fn cmd_status(project_dir: &Path) {
         println!("No AI tool configs found.");
     }
     for tool in &tools {
-        let (mcp_path, rule_path) = match tool.as_str() {
-            "kiro" => (".kiro/settings/mcp.json", ".kiro/steering/memory.md"),
-            "cursor" => (".cursor/mcp.json", ".cursor/rules/memory.mdc"),
-            "claude" => (".mcp.json", "CLAUDE.md"),
-            _ => continue,
-        };
         println!("[{}]", tool);
-        let mcp = project_dir.join(mcp_path);
-        if mcp.exists() {
-            println!("  ✓ {}", mcp_path);
-        } else {
-            println!("  ✗ {} (missing)", mcp_path);
-        }
-        let rule = project_dir.join(rule_path);
-        if rule.exists() {
-            let ver = installed_version(&rule)
-                .map(|v| format!(" (v{})", v))
-                .unwrap_or_default();
-            println!("  ✓ {}{}", rule_path, ver);
-        } else {
-            println!("  ✗ {} (missing)", rule_path);
+        match tool.as_str() {
+            "kiro" => {
+                let mcp = project_dir.join(".kiro/settings/mcp.json");
+                if mcp.exists() {
+                    println!("  ✓ .kiro/settings/mcp.json");
+                } else {
+                    println!("  ✗ .kiro/settings/mcp.json (missing)");
+                }
+                let rules = [
+                    "memory.md",
+                    "session-lifecycle.md",
+                    "memory-hygiene.md",
+                    "memory-branching-patterns.md",
+                    "goal-driven-evolution.md",
+                ];
+                for name in &rules {
+                    let path = project_dir.join(".kiro/steering").join(name);
+                    let rel = format!(".kiro/steering/{}", name);
+                    if path.exists() {
+                        let ver = installed_version(&path)
+                            .map(|v| format!(" (v{})", v))
+                            .unwrap_or_default();
+                        println!("  ✓ {}{}", rel, ver);
+                    } else {
+                        println!("  ✗ {} (missing)", rel);
+                    }
+                }
+            }
+            "cursor" => {
+                let mcp = project_dir.join(".cursor/mcp.json");
+                if mcp.exists() {
+                    println!("  ✓ .cursor/mcp.json");
+                } else {
+                    println!("  ✗ .cursor/mcp.json (missing)");
+                }
+                let rules = [
+                    "memory.mdc",
+                    "session-lifecycle.mdc",
+                    "memory-hygiene.mdc",
+                    "memory-branching-patterns.mdc",
+                    "goal-driven-evolution.mdc",
+                ];
+                for name in &rules {
+                    let path = project_dir.join(".cursor/rules").join(name);
+                    let rel = format!(".cursor/rules/{}", name);
+                    if path.exists() {
+                        let ver = installed_version(&path)
+                            .map(|v| format!(" (v{})", v))
+                            .unwrap_or_default();
+                        println!("  ✓ {}{}", rel, ver);
+                    } else {
+                        println!("  ✗ {} (missing)", rel);
+                    }
+                }
+            }
+            "claude" => {
+                let mcp = project_dir.join(".mcp.json");
+                if mcp.exists() {
+                    println!("  ✓ .mcp.json");
+                } else {
+                    println!("  ✗ .mcp.json (missing)");
+                }
+                let rules = [
+                    "memory.md",
+                    "session-lifecycle.md",
+                    "memory-hygiene.md",
+                    "memory-branching-patterns.md",
+                    "goal-driven-evolution.md",
+                ];
+                for name in &rules {
+                    let path = project_dir.join(".claude/rules").join(name);
+                    let rel = format!(".claude/rules/{}", name);
+                    if path.exists() {
+                        let ver = installed_version(&path)
+                            .map(|v| format!(" (v{})", v))
+                            .unwrap_or_default();
+                        println!("  ✓ {}{}", rel, ver);
+                    } else {
+                        println!("  ✗ {} (missing)", rel);
+                    }
+                }
+            }
+            _ => continue,
         }
     }
     let bundled = VERSION;
     println!("\nBundled rule version: {}", bundled);
 }
 
-fn cmd_update_rules(project_dir: &Path) {
-    let tools = detect_tools(project_dir);
-    if tools.is_empty() {
-        println!("No AI tool configs found. Run 'memoria init' first.");
-        return;
-    }
-    for tool in &tools {
-        println!("[{}]", tool);
-        let result = match tool.as_str() {
-            "kiro" => write_rule(
-                &project_dir.join(".kiro/steering/memory.md"),
-                KIRO_STEERING,
-                true,
-                project_dir,
-            ),
-            "cursor" => write_rule(
-                &project_dir.join(".cursor/rules/memory.mdc"),
-                CURSOR_RULE,
-                true,
-                project_dir,
-            ),
-            "claude" => {
-                println!("  ⚠ CLAUDE.md — manual update recommended");
-                continue;
+fn write_rules_for_tool(project_dir: &Path, tool: &str, force: bool) {
+    match tool {
+        "kiro" => {
+            let steering = project_dir.join(".kiro/steering");
+            let pairs: &[(&str, &str)] = &[
+                ("memory.md", KIRO_STEERING),
+                ("session-lifecycle.md", KIRO_SESSION_LIFECYCLE),
+                ("memory-hygiene.md", KIRO_MEMORY_HYGIENE),
+                ("memory-branching-patterns.md", KIRO_MEMORY_BRANCHING),
+                ("goal-driven-evolution.md", KIRO_GOAL_EVOLUTION),
+            ];
+            for (name, content) in pairs {
+                println!("{}", write_rule(&steering.join(name), content, force, project_dir));
             }
-            _ => continue,
-        };
-        println!("{}", result);
+        }
+        "cursor" => {
+            let rules = project_dir.join(".cursor/rules");
+            let pairs: &[(&str, &str)] = &[
+                ("memory.mdc", CURSOR_RULE),
+                ("session-lifecycle.mdc", CURSOR_SESSION_LIFECYCLE),
+                ("memory-hygiene.mdc", CURSOR_MEMORY_HYGIENE),
+                ("memory-branching-patterns.mdc", CURSOR_MEMORY_BRANCHING),
+                ("goal-driven-evolution.mdc", CURSOR_GOAL_EVOLUTION),
+            ];
+            for (name, content) in pairs {
+                println!("{}", write_rule(&rules.join(name), content, force, project_dir));
+            }
+        }
+        "claude" => {
+            let rules = project_dir.join(".claude/rules");
+            let pairs: &[(&str, &str)] = &[
+                ("memory.md", CLAUDE_RULE),
+                ("session-lifecycle.md", CLAUDE_SESSION_LIFECYCLE),
+                ("memory-hygiene.md", CLAUDE_MEMORY_HYGIENE),
+                ("memory-branching-patterns.md", CLAUDE_MEMORY_BRANCHING),
+                ("goal-driven-evolution.md", CLAUDE_GOAL_EVOLUTION),
+            ];
+            for (name, content) in pairs {
+                println!("{}", write_rule(&rules.join(name), content, force, project_dir));
+            }
+        }
+        _ => {}
     }
+}
+
+fn cmd_rules(project_dir: &Path, tools: Vec<ToolName>, interactive: bool, force: bool) {
+    let tool_names: Vec<String> = if interactive {
+        cliclack::intro("memoria rules").ok();
+        let sel: usize = match cliclack::select("Which AI tool?")
+            .item(0, "Kiro", "")
+            .item(1, "Cursor", "")
+            .item(2, "Claude Code", "")
+            .item(3, "All", "")
+            .interact()
+        {
+            Ok(v) => v,
+            Err(_) => { cliclack::outro_cancel("Cancelled").ok(); return; }
+        };
+        match sel {
+            0 => vec!["kiro".to_string()],
+            1 => vec!["cursor".to_string()],
+            2 => vec!["claude".to_string()],
+            _ => vec!["kiro".to_string(), "cursor".to_string(), "claude".to_string()],
+        }
+    } else if tools.is_empty() {
+        let detected = detect_tools(project_dir);
+        if detected.is_empty() {
+            println!("No AI tool detected. Use --tool to specify one, or -i for interactive.");
+            return;
+        }
+        detected
+    } else {
+        tools.iter().map(|t| t.to_string()).collect()
+    };
+    for tool in &tool_names {
+        println!("[{}]", tool);
+        write_rules_for_tool(project_dir, tool, force);
+    }
+    println!("\n✅ Restart your AI tool to load the updated rules.");
 }
 
 fn cmd_benchmark(
@@ -1944,7 +2066,7 @@ fn main() -> Result<()> {
             }
         }
         Commands::Status => cmd_status(&project_dir),
-        Commands::UpdateRules => cmd_update_rules(&project_dir),
+        Commands::Rules { tool, interactive, force } => cmd_rules(&project_dir, tool, interactive, force),
         Commands::Benchmark {
             api_url,
             token,

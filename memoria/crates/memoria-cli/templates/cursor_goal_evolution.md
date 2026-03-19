@@ -1,5 +1,7 @@
 ---
-inclusion: agent_requested
+description: USE WHEN tracking goals, plans, progress, lessons, and user feedback across conversations using memory
+globs:
+alwaysApply: false
 ---
 
 <!-- memoria-version: 0.1.0-->
