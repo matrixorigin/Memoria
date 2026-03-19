@@ -392,6 +392,7 @@ impl SqlMemoryStore {
             r#"CREATE TABLE IF NOT EXISTS mem_async_tasks (
                 task_id     VARCHAR(64)  PRIMARY KEY,
                 instance_id VARCHAR(128) NOT NULL,
+                user_id     VARCHAR(64)  NOT NULL DEFAULT '',
                 status      VARCHAR(16)  NOT NULL DEFAULT 'processing',
                 result_json JSON         DEFAULT NULL,
                 error_json  JSON         DEFAULT NULL,
@@ -399,6 +400,14 @@ impl SqlMemoryStore {
                 updated_at  DATETIME(6)  NOT NULL,
                 INDEX idx_task_status (status, created_at)
             )"#,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+
+        // Backfill user_id column for existing deployments
+        let _ = sqlx::query(
+            "ALTER TABLE mem_async_tasks ADD COLUMN user_id VARCHAR(64) NOT NULL DEFAULT '' AFTER instance_id",
         )
         .execute(&self.pool)
         .await

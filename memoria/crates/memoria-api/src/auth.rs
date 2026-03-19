@@ -9,6 +9,7 @@ use axum::{
 use serde::Deserialize;
 use sha2::{Sha256, Digest};
 use sqlx::Row;
+use subtle::ConstantTimeEq;
 use tracing::warn;
 
 use crate::state::AppState;
@@ -50,7 +51,10 @@ impl FromRequestParts<AppState> for AuthUser {
 
         if let Some(token) = bearer {
             // 1) Master key — full access, fall through to X-User-Id extraction
-            if !state.master_key.is_empty() && token == state.master_key {
+            let master_match = !state.master_key.is_empty()
+                && token.len() == state.master_key.len()
+                && token.as_bytes().ct_eq(state.master_key.as_bytes()).into();
+            if master_match {
                 // fall through
             }
             // 2) API key — user_id resolved from DB, never master
@@ -102,11 +106,15 @@ async fn validate_api_key(token: &str, state: &AppState) -> Option<String> {
 
     // Update last_used_at (fire-and-forget)
     let pool = sql.pool().clone();
+    let hash = key_hash.clone();
     tokio::spawn(async move {
-        let _ = sqlx::query("UPDATE mem_api_keys SET last_used_at = NOW(6) WHERE key_hash = ?")
-            .bind(&key_hash)
+        if let Err(e) = sqlx::query("UPDATE mem_api_keys SET last_used_at = NOW(6) WHERE key_hash = ?")
+            .bind(&hash)
             .execute(&pool)
-            .await;
+            .await
+        {
+            warn!("Failed to update API key last_used_at: {e}");
+        }
     });
 
     row.try_get::<String, _>("user_id").ok()

@@ -157,6 +157,7 @@ impl DistributedLock for SqlMemoryStore {
 pub struct AsyncTask {
     pub task_id: String,
     pub instance_id: String,
+    pub user_id: String,
     pub status: String,
     pub result: Option<serde_json::Value>,
     pub error: Option<serde_json::Value>,
@@ -167,7 +168,7 @@ pub struct AsyncTask {
 /// Trait for cross-instance async task tracking (e.g. episodic summary generation).
 #[async_trait]
 pub trait AsyncTaskStore: Send + Sync {
-    async fn create_task(&self, task_id: &str, instance_id: &str) -> Result<(), MemoriaError>;
+    async fn create_task(&self, task_id: &str, instance_id: &str, user_id: &str) -> Result<(), MemoriaError>;
     async fn complete_task(
         &self,
         task_id: &str,
@@ -179,13 +180,14 @@ pub trait AsyncTaskStore: Send + Sync {
 
 #[async_trait]
 impl AsyncTaskStore for SqlMemoryStore {
-    async fn create_task(&self, task_id: &str, instance_id: &str) -> Result<(), MemoriaError> {
+    async fn create_task(&self, task_id: &str, instance_id: &str, user_id: &str) -> Result<(), MemoriaError> {
         sqlx::query(
-            "INSERT INTO mem_async_tasks (task_id, instance_id, status, created_at, updated_at) \
-             VALUES (?, ?, 'processing', NOW(), NOW())",
+            "INSERT INTO mem_async_tasks (task_id, instance_id, user_id, status, created_at, updated_at) \
+             VALUES (?, ?, ?, 'processing', NOW(), NOW())",
         )
         .bind(task_id)
         .bind(instance_id)
+        .bind(user_id)
         .execute(self.pool())
         .await
         .map_err(db_err)?;
@@ -224,7 +226,7 @@ impl AsyncTaskStore for SqlMemoryStore {
 
     async fn get_task(&self, task_id: &str) -> Result<Option<AsyncTask>, MemoriaError> {
         let row = sqlx::query(
-            "SELECT task_id, instance_id, status, result_json, error_json, \
+            "SELECT task_id, instance_id, user_id, status, result_json, error_json, \
                     created_at, updated_at \
              FROM mem_async_tasks WHERE task_id = ?",
         )
@@ -240,6 +242,7 @@ impl AsyncTaskStore for SqlMemoryStore {
             AsyncTask {
                 task_id: r.get("task_id"),
                 instance_id: r.get("instance_id"),
+                user_id: r.get("user_id"),
                 status: r.get("status"),
                 result: r.get::<Option<serde_json::Value>, _>("result_json"),
                 error: r.get::<Option<serde_json::Value>, _>("error_json"),

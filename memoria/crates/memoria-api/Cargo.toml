@@ -32,6 +32,7 @@ chrono = { workspace = true }
 uuid = { workspace = true }
 sqlx = { workspace = true }
 sha2 = "0.10"
+subtle = "2.6"
 base64 = "0.22"
 tempfile = "3.14"
 

@@ -3568,7 +3568,7 @@ async fn test_distributed_async_task_cross_instance() {
     let task_id = format!("task_{}", uuid::Uuid::new_v4().simple());
 
     // Create task on "instance_a"
-    store.create_task(&task_id, "instance_a").await.unwrap();
+    store.create_task(&task_id, "instance_a", "test_user").await.unwrap();
 
     // Read from "instance_b" perspective (same store, simulating different instance)
     let task = store
@@ -3608,7 +3608,7 @@ async fn test_distributed_async_task_fail() {
     store.migrate().await.expect("migrate");
 
     let task_id = format!("task_{}", uuid::Uuid::new_v4().simple());
-    store.create_task(&task_id, "instance_x").await.unwrap();
+    store.create_task(&task_id, "instance_x", "test_user").await.unwrap();
     store
         .fail_task(&task_id, json!({"code": "ERR", "message": "boom"}))
         .await
