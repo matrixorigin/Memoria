@@ -3,11 +3,11 @@
 //!
 //! Parity with Python version:
 //! - snapshot names prefixed with "mem_snap_", sanitized to 40 chars
-//! - snapshot list filters to mem_snap_/mem_milestone_ only, strips prefix for display
+//! - snapshot list filters to current user's mem_snap_ + global mem_milestone_, strips prefix for display
 //! - snapshot delete supports names, prefix, older_than
-//! - snapshot limit: 1000
+//! - snapshot limit: 20 per user
 //! - rollback restores mem_memories + graph tables
-//! - branch limit: 20 (global)
+//! - branch limit: 20 per user
 //! - branch duplicate name rejected (including deleted)
 //! - branch name sanitized to 40 chars
 
@@ -17,12 +17,15 @@ use memoria_git::GitForDataService;
 use memoria_service::MemoryService;
 use serde_json::{json, Value};
 use sqlx::Row;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use uuid::Uuid;
 
-const MAX_SNAPSHOTS: i64 = 1000;
+const MAX_USER_SNAPSHOTS: i64 = 20;
 const MAX_BRANCHES: i64 = 20;
 const SNAP_PREFIX: &str = "mem_snap_";
+const MILESTONE_PREFIX: &str = "mem_milestone_";
+const SAFETY_PREFIX: &str = "mem_snap_pre_";
 
 /// Sanitize a user-provided name: keep alphanumeric+underscore, truncate to 40 chars.
 /// If result starts with non-alpha, prepend "s_".
@@ -46,7 +49,7 @@ fn sanitize_name(name: &str) -> String {
 
 /// Convert user-facing snapshot name → internal MatrixOne snapshot name.
 fn snap_internal(name: &str) -> String {
-    if name.starts_with(SNAP_PREFIX) || name.starts_with("mem_milestone_") {
+    if name.starts_with(SNAP_PREFIX) || name.starts_with(MILESTONE_PREFIX) {
         name.to_string()
     } else {
         format!("{SNAP_PREFIX}{}", sanitize_name(name))
@@ -57,11 +60,106 @@ fn snap_internal(name: &str) -> String {
 fn snap_display(internal: &str) -> String {
     if let Some(rest) = internal.strip_prefix(SNAP_PREFIX) {
         rest.to_string()
-    } else if let Some(rest) = internal.strip_prefix("mem_milestone_") {
+    } else if let Some(rest) = internal.strip_prefix(MILESTONE_PREFIX) {
         format!("auto:{rest}")
     } else {
         internal.to_string()
     }
+}
+
+#[derive(Clone)]
+struct VisibleSnapshot {
+    display_name: String,
+    internal_name: String,
+    timestamp: Option<NaiveDateTime>,
+    registered: bool,
+}
+
+fn milestone_internal(name: &str) -> Option<String> {
+    if let Some(rest) = name.strip_prefix("auto:") {
+        Some(format!("{MILESTONE_PREFIX}{rest}"))
+    } else if name.starts_with(MILESTONE_PREFIX) {
+        Some(name.to_string())
+    } else {
+        None
+    }
+}
+
+fn snapshot_store(svc: &Arc<MemoryService>) -> Result<&memoria_storage::SqlMemoryStore> {
+    svc.sql_store
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("Snapshot ops require SQL store"))
+}
+
+async fn visible_snapshots_for_user(
+    git: &Arc<GitForDataService>,
+    svc: &Arc<MemoryService>,
+    user_id: &str,
+) -> Result<Vec<VisibleSnapshot>> {
+    let sql = snapshot_store(svc)?;
+    let all = git.list_snapshots().await?;
+    let actual_by_name: HashMap<String, memoria_git::Snapshot> = all
+        .into_iter()
+        .filter(|s| {
+            s.snapshot_name.starts_with(SNAP_PREFIX)
+                || s.snapshot_name.starts_with(MILESTONE_PREFIX)
+        })
+        .map(|s| (s.snapshot_name.clone(), s))
+        .collect();
+
+    let mut snapshots = Vec::new();
+    let mut seen_internal = HashSet::new();
+    for reg in sql.list_snapshot_registrations(user_id).await? {
+        if let Some(actual) = actual_by_name.get(&reg.snapshot_name) {
+            seen_internal.insert(reg.snapshot_name.clone());
+            snapshots.push(VisibleSnapshot {
+                display_name: reg.name,
+                internal_name: reg.snapshot_name,
+                timestamp: actual.timestamp.or(Some(reg.created_at)),
+                registered: true,
+            });
+        }
+    }
+
+    for actual in actual_by_name.values() {
+        if !seen_internal.contains(&actual.snapshot_name)
+            && (actual.snapshot_name.starts_with(MILESTONE_PREFIX)
+                || actual.snapshot_name.starts_with(SAFETY_PREFIX))
+        {
+            snapshots.push(VisibleSnapshot {
+                display_name: snap_display(&actual.snapshot_name),
+                internal_name: actual.snapshot_name.clone(),
+                timestamp: actual.timestamp,
+                registered: false,
+            });
+        }
+    }
+
+    snapshots.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+    Ok(snapshots)
+}
+
+async fn resolve_snapshot_for_user(
+    git: &Arc<GitForDataService>,
+    svc: &Arc<MemoryService>,
+    user_id: &str,
+    name: &str,
+) -> Result<Option<String>> {
+    if let Some(internal) = milestone_internal(name) {
+        return Ok(git.get_snapshot(&internal).await?.map(|_| internal));
+    }
+    if name.starts_with(SAFETY_PREFIX) {
+        return Ok(git.get_snapshot(name).await?.map(|_| name.to_string()));
+    }
+
+    let sql = snapshot_store(svc)?;
+    let reg = if name.starts_with(SNAP_PREFIX) {
+        sql.get_snapshot_registration_by_internal(user_id, name)
+            .await?
+    } else {
+        sql.get_snapshot_registration(user_id, name).await?
+    };
+    Ok(reg.map(|r| r.snapshot_name))
 }
 
 pub fn list() -> Value {
@@ -192,43 +290,33 @@ pub async fn call(
 ) -> Result<Value> {
     match name {
         "memory_snapshot" => {
-            // Check global snapshot limit
-            let all = git.list_snapshots().await?;
-            let mem_snaps = all
-                .iter()
-                .filter(|s| {
-                    s.snapshot_name.starts_with(SNAP_PREFIX)
-                        || s.snapshot_name.starts_with("mem_milestone_")
-                })
+            let user_snapshots = visible_snapshots_for_user(git, svc, user_id)
+                .await?
+                .into_iter()
+                .filter(|s| s.registered)
                 .count() as i64;
-            if mem_snaps >= MAX_SNAPSHOTS {
+            if user_snapshots >= MAX_USER_SNAPSHOTS {
                 return Ok(mcp_text(&format!(
-                    "Snapshot limit reached ({MAX_SNAPSHOTS}). Delete old snapshots first."
+                    "Snapshot limit reached ({MAX_USER_SNAPSHOTS}) for user {user_id}. Delete old snapshots first."
                 )));
             }
             let snap_name = args["name"].as_str().unwrap_or("");
             let internal = snap_internal(snap_name);
+            let display = snap_display(&internal);
             let snap = git.create_snapshot(&internal).await?;
+            snapshot_store(svc)?
+                .register_snapshot(user_id, &display, &snap.snapshot_name)
+                .await?;
             Ok(mcp_text(&format!(
                 "Snapshot '{}' created at {:?}",
-                snap_display(&snap.snapshot_name),
-                snap.timestamp
+                display, snap.timestamp
             )))
         }
 
         "memory_snapshots" => {
             let limit = args["limit"].as_i64().unwrap_or(20) as usize;
             let offset = args["offset"].as_i64().unwrap_or(0) as usize;
-            let all = git.list_snapshots().await?;
-            // Filter to mem_snap_/mem_milestone_ only, sorted newest first
-            let mut snaps: Vec<_> = all
-                .into_iter()
-                .filter(|s| {
-                    s.snapshot_name.starts_with(SNAP_PREFIX)
-                        || s.snapshot_name.starts_with("mem_milestone_")
-                })
-                .collect();
-            snaps.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+            let snaps = visible_snapshots_for_user(git, svc, user_id).await?;
             let total = snaps.len();
             let page: Vec<_> = snaps.into_iter().skip(offset).take(limit).collect();
             if page.is_empty() {
@@ -239,7 +327,7 @@ pub async fn call(
                 .map(|s| {
                     format!(
                         "{} ({})",
-                        snap_display(&s.snapshot_name),
+                        s.display_name,
                         s.timestamp.map(|t| t.to_string()).unwrap_or_default()
                     )
                 })
@@ -249,31 +337,24 @@ pub async fn call(
         }
 
         "memory_snapshot_delete" => {
-            // Get the filtered list (mem_snap_/mem_milestone_ only)
-            let all = git.list_snapshots().await?;
-            let snaps: Vec<_> = all
-                .into_iter()
-                .filter(|s| {
-                    s.snapshot_name.starts_with(SNAP_PREFIX)
-                        || s.snapshot_name.starts_with("mem_milestone_")
-                })
-                .collect();
+            let sql = snapshot_store(svc)?;
+            let snaps = visible_snapshots_for_user(git, svc, user_id).await?;
 
-            let to_delete: Vec<String> = if let Some(names) = args["names"].as_str() {
-                // User passes display names (without prefix)
-                let name_set: std::collections::HashSet<String> =
-                    names.split(',').map(|n| snap_internal(n.trim())).collect();
+            let to_delete: Vec<VisibleSnapshot> = if let Some(names) = args["names"].as_str() {
+                let name_set: HashSet<String> =
+                    names.split(',').map(|n| n.trim().to_string()).collect();
                 snaps
                     .iter()
-                    .filter(|s| name_set.contains(&s.snapshot_name))
-                    .map(|s| s.snapshot_name.clone())
+                    .filter(|s| {
+                        name_set.contains(&s.display_name) || name_set.contains(&s.internal_name)
+                    })
+                    .cloned()
                     .collect()
             } else if let Some(prefix) = args["prefix"].as_str() {
-                // Match against display names
                 snaps
                     .iter()
-                    .filter(|s| snap_display(&s.snapshot_name).starts_with(prefix))
-                    .map(|s| s.snapshot_name.clone())
+                    .filter(|s| s.display_name.starts_with(prefix))
+                    .cloned()
                     .collect()
             } else if let Some(older_than) = args["older_than"].as_str() {
                 let cutoff = NaiveDateTime::parse_from_str(
@@ -285,17 +366,21 @@ pub async fn call(
                 snaps
                     .iter()
                     .filter(|s| s.timestamp.map(|t| t < cutoff).unwrap_or(false))
-                    .map(|s| s.snapshot_name.clone())
+                    .cloned()
                     .collect()
             } else {
                 return Ok(mcp_text("Specify 'names', 'prefix', or 'older_than'"));
             };
 
             let count = to_delete.len();
-            for n in &to_delete {
-                git.drop_snapshot(n).await?;
+            for snapshot in &to_delete {
+                git.drop_snapshot(&snapshot.internal_name).await?;
+                if snapshot.registered {
+                    sql.deregister_snapshot_by_internal(user_id, &snapshot.internal_name)
+                        .await?;
+                }
             }
-            let display: Vec<_> = to_delete.iter().map(|n| snap_display(n)).collect();
+            let display: Vec<_> = to_delete.iter().map(|s| s.display_name.clone()).collect();
             Ok(mcp_text(&format!(
                 "Deleted {count} snapshot(s): {}",
                 display.join(", ")
@@ -304,7 +389,9 @@ pub async fn call(
 
         "memory_rollback" => {
             let snap_name = args["name"].as_str().unwrap_or("");
-            let internal = snap_internal(snap_name);
+            let internal = resolve_snapshot_for_user(git, svc, user_id, snap_name)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("Snapshot '{snap_name}' not found"))?;
             // Restore mem_memories (required) + graph tables (best-effort, like Python)
             git.restore_table_from_snapshot("mem_memories", &internal)
                 .await

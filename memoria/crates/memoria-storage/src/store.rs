@@ -80,6 +80,13 @@ pub struct SqlMemoryStore {
     embedding_dim: usize,
 }
 
+#[derive(Debug, Clone)]
+pub struct SnapshotRegistration {
+    pub name: String,
+    pub snapshot_name: String,
+    pub created_at: chrono::NaiveDateTime,
+}
+
 impl SqlMemoryStore {
     pub fn new(pool: MySqlPool, embedding_dim: usize) -> Self {
         Self {
@@ -173,6 +180,23 @@ impl SqlMemoryStore {
                 status      VARCHAR(20)  NOT NULL DEFAULT 'active',
                 created_at  DATETIME(6)  NOT NULL,
                 INDEX idx_user_name (user_id, name)
+            )"#,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+
+        // mem_snapshots — user snapshot registry
+        sqlx::query(
+            r#"CREATE TABLE IF NOT EXISTS mem_snapshots (
+                id             VARCHAR(64)  PRIMARY KEY,
+                user_id        VARCHAR(64)  NOT NULL,
+                name           VARCHAR(100) NOT NULL,
+                snapshot_name  VARCHAR(100) NOT NULL,
+                status         VARCHAR(20)  NOT NULL DEFAULT 'active',
+                created_at     DATETIME(6)  NOT NULL,
+                INDEX idx_user_snapshot_name (user_id, name, status),
+                INDEX idx_user_snapshot_internal (user_id, snapshot_name, status)
             )"#,
         )
         .execute(&self.pool)
@@ -672,6 +696,138 @@ impl SqlMemoryStore {
                 ))
             })
             .collect()
+    }
+
+    pub async fn register_snapshot(
+        &self,
+        user_id: &str,
+        name: &str,
+        snapshot_name: &str,
+    ) -> Result<(), MemoriaError> {
+        let now = Utc::now().naive_utc();
+        let id = uuid::Uuid::new_v4().simple().to_string();
+        sqlx::query(
+            r#"INSERT INTO mem_snapshots (id, user_id, name, snapshot_name, status, created_at)
+               VALUES (?, ?, ?, ?, 'active', ?)"#,
+        )
+        .bind(id)
+        .bind(user_id)
+        .bind(name)
+        .bind(snapshot_name)
+        .bind(now)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    pub async fn get_snapshot_registration(
+        &self,
+        user_id: &str,
+        name: &str,
+    ) -> Result<Option<SnapshotRegistration>, MemoriaError> {
+        let row = sqlx::query(
+            "SELECT name, snapshot_name, created_at \
+             FROM mem_snapshots \
+             WHERE user_id = ? AND name = ? AND status = 'active' \
+             ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(user_id)
+        .bind(name)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+
+        row.map(|r| {
+            Ok(SnapshotRegistration {
+                name: r.try_get("name").map_err(db_err)?,
+                snapshot_name: r.try_get("snapshot_name").map_err(db_err)?,
+                created_at: r.try_get("created_at").map_err(db_err)?,
+            })
+        })
+        .transpose()
+    }
+
+    pub async fn get_snapshot_registration_by_internal(
+        &self,
+        user_id: &str,
+        snapshot_name: &str,
+    ) -> Result<Option<SnapshotRegistration>, MemoriaError> {
+        let row = sqlx::query(
+            "SELECT name, snapshot_name, created_at \
+             FROM mem_snapshots \
+             WHERE user_id = ? AND snapshot_name = ? AND status = 'active' \
+             ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(user_id)
+        .bind(snapshot_name)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+
+        row.map(|r| {
+            Ok(SnapshotRegistration {
+                name: r.try_get("name").map_err(db_err)?,
+                snapshot_name: r.try_get("snapshot_name").map_err(db_err)?,
+                created_at: r.try_get("created_at").map_err(db_err)?,
+            })
+        })
+        .transpose()
+    }
+
+    pub async fn list_snapshot_registrations(
+        &self,
+        user_id: &str,
+    ) -> Result<Vec<SnapshotRegistration>, MemoriaError> {
+        let rows = sqlx::query(
+            "SELECT name, snapshot_name, created_at \
+             FROM mem_snapshots \
+             WHERE user_id = ? AND status = 'active' \
+             ORDER BY created_at DESC",
+        )
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+
+        rows.iter()
+            .map(|r| {
+                Ok(SnapshotRegistration {
+                    name: r.try_get("name").map_err(db_err)?,
+                    snapshot_name: r.try_get("snapshot_name").map_err(db_err)?,
+                    created_at: r.try_get("created_at").map_err(db_err)?,
+                })
+            })
+            .collect()
+    }
+
+    pub async fn deregister_snapshot(&self, user_id: &str, name: &str) -> Result<(), MemoriaError> {
+        sqlx::query(
+            "UPDATE mem_snapshots SET status = 'deleted' WHERE user_id = ? AND name = ? AND status = 'active'",
+        )
+        .bind(user_id)
+        .bind(name)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    pub async fn deregister_snapshot_by_internal(
+        &self,
+        user_id: &str,
+        snapshot_name: &str,
+    ) -> Result<(), MemoriaError> {
+        sqlx::query(
+            "UPDATE mem_snapshots SET status = 'deleted' \
+             WHERE user_id = ? AND snapshot_name = ? AND status = 'active'",
+        )
+        .bind(user_id)
+        .bind(snapshot_name)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(())
     }
 
     // ── Governance ────────────────────────────────────────────────────────────

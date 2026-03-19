@@ -550,6 +550,127 @@ async fn test_multiuser_snapshot_isolation() {
     .await;
 }
 
+#[tokio::test]
+#[serial]
+async fn test_snapshot_limit_is_per_user_and_capped_at_20() {
+    let (svc, git, _) = setup().await;
+    let uid_a = uid();
+    let uid_b = uid();
+
+    let names_a: Vec<String> = (0..20).map(|i| snap(&format!("cap_a_{i}"))).collect();
+    for name in &names_a {
+        let r = git_call("memory_snapshot", json!({"name": name}), &git, &svc, &uid_a).await;
+        assert!(
+            text(&r).contains("created"),
+            "A create failed: {}",
+            text(&r)
+        );
+    }
+
+    let extra_a = snap("cap_a_overflow");
+    let r = git_call(
+        "memory_snapshot",
+        json!({"name": extra_a}),
+        &git,
+        &svc,
+        &uid_a,
+    )
+    .await;
+    assert!(
+        text(&r).contains("Snapshot limit reached (20)"),
+        "expected per-user cap message, got: {}",
+        text(&r)
+    );
+
+    let first_b = snap("cap_b_first");
+    let r = git_call(
+        "memory_snapshot",
+        json!({"name": first_b}),
+        &git,
+        &svc,
+        &uid_b,
+    )
+    .await;
+    assert!(
+        text(&r).contains("created"),
+        "user B should not be blocked by user A's cap: {}",
+        text(&r)
+    );
+
+    let r = git_call("memory_snapshots", json!({"limit": 50}), &git, &svc, &uid_b).await;
+    let t = text(&r);
+    assert!(t.contains(&first_b), "B should see own snapshot: {t}");
+    assert!(
+        !t.contains(&names_a[0]),
+        "B should not see A's snapshots in list: {t}"
+    );
+
+    git_call(
+        "memory_snapshot_delete",
+        json!({"names": names_a.join(",")}),
+        &git,
+        &svc,
+        &uid_a,
+    )
+    .await;
+    git_call(
+        "memory_snapshot_delete",
+        json!({"names": first_b}),
+        &git,
+        &svc,
+        &uid_b,
+    )
+    .await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_snapshot_delete_is_scoped_to_owner() {
+    let (svc, git, _) = setup().await;
+    let uid_a = uid();
+    let uid_b = uid();
+    let snap_a = snap("owned");
+
+    git_call(
+        "memory_snapshot",
+        json!({"name": snap_a}),
+        &git,
+        &svc,
+        &uid_a,
+    )
+    .await;
+
+    let r = git_call(
+        "memory_snapshot_delete",
+        json!({"names": snap_a}),
+        &git,
+        &svc,
+        &uid_b,
+    )
+    .await;
+    assert!(
+        text(&r).contains("Deleted 0 snapshot(s)"),
+        "non-owner delete should be ignored: {}",
+        text(&r)
+    );
+
+    let r = git_call("memory_snapshots", json!({"limit": 20}), &git, &svc, &uid_a).await;
+    assert!(
+        text(&r).contains(&snap_a),
+        "owner should still see snapshot after foreign delete attempt: {}",
+        text(&r)
+    );
+
+    git_call(
+        "memory_snapshot_delete",
+        json!({"names": snap_a}),
+        &git,
+        &svc,
+        &uid_a,
+    )
+    .await;
+}
+
 // ── 10. older_than delete ─────────────────────────────────────────────────────
 
 #[tokio::test]

@@ -50,6 +50,61 @@ async fn git_call(
     Ok(json!({ "result": text }))
 }
 
+fn validate_snapshot_identifier(name: &str) -> Result<&str, (StatusCode, String)> {
+    if !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+        Ok(name)
+    } else {
+        Err((StatusCode::BAD_REQUEST, "Invalid snapshot name".into()))
+    }
+}
+
+fn milestone_internal(name: &str) -> Option<String> {
+    if let Some(rest) = name.strip_prefix("auto:") {
+        Some(format!("mem_milestone_{rest}"))
+    } else if name.starts_with("mem_milestone_") || name.starts_with("mem_snap_pre_") {
+        Some(name.to_string())
+    } else {
+        None
+    }
+}
+
+async fn resolve_snapshot_internal(
+    state: &AppState,
+    user_id: &str,
+    name: &str,
+) -> Result<String, (StatusCode, String)> {
+    let sql = state
+        .service
+        .sql_store
+        .as_ref()
+        .ok_or((StatusCode::SERVICE_UNAVAILABLE, "SQL store required".into()))?;
+
+    let internal = if let Some(milestone) = milestone_internal(name) {
+        milestone
+    } else if name.starts_with("mem_snap_") {
+        sql.get_snapshot_registration_by_internal(user_id, name)
+            .await
+            .map_err(api_err)?
+            .map(|r| r.snapshot_name)
+            .ok_or((StatusCode::NOT_FOUND, "Snapshot not found".into()))?
+    } else {
+        sql.get_snapshot_registration(user_id, name)
+            .await
+            .map_err(api_err)?
+            .map(|r| r.snapshot_name)
+            .ok_or((StatusCode::NOT_FOUND, "Snapshot not found".into()))?
+    };
+
+    let internal = validate_snapshot_identifier(&internal)?.to_string();
+    state
+        .git
+        .get_snapshot(&internal)
+        .await
+        .map_err(api_err)?
+        .ok_or((StatusCode::NOT_FOUND, "Snapshot not found".into()))?;
+    Ok(internal)
+}
+
 pub async fn create_snapshot(
     State(state): State<AppState>,
     AuthUser { user_id, .. }: AuthUser,
@@ -94,7 +149,7 @@ pub async fn get_snapshot(
         .map(|s| s.pool())
         .ok_or((StatusCode::SERVICE_UNAVAILABLE, "SQL store required".into()))?;
 
-    let snap_name = format!("mem_snap_{name}");
+    let snap_name = resolve_snapshot_internal(&state, &user_id, &name).await?;
     let limit = q.limit.unwrap_or(50).min(500);
     let offset = q.offset.unwrap_or(0);
     let detail = q.detail.as_deref().unwrap_or("brief");
@@ -193,7 +248,7 @@ pub async fn diff_snapshot(
         .map(|s| s.pool())
         .ok_or((StatusCode::SERVICE_UNAVAILABLE, "SQL store required".into()))?;
 
-    let snap_name = format!("mem_snap_{name}");
+    let snap_name = resolve_snapshot_internal(&state, &user_id, &name).await?;
     let limit = q.limit.unwrap_or(50).min(200);
 
     // Counts

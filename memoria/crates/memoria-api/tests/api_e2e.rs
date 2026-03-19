@@ -664,8 +664,7 @@ async fn test_api_key_cannot_delete_other_users_memory() {
     let auth = format!("Bearer {mk}");
     let owner_id = uid();
     let attacker_id = uid();
-    let owner_key =
-        create_api_key_for_user(&client, &base, &auth, &owner_id, "owner-del").await;
+    let owner_key = create_api_key_for_user(&client, &base, &auth, &owner_id, "owner-del").await;
     let attacker_key =
         create_api_key_for_user(&client, &base, &auth, &attacker_id, "attacker-del").await;
 
@@ -2907,6 +2906,155 @@ async fn test_snapshot_diff_no_changes() {
     client
         .delete(format!("{base}/v1/snapshots/{snap}"))
         .header("X-User-Id", &uid)
+        .send()
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn test_api_snapshot_limit_is_per_user() {
+    let (base, client) = spawn_server().await;
+    let uid_a = uid();
+    let uid_b = uid();
+    let names_a: Vec<String> = (0..20)
+        .map(|i| {
+            format!(
+                "api_cap_a_{i}_{}",
+                &uuid::Uuid::new_v4().simple().to_string()[..6]
+            )
+        })
+        .collect();
+
+    for name in &names_a {
+        let r = client
+            .post(format!("{base}/v1/snapshots"))
+            .header("X-User-Id", &uid_a)
+            .json(&json!({"name": name}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 201);
+        let body: Value = r.json().await.unwrap();
+        let result = body["result"].as_str().unwrap_or("");
+        assert!(
+            result.contains("created"),
+            "snapshot create failed: {result}"
+        );
+    }
+
+    let overflow = format!(
+        "api_cap_overflow_{}",
+        &uuid::Uuid::new_v4().simple().to_string()[..6]
+    );
+    let r = client
+        .post(format!("{base}/v1/snapshots"))
+        .header("X-User-Id", &uid_a)
+        .json(&json!({"name": overflow}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 201);
+    let body: Value = r.json().await.unwrap();
+    assert!(
+        body["result"]
+            .as_str()
+            .unwrap_or("")
+            .contains("Snapshot limit reached (20)"),
+        "expected per-user cap message: {body}"
+    );
+
+    let b_snap = format!(
+        "api_cap_b_{}",
+        &uuid::Uuid::new_v4().simple().to_string()[..6]
+    );
+    let r = client
+        .post(format!("{base}/v1/snapshots"))
+        .header("X-User-Id", &uid_b)
+        .json(&json!({"name": b_snap}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 201);
+    let body: Value = r.json().await.unwrap();
+    assert!(
+        body["result"].as_str().unwrap_or("").contains("created"),
+        "user B should still be able to create: {body}"
+    );
+
+    let r = client
+        .get(format!("{base}/v1/snapshots"))
+        .header("X-User-Id", &uid_b)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let body: Value = r.json().await.unwrap();
+    let listed = body["result"].as_str().unwrap_or("");
+    assert!(
+        listed.contains(&b_snap),
+        "B should see own snapshot: {listed}"
+    );
+    assert!(
+        !listed.contains(&names_a[0]),
+        "B should not see A's snapshots: {listed}"
+    );
+
+    client
+        .post(format!("{base}/v1/snapshots/delete"))
+        .header("X-User-Id", &uid_a)
+        .json(&json!({"names": names_a.join(",")}))
+        .send()
+        .await
+        .unwrap();
+    client
+        .delete(format!("{base}/v1/snapshots/{b_snap}"))
+        .header("X-User-Id", &uid_b)
+        .send()
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn test_api_snapshot_detail_is_scoped_to_owner() {
+    let (base, client) = spawn_server().await;
+    let uid_a = uid();
+    let uid_b = uid();
+    let snap = format!(
+        "api_owned_{}",
+        &uuid::Uuid::new_v4().simple().to_string()[..6]
+    );
+
+    client
+        .post(format!("{base}/v1/memories"))
+        .header("X-User-Id", &uid_a)
+        .json(&json!({"content": "owner snapshot detail"}))
+        .send()
+        .await
+        .unwrap();
+
+    client
+        .post(format!("{base}/v1/snapshots"))
+        .header("X-User-Id", &uid_a)
+        .json(&json!({"name": snap}))
+        .send()
+        .await
+        .unwrap();
+
+    let r = client
+        .get(format!("{base}/v1/snapshots/{snap}"))
+        .header("X-User-Id", &uid_b)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        r.status(),
+        404,
+        "non-owner should not resolve snapshot detail"
+    );
+
+    client
+        .delete(format!("{base}/v1/snapshots/{snap}"))
+        .header("X-User-Id", &uid_a)
         .send()
         .await
         .unwrap();
