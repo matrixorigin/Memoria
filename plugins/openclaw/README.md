@@ -27,6 +27,15 @@ If you want the shortest OpenClaw-native path:
 - install the plugin with `openclaw plugins install`
 - let the plugin install or validate the Rust `memoria` runtime through `openclaw memoria install`
 
+If you want one installer to check OpenClaw, Memoria, and the default local MatrixOne target for you, use:
+
+```bash
+bash plugins/openclaw/scripts/install-openclaw-memoria.sh \
+  --install-openclaw \
+  --ensure-matrixone \
+  --verify
+```
+
 Example:
 
 ```bash
@@ -75,11 +84,21 @@ Important environment variables:
 Installer flags:
 
 - `--openclaw-bin <path|command>`: use an explicit `openclaw` executable
+- `--install-openclaw`: install OpenClaw with npm if it is missing
+- `--openclaw-version <tag>`: OpenClaw npm version/dist-tag to install
+- `--openclaw-prefix <path>`: npm global prefix for automatic OpenClaw installs
 - `--memoria-bin <path|command>`: use an existing `memoria` executable
 - `--memoria-version <tag>`: override the Rust Memoria release tag
 - `--memoria-install-dir <path>`: where to install `memoria` if it is missing
 - `--skip-memoria-install`: require an existing `memoria` executable
 - `--skip-plugin-install`: only rewrite plugin config; assume OpenClaw already installed and the plugin already loaded
+- `--ensure-matrixone`: install or repair the default local MatrixOne target via `mo_ctl`
+- `--skip-matrixone-check`: skip MatrixOne readiness checks
+- `--matrixone-version <ref>`: MatrixOne ref/version for `mo_ctl deploy`
+- `--matrixone-deploy-mode <mode>`: `docker` or `git`
+- `--matrixone-data-dir <path>`: data dir used for `mo_ctl` docker deploys
+- `--install-system-deps`: install the MySQL client automatically when supported
+- `-y`, `--yes`: skip confirmation prompts during onboarding
 - `--verify`: run a post-install smoke check
 
 ## Tool Surface

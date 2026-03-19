@@ -117,12 +117,21 @@ docker compose up -d
 
 Don't want Docker? Use [MatrixOne Cloud](https://cloud.matrixorigin.cn) (free tier).
 
+Prefer the official MatrixOne installer path? `scripts/install.sh` can now validate your DB target and, when asked, drive the official `mo_ctl` onboarding flow for a local MatrixOne.
+
 ### 2. Install Memoria
 
-**Option A — Install script (detects OS/arch, verifies checksum):**
+**Option A — Install script (detects OS/arch, verifies checksum, and can prepare MatrixOne):**
 
 ```bash
 curl -sSL https://raw.githubusercontent.com/matrixorigin/Memoria/main/scripts/install.sh | bash
+```
+
+If you want the installer to also check and repair the default local MatrixOne target:
+
+```bash
+curl -sSL https://raw.githubusercontent.com/matrixorigin/Memoria/main/scripts/install.sh | \
+  bash -s -- --ensure-matrixone
 ```
 
 **Option B — Manual download** from [GitHub Releases](https://github.com/matrixorigin/Memoria/releases):

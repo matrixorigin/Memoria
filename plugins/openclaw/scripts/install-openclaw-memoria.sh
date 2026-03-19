@@ -5,6 +5,10 @@ PLUGIN_ID="memory-memoria"
 DEFAULT_REPO_URL="https://github.com/matrixorigin/openclaw-memoria.git"
 DEFAULT_REPO_REF="main"
 DEFAULT_MEMORIA_VERSION="v0.1.0"
+DEFAULT_OPENCLAW_VERSION="latest"
+DEFAULT_MATRIXONE_VERSION="main"
+DEFAULT_MATRIXONE_DEPLOY_MODE="docker"
+DEFAULT_MOCTL_INSTALL_URL="https://raw.githubusercontent.com/matrixorigin/mo_ctl_standalone/main/deploy/local/install.sh"
 
 MEMORIA_TOOL_NAMES=(
   memory_search
@@ -47,8 +51,249 @@ fail() {
   exit 1
 }
 
+can_cmd() {
+  command -v "$1" >/dev/null 2>&1
+}
+
 need_cmd() {
-  command -v "$1" >/dev/null 2>&1 || fail "Missing required command: $1"
+  can_cmd "$1" || fail "Missing required command: $1"
+}
+
+confirm() {
+  local prompt="$1"
+  if [[ "${ASSUME_YES}" == true ]]; then
+    return 0
+  fi
+  read -r -p "[memory-memoria] ${prompt} [y/N] " reply < /dev/tty || return 1
+  case "${reply,,}" in
+    y|yes)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+run_privileged() {
+  if [[ "$(id -u)" -eq 0 ]]; then
+    "$@"
+    return 0
+  fi
+  if can_cmd sudo; then
+    sudo "$@"
+    return 0
+  fi
+  fail "Need elevated privileges to run: $*"
+}
+
+detect_package_manager() {
+  if can_cmd apt-get; then
+    printf 'apt'
+    return 0
+  fi
+  if can_cmd brew; then
+    printf 'brew'
+    return 0
+  fi
+  printf ''
+}
+
+print_path_hint() {
+  local dir="$1"
+  case ":${PATH}:" in
+    *:"${dir}":*)
+      return 0
+      ;;
+  esac
+  log "Add ${dir} to PATH before using the freshly installed CLI."
+}
+
+print_mysql_client_hint() {
+  local pm
+  pm="$(detect_package_manager)"
+  case "${pm}" in
+    apt)
+      log "Install a MySQL client with: sudo apt-get update && sudo apt-get install -y default-mysql-client"
+      ;;
+    brew)
+      log "Install a MySQL client with: brew install mysql-client"
+      ;;
+    *)
+      log "Install a MySQL 8.0.30+ client, then rerun the installer."
+      ;;
+  esac
+}
+
+print_wget_hint() {
+  local pm
+  pm="$(detect_package_manager)"
+  case "${pm}" in
+    apt)
+      log "Install wget with: sudo apt-get update && sudo apt-get install -y wget"
+      ;;
+    brew)
+      log "Install wget with: brew install wget"
+      ;;
+    *)
+      log "Install wget before using the automatic MatrixOne onboarding path."
+      ;;
+  esac
+}
+
+print_git_hint() {
+  local pm
+  pm="$(detect_package_manager)"
+  case "${pm}" in
+    apt)
+      log "Install git with: sudo apt-get update && sudo apt-get install -y git"
+      ;;
+    brew)
+      log "Install git with: brew install git"
+      ;;
+    *)
+      log "Install git before using automatic OpenClaw installation."
+      ;;
+  esac
+}
+
+install_mysql_client_pkg() {
+  local pm
+  pm="$(detect_package_manager)"
+  case "${pm}" in
+    apt)
+      run_privileged apt-get update
+      run_privileged apt-get install -y default-mysql-client
+      ;;
+    brew)
+      brew install mysql-client
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+install_git_pkg() {
+  local pm
+  pm="$(detect_package_manager)"
+  case "${pm}" in
+    apt)
+      run_privileged apt-get update
+      run_privileged apt-get install -y git
+      ;;
+    brew)
+      brew install git
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+install_wget_pkg() {
+  local pm
+  pm="$(detect_package_manager)"
+  case "${pm}" in
+    apt)
+      run_privileged apt-get update
+      run_privileged apt-get install -y wget
+      ;;
+    brew)
+      brew install wget
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+print_docker_hint() {
+  log "Docker is required for the default MatrixOne onboarding path."
+  log "Install Docker Engine / Docker Desktop, or point MEMORIA_DB_URL to an existing MatrixOne deployment."
+}
+
+parse_db_host_port() {
+  local raw="$1"
+  raw="${raw#*://}"
+  raw="${raw#*@}"
+  raw="${raw%%/*}"
+  if [[ "${raw}" == *:* ]]; then
+    DB_HOST="${raw%%:*}"
+    DB_PORT="${raw##*:}"
+  else
+    DB_HOST="${raw}"
+    DB_PORT="3306"
+  fi
+  [[ -n "${DB_HOST}" ]] || DB_HOST="127.0.0.1"
+  [[ -n "${DB_PORT}" ]] || DB_PORT="3306"
+}
+
+check_tcp() {
+  local host="$1"
+  local port="$2"
+  if can_cmd nc; then
+    nc -z "${host}" "${port}" >/dev/null 2>&1
+    return $?
+  fi
+  if can_cmd node; then
+    node -e 'const net=require("node:net");const s=net.connect({host:process.argv[1],port:Number(process.argv[2])});const done=(code)=>{s.destroy();process.exit(code)};s.setTimeout(1500);s.on("connect",()=>done(0));s.on("timeout",()=>done(1));s.on("error",()=>done(1));' "${host}" "${port}" >/dev/null 2>&1
+    return $?
+  fi
+  return 2
+}
+
+is_local_matrixone_target() {
+  [[ "${DB_HOST}" == "127.0.0.1" || "${DB_HOST}" == "localhost" ]]
+}
+
+install_moctl() {
+  local tmp_script
+  if ! can_cmd wget; then
+    if [[ "${INSTALL_SYSTEM_DEPS}" == true ]]; then
+      install_wget_pkg || {
+        print_wget_hint
+        exit 1
+      }
+    else
+      print_wget_hint
+      exit 1
+    fi
+  fi
+  tmp_script="$(mktemp)"
+  trap 'rm -f "${tmp_script}"' RETURN
+  log "Installing mo_ctl via the official MatrixOne installer"
+  curl -fsSL -o "${tmp_script}" "${MOCTL_INSTALL_URL}" || fail "Failed to download mo_ctl installer"
+  bash "${tmp_script}"
+  rm -f "${tmp_script}"
+}
+
+install_openclaw_cli() {
+  local spec="openclaw"
+  need_cmd node
+  need_cmd npm
+  if ! can_cmd git; then
+    if [[ "${INSTALL_SYSTEM_DEPS}" == true ]]; then
+      install_git_pkg || {
+        print_git_hint
+        exit 1
+      }
+    else
+      print_git_hint
+      exit 1
+    fi
+  fi
+
+  if [[ -n "${OPENCLAW_VERSION}" && "${OPENCLAW_VERSION}" != "latest" ]]; then
+    spec="openclaw@${OPENCLAW_VERSION}"
+  else
+    spec="openclaw@latest"
+  fi
+
+  mkdir -p "${OPENCLAW_PREFIX}/bin"
+  log "Installing ${spec} with npm into ${OPENCLAW_PREFIX}"
+  npm install --global --prefix "${OPENCLAW_PREFIX}" "${spec}"
+  print_path_hint "${OPENCLAW_PREFIX}/bin"
 }
 
 validate_openclaw_bin() {
@@ -59,12 +304,12 @@ validate_openclaw_bin() {
   return 0
 }
 
-resolve_openclaw_bin() {
+try_resolve_openclaw_bin() {
   local candidate="${1:-openclaw}"
   local resolved=''
 
   if [[ "${candidate}" == */* ]]; then
-    [[ -x "${candidate}" ]] || fail "OPENCLAW_BIN is not executable: ${candidate}"
+    [[ -x "${candidate}" ]] || return 1
     printf '%s' "${candidate}"
     return 0
   fi
@@ -76,6 +321,7 @@ resolve_openclaw_bin() {
   fi
 
   for fallback in \
+    "${HOME}/.local/bin/openclaw" \
     "${HOME}/Library/pnpm/openclaw" \
     "${HOME}/.local/share/pnpm/openclaw" \
     "${HOME}/.pnpm/openclaw"
@@ -94,7 +340,14 @@ resolve_openclaw_bin() {
     fi
   fi
 
-  fail "Missing required command: openclaw. Set OPENCLAW_BIN=/absolute/path/to/openclaw"
+  return 1
+}
+
+resolve_openclaw_bin() {
+  local resolved=''
+  resolved="$(try_resolve_openclaw_bin "$1" 2>/dev/null || true)"
+  [[ -n "${resolved}" ]] || fail "Missing required command: openclaw. Set OPENCLAW_BIN=/absolute/path/to/openclaw"
+  printf '%s' "${resolved}"
 }
 
 usage() {
@@ -111,18 +364,35 @@ Options:
   --repo-url <url>              Git repo to clone when no local checkout is used.
   --ref <ref>                   Git branch, tag, or ref to clone. Default: main.
   --openclaw-bin <path|command> Use an existing openclaw executable.
+  --install-openclaw            Install OpenClaw with npm if it is missing.
+  --openclaw-version <tag>      OpenClaw npm version or dist-tag. Default: latest.
+  --openclaw-prefix <path>      npm global prefix for OpenClaw installs. Default: ~/.local.
   --memoria-bin <path|command>  Use an existing memoria executable.
   --memoria-version <tag>       Rust Memoria release tag. Default: v0.1.0.
   --memoria-install-dir <path>  Where to install memoria if it is missing.
   --skip-memoria-install        Require an existing memoria executable.
   --skip-plugin-install         Assume the plugin is already installed/enabled in OpenClaw.
+  --ensure-matrixone            Install or repair MatrixOne via mo_ctl when the local DB is unreachable.
+  --skip-matrixone-check        Skip MatrixOne readiness checks.
+  --matrixone-version <ref>     MatrixOne version/ref for mo_ctl deploy. Default: main.
+  --matrixone-deploy-mode <m>   MatrixOne deploy mode: docker or git. Default: docker.
+  --matrixone-data-dir <path>   Host data dir for mo_ctl docker deploy.
+  --install-system-deps         Install MySQL client automatically when supported.
+  -y, --yes                     Skip confirmation prompts.
   --verify                      Run verify_plugin_install.mjs after installation.
   --help                        Show this help text.
 
 Environment overrides:
   OPENCLAW_BIN                    Default: auto-detected openclaw executable
   OPENCLAW_HOME                   Optional target OpenClaw home.
+  OPENCLAW_VERSION                npm version/dist-tag to install when OpenClaw is missing
+  OPENCLAW_PREFIX                 npm global prefix used for automatic OpenClaw installs
   MEMORIA_DB_URL                  Default: mysql://root:111@127.0.0.1:6001/memoria
+  MATRIXONE_MODE                  auto, ensure, check, or skip. Default: auto
+  MATRIXONE_VERSION               Default: main
+  MATRIXONE_DEPLOY_MODE           docker or git. Default: docker
+  MATRIXONE_DATA_DIR              Default: ~/.local/share/matrixone
+  MOCTL_INSTALL_URL               Official mo_ctl installer URL
   MEMORIA_DEFAULT_USER_ID         Default: openclaw-user
   MEMORIA_USER_ID_STRATEGY        Default: config
   MEMORIA_AUTO_RECALL             Default: true
@@ -166,6 +436,9 @@ infer_embedding_dim() {
       printf '3072'
       ;;
     text-embedding-ada-002|openai/text-embedding-ada-002)
+      printf '1536'
+      ;;
+    mock)
       printf '1536'
       ;;
     all-MiniLM-L6-v2|sentence-transformers/all-MiniLM-L6-v2)
@@ -325,15 +598,162 @@ install_bundled_skills() {
   done
 }
 
+print_openclaw_install_hint() {
+  log "Install OpenClaw with: npm install --global --prefix \"${OPENCLAW_PREFIX}\" openclaw@latest"
+}
+
+print_matrixone_hint() {
+  log "MatrixOne quick path with mo_ctl:"
+  log "  curl -fsSL ${MOCTL_INSTALL_URL} | bash"
+  log "  mo_ctl set_conf MO_DEPLOY_MODE=${MATRIXONE_DEPLOY_MODE}"
+  if [[ "${MATRIXONE_DEPLOY_MODE}" == "docker" ]]; then
+    log "  mo_ctl set_conf MO_CONTAINER_DATA_HOST_PATH=${MATRIXONE_DATA_DIR}"
+  fi
+  log "  mo_ctl deploy ${MATRIXONE_VERSION}"
+  log "  mo_ctl start"
+}
+
+ensure_matrixone_ready() {
+  parse_db_host_port "${MEMORIA_DB_URL}"
+
+  if check_tcp "${DB_HOST}" "${DB_PORT}"; then
+    log "MatrixOne is reachable at ${DB_HOST}:${DB_PORT}"
+    MATRIXONE_READY=true
+    return 0
+  fi
+
+  if [[ "$?" -eq 2 ]]; then
+    log "Could not probe ${DB_HOST}:${DB_PORT}; nc/node is unavailable."
+  else
+    log "MatrixOne is not reachable at ${DB_HOST}:${DB_PORT}"
+  fi
+
+  case "${MATRIXONE_MODE}" in
+    skip)
+      return 0
+      ;;
+    check)
+      print_matrixone_hint
+      return 0
+      ;;
+    auto)
+      if ! is_local_matrixone_target; then
+        log "DB target is remote/non-local. Skipping automatic MatrixOne install."
+        return 0
+      fi
+      if ! confirm "Install MatrixOne locally via mo_ctl now?"; then
+        print_matrixone_hint
+        return 0
+      fi
+      ;;
+  esac
+
+  if ! can_cmd mysql; then
+    if [[ "${INSTALL_SYSTEM_DEPS}" == true ]]; then
+      install_mysql_client_pkg || {
+        print_mysql_client_hint
+        exit 1
+      }
+    else
+      print_mysql_client_hint
+      exit 1
+    fi
+  fi
+
+  if [[ "${MATRIXONE_DEPLOY_MODE}" == "docker" ]] && ! can_cmd docker; then
+    print_docker_hint
+    exit 1
+  fi
+
+  if ! can_cmd mo_ctl; then
+    install_moctl
+  fi
+  can_cmd mo_ctl || fail "mo_ctl is still not available after installation"
+
+  log "Configuring MatrixOne with mo_ctl"
+  mo_ctl set_conf MO_DEPLOY_MODE="${MATRIXONE_DEPLOY_MODE}"
+  if [[ "${MATRIXONE_DEPLOY_MODE}" == "docker" ]]; then
+    mkdir -p "${MATRIXONE_DATA_DIR}"
+    mo_ctl set_conf MO_CONTAINER_DATA_HOST_PATH="${MATRIXONE_DATA_DIR}"
+  elif [[ -n "${MO_PATH:-}" ]]; then
+    mo_ctl set_conf MO_PATH="${MO_PATH}"
+  fi
+
+  log "Deploying MatrixOne ${MATRIXONE_VERSION}"
+  mo_ctl deploy "${MATRIXONE_VERSION}"
+  log "Starting MatrixOne"
+  mo_ctl start
+
+  local attempt=0
+  while (( attempt < 20 )); do
+    if check_tcp "${DB_HOST}" "${DB_PORT}"; then
+      log "MatrixOne is ready at ${DB_HOST}:${DB_PORT}"
+      MATRIXONE_READY=true
+      return 0
+    fi
+    attempt=$((attempt + 1))
+    sleep 3
+  done
+
+  log "mo_ctl ran, but MatrixOne did not become reachable in time."
+  mo_ctl status || true
+  exit 1
+}
+
+print_dependency_summary() {
+  log "System status:"
+  if [[ -n "${OPENCLAW_BIN:-}" && -x "${OPENCLAW_BIN}" ]]; then
+    log "  OpenClaw: $("${OPENCLAW_BIN}" --version 2>/dev/null | head -n 1)"
+  else
+    log "  OpenClaw: missing"
+  fi
+  if can_cmd npm; then
+    log "  npm: $(npm -v 2>/dev/null | head -n 1)"
+  else
+    log "  npm: missing"
+  fi
+  if [[ -n "${MEMORIA_EXECUTABLE_VALUE:-}" ]]; then
+    log "  Memoria: $("${MEMORIA_EXECUTABLE_VALUE}" --version 2>/dev/null | head -n 1)"
+  else
+    log "  Memoria: pending"
+  fi
+  if can_cmd mo_ctl; then
+    log "  mo_ctl: available"
+  else
+    log "  mo_ctl: missing"
+  fi
+  if can_cmd mysql; then
+    log "  MySQL client: available"
+  else
+    log "  MySQL client: missing"
+  fi
+  if can_cmd docker; then
+    log "  Docker: available"
+  else
+    log "  Docker: missing"
+  fi
+}
+
 SOURCE_DIR="${MEMORIA_SOURCE_DIR:-}"
 INSTALL_DIR="${MEMORIA_INSTALL_DIR:-$HOME/.local/share/openclaw-plugins/openclaw-memoria}"
 REPO_URL="${MEMORIA_REPO_URL:-$DEFAULT_REPO_URL}"
 REPO_REF="${MEMORIA_REPO_REF:-$DEFAULT_REPO_REF}"
 OPENCLAW_BIN="${OPENCLAW_BIN:-openclaw}"
 OPENCLAW_HOME_VALUE="${OPENCLAW_HOME:-}"
+OPENCLAW_VERSION="${OPENCLAW_VERSION:-$DEFAULT_OPENCLAW_VERSION}"
+OPENCLAW_PREFIX="${OPENCLAW_PREFIX:-$HOME/.local}"
 MEMORIA_BIN="${MEMORIA_EXECUTABLE:-${MEMORIA_BIN:-}}"
 MEMORIA_RELEASE_TAG="${MEMORIA_RELEASE_TAG:-$DEFAULT_MEMORIA_VERSION}"
 MEMORIA_BINARY_INSTALL_DIR="${MEMORIA_BINARY_INSTALL_DIR:-$HOME/.local/bin}"
+MATRIXONE_MODE="${MATRIXONE_MODE:-auto}"
+MATRIXONE_VERSION="${MATRIXONE_VERSION:-$DEFAULT_MATRIXONE_VERSION}"
+MATRIXONE_DEPLOY_MODE="${MATRIXONE_DEPLOY_MODE:-$DEFAULT_MATRIXONE_DEPLOY_MODE}"
+MATRIXONE_DATA_DIR="${MATRIXONE_DATA_DIR:-$HOME/.local/share/matrixone}"
+MOCTL_INSTALL_URL="${MOCTL_INSTALL_URL:-$DEFAULT_MOCTL_INSTALL_URL}"
+ASSUME_YES=false
+INSTALL_OPENCLAW=false
+INSTALL_SYSTEM_DEPS=false
+MATRIXONE_READY=false
 SKIP_MEMORIA_INSTALL=false
 SKIP_PLUGIN_INSTALL=false
 RUN_VERIFY=false
@@ -360,6 +780,18 @@ while [[ $# -gt 0 ]]; do
       OPENCLAW_BIN="${2:?missing value for --openclaw-bin}"
       shift 2
       ;;
+    --install-openclaw)
+      INSTALL_OPENCLAW=true
+      shift
+      ;;
+    --openclaw-version)
+      OPENCLAW_VERSION="${2:?missing value for --openclaw-version}"
+      shift 2
+      ;;
+    --openclaw-prefix)
+      OPENCLAW_PREFIX="${2:?missing value for --openclaw-prefix}"
+      shift 2
+      ;;
     --memoria-bin)
       MEMORIA_BIN="${2:?missing value for --memoria-bin}"
       shift 2
@@ -380,6 +812,34 @@ while [[ $# -gt 0 ]]; do
       SKIP_PLUGIN_INSTALL=true
       shift
       ;;
+    --ensure-matrixone)
+      MATRIXONE_MODE="ensure"
+      shift
+      ;;
+    --skip-matrixone-check)
+      MATRIXONE_MODE="skip"
+      shift
+      ;;
+    --matrixone-version)
+      MATRIXONE_VERSION="${2:?missing value for --matrixone-version}"
+      shift 2
+      ;;
+    --matrixone-deploy-mode)
+      MATRIXONE_DEPLOY_MODE="${2:?missing value for --matrixone-deploy-mode}"
+      shift 2
+      ;;
+    --matrixone-data-dir)
+      MATRIXONE_DATA_DIR="${2:?missing value for --matrixone-data-dir}"
+      shift 2
+      ;;
+    --install-system-deps)
+      INSTALL_SYSTEM_DEPS=true
+      shift
+      ;;
+    --yes|-y)
+      ASSUME_YES=true
+      shift
+      ;;
     --verify)
       RUN_VERIFY=true
       shift
@@ -394,7 +854,34 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-OPENCLAW_BIN="$(resolve_openclaw_bin "${OPENCLAW_BIN}")"
+case "${MATRIXONE_MODE}" in
+  auto|ensure|check|skip) ;;
+  *)
+    fail "Invalid MATRIXONE_MODE: ${MATRIXONE_MODE}"
+    ;;
+esac
+
+case "${MATRIXONE_DEPLOY_MODE}" in
+  docker|git) ;;
+  *)
+    fail "Invalid MatrixOne deploy mode: ${MATRIXONE_DEPLOY_MODE}"
+    ;;
+esac
+
+OPENCLAW_BIN="$(try_resolve_openclaw_bin "${OPENCLAW_BIN}" 2>/dev/null || true)"
+if [[ -z "${OPENCLAW_BIN}" ]]; then
+  if [[ "${INSTALL_OPENCLAW}" == true ]]; then
+    install_openclaw_cli
+    OPENCLAW_BIN="$(resolve_openclaw_bin openclaw)"
+  elif confirm "OpenClaw is not installed. Install it now with npm?"; then
+    install_openclaw_cli
+    OPENCLAW_BIN="$(resolve_openclaw_bin openclaw)"
+  else
+    print_openclaw_install_hint
+    fail "OpenClaw is required for the plugin onboarding flow"
+  fi
+fi
+
 validate_openclaw_bin "${OPENCLAW_BIN}" || fail "OpenClaw executable is not healthy: ${OPENCLAW_BIN}. Fix OpenClaw first, then retry."
 need_cmd node
 
@@ -446,6 +933,7 @@ else
   log "Installed memoria executable: ${MEMORIA_EXECUTABLE_VALUE}"
 fi
 log "Memoria version: $("${MEMORIA_EXECUTABLE_VALUE}" --version 2>/dev/null | head -n 1)"
+print_dependency_summary
 
 MEMORIA_DB_URL="$(normalize_db_url "${MEMORIA_DB_URL:-mysql://root:111@127.0.0.1:6001/memoria}")"
 MEMORIA_DEFAULT_USER_ID="${MEMORIA_DEFAULT_USER_ID:-openclaw-user}"
@@ -475,7 +963,7 @@ if [[ -n "${LLM_BASE_URL_RAW}" && "${LLM_BASE_URL_RAW}" != "${MEMORIA_LLM_BASE_U
 fi
 
 KNOWN_EMBEDDING_DIM="$(infer_embedding_dim "${MEMORIA_EMBEDDING_MODEL}")"
-if [[ "${MEMORIA_EMBEDDING_PROVIDER}" != "local" && -z "${MEMORIA_EMBEDDING_API_KEY}" ]]; then
+if [[ "${MEMORIA_EMBEDDING_PROVIDER}" != "local" && "${MEMORIA_EMBEDDING_PROVIDER}" != "mock" && -z "${MEMORIA_EMBEDDING_API_KEY}" ]]; then
   fail "MEMORIA_EMBEDDING_API_KEY is required unless provider=local"
 fi
 if [[ "${MEMORIA_EMBEDDING_PROVIDER}" != "local" && -z "${MEMORIA_EMBEDDING_DIM}" ]]; then
@@ -485,10 +973,16 @@ if [[ "${MEMORIA_EMBEDDING_PROVIDER}" != "local" && -z "${MEMORIA_EMBEDDING_DIM}
 fi
 if [[ "${MEMORIA_EMBEDDING_PROVIDER}" == "local" ]]; then
   log "Embedding provider is local. Make sure your memoria binary was built with local-embedding support."
+elif [[ "${MEMORIA_EMBEDDING_PROVIDER}" == "mock" ]]; then
+  log "Embedding provider is mock. This is suitable for smoke tests, not production memory recall."
 fi
 if [[ "${MEMORIA_AUTO_OBSERVE}" == "true" ]]; then
   [[ -n "${MEMORIA_LLM_API_KEY}" ]] || fail "MEMORIA_AUTO_OBSERVE=true requires MEMORIA_LLM_API_KEY"
   [[ -n "${MEMORIA_LLM_MODEL}" ]] || fail "MEMORIA_AUTO_OBSERVE=true requires MEMORIA_LLM_MODEL"
+fi
+
+if [[ "${MATRIXONE_MODE}" != "skip" ]]; then
+  ensure_matrixone_ready
 fi
 
 CONFIG_FILE="$(config_file_path)"
@@ -690,14 +1184,19 @@ cat <<EOF
 Install complete.
 
 Plugin source: ${SOURCE_DIR}
+OpenClaw executable: ${OPENCLAW_BIN}
 Memoria executable: ${MEMORIA_EXECUTABLE_VALUE}
 OpenClaw config: ${CONFIG_FILE}
+MatrixOne DB URL: ${MEMORIA_DB_URL}
 
 Recommended smoke checks:
-  openclaw memoria capabilities
-  openclaw memoria stats
-  openclaw ltm list --limit 10
+  ${OPENCLAW_BIN} memoria capabilities
+  ${OPENCLAW_BIN} memoria stats
+  ${OPENCLAW_BIN} ltm list --limit 10
 
-If embedded mode is enabled, make sure MatrixOne is reachable at:
+If embedded mode is enabled, MatrixOne should be reachable at:
   ${MEMORIA_DB_URL}
+
+If OpenClaw was newly installed into a custom prefix, make sure this directory is on PATH:
+  ${OPENCLAW_PREFIX}/bin
 EOF
