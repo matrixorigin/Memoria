@@ -72,8 +72,8 @@ detect_target() {
   esac
   case "$os" in
     linux)
-      [ "$arch" = "x86_64" ] && printf "x86_64-unknown-linux-gnu" && return
-      [ "$arch" = "aarch64" ] && printf "aarch64-unknown-linux-gnu" && return
+      [ "$arch" = "x86_64" ] && printf "x86_64-unknown-linux-musl" && return
+      [ "$arch" = "aarch64" ] && printf "aarch64-unknown-linux-musl" && return
       ;;
     darwin)
       [ "$arch" = "x86_64" ] && printf "x86_64-apple-darwin" && return

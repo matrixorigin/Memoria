@@ -213,8 +213,8 @@ resolve_memoria_target() {
   esac
   case "${os}" in
     linux)
-      [[ "${arch}" == "x86_64" ]] && printf 'x86_64-unknown-linux-gnu' && return 0
-      [[ "${arch}" == "aarch64" ]] && printf 'aarch64-unknown-linux-gnu' && return 0
+      [[ "${arch}" == "x86_64" ]] && printf 'x86_64-unknown-linux-musl' && return 0
+      [[ "${arch}" == "aarch64" ]] && printf 'aarch64-unknown-linux-musl' && return 0
       ;;
     darwin)
       [[ "${arch}" == "x86_64" ]] && printf 'x86_64-apple-darwin' && return 0
