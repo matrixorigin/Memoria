@@ -1389,21 +1389,15 @@ fn cmd_init_interactive(project_dir: &Path, force: bool) {
         .interact()
         .unwrap_or_else(|_| existing.db_user.clone());
     let db_pass: String = if existing.db_pass.is_empty() {
-        cliclack::password("Password")
-            .mask('▪')
+        cliclack::input("Password")
+            .default_input("111")
             .interact()
-            .unwrap_or_default()
+            .unwrap_or_else(|_| "111".into())
     } else {
-        let v: String = cliclack::password(format!("Password [{}]", mask_key(&existing.db_pass)))
-            .mask('▪')
-            .allow_empty()
+        cliclack::input("Password")
+            .default_input(&existing.db_pass)
             .interact()
-            .unwrap_or_default();
-        if v.is_empty() {
-            existing.db_pass.clone()
-        } else {
-            v
-        }
+            .unwrap_or_else(|_| existing.db_pass.clone())
     };
     let db_name: String = cliclack::input("Database")
         .default_input(&existing.db_name)
