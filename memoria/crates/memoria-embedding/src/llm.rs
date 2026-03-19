@@ -44,11 +44,12 @@ struct MessageContent {
 impl LlmClient {
     /// Create from environment variables. Returns None if LLM_API_KEY not set.
     pub fn from_env() -> Option<Self> {
-        let api_key = std::env::var("LLM_API_KEY").ok().filter(|s| !s.is_empty())?;
+        let api_key = std::env::var("LLM_API_KEY")
+            .ok()
+            .filter(|s| !s.is_empty())?;
         let base_url = std::env::var("LLM_BASE_URL")
             .unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
-        let model = std::env::var("LLM_MODEL")
-            .unwrap_or_else(|_| "gpt-4o-mini".to_string());
+        let model = std::env::var("LLM_MODEL").unwrap_or_else(|_| "gpt-4o-mini".to_string());
         Some(Self::new(api_key, base_url, model))
     }
 
@@ -58,10 +59,17 @@ impl LlmClient {
             .timeout(std::time::Duration::from_secs(60))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
-        Self { api_key, base_url, model, client }
+        Self {
+            api_key,
+            base_url,
+            model,
+            client,
+        }
     }
 
-    pub fn model(&self) -> &str { &self.model }
+    pub fn model(&self) -> &str {
+        &self.model
+    }
 
     /// Send a chat completion request. Returns the assistant message content.
     pub async fn chat(
@@ -77,7 +85,8 @@ impl LlmClient {
             temperature,
             max_tokens,
         };
-        let resp = self.client
+        let resp = self
+            .client
             .post(&url)
             .bearer_auth(&self.api_key)
             .json(&req)
@@ -87,7 +96,9 @@ impl LlmClient {
             .json::<ChatResponse>()
             .await?;
 
-        Ok(resp.choices.into_iter()
+        Ok(resp
+            .choices
+            .into_iter()
             .next()
             .and_then(|c| c.message.content)
             .unwrap_or_default())

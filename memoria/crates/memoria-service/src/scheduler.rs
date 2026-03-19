@@ -148,7 +148,15 @@ impl GovernanceScheduler {
             }
         }
 
-        Ok(Self::from_parts(service, delegate.clone(), delegate, None, lock, instance_id, lock_ttl))
+        Ok(Self::from_parts(
+            service,
+            delegate.clone(),
+            delegate,
+            None,
+            lock,
+            instance_id,
+            lock_ttl,
+        ))
     }
 
     pub fn new_with_registry(
@@ -308,7 +316,11 @@ impl GovernanceScheduler {
         loop {
             ticker.tick().await;
             // Distributed leader election: only one instance runs each task
-            match self.lock.try_acquire(&lock_key, &self.instance_id, self.lock_ttl).await {
+            match self
+                .lock
+                .try_acquire(&lock_key, &self.instance_id, self.lock_ttl)
+                .await
+            {
                 Ok(true) => {}
                 Ok(false) => {
                     info!(
@@ -1278,7 +1290,10 @@ mod tests {
             .unwrap();
 
         assert_eq!(scheduler.strategy.strategy_key(), "governance:default:v1");
-        assert_eq!(scheduler.fallback_strategy.strategy_key(), "governance:default:v1");
+        assert_eq!(
+            scheduler.fallback_strategy.strategy_key(),
+            "governance:default:v1"
+        );
     }
 
     /// In-memory distributed lock for testing leader election.
@@ -1288,13 +1303,20 @@ mod tests {
 
     impl InMemoryLock {
         fn new() -> Self {
-            Self { locks: Mutex::new(std::collections::HashMap::new()) }
+            Self {
+                locks: Mutex::new(std::collections::HashMap::new()),
+            }
         }
     }
 
     #[async_trait]
     impl crate::distributed::DistributedLock for InMemoryLock {
-        async fn try_acquire(&self, key: &str, holder: &str, _ttl: Duration) -> Result<bool, crate::MemoriaError> {
+        async fn try_acquire(
+            &self,
+            key: &str,
+            holder: &str,
+            _ttl: Duration,
+        ) -> Result<bool, crate::MemoriaError> {
             let mut locks = self.locks.lock().unwrap();
             if let Some(existing) = locks.get(key) {
                 return Ok(existing == holder);
@@ -1302,7 +1324,12 @@ mod tests {
             locks.insert(key.to_string(), holder.to_string());
             Ok(true)
         }
-        async fn renew(&self, key: &str, holder: &str, _ttl: Duration) -> Result<bool, crate::MemoriaError> {
+        async fn renew(
+            &self,
+            key: &str,
+            holder: &str,
+            _ttl: Duration,
+        ) -> Result<bool, crate::MemoriaError> {
             let locks = self.locks.lock().unwrap();
             Ok(locks.get(key).map_or(false, |h| h == holder))
         }
@@ -1347,16 +1374,28 @@ mod tests {
 
         // Simulate run_loop lock acquisition: A acquires first
         let lock_key = "governance:daily";
-        let acquired_a = shared_lock.try_acquire(lock_key, "instance_a", Duration::from_secs(120)).await.unwrap();
+        let acquired_a = shared_lock
+            .try_acquire(lock_key, "instance_a", Duration::from_secs(120))
+            .await
+            .unwrap();
         assert!(acquired_a, "instance_a should acquire the lock");
 
         // B tries to acquire — should fail
-        let acquired_b = shared_lock.try_acquire(lock_key, "instance_b", Duration::from_secs(120)).await.unwrap();
-        assert!(!acquired_b, "instance_b should NOT acquire while instance_a holds it");
+        let acquired_b = shared_lock
+            .try_acquire(lock_key, "instance_b", Duration::from_secs(120))
+            .await
+            .unwrap();
+        assert!(
+            !acquired_b,
+            "instance_b should NOT acquire while instance_a holds it"
+        );
 
         // Only A runs the task
         let exec_a = scheduler_a.run_task(GovernanceTask::Daily).await.unwrap();
-        assert_eq!(*strategy_a.tasks.lock().unwrap(), vec![GovernanceTask::Daily]);
+        assert_eq!(
+            *strategy_a.tasks.lock().unwrap(),
+            vec![GovernanceTask::Daily]
+        );
         assert_eq!(exec_a.report.status, StrategyStatus::Success);
 
         // B's strategy was never called
@@ -1364,11 +1403,17 @@ mod tests {
 
         // A releases, now B can acquire and run
         shared_lock.release(lock_key, "instance_a").await.unwrap();
-        let acquired_b = shared_lock.try_acquire(lock_key, "instance_b", Duration::from_secs(120)).await.unwrap();
+        let acquired_b = shared_lock
+            .try_acquire(lock_key, "instance_b", Duration::from_secs(120))
+            .await
+            .unwrap();
         assert!(acquired_b);
 
         let exec_b = scheduler_b.run_task(GovernanceTask::Daily).await.unwrap();
-        assert_eq!(*strategy_b.tasks.lock().unwrap(), vec![GovernanceTask::Daily]);
+        assert_eq!(
+            *strategy_b.tasks.lock().unwrap(),
+            vec![GovernanceTask::Daily]
+        );
         assert_eq!(exec_b.report.status, StrategyStatus::Success);
 
         shared_lock.release(lock_key, "instance_b").await.unwrap();

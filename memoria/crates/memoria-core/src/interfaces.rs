@@ -1,4 +1,4 @@
-use crate::{Memory, MemoriaError};
+use crate::{MemoriaError, Memory};
 use async_trait::async_trait;
 
 /// Core storage trait — implemented by memoria-storage.

@@ -1,7 +1,6 @@
 /// Git-for-Data integration tests against real MatrixOne.
 /// Run: DATABASE_URL=mysql://root:111@localhost:6001/memoria \
 ///      SQLX_OFFLINE=true cargo test -p memoria-git --test git_ops -- --nocapture
-
 use memoria_git::GitForDataService;
 use sqlx::mysql::MySqlPool;
 use uuid::Uuid;
@@ -13,9 +12,14 @@ async fn setup() -> (GitForDataService, String) {
         .unwrap_or_else(|_| "mysql://root:111@localhost:6001/memoria".to_string());
     let pool = MySqlPool::connect(&url).await.expect("connect");
     // Ensure full schema exists (branch/count tests need mem_memories)
-    let dim: usize = std::env::var("EMBEDDING_DIM").ok()
-        .and_then(|v| v.parse().ok()).unwrap_or(384);
-    SqlMemoryStore::new(pool.clone(), dim).migrate().await.expect("migrate");
+    let dim: usize = std::env::var("EMBEDDING_DIM")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(384);
+    SqlMemoryStore::new(pool.clone(), dim)
+        .migrate()
+        .await
+        .expect("migrate");
     let db_name = url.rsplit('/').next().unwrap_or("memoria_test");
     let svc = GitForDataService::new(pool, db_name);
     let suffix = Uuid::new_v4().simple().to_string()[..8].to_string();
@@ -49,7 +53,9 @@ async fn test_branch_create_drop() {
     let (svc, suffix) = setup().await;
     let branch = format!("rs_branch_{suffix}");
 
-    svc.create_branch(&branch, "mem_memories").await.expect("create_branch");
+    svc.create_branch(&branch, "mem_memories")
+        .await
+        .expect("create_branch");
     println!("✅ create_branch: {branch}");
 
     svc.drop_branch(&branch).await.expect("drop_branch");
@@ -61,11 +67,15 @@ async fn test_count_at_snapshot() {
     let (svc, suffix) = setup().await;
     let snap_name = format!("rs_count_{suffix}");
 
-    svc.create_snapshot(&snap_name).await.expect("create_snapshot");
+    svc.create_snapshot(&snap_name)
+        .await
+        .expect("create_snapshot");
 
     // Count at snapshot (user_id that doesn't exist → 0)
-    let count = svc.count_at_snapshot("mem_memories", &snap_name, "nonexistent_user")
-        .await.expect("count_at_snapshot");
+    let count = svc
+        .count_at_snapshot("mem_memories", &snap_name, "nonexistent_user")
+        .await
+        .expect("count_at_snapshot");
     assert_eq!(count, 0);
     println!("✅ count_at_snapshot: {count}");
 
@@ -76,7 +86,9 @@ async fn test_count_at_snapshot() {
 async fn test_invalid_identifier_rejected() {
     let (svc, _) = setup().await;
     // SQL injection attempt should be rejected
-    let result = svc.create_snapshot("valid'; DROP TABLE mem_memories; --").await;
+    let result = svc
+        .create_snapshot("valid'; DROP TABLE mem_memories; --")
+        .await;
     assert!(result.is_err());
     println!("✅ invalid identifier rejected: {:?}", result.unwrap_err());
 }

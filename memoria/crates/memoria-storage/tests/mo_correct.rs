@@ -4,13 +4,14 @@
 /// 1. JSON: use sqlx::types::Json<T> or CAST(col AS CHAR) — not raw String
 /// 2. Vector: vecf32(N) column + l2_distance(col, '[...]') string literal
 /// 3. Fulltext: MATCH(col) AGAINST('+term' IN BOOLEAN MODE) with NGRAM parser, inline string
-
 use sqlx::{mysql::MySqlPool, Row};
 
 async fn connect() -> MySqlPool {
     let url = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "mysql://root:111@localhost:6001/memoria".to_string());
-    MySqlPool::connect(&url).await.expect("connect to MatrixOne")
+    MySqlPool::connect(&url)
+        .await
+        .expect("connect to MatrixOne")
 }
 
 // ── JSON: correct approach — CAST(col AS CHAR) on read ───────────────────────
@@ -18,26 +19,40 @@ async fn connect() -> MySqlPool {
 #[tokio::test]
 async fn test_json_cast_char_read() {
     let pool = connect().await;
-    sqlx::query("DROP TABLE IF EXISTS _t_json").execute(&pool).await.unwrap();
+    sqlx::query("DROP TABLE IF EXISTS _t_json")
+        .execute(&pool)
+        .await
+        .unwrap();
     sqlx::query("CREATE TABLE _t_json (id VARCHAR(64) PRIMARY KEY, data JSON)")
-        .execute(&pool).await.unwrap();
+        .execute(&pool)
+        .await
+        .unwrap();
 
     let payload = serde_json::json!({"nums": [1, 2, 3], "name": "test"});
     let payload_str = payload.to_string();
 
     sqlx::query("INSERT INTO _t_json (id, data) VALUES (?, ?)")
-        .bind("j1").bind(&payload_str)
-        .execute(&pool).await.unwrap();
+        .bind("j1")
+        .bind(&payload_str)
+        .execute(&pool)
+        .await
+        .unwrap();
 
     // Read back with CAST(data AS CHAR)
     let row = sqlx::query("SELECT CAST(data AS CHAR) AS data_str FROM _t_json WHERE id = ?")
-        .bind("j1").fetch_one(&pool).await.unwrap();
+        .bind("j1")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
     let s: String = row.try_get("data_str").unwrap();
     let v: serde_json::Value = serde_json::from_str(&s).unwrap();
     assert_eq!(v["name"], "test");
     assert_eq!(v["nums"][0], 1);
 
-    sqlx::query("DROP TABLE IF EXISTS _t_json").execute(&pool).await.unwrap();
+    sqlx::query("DROP TABLE IF EXISTS _t_json")
+        .execute(&pool)
+        .await
+        .unwrap();
     println!("✅ JSON: CAST(data AS CHAR) works correctly");
 }
 
@@ -46,9 +61,14 @@ async fn test_json_cast_char_read() {
 #[tokio::test]
 async fn test_vector_vecf32_crud() {
     let pool = connect().await;
-    sqlx::query("DROP TABLE IF EXISTS _t_vec").execute(&pool).await.unwrap();
+    sqlx::query("DROP TABLE IF EXISTS _t_vec")
+        .execute(&pool)
+        .await
+        .unwrap();
     sqlx::query("CREATE TABLE _t_vec (id VARCHAR(64) PRIMARY KEY, embedding vecf32(4))")
-        .execute(&pool).await.unwrap();
+        .execute(&pool)
+        .await
+        .unwrap();
 
     // INSERT: use string format '[f1, f2, f3, f4]'
     let vecs: &[(&str, [f32; 4])] = &[
@@ -59,14 +79,20 @@ async fn test_vector_vecf32_crud() {
     for (id, v) in vecs {
         let vec_str = format!("[{}, {}, {}, {}]", v[0], v[1], v[2], v[3]);
         sqlx::query("INSERT INTO _t_vec (id, embedding) VALUES (?, ?)")
-            .bind(id).bind(&vec_str)
-            .execute(&pool).await.unwrap();
+            .bind(id)
+            .bind(&vec_str)
+            .execute(&pool)
+            .await
+            .unwrap();
     }
 
     // Query: l2_distance with inline string literal (NOT ? binding)
     // Build the query string with the vector literal inlined
     let query_vec = [1.0f32, 0.0, 0.0, 0.0];
-    let vec_literal = format!("[{}, {}, {}, {}]", query_vec[0], query_vec[1], query_vec[2], query_vec[3]);
+    let vec_literal = format!(
+        "[{}, {}, {}, {}]",
+        query_vec[0], query_vec[1], query_vec[2], query_vec[3]
+    );
     let sql = format!(
         "SELECT id FROM _t_vec ORDER BY l2_distance(embedding, '{}') ASC LIMIT 2",
         vec_literal
@@ -78,17 +104,24 @@ async fn test_vector_vecf32_crud() {
 
     // Also verify we can read the embedding back — vecf32 returns as String "[f1,f2,...]"
     let row = sqlx::query("SELECT embedding FROM _t_vec WHERE id = ?")
-        .bind("v1").fetch_one(&pool).await.unwrap();
+        .bind("v1")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
     let emb_str: String = row.try_get("embedding").unwrap();
     println!("  embedding read back as String: {emb_str}");
     // Parse "[1,0,0,0]" → Vec<f32>
-    let parsed: Vec<f32> = emb_str.trim_matches(|c| c == '[' || c == ']')
+    let parsed: Vec<f32> = emb_str
+        .trim_matches(|c| c == '[' || c == ']')
         .split(',')
         .map(|s| s.trim().parse().unwrap())
         .collect();
     assert_eq!(parsed[0], 1.0f32);
 
-    sqlx::query("DROP TABLE IF EXISTS _t_vec").execute(&pool).await.unwrap();
+    sqlx::query("DROP TABLE IF EXISTS _t_vec")
+        .execute(&pool)
+        .await
+        .unwrap();
 }
 
 // ── Fulltext: NGRAM parser + MATCH AGAINST with inline string ────────────────
@@ -96,7 +129,10 @@ async fn test_vector_vecf32_crud() {
 #[tokio::test]
 async fn test_fulltext_ngram_boolean_mode() {
     let pool = connect().await;
-    sqlx::query("DROP TABLE IF EXISTS _t_ft").execute(&pool).await.unwrap();
+    sqlx::query("DROP TABLE IF EXISTS _t_ft")
+        .execute(&pool)
+        .await
+        .unwrap();
 
     // Python uses FulltextParserType.NGRAM — try WITH PARSER ngram
     let create = sqlx::query(
@@ -104,31 +140,44 @@ async fn test_fulltext_ngram_boolean_mode() {
             id VARCHAR(64) PRIMARY KEY,
             content TEXT NOT NULL,
             FULLTEXT INDEX ft_content (content) WITH PARSER ngram
-        )"
-    ).execute(&pool).await;
+        )",
+    )
+    .execute(&pool)
+    .await;
 
     match create {
         Err(e) => {
             println!("⚠️  NGRAM parser failed: {e}");
             // Fallback: try without parser
-            sqlx::query("DROP TABLE IF EXISTS _t_ft").execute(&pool).await.unwrap();
+            sqlx::query("DROP TABLE IF EXISTS _t_ft")
+                .execute(&pool)
+                .await
+                .unwrap();
             sqlx::query(
                 "CREATE TABLE _t_ft (
                     id VARCHAR(64) PRIMARY KEY,
                     content TEXT NOT NULL,
                     FULLTEXT INDEX ft_content (content)
-                )"
-            ).execute(&pool).await.unwrap();
+                )",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
             println!("  Fallback: FULLTEXT without NGRAM parser");
         }
         Ok(_) => println!("  FULLTEXT with NGRAM parser created OK"),
     }
 
     sqlx::query("INSERT INTO _t_ft (id, content) VALUES (?, ?), (?, ?), (?, ?)")
-        .bind("e1").bind("rust programming language systems performance")
-        .bind("e2").bind("python memory service embedding vector")
-        .bind("e3").bind("matrixone database vector search fulltext")
-        .execute(&pool).await.unwrap();
+        .bind("e1")
+        .bind("rust programming language systems performance")
+        .bind("e2")
+        .bind("python memory service embedding vector")
+        .bind("e3")
+        .bind("matrixone database vector search fulltext")
+        .execute(&pool)
+        .await
+        .unwrap();
 
     // Python pattern: MATCH(content) AGAINST('+term' IN BOOLEAN MODE) — inline string
     let term = "rust";
@@ -148,13 +197,15 @@ async fn test_fulltext_ngram_boolean_mode() {
 
     // Test Chinese with NGRAM
     sqlx::query("INSERT INTO _t_ft (id, content) VALUES (?, ?)")
-        .bind("e4").bind("向量数据库内存检索系统")
-        .execute(&pool).await.unwrap();
+        .bind("e4")
+        .bind("向量数据库内存检索系统")
+        .execute(&pool)
+        .await
+        .unwrap();
 
     let cn_term = "向量";
-    let sql2 = format!(
-        "SELECT id FROM _t_ft WHERE MATCH(content) AGAINST('{cn_term}' IN BOOLEAN MODE)"
-    );
+    let sql2 =
+        format!("SELECT id FROM _t_ft WHERE MATCH(content) AGAINST('{cn_term}' IN BOOLEAN MODE)");
     let rows2 = sqlx::query(&sql2).fetch_all(&pool).await;
     match rows2 {
         Err(e) => println!("⚠️  Chinese fulltext failed: {e}"),
@@ -162,9 +213,16 @@ async fn test_fulltext_ngram_boolean_mode() {
     }
 
     // Drop index before table to avoid MatrixOne internal index metadata leak
-    let _ = sqlx::query("ALTER TABLE _t_ft DROP INDEX ft_content").execute(&pool).await;
-    let _ = sqlx::query("ALTER TABLE _t_ft DROP INDEX ft_content2").execute(&pool).await;
-    sqlx::query("DROP TABLE IF EXISTS _t_ft").execute(&pool).await.unwrap();
+    let _ = sqlx::query("ALTER TABLE _t_ft DROP INDEX ft_content")
+        .execute(&pool)
+        .await;
+    let _ = sqlx::query("ALTER TABLE _t_ft DROP INDEX ft_content2")
+        .execute(&pool)
+        .await;
+    sqlx::query("DROP TABLE IF EXISTS _t_ft")
+        .execute(&pool)
+        .await
+        .unwrap();
 }
 
 // ── Combined: the actual mem_memories schema ─────────────────────────────────
@@ -177,7 +235,10 @@ async fn test_mem_memories_schema() {
         .parse::<usize>()
         .unwrap_or(4);
 
-    sqlx::query("DROP TABLE IF EXISTS _t_memories").execute(&pool).await.unwrap();
+    sqlx::query("DROP TABLE IF EXISTS _t_memories")
+        .execute(&pool)
+        .await
+        .unwrap();
 
     let create_sql = format!(
         "CREATE TABLE _t_memories (
@@ -201,7 +262,10 @@ async fn test_mem_memories_schema() {
         )"
     );
 
-    sqlx::query(&create_sql).execute(&pool).await.expect("CREATE mem_memories schema");
+    sqlx::query(&create_sql)
+        .execute(&pool)
+        .await
+        .expect("CREATE mem_memories schema");
     println!("✅ mem_memories schema created with vecf32({dim}) + FULLTEXT NGRAM");
 
     // Insert a test row
@@ -222,8 +286,12 @@ async fn test_mem_memories_schema() {
     // Read back — JSON via CAST
     let row = sqlx::query(
         "SELECT memory_id, content, is_active, CAST(source_event_ids AS CHAR) AS src_ids
-         FROM _t_memories WHERE memory_id = ?"
-    ).bind("m1").fetch_one(&pool).await.unwrap();
+         FROM _t_memories WHERE memory_id = ?",
+    )
+    .bind("m1")
+    .fetch_one(&pool)
+    .await
+    .unwrap();
 
     let mid: String = row.try_get("memory_id").unwrap();
     let content: String = row.try_get("content").unwrap();
@@ -234,6 +302,11 @@ async fn test_mem_memories_schema() {
     let _: serde_json::Value = serde_json::from_str(&src_ids).unwrap();
     println!("✅ mem_memories INSERT+SELECT: id={mid}, content={content:?}, is_active={is_active}");
 
-    let _ = sqlx::query("ALTER TABLE _t_memories DROP INDEX ft_content").execute(&pool).await;
-    sqlx::query("DROP TABLE IF EXISTS _t_memories").execute(&pool).await.unwrap();
+    let _ = sqlx::query("ALTER TABLE _t_memories DROP INDEX ft_content")
+        .execute(&pool)
+        .await;
+    sqlx::query("DROP TABLE IF EXISTS _t_memories")
+        .execute(&pool)
+        .await
+        .unwrap();
 }

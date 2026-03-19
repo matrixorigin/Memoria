@@ -49,7 +49,9 @@ impl GrpcGovernanceStrategy {
             .map_err(|err| MemoriaError::Blocked(format!("Invalid gRPC endpoint: {err}")))?
             .connect()
             .await
-            .map_err(|err| MemoriaError::Blocked(format!("Failed to connect gRPC runtime: {err}")))?;
+            .map_err(|err| {
+                MemoriaError::Blocked(format!("Failed to connect gRPC runtime: {err}"))
+            })?;
 
         let strategy = Self {
             package,
@@ -141,7 +143,10 @@ impl GovernanceStrategy for GrpcGovernanceStrategy {
             return Ok(base_plan);
         }
         let patch: PluginPlanPatch = self
-            .call_remote(task, PlanHookContext::new(self.strategy_key(), task, &base_plan))
+            .call_remote(
+                task,
+                PlanHookContext::new(self.strategy_key(), task, &base_plan),
+            )
             .await?;
         Ok(apply_plan_patch(base_plan, patch))
     }
@@ -226,7 +231,11 @@ mod tests {
         ) -> Result<i64, MemoriaError> {
             Ok(0)
         }
-        async fn cleanup_orphaned_incrementals(&self, _: &str, _: i64) -> Result<i64, MemoriaError> {
+        async fn cleanup_orphaned_incrementals(
+            &self,
+            _: &str,
+            _: i64,
+        ) -> Result<i64, MemoriaError> {
             Ok(0)
         }
         async fn rebuild_vector_index(&self, _: &str) -> Result<i64, MemoriaError> {
@@ -302,9 +311,8 @@ mod tests {
             request: Request<proto::GovernanceRequest>,
         ) -> Result<Response<proto::GovernanceResponse>, Status> {
             let payload: serde_json::Value =
-                serde_json::from_slice(&request.get_ref().payload_json).map_err(|err| {
-                    Status::invalid_argument(format!("invalid payload: {err}"))
-                })?;
+                serde_json::from_slice(&request.get_ref().payload_json)
+                    .map_err(|err| Status::invalid_argument(format!("invalid payload: {err}")))?;
             let phase = payload["phase"].as_str().unwrap_or_default();
             let report_json = if phase == "plan" {
                 serde_json::to_vec(&serde_json::json!({
@@ -395,15 +403,15 @@ mod tests {
     #[tokio::test]
     async fn grpc_governance_strategy_calls_remote_runtime() {
         let (endpoint, shutdown) = spawn_runtime().await;
-        let strategy = GrpcGovernanceStrategy::connect(
-            grpc_package(),
-            endpoint,
-            Arc::new(DelegateStrategy),
-        )
-        .await
-        .unwrap();
+        let strategy =
+            GrpcGovernanceStrategy::connect(grpc_package(), endpoint, Arc::new(DelegateStrategy))
+                .await
+                .unwrap();
 
-        let plan = strategy.plan(&NoopStore, GovernanceTask::Daily).await.unwrap();
+        let plan = strategy
+            .plan(&NoopStore, GovernanceTask::Daily)
+            .await
+            .unwrap();
         assert!(plan.requires_approval);
         assert_eq!(plan.estimated_impact.get("grpc.plan"), Some(&1.0));
 

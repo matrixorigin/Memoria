@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="assets/logo.png" alt="Memoria Logo" width="300"/>
+  <img src="assets/memoria-logo.png" alt="Memoria Logo" width="300"/>
   
   # Memoria
   
@@ -358,6 +358,47 @@ AI:  → calls memory_diff(source="eval_sqlite")   ← preview first
 | `memoria plugin publish --package-dir <dir>` | Publish plugin to shared repository |
 | `memoria plugin dev-keygen --dir <dir>` | Generate ed25519 dev signing keypair |
 | `memoria benchmark --api-url <url> --token <key> --dataset <name>` | Run benchmark against API |
+
+---
+
+## Benchmark Reporting
+
+For LongMemEval and BEAM, the primary reporting path is to keep each benchmark's official
+categories separate:
+
+- LongMemEval: report by official LongMemEval category
+- BEAM: report by official BEAM ability
+
+If you need a secondary internal rollup, you can also normalize reports into a shared
+6-bucket memory taxonomy:
+
+- `Single-Session Grounding`
+- `Preference Understanding`
+- `Multi-Session Synthesis`
+- `Temporal State Tracking`
+- `Knowledge Update And Conflict Handling`
+- `Abstention And Constraint Following`
+
+Use the rollup helper after generating JSON benchmark reports:
+
+```bash
+uv run python scripts/rollup_benchmark_report.py path/to/report.json
+```
+
+Or recursively over a results directory:
+
+```bash
+uv run python scripts/rollup_benchmark_report.py benchmarks/results/
+```
+
+This optional post-processing augments each report with:
+
+- top-level `memory_ability_taxonomy`
+- top-level `by_memory_ability_bucket`
+- per-result `memory_ability_bucket`
+- per-result `memory_ability_bucket_label`
+
+See [Memory Ability Taxonomy](docs/memory-ability-taxonomy.md) for the LongMemEval and BEAM mapping and the rationale behind the 6-bucket summary.
 
 ---
 

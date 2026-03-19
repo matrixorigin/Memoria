@@ -27,8 +27,15 @@ const SNAP_PREFIX: &str = "mem_snap_";
 /// Sanitize a user-provided name: keep alphanumeric+underscore, truncate to 40 chars.
 /// If result starts with non-alpha, prepend "s_".
 fn sanitize_name(name: &str) -> String {
-    let mut clean: String = name.chars()
-        .map(|c| if c.is_alphanumeric() || c == '_' { c } else { '_' })
+    let mut clean: String = name
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .take(40)
         .collect();
     if clean.is_empty() || !clean.chars().next().unwrap().is_alphabetic() {
@@ -187,16 +194,26 @@ pub async fn call(
         "memory_snapshot" => {
             // Check global snapshot limit
             let all = git.list_snapshots().await?;
-            let mem_snaps = all.iter().filter(|s|
-                s.snapshot_name.starts_with(SNAP_PREFIX) || s.snapshot_name.starts_with("mem_milestone_")
-            ).count() as i64;
+            let mem_snaps = all
+                .iter()
+                .filter(|s| {
+                    s.snapshot_name.starts_with(SNAP_PREFIX)
+                        || s.snapshot_name.starts_with("mem_milestone_")
+                })
+                .count() as i64;
             if mem_snaps >= MAX_SNAPSHOTS {
-                return Ok(mcp_text(&format!("Snapshot limit reached ({MAX_SNAPSHOTS}). Delete old snapshots first.")));
+                return Ok(mcp_text(&format!(
+                    "Snapshot limit reached ({MAX_SNAPSHOTS}). Delete old snapshots first."
+                )));
             }
             let snap_name = args["name"].as_str().unwrap_or("");
             let internal = snap_internal(snap_name);
             let snap = git.create_snapshot(&internal).await?;
-            Ok(mcp_text(&format!("Snapshot '{}' created at {:?}", snap_display(&snap.snapshot_name), snap.timestamp)))
+            Ok(mcp_text(&format!(
+                "Snapshot '{}' created at {:?}",
+                snap_display(&snap.snapshot_name),
+                snap.timestamp
+            )))
         }
 
         "memory_snapshots" => {
@@ -204,60 +221,93 @@ pub async fn call(
             let offset = args["offset"].as_i64().unwrap_or(0) as usize;
             let all = git.list_snapshots().await?;
             // Filter to mem_snap_/mem_milestone_ only, sorted newest first
-            let mut snaps: Vec<_> = all.into_iter()
-                .filter(|s| s.snapshot_name.starts_with(SNAP_PREFIX) || s.snapshot_name.starts_with("mem_milestone_"))
+            let mut snaps: Vec<_> = all
+                .into_iter()
+                .filter(|s| {
+                    s.snapshot_name.starts_with(SNAP_PREFIX)
+                        || s.snapshot_name.starts_with("mem_milestone_")
+                })
                 .collect();
             snaps.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
             let total = snaps.len();
             let page: Vec<_> = snaps.into_iter().skip(offset).take(limit).collect();
-            if page.is_empty() { return Ok(mcp_text("No snapshots found.")); }
-            let text = page.iter().map(|s| {
-                format!("{} ({})", snap_display(&s.snapshot_name), s.timestamp.map(|t| t.to_string()).unwrap_or_default())
-            }).collect::<Vec<_>>().join("\n");
+            if page.is_empty() {
+                return Ok(mcp_text("No snapshots found."));
+            }
+            let text = page
+                .iter()
+                .map(|s| {
+                    format!(
+                        "{} ({})",
+                        snap_display(&s.snapshot_name),
+                        s.timestamp.map(|t| t.to_string()).unwrap_or_default()
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
             Ok(mcp_text(&format!("Snapshots ({total} total):\n{text}")))
         }
 
         "memory_snapshot_delete" => {
             // Get the filtered list (mem_snap_/mem_milestone_ only)
             let all = git.list_snapshots().await?;
-            let snaps: Vec<_> = all.into_iter()
-                .filter(|s| s.snapshot_name.starts_with(SNAP_PREFIX) || s.snapshot_name.starts_with("mem_milestone_"))
+            let snaps: Vec<_> = all
+                .into_iter()
+                .filter(|s| {
+                    s.snapshot_name.starts_with(SNAP_PREFIX)
+                        || s.snapshot_name.starts_with("mem_milestone_")
+                })
                 .collect();
 
             let to_delete: Vec<String> = if let Some(names) = args["names"].as_str() {
                 // User passes display names (without prefix)
-                let name_set: std::collections::HashSet<String> = names.split(',')
-                    .map(|n| snap_internal(n.trim()))
-                    .collect();
-                snaps.iter().filter(|s| name_set.contains(&s.snapshot_name))
-                    .map(|s| s.snapshot_name.clone()).collect()
+                let name_set: std::collections::HashSet<String> =
+                    names.split(',').map(|n| snap_internal(n.trim())).collect();
+                snaps
+                    .iter()
+                    .filter(|s| name_set.contains(&s.snapshot_name))
+                    .map(|s| s.snapshot_name.clone())
+                    .collect()
             } else if let Some(prefix) = args["prefix"].as_str() {
                 // Match against display names
-                snaps.iter()
+                snaps
+                    .iter()
                     .filter(|s| snap_display(&s.snapshot_name).starts_with(prefix))
-                    .map(|s| s.snapshot_name.clone()).collect()
+                    .map(|s| s.snapshot_name.clone())
+                    .collect()
             } else if let Some(older_than) = args["older_than"].as_str() {
-                let cutoff = NaiveDateTime::parse_from_str(&format!("{older_than} 00:00:00"), "%Y-%m-%d %H:%M:%S")
-                    .or_else(|_| NaiveDateTime::parse_from_str(older_than, "%Y-%m-%dT%H:%M:%S"))
-                    .map_err(|_| anyhow::anyhow!("older_than must be ISO date e.g. '2026-03-01'"))?;
-                snaps.iter()
+                let cutoff = NaiveDateTime::parse_from_str(
+                    &format!("{older_than} 00:00:00"),
+                    "%Y-%m-%d %H:%M:%S",
+                )
+                .or_else(|_| NaiveDateTime::parse_from_str(older_than, "%Y-%m-%dT%H:%M:%S"))
+                .map_err(|_| anyhow::anyhow!("older_than must be ISO date e.g. '2026-03-01'"))?;
+                snaps
+                    .iter()
                     .filter(|s| s.timestamp.map(|t| t < cutoff).unwrap_or(false))
-                    .map(|s| s.snapshot_name.clone()).collect()
+                    .map(|s| s.snapshot_name.clone())
+                    .collect()
             } else {
                 return Ok(mcp_text("Specify 'names', 'prefix', or 'older_than'"));
             };
 
             let count = to_delete.len();
-            for n in &to_delete { git.drop_snapshot(n).await?; }
+            for n in &to_delete {
+                git.drop_snapshot(n).await?;
+            }
             let display: Vec<_> = to_delete.iter().map(|n| snap_display(n)).collect();
-            Ok(mcp_text(&format!("Deleted {count} snapshot(s): {}", display.join(", "))))
+            Ok(mcp_text(&format!(
+                "Deleted {count} snapshot(s): {}",
+                display.join(", ")
+            )))
         }
 
         "memory_rollback" => {
             let snap_name = args["name"].as_str().unwrap_or("");
             let internal = snap_internal(snap_name);
             // Restore mem_memories (required) + graph tables (best-effort, like Python)
-            git.restore_table_from_snapshot("mem_memories", &internal).await
+            git.restore_table_from_snapshot("mem_memories", &internal)
+                .await
                 .map_err(|e| anyhow::anyhow!("Rollback failed: {e}"))?;
             for table in &["memory_graph_nodes", "memory_graph_edges", "mem_edit_log"] {
                 let _ = git.restore_table_from_snapshot(table, &internal).await;
@@ -271,7 +321,9 @@ pub async fn call(
             let from_timestamp = args["from_timestamp"].as_str();
 
             if from_snapshot.is_some() && from_timestamp.is_some() {
-                return Ok(mcp_text("Specify from_snapshot or from_timestamp, not both."));
+                return Ok(mcp_text(
+                    "Specify from_snapshot or from_timestamp, not both.",
+                ));
             }
 
             // from_timestamp validation: must be within last 30 minutes, not future
@@ -283,25 +335,33 @@ pub async fn call(
                     return Ok(mcp_text("from_timestamp cannot be in the future"));
                 }
                 if now - ts > chrono::Duration::minutes(30) {
-                    return Ok(mcp_text("from_timestamp must be within the last 30 minutes"));
+                    return Ok(mcp_text(
+                        "from_timestamp must be within the last 30 minutes",
+                    ));
                 }
             }
 
-            let sql = svc.sql_store.as_ref()
+            let sql = svc
+                .sql_store
+                .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("Branch ops require SQL store"))?;
 
             // Global branch limit
             let all_branches = sql.list_branches(user_id).await?;
             if all_branches.len() as i64 >= MAX_BRANCHES {
-                return Ok(mcp_text(&format!("Branch limit reached ({MAX_BRANCHES}). Delete old branches first.")));
+                return Ok(mcp_text(&format!(
+                    "Branch limit reached ({MAX_BRANCHES}). Delete old branches first."
+                )));
             }
 
             // Duplicate name check (including deleted)
             let dup = sqlx::query(
-                "SELECT COUNT(*) as cnt FROM mem_branches WHERE user_id = ? AND name = ?"
+                "SELECT COUNT(*) as cnt FROM mem_branches WHERE user_id = ? AND name = ?",
             )
-            .bind(user_id).bind(branch_name)
-            .fetch_one(git.pool()).await
+            .bind(user_id)
+            .bind(branch_name)
+            .fetch_one(git.pool())
+            .await
             .map_err(|e| anyhow::anyhow!("{e}"))?;
             let cnt: i64 = dup.try_get("cnt").unwrap_or(0);
             if cnt > 0 {
@@ -314,11 +374,13 @@ pub async fn call(
             if let Some(snap) = from_snapshot {
                 // Create branch from snapshot: restore snapshot to temp, then branch
                 let internal = snap_internal(snap);
-                git.create_branch_from_snapshot(&table_name, "mem_memories", &internal).await?;
+                git.create_branch_from_snapshot(&table_name, "mem_memories", &internal)
+                    .await?;
             } else {
                 git.create_branch(&table_name, "mem_memories").await?;
             }
-            sql.register_branch(user_id, branch_name, &table_name).await?;
+            sql.register_branch(user_id, branch_name, &table_name)
+                .await?;
             Ok(mcp_text(&format!("Created branch '{branch_name}'")))
         }
 
@@ -328,20 +390,31 @@ pub async fn call(
                 None => vec![],
             };
             let active = match &svc.sql_store {
-                Some(sql) => sql.active_table(user_id).await.unwrap_or_else(|_| "mem_memories".to_string()),
+                Some(sql) => sql
+                    .active_table(user_id)
+                    .await
+                    .unwrap_or_else(|_| "mem_memories".to_string()),
                 None => "mem_memories".to_string(),
             };
-            if branches.is_empty() { return Ok(mcp_text("No branches. On main.")); }
-            let text = branches.iter().map(|(name, table)| {
-                let marker = if *table == active { " ← active" } else { "" };
-                format!("{name}{marker}")
-            }).collect::<Vec<_>>().join("\n");
+            if branches.is_empty() {
+                return Ok(mcp_text("No branches. On main."));
+            }
+            let text = branches
+                .iter()
+                .map(|(name, table)| {
+                    let marker = if *table == active { " ← active" } else { "" };
+                    format!("{name}{marker}")
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
             Ok(mcp_text(&format!("Branches:\nmain\n{text}")))
         }
 
         "memory_checkout" => {
             let branch = args["name"].as_str().unwrap_or("main");
-            let sql = svc.sql_store.as_ref()
+            let sql = svc
+                .sql_store
+                .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("Branch ops require SQL store"))?;
             if branch == "main" {
                 sql.set_active_branch(user_id, "main").await?;
@@ -353,7 +426,9 @@ pub async fn call(
             }
             sql.set_active_branch(user_id, branch).await?;
             let count = svc.list_active(user_id, 50).await?.len();
-            Ok(mcp_text(&format!("Switched to branch '{branch}'. {count} memories on this branch.")))
+            Ok(mcp_text(&format!(
+                "Switched to branch '{branch}'. {count} memories on this branch."
+            )))
         }
 
         "memory_merge" => {
@@ -368,10 +443,13 @@ pub async fn call(
                     ));
                 }
             };
-            let sql = svc.sql_store.as_ref()
+            let sql = svc
+                .sql_store
+                .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("Branch ops require SQL store"))?;
             let branches = sql.list_branches(user_id).await?;
-            let table_name = branches.iter()
+            let table_name = branches
+                .iter()
                 .find(|(name, _)| name == source_branch)
                 .map(|(_, t)| t.clone())
                 .ok_or_else(|| anyhow::anyhow!("Branch '{source_branch}' not found"))?;
@@ -381,10 +459,13 @@ pub async fn call(
                 "SELECT COUNT(*) as cnt FROM {table_name} b WHERE b.user_id = ? \
                  AND NOT EXISTS (SELECT 1 FROM mem_memories m WHERE m.memory_id = b.memory_id)"
             );
-            let new_count: i64 = sqlx::query(&count_sql).bind(user_id)
-                .fetch_one(git.pool()).await
+            let new_count: i64 = sqlx::query(&count_sql)
+                .bind(user_id)
+                .fetch_one(git.pool())
+                .await
                 .map_err(|e| anyhow::anyhow!("count failed: {e}"))?
-                .try_get("cnt").unwrap_or(0);
+                .try_get("cnt")
+                .unwrap_or(0);
             if new_count > 5000 {
                 return Ok(mcp_text(&format!(
                     "Too many changes ({new_count}). Max 5000. Reduce branch scope."
@@ -407,7 +488,8 @@ pub async fn call(
                 // We intentionally keep the native behavior here for now and leave richer
                 // reconcile/delete-propagation semantics for a future strategy.
                 if new_count > 0 {
-                    git.merge_branch(&table_name, "mem_memories").await
+                    git.merge_branch(&table_name, "mem_memories")
+                        .await
                         .map_err(|e| anyhow::anyhow!("merge failed: {e}"))?;
                 }
                 return Ok(mcp_text(&format!(
@@ -439,8 +521,11 @@ pub async fn call(
                      ) \
                    )"
             );
-            let inserted = sqlx::query(&insert_sql).bind(user_id).bind(user_id)
-                .execute(git.pool()).await
+            let inserted = sqlx::query(&insert_sql)
+                .bind(user_id)
+                .bind(user_id)
+                .execute(git.pool())
+                .await
                 .map_err(|e| anyhow::anyhow!("merge insert failed: {e}"))?
                 .rows_affected();
 
@@ -458,11 +543,15 @@ pub async fn call(
                        AND l2_distance(m.embedding, b.embedding) < {L2_CONFLICT} \
                    )"
             );
-            let conflict_count: i64 = sqlx::query(&format!("SELECT COUNT(*) as cnt {conflict_where}"))
-                .bind(user_id).bind(user_id)
-                .fetch_one(git.pool()).await
-                .map_err(|e| anyhow::anyhow!("conflict count failed: {e}"))?
-                .try_get("cnt").unwrap_or(0);
+            let conflict_count: i64 =
+                sqlx::query(&format!("SELECT COUNT(*) as cnt {conflict_where}"))
+                    .bind(user_id)
+                    .bind(user_id)
+                    .fetch_one(git.pool())
+                    .await
+                    .map_err(|e| anyhow::anyhow!("conflict count failed: {e}"))?
+                    .try_get("cnt")
+                    .unwrap_or(0);
 
             let (replaced, skipped) = if strategy == "replace" && conflict_count > 0 {
                 let update_sql = format!(
@@ -488,8 +577,12 @@ pub async fn call(
                        AND l2_distance(m.embedding, b.embedding) < {L2_CONFLICT} \
                      )"
                 );
-                sqlx::query(&update_sql).bind(user_id).bind(user_id).bind(user_id)
-                    .execute(git.pool()).await
+                sqlx::query(&update_sql)
+                    .bind(user_id)
+                    .bind(user_id)
+                    .bind(user_id)
+                    .execute(git.pool())
+                    .await
                     .map_err(|e| anyhow::anyhow!("merge replace failed: {e}"))?;
                 (conflict_count as u64, 0u64)
             } else {
@@ -506,7 +599,9 @@ pub async fn call(
             if branch == "main" {
                 return Ok(mcp_text("Cannot delete main"));
             }
-            let sql = svc.sql_store.as_ref()
+            let sql = svc
+                .sql_store
+                .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("Branch ops require SQL store"))?;
             let branches = sql.list_branches(user_id).await?;
             if let Some((_, table_name)) = branches.iter().find(|(name, _)| name == branch) {
@@ -525,34 +620,60 @@ pub async fn call(
         "memory_diff" => {
             let source_branch = args["source"].as_str().unwrap_or("");
             let limit = args["limit"].as_i64().unwrap_or(50);
-            let sql = svc.sql_store.as_ref()
+            let sql = svc
+                .sql_store
+                .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("Branch ops require SQL store"))?;
             let branches = sql.list_branches(user_id).await?;
-            let table_name = branches.iter()
+            let table_name = branches
+                .iter()
                 .find(|(name, _)| name == source_branch)
                 .map(|(_, t)| t.clone())
                 .ok_or_else(|| anyhow::anyhow!("Branch '{source_branch}' not found"))?;
 
             // Use native LCA-based diff count, SQL JOIN for row details
             // (native diff output limit returns unknown column types that sqlx can't decode)
-            let total = git.diff_branch_count(&table_name, "mem_memories", user_id).await
+            let total = git
+                .diff_branch_count(&table_name, "mem_memories", user_id)
+                .await
                 .unwrap_or(0);
             if total == 0 {
-                return Ok(mcp_text(&format!("No changes in branch '{source_branch}' vs main.")));
+                return Ok(mcp_text(&format!(
+                    "No changes in branch '{source_branch}' vs main."
+                )));
             }
-            let rows = git.diff_branch_rows(&table_name, "mem_memories", user_id, limit).await?;
-            let lines: Vec<String> = rows.iter().map(|r| {
-                let semantic = match r.flag.as_str() {
-                    "INSERT" => "new",
-                    "UPDATE" => "modified",
-                    "DELETE" => "removed",
-                    other => other,
-                };
-                let preview = if r.content.len() > 80 { format!("{}...", &r.content[..80]) } else { r.content.clone() };
-                format!("[{semantic}] {}: {preview}", &r.memory_id[..8.min(r.memory_id.len())])
-            }).collect();
-            let truncated = if total > limit { format!(" (showing {limit}/{total})") } else { String::new() };
-            Ok(mcp_text(&format!("Diff '{source_branch}' vs main{truncated}:\n{}", lines.join("\n"))))
+            let rows = git
+                .diff_branch_rows(&table_name, "mem_memories", user_id, limit)
+                .await?;
+            let lines: Vec<String> = rows
+                .iter()
+                .map(|r| {
+                    let semantic = match r.flag.as_str() {
+                        "INSERT" => "new",
+                        "UPDATE" => "modified",
+                        "DELETE" => "removed",
+                        other => other,
+                    };
+                    let preview = if r.content.len() > 80 {
+                        format!("{}...", &r.content[..80])
+                    } else {
+                        r.content.clone()
+                    };
+                    format!(
+                        "[{semantic}] {}: {preview}",
+                        &r.memory_id[..8.min(r.memory_id.len())]
+                    )
+                })
+                .collect();
+            let truncated = if total > limit {
+                format!(" (showing {limit}/{total})")
+            } else {
+                String::new()
+            };
+            Ok(mcp_text(&format!(
+                "Diff '{source_branch}' vs main{truncated}:\n{}",
+                lines.join("\n")
+            )))
         }
 
         _ => Err(anyhow::anyhow!("Unknown git tool: {name}")),

@@ -7,9 +7,10 @@ use ed25519_dalek::{Signer, SigningKey};
 use memoria_core::MemoriaError;
 use memoria_service::{
     get_plugin_audit_events, grpc_proto, load_active_governance_plugin, publish_plugin_package,
-    review_plugin_package, upsert_plugin_binding_rule, upsert_trusted_plugin_signer, BindingRuleInput,
-    Config, GovernanceExecution, GovernancePlan, GovernanceRunSummary, GovernanceScheduler,
-    GovernanceStore, GovernanceStrategy, GovernanceTask, MemoryService, StrategyReport,
+    review_plugin_package, upsert_plugin_binding_rule, upsert_trusted_plugin_signer,
+    BindingRuleInput, Config, GovernanceExecution, GovernancePlan, GovernanceRunSummary,
+    GovernanceScheduler, GovernanceStore, GovernanceStrategy, GovernanceTask, MemoryService,
+    StrategyReport,
 };
 use memoria_storage::SqlMemoryStore;
 use serde_json::json;
@@ -287,10 +288,8 @@ impl grpc_proto::strategy_runtime_server::StrategyRuntime for MockGrpcRuntime {
         &self,
         request: Request<grpc_proto::GovernanceRequest>,
     ) -> Result<Response<grpc_proto::GovernanceResponse>, Status> {
-        let payload: serde_json::Value =
-            serde_json::from_slice(&request.get_ref().payload_json).map_err(|err| {
-                Status::invalid_argument(format!("invalid payload: {err}"))
-            })?;
+        let payload: serde_json::Value = serde_json::from_slice(&request.get_ref().payload_json)
+            .map_err(|err| Status::invalid_argument(format!("invalid payload: {err}")))?;
         let report_json = if payload["phase"] == "plan" {
             serde_json::to_vec(&json!({
                 "requires_approval": true,
@@ -320,9 +319,9 @@ async fn spawn_grpc_runtime() -> (String, tokio::sync::oneshot::Sender<()>) {
     let (tx, rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
         Server::builder()
-            .add_service(grpc_proto::strategy_runtime_server::StrategyRuntimeServer::new(
-                MockGrpcRuntime,
-            ))
+            .add_service(
+                grpc_proto::strategy_runtime_server::StrategyRuntimeServer::new(MockGrpcRuntime),
+            )
             .serve_with_shutdown(addr, async move {
                 let _ = rx.await;
             })
@@ -334,7 +333,9 @@ async fn spawn_grpc_runtime() -> (String, tokio::sync::oneshot::Sender<()>) {
 
 #[tokio::test]
 async fn repository_requires_review_before_activation_and_startup_load() {
-    let store = SqlMemoryStore::connect(&db_url(), test_dim()).await.unwrap();
+    let store = SqlMemoryStore::connect(&db_url(), test_dim())
+        .await
+        .unwrap();
     store.migrate().await.unwrap();
 
     let signer_name = format!("repo-signer-{}", unique_suffix());
@@ -405,11 +406,7 @@ async fn repository_requires_review_before_activation_and_startup_load() {
         .any(|event| event.event_type == "binding.loaded"));
 
     let sql_store = Arc::new(store);
-    let service = Arc::new(MemoryService::new_sql_with_llm(
-        sql_store,
-        None,
-        None,
-    ));
+    let service = Arc::new(MemoryService::new_sql_with_llm(sql_store, None, None));
     let config = Config {
         db_url: db_url(),
         db_name: "memoria_test".into(),
@@ -428,14 +425,18 @@ async fn repository_requires_review_before_activation_and_startup_load() {
         instance_id: "test-instance".into(),
         lock_ttl_secs: 120,
     };
-    let scheduler = GovernanceScheduler::from_config(service, &config).await.unwrap();
+    let scheduler = GovernanceScheduler::from_config(service, &config)
+        .await
+        .unwrap();
     assert_eq!(scheduler.strategy_key(), published.plugin_key);
     assert!(plugin_name.contains("memoria-governance-repo-"));
 }
 
 #[tokio::test]
 async fn repository_binding_rules_support_semver_selection_and_subject_freeze() {
-    let store = SqlMemoryStore::connect(&db_url(), test_dim()).await.unwrap();
+    let store = SqlMemoryStore::connect(&db_url(), test_dim())
+        .await
+        .unwrap();
     store.migrate().await.unwrap();
 
     let signer_name = format!("repo-signer-{}", unique_suffix());
@@ -447,8 +448,12 @@ async fn repository_binding_rules_support_semver_selection_and_subject_freeze() 
 
     let shared_name = format!("memoria-governance-repo-{}", unique_suffix());
 
-    let (v1_dir, _) = write_signed_rhai_package_named(&signer_name, &signer_key, "1.0.0", Some(&shared_name)).unwrap();
-    let package_v1 = publish_plugin_package(&store, v1_dir.path(), "test").await.unwrap();
+    let (v1_dir, _) =
+        write_signed_rhai_package_named(&signer_name, &signer_key, "1.0.0", Some(&shared_name))
+            .unwrap();
+    let package_v1 = publish_plugin_package(&store, v1_dir.path(), "test")
+        .await
+        .unwrap();
     review_plugin_package(
         &store,
         &package_v1.plugin_key,
@@ -460,8 +465,12 @@ async fn repository_binding_rules_support_semver_selection_and_subject_freeze() 
     .await
     .unwrap();
 
-    let (v11_dir, _) = write_signed_rhai_package_named(&signer_name, &signer_key, "1.1.0", Some(&shared_name)).unwrap();
-    let package_v11 = publish_plugin_package(&store, v11_dir.path(), "test").await.unwrap();
+    let (v11_dir, _) =
+        write_signed_rhai_package_named(&signer_name, &signer_key, "1.1.0", Some(&shared_name))
+            .unwrap();
+    let package_v11 = publish_plugin_package(&store, v11_dir.path(), "test")
+        .await
+        .unwrap();
     review_plugin_package(
         &store,
         &package_v11.plugin_key,
@@ -534,7 +543,9 @@ async fn repository_binding_rules_support_semver_selection_and_subject_freeze() 
 
 #[tokio::test]
 async fn repository_loads_grpc_plugin_from_shared_binding() {
-    let store = SqlMemoryStore::connect(&db_url(), test_dim()).await.unwrap();
+    let store = SqlMemoryStore::connect(&db_url(), test_dim())
+        .await
+        .unwrap();
     store.migrate().await.unwrap();
 
     let signer_name = format!("repo-signer-{}", unique_suffix());
@@ -578,17 +589,17 @@ async fn repository_loads_grpc_plugin_from_shared_binding() {
     .await
     .unwrap();
 
-    let loaded = load_active_governance_plugin(
-        &store,
-        "grpc",
-        "system",
-        Arc::new(DelegateStrategy),
-    )
-    .await
-    .unwrap()
-    .unwrap();
+    let loaded =
+        load_active_governance_plugin(&store, "grpc", "system", Arc::new(DelegateStrategy))
+            .await
+            .unwrap()
+            .unwrap();
 
-    let plan = loaded.strategy.plan(&NoopStore, GovernanceTask::Daily).await.unwrap();
+    let plan = loaded
+        .strategy
+        .plan(&NoopStore, GovernanceTask::Daily)
+        .await
+        .unwrap();
     assert!(plan.requires_approval);
     let execution = loaded
         .strategy

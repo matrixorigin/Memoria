@@ -33,22 +33,65 @@ struct Pattern {
 // Patterns defined as static strings; compiled lazily via once_cell
 static PATTERNS: &[Pattern] = &[
     // HIGH — block
-    Pattern { label: "aws_key",            tier: SensitivityTier::High,   regex: r"(?:AKIA|ABIA|ACCA|ASIA)[0-9A-Z]{16}",                    replacement: "" },
-    Pattern { label: "private_key",        tier: SensitivityTier::High,   regex: r"-----BEGIN (?:RSA |EC |DSA )?PRIVATE KEY-----",           replacement: "" },
-    Pattern { label: "bearer_token",       tier: SensitivityTier::High,   regex: r"(?i)Bearer\s+[A-Za-z0-9\-._~+/]+=*",                     replacement: "" },
-    Pattern { label: "password_assign",    tier: SensitivityTier::High,   regex: r"(?i)(?:password|passwd|secret)\s*[:=]\s*\S+",             replacement: "" },
+    Pattern {
+        label: "aws_key",
+        tier: SensitivityTier::High,
+        regex: r"(?:AKIA|ABIA|ACCA|ASIA)[0-9A-Z]{16}",
+        replacement: "",
+    },
+    Pattern {
+        label: "private_key",
+        tier: SensitivityTier::High,
+        regex: r"-----BEGIN (?:RSA |EC |DSA )?PRIVATE KEY-----",
+        replacement: "",
+    },
+    Pattern {
+        label: "bearer_token",
+        tier: SensitivityTier::High,
+        regex: r"(?i)Bearer\s+[A-Za-z0-9\-._~+/]+=*",
+        replacement: "",
+    },
+    Pattern {
+        label: "password_assign",
+        tier: SensitivityTier::High,
+        regex: r"(?i)(?:password|passwd|secret)\s*[:=]\s*\S+",
+        replacement: "",
+    },
     // MEDIUM — redact
-    Pattern { label: "email",             tier: SensitivityTier::Medium, regex: r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z]{2,}",           replacement: "[email]" },
-    Pattern { label: "phone",             tier: SensitivityTier::Medium, regex: r"\b\d{3}[-.]?\d{3,4}[-.]?\d{4}\b",                        replacement: "[phone]" },
-    Pattern { label: "ssn",               tier: SensitivityTier::Medium, regex: r"\b\d{3}-\d{2}-\d{4}\b",                                  replacement: "[ssn]" },
-    Pattern { label: "credit_card",       tier: SensitivityTier::Medium, regex: r"\b(?:\d[ -]*?){13,19}\b",                                 replacement: "[card]" },
+    Pattern {
+        label: "email",
+        tier: SensitivityTier::Medium,
+        regex: r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z]{2,}",
+        replacement: "[email]",
+    },
+    Pattern {
+        label: "phone",
+        tier: SensitivityTier::Medium,
+        regex: r"\b\d{3}[-.]?\d{3,4}[-.]?\d{4}\b",
+        replacement: "[phone]",
+    },
+    Pattern {
+        label: "ssn",
+        tier: SensitivityTier::Medium,
+        regex: r"\b\d{3}-\d{2}-\d{4}\b",
+        replacement: "[ssn]",
+    },
+    Pattern {
+        label: "credit_card",
+        tier: SensitivityTier::Medium,
+        regex: r"\b(?:\d[ -]*?){13,19}\b",
+        replacement: "[card]",
+    },
 ];
 
 use once_cell::sync::Lazy;
 use regex::Regex;
 
 static COMPILED: Lazy<Vec<(&'static Pattern, Regex)>> = Lazy::new(|| {
-    PATTERNS.iter().map(|p| (p, Regex::new(p.regex).expect("valid regex"))).collect()
+    PATTERNS
+        .iter()
+        .map(|p| (p, Regex::new(p.regex).expect("valid regex")))
+        .collect()
 });
 
 /// Check content for PII/credentials. Returns a `SensitivityResult`.
@@ -86,7 +129,11 @@ pub fn check_sensitivity(text: &str) -> SensitivityResult {
         };
     }
 
-    SensitivityResult { blocked: false, redacted_content: None, matched_labels: vec![] }
+    SensitivityResult {
+        blocked: false,
+        redacted_content: None,
+        matched_labels: vec![],
+    }
 }
 
 #[cfg(test)]
@@ -117,7 +164,10 @@ mod tests {
     fn test_email_redacted() {
         let r = check_sensitivity("contact me at alice@example.com please");
         assert!(!r.blocked);
-        assert_eq!(r.redacted_content.as_deref(), Some("contact me at [email] please"));
+        assert_eq!(
+            r.redacted_content.as_deref(),
+            Some("contact me at [email] please")
+        );
         assert!(r.matched_labels.contains(&"email"));
     }
 
