@@ -42,8 +42,8 @@ Ask: "Do you have an OpenAI-compatible embedding endpoint?"
 
 ```bash
 # Linux x86_64
-curl -LO https://github.com/matrixorigin/Memoria/releases/latest/download/memoria-x86_64-unknown-linux-gnu.tar.gz
-tar xzf memoria-x86_64-unknown-linux-gnu.tar.gz && sudo mv memoria /usr/local/bin/
+curl -LO https://github.com/matrixorigin/Memoria/releases/latest/download/memoria-x86_64-unknown-linux-musl.tar.gz
+tar xzf memoria-x86_64-unknown-linux-musl.tar.gz && sudo mv memoria /usr/local/bin/
 
 # macOS Apple Silicon
 curl -LO https://github.com/matrixorigin/Memoria/releases/latest/download/memoria-aarch64-apple-darwin.tar.gz
