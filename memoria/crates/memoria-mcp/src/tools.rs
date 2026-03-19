@@ -925,6 +925,29 @@ pub fn entity_extract_prompt(text: &str) -> String {
          - Max 10 entities per text\n\
          - Do NOT extract: generic verbs, common nouns, numbers, dates\n\n\
          Text:\n{}\n\nJSON array:",
-        &text[..text.len().min(2000)]
+        &memoria_core::truncate_utf8(text, 2000)
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn entity_extract_prompt_truncates_at_char_boundary() {
+        // 2000 ASCII bytes then a 3-byte Chinese char — must not panic
+        let text = format!("{}你好世界", "x".repeat(2000));
+        let prompt = entity_extract_prompt(&text);
+        assert!(prompt.contains(&"x".repeat(2000)));
+        assert!(!prompt.contains('你'));
+    }
+
+    #[test]
+    fn entity_extract_prompt_multibyte_at_boundary() {
+        // Place a 3-byte char so byte 2000 lands inside it
+        let text = format!("{}，after", "a".repeat(1999));
+        let prompt = entity_extract_prompt(&text);
+        assert!(prompt.contains(&"a".repeat(1999)));
+        assert!(!prompt.contains('，'));
+    }
 }

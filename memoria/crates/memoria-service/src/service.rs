@@ -214,7 +214,7 @@ impl MemoryService {
             "Extract named entities from the following text. Return a JSON array of objects.\n\
              Each object: {{\"name\": \"canonical name\", \"type\": \"tech|person|repo|project|concept\"}}\n\
              Rules: only specific named entities, max 10, deduplicate.\n\nText:\n{}\n\nJSON array:",
-            &content[..content.len().min(2000)]
+            memoria_core::truncate_utf8(content, 2000)
         );
         let msgs = vec![ChatMessage { role: "user".into(), content: prompt }];
         let raw = match llm.chat(&msgs, 0.0, Some(300)).await {

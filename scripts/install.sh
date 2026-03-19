@@ -266,6 +266,7 @@ fi
 # ── Install ─────────────────────────────────────────────────────────
 
 tar -xzf "$TMP/$ASSET" -C "$TMP"
+$SUDO rm -f "$INSTALL_DIR/memoria"
 $SUDO cp "$TMP/memoria" "$INSTALL_DIR/memoria"
 $SUDO chmod +x "$INSTALL_DIR/memoria"
 
