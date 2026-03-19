@@ -46,6 +46,16 @@ pub fn build_router(state: AppState) -> Router {
             get(routes::memory::get_profile),
         )
         .route("/v1/observe", post(routes::memory::observe_turn))
+        // Feedback
+        .route(
+            "/v1/memories/:id/feedback",
+            post(routes::memory::record_feedback),
+        )
+        .route("/v1/feedback/stats", get(routes::memory::get_feedback_stats))
+        .route(
+            "/v1/feedback/by-tier",
+            get(routes::memory::get_feedback_by_tier),
+        )
         // Governance
         .route("/v1/governance", post(routes::governance::governance))
         .route("/v1/consolidate", post(routes::governance::consolidate))

@@ -4137,3 +4137,173 @@ async fn test_distributed_async_task_fail() {
 
     println!("✅ async task failure recorded correctly");
 }
+
+
+// ── Feedback API tests ────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_api_feedback_record() {
+    let (base, client) = spawn_server().await;
+    let uid = uid();
+
+    // Store a memory first
+    let r = client
+        .post(format!("{base}/v1/memories"))
+        .header("X-User-Id", &uid)
+        .json(&json!({"content": "API feedback test memory", "memory_type": "semantic"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 201);
+    let body: Value = r.json().await.unwrap();
+    let memory_id = body["memory_id"].as_str().unwrap();
+
+    // Record feedback
+    let r = client
+        .post(format!("{base}/v1/memories/{memory_id}/feedback"))
+        .header("X-User-Id", &uid)
+        .json(&json!({"signal": "useful", "context": "very helpful"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 201);
+    let body: Value = r.json().await.unwrap();
+    assert!(!body["feedback_id"].as_str().unwrap().is_empty());
+    assert_eq!(body["memory_id"], memory_id);
+    assert_eq!(body["signal"], "useful");
+
+    println!("✅ POST /v1/memories/:id/feedback");
+}
+
+#[tokio::test]
+async fn test_api_feedback_invalid_signal() {
+    let (base, client) = spawn_server().await;
+    let uid = uid();
+
+    // Store a memory
+    let r = client
+        .post(format!("{base}/v1/memories"))
+        .header("X-User-Id", &uid)
+        .json(&json!({"content": "Invalid signal test", "memory_type": "semantic"}))
+        .send()
+        .await
+        .unwrap();
+    let body: Value = r.json().await.unwrap();
+    let memory_id = body["memory_id"].as_str().unwrap();
+
+    // Try invalid signal
+    let r = client
+        .post(format!("{base}/v1/memories/{memory_id}/feedback"))
+        .header("X-User-Id", &uid)
+        .json(&json!({"signal": "bad_signal"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 500); // Internal error for invalid signal
+    println!("✅ POST /v1/memories/:id/feedback rejects invalid signal");
+}
+
+#[tokio::test]
+async fn test_api_feedback_nonexistent_memory() {
+    let (base, client) = spawn_server().await;
+    let uid = uid();
+
+    let r = client
+        .post(format!("{base}/v1/memories/nonexistent_id_12345/feedback"))
+        .header("X-User-Id", &uid)
+        .json(&json!({"signal": "useful"}))
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_client_error() || r.status().is_server_error());
+    println!("✅ POST /v1/memories/:id/feedback rejects nonexistent memory");
+}
+
+#[tokio::test]
+async fn test_api_feedback_stats() {
+    let (base, client) = spawn_server().await;
+    let uid = uid();
+
+    // Store memories and give feedback
+    for signal in &["useful", "useful", "irrelevant", "outdated"] {
+        let r = client
+            .post(format!("{base}/v1/memories"))
+            .header("X-User-Id", &uid)
+            .json(&json!({"content": format!("Stats test {signal}"), "memory_type": "semantic"}))
+            .send()
+            .await
+            .unwrap();
+        let body: Value = r.json().await.unwrap();
+        let memory_id = body["memory_id"].as_str().unwrap();
+
+        client
+            .post(format!("{base}/v1/memories/{memory_id}/feedback"))
+            .header("X-User-Id", &uid)
+            .json(&json!({"signal": signal}))
+            .send()
+            .await
+            .unwrap();
+    }
+
+    // Get stats
+    let r = client
+        .get(format!("{base}/v1/feedback/stats"))
+        .header("X-User-Id", &uid)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let body: Value = r.json().await.unwrap();
+    assert_eq!(body["total"], 4);
+    assert_eq!(body["useful"], 2);
+    assert_eq!(body["irrelevant"], 1);
+    assert_eq!(body["outdated"], 1);
+    assert_eq!(body["wrong"], 0);
+
+    println!("✅ GET /v1/feedback/stats: {body}");
+}
+
+#[tokio::test]
+async fn test_api_feedback_by_tier() {
+    let (base, client) = spawn_server().await;
+    let uid = uid();
+
+    // Store memories with different tiers and give feedback
+    for (tier, signal) in &[("T1", "useful"), ("T2", "useful"), ("T3", "irrelevant")] {
+        let r = client
+            .post(format!("{base}/v1/memories"))
+            .header("X-User-Id", &uid)
+            .json(&json!({
+                "content": format!("Tier {tier} test"),
+                "memory_type": "semantic",
+                "trust_tier": tier
+            }))
+            .send()
+            .await
+            .unwrap();
+        let body: Value = r.json().await.unwrap();
+        let memory_id = body["memory_id"].as_str().unwrap();
+
+        client
+            .post(format!("{base}/v1/memories/{memory_id}/feedback"))
+            .header("X-User-Id", &uid)
+            .json(&json!({"signal": signal}))
+            .send()
+            .await
+            .unwrap();
+    }
+
+    // Get breakdown by tier
+    let r = client
+        .get(format!("{base}/v1/feedback/by-tier"))
+        .header("X-User-Id", &uid)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let body: Value = r.json().await.unwrap();
+    let breakdown = body["breakdown"].as_array().unwrap();
+    assert!(!breakdown.is_empty(), "should have tier breakdown");
+
+    println!("✅ GET /v1/feedback/by-tier: {} entries", breakdown.len());
+}

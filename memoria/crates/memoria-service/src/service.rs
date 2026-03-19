@@ -656,11 +656,37 @@ impl MemoryService {
             // Phase 3: fulltext fallback
             explain.fulltext_attempted = true;
             let ft_start = std::time::Instant::now();
-            let results = sql
+            let mut results = sql
                 .search_fulltext_from(&table, user_id, query, top_k)
                 .await?;
             explain.fulltext_ms = ft_start.elapsed().as_secs_f64() * 1000.0;
             explain.fulltext_hit = !results.is_empty();
+
+            // Apply feedback adjustment to fulltext results
+            if !results.is_empty() {
+                let ids: Vec<String> = results.iter().map(|m| m.memory_id.clone()).collect();
+                if let Ok(fb_map) = sql.get_feedback_batch(&ids).await {
+                    for m in &mut results {
+                        if let Some(fb) = fb_map.get(&m.memory_id) {
+                            let positive = fb.useful as f64;
+                            let negative = (fb.irrelevant + fb.outdated + fb.wrong) as f64;
+                            let feedback_delta = positive - 0.5 * negative;
+                            if feedback_delta.abs() > 0.01 {
+                                if let Some(score) = m.retrieval_score.as_mut() {
+                                    *score *= (1.0 + 0.1 * feedback_delta).max(0.5).min(2.0);
+                                }
+                            }
+                        }
+                    }
+                    // Re-sort after feedback adjustment
+                    results.sort_by(|a, b| {
+                        b.retrieval_score
+                            .partial_cmp(&a.retrieval_score)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                }
+            }
+
             explain.path = if explain.fulltext_hit {
                 "fulltext"
             } else {
@@ -1245,3 +1271,48 @@ Confidence guide:
 Do NOT extract: greetings, pure meta-conversation.
 If nothing worth remembering, return [].
 "#;
+
+// ── Feedback methods ──────────────────────────────────────────────────────────
+
+impl MemoryService {
+    /// Record explicit relevance feedback for a memory.
+    /// signal: "useful" | "irrelevant" | "outdated" | "wrong"
+    pub async fn record_feedback(
+        &self,
+        user_id: &str,
+        memory_id: &str,
+        signal: &str,
+        context: Option<&str>,
+    ) -> Result<String, MemoriaError> {
+        let sql = self
+            .sql_store
+            .as_ref()
+            .ok_or_else(|| MemoriaError::Internal("Feedback requires SQL store".into()))?;
+        sql.record_feedback(user_id, memory_id, signal, context)
+            .await
+    }
+
+    /// Get feedback statistics for a user.
+    pub async fn get_feedback_stats(
+        &self,
+        user_id: &str,
+    ) -> Result<memoria_storage::FeedbackStats, MemoriaError> {
+        let sql = self
+            .sql_store
+            .as_ref()
+            .ok_or_else(|| MemoriaError::Internal("Feedback requires SQL store".into()))?;
+        sql.get_feedback_stats(user_id).await
+    }
+
+    /// Get feedback breakdown by trust tier.
+    pub async fn get_feedback_by_tier(
+        &self,
+        user_id: &str,
+    ) -> Result<Vec<memoria_storage::TierFeedback>, MemoriaError> {
+        let sql = self
+            .sql_store
+            .as_ref()
+            .ok_or_else(|| MemoriaError::Internal("Feedback requires SQL store".into()))?;
+        sql.get_feedback_by_tier(user_id).await
+    }
+}

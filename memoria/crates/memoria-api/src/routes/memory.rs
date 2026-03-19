@@ -597,3 +597,66 @@ pub async fn run_pipeline(
         "errors": result.errors,
     })))
 }
+
+// ── Feedback ──────────────────────────────────────────────────────────────────
+
+#[derive(serde::Deserialize)]
+pub struct FeedbackRequest {
+    pub signal: String,
+    pub context: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+pub struct FeedbackResponse {
+    pub feedback_id: String,
+    pub memory_id: String,
+    pub signal: String,
+}
+
+/// POST /v1/memories/:id/feedback — record explicit relevance feedback.
+pub async fn record_feedback(
+    State(state): State<AppState>,
+    AuthUser { user_id, .. }: AuthUser,
+    Path(memory_id): Path<String>,
+    Json(req): Json<FeedbackRequest>,
+) -> Result<(StatusCode, Json<FeedbackResponse>), (StatusCode, String)> {
+    let feedback_id = state
+        .service
+        .record_feedback(&user_id, &memory_id, &req.signal, req.context.as_deref())
+        .await
+        .map_err(api_err)?;
+    Ok((
+        StatusCode::CREATED,
+        Json(FeedbackResponse {
+            feedback_id,
+            memory_id,
+            signal: req.signal,
+        }),
+    ))
+}
+
+/// GET /v1/feedback/stats — get feedback statistics for the user.
+pub async fn get_feedback_stats(
+    State(state): State<AppState>,
+    AuthUser { user_id, .. }: AuthUser,
+) -> ApiResult<serde_json::Value> {
+    let stats = state
+        .service
+        .get_feedback_stats(&user_id)
+        .await
+        .map_err(api_err)?;
+    Ok(Json(serde_json::json!(stats)))
+}
+
+/// GET /v1/feedback/by-tier — get feedback breakdown by trust tier.
+pub async fn get_feedback_by_tier(
+    State(state): State<AppState>,
+    AuthUser { user_id, .. }: AuthUser,
+) -> ApiResult<serde_json::Value> {
+    let breakdown = state
+        .service
+        .get_feedback_by_tier(&user_id)
+        .await
+        .map_err(api_err)?;
+    Ok(Json(serde_json::json!({"breakdown": breakdown})))
+}

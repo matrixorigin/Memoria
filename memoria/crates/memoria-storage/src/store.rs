@@ -87,6 +87,33 @@ pub struct SnapshotRegistration {
     pub created_at: chrono::NaiveDateTime,
 }
 
+/// Aggregated feedback statistics for a user.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct FeedbackStats {
+    pub total: i64,
+    pub useful: i64,
+    pub irrelevant: i64,
+    pub outdated: i64,
+    pub wrong: i64,
+}
+
+/// Feedback breakdown by trust tier.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TierFeedback {
+    pub tier: String,
+    pub signal: String,
+    pub count: i64,
+}
+
+/// Feedback counts for a single memory (denormalized, no JOIN needed).
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct MemoryFeedback {
+    pub useful: i32,
+    pub irrelevant: i32,
+    pub outdated: i32,
+    pub wrong: i32,
+}
+
 impl SqlMemoryStore {
     pub fn new(pool: MySqlPool, embedding_dim: usize) -> Self {
         Self {
@@ -361,17 +388,49 @@ impl SqlMemoryStore {
         .await
         .map_err(db_err)?;
 
-        // mem_memories_stats — access_count tracking (separated to reduce write contention)
+        // mem_memories_stats — access_count + feedback tracking (separated to reduce write contention)
         sqlx::query(
             r#"CREATE TABLE IF NOT EXISTS mem_memories_stats (
-                memory_id       VARCHAR(64)  PRIMARY KEY,
-                access_count    INT          NOT NULL DEFAULT 0,
-                last_accessed_at DATETIME(6)
+                memory_id        VARCHAR(64)  PRIMARY KEY,
+                access_count     INT          NOT NULL DEFAULT 0,
+                last_accessed_at DATETIME(6),
+                feedback_useful  INT          NOT NULL DEFAULT 0,
+                feedback_irrelevant INT       NOT NULL DEFAULT 0,
+                feedback_outdated INT         NOT NULL DEFAULT 0,
+                feedback_wrong   INT          NOT NULL DEFAULT 0,
+                last_feedback_at DATETIME(6)
             )"#,
         )
         .execute(&self.pool)
         .await
         .map_err(db_err)?;
+
+        // Migration: add feedback columns to existing mem_memories_stats
+        let _ = sqlx::query(
+            "ALTER TABLE mem_memories_stats ADD COLUMN feedback_useful INT NOT NULL DEFAULT 0",
+        )
+        .execute(&self.pool)
+        .await;
+        let _ = sqlx::query(
+            "ALTER TABLE mem_memories_stats ADD COLUMN feedback_irrelevant INT NOT NULL DEFAULT 0",
+        )
+        .execute(&self.pool)
+        .await;
+        let _ = sqlx::query(
+            "ALTER TABLE mem_memories_stats ADD COLUMN feedback_outdated INT NOT NULL DEFAULT 0",
+        )
+        .execute(&self.pool)
+        .await;
+        let _ = sqlx::query(
+            "ALTER TABLE mem_memories_stats ADD COLUMN feedback_wrong INT NOT NULL DEFAULT 0",
+        )
+        .execute(&self.pool)
+        .await;
+        let _ = sqlx::query(
+            "ALTER TABLE mem_memories_stats ADD COLUMN last_feedback_at DATETIME(6)",
+        )
+        .execute(&self.pool)
+        .await;
 
         // mem_edit_log — audit log for inject/correct/purge/governance operations
         sqlx::query(
@@ -497,6 +556,23 @@ impl SqlMemoryStore {
             .await
             .map_err(db_err)?;
         }
+
+        // mem_retrieval_feedback — explicit relevance feedback for adaptive tuning
+        sqlx::query(
+            r#"CREATE TABLE IF NOT EXISTS mem_retrieval_feedback (
+                id          VARCHAR(64)  PRIMARY KEY,
+                user_id     VARCHAR(64)  NOT NULL,
+                memory_id   VARCHAR(64)  NOT NULL,
+                signal      VARCHAR(16)  NOT NULL,
+                context     TEXT         DEFAULT NULL,
+                created_at  DATETIME(6)  NOT NULL,
+                INDEX idx_feedback_user (user_id, created_at),
+                INDEX idx_feedback_memory (memory_id)
+            )"#,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
 
         Ok(())
     }
@@ -1321,6 +1397,182 @@ impl SqlMemoryStore {
         Ok(result.rows_affected() as i64)
     }
 
+    // ── Retrieval feedback ────────────────────────────────────────────────────
+
+    /// Record explicit relevance feedback for a memory.
+    /// signal: "useful" | "irrelevant" | "outdated" | "wrong"
+    pub async fn record_feedback(
+        &self,
+        user_id: &str,
+        memory_id: &str,
+        signal: &str,
+        context: Option<&str>,
+    ) -> Result<String, MemoriaError> {
+        // Validate signal
+        if !["useful", "irrelevant", "outdated", "wrong"].contains(&signal) {
+            return Err(MemoriaError::Internal(format!(
+                "Invalid signal '{}'. Must be one of: useful, irrelevant, outdated, wrong",
+                signal
+            )));
+        }
+        // Verify memory exists and belongs to user
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM mem_memories WHERE memory_id = ? AND user_id = ?",
+        )
+        .bind(memory_id)
+        .bind(user_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(db_err)?;
+        if count == 0 {
+            return Err(MemoriaError::NotFound(format!(
+                "Memory {} not found or not owned by user",
+                memory_id
+            )));
+        }
+
+        let id = uuid::Uuid::new_v4().simple().to_string();
+        sqlx::query(
+            "INSERT INTO mem_retrieval_feedback (id, user_id, memory_id, signal, context, created_at) \
+             VALUES (?, ?, ?, ?, ?, NOW())",
+        )
+        .bind(&id)
+        .bind(user_id)
+        .bind(memory_id)
+        .bind(signal)
+        .bind(context)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+
+        // Update denormalized feedback counters in mem_memories_stats
+        let col = match signal {
+            "useful" => "feedback_useful",
+            "irrelevant" => "feedback_irrelevant",
+            "outdated" => "feedback_outdated",
+            "wrong" => "feedback_wrong",
+            _ => unreachable!(),
+        };
+        let sql = format!(
+            "INSERT INTO mem_memories_stats (memory_id, {col}, last_feedback_at) VALUES (?, 1, NOW()) \
+             ON DUPLICATE KEY UPDATE {col} = {col} + 1, last_feedback_at = NOW()"
+        );
+        sqlx::query(&sql)
+            .bind(memory_id)
+            .execute(&self.pool)
+            .await
+            .map_err(db_err)?;
+
+        Ok(id)
+    }
+
+    /// Get feedback statistics for a user (for adaptive tuning analysis).
+    pub async fn get_feedback_stats(
+        &self,
+        user_id: &str,
+    ) -> Result<FeedbackStats, MemoriaError> {
+        let row: (i64, i64, i64, i64, i64) = sqlx::query_as(
+            "SELECT \
+               COUNT(*) as total, \
+               SUM(CASE WHEN signal = 'useful' THEN 1 ELSE 0 END) as useful, \
+               SUM(CASE WHEN signal = 'irrelevant' THEN 1 ELSE 0 END) as irrelevant, \
+               SUM(CASE WHEN signal = 'outdated' THEN 1 ELSE 0 END) as outdated, \
+               SUM(CASE WHEN signal = 'wrong' THEN 1 ELSE 0 END) as wrong \
+             FROM mem_retrieval_feedback WHERE user_id = ?",
+        )
+        .bind(user_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(FeedbackStats {
+            total: row.0,
+            useful: row.1,
+            irrelevant: row.2,
+            outdated: row.3,
+            wrong: row.4,
+        })
+    }
+
+    /// Get feedback breakdown by trust tier (for adaptive tuning).
+    pub async fn get_feedback_by_tier(
+        &self,
+        user_id: &str,
+    ) -> Result<Vec<TierFeedback>, MemoriaError> {
+        let rows: Vec<(String, String, i64)> = sqlx::query_as(
+            "SELECT m.trust_tier, f.signal, COUNT(*) as cnt \
+             FROM mem_retrieval_feedback f \
+             JOIN mem_memories m ON f.memory_id = m.memory_id \
+             WHERE f.user_id = ? \
+             GROUP BY m.trust_tier, f.signal \
+             ORDER BY m.trust_tier, f.signal",
+        )
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(rows
+            .into_iter()
+            .map(|(tier, signal, count)| TierFeedback { tier, signal, count })
+            .collect())
+    }
+
+    /// Get feedback counts for a single memory (from denormalized stats, no JOIN).
+    pub async fn get_memory_feedback(
+        &self,
+        memory_id: &str,
+    ) -> Result<MemoryFeedback, MemoriaError> {
+        let row: Option<(i32, i32, i32, i32)> = sqlx::query_as(
+            "SELECT feedback_useful, feedback_irrelevant, feedback_outdated, feedback_wrong \
+             FROM mem_memories_stats WHERE memory_id = ?",
+        )
+        .bind(memory_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+
+        Ok(row
+            .map(|(useful, irrelevant, outdated, wrong)| MemoryFeedback {
+                useful,
+                irrelevant,
+                outdated,
+                wrong,
+            })
+            .unwrap_or_default())
+    }
+
+    /// Get feedback counts for multiple memories (batch, for retrieval scoring).
+    pub async fn get_feedback_batch(
+        &self,
+        memory_ids: &[String],
+    ) -> Result<std::collections::HashMap<String, MemoryFeedback>, MemoriaError> {
+        let mut map = std::collections::HashMap::new();
+        if memory_ids.is_empty() {
+            return Ok(map);
+        }
+        for chunk in memory_ids.chunks(500) {
+            let placeholders: Vec<&str> = chunk.iter().map(|_| "?").collect();
+            let sql = format!(
+                "SELECT memory_id, feedback_useful, feedback_irrelevant, feedback_outdated, feedback_wrong \
+                 FROM mem_memories_stats WHERE memory_id IN ({})",
+                placeholders.join(", ")
+            );
+            let mut q = sqlx::query(&sql);
+            for id in chunk {
+                q = q.bind(id);
+            }
+            let rows = q.fetch_all(&self.pool).await.map_err(db_err)?;
+            for row in &rows {
+                let id: String = row.try_get("memory_id").map_err(db_err)?;
+                let useful: i32 = row.try_get("feedback_useful").unwrap_or(0);
+                let irrelevant: i32 = row.try_get("feedback_irrelevant").unwrap_or(0);
+                let outdated: i32 = row.try_get("feedback_outdated").unwrap_or(0);
+                let wrong: i32 = row.try_get("feedback_wrong").unwrap_or(0);
+                map.insert(id, MemoryFeedback { useful, irrelevant, outdated, wrong });
+            }
+        }
+        Ok(map)
+    }
+
     /// Get access_count for a set of memory IDs.
     pub async fn get_access_counts(
         &self,
@@ -1889,6 +2141,9 @@ impl SqlMemoryStore {
         let ac_ids: Vec<String> = candidates.iter().map(|m| m.memory_id.clone()).collect();
         let ac_map = self.get_access_counts(&ac_ids).await.unwrap_or_default();
 
+        // Fetch feedback for relevance adjustment
+        let fb_map = self.get_feedback_batch(&ac_ids).await.unwrap_or_default();
+
         for m in &mut candidates {
             let vec_score = m.retrieval_score.unwrap_or(0.0);
             let raw_ft = ft_map.get(&m.memory_id).copied().unwrap_or(0.0);
@@ -1914,6 +2169,22 @@ impl SqlMemoryStore {
             if ac > 0 {
                 final_score *= 1.0 + 0.1 * ((1 + ac) as f64).ln();
             }
+
+            // Feedback adjustment: boost useful, penalize negative feedback
+            if let Some(fb) = fb_map.get(&m.memory_id) {
+                let positive = fb.useful as f64;
+                let negative = (fb.irrelevant + fb.outdated + fb.wrong) as f64;
+                // Net feedback score: positive boosts, negative penalizes
+                // Formula: multiplier = 1 + 0.1 * (useful - 0.5 * negative)
+                // - 2 useful, 0 negative → 1.2x boost
+                // - 0 useful, 2 wrong → 0.9x penalty
+                // - 1 useful, 1 wrong → 1.05x (slight boost, useful outweighs)
+                let feedback_delta = positive - 0.5 * negative;
+                if feedback_delta.abs() > 0.01 {
+                    final_score *= (1.0 + 0.1 * feedback_delta).max(0.5).min(2.0);
+                }
+            }
+
             m.access_count = ac;
             m.retrieval_score = Some(final_score);
             score_breakdown.push((

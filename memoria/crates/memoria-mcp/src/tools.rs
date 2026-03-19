@@ -164,6 +164,19 @@ pub fn list() -> Value {
             }
         },
         {
+            "name": "memory_feedback",
+            "description": "Record explicit relevance feedback for a memory. Helps improve retrieval over time.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "memory_id": {"type": "string", "description": "ID of the memory to provide feedback on"},
+                    "signal": {"type": "string", "enum": ["useful", "irrelevant", "outdated", "wrong"], "description": "Feedback signal"},
+                    "context": {"type": "string", "description": "Optional context about why this feedback was given"}
+                },
+                "required": ["memory_id", "signal"]
+            }
+        },
+        {
             "name": "memory_observe",
             "description": "Observe a conversation turn and extract memories from messages. Stores assistant/user messages as semantic memories.",
             "inputSchema": {
@@ -416,7 +429,7 @@ pub async fn call(
              memory_correct, memory_purge, memory_profile, memory_list, \
              memory_capabilities, memory_governance, memory_rebuild_index, \
              memory_consolidate, memory_reflect, memory_extract_entities, \
-             memory_link_entities, memory_observe",
+             memory_link_entities, memory_feedback, memory_observe",
         )),
 
         "memory_governance" => {
@@ -837,6 +850,25 @@ pub async fn call(
                 "entities_reused": total_reused,
                 "edges_created": total_edges
             }))?))
+        }
+
+        "memory_feedback" => {
+            let memory_id = args["memory_id"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("memory_id is required"))?;
+            let signal = args["signal"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("signal is required"))?;
+            let context = args["context"].as_str();
+
+            let feedback_id = service
+                .record_feedback(user_id, memory_id, signal, context)
+                .await?;
+
+            Ok(mcp_text(&format!(
+                "Recorded feedback: memory={}, signal={}, feedback_id={}",
+                memory_id, signal, feedback_id
+            )))
         }
 
         "memory_observe" => {

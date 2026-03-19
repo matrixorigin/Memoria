@@ -231,7 +231,7 @@ impl RemoteClient {
                  memory_correct, memory_purge, memory_profile, memory_list, \
                  memory_capabilities, memory_governance, memory_rebuild_index, \
                  memory_consolidate, memory_reflect, memory_extract_entities, \
-                 memory_link_entities, memory_observe \
+                 memory_link_entities, memory_feedback, memory_observe \
                  [remote mode — connected to Memoria API server]",
             )),
 
@@ -509,6 +509,27 @@ impl RemoteClient {
                     .await?;
                 let body = Self::parse_response(r).await?;
                 Ok(Self::mcp_json(&body))
+            }
+
+            "memory_feedback" => {
+                let memory_id = args["memory_id"].as_str().unwrap_or("");
+                let signal = args["signal"].as_str().unwrap_or("");
+                let r = self
+                    .client
+                    .post(self.url(&format!("/v1/memories/{memory_id}/feedback")))
+                    .json(&json!({
+                        "signal": signal,
+                        "context": args["context"],
+                    }))
+                    .send()
+                    .await?;
+                let body = Self::parse_response(r).await?;
+                Ok(Self::mcp_text(&format!(
+                    "Recorded feedback: memory={}, signal={}, feedback_id={}",
+                    memory_id,
+                    signal,
+                    body["feedback_id"].as_str().unwrap_or("")
+                )))
             }
 
             _ => Ok(Self::mcp_text(&format!("Unknown tool: {name}"))),
