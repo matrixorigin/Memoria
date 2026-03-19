@@ -486,12 +486,11 @@ impl SqlMemoryStore {
         .map_err(db_err)?;
 
         if let Some(ct) = col_type {
-            // Parse "vecf32(768)" → Some(768)
-            if let Some(schema_dim) = ct
+            // Parse "vecf32(768)" → 768
+            if let Ok(schema_dim) = ct
                 .trim_start_matches("vecf32(")
                 .trim_end_matches(')')
                 .parse::<usize>()
-                .ok()
             {
                 if schema_dim != self.embedding_dim {
                     return Err(MemoriaError::Internal(format!(
