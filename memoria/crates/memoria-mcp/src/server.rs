@@ -69,7 +69,12 @@ pub async fn run_sse(
     }
 
     let (tx, _) = broadcast::channel::<String>(64);
-    let state = SseState { tx: tx.clone(), service, git, user_id };
+    let state = SseState {
+        tx: tx.clone(),
+        service,
+        git,
+        user_id,
+    };
 
     let app = Router::new()
         .route("/sse", get(|State(s): State<SseState>| async move {
@@ -126,7 +131,9 @@ async fn run_loop(mode: Mode, user_id: String) -> Result<()> {
 
     while let Some(line) = reader.next_line().await? {
         let line = line.trim().to_string();
-        if line.is_empty() { continue; }
+        if line.is_empty() {
+            continue;
+        }
 
         let req: Request = match serde_json::from_str(&line) {
             Ok(r) => r,
@@ -150,10 +157,16 @@ async fn run_loop(mode: Mode, user_id: String) -> Result<()> {
         let resp = match result {
             Ok(v) => {
                 let result_val = if v.is_null() { json!({}) } else { v };
-                Response { jsonrpc: "2.0", id, result: Some(result_val), error: None }
+                Response {
+                    jsonrpc: "2.0",
+                    id,
+                    result: Some(result_val),
+                    error: None,
+                }
             }
             Err(e) => Response {
-                jsonrpc: "2.0", id,
+                jsonrpc: "2.0",
+                id,
                 result: None,
                 error: Some(json!({"code": -32000, "message": e.to_string()})),
             },
@@ -196,9 +209,16 @@ async fn dispatch(
                 Mode::Remote(client) => client.call(&name, args).await,
                 Mode::Embedded { service, git } => {
                     let git_tool_names = [
-                        "memory_snapshot", "memory_snapshots", "memory_snapshot_delete",
-                        "memory_rollback", "memory_branch", "memory_branches", "memory_checkout",
-                        "memory_merge", "memory_diff", "memory_branch_delete",
+                        "memory_snapshot",
+                        "memory_snapshots",
+                        "memory_snapshot_delete",
+                        "memory_rollback",
+                        "memory_branch",
+                        "memory_branches",
+                        "memory_checkout",
+                        "memory_merge",
+                        "memory_diff",
+                        "memory_branch_delete",
                     ];
                     if git_tool_names.contains(&name.as_str()) {
                         git_tools::call(&name, args, git, service, user_id).await

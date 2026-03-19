@@ -350,9 +350,8 @@ async fn cmd_serve(db_url: Option<String>, port: u16, master_key: String) -> Res
         llm,
     ));
     Arc::new(memoria_service::GovernanceScheduler::from_config(service.clone(), &cfg).await?)
-    .start();
-    let state = AppState::new(service, git, master_key)
-        .with_instance_id(cfg.instance_id.clone());
+        .start();
+    let state = AppState::new(service, git, master_key).with_instance_id(cfg.instance_id.clone());
 
     let app = build_router(state).layer(TraceLayer::new_for_http());
     let addr = format!("0.0.0.0:{}", port);
@@ -456,7 +455,7 @@ async fn cmd_mcp(
         llm,
     ));
     Arc::new(memoria_service::GovernanceScheduler::from_config(service.clone(), &cfg).await?)
-    .start();
+        .start();
 
     if transport == "sse" {
         memoria_mcp::run_sse(service, git, cfg.user, mcp_port).await
@@ -476,7 +475,12 @@ async fn cmd_plugin(command: PluginCommands) -> Result<()> {
 
     // Commands that don't need a DB connection
     match &command {
-        PluginCommands::Init { dir, name, capabilities, runtime } => {
+        PluginCommands::Init {
+            dir,
+            name,
+            capabilities,
+            runtime,
+        } => {
             return cmd_plugin_init(dir, name, capabilities, runtime);
         }
         PluginCommands::DevKeygen { dir } => {
@@ -525,7 +529,10 @@ async fn cmd_plugin(command: PluginCommands) -> Result<()> {
             }
         }
         PluginCommands::Publish {
-            package_dir, actor, dev_mode, ..
+            package_dir,
+            actor,
+            dev_mode,
+            ..
         } => {
             let published = if dev_mode {
                 publish_plugin_package_dev(&store, &package_dir, &actor).await?
@@ -603,8 +610,15 @@ async fn cmd_plugin(command: PluginCommands) -> Result<()> {
             actor,
             ..
         } => {
-            review_plugin_package(&store, &plugin_key, &version, &status, notes.as_deref(), &actor)
-                .await?;
+            review_plugin_package(
+                &store,
+                &plugin_key,
+                &version,
+                &status,
+                notes.as_deref(),
+                &actor,
+            )
+            .await?;
             println!("reviewed {plugin_key}@{version} -> {status}");
         }
         PluginCommands::Score {
@@ -615,8 +629,15 @@ async fn cmd_plugin(command: PluginCommands) -> Result<()> {
             actor,
             ..
         } => {
-            score_plugin_package(&store, &plugin_key, &version, score, notes.as_deref(), &actor)
-                .await?;
+            score_plugin_package(
+                &store,
+                &plugin_key,
+                &version,
+                score,
+                notes.as_deref(),
+                &actor,
+            )
+            .await?;
             println!("scored {plugin_key}@{version} -> {score}");
         }
         PluginCommands::Matrix { domain, .. } => {
@@ -735,7 +756,10 @@ fn cmd_plugin_init(dir: &Path, name: &str, capabilities: &str, runtime: &str) ->
     println!("  1. Edit the script/manifest");
     println!("  2. memoria plugin dev-keygen --dir {}", dir.display());
     println!("  3. Sign and publish:");
-    println!("     memoria plugin publish --package-dir {} --dev-mode", dir.display());
+    println!(
+        "     memoria plugin publish --package-dir {} --dev-mode",
+        dir.display()
+    );
     Ok(())
 }
 
@@ -1055,10 +1079,16 @@ impl Default for ExistingConfig {
     fn default() -> Self {
         Self {
             tools: vec![],
-            db_host: "localhost".into(), db_port: "6001".into(),
-            db_user: "root".into(), db_pass: "111".into(), db_name: "memoria".into(),
-            emb_provider: String::new(), emb_base_url: String::new(),
-            emb_api_key: String::new(), emb_model: String::new(), emb_dim: String::new(),
+            db_host: "localhost".into(),
+            db_port: "6001".into(),
+            db_user: "root".into(),
+            db_pass: "111".into(),
+            db_name: "memoria".into(),
+            emb_provider: String::new(),
+            emb_base_url: String::new(),
+            emb_api_key: String::new(),
+            emb_model: String::new(),
+            emb_dim: String::new(),
         }
     }
 }
@@ -1075,7 +1105,11 @@ fn load_existing_config(project_dir: &Path) -> ExistingConfig {
         let full = project_dir.join(path);
         if let Ok(content) = std::fs::read_to_string(&full) {
             if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
-                if json.get("mcpServers").and_then(|s| s.get(MCP_KEY)).is_some() {
+                if json
+                    .get("mcpServers")
+                    .and_then(|s| s.get(MCP_KEY))
+                    .is_some()
+                {
                     match *tool {
                         "kiro" => cfg.tools.push(ToolName::Kiro),
                         "cursor" => cfg.tools.push(ToolName::Cursor),
@@ -1102,7 +1136,8 @@ fn load_existing_config(project_dir: &Path) -> ExistingConfig {
                                 cfg.db_pass = p.to_string();
                                 if let Some((hostport, db)) = hostdb.split_once('/') {
                                     cfg.db_name = db.to_string();
-                                    let (h, port) = hostport.split_once(':').unwrap_or((hostport, "6001"));
+                                    let (h, port) =
+                                        hostport.split_once(':').unwrap_or((hostport, "6001"));
                                     cfg.db_host = h.to_string();
                                     cfg.db_port = port.to_string();
                                 }
@@ -1113,7 +1148,12 @@ fn load_existing_config(project_dir: &Path) -> ExistingConfig {
             }
         }
         if let Some(env) = entry["env"].as_object() {
-            let get = |k: &str| env.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let get = |k: &str| {
+                env.get(k)
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string()
+            };
             cfg.emb_provider = get("EMBEDDING_PROVIDER");
             cfg.emb_base_url = get("EMBEDDING_BASE_URL");
             cfg.emb_api_key = get("EMBEDDING_API_KEY");
@@ -1125,8 +1165,10 @@ fn load_existing_config(project_dir: &Path) -> ExistingConfig {
 }
 
 fn mask_key(key: &str) -> String {
-    if key.len() <= 9 { return "*".repeat(key.len()); }
-    format!("{}...{}", &key[..6], &key[key.len()-3..])
+    if key.len() <= 9 {
+        return "*".repeat(key.len());
+    }
+    format!("{}...{}", &key[..6], &key[key.len() - 3..])
 }
 
 fn check_db(db_url: &str) -> bool {
@@ -1154,8 +1196,14 @@ fn check_db(db_url: &str) -> bool {
         }),
         Duration::from_secs(3),
     ) {
-        Ok(_) => { println!("  ✓ Database: {} reachable", addr); true }
-        Err(e) => { println!("  ✗ Database: {} — {}", addr, e); false }
+        Ok(_) => {
+            println!("  ✓ Database: {} reachable", addr);
+            true
+        }
+        Err(e) => {
+            println!("  ✗ Database: {} — {}", addr, e);
+            false
+        }
     }
 }
 
@@ -1173,7 +1221,8 @@ fn check_embedding_request(base_url: &str, api_key: &str, model: &str) -> bool {
         .timeout(std::time::Duration::from_secs(10))
         .build()
         .unwrap();
-    let mut req = client.post(&url)
+    let mut req = client
+        .post(&url)
         .header("Content-Type", "application/json")
         .body(format!(r#"{{"model":"{}","input":"test"}}"#, model));
     if !api_key.is_empty() {
@@ -1204,38 +1253,56 @@ fn cmd_init_interactive(project_dir: &Path, force: bool) {
     let project_input: String = cliclack::input("Project directory")
         .default_input(&default_dir)
         .validate_interactively(|input: &String| {
-            if input.is_empty() { return Ok(()); }
+            if input.is_empty() {
+                return Ok(());
+            }
             let p = std::path::Path::new(input.as_str());
-            let resolved = if p.is_absolute() { p.to_path_buf() } else {
+            let resolved = if p.is_absolute() {
+                p.to_path_buf()
+            } else {
                 std::env::current_dir().unwrap_or_default().join(p)
             };
             if resolved.is_dir() {
-                if !input.ends_with('/') { return Ok(()); }
+                if !input.ends_with('/') {
+                    return Ok(());
+                }
                 // Trailing slash — show subdirectories
-                let mut subs: Vec<String> = std::fs::read_dir(&resolved).ok()
-                    .map(|rd| rd.filter_map(|e| e.ok())
-                        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
-                        .filter(|e| !e.file_name().to_string_lossy().starts_with('.'))
-                        .map(|e| e.file_name().to_string_lossy().to_string())
-                        .collect())
+                let mut subs: Vec<String> = std::fs::read_dir(&resolved)
+                    .ok()
+                    .map(|rd| {
+                        rd.filter_map(|e| e.ok())
+                            .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+                            .filter(|e| !e.file_name().to_string_lossy().starts_with('.'))
+                            .map(|e| e.file_name().to_string_lossy().to_string())
+                            .collect()
+                    })
                     .unwrap_or_default();
                 subs.sort();
                 subs.truncate(8);
-                if subs.is_empty() { Ok(()) } else { Err(subs.join("  ")) }
+                if subs.is_empty() {
+                    Ok(())
+                } else {
+                    Err(subs.join("  "))
+                }
             } else {
                 // Partial path — match siblings
                 let parent = resolved.parent().unwrap_or(&resolved);
-                let prefix = resolved.file_name()
-                    .map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-                let mut matches: Vec<String> = std::fs::read_dir(parent).ok()
-                    .map(|rd| rd.filter_map(|e| e.ok())
-                        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
-                        .filter(|e| {
-                            let name = e.file_name().to_string_lossy().to_string();
-                            name.starts_with(&prefix) && !name.starts_with('.')
-                        })
-                        .map(|e| e.file_name().to_string_lossy().to_string())
-                        .collect())
+                let prefix = resolved
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                let mut matches: Vec<String> = std::fs::read_dir(parent)
+                    .ok()
+                    .map(|rd| {
+                        rd.filter_map(|e| e.ok())
+                            .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+                            .filter(|e| {
+                                let name = e.file_name().to_string_lossy().to_string();
+                                name.starts_with(&prefix) && !name.starts_with('.')
+                            })
+                            .map(|e| e.file_name().to_string_lossy().to_string())
+                            .collect()
+                    })
                     .unwrap_or_default();
                 matches.sort();
                 matches.truncate(8);
@@ -1248,7 +1315,8 @@ fn cmd_init_interactive(project_dir: &Path, force: bool) {
         })
         .interact()
         .unwrap_or_else(|_| default_dir.clone());
-    let project_dir = std::path::Path::new(&project_input).canonicalize()
+    let project_dir = std::path::Path::new(&project_input)
+        .canonicalize()
         .unwrap_or_else(|_| std::path::PathBuf::from(&project_input));
 
     let existing = load_existing_config(&project_dir);
@@ -1258,9 +1326,15 @@ fn cmd_init_interactive(project_dir: &Path, force: bool) {
         vec![0]
     } else {
         let mut v = vec![];
-        if existing.tools.iter().any(|t| matches!(t, ToolName::Kiro)) { v.push(0); }
-        if existing.tools.iter().any(|t| matches!(t, ToolName::Cursor)) { v.push(1); }
-        if existing.tools.iter().any(|t| matches!(t, ToolName::Claude)) { v.push(2); }
+        if existing.tools.iter().any(|t| matches!(t, ToolName::Kiro)) {
+            v.push(0);
+        }
+        if existing.tools.iter().any(|t| matches!(t, ToolName::Cursor)) {
+            v.push(1);
+        }
+        if existing.tools.iter().any(|t| matches!(t, ToolName::Claude)) {
+            v.push(2);
+        }
         v
     };
     let tool_sel: Vec<usize> = match cliclack::multiselect("Which AI tools?")
@@ -1271,42 +1345,77 @@ fn cmd_init_interactive(project_dir: &Path, force: bool) {
         .interact()
     {
         Ok(v) => v,
-        Err(_) => { cliclack::outro_cancel("Cancelled").ok(); return; }
+        Err(_) => {
+            cliclack::outro_cancel("Cancelled").ok();
+            return;
+        }
     };
     let mut tools = vec![];
-    if tool_sel.contains(&0) { tools.push(ToolName::Kiro); }
-    if tool_sel.contains(&1) { tools.push(ToolName::Cursor); }
-    if tool_sel.contains(&2) { tools.push(ToolName::Claude); }
+    if tool_sel.contains(&0) {
+        tools.push(ToolName::Kiro);
+    }
+    if tool_sel.contains(&1) {
+        tools.push(ToolName::Cursor);
+    }
+    if tool_sel.contains(&2) {
+        tools.push(ToolName::Claude);
+    }
     if tools.is_empty() {
         cliclack::outro_cancel("No tool selected").ok();
         return;
     }
 
     // ── Step 2: Database ────────────────────────────────────────────
-    cliclack::note("Database (MatrixOne)", "Configure your MatrixOne connection").ok();
+    cliclack::note(
+        "Database (MatrixOne)",
+        "Configure your MatrixOne connection",
+    )
+    .ok();
 
     let db_host: String = cliclack::input("Host")
-        .default_input(&existing.db_host).interact().unwrap_or_else(|_| existing.db_host.clone());
+        .default_input(&existing.db_host)
+        .interact()
+        .unwrap_or_else(|_| existing.db_host.clone());
     let db_port: String = cliclack::input("Port")
-        .default_input(&existing.db_port).interact().unwrap_or_else(|_| existing.db_port.clone());
+        .default_input(&existing.db_port)
+        .interact()
+        .unwrap_or_else(|_| existing.db_port.clone());
     let db_user: String = cliclack::input("User")
-        .default_input(&existing.db_user).interact().unwrap_or_else(|_| existing.db_user.clone());
+        .default_input(&existing.db_user)
+        .interact()
+        .unwrap_or_else(|_| existing.db_user.clone());
     let db_pass: String = if existing.db_pass.is_empty() {
-        cliclack::password("Password").mask('▪').interact().unwrap_or_default()
+        cliclack::password("Password")
+            .mask('▪')
+            .interact()
+            .unwrap_or_default()
     } else {
         let v: String = cliclack::password(format!("Password [{}]", mask_key(&existing.db_pass)))
-            .mask('▪').allow_empty().interact().unwrap_or_default();
-        if v.is_empty() { existing.db_pass.clone() } else { v }
+            .mask('▪')
+            .allow_empty()
+            .interact()
+            .unwrap_or_default();
+        if v.is_empty() {
+            existing.db_pass.clone()
+        } else {
+            v
+        }
     };
     let db_name: String = cliclack::input("Database")
-        .default_input(&existing.db_name).interact().unwrap_or_else(|_| existing.db_name.clone());
-    let db_url = format!("mysql://{}:{}@{}:{}/{}", db_user, db_pass, db_host, db_port, db_name);
+        .default_input(&existing.db_name)
+        .interact()
+        .unwrap_or_else(|_| existing.db_name.clone());
+    let db_url = format!(
+        "mysql://{}:{}@{}:{}/{}",
+        db_user, db_pass, db_host, db_port, db_name
+    );
 
     // ── Step 3: Embedding ───────────────────────────────────────────
     cliclack::note(
         "Embedding Service",
         "⚠ Dimension is locked on first startup. Choose a preset, then adjust any field.",
-    ).ok();
+    )
+    .ok();
 
     let emb_default: usize = match existing.emb_provider.as_str() {
         "openai" if existing.emb_base_url.contains("siliconflow") => 0,
@@ -1316,7 +1425,11 @@ fn cmd_init_interactive(project_dir: &Path, force: bool) {
         _ => 0,
     };
     let emb_choice: usize = cliclack::select("Preset")
-        .item(0, "SiliconFlow", "BAAI/bge-m3, 1024d — recommended, free tier")
+        .item(
+            0,
+            "SiliconFlow",
+            "BAAI/bge-m3, 1024d — recommended, free tier",
+        )
         .item(1, "OpenAI", "text-embedding-3-small, 1536d")
         .item(2, "Ollama", "nomic-embed-text, 768d — local")
         .item(3, "Custom", "enter all fields manually")
@@ -1326,15 +1439,31 @@ fn cmd_init_interactive(project_dir: &Path, force: bool) {
 
     let (pre_url, pre_model, pre_dim) = match emb_choice {
         0 => ("https://api.siliconflow.cn/v1", "BAAI/bge-m3", "1024"),
-        1 => ("https://api.openai.com/v1", "text-embedding-3-small", "1536"),
+        1 => (
+            "https://api.openai.com/v1",
+            "text-embedding-3-small",
+            "1536",
+        ),
         2 => ("http://localhost:11434/v1", "nomic-embed-text", "768"),
         _ => ("", "", ""),
     };
     // Existing config wins over preset; preset fills blanks
-    let def_url = if !existing.emb_base_url.is_empty() { &existing.emb_base_url } else { pre_url };
+    let def_url = if !existing.emb_base_url.is_empty() {
+        &existing.emb_base_url
+    } else {
+        pre_url
+    };
     let def_key = &existing.emb_api_key;
-    let def_model = if !existing.emb_model.is_empty() { &existing.emb_model } else { pre_model };
-    let def_dim = if !existing.emb_dim.is_empty() { &existing.emb_dim } else { pre_dim };
+    let def_model = if !existing.emb_model.is_empty() {
+        &existing.emb_model
+    } else {
+        pre_model
+    };
+    let def_dim = if !existing.emb_dim.is_empty() {
+        &existing.emb_dim
+    } else {
+        pre_dim
+    };
 
     let mut url_input = cliclack::input("Base URL").default_input(def_url);
     if def_url.is_empty() {
@@ -1342,37 +1471,68 @@ fn cmd_init_interactive(project_dir: &Path, force: bool) {
     }
     let emb_base_url: String = url_input.interact().unwrap_or_else(|_| def_url.to_string());
     let emb_api_key: String = if def_key.is_empty() {
-        cliclack::password("API Key").mask('▪').interact().unwrap_or_default()
+        cliclack::password("API Key")
+            .mask('▪')
+            .interact()
+            .unwrap_or_default()
     } else {
         let v: String = cliclack::password(format!("API Key [{}]", mask_key(def_key)))
-            .mask('▪').allow_empty().interact().unwrap_or_default();
-        if v.is_empty() { def_key.clone() } else { v }
+            .mask('▪')
+            .allow_empty()
+            .interact()
+            .unwrap_or_default();
+        if v.is_empty() {
+            def_key.clone()
+        } else {
+            v
+        }
     };
     let emb_model: String = cliclack::input("Model")
-        .default_input(def_model).interact().unwrap_or_else(|_| def_model.to_string());
+        .default_input(def_model)
+        .interact()
+        .unwrap_or_else(|_| def_model.to_string());
     let emb_dim: String = cliclack::input("Dimension")
-        .default_input(def_dim).interact().unwrap_or_else(|_| def_dim.to_string());
+        .default_input(def_dim)
+        .interact()
+        .unwrap_or_else(|_| def_dim.to_string());
     let emb_provider = "openai".to_string();
 
     // ── Summary ─────────────────────────────────────────────────────
-    let tool_names: Vec<&str> = tools.iter().map(|t| match t {
-        ToolName::Kiro => "Kiro",
-        ToolName::Cursor => "Cursor",
-        ToolName::Claude => "Claude Code",
-    }).collect();
-    let emb_label = match emb_choice { 0 => "SiliconFlow", 1 => "OpenAI", 2 => "Ollama", _ => "Custom" };
+    let tool_names: Vec<&str> = tools
+        .iter()
+        .map(|t| match t {
+            ToolName::Kiro => "Kiro",
+            ToolName::Cursor => "Cursor",
+            ToolName::Claude => "Claude Code",
+        })
+        .collect();
+    let emb_label = match emb_choice {
+        0 => "SiliconFlow",
+        1 => "OpenAI",
+        2 => "Ollama",
+        _ => "Custom",
+    };
 
     cliclack::note(
         "Summary",
         format!(
             "Tools:     {}\nDatabase:  mysql://{}:***@{}:{}/{}\nEmbedding: {} / {} / {}d",
-            tool_names.join(", "), db_user, db_host, db_port, db_name,
-            emb_label, emb_model, emb_dim,
+            tool_names.join(", "),
+            db_user,
+            db_host,
+            db_port,
+            db_name,
+            emb_label,
+            emb_model,
+            emb_dim,
         ),
-    ).ok();
+    )
+    .ok();
 
     let proceed: bool = cliclack::confirm("Proceed?")
-        .initial_value(true).interact().unwrap_or(false);
+        .initial_value(true)
+        .interact()
+        .unwrap_or(false);
     if !proceed {
         cliclack::outro_cancel("Aborted").ok();
         return;
@@ -1399,7 +1559,9 @@ fn cmd_init_interactive(project_dir: &Path, force: bool) {
 
     if !db_ok || !emb_ok {
         let cont: bool = cliclack::confirm("Continue anyway?")
-            .initial_value(false).interact().unwrap_or(false);
+            .initial_value(false)
+            .interact()
+            .unwrap_or(false);
         if !cont {
             cliclack::outro_cancel("Aborted").ok();
             return;
@@ -1407,10 +1569,18 @@ fn cmd_init_interactive(project_dir: &Path, force: bool) {
     }
 
     cmd_init(
-        &project_dir, tools,
-        Some(db_url), None, None, "default".into(), force,
-        Some(emb_provider), Some(emb_model), Some(emb_dim),
-        Some(emb_api_key), Some(emb_base_url),
+        &project_dir,
+        tools,
+        Some(db_url),
+        None,
+        None,
+        "default".into(),
+        force,
+        Some(emb_provider),
+        Some(emb_model),
+        Some(emb_dim),
+        Some(emb_api_key),
+        Some(emb_base_url),
     );
 
     cliclack::outro("You're all set! Restart your AI tool to activate Memoria.").ok();
@@ -1665,7 +1835,10 @@ fn cmd_benchmark(
         println!();
     }
     print_category_breakdown("By source family", &report.by_source_family);
-    print_category_breakdown("LongMemEval official categories", &report.by_longmemeval_category);
+    print_category_breakdown(
+        "LongMemEval official categories",
+        &report.by_longmemeval_category,
+    );
     print_category_breakdown("BEAM official abilities", &report.by_beam_ability);
 
     if let Some(path) = out {
@@ -1735,9 +1908,18 @@ fn main() -> Result<()> {
                 ))?;
         }
         Commands::Init {
-            tool, interactive, db_url, api_url, token, user, force,
-            embedding_provider, embedding_model, embedding_dim,
-            embedding_api_key, embedding_base_url,
+            tool,
+            interactive,
+            db_url,
+            api_url,
+            token,
+            user,
+            force,
+            embedding_provider,
+            embedding_model,
+            embedding_dim,
+            embedding_api_key,
+            embedding_base_url,
         } => {
             if interactive {
                 cmd_init_interactive(&project_dir, force);
@@ -1746,9 +1928,18 @@ fn main() -> Result<()> {
                 std::process::exit(1);
             } else {
                 cmd_init(
-                    &project_dir, tool, db_url, api_url, token, user, force,
-                    embedding_provider, embedding_model, embedding_dim,
-                    embedding_api_key, embedding_base_url,
+                    &project_dir,
+                    tool,
+                    db_url,
+                    api_url,
+                    token,
+                    user,
+                    force,
+                    embedding_provider,
+                    embedding_model,
+                    embedding_dim,
+                    embedding_api_key,
+                    embedding_base_url,
                 );
             }
         }

@@ -3,20 +3,20 @@
 
 #[path = "benchmark_executor.rs"]
 mod benchmark_executor;
-#[path = "benchmark_scoring.rs"]
-mod benchmark_scoring;
 #[path = "benchmark_schema.rs"]
 mod benchmark_schema;
+#[path = "benchmark_scoring.rs"]
+mod benchmark_scoring;
 #[path = "benchmark_taxonomy.rs"]
 mod benchmark_taxonomy;
 
 pub use benchmark_executor::BenchmarkExecutor;
-pub use benchmark_scoring::{score_dataset, score_scenario};
 #[allow(unused_imports)]
 pub use benchmark_schema::{
     AssertionResult, BenchmarkReport, CategoryBreakdown, MemoryAssertion, Scenario,
     ScenarioDataset, ScenarioExecution, ScenarioResult, ScenarioStep, SeedMemory, StepResult,
 };
+pub use benchmark_scoring::{score_dataset, score_scenario};
 #[allow(unused_imports)]
 pub use benchmark_taxonomy::{official_category, scenario_question_type, scenario_source_family};
 
@@ -88,7 +88,12 @@ mod tests {
             scenario_id: scenario_id.into(),
             title: "test".into(),
             description: String::new(),
-            domain: if source_family == "beam" { "beam" } else { "longmem" }.into(),
+            domain: if source_family == "beam" {
+                "beam"
+            } else {
+                "longmem"
+            }
+            .into(),
             difficulty: "L1".into(),
             horizon: "short".into(),
             tags: vec![],

@@ -68,11 +68,23 @@ impl HttpEmbedder {
             if attempt > 0 {
                 tokio::time::sleep(Duration::from_millis(200 * (1 << (attempt - 1)))).await;
             }
-            let resp = match self.client.post(&url).bearer_auth(&self.api_key).json(body).send().await {
+            let resp = match self
+                .client
+                .post(&url)
+                .bearer_auth(&self.api_key)
+                .json(body)
+                .send()
+                .await
+            {
                 Ok(r) => r,
-                Err(e) => { last_err = e.to_string(); continue },
+                Err(e) => {
+                    last_err = e.to_string();
+                    continue;
+                }
             };
-            if resp.status().is_server_error() || resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            if resp.status().is_server_error()
+                || resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS
+            {
                 last_err = format!("HTTP {}", resp.status());
                 continue;
             }
@@ -81,29 +93,47 @@ impl HttpEmbedder {
                 let body = resp.text().await.unwrap_or_default();
                 return Err(MemoriaError::Embedding(format!("HTTP {status}: {body}")));
             }
-            return resp.json::<EmbedResponse>().await
+            return resp
+                .json::<EmbedResponse>()
+                .await
                 .map_err(|e| MemoriaError::Embedding(e.to_string()));
         }
-        Err(MemoriaError::Embedding(format!("failed after {} retries: {last_err}", MAX_RETRIES + 1)))
+        Err(MemoriaError::Embedding(format!(
+            "failed after {} retries: {last_err}",
+            MAX_RETRIES + 1
+        )))
     }
 }
 
 #[async_trait]
 impl EmbeddingProvider for HttpEmbedder {
     async fn embed(&self, text: &str) -> Result<Vec<f32>, MemoriaError> {
-        let data = self.post_embed(&EmbedRequest {
-            input: EmbedInput::Single(text), model: &self.model,
-        }).await?;
-        data.data.into_iter().next().map(|d| d.embedding)
+        let data = self
+            .post_embed(&EmbedRequest {
+                input: EmbedInput::Single(text),
+                model: &self.model,
+            })
+            .await?;
+        data.data
+            .into_iter()
+            .next()
+            .map(|d| d.embedding)
             .ok_or_else(|| MemoriaError::Embedding("Empty embedding response".into()))
     }
 
     async fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, MemoriaError> {
-        if texts.is_empty() { return Ok(vec![]); }
-        if texts.len() == 1 { return Ok(vec![self.embed(&texts[0]).await?]); }
-        let data = self.post_embed(&EmbedRequest {
-            input: EmbedInput::Batch(texts), model: &self.model,
-        }).await?;
+        if texts.is_empty() {
+            return Ok(vec![]);
+        }
+        if texts.len() == 1 {
+            return Ok(vec![self.embed(&texts[0]).await?]);
+        }
+        let data = self
+            .post_embed(&EmbedRequest {
+                input: EmbedInput::Batch(texts),
+                model: &self.model,
+            })
+            .await?;
         Ok(data.data.into_iter().map(|d| d.embedding).collect())
     }
 

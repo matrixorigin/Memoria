@@ -1,4 +1,8 @@
-use axum::{extract::{Path, Query, State}, http::StatusCode, Json};
+use axum::{
+    extract::{Path, Query, State},
+    http::StatusCode,
+    Json,
+};
 use serde::Deserialize;
 use serde_json::json;
 use sqlx::Row;
@@ -12,7 +16,9 @@ pub struct ListSnapshotsQuery {
     #[serde(default)]
     pub offset: i64,
 }
-fn default_snap_limit() -> i64 { 20 }
+fn default_snap_limit() -> i64 {
+    20
+}
 
 #[derive(Deserialize, Default)]
 pub struct GetSnapshotQuery {
@@ -34,9 +40,13 @@ async fn git_call(
     args: serde_json::Value,
 ) -> Result<serde_json::Value, (StatusCode, String)> {
     let result = memoria_mcp::git_tools::call(tool, args, &state.git, &state.service, user_id)
-        .await.map_err(api_err)?;
+        .await
+        .map_err(api_err)?;
     // Extract text from MCP response
-    let text = result["content"][0]["text"].as_str().unwrap_or("").to_string();
+    let text = result["content"][0]["text"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
     Ok(json!({ "result": text }))
 }
 
@@ -45,7 +55,13 @@ pub async fn create_snapshot(
     AuthUser(user_id): AuthUser,
     Json(req): Json<CreateSnapshotRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, String)> {
-    let r = git_call(&state, &user_id, "memory_snapshot", json!({ "name": req.name })).await?;
+    let r = git_call(
+        &state,
+        &user_id,
+        "memory_snapshot",
+        json!({ "name": req.name }),
+    )
+    .await?;
     Ok((StatusCode::CREATED, Json(r)))
 }
 
@@ -54,8 +70,13 @@ pub async fn list_snapshots(
     AuthUser(user_id): AuthUser,
     Query(q): Query<ListSnapshotsQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let r = git_call(&state, &user_id, "memory_snapshots",
-        json!({ "limit": q.limit, "offset": q.offset })).await?;
+    let r = git_call(
+        &state,
+        &user_id,
+        "memory_snapshots",
+        json!({ "limit": q.limit, "offset": q.offset }),
+    )
+    .await?;
     Ok(Json(r))
 }
 
@@ -66,7 +87,10 @@ pub async fn get_snapshot(
     Path(name): Path<String>,
     Query(q): Query<GetSnapshotQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let pool = state.service.sql_store.as_ref()
+    let pool = state
+        .service
+        .sql_store
+        .as_ref()
         .map(|s| s.pool())
         .ok_or((StatusCode::SERVICE_UNAVAILABLE, "SQL store required".into()))?;
 
@@ -80,7 +104,10 @@ pub async fn get_snapshot(
         "SELECT COUNT(*) as cnt FROM mem_memories {{SNAPSHOT = '{snap_name}'}} WHERE user_id = ? AND is_active > 0"
     );
     let total: i64 = sqlx::query_scalar(&count_sql)
-        .bind(&user_id).fetch_one(pool).await.map_err(api_err)?;
+        .bind(&user_id)
+        .fetch_one(pool)
+        .await
+        .map_err(api_err)?;
 
     // Type distribution
     let type_sql = format!(
@@ -88,38 +115,57 @@ pub async fn get_snapshot(
          WHERE user_id = ? AND is_active > 0 GROUP BY memory_type"
     );
     let type_rows = sqlx::query(&type_sql)
-        .bind(&user_id).fetch_all(pool).await.map_err(api_err)?;
-    let by_type: serde_json::Map<String, serde_json::Value> = type_rows.iter().map(|r| {
-        let t: String = r.try_get("memory_type").unwrap_or_default();
-        let c: i64 = r.try_get("cnt").unwrap_or(0);
-        (t, json!(c))
-    }).collect();
+        .bind(&user_id)
+        .fetch_all(pool)
+        .await
+        .map_err(api_err)?;
+    let by_type: serde_json::Map<String, serde_json::Value> = type_rows
+        .iter()
+        .map(|r| {
+            let t: String = r.try_get("memory_type").unwrap_or_default();
+            let c: i64 = r.try_get("cnt").unwrap_or(0);
+            (t, json!(c))
+        })
+        .collect();
 
     // Paginated memories
-    let content_limit: usize = match detail { "full" => 2000, "normal" => 200, _ => 80 };
+    let content_limit: usize = match detail {
+        "full" => 2000,
+        "normal" => 200,
+        _ => 80,
+    };
     let mem_sql = format!(
         "SELECT memory_id, content, memory_type, initial_confidence FROM mem_memories {{SNAPSHOT = '{snap_name}'}} \
          WHERE user_id = ? AND is_active > 0 ORDER BY observed_at DESC LIMIT ? OFFSET ?"
     );
     let rows = sqlx::query(&mem_sql)
-        .bind(&user_id).bind(limit).bind(offset)
-        .fetch_all(pool).await.map_err(api_err)?;
+        .bind(&user_id)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(pool)
+        .await
+        .map_err(api_err)?;
 
-    let memories: Vec<serde_json::Value> = rows.iter().map(|r| {
-        let content: String = r.try_get("content").unwrap_or_default();
-        let truncated = if content.len() > content_limit {
-            format!("{} [truncated]", &content[..content_limit])
-        } else { content };
-        let mut m = json!({
-            "memory_id": r.try_get::<String, _>("memory_id").unwrap_or_default(),
-            "memory_type": r.try_get::<String, _>("memory_type").unwrap_or_default(),
-            "content": truncated,
-        });
-        if detail == "full" {
-            m["confidence"] = json!(r.try_get::<f64, _>("initial_confidence").unwrap_or(0.0));
-        }
-        m
-    }).collect();
+    let memories: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|r| {
+            let content: String = r.try_get("content").unwrap_or_default();
+            let truncated = if content.len() > content_limit {
+                format!("{} [truncated]", &content[..content_limit])
+            } else {
+                content
+            };
+            let mut m = json!({
+                "memory_id": r.try_get::<String, _>("memory_id").unwrap_or_default(),
+                "memory_type": r.try_get::<String, _>("memory_type").unwrap_or_default(),
+                "content": truncated,
+            });
+            if detail == "full" {
+                m["confidence"] = json!(r.try_get::<f64, _>("initial_confidence").unwrap_or(0.0));
+            }
+            m
+        })
+        .collect();
 
     Ok(Json(json!({
         "name": name,
@@ -140,7 +186,10 @@ pub async fn diff_snapshot(
     Path(name): Path<String>,
     Query(q): Query<DiffSnapshotQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let pool = state.service.sql_store.as_ref()
+    let pool = state
+        .service
+        .sql_store
+        .as_ref()
         .map(|s| s.pool())
         .ok_or((StatusCode::SERVICE_UNAVAILABLE, "SQL store required".into()))?;
 
@@ -152,9 +201,12 @@ pub async fn diff_snapshot(
         "SELECT COUNT(*) FROM mem_memories {{SNAPSHOT = '{snap_name}'}} WHERE user_id = ? AND is_active > 0"
     )).bind(&user_id).fetch_one(pool).await.map_err(api_err)?;
 
-    let curr_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM mem_memories WHERE user_id = ? AND is_active > 0"
-    ).bind(&user_id).fetch_one(pool).await.map_err(api_err)?;
+    let curr_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM mem_memories WHERE user_id = ? AND is_active > 0")
+            .bind(&user_id)
+            .fetch_one(pool)
+            .await
+            .map_err(api_err)?;
 
     // Added (in current but not in snapshot)
     let added_sql = format!(
@@ -163,7 +215,11 @@ pub async fn diff_snapshot(
          WHERE c.user_id = ? AND c.is_active > 0 AND s.memory_id IS NULL LIMIT ?"
     );
     let added_rows = sqlx::query(&added_sql)
-        .bind(&user_id).bind(limit).fetch_all(pool).await.map_err(api_err)?;
+        .bind(&user_id)
+        .bind(limit)
+        .fetch_all(pool)
+        .await
+        .map_err(api_err)?;
 
     // Removed (in snapshot but not in current)
     let removed_sql = format!(
@@ -172,14 +228,22 @@ pub async fn diff_snapshot(
          WHERE s.user_id = ? AND s.is_active > 0 AND c.memory_id IS NULL LIMIT ?"
     );
     let removed_rows = sqlx::query(&removed_sql)
-        .bind(&user_id).bind(limit).fetch_all(pool).await.map_err(api_err)?;
+        .bind(&user_id)
+        .bind(limit)
+        .fetch_all(pool)
+        .await
+        .map_err(api_err)?;
 
     let to_json = |rows: &[sqlx::mysql::MySqlRow]| -> Vec<serde_json::Value> {
-        rows.iter().map(|r| json!({
-            "memory_id": r.try_get::<String, _>("memory_id").unwrap_or_default(),
-            "content": r.try_get::<String, _>("content").unwrap_or_default(),
-            "memory_type": r.try_get::<String, _>("memory_type").unwrap_or_default(),
-        })).collect()
+        rows.iter()
+            .map(|r| {
+                json!({
+                    "memory_id": r.try_get::<String, _>("memory_id").unwrap_or_default(),
+                    "content": r.try_get::<String, _>("content").unwrap_or_default(),
+                    "memory_type": r.try_get::<String, _>("memory_type").unwrap_or_default(),
+                })
+            })
+            .collect()
     };
 
     Ok(Json(json!({
@@ -196,7 +260,13 @@ pub async fn delete_snapshot(
     AuthUser(user_id): AuthUser,
     Path(name): Path<String>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    git_call(&state, &user_id, "memory_snapshot_delete", json!({ "names": name })).await?;
+    git_call(
+        &state,
+        &user_id,
+        "memory_snapshot_delete",
+        json!({ "names": name }),
+    )
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -231,11 +301,17 @@ pub async fn create_branch(
     AuthUser(user_id): AuthUser,
     Json(req): Json<CreateBranchRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, String)> {
-    let r = git_call(&state, &user_id, "memory_branch", json!({
-        "name": req.name,
-        "from_snapshot": req.from_snapshot,
-        "from_timestamp": req.from_timestamp,
-    })).await?;
+    let r = git_call(
+        &state,
+        &user_id,
+        "memory_branch",
+        json!({
+            "name": req.name,
+            "from_snapshot": req.from_snapshot,
+            "from_timestamp": req.from_timestamp,
+        }),
+    )
+    .await?;
     Ok((StatusCode::CREATED, Json(r)))
 }
 
@@ -254,8 +330,13 @@ pub async fn merge_branch(
     Path(name): Path<String>,
     Json(req): Json<MergeRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let r = git_call(&state, &user_id, "memory_merge",
-        json!({ "source": name, "strategy": req.strategy })).await?;
+    let r = git_call(
+        &state,
+        &user_id,
+        "memory_merge",
+        json!({ "source": name, "strategy": req.strategy }),
+    )
+    .await?;
     Ok(Json(r))
 }
 
@@ -273,6 +354,12 @@ pub async fn delete_branch(
     AuthUser(user_id): AuthUser,
     Path(name): Path<String>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    git_call(&state, &user_id, "memory_branch_delete", json!({ "name": name })).await?;
+    git_call(
+        &state,
+        &user_id,
+        "memory_branch_delete",
+        json!({ "name": name }),
+    )
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }

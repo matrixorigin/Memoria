@@ -162,7 +162,7 @@ pub async fn list_trusted_plugin_signers(
     store: &SqlMemoryStore,
 ) -> Result<Vec<TrustedPluginSignerEntry>, MemoriaError> {
     let rows = sqlx::query(
-        "SELECT signer, algorithm, public_key, is_active FROM mem_plugin_signers ORDER BY signer"
+        "SELECT signer, algorithm, public_key, is_active FROM mem_plugin_signers ORDER BY signer",
     )
     .fetch_all(store.pool())
     .await
@@ -217,7 +217,7 @@ async fn publish_plugin_package_inner(
 
     if let Some(existing) = sqlx::query(
         "SELECT sha256, signature, signer, status, published_at, published_by \
-         FROM mem_plugin_packages WHERE plugin_key = ? AND version = ?"
+         FROM mem_plugin_packages WHERE plugin_key = ? AND version = ?",
     )
     .bind(&package.plugin_key)
     .bind(&package.manifest.version)
@@ -242,7 +242,11 @@ async fn publish_plugin_package_inner(
 
     let initial_status = if dev_mode { "active" } else { "pending" };
     let initial_review = if dev_mode { "active" } else { "pending" };
-    let review_notes = if dev_mode { "Auto-approved (dev mode)" } else { "Awaiting review" };
+    let review_notes = if dev_mode {
+        "Auto-approved (dev mode)"
+    } else {
+        "Awaiting review"
+    };
 
     sqlx::query(
         "INSERT INTO mem_plugin_packages \
@@ -290,12 +294,21 @@ async fn publish_plugin_package_inner(
             subject_key: None,
             plugin_key: Some(&package.plugin_key),
             version: Some(&package.manifest.version),
-            event_type: if dev_mode { "package.published_dev" } else { "package.published" },
+            event_type: if dev_mode {
+                "package.published_dev"
+            } else {
+                "package.published"
+            },
             status: initial_status,
             message: format!(
-                "Published plugin package {}@{}{}", 
-                package.plugin_key, package.manifest.version,
-                if dev_mode { " (dev mode, auto-approved)" } else { " and submitted it for review" }
+                "Published plugin package {}@{}{}",
+                package.plugin_key,
+                package.manifest.version,
+                if dev_mode {
+                    " (dev mode, auto-approved)"
+                } else {
+                    " and submitted it for review"
+                }
             ),
             actor: published_by,
         },
@@ -316,15 +329,13 @@ pub async fn review_plugin_package(
     validate_review_status(status)?;
     ensure_package_exists(store, plugin_key, version).await?;
     let now = Utc::now().naive_utc();
-    sqlx::query(
-        "UPDATE mem_plugin_packages SET status = ? WHERE plugin_key = ? AND version = ?"
-    )
-    .bind(status)
-    .bind(plugin_key)
-    .bind(version)
-    .execute(store.pool())
-    .await
-    .map_err(db_err)?;
+    sqlx::query("UPDATE mem_plugin_packages SET status = ? WHERE plugin_key = ? AND version = ?")
+        .bind(status)
+        .bind(plugin_key)
+        .bind(version)
+        .execute(store.pool())
+        .await
+        .map_err(db_err)?;
     sqlx::query(
         "INSERT INTO mem_plugin_reviews \
              (plugin_key, version, review_status, score, review_notes, reviewed_at, reviewed_by) \
@@ -456,7 +467,7 @@ pub async fn upsert_plugin_binding_rule(
     let now = Utc::now().naive_utc();
     let rule_id = sqlx::query_scalar::<_, String>(
         "SELECT rule_id FROM mem_plugin_binding_rules \
-         WHERE domain = ? AND binding_key = ? AND subject_key = ? AND priority = ?"
+         WHERE domain = ? AND binding_key = ? AND subject_key = ? AND priority = ?",
     )
     .bind(input.domain)
     .bind(input.binding_key)
@@ -588,7 +599,7 @@ pub async fn list_plugin_compatibility_matrix(
     let mut matrix = Vec::with_capacity(entries.len());
     for entry in entries {
         let manifest_json: String = sqlx::query_scalar(
-            "SELECT manifest_json FROM mem_plugin_packages WHERE plugin_key = ? AND version = ?"
+            "SELECT manifest_json FROM mem_plugin_packages WHERE plugin_key = ? AND version = ?",
         )
         .bind(&entry.plugin_key)
         .bind(&entry.version)
@@ -696,7 +707,8 @@ pub async fn load_active_governance_plugin(
             continue;
         }
         if let Some(package) = resolve_package_for_rule(store, &rule).await? {
-            let strategy = build_governance_strategy(store, &package, &rule, delegate.clone()).await?;
+            let strategy =
+                build_governance_strategy(store, &package, &rule, delegate.clone()).await?;
             record_plugin_audit_event(
                 store,
                 AuditEventInput {
@@ -924,7 +936,9 @@ async fn resolve_package_for_rule(
 ) -> Result<Option<PackageRecord>, MemoriaError> {
     match rule.selector_kind.as_str() {
         "exact" => load_package_record(store, &rule.plugin_key, &rule.selector_value).await,
-        "semver" => resolve_highest_matching_package(store, &rule.plugin_key, &rule.selector_value).await,
+        "semver" => {
+            resolve_highest_matching_package(store, &rule.plugin_key, &rule.selector_value).await
+        }
         other => Err(MemoriaError::Blocked(format!(
             "Unsupported selector kind `{other}`"
         ))),
@@ -938,7 +952,7 @@ async fn load_package_record(
 ) -> Result<Option<PackageRecord>, MemoriaError> {
     let row = sqlx::query(
         "SELECT version, runtime, manifest_json, package_payload \
-         FROM mem_plugin_packages WHERE plugin_key = ? AND version = ? AND status = 'active'"
+         FROM mem_plugin_packages WHERE plugin_key = ? AND version = ? AND status = 'active'",
     )
     .bind(plugin_key)
     .bind(version)
@@ -959,7 +973,7 @@ async fn resolve_highest_matching_package(
     })?;
     let rows = sqlx::query(
         "SELECT version, runtime, manifest_json, package_payload \
-         FROM mem_plugin_packages WHERE plugin_key = ? AND status = 'active'"
+         FROM mem_plugin_packages WHERE plugin_key = ? AND status = 'active'",
     )
     .bind(plugin_key)
     .fetch_all(store.pool())
@@ -1040,8 +1054,10 @@ async fn build_governance_strategy(
                     loaded.script_path.display()
                 ))
             })?;
-            let virtual_root =
-                PathBuf::from(format!("plugin-repo://{}/{}", package.plugin_key, package.version));
+            let virtual_root = PathBuf::from(format!(
+                "plugin-repo://{}/{}",
+                package.plugin_key, package.version
+            ));
             loaded.root_dir = virtual_root.clone();
             loaded.script_path = virtual_root.join(
                 package
@@ -1073,12 +1089,10 @@ async fn build_governance_strategy(
 }
 
 async fn repository_policy(store: &SqlMemoryStore) -> Result<HostPluginPolicy, MemoriaError> {
-    let rows = sqlx::query(
-        "SELECT signer, public_key FROM mem_plugin_signers WHERE is_active > 0"
-    )
-    .fetch_all(store.pool())
-    .await
-    .map_err(db_err)?;
+    let rows = sqlx::query("SELECT signer, public_key FROM mem_plugin_signers WHERE is_active > 0")
+        .fetch_all(store.pool())
+        .await
+        .map_err(db_err)?;
     let mut policy = HostPluginPolicy::development();
     policy.current_memoria_version = current_memoria_version();
     policy.enforce_signatures = true;
@@ -1097,7 +1111,10 @@ fn compatibility_status(policy: &HostPluginPolicy, manifest: &PluginManifest) ->
     if !policy.supported_runtimes.contains(&manifest.runtime) {
         return (
             false,
-            format!("runtime {:?} is not supported by this host", manifest.runtime),
+            format!(
+                "runtime {:?} is not supported by this host",
+                manifest.runtime
+            ),
         );
     }
     let req = match VersionReq::parse(&manifest.compatibility.memoria) {
@@ -1178,7 +1195,7 @@ async fn ensure_package_exists(
     version: &str,
 ) -> Result<(), MemoriaError> {
     let count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM mem_plugin_packages WHERE plugin_key = ? AND version = ?"
+        "SELECT COUNT(*) FROM mem_plugin_packages WHERE plugin_key = ? AND version = ?",
     )
     .bind(plugin_key)
     .bind(version)
@@ -1223,7 +1240,7 @@ async fn ensure_semver_target_exists(
         MemoriaError::Blocked(format!("Invalid semver selector `{version_req}`: {err}"))
     })?;
     let count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM mem_plugin_packages WHERE plugin_key = ? AND status = 'active'"
+        "SELECT COUNT(*) FROM mem_plugin_packages WHERE plugin_key = ? AND status = 'active'",
     )
     .bind(plugin_key)
     .fetch_one(store.pool())
@@ -1336,7 +1353,9 @@ fn materialize_payload(payload: &[StoredPluginFile]) -> Result<tempfile::TempDir
         }
         let bytes = BASE64_STANDARD
             .decode(&file.content_base64)
-            .map_err(|err| MemoriaError::Blocked(format!("Invalid package payload encoding: {err}")))?;
+            .map_err(|err| {
+                MemoriaError::Blocked(format!("Invalid package payload encoding: {err}"))
+            })?;
         fs::write(&path, bytes).map_err(|err| {
             MemoriaError::Internal(format!(
                 "Failed to materialize plugin repository file {}: {err}",

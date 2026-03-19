@@ -164,7 +164,7 @@ impl GovernanceStore for SqlMemoryStore {
     async fn cleanup_async_tasks(&self, ttl_hours: i64) -> Result<i64, MemoriaError> {
         let result = sqlx::query(
             "DELETE FROM mem_async_tasks WHERE status IN ('completed', 'failed') \
-             AND updated_at < DATE_SUB(NOW(), INTERVAL ? HOUR)"
+             AND updated_at < DATE_SUB(NOW(), INTERVAL ? HOUR)",
         )
         .bind(ttl_hours)
         .execute(self.pool())
@@ -379,10 +379,7 @@ impl DefaultGovernanceStrategy {
         store: &dyn GovernanceStore,
         state: &mut ExecutionState,
     ) {
-        match store
-            .cleanup_async_tasks(Self::ASYNC_TASK_TTL_HOURS)
-            .await
-        {
+        match store.cleanup_async_tasks(Self::ASYNC_TASK_TTL_HOURS).await {
             Ok(cleaned) => {
                 state.summary.async_tasks_cleaned = cleaned;
                 state.decisions.push(governance_decision(

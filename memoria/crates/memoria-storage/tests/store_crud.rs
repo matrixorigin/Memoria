@@ -3,7 +3,6 @@
 ///
 /// Run: DATABASE_URL=mysql://root:111@localhost:6001/memoria \
 ///      SQLX_OFFLINE=true cargo test -p memoria-storage --test store_crud -- --nocapture
-
 use chrono::Utc;
 use memoria_core::{interfaces::MemoryStore, Memory, MemoryType, TrustTier};
 use memoria_storage::SqlMemoryStore;
@@ -11,7 +10,8 @@ use uuid::Uuid;
 
 fn test_dim() -> usize {
     std::env::var("EMBEDDING_DIM")
-        .ok().and_then(|s| s.parse().ok())
+        .ok()
+        .and_then(|s| s.parse().ok())
         .unwrap_or(1024)
 }
 
@@ -25,7 +25,9 @@ fn dim_vec(idx: usize, val: f32) -> Vec<f32> {
 async fn setup() -> (SqlMemoryStore, String) {
     let url = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "mysql://root:111@localhost:6001/memoria".to_string());
-    let store = SqlMemoryStore::connect(&url, test_dim()).await.expect("connect");
+    let store = SqlMemoryStore::connect(&url, test_dim())
+        .await
+        .expect("connect");
     store.migrate().await.expect("migrate");
     // Unique user_id per test — no cleanup needed, no interference between parallel tests
     let user_id = format!("test_{}", Uuid::new_v4().simple());
@@ -116,10 +118,17 @@ async fn test_soft_delete() {
 async fn test_list_active() {
     let (store, uid) = setup().await;
     for i in 0..3 {
-        let m = make_memory(&format!("list-{i}-{uid}"), &format!("memory number {i}"), &uid);
+        let m = make_memory(
+            &format!("list-{i}-{uid}"),
+            &format!("memory number {i}"),
+            &uid,
+        );
         store.insert(&m).await.expect("insert");
     }
-    store.soft_delete(&format!("list-1-{uid}")).await.expect("soft_delete");
+    store
+        .soft_delete(&format!("list-1-{uid}"))
+        .await
+        .expect("soft_delete");
 
     let results = store.list_active(&uid, 10).await.expect("list_active");
     assert_eq!(results.len(), 2);
@@ -131,10 +140,27 @@ async fn test_list_active() {
 #[tokio::test]
 async fn test_search_fulltext() {
     let (store, uid) = setup().await;
-    store.insert(&make_memory(&format!("ft-1-{uid}"), "rust programming language systems performance", &uid)).await.unwrap();
-    store.insert(&make_memory(&format!("ft-2-{uid}"), "python memory service embedding vector search", &uid)).await.unwrap();
+    store
+        .insert(&make_memory(
+            &format!("ft-1-{uid}"),
+            "rust programming language systems performance",
+            &uid,
+        ))
+        .await
+        .unwrap();
+    store
+        .insert(&make_memory(
+            &format!("ft-2-{uid}"),
+            "python memory service embedding vector search",
+            &uid,
+        ))
+        .await
+        .unwrap();
 
-    let results = store.search_fulltext(&uid, "rust", 5).await.expect("fulltext");
+    let results = store
+        .search_fulltext(&uid, "rust", 5)
+        .await
+        .expect("fulltext");
     assert!(!results.is_empty());
     assert!(results[0].content.contains("rust"));
     println!("✅ search_fulltext: top={}", results[0].memory_id);
@@ -152,7 +178,10 @@ async fn test_search_vector() {
     store.insert(&m2).await.unwrap();
 
     let query = dim_vec(0, 1.0);
-    let results = store.search_vector(&uid, &query, 2).await.expect("vector search");
+    let results = store
+        .search_vector(&uid, &query, 2)
+        .await
+        .expect("vector search");
     assert!(!results.is_empty());
     assert!(results[0].memory_id.contains("vec-1"));
     println!("✅ search_vector: nearest={}", results[0].memory_id);
@@ -195,7 +224,10 @@ async fn test_all_fields_round_trip() {
 
     assert_eq!(got.memory_type, MemoryType::Profile);
     assert_eq!(got.trust_tier, TrustTier::T1Verified);
-    assert!((got.initial_confidence - 0.91).abs() < 1e-4, "initial_confidence mismatch");
+    assert!(
+        (got.initial_confidence - 0.91).abs() < 1e-4,
+        "initial_confidence mismatch"
+    );
     assert_eq!(got.session_id.as_deref(), Some("sess-xyz"));
     assert_eq!(got.superseded_by.as_deref(), Some("other-id"));
     assert_eq!(got.source_event_ids, vec!["e1", "e2"]);
@@ -210,7 +242,10 @@ async fn test_all_fields_round_trip() {
 
     // observed_at round-trips within 1 second
     let got_ts = got.observed_at.expect("observed_at").timestamp();
-    assert!((got_ts - now.timestamp()).abs() <= 1, "observed_at mismatch");
+    assert!(
+        (got_ts - now.timestamp()).abs() <= 1,
+        "observed_at mismatch"
+    );
 
     // created_at is set by DB
     assert!(got.created_at.is_some(), "created_at should be set by DB");
@@ -276,7 +311,7 @@ async fn test_null_optional_fields() {
         memory_type: MemoryType::Semantic,
         content: "null fields test".to_string(),
         initial_confidence: 0.5,
-        embedding: None,          // NULL vecf32
+        embedding: None, // NULL vecf32
         source_event_ids: vec![],
         superseded_by: None,
         is_active: true,
@@ -285,7 +320,7 @@ async fn test_null_optional_fields() {
         observed_at: None,
         created_at: None,
         updated_at: None,
-        extra_metadata: None,     // NULL JSON
+        extra_metadata: None, // NULL JSON
         trust_tier: TrustTier::T3Inferred,
         retrieval_score: None,
     };
@@ -295,7 +330,10 @@ async fn test_null_optional_fields() {
     assert!(got.embedding.is_none(), "embedding should be NULL");
     assert!(got.session_id.is_none(), "session_id should be NULL");
     assert!(got.superseded_by.is_none(), "superseded_by should be NULL");
-    assert!(got.extra_metadata.is_none(), "extra_metadata should be NULL");
+    assert!(
+        got.extra_metadata.is_none(),
+        "extra_metadata should be NULL"
+    );
     assert_eq!(got.source_event_ids, Vec::<String>::new());
     println!("✅ null_optional_fields: all NULLs round-trip correctly");
 }

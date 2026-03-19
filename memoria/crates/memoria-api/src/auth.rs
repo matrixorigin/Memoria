@@ -21,10 +21,14 @@ struct UserQuery {
 impl FromRequestParts<AppState> for AuthUser {
     type Rejection = (StatusCode, String);
 
-    async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, Self::Rejection> {
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
         // Validate Bearer token if master_key is set
         if !state.master_key.is_empty() {
-            let auth = parts.headers
+            let auth = parts
+                .headers
                 .get("Authorization")
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("");
@@ -38,7 +42,8 @@ impl FromRequestParts<AppState> for AuthUser {
         }
 
         // Extract user_id from X-User-Id header, X-Impersonate-User, then query param, then default
-        let user_id = parts.headers
+        let user_id = parts
+            .headers
             .get("X-User-Id")
             .or_else(|| parts.headers.get("X-Impersonate-User"))
             .and_then(|v| v.to_str().ok())
@@ -46,7 +51,8 @@ impl FromRequestParts<AppState> for AuthUser {
             .or_else(|| {
                 // Try query param
                 let uri = parts.uri.query().unwrap_or("");
-                serde_urlencoded::from_str::<UserQuery>(uri).ok()
+                serde_urlencoded::from_str::<UserQuery>(uri)
+                    .ok()
                     .and_then(|q| q.user_id)
             })
             .unwrap_or_else(|| "default".to_string());

@@ -10,10 +10,7 @@ fn db_err(e: sqlx::Error) -> MemoriaError {
 /// Execute a DDL statement without prepared statement protocol.
 /// MatrixOne does not support PREPARE for DDL (CREATE SNAPSHOT, data branch, etc.)
 async fn exec_ddl(pool: &MySqlPool, sql: &str) -> Result<(), MemoriaError> {
-    sqlx::raw_sql(sql)
-        .execute(pool)
-        .await
-        .map_err(db_err)?;
+    sqlx::raw_sql(sql).execute(pool).await.map_err(db_err)?;
     Ok(())
 }
 
@@ -40,7 +37,7 @@ pub struct Snapshot {
 
 #[derive(Debug, Clone)]
 pub struct DiffRow {
-    pub flag: String,       // INSERT | UPDATE | DELETE
+    pub flag: String, // INSERT | UPDATE | DELETE
     pub memory_id: String,
     pub content: String,
     pub memory_type: String,
@@ -53,7 +50,10 @@ pub struct GitForDataService {
 
 impl GitForDataService {
     pub fn new(pool: MySqlPool, db_name: impl Into<String>) -> Self {
-        Self { pool, db_name: db_name.into() }
+        Self {
+            pool,
+            db_name: db_name.into(),
+        }
     }
 
     pub fn pool(&self) -> &MySqlPool {
@@ -64,7 +64,11 @@ impl GitForDataService {
 
     pub async fn create_snapshot(&self, name: &str) -> Result<Snapshot, MemoriaError> {
         let safe = validate_identifier(name)?;
-        exec_ddl(&self.pool, &format!("CREATE SNAPSHOT {safe} FOR ACCOUNT sys")).await?;
+        exec_ddl(
+            &self.pool,
+            &format!("CREATE SNAPSHOT {safe} FOR ACCOUNT sys"),
+        )
+        .await?;
         self.get_snapshot(name).await?.ok_or_else(|| {
             MemoriaError::Internal(format!("Snapshot {name} not found after creation"))
         })
@@ -75,25 +79,26 @@ impl GitForDataService {
             .fetch_all(&self.pool)
             .await
             .map_err(db_err)?;
-        rows.iter().map(|r| {
-            // Try NaiveDateTime directly first, then fall back to string parsing
-            let timestamp = r.try_get::<NaiveDateTime, _>("TIMESTAMP").ok()
-                .or_else(|| {
-                    r.try_get::<String, _>("TIMESTAMP").ok()
-                        .and_then(|s| {
-                            NaiveDateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S%.f").ok()
-                                .or_else(|| NaiveDateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S").ok())
-                        })
+        rows.iter()
+            .map(|r| {
+                // Try NaiveDateTime directly first, then fall back to string parsing
+                let timestamp = r.try_get::<NaiveDateTime, _>("TIMESTAMP").ok().or_else(|| {
+                    r.try_get::<String, _>("TIMESTAMP").ok().and_then(|s| {
+                        NaiveDateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S%.f")
+                            .ok()
+                            .or_else(|| NaiveDateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S").ok())
+                    })
                 });
-            Ok(Snapshot {
-                snapshot_name: r.try_get("SNAPSHOT_NAME").map_err(db_err)?,
-                timestamp,
-                snapshot_level: r.try_get("SNAPSHOT_LEVEL").map_err(db_err)?,
-                account_name: r.try_get("ACCOUNT_NAME").map_err(db_err)?,
-                database_name: r.try_get("DATABASE_NAME").ok(),
-                table_name: r.try_get("TABLE_NAME").ok(),
+                Ok(Snapshot {
+                    snapshot_name: r.try_get("SNAPSHOT_NAME").map_err(db_err)?,
+                    timestamp,
+                    snapshot_level: r.try_get("SNAPSHOT_LEVEL").map_err(db_err)?,
+                    account_name: r.try_get("ACCOUNT_NAME").map_err(db_err)?,
+                    database_name: r.try_get("DATABASE_NAME").ok(),
+                    table_name: r.try_get("TABLE_NAME").ok(),
+                })
             })
-        }).collect()
+            .collect()
     }
 
     pub async fn get_snapshot(&self, name: &str) -> Result<Option<Snapshot>, MemoriaError> {
@@ -118,7 +123,8 @@ impl GitForDataService {
         let safe_snap = validate_identifier(snapshot_name)?;
 
         // Verify snapshot exists
-        self.get_snapshot(snapshot_name).await?
+        self.get_snapshot(snapshot_name)
+            .await?
             .ok_or_else(|| MemoriaError::NotFound(format!("Snapshot {snapshot_name}")))?;
 
         // MO#23860: concurrent snapshot restore causes w-w conflict
@@ -129,9 +135,13 @@ impl GitForDataService {
         // support {SNAPSHOT = '...'} syntax inside transactions. The DELETE+INSERT
         // is non-atomic; callers should create a safety snapshot before rollback.
         exec_ddl(&self.pool, &format!("DELETE FROM {safe_table}")).await?;
-        exec_ddl(&self.pool, &format!(
-            "INSERT INTO {safe_table} SELECT * FROM {safe_table} {{SNAPSHOT = '{safe_snap}'}}"
-        )).await?;
+        exec_ddl(
+            &self.pool,
+            &format!(
+                "INSERT INTO {safe_table} SELECT * FROM {safe_table} {{SNAPSHOT = '{safe_snap}'}}"
+            ),
+        )
+        .await?;
 
         Ok(())
     }
@@ -146,9 +156,11 @@ impl GitForDataService {
     ) -> Result<(), MemoriaError> {
         let safe_branch = validate_identifier(branch_name)?;
         let safe_source = validate_identifier(source_table)?;
-        exec_ddl(&self.pool, &format!(
-            "data branch create table {safe_branch} from {safe_source}"
-        )).await
+        exec_ddl(
+            &self.pool,
+            &format!("data branch create table {safe_branch} from {safe_source}"),
+        )
+        .await
     }
 
     /// Create a branch from a snapshot: branch table contains the snapshot's data.
@@ -162,9 +174,13 @@ impl GitForDataService {
         let safe_branch = validate_identifier(branch_name)?;
         let safe_source = validate_identifier(source_table)?;
         let safe_snap = validate_identifier(snapshot_name)?;
-        exec_ddl(&self.pool, &format!(
+        exec_ddl(
+            &self.pool,
+            &format!(
             "data branch create table {safe_branch} from {safe_source} {{snapshot = '{safe_snap}'}}"
-        )).await
+        ),
+        )
+        .await
     }
 
     pub async fn drop_branch(&self, branch_name: &str) -> Result<(), MemoriaError> {
@@ -183,9 +199,11 @@ impl GitForDataService {
     ) -> Result<(), MemoriaError> {
         let safe_branch = validate_identifier(branch_table)?;
         let safe_main = validate_identifier(main_table)?;
-        exec_ddl(&self.pool, &format!(
-            "data branch merge {safe_branch} into {safe_main} when conflict skip"
-        )).await
+        exec_ddl(
+            &self.pool,
+            &format!("data branch merge {safe_branch} into {safe_main} when conflict skip"),
+        )
+        .await
     }
 
     /// LCA-based diff count for a specific user.
@@ -198,7 +216,9 @@ impl GitForDataService {
     ) -> Result<i64, MemoriaError> {
         // Fetch a large batch and count user's rows
         // For safety limit purposes, 5000 is the max we care about
-        let rows = self.diff_branch_rows(branch_table, main_table, user_id, 5001).await?;
+        let rows = self
+            .diff_branch_rows(branch_table, main_table, user_id, 5001)
+            .await?;
         Ok(rows.len() as i64)
     }
 
@@ -227,14 +247,18 @@ impl GitForDataService {
         let mut result = Vec::new();
         for r in &rows {
             let uid: String = r.try_get("user_id").map_err(db_err)?;
-            if uid != user_id { continue; }
+            if uid != user_id {
+                continue;
+            }
             result.push(DiffRow {
                 flag: r.try_get("flag").map_err(db_err)?,
                 memory_id: r.try_get("memory_id").map_err(db_err)?,
                 content: r.try_get("content").map_err(db_err)?,
                 memory_type: r.try_get("memory_type").map_err(db_err)?,
             });
-            if result.len() >= limit as usize { break; }
+            if result.len() >= limit as usize {
+                break;
+            }
         }
         Ok(result)
     }
