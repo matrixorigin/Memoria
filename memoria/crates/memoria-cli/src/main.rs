@@ -21,6 +21,10 @@ const MCP_KEY: &str = "memoria";
 // ── Embedded steering templates ───────────────────────────────────────────────
 
 const KIRO_STEERING: &str = include_str!("../templates/kiro_steering.md");
+const KIRO_SESSION_LIFECYCLE: &str = include_str!("../templates/kiro_session_lifecycle.md");
+const KIRO_MEMORY_HYGIENE: &str = include_str!("../templates/kiro_memory_hygiene.md");
+const KIRO_MEMORY_BRANCHING: &str = include_str!("../templates/kiro_memory_branching.md");
+const KIRO_GOAL_EVOLUTION: &str = include_str!("../templates/kiro_goal_evolution.md");
 const CURSOR_RULE: &str = include_str!("../templates/cursor_rule.md");
 const CLAUDE_RULE: &str = include_str!("../templates/claude_rule.md");
 
@@ -1000,18 +1004,18 @@ fn write_mcp_json(path: &Path, entry: &serde_json::Value, project_dir: &Path) ->
 }
 
 fn configure_kiro(project_dir: &Path, entry: &serde_json::Value, force: bool) -> Vec<String> {
+    let steering = project_dir.join(".kiro/steering");
     vec![
         write_mcp_json(
             &project_dir.join(".kiro/settings/mcp.json"),
             entry,
             project_dir,
         ),
-        write_rule(
-            &project_dir.join(".kiro/steering/memory.md"),
-            KIRO_STEERING,
-            force,
-            project_dir,
-        ),
+        write_rule(&steering.join("memory.md"), KIRO_STEERING, force, project_dir),
+        write_rule(&steering.join("session-lifecycle.md"), KIRO_SESSION_LIFECYCLE, force, project_dir),
+        write_rule(&steering.join("memory-hygiene.md"), KIRO_MEMORY_HYGIENE, force, project_dir),
+        write_rule(&steering.join("memory-branching-patterns.md"), KIRO_MEMORY_BRANCHING, force, project_dir),
+        write_rule(&steering.join("goal-driven-evolution.md"), KIRO_GOAL_EVOLUTION, force, project_dir),
     ]
 }
 
@@ -1648,27 +1652,57 @@ fn cmd_status(project_dir: &Path) {
         println!("No AI tool configs found.");
     }
     for tool in &tools {
-        let (mcp_path, rule_path) = match tool.as_str() {
-            "kiro" => (".kiro/settings/mcp.json", ".kiro/steering/memory.md"),
-            "cursor" => (".cursor/mcp.json", ".cursor/rules/memory.mdc"),
-            "claude" => (".mcp.json", "CLAUDE.md"),
-            _ => continue,
-        };
         println!("[{}]", tool);
-        let mcp = project_dir.join(mcp_path);
-        if mcp.exists() {
-            println!("  ✓ {}", mcp_path);
-        } else {
-            println!("  ✗ {} (missing)", mcp_path);
-        }
-        let rule = project_dir.join(rule_path);
-        if rule.exists() {
-            let ver = installed_version(&rule)
-                .map(|v| format!(" (v{})", v))
-                .unwrap_or_default();
-            println!("  ✓ {}{}", rule_path, ver);
-        } else {
-            println!("  ✗ {} (missing)", rule_path);
+        match tool.as_str() {
+            "kiro" => {
+                let mcp = project_dir.join(".kiro/settings/mcp.json");
+                if mcp.exists() {
+                    println!("  ✓ .kiro/settings/mcp.json");
+                } else {
+                    println!("  ✗ .kiro/settings/mcp.json (missing)");
+                }
+                let rules = [
+                    "memory.md",
+                    "session-lifecycle.md",
+                    "memory-hygiene.md",
+                    "memory-branching-patterns.md",
+                    "goal-driven-evolution.md",
+                ];
+                for name in &rules {
+                    let path = project_dir.join(".kiro/steering").join(name);
+                    let rel = format!(".kiro/steering/{}", name);
+                    if path.exists() {
+                        let ver = installed_version(&path)
+                            .map(|v| format!(" (v{})", v))
+                            .unwrap_or_default();
+                        println!("  ✓ {}{}", rel, ver);
+                    } else {
+                        println!("  ✗ {} (missing)", rel);
+                    }
+                }
+            }
+            "cursor" | "claude" => {
+                let (mcp_path, rule_path) = match tool.as_str() {
+                    "cursor" => (".cursor/mcp.json", ".cursor/rules/memory.mdc"),
+                    _ => (".mcp.json", "CLAUDE.md"),
+                };
+                let mcp = project_dir.join(mcp_path);
+                if mcp.exists() {
+                    println!("  ✓ {}", mcp_path);
+                } else {
+                    println!("  ✗ {} (missing)", mcp_path);
+                }
+                let rule = project_dir.join(rule_path);
+                if rule.exists() {
+                    let ver = installed_version(&rule)
+                        .map(|v| format!(" (v{})", v))
+                        .unwrap_or_default();
+                    println!("  ✓ {}{}", rule_path, ver);
+                } else {
+                    println!("  ✗ {} (missing)", rule_path);
+                }
+            }
+            _ => continue,
         }
     }
     let bundled = VERSION;
@@ -1683,26 +1717,34 @@ fn cmd_update_rules(project_dir: &Path) {
     }
     for tool in &tools {
         println!("[{}]", tool);
-        let result = match tool.as_str() {
-            "kiro" => write_rule(
-                &project_dir.join(".kiro/steering/memory.md"),
-                KIRO_STEERING,
-                true,
-                project_dir,
-            ),
-            "cursor" => write_rule(
-                &project_dir.join(".cursor/rules/memory.mdc"),
-                CURSOR_RULE,
-                true,
-                project_dir,
-            ),
+        match tool.as_str() {
+            "kiro" => {
+                let steering = project_dir.join(".kiro/steering");
+                let pairs: &[(&str, &str)] = &[
+                    ("memory.md", KIRO_STEERING),
+                    ("session-lifecycle.md", KIRO_SESSION_LIFECYCLE),
+                    ("memory-hygiene.md", KIRO_MEMORY_HYGIENE),
+                    ("memory-branching-patterns.md", KIRO_MEMORY_BRANCHING),
+                    ("goal-driven-evolution.md", KIRO_GOAL_EVOLUTION),
+                ];
+                for (name, content) in pairs {
+                    println!("{}", write_rule(&steering.join(name), content, true, project_dir));
+                }
+            }
+            "cursor" => {
+                println!("{}", write_rule(
+                    &project_dir.join(".cursor/rules/memory.mdc"),
+                    CURSOR_RULE,
+                    true,
+                    project_dir,
+                ));
+            }
             "claude" => {
                 println!("  ⚠ CLAUDE.md — manual update recommended");
                 continue;
             }
             _ => continue,
         };
-        println!("{}", result);
     }
 }
 

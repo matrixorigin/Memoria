@@ -5,7 +5,11 @@
 You have persistent memory via MCP tools. Memory survives across conversations.
 
 ## 🔴 MANDATORY: Every conversation start
-Call `memory_retrieve` with a **semantic query** derived from the user's message BEFORE responding.
+Before your first response, run a multi-query bootstrap to load full context:
+
+1. **Primary query** — call `memory_retrieve` with a **semantic query** derived from the user's message.
+2. **Active goals** — `memory_search(query="GOAL ACTIVE")` (if user's message references ongoing work or a previous task)
+3. **User profile** — `memory_profile()` (if user asks about preferences or you need style context)
 
 **Query construction rules:**
 - ✅ **DO**: Extract key concepts from user's question → "benchmark optimization", "graph retrieval bug", "active goals"
@@ -43,6 +47,12 @@ Do NOT call `memory_store` for:
 - Task or debug session is complete → `memory_purge(topic="<task keyword>", reason="task complete")`
 - You stored a working memory that turned out to be wrong → `memory_purge(memory_id="...", reason="incorrect conclusion")`
 - User says "start fresh", "forget what we tried", "let's try a different approach"
+- Only purge completed tasks — leave active task working memories for next session
+
+**Promote or purge as you go:**
+- Hypothesis confirmed → `memory_store` the conclusion as `semantic`, then `memory_purge` the working memory
+- Hypothesis disproven → `memory_purge` the working memory immediately
+- Don't wait until session end to promote — do it as soon as you know
 
 **When a working memory contradicts current findings:**
 - Do NOT keep both. Purge the stale one immediately: `memory_purge(memory_id="...", reason="superseded by new finding")`
@@ -80,6 +90,11 @@ Before storing a new memory, consider:
 | `memory_search` | User asks "what do you know about X" or you need to browse | `query`, `top_k` (default 10), `explain` (false = no debug, true = show timing) |
 | `memory_profile` | User asks "what do you know about me" | — |
 
+**`memory_retrieve` vs `memory_search`**: In MCP mode, both use the same retrieval pipeline (graph → hybrid vector+fulltext → fulltext fallback). The differences are:
+- `memory_retrieve` accepts `session_id` for session-scoped boosting; `memory_search` does not
+- `memory_retrieve` defaults to `top_k=5` (focused); `memory_search` defaults to `top_k=10` (broader)
+- Use `memory_retrieve` when you have a `session_id` or want focused results; use `memory_search` for broader exploration
+
 **Debug parameter:** `explain=true` shows execution timing and retrieval path. **ONLY use when user explicitly asks** to debug performance or investigate why certain memories were/weren't retrieved. **DO NOT use proactively** — it adds overhead and clutters output.
 
 **When to use explain:**
@@ -94,6 +109,7 @@ Before storing a new memory, consider:
 | `procedural` | How-to knowledge, workflows | "Deploy with: make dev-start", "Run tests with pytest -n auto" |
 | `working` | Temporary context for current task | "Currently debugging embedding issue" |
 | `tool_result` | Tool execution results worth caching | "Last CI run: 126 passed, 0 failed" |
+| `episodic` | Session summaries (topic/action/outcome) | "Session Summary: Database optimization\n\nActions: Added indexes\n\nOutcome: 93% faster" |
 
 ### Snapshots (save/restore/cleanup)
 Use before risky changes. `memory_snapshot(name)` saves state, `memory_rollback(name)` restores it, `memory_snapshots(limit, offset)` lists with pagination, `memory_snapshot_delete(names|prefix|older_than)` cleans up.
@@ -123,10 +139,10 @@ Git-like workflow for memory. `memory_branch(name)` creates, `memory_checkout(na
 - User is only asking questions, not sharing new information
 - You already ran extraction this session
 
-### Maintenance (only when user explicitly asks)
+### Maintenance
 | Tool | Trigger phrase | Cooldown |
 |------|---------------|----------|
-| `memory_governance` | "clean up memories", "check memory health" | 1 hour |
+| `memory_governance` | "clean up memories", "check memory health", or proactively when retrieval returns outdated/contradictory results | 1 hour |
 | `memory_consolidate` | "check for contradictions", "fix conflicts" | 30 min |
 | `memory_reflect` | "find patterns", "summarize what you know" | 2 hours |
 | `memory_rebuild_index` | Only when governance reports `needs_rebuild=True` | — |
@@ -136,3 +152,16 @@ Git-like workflow for memory. `memory_branch(name)` creates, `memory_checkout(na
 - `auto` (default): uses Memoria's internal LLM if configured, otherwise returns candidates for YOU to process
 - `candidates`: always returns raw data for YOU to synthesize/extract, then store results via `memory_store` or `memory_link_entities`
 - `internal`: always uses Memoria's internal LLM (fails if not configured)
+
+## Session Lifecycle
+
+### Mid-Session
+- Store facts as they emerge (don't batch at end). One fact per `memory_store` call.
+- Re-retrieve when user shifts topic or references past decisions not in current context.
+- Store temporary context as `working` type; promote to `semantic` when confirmed, purge when disproven.
+
+### Conversation End (Wrap-Up)
+- Clean up completed task working memories: `memory_purge(topic="<task keyword>", reason="session complete")`
+- Promote any durable findings still in `working` to `semantic`
+- Generate episodic summary if session was substantive: `memory_store(content="Session Summary: [topic]\n\nActions: [what was done]\n\nOutcome: [result]", memory_type="episodic")`
+- Update tracked goal status via `memory_correct`
