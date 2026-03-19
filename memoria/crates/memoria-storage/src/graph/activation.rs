@@ -54,7 +54,12 @@ fn task_edge_boost(task_type: Option<&str>, etype: &str) -> f32 {
     }
 }
 
-fn edge_weight(etype: &str, base_weight: f32, task_type: Option<&str>, entity_link_mult: f32) -> f32 {
+fn edge_weight(
+    etype: &str,
+    base_weight: f32,
+    task_type: Option<&str>,
+    entity_link_mult: f32,
+) -> f32 {
     let mut mult = edge_type_multiplier(etype);
     if etype == edge_type::ENTITY_LINK {
         mult = entity_link_mult;

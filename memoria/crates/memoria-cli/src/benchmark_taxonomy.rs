@@ -17,7 +17,8 @@ pub fn grade(score: f64) -> &'static str {
 }
 
 fn normalize_key(value: &str) -> String {
-    value.trim()
+    value
+        .trim()
         .to_lowercase()
         .replace([' ', '/', '-'], "_")
         .replace("__", "_")
@@ -127,7 +128,10 @@ pub fn official_category(
             _ if qtype.ends_with("_abs") => "abstention",
             _ => return None,
         };
-        return Some((canonical.into(), longmemeval_category_label(canonical).into()));
+        return Some((
+            canonical.into(),
+            longmemeval_category_label(canonical).into(),
+        ));
     }
     if family == "beam" {
         let canonical = match qtype.as_str() {

@@ -194,11 +194,13 @@ pub fn score_dataset(
                 .entry(family.clone())
                 .or_default()
                 .push(result.total_score);
-            family_labels.entry(family.clone()).or_insert_with(|| match family.as_str() {
-                "longmemeval" => "LongMemEval".into(),
-                "beam" => "BEAM".into(),
-                _ => family.clone(),
-            });
+            family_labels
+                .entry(family.clone())
+                .or_insert_with(|| match family.as_str() {
+                    "longmemeval" => "LongMemEval".into(),
+                    "beam" => "BEAM".into(),
+                    _ => family.clone(),
+                });
         }
         if let (Some(family), Some(category), Some(label)) = (
             result.source_family.as_ref(),
@@ -210,13 +212,17 @@ pub fn score_dataset(
                     .entry(category.clone())
                     .or_default()
                     .push(result.total_score);
-                lme_labels.entry(category.clone()).or_insert_with(|| label.clone());
+                lme_labels
+                    .entry(category.clone())
+                    .or_insert_with(|| label.clone());
             } else if family == "beam" {
                 by_beam_ability
                     .entry(category.clone())
                     .or_default()
                     .push(result.total_score);
-                beam_labels.entry(category.clone()).or_insert_with(|| label.clone());
+                beam_labels
+                    .entry(category.clone())
+                    .or_insert_with(|| label.clone());
             }
         }
         results.push(result);

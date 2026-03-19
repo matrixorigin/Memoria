@@ -18,7 +18,9 @@ pub struct StoreRequest {
     pub observed_at: Option<String>,
     pub source: Option<String>,
 }
-fn default_memory_type() -> String { "semantic".to_string() }
+fn default_memory_type() -> String {
+    "semantic".to_string()
+}
 
 #[derive(Deserialize)]
 pub struct BatchStoreRequest {
@@ -38,14 +40,21 @@ pub struct RetrieveRequest {
     #[serde(default, deserialize_with = "deserialize_explain")]
     pub explain: String,
 }
-fn default_top_k() -> i64 { 5 }
-fn default_true() -> bool { true }
+fn default_top_k() -> i64 {
+    5
+}
+fn default_true() -> bool {
+    true
+}
 
 fn deserialize_explain<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
     use serde::Deserialize;
     #[derive(Deserialize)]
     #[serde(untagged)]
-    enum ExplainInput { Bool(bool), Str(String) }
+    enum ExplainInput {
+        Bool(bool),
+        Str(String),
+    }
     Ok(match ExplainInput::deserialize(d)? {
         ExplainInput::Bool(true) => "basic".to_string(),
         ExplainInput::Bool(false) => "none".to_string(),
@@ -136,7 +145,9 @@ pub struct ReflectRequest {
     #[serde(default = "default_mode")]
     pub mode: String,
 }
-fn default_mode() -> String { "auto".to_string() }
+fn default_mode() -> String {
+    "auto".to_string()
+}
 
 #[derive(Deserialize, Default)]
 pub struct ExtractEntitiesRequest {
@@ -161,7 +172,9 @@ pub struct EntityItem {
     #[serde(rename = "type", default = "default_entity_type")]
     pub entity_type: String,
 }
-fn default_entity_type() -> String { "concept".to_string() }
+fn default_entity_type() -> String {
+    "concept".to_string()
+}
 
 // ── Snapshots ─────────────────────────────────────────────────────────────────
 
@@ -192,7 +205,9 @@ pub struct MergeRequest {
     #[serde(default = "default_strategy")]
     pub strategy: String,
 }
-fn default_strategy() -> String { "accept".to_string() }
+fn default_strategy() -> String {
+    "accept".to_string()
+}
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 

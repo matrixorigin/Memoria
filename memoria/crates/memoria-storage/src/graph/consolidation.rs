@@ -46,7 +46,10 @@ impl<'a> GraphConsolidator<'a> {
             Err(e) => result.errors.push(format!("integrity: {e}")),
         }
         match self.trust_tier_lifecycle(user_id).await {
-            Ok((p, d)) => { result.promoted = p; result.demoted = d; }
+            Ok((p, d)) => {
+                result.promoted = p;
+                result.demoted = d;
+            }
             Err(e) => result.errors.push(format!("tier_lifecycle: {e}")),
         }
 
@@ -54,18 +57,25 @@ impl<'a> GraphConsolidator<'a> {
     }
 
     async fn detect_conflicts(&self, user_id: &str) -> Result<usize, MemoriaError> {
-        let candidates = self.store.get_association_edges_with_current_sim(
-            user_id,
-            CONTRADICTION_ASSOCIATION_THRESHOLD,
-            0.4,
-        ).await?;
+        let candidates = self
+            .store
+            .get_association_edges_with_current_sim(
+                user_id,
+                CONTRADICTION_ASSOCIATION_THRESHOLD,
+                0.4,
+            )
+            .await?;
 
-        if candidates.is_empty() { return Ok(0); }
+        if candidates.is_empty() {
+            return Ok(0);
+        }
 
-        let candidate_ids: Vec<String> = candidates.iter()
+        let candidate_ids: Vec<String> = candidates
+            .iter()
             .flat_map(|(src, tgt, _, _)| [src.clone(), tgt.clone()])
             .collect::<std::collections::HashSet<_>>()
-            .into_iter().collect();
+            .into_iter()
+            .collect();
 
         let nodes = self.store.get_nodes_by_ids(&candidate_ids).await?;
         let node_map: std::collections::HashMap<String, _> =
@@ -73,12 +83,26 @@ impl<'a> GraphConsolidator<'a> {
 
         let mut conflicts_found = 0;
         for (src_id, tgt_id, _ew, _cs) in &candidates {
-            let node = match node_map.get(src_id) { Some(n) => n, None => continue };
-            let neighbor = match node_map.get(tgt_id) { Some(n) => n, None => continue };
-            if !node.is_active || !neighbor.is_active { continue; }
-            if node.node_type != NodeType::Semantic || neighbor.node_type != NodeType::Semantic { continue; }
-            if node.conflicts_with.is_some() || neighbor.conflicts_with.is_some() { continue; }
-            if node.session_id == neighbor.session_id { continue; }
+            let node = match node_map.get(src_id) {
+                Some(n) => n,
+                None => continue,
+            };
+            let neighbor = match node_map.get(tgt_id) {
+                Some(n) => n,
+                None => continue,
+            };
+            if !node.is_active || !neighbor.is_active {
+                continue;
+            }
+            if node.node_type != NodeType::Semantic || neighbor.node_type != NodeType::Semantic {
+                continue;
+            }
+            if node.conflicts_with.is_some() || neighbor.conflicts_with.is_some() {
+                continue;
+            }
+            if node.session_id == neighbor.session_id {
+                continue;
+            }
 
             let (older, newer) = if node.node_id < neighbor.node_id {
                 (node, neighbor)
@@ -86,35 +110,49 @@ impl<'a> GraphConsolidator<'a> {
                 (neighbor, node)
             };
 
-            self.store.mark_conflict(
-                &older.node_id, &newer.node_id, 0.5, older.confidence,
-            ).await?;
+            self.store
+                .mark_conflict(&older.node_id, &newer.node_id, 0.5, older.confidence)
+                .await?;
             conflicts_found += 1;
         }
         Ok(conflicts_found)
     }
 
     async fn check_source_integrity(&self, user_id: &str) -> Result<usize, MemoriaError> {
-        let scenes = self.store.get_user_nodes(user_id, &NodeType::Scene, true).await?;
+        let scenes = self
+            .store
+            .get_user_nodes(user_id, &NodeType::Scene, true)
+            .await?;
         let mut orphaned = 0;
         for scene in &scenes {
-            if scene.source_nodes.is_empty() { continue; }
+            if scene.source_nodes.is_empty() {
+                continue;
+            }
             let sources = self.store.get_nodes_by_ids(&scene.source_nodes).await?;
             let active_count = sources.iter().filter(|n| n.is_active).count();
             if active_count == 0 {
                 self.store.deactivate_node(&scene.node_id).await?;
                 orphaned += 1;
-            } else if (active_count as f32) < (scene.source_nodes.len() as f32 * SOURCE_INTEGRITY_RATIO) {
-                self.store.update_confidence_and_tier(
-                    &scene.node_id, scene.confidence * 0.8, &scene.trust_tier,
-                ).await?;
+            } else if (active_count as f32)
+                < (scene.source_nodes.len() as f32 * SOURCE_INTEGRITY_RATIO)
+            {
+                self.store
+                    .update_confidence_and_tier(
+                        &scene.node_id,
+                        scene.confidence * 0.8,
+                        &scene.trust_tier,
+                    )
+                    .await?;
             }
         }
         Ok(orphaned)
     }
 
     async fn trust_tier_lifecycle(&self, user_id: &str) -> Result<(usize, usize), MemoriaError> {
-        let scenes = self.store.get_user_nodes(user_id, &NodeType::Scene, true).await?;
+        let scenes = self
+            .store
+            .get_user_nodes(user_id, &NodeType::Scene, true)
+            .await?;
         let mut promoted = 0usize;
         let mut demoted = 0usize;
 
@@ -127,7 +165,9 @@ impl<'a> GraphConsolidator<'a> {
             match scene.trust_tier.as_str() {
                 "T4" => {
                     if scene.confidence >= t4_to_t3_confidence && age >= t4_to_t3_min_age_days {
-                        self.store.update_confidence_and_tier(&scene.node_id, scene.confidence, "T3").await?;
+                        self.store
+                            .update_confidence_and_tier(&scene.node_id, scene.confidence, "T3")
+                            .await?;
                         promoted += 1;
                     }
                 }
@@ -136,16 +176,24 @@ impl<'a> GraphConsolidator<'a> {
                         && age >= T3_TO_T2_MIN_AGE_DAYS
                         && scene.cross_session_count >= T3_TO_T2_MIN_CROSS_SESSION
                     {
-                        self.store.update_confidence_and_tier(&scene.node_id, scene.confidence, "T2").await?;
+                        self.store
+                            .update_confidence_and_tier(&scene.node_id, scene.confidence, "T2")
+                            .await?;
                         promoted += 1;
-                    } else if age >= T3_DEMOTION_STALE_DAYS && scene.confidence < t4_to_t3_confidence {
-                        self.store.update_confidence_and_tier(&scene.node_id, scene.confidence, "T4").await?;
+                    } else if age >= T3_DEMOTION_STALE_DAYS
+                        && scene.confidence < t4_to_t3_confidence
+                    {
+                        self.store
+                            .update_confidence_and_tier(&scene.node_id, scene.confidence, "T4")
+                            .await?;
                         demoted += 1;
                     }
                 }
                 "T2" => {
                     if scene.confidence < T2_DEMOTION_CONFIDENCE {
-                        self.store.update_confidence_and_tier(&scene.node_id, scene.confidence, "T3").await?;
+                        self.store
+                            .update_confidence_and_tier(&scene.node_id, scene.confidence, "T3")
+                            .await?;
                         demoted += 1;
                     }
                 }

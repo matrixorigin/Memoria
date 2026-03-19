@@ -26,8 +26,12 @@ pub struct SessionSummaryRequest {
     #[serde(default = "default_true")]
     pub generate_embedding: bool,
 }
-fn default_mode() -> String { "full".to_string() }
-fn default_true() -> bool { true }
+fn default_mode() -> String {
+    "full".to_string()
+}
+fn default_true() -> bool {
+    true
+}
 
 #[derive(Serialize)]
 pub struct SessionSummaryResponse {
@@ -51,7 +55,8 @@ pub struct TaskStatus {
 
 // ── LLM prompts ───────────────────────────────────────────────────────────────
 
-const EPISODIC_PROMPT: &str = "You are analyzing a conversation session to create an episodic memory summary.\n\n\
+const EPISODIC_PROMPT: &str =
+    "You are analyzing a conversation session to create an episodic memory summary.\n\n\
 Extract the following information from the conversation:\n\
 1. **Topic**: The main subject or theme discussed (1-2 sentences)\n\
 2. **Action**: Key actions, decisions, or activities performed (2-3 sentences)\n\
@@ -69,7 +74,11 @@ Respond with a JSON object: {\"points\": [\"point 1\", \"point 2\", ...]}";
 
 fn extract_json(text: &str) -> &str {
     let text = text.trim();
-    let text = text.trim_start_matches("```json").trim_start_matches("```").trim_end_matches("```").trim();
+    let text = text
+        .trim_start_matches("```json")
+        .trim_start_matches("```")
+        .trim_end_matches("```")
+        .trim();
     text
 }
 
@@ -82,69 +91,132 @@ async fn generate_and_store(
     mode: &str,
     focus_topics: Option<&[String]>,
 ) -> Result<(String, String, bool, serde_json::Value), String> {
-    let sql = state.service.sql_store.as_ref()
+    let sql = state
+        .service
+        .sql_store
+        .as_ref()
         .ok_or("SQL store required")?;
-    let llm = state.service.llm.as_ref()
+    let llm = state
+        .service
+        .llm
+        .as_ref()
         .ok_or("LLM not configured — set LLM_API_KEY")?;
 
     let rows = sqlx::query(
         "SELECT memory_id, content, memory_type FROM mem_memories \
          WHERE user_id = ? AND session_id = ? AND is_active = 1 \
-         ORDER BY created_at ASC"
+         ORDER BY created_at ASC",
     )
-    .bind(user_id).bind(session_id)
-    .fetch_all(sql.pool()).await
+    .bind(user_id)
+    .bind(session_id)
+    .fetch_all(sql.pool())
+    .await
     .map_err(|e| e.to_string())?;
 
     if rows.is_empty() {
         return Err(format!("No memories found for session {session_id}"));
     }
 
-    let messages: Vec<(String, String, String)> = rows.iter().filter_map(|r| {
-        let mid: String = r.try_get("memory_id").ok()?;
-        let content: String = r.try_get("content").ok()?;
-        let mtype: String = r.try_get("memory_type").ok()?;
-        Some((mid, content, mtype))
-    }).take(200).collect();
+    let messages: Vec<(String, String, String)> = rows
+        .iter()
+        .filter_map(|r| {
+            let mid: String = r.try_get("memory_id").ok()?;
+            let content: String = r.try_get("content").ok()?;
+            let mtype: String = r.try_get("memory_type").ok()?;
+            Some((mid, content, mtype))
+        })
+        .take(200)
+        .collect();
 
     let truncated = messages.len() < rows.len();
-    let msg_text = messages.iter()
+    let msg_text = messages
+        .iter()
         .map(|(_, c, t)| format!("user: [{t}] {}", truncate_utf8(c, 500)))
-        .collect::<Vec<_>>().join("\n");
+        .collect::<Vec<_>>()
+        .join("\n");
 
     if mode == "lightweight" {
         let prompt = LIGHTWEIGHT_PROMPT.replace("{messages}", &msg_text);
-        let msgs = vec![memoria_embedding::ChatMessage { role: "user".to_string(), content: prompt }];
-        let raw = llm.chat(&msgs, 0.3, Some(300)).await.map_err(|e| e.to_string())?;
+        let msgs = vec![memoria_embedding::ChatMessage {
+            role: "user".to_string(),
+            content: prompt,
+        }];
+        let raw = llm
+            .chat(&msgs, 0.3, Some(300))
+            .await
+            .map_err(|e| e.to_string())?;
         let json_str = extract_json(&raw);
         let data: serde_json::Value = serde_json::from_str(json_str)
             .map_err(|e| format!("LLM returned invalid JSON: {e}"))?;
-        let points = data["points"].as_array()
-            .ok_or("Expected 'points' array")?;
-        let content = format!("Session Highlights:\n{}",
-            points.iter().map(|p| format!("• {}", p.as_str().unwrap_or(""))).collect::<Vec<_>>().join("\n"));
+        let points = data["points"].as_array().ok_or("Expected 'points' array")?;
+        let content = format!(
+            "Session Highlights:\n{}",
+            points
+                .iter()
+                .map(|p| format!("• {}", p.as_str().unwrap_or("")))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
         let metadata = json!({"mode": "lightweight", "points": points});
-        let m = state.service.store_memory(user_id, &content, memoria_core::MemoryType::Episodic, None, None, None, None)
-            .await.map_err(|e| e.to_string())?;
+        let m = state
+            .service
+            .store_memory(
+                user_id,
+                &content,
+                memoria_core::MemoryType::Episodic,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .map_err(|e| e.to_string())?;
         Ok((m.memory_id, content, truncated, metadata))
     } else {
-        let focus_clause = focus_topics.map(|t| format!("\nPay special attention to these topics: {}.\n", t.join(", "))).unwrap_or_default();
+        let focus_clause = focus_topics
+            .map(|t| {
+                format!(
+                    "\nPay special attention to these topics: {}.\n",
+                    t.join(", ")
+                )
+            })
+            .unwrap_or_default();
         let prompt = EPISODIC_PROMPT
             .replace("{messages}", &msg_text)
             .replace("{focus_clause}", &focus_clause);
-        let msgs = vec![memoria_embedding::ChatMessage { role: "user".to_string(), content: prompt }];
-        let raw = llm.chat(&msgs, 0.3, Some(500)).await.map_err(|e| e.to_string())?;
+        let msgs = vec![memoria_embedding::ChatMessage {
+            role: "user".to_string(),
+            content: prompt,
+        }];
+        let raw = llm
+            .chat(&msgs, 0.3, Some(500))
+            .await
+            .map_err(|e| e.to_string())?;
         let json_str = extract_json(&raw);
         let data: serde_json::Value = serde_json::from_str(json_str)
             .map_err(|e| format!("LLM returned invalid JSON: {e}"))?;
         let topic = data["topic"].as_str().unwrap_or("").to_string();
         let action = data["action"].as_str().unwrap_or("").to_string();
         let outcome = data["outcome"].as_str().unwrap_or("").to_string();
-        if topic.is_empty() { return Err("LLM returned empty topic".to_string()); }
-        let content = format!("Session Summary: {topic}\n\nActions: {action}\n\nOutcome: {outcome}");
+        if topic.is_empty() {
+            return Err("LLM returned empty topic".to_string());
+        }
+        let content =
+            format!("Session Summary: {topic}\n\nActions: {action}\n\nOutcome: {outcome}");
         let metadata = json!({"mode": "full", "topic": topic, "action": action, "outcome": outcome, "session_id": session_id});
-        let m = state.service.store_memory(user_id, &content, memoria_core::MemoryType::Episodic, None, None, None, None)
-            .await.map_err(|e| e.to_string())?;
+        let m = state
+            .service
+            .store_memory(
+                user_id,
+                &content,
+                memoria_core::MemoryType::Episodic,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .map_err(|e| e.to_string())?;
         Ok((m.memory_id, content, truncated, metadata))
     }
 }
@@ -158,15 +230,22 @@ pub async fn create_session_summary(
     Json(req): Json<SessionSummaryRequest>,
 ) -> Result<Json<SessionSummaryResponse>, (StatusCode, String)> {
     if state.service.llm.is_none() {
-        return Err((StatusCode::SERVICE_UNAVAILABLE,
-            "LLM not configured — set LLM_API_KEY to enable episodic memory".to_string()));
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "LLM not configured — set LLM_API_KEY to enable episodic memory".to_string(),
+        ));
     }
 
     if req.sync {
         let result = generate_and_store(
-            &state, &user_id, &session_id, &req.mode,
+            &state,
+            &user_id,
+            &session_id,
+            &req.mode,
             req.focus_topics.as_deref(),
-        ).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        )
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
         return Ok(Json(SessionSummaryResponse {
             memory_id: Some(result.0),
@@ -179,11 +258,15 @@ pub async fn create_session_summary(
     }
 
     // Async: create task in DB
-    let task_store = state.task_store.as_ref()
-        .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "Task store not available".to_string()))?;
+    let task_store = state.task_store.as_ref().ok_or((
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "Task store not available".to_string(),
+    ))?;
 
     let task_id = uuid::Uuid::new_v4().simple().to_string();
-    task_store.create_task(&task_id, &state.instance_id).await
+    task_store
+        .create_task(&task_id, &state.instance_id)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     let state_clone = state.clone();
@@ -198,13 +281,20 @@ pub async fn create_session_summary(
         if let Some(ts) = &state_clone.task_store {
             match result {
                 Ok((mid, content, truncated, metadata)) => {
-                    let _ = ts.complete_task(&tid, json!({
-                        "memory_id": mid, "content": content,
-                        "truncated": truncated, "metadata": metadata
-                    })).await;
+                    let _ = ts
+                        .complete_task(
+                            &tid,
+                            json!({
+                                "memory_id": mid, "content": content,
+                                "truncated": truncated, "metadata": metadata
+                            }),
+                        )
+                        .await;
                 }
                 Err(e) => {
-                    let _ = ts.fail_task(&tid, json!({"code": "GENERATION_ERROR", "message": e})).await;
+                    let _ = ts
+                        .fail_task(&tid, json!({"code": "GENERATION_ERROR", "message": e}))
+                        .await;
                 }
             }
         }
@@ -225,10 +315,14 @@ pub async fn get_task_status(
     AuthUser(_): AuthUser,
     Path(task_id): Path<String>,
 ) -> Result<Json<TaskStatus>, (StatusCode, String)> {
-    let task_store = state.task_store.as_ref()
-        .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "Task store not available".to_string()))?;
+    let task_store = state.task_store.as_ref().ok_or((
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "Task store not available".to_string(),
+    ))?;
 
-    let task = task_store.get_task(&task_id).await
+    let task = task_store
+        .get_task(&task_id)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     match task {

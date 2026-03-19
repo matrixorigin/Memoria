@@ -195,7 +195,14 @@ impl MemoryService {
                     && job.content.len() >= Self::ENTITY_LLM_MIN_CONTENT_LEN
                 {
                     if let Some(ref llm) = llm {
-                        Self::llm_extract_entities(llm, &graph, &job.user_id, &job.memory_id, &job.content).await;
+                        Self::llm_extract_entities(
+                            llm,
+                            &graph,
+                            &job.user_id,
+                            &job.memory_id,
+                            &job.content,
+                        )
+                        .await;
                     }
                 }
             }
@@ -216,25 +223,37 @@ impl MemoryService {
              Rules: only specific named entities, max 10, deduplicate.\n\nText:\n{}\n\nJSON array:",
             memoria_core::truncate_utf8(content, 2000)
         );
-        let msgs = vec![ChatMessage { role: "user".into(), content: prompt }];
+        let msgs = vec![ChatMessage {
+            role: "user".into(),
+            content: prompt,
+        }];
         let raw = match llm.chat(&msgs, 0.0, Some(300)).await {
             Ok(r) => r,
-            Err(e) => { warn!(error = %e, "entity worker LLM extraction failed"); return; }
+            Err(e) => {
+                warn!(error = %e, "entity worker LLM extraction failed");
+                return;
+            }
         };
         let start = raw.find('[').unwrap_or(raw.len());
         let end = raw.rfind(']').map(|i| i + 1).unwrap_or(raw.len());
-        if start >= end { return; }
+        if start >= end {
+            return;
+        }
         let items: Vec<serde_json::Value> = match serde_json::from_str(&raw[start..end]) {
             Ok(v) => v,
             Err(_) => return,
         };
         for item in &items {
             let name = item["name"].as_str().unwrap_or("").trim().to_lowercase();
-            if name.is_empty() { continue; }
+            if name.is_empty() {
+                continue;
+            }
             let display = item["name"].as_str().unwrap_or("").trim().to_string();
             let etype = item["type"].as_str().unwrap_or("concept").to_string();
             if let Ok((eid, _)) = graph.upsert_entity(user_id, &name, &display, &etype).await {
-                let _ = graph.upsert_memory_entity_link(memory_id, &eid, user_id, "llm").await;
+                let _ = graph
+                    .upsert_memory_entity_link(memory_id, &eid, user_id, "llm")
+                    .await;
             }
         }
     }

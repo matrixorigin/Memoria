@@ -428,11 +428,13 @@ pub fn verify_manifest_signature(
         )));
     };
 
-    let public_key_bytes = BASE64_STANDARD
-        .decode(public_key)
-        .map_err(|err| MemoriaError::Blocked(format!("Invalid signer public key encoding: {err}")))?;
+    let public_key_bytes = BASE64_STANDARD.decode(public_key).map_err(|err| {
+        MemoriaError::Blocked(format!("Invalid signer public key encoding: {err}"))
+    })?;
     let public_key_bytes: [u8; 32] = public_key_bytes.try_into().map_err(|_| {
-        MemoriaError::Blocked("Signer public key must be a base64-encoded 32-byte Ed25519 key".into())
+        MemoriaError::Blocked(
+            "Signer public key must be a base64-encoded 32-byte Ed25519 key".into(),
+        )
     })?;
     let verifying_key = VerifyingKey::from_bytes(&public_key_bytes)
         .map_err(|err| MemoriaError::Blocked(format!("Invalid Ed25519 public key: {err}")))?;
@@ -445,7 +447,9 @@ pub fn verify_manifest_signature(
 
     verifying_key
         .verify(manifest.integrity.sha256.as_bytes(), &signature)
-        .map_err(|err| MemoriaError::Blocked(format!("Plugin signature verification failed: {err}")))
+        .map_err(|err| {
+            MemoriaError::Blocked(format!("Plugin signature verification failed: {err}"))
+        })
 }
 
 pub fn compute_package_sha256(root_dir: &Path) -> Result<String, MemoriaError> {
@@ -711,7 +715,11 @@ mod tests {
 
         let signing_key = SigningKey::from_bytes(&[7u8; 32]);
         let public_key = BASE64_STANDARD.encode(signing_key.verifying_key().to_bytes());
-        let signature = BASE64_STANDARD.encode(signing_key.sign(manifest.integrity.sha256.as_bytes()).to_bytes());
+        let signature = BASE64_STANDARD.encode(
+            signing_key
+                .sign(manifest.integrity.sha256.as_bytes())
+                .to_bytes(),
+        );
         manifest.integrity.signer = "trusted-signer".into();
         manifest.integrity.signature = signature;
         fs::write(
@@ -727,7 +735,8 @@ mod tests {
             .signer_public_keys
             .insert("trusted-signer".into(), public_key);
 
-        let package = load_plugin_package(&dir, &policy).expect("trusted signed package should load");
+        let package =
+            load_plugin_package(&dir, &policy).expect("trusted signed package should load");
         assert_eq!(package.plugin_key, "governance:signed-test:v1");
 
         let _ = fs::remove_dir_all(dir);

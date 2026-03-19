@@ -12,4 +12,4 @@ pub use consolidation::{ConsolidationResult, GraphConsolidator};
 pub use ner::extract_entities;
 pub use retriever::ActivationRetriever;
 pub use store::GraphStore;
-pub use types::{GraphEdge, GraphNode, NodeType, edge_type};
+pub use types::{edge_type, GraphEdge, GraphNode, NodeType};

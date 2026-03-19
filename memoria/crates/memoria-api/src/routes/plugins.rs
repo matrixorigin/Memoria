@@ -141,7 +141,9 @@ pub async fn list_signers(
     _user: AuthUser,
 ) -> Result<Json<SignerResponse>, (StatusCode, String)> {
     let store = get_store(&state)?;
-    let signers = plugin::list_trusted_plugin_signers(store).await.map_err(api_err)?;
+    let signers = plugin::list_trusted_plugin_signers(store)
+        .await
+        .map_err(api_err)?;
     Ok(Json(SignerResponse { signers }))
 }
 
@@ -163,15 +165,24 @@ pub async fn publish_package(
     Json(req): Json<PublishRequest>,
 ) -> Result<Json<plugin::PluginRepositoryEntry>, (StatusCode, String)> {
     if !req.files.contains_key("manifest.json") {
-        return Err((StatusCode::BAD_REQUEST, "files must include manifest.json".into()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "files must include manifest.json".into(),
+        ));
     }
-    let dir = tempfile::tempdir().map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let dir =
+        tempfile::tempdir().map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     for (name, b64) in &req.files {
         // Reject path traversal
         if name.contains("..") || name.starts_with('/') {
             return Err((StatusCode::BAD_REQUEST, format!("invalid filename: {name}")));
         }
-        let bytes = BASE64.decode(b64).map_err(|e| (StatusCode::BAD_REQUEST, format!("base64 decode {name}: {e}")))?;
+        let bytes = BASE64.decode(b64).map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("base64 decode {name}: {e}"),
+            )
+        })?;
         std::fs::write(dir.path().join(name), bytes)
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     }

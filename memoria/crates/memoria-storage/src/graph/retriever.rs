@@ -184,8 +184,7 @@ impl<'a> ActivationRetriever<'a> {
             // Temporal recency decay
             if let Some(created) = node.created_at {
                 let now = chrono::Utc::now().naive_utc();
-                let age_hours =
-                    (now - created).num_seconds().max(0) as f64 / 3600.0;
+                let age_hours = (now - created).num_seconds().max(0) as f64 / 3600.0;
                 score *= (-age_hours / TEMPORAL_DECAY_HOURS).exp() as f32;
             }
 
@@ -233,11 +232,7 @@ impl<'a> ActivationRetriever<'a> {
             if ent.entity_type == "time" || ent.entity_type == "person" {
                 continue;
             }
-            if let Ok(Some(entity_id)) = self
-                .store
-                .find_entity_by_name(user_id, &ent.name)
-                .await
-            {
+            if let Ok(Some(entity_id)) = self.store.find_entity_by_name(user_id, &ent.name).await {
                 entity_anchors.entry(entity_id.clone()).or_insert(1.0);
                 if let Ok(mems) = self
                     .store

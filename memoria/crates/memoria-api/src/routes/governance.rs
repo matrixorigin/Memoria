@@ -10,25 +10,56 @@ pub async fn governance(
     AuthUser(user_id): AuthUser,
     Json(req): Json<GovernanceRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let sql = state.service.sql_store.as_ref()
-        .ok_or_else(|| (StatusCode::SERVICE_UNAVAILABLE, "SQL store required".to_string()))?;
+    let sql = state.service.sql_store.as_ref().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "SQL store required".to_string(),
+        )
+    })?;
 
     const COOLDOWN_SECS: i64 = 3600;
     if !req.force {
-        if let Some(remaining) = sql.check_cooldown(&user_id, "governance", COOLDOWN_SECS).await.map_err(api_err)? {
-            return Ok(Json(json!({ "skipped": true, "cooldown_remaining_s": remaining })));
+        if let Some(remaining) = sql
+            .check_cooldown(&user_id, "governance", COOLDOWN_SECS)
+            .await
+            .map_err(api_err)?
+        {
+            return Ok(Json(
+                json!({ "skipped": true, "cooldown_remaining_s": remaining }),
+            ));
         }
     }
-    let quarantined = sql.quarantine_low_confidence(&user_id).await.map_err(api_err)?;
+    let quarantined = sql
+        .quarantine_low_confidence(&user_id)
+        .await
+        .map_err(api_err)?;
     let cleaned = sql.cleanup_stale(&user_id).await.map_err(api_err)?;
     if quarantined > 0 {
-        sql.log_edit(&user_id, "governance:quarantine", &[], &format!("quarantined {quarantined}"), None).await;
+        sql.log_edit(
+            &user_id,
+            "governance:quarantine",
+            &[],
+            &format!("quarantined {quarantined}"),
+            None,
+        )
+        .await;
     }
     if cleaned > 0 {
-        sql.log_edit(&user_id, "governance:cleanup_stale", &[], &format!("cleaned {cleaned}"), None).await;
+        sql.log_edit(
+            &user_id,
+            "governance:cleanup_stale",
+            &[],
+            &format!("cleaned {cleaned}"),
+            None,
+        )
+        .await;
     }
-    sql.set_cooldown(&user_id, "governance").await.map_err(api_err)?;
-    Ok(Json(json!({ "quarantined": quarantined, "cleaned_stale": cleaned })))
+    sql.set_cooldown(&user_id, "governance")
+        .await
+        .map_err(api_err)?;
+    Ok(Json(
+        json!({ "quarantined": quarantined, "cleaned_stale": cleaned }),
+    ))
 }
 
 pub async fn consolidate(
@@ -36,13 +67,23 @@ pub async fn consolidate(
     AuthUser(user_id): AuthUser,
     Json(req): Json<GovernanceRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let sql = state.service.sql_store.as_ref()
-        .ok_or_else(|| (StatusCode::SERVICE_UNAVAILABLE, "SQL store required".to_string()))?;
+    let sql = state.service.sql_store.as_ref().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "SQL store required".to_string(),
+        )
+    })?;
 
     const COOLDOWN_SECS: i64 = 1800;
     if !req.force {
-        if let Some(remaining) = sql.check_cooldown(&user_id, "consolidate", COOLDOWN_SECS).await.map_err(api_err)? {
-            return Ok(Json(json!({ "skipped": true, "cooldown_remaining_s": remaining })));
+        if let Some(remaining) = sql
+            .check_cooldown(&user_id, "consolidate", COOLDOWN_SECS)
+            .await
+            .map_err(api_err)?
+        {
+            return Ok(Json(
+                json!({ "skipped": true, "cooldown_remaining_s": remaining }),
+            ));
         }
     }
     let graph = sql.graph_store();
@@ -50,7 +91,9 @@ pub async fn consolidate(
         .consolidate(&graph, &ConsolidationInput::for_user(user_id.clone()))
         .await
         .map_err(api_err)?;
-    sql.set_cooldown(&user_id, "consolidate").await.map_err(api_err)?;
+    sql.set_cooldown(&user_id, "consolidate")
+        .await
+        .map_err(api_err)?;
     Ok(Json(json!({
         "status": result.status.as_str(),
         "conflicts_detected": result.metrics.get("consolidation.conflicts_detected").copied().unwrap_or(0.0) as i64,
@@ -67,23 +110,37 @@ pub async fn reflect(
     AuthUser(user_id): AuthUser,
     Json(req): Json<ReflectRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let sql = state.service.sql_store.as_ref()
-        .ok_or_else(|| (StatusCode::SERVICE_UNAVAILABLE, "SQL store required".to_string()))?;
+    let sql = state.service.sql_store.as_ref().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "SQL store required".to_string(),
+        )
+    })?;
 
     if req.mode == "internal" && state.service.llm.is_none() {
-        return Err((StatusCode::SERVICE_UNAVAILABLE, "LLM_API_KEY not configured".to_string()));
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "LLM_API_KEY not configured".to_string(),
+        ));
     }
 
     const COOLDOWN_SECS: i64 = 7200;
     if req.mode != "candidates" && !req.force {
-        if let Some(remaining) = sql.check_cooldown(&user_id, "reflect", COOLDOWN_SECS).await.map_err(api_err)? {
-            return Ok(Json(json!({ "skipped": true, "cooldown_remaining_s": remaining })));
+        if let Some(remaining) = sql
+            .check_cooldown(&user_id, "reflect", COOLDOWN_SECS)
+            .await
+            .map_err(api_err)?
+        {
+            return Ok(Json(
+                json!({ "skipped": true, "cooldown_remaining_s": remaining }),
+            ));
         }
     }
 
     let graph = sql.graph_store();
     let clusters = memoria_mcp::tools::build_reflect_clusters(&graph, &user_id)
-        .await.map_err(api_err)?;
+        .await
+        .map_err(api_err)?;
 
     if clusters.is_empty() {
         return Ok(Json(json!({ "candidates": [], "scenes_created": 0 })));
@@ -104,30 +161,64 @@ pub async fn reflect(
     let llm = state.service.llm.as_ref().unwrap();
     let mut scenes_created = 0usize;
     for (_, _, mems) in &clusters {
-        let experiences = mems.iter().map(|(_, c, _)| format!("- {c}")).collect::<Vec<_>>().join("\n");
+        let experiences = mems
+            .iter()
+            .map(|(_, c, _)| format!("- {c}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         let prompt = memoria_mcp::tools::reflection_prompt(&experiences, "");
-        let msgs = vec![memoria_embedding::ChatMessage { role: "user".to_string(), content: prompt }];
+        let msgs = vec![memoria_embedding::ChatMessage {
+            role: "user".to_string(),
+            content: prompt,
+        }];
         let raw = match llm.chat(&msgs, 0.3, Some(400)).await {
-            Ok(r) => r, Err(e) => { warn!("reflect LLM chat failed: {e}"); continue },
+            Ok(r) => r,
+            Err(e) => {
+                warn!("reflect LLM chat failed: {e}");
+                continue;
+            }
         };
         let start = raw.find('[').unwrap_or(raw.len());
         let end = raw.rfind(']').map(|i| i + 1).unwrap_or(raw.len());
-        if start >= end { continue; }
+        if start >= end {
+            continue;
+        }
         let items: Vec<serde_json::Value> = match serde_json::from_str(&raw[start..end]) {
-            Ok(v) => v, Err(e) => { warn!("reflect LLM response parse failed: {e}"); continue },
+            Ok(v) => v,
+            Err(e) => {
+                warn!("reflect LLM response parse failed: {e}");
+                continue;
+            }
         };
         for item in &items {
             let content = item["content"].as_str().unwrap_or("").trim().to_string();
-            if content.is_empty() { continue; }
+            if content.is_empty() {
+                continue;
+            }
             let mt_str = item["type"].as_str().unwrap_or("semantic");
-            let mt = memoria_core::MemoryType::from_str(mt_str).unwrap_or(memoria_core::MemoryType::Semantic);
-            let _ = state.service.store_memory(&user_id, &content, mt, None,
-                Some(memoria_core::TrustTier::T4Unverified), None, None).await;
+            let mt = memoria_core::MemoryType::from_str(mt_str)
+                .unwrap_or(memoria_core::MemoryType::Semantic);
+            let _ = state
+                .service
+                .store_memory(
+                    &user_id,
+                    &content,
+                    mt,
+                    None,
+                    Some(memoria_core::TrustTier::T4Unverified),
+                    None,
+                    None,
+                )
+                .await;
             scenes_created += 1;
         }
     }
-    sql.set_cooldown(&user_id, "reflect").await.map_err(api_err)?;
-    Ok(Json(json!({ "scenes_created": scenes_created, "candidates_found": clusters.len() })))
+    sql.set_cooldown(&user_id, "reflect")
+        .await
+        .map_err(api_err)?;
+    Ok(Json(
+        json!({ "scenes_created": scenes_created, "candidates_found": clusters.len() }),
+    ))
 }
 
 pub async fn extract_entities(
@@ -135,15 +226,25 @@ pub async fn extract_entities(
     AuthUser(user_id): AuthUser,
     Json(req): Json<ExtractEntitiesRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let sql = state.service.sql_store.as_ref()
-        .ok_or_else(|| (StatusCode::SERVICE_UNAVAILABLE, "SQL store required".to_string()))?;
+    let sql = state.service.sql_store.as_ref().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "SQL store required".to_string(),
+        )
+    })?;
 
     if req.mode == "internal" && state.service.llm.is_none() {
-        return Err((StatusCode::SERVICE_UNAVAILABLE, "LLM_API_KEY not configured".to_string()));
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "LLM_API_KEY not configured".to_string(),
+        ));
     }
 
     let graph = sql.graph_store();
-    let unlinked = graph.get_unlinked_memories(&user_id, 50).await.map_err(api_err)?;
+    let unlinked = graph
+        .get_unlinked_memories(&user_id, 50)
+        .await
+        .map_err(api_err)?;
     if unlinked.is_empty() {
         return Ok(Json(json!({ "status": "complete", "unlinked": 0 })));
     }
@@ -162,24 +263,51 @@ pub async fn extract_entities(
     let mut total_created = 0usize;
     for (memory_id, content) in &unlinked {
         let prompt = memoria_mcp::tools::entity_extract_prompt(content);
-        let msgs = vec![memoria_embedding::ChatMessage { role: "user".to_string(), content: prompt }];
-        let raw = match llm.chat(&msgs, 0.0, Some(300)).await { Ok(r) => r, Err(e) => { warn!("entity extract LLM failed: {e}"); continue } };
+        let msgs = vec![memoria_embedding::ChatMessage {
+            role: "user".to_string(),
+            content: prompt,
+        }];
+        let raw = match llm.chat(&msgs, 0.0, Some(300)).await {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("entity extract LLM failed: {e}");
+                continue;
+            }
+        };
         let start = raw.find('[').unwrap_or(raw.len());
         let end = raw.rfind(']').map(|i| i + 1).unwrap_or(raw.len());
-        if start >= end { continue; }
-        let items: Vec<serde_json::Value> = match serde_json::from_str(&raw[start..end]) { Ok(v) => v, Err(e) => { warn!("entity extract parse failed: {e}"); continue } };
+        if start >= end {
+            continue;
+        }
+        let items: Vec<serde_json::Value> = match serde_json::from_str(&raw[start..end]) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!("entity extract parse failed: {e}");
+                continue;
+            }
+        };
         for item in &items {
             let name = item["name"].as_str().unwrap_or("").trim().to_lowercase();
-            if name.is_empty() { continue; }
+            if name.is_empty() {
+                continue;
+            }
             let display = item["name"].as_str().unwrap_or("").trim().to_string();
             let etype = item["type"].as_str().unwrap_or("concept").to_string();
-            if let Ok((entity_id, is_new)) = graph.upsert_entity(&user_id, &name, &display, &etype).await {
-                let _ = graph.upsert_memory_entity_link(memory_id, &entity_id, &user_id, "llm").await;
-                if is_new { total_created += 1; }
+            if let Ok((entity_id, is_new)) =
+                graph.upsert_entity(&user_id, &name, &display, &etype).await
+            {
+                let _ = graph
+                    .upsert_memory_entity_link(memory_id, &entity_id, &user_id, "llm")
+                    .await;
+                if is_new {
+                    total_created += 1;
+                }
             }
         }
     }
-    Ok(Json(json!({ "status": "done", "total_memories": unlinked.len(), "entities_found": total_created })))
+    Ok(Json(
+        json!({ "status": "done", "total_memories": unlinked.len(), "entities_found": total_created }),
+    ))
 }
 
 pub async fn link_entities(
@@ -187,31 +315,51 @@ pub async fn link_entities(
     AuthUser(user_id): AuthUser,
     Json(req): Json<LinkEntitiesRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let sql = state.service.sql_store.as_ref()
-        .ok_or_else(|| (StatusCode::SERVICE_UNAVAILABLE, "SQL store required".to_string()))?;
+    let sql = state.service.sql_store.as_ref().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "SQL store required".to_string(),
+        )
+    })?;
     let graph = sql.graph_store();
     let mut created = 0usize;
     let mut reused = 0usize;
     for link in &req.entities {
         for ent in &link.entities {
             let name = ent.name.trim().to_lowercase();
-            if name.is_empty() { continue; }
-            let (entity_id, is_new) = graph.upsert_entity(&user_id, &name, &ent.name, &ent.entity_type)
-                .await.map_err(api_err)?;
-            graph.upsert_memory_entity_link(&link.memory_id, &entity_id, &user_id, "manual")
-                .await.map_err(api_err)?;
-            if is_new { created += 1; } else { reused += 1; }
+            if name.is_empty() {
+                continue;
+            }
+            let (entity_id, is_new) = graph
+                .upsert_entity(&user_id, &name, &ent.name, &ent.entity_type)
+                .await
+                .map_err(api_err)?;
+            graph
+                .upsert_memory_entity_link(&link.memory_id, &entity_id, &user_id, "manual")
+                .await
+                .map_err(api_err)?;
+            if is_new {
+                created += 1;
+            } else {
+                reused += 1;
+            }
         }
     }
-    Ok(Json(json!({ "entities_created": created, "entities_reused": reused, "edges_created": created })))
+    Ok(Json(
+        json!({ "entities_created": created, "entities_reused": reused, "edges_created": created }),
+    ))
 }
 
 pub async fn get_entities(
     State(state): State<AppState>,
     AuthUser(user_id): AuthUser,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let sql = state.service.sql_store.as_ref()
-        .ok_or_else(|| (StatusCode::SERVICE_UNAVAILABLE, "SQL store required".to_string()))?;
+    let sql = state.service.sql_store.as_ref().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "SQL store required".to_string(),
+        )
+    })?;
     let graph = sql.graph_store();
     let entities = graph.get_user_entities(&user_id).await.map_err(api_err)?;
     Ok(Json(json!({
