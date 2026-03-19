@@ -1,3 +1,9 @@
+---
+description:
+globs:
+alwaysApply: true
+---
+
 <!-- memoria-version: 0.1.0-->
 
 # Memory Integration (Memoria Lite)
@@ -152,16 +158,3 @@ Git-like workflow for memory. `memory_branch(name)` creates, `memory_checkout(na
 - `auto` (default): uses Memoria's internal LLM if configured, otherwise returns candidates for YOU to process
 - `candidates`: always returns raw data for YOU to synthesize/extract, then store results via `memory_store` or `memory_link_entities`
 - `internal`: always uses Memoria's internal LLM (fails if not configured)
-
-## Session Lifecycle
-
-### Mid-Session
-- Store facts as they emerge (don't batch at end). One fact per `memory_store` call.
-- Re-retrieve when user shifts topic or references past decisions not in current context.
-- Store temporary context as `working` type; promote to `semantic` when confirmed, purge when disproven.
-
-### Conversation End (Wrap-Up)
-- Clean up completed task working memories: `memory_purge(topic="<task keyword>", reason="session complete")`
-- Promote any durable findings still in `working` to `semantic`
-- Generate episodic summary if session was substantive: `memory_store(content="Session Summary: [topic]\n\nActions: [what was done]\n\nOutcome: [result]", memory_type="episodic")`
-- Update tracked goal status via `memory_correct`
