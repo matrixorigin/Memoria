@@ -445,12 +445,12 @@
   <text x="72" y="188" class="subtitle">Watch Memoria's Git-for-Data model handle branching, merging, and rollback — in a story-writing workflow.</text>
 
   <g>
-    <rect x="1014" y="128" width="88" height="28" rx="14" class="capPill capPillBranchRect"/>
-    <text x="1058" y="146" text-anchor="middle" class="capPillText capPillBranchText">Branch</text>
-    <rect x="1114" y="128" width="86" height="28" rx="14" class="capPill capPillMergeRect"/>
-    <text x="1157" y="146" text-anchor="middle" class="capPillText capPillMergeText">Merge</text>
-    <rect x="1212" y="128" width="102" height="28" rx="14" class="capPill capPillRollbackRect"/>
-    <text x="1263" y="146" text-anchor="middle" class="capPillText capPillRollbackText">Rollback</text>
+    <rect x="72" y="772" width="88" height="28" rx="14" class="capPill capPillBranchRect"/>
+    <text x="116" y="790" text-anchor="middle" class="capPillText capPillBranchText">Branch</text>
+    <rect x="172" y="772" width="86" height="28" rx="14" class="capPill capPillMergeRect"/>
+    <text x="215" y="790" text-anchor="middle" class="capPillText capPillMergeText">Merge</text>
+    <rect x="270" y="772" width="102" height="28" rx="14" class="capPill capPillRollbackRect"/>
+    <text x="321" y="790" text-anchor="middle" class="capPillText capPillRollbackText">Rollback</text>
   </g>
 
   <rect x="60" y="216" width="1280" height="534" rx="30" class="panel"/>
