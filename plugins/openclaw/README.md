@@ -32,6 +32,11 @@ Cloud is the default path for new users.
 #### Developer Flow
 
 ```bash
+# A0. Optional cleanup (if you installed an older/source-linked memory-memoria before)
+openclaw plugins uninstall memory-memoria
+```
+
+```bash
 # A1. Install plugin from npm
 openclaw plugins install @matrixorigin/memory-memoria
 openclaw plugins enable memory-memoria
@@ -39,8 +44,13 @@ openclaw plugins enable memory-memoria
 
 ```bash
 # A2. If npm package is unavailable, use source-link instead
-git clone https://github.com/matrixorigin/Memoria.git
-openclaw plugins install --link ./Memoria/plugins/openclaw
+mkdir -p ~/.openclaw/plugins-src
+if [ ! -d ~/.openclaw/plugins-src/Memoria/.git ]; then
+  git clone https://github.com/matrixorigin/Memoria.git ~/.openclaw/plugins-src/Memoria
+else
+  git -C ~/.openclaw/plugins-src/Memoria pull --ff-only
+fi
+openclaw plugins install --link ~/.openclaw/plugins-src/Memoria/plugins/openclaw
 openclaw plugins enable memory-memoria
 ```
 
@@ -71,8 +81,9 @@ Execute exactly:
 1) Try npm install first:
    openclaw plugins install @matrixorigin/memory-memoria
 2) If step 1 fails, fallback:
-   git clone https://github.com/matrixorigin/Memoria.git
-   openclaw plugins install --link ./Memoria/plugins/openclaw
+   mkdir -p ~/.openclaw/plugins-src
+   if [ ! -d ~/.openclaw/plugins-src/Memoria/.git ]; then git clone https://github.com/matrixorigin/Memoria.git ~/.openclaw/plugins-src/Memoria; else git -C ~/.openclaw/plugins-src/Memoria pull --ff-only; fi
+   openclaw plugins install --link ~/.openclaw/plugins-src/Memoria/plugins/openclaw
 3) Enable plugin:
    openclaw plugins enable memory-memoria
 4) Connect cloud:
@@ -94,7 +105,7 @@ Use local mode when you explicitly want self-hosted storage/runtime.
 
 ```bash
 # A. Install memoria CLI (if missing)
-curl -sSL https://raw.githubusercontent.com/matrixorigin/Memoria/main/scripts/install.sh | sh -s -- -y -d ~/.local/bin
+curl -sSL https://raw.githubusercontent.com/matrixorigin/Memoria/main/scripts/install.sh | bash -s -- -y -d ~/.local/bin
 
 # B1. Install + enable plugin from npm
 openclaw plugins install @matrixorigin/memory-memoria
@@ -103,8 +114,13 @@ openclaw plugins enable memory-memoria
 
 ```bash
 # B2. If npm package is unavailable, use source-link instead
-git clone https://github.com/matrixorigin/Memoria.git
-openclaw plugins install --link ./Memoria/plugins/openclaw
+mkdir -p ~/.openclaw/plugins-src
+if [ ! -d ~/.openclaw/plugins-src/Memoria/.git ]; then
+  git clone https://github.com/matrixorigin/Memoria.git ~/.openclaw/plugins-src/Memoria
+else
+  git -C ~/.openclaw/plugins-src/Memoria pull --ff-only
+fi
+openclaw plugins install --link ~/.openclaw/plugins-src/Memoria/plugins/openclaw
 openclaw plugins enable memory-memoria
 ```
 
@@ -140,12 +156,13 @@ Use:
 
 Execute exactly:
 1) Ensure memoria CLI exists (install if missing):
-   curl -sSL https://raw.githubusercontent.com/matrixorigin/Memoria/main/scripts/install.sh | sh -s -- -y -d ~/.local/bin
+   curl -sSL https://raw.githubusercontent.com/matrixorigin/Memoria/main/scripts/install.sh | bash -s -- -y -d ~/.local/bin
 2) Try npm install first:
    openclaw plugins install @matrixorigin/memory-memoria
 3) If step 2 fails, fallback:
-   git clone https://github.com/matrixorigin/Memoria.git
-   openclaw plugins install --link ./Memoria/plugins/openclaw
+   mkdir -p ~/.openclaw/plugins-src
+   if [ ! -d ~/.openclaw/plugins-src/Memoria/.git ]; then git clone https://github.com/matrixorigin/Memoria.git ~/.openclaw/plugins-src/Memoria; else git -C ~/.openclaw/plugins-src/Memoria pull --ff-only; fi
+   openclaw plugins install --link ~/.openclaw/plugins-src/Memoria/plugins/openclaw
 4) Enable plugin:
    openclaw plugins enable memory-memoria
 5) Connect local:
@@ -279,6 +296,14 @@ Notes:
 - `openclaw memoria connect` is the preferred config entrypoint for cloud/local mode switching
 - `openclaw memoria install` is optional local bootstrap/repair (runtime + config rewrite)
 - `openclaw memoria verify` is an optional deeper diagnostic; `openclaw memoria health` is the primary quick connectivity check
+
+If `openclaw memoria connect` is missing:
+
+```bash
+openclaw plugins update memory-memoria
+openclaw plugins enable memory-memoria
+openclaw memoria --help
+```
 
 Low-level fallback:
 

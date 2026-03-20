@@ -178,8 +178,9 @@ openclaw plugins install @matrixorigin/memory-memoria
 openclaw plugins enable memory-memoria
 
 # if npm package is unavailable, fallback to source-link
-git clone https://github.com/matrixorigin/Memoria.git
-openclaw plugins install --link ./Memoria/plugins/openclaw
+mkdir -p ~/.openclaw/plugins-src
+if [ ! -d ~/.openclaw/plugins-src/Memoria/.git ]; then git clone https://github.com/matrixorigin/Memoria.git ~/.openclaw/plugins-src/Memoria; else git -C ~/.openclaw/plugins-src/Memoria pull --ff-only; fi
+openclaw plugins install --link ~/.openclaw/plugins-src/Memoria/plugins/openclaw
 openclaw plugins enable memory-memoria
 
 # cloud-first connect flow
