@@ -107,6 +107,12 @@ pub trait GovernanceStore: Send + Sync {
     /// Remove orphaned stats records (stats without corresponding memory).
     async fn cleanup_orphan_stats(&self) -> Result<i64, MemoriaError>;
 
+    /// Delete old audit-log rows, keeping only the last `retain_days` days.
+    async fn cleanup_edit_log(&self, retain_days: i64) -> Result<i64, MemoriaError>;
+
+    /// Delete old feedback rows, keeping only the last `retain_days` days.
+    async fn cleanup_feedback(&self, retain_days: i64) -> Result<i64, MemoriaError>;
+
     /// Create a rollback snapshot before destructive governance work begins.
     async fn create_safety_snapshot(&self, operation: &str) -> (Option<String>, Option<String>);
 
@@ -240,6 +246,14 @@ impl GovernanceStore for SqlMemoryStore {
         SqlMemoryStore::cleanup_orphan_stats(self).await
     }
 
+    async fn cleanup_edit_log(&self, retain_days: i64) -> Result<i64, MemoriaError> {
+        SqlMemoryStore::cleanup_edit_log(self, retain_days).await
+    }
+
+    async fn cleanup_feedback(&self, retain_days: i64) -> Result<i64, MemoriaError> {
+        SqlMemoryStore::cleanup_feedback(self, retain_days).await
+    }
+
     async fn create_safety_snapshot(&self, operation: &str) -> (Option<String>, Option<String>) {
         SqlMemoryStore::create_safety_snapshot(self, operation).await
     }
@@ -351,6 +365,8 @@ impl DefaultGovernanceStrategy {
     const REDUNDANCY_MAX_PAIRS: usize = 10_000;
     const ORPHANED_INCREMENTALS_HOURS: i64 = 24;
     const SNAPSHOTS_TO_KEEP: usize = 5;
+    const EDIT_LOG_RETAIN_DAYS: i64 = 90;
+    const FEEDBACK_RETAIN_DAYS: i64 = 180;
     const VECTOR_INDEX_TABLE: &'static str = "mem_memories";
 
     async fn cleanup_tool_results_operation(
@@ -870,6 +886,58 @@ impl DefaultGovernanceStrategy {
         }
     }
 
+    async fn cleanup_edit_log_operation(
+        &self,
+        store: &dyn GovernanceStore,
+        state: &mut ExecutionState,
+    ) {
+        match store.cleanup_edit_log(Self::EDIT_LOG_RETAIN_DAYS).await {
+            Ok(deleted) => {
+                state.decisions.push(governance_decision(
+                    GovernanceTask::Weekly,
+                    "cleanup_edit_log",
+                    format!("Deleted {deleted} audit-log rows older than {} days", Self::EDIT_LOG_RETAIN_DAYS),
+                    Some(if deleted > 0 { 1.0 } else { 0.0 }),
+                    vec![],
+                    state.snapshot_before.as_deref(),
+                ));
+            }
+            Err(err) => record_warning(
+                GovernanceTask::Weekly,
+                None,
+                "cleanup_edit_log",
+                &err,
+                &mut state.warnings,
+            ),
+        }
+    }
+
+    async fn cleanup_feedback_operation(
+        &self,
+        store: &dyn GovernanceStore,
+        state: &mut ExecutionState,
+    ) {
+        match store.cleanup_feedback(Self::FEEDBACK_RETAIN_DAYS).await {
+            Ok(deleted) => {
+                state.decisions.push(governance_decision(
+                    GovernanceTask::Weekly,
+                    "cleanup_feedback",
+                    format!("Deleted {deleted} feedback rows older than {} days", Self::FEEDBACK_RETAIN_DAYS),
+                    Some(if deleted > 0 { 1.0 } else { 0.0 }),
+                    vec![],
+                    state.snapshot_before.as_deref(),
+                ));
+            }
+            Err(err) => record_warning(
+                GovernanceTask::Weekly,
+                None,
+                "cleanup_feedback",
+                &err,
+                &mut state.warnings,
+            ),
+        }
+    }
+
     async fn tune_retrieval_params_operation(
         &self,
         users: &[String],
@@ -947,6 +1015,8 @@ impl DefaultGovernanceStrategy {
             .await;
         self.cleanup_orphan_stats_operation(plan, store, state)
             .await;
+        self.cleanup_edit_log_operation(store, state).await;
+        self.cleanup_feedback_operation(store, state).await;
     }
 }
 
@@ -1372,6 +1442,9 @@ mod tests {
             Ok(0)
         }
 
+        async fn cleanup_edit_log(&self, _: i64) -> Result<i64, MemoriaError> { Ok(0) }
+        async fn cleanup_feedback(&self, _: i64) -> Result<i64, MemoriaError> { Ok(0) }
+
         async fn create_safety_snapshot(
             &self,
             operation: &str,
@@ -1640,6 +1713,8 @@ mod tests {
             async fn cleanup_snapshots(&self, _: usize) -> Result<i64, MemoriaError> { Ok(0) }
             async fn cleanup_orphan_branches(&self) -> Result<i64, MemoriaError> { Ok(0) }
             async fn cleanup_orphan_stats(&self) -> Result<i64, MemoriaError> { Ok(0) }
+            async fn cleanup_edit_log(&self, _: i64) -> Result<i64, MemoriaError> { Ok(0) }
+        async fn cleanup_feedback(&self, _: i64) -> Result<i64, MemoriaError> { Ok(0) }
             async fn create_safety_snapshot(&self, _: &str) -> (Option<String>, Option<String>) { (None, None) }
             async fn log_edit(&self, _: &str, _: &str, _: Option<&str>, _: Option<&str>, _: &str, _: Option<&str>) {}
 

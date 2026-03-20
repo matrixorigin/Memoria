@@ -917,11 +917,22 @@ impl MemoryService {
         self.store.insert(&new_mem).await?;
 
         // Deactivate old and link to new via superseded_by
+        // Only update superseded_by — avoid touching content to skip fulltext index rebuild
         self.store.soft_delete(memory_id).await?;
-        let user_id = old.user_id.clone();
-        let mut old_updated = old;
-        old_updated.superseded_by = Some(new_mem.memory_id.clone());
-        self.store.update(&old_updated).await?;
+        if let Some(sql) = &self.sql_store {
+            sqlx::query(
+                "UPDATE mem_memories SET superseded_by = ?, updated_at = NOW() WHERE memory_id = ?"
+            )
+            .bind(&new_mem.memory_id)
+            .bind(memory_id)
+            .execute(sql.pool())
+            .await
+            .map_err(|e| MemoriaError::Database(e.to_string()))?;
+        } else {
+            let mut old_updated = old;
+            old_updated.superseded_by = Some(new_mem.memory_id.clone());
+            self.store.update(&old_updated).await?;
+        }
 
         if let Some(sql) = &self.sql_store {
             let payload = serde_json::json!({

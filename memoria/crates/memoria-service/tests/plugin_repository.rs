@@ -227,6 +227,8 @@ impl GovernanceStore for NoopStore {
     async fn cleanup_orphan_stats(&self) -> Result<i64, MemoriaError> {
         Ok(0)
     }
+    async fn cleanup_edit_log(&self, _: i64) -> Result<i64, MemoriaError> { Ok(0) }
+    async fn cleanup_feedback(&self, _: i64) -> Result<i64, MemoriaError> { Ok(0) }
     async fn create_safety_snapshot(&self, _: &str) -> (Option<String>, Option<String>) {
         (None, None)
     }

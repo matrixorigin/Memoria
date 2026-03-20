@@ -1109,31 +1109,42 @@ impl SqlMemoryStore {
     /// Quarantine memories whose effective confidence has decayed below threshold.
     /// effective_confidence = initial_confidence * EXP(-age_days / half_life)
     pub async fn quarantine_low_confidence(&self, user_id: &str) -> Result<i64, MemoriaError> {
-        // Half-lives per tier (days): T1=365, T2=180, T3=60, T4=30
-        // Quarantine threshold: 0.2
         const THRESHOLD: f64 = 0.2;
+        const BATCH: i64 = 500;
         let tiers: &[(&str, f64)] = &[("T1", 365.0), ("T2", 180.0), ("T3", 60.0), ("T4", 30.0)];
         let mut total = 0i64;
         for (tier, hl) in tiers {
-            let res = sqlx::query(&format!(
-                "UPDATE mem_memories SET is_active = 0, updated_at = NOW() \
-                 WHERE user_id = ? AND is_active = 1 AND trust_tier = ? \
-                   AND (initial_confidence * EXP(-TIMESTAMPDIFF(DAY, observed_at, NOW()) / {hl})) < {THRESHOLD}"
-            ))
-            .bind(user_id).bind(tier)
-            .execute(&self.pool).await.map_err(db_err)?;
-            total += res.rows_affected() as i64;
+            loop {
+                let res = sqlx::query(&format!(
+                    "UPDATE mem_memories SET is_active = 0, updated_at = NOW() \
+                     WHERE user_id = ? AND is_active = 1 AND trust_tier = ? \
+                       AND (initial_confidence * EXP(-TIMESTAMPDIFF(DAY, observed_at, NOW()) / {hl})) < {THRESHOLD} \
+                     LIMIT {BATCH}"
+                ))
+                .bind(user_id).bind(tier)
+                .execute(&self.pool).await.map_err(db_err)?;
+                let n = res.rows_affected() as i64;
+                total += n;
+                if n < BATCH { break; }
+            }
         }
         Ok(total)
     }
 
     /// Delete inactive memories with very low initial_confidence (already superseded/stale).
     pub async fn cleanup_stale(&self, user_id: &str) -> Result<i64, MemoriaError> {
-        let res = sqlx::query(
-            "DELETE FROM mem_memories WHERE user_id = ? AND is_active = 0 AND initial_confidence < 0.1"
-        )
-        .bind(user_id).execute(&self.pool).await.map_err(db_err)?;
-        Ok(res.rows_affected() as i64)
+        const BATCH: u64 = 500;
+        let mut total = 0i64;
+        loop {
+            let res = sqlx::query(
+                "DELETE FROM mem_memories WHERE user_id = ? AND is_active = 0 AND initial_confidence < 0.1 LIMIT 500"
+            )
+            .bind(user_id).execute(&self.pool).await.map_err(db_err)?;
+            let n = res.rows_affected();
+            total += n as i64;
+            if n < BATCH { break; }
+        }
+        Ok(total)
     }
 
     /// Delete expired tool_result memories (TTL = 72h by default).
@@ -1165,9 +1176,11 @@ impl SqlMemoryStore {
         &self,
         stale_hours: i64,
     ) -> Result<Vec<(String, i64)>, MemoriaError> {
-        // Fetch affected user_ids before updating
-        let rows: Vec<(String,)> = sqlx::query_as(
-            "SELECT user_id FROM mem_memories \
+        const BATCH: i64 = 500;
+
+        // Collect affected users first (cheap DISTINCT query)
+        let users: Vec<(String,)> = sqlx::query_as(
+            "SELECT DISTINCT user_id FROM mem_memories \
              WHERE memory_type = 'working' AND is_active = 1 \
                AND TIMESTAMPDIFF(HOUR, observed_at, NOW()) > ?",
         )
@@ -1176,25 +1189,35 @@ impl SqlMemoryStore {
         .await
         .map_err(db_err)?;
 
-        if rows.is_empty() {
+        if users.is_empty() {
             return Ok(vec![]);
         }
 
-        sqlx::query(
-            "UPDATE mem_memories SET is_active = 0, updated_at = NOW() \
-             WHERE memory_type = 'working' AND is_active = 1 \
-               AND TIMESTAMPDIFF(HOUR, observed_at, NOW()) > ?",
-        )
-        .bind(stale_hours)
-        .execute(&self.pool)
-        .await
-        .map_err(db_err)?;
-
-        let mut by_user: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
-        for (uid,) in rows {
-            *by_user.entry(uid).or_insert(0) += 1;
+        // Batched UPDATE per user to avoid global lock
+        let mut result = Vec::with_capacity(users.len());
+        for (uid,) in users {
+            let mut total = 0i64;
+            loop {
+                let res = sqlx::query(
+                    "UPDATE mem_memories SET is_active = 0, updated_at = NOW() \
+                     WHERE user_id = ? AND memory_type = 'working' AND is_active = 1 \
+                       AND TIMESTAMPDIFF(HOUR, observed_at, NOW()) > ? \
+                     LIMIT 500",
+                )
+                .bind(&uid)
+                .bind(stale_hours)
+                .execute(&self.pool)
+                .await
+                .map_err(db_err)?;
+                let n = res.rows_affected() as i64;
+                total += n;
+                if n < BATCH { break; }
+            }
+            if total > 0 {
+                result.push((uid, total));
+            }
         }
-        Ok(by_user.into_iter().collect())
+        Ok(result)
     }
 
     /// Deactivate near-duplicate memories (same user, same type, cosine sim > threshold).
@@ -1298,12 +1321,24 @@ impl SqlMemoryStore {
             return Ok(0);
         }
 
-        for (older, newer) in &to_deactivate {
-            sqlx::query(
-                "UPDATE mem_memories SET is_active = 0, superseded_by = ?, updated_at = NOW() WHERE memory_id = ?"
-            )
-            .bind(newer).bind(older)
-            .execute(&self.pool).await.map_err(db_err)?;
+        // Batch UPDATE with CASE for superseded_by (preserves audit trail for all rows)
+        // Split into chunks of 100 to avoid SQL statement size limits
+        for chunk in to_deactivate.chunks(100) {
+            let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let case_clauses = chunk.iter().map(|_| "WHEN ? THEN ?").collect::<Vec<_>>().join(" ");
+            let sql = format!(
+                "UPDATE mem_memories SET is_active = 0, superseded_by = CASE memory_id {case_clauses} END, updated_at = NOW() WHERE memory_id IN ({placeholders})"
+            );
+            let mut q = sqlx::query(&sql);
+            // Bind CASE values first
+            for (older, newer) in chunk {
+                q = q.bind(older).bind(newer);
+            }
+            // Then bind IN clause values
+            for (older, _) in chunk {
+                q = q.bind(older);
+            }
+            q.execute(&self.pool).await.map_err(db_err)?;
         }
 
         Ok(to_deactivate.len() as i64)
@@ -1502,6 +1537,40 @@ impl SqlMemoryStore {
         .await
         .map_err(db_err)?;
         Ok(result.rows_affected() as i64)
+    }
+
+    /// Delete old audit-log rows older than `retain_days` days, in batches to avoid lock pressure.
+    pub async fn cleanup_edit_log(&self, retain_days: i64) -> Result<i64, MemoriaError> {
+        const BATCH: u64 = 1000;
+        let mut total = 0i64;
+        loop {
+            let res = sqlx::query(
+                "DELETE FROM mem_edit_log WHERE created_at < DATE_SUB(NOW(), INTERVAL ? DAY) LIMIT 1000"
+            )
+            .bind(retain_days)
+            .execute(&self.pool).await.map_err(db_err)?;
+            let n = res.rows_affected();
+            total += n as i64;
+            if n < BATCH { break; }
+        }
+        Ok(total)
+    }
+
+    /// Delete old feedback rows older than `retain_days` days, in batches.
+    pub async fn cleanup_feedback(&self, retain_days: i64) -> Result<i64, MemoriaError> {
+        const BATCH: u64 = 1000;
+        let mut total = 0i64;
+        loop {
+            let res = sqlx::query(
+                "DELETE FROM mem_retrieval_feedback WHERE created_at < DATE_SUB(NOW(), INTERVAL ? DAY) LIMIT 1000"
+            )
+            .bind(retain_days)
+            .execute(&self.pool).await.map_err(db_err)?;
+            let n = res.rows_affected();
+            total += n as i64;
+            if n < BATCH { break; }
+        }
+        Ok(total)
     }
 
     /// Validate table name to prevent SQL injection
@@ -2513,34 +2582,29 @@ impl SqlMemoryStore {
             Some(mt) => format!(" AND memory_type = '{}'", sanitize_sql_literal(mt)),
             None => String::new(),
         };
+        // MatrixOne bug workaround: prepared statement with l2_distance in ORDER BY returns 0 rows
+        // Solution: inline all parameters instead of using bind()
         let sql = format!(
             "SELECT memory_id, user_id, memory_type, content, \
-             embedding AS emb_str, session_id, \
+             session_id, \
              CAST(source_event_ids AS CHAR) AS src_ids, \
              CAST(extra_metadata AS CHAR) AS extra_meta, \
              is_active, superseded_by, trust_tier, initial_confidence, \
-             observed_at, created_at, updated_at, \
-             l2_distance(embedding, '{vec_literal}') AS l2_dist \
+             observed_at, created_at, updated_at \
              FROM {table} \
-             WHERE user_id = ? AND is_active = 1 AND embedding IS NOT NULL{type_clause} \
-             ORDER BY l2_dist ASC \
-             LIMIT ?"
+             WHERE user_id = '{}' AND is_active = 1 AND embedding IS NOT NULL{type_clause} \
+             ORDER BY l2_distance(embedding, '{vec_literal}') ASC \
+             LIMIT {}",
+            sanitize_sql_literal(user_id),
+            limit
         );
+        
         let rows = sqlx::query(&sql)
-            .bind(user_id)
-            .bind(limit)
             .fetch_all(&self.pool)
             .await
             .map_err(db_err)?;
-        rows.iter()
-            .map(|r| {
-                let mut m = row_to_memory(r)?;
-                if let Ok(dist) = r.try_get::<f64, _>("l2_dist") {
-                    m.retrieval_score = Some(1.0 / (1.0 + dist));
-                }
-                Ok(m)
-            })
-            .collect()
+        
+        rows.iter().map(|r| row_to_memory(r)).collect()
     }
 
     /// Hybrid search: vector + fulltext, merged with 4-dimension weighted scoring.
@@ -2909,8 +2973,16 @@ fn row_to_memory(row: &sqlx::mysql::MySqlRow) -> Result<Memory, MemoriaError> {
             .transpose()?
     };
     let embedding: Option<Vec<f32>> = {
-        let s: Option<String> = row.try_get("emb_str").map_err(db_err)?;
-        s.map(|v| mo_to_vec(&v)).transpose()?
+        // Try emb_str first (for compatibility with old queries that use CAST)
+        if let Ok(Some(s)) = row.try_get::<Option<String>, _>("emb_str") {
+            Some(mo_to_vec(&s)?)
+        } else if let Ok(Some(s)) = row.try_get::<Option<String>, _>("embedding") {
+            // Direct embedding column (MatrixOne returns vector as string)
+            Some(mo_to_vec(&s)?)
+        } else {
+            // No embedding column in result set (e.g., vector search queries)
+            None
+        }
     };
     let observed_at = row
         .try_get::<chrono::NaiveDateTime, _>("observed_at")
