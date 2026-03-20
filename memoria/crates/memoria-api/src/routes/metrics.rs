@@ -102,11 +102,11 @@ async fn collect_metrics(state: &AppState) -> Result<Arc<String>, String> {
     }
 
     // ── Entity graph ──────────────────────────────────────────────────────
-    let (nodes,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM mem_graph_nodes")
+    let (nodes,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM memory_graph_nodes WHERE is_active = 1")
         .fetch_one(pool)
         .await
         .unwrap_or((0,));
-    let (edges,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM mem_graph_edges")
+    let (edges,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM memory_graph_edges")
         .fetch_one(pool)
         .await
         .unwrap_or((0,));

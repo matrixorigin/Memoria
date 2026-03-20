@@ -2165,52 +2165,43 @@ impl SqlMemoryStore {
     }
 
     /// Find memory IDs whose content contains `topic` (exact substring match).
-    /// Uses fulltext boolean MUST first, falls back to LIKE.
+    /// Uses fulltext boolean MUST with LIKE refinement. Requires topic >= 3 chars.
     pub async fn find_ids_by_topic(
         &self,
         table: &str,
         user_id: &str,
         topic: &str,
     ) -> Result<Vec<String>, MemoriaError> {
+        // Require minimum length to avoid full table scan
+        if topic.trim().len() < 3 {
+            return Err(MemoriaError::Validation(
+                "topic must be at least 3 characters".into(),
+            ));
+        }
         let ft_safe = sanitize_fulltext_query(topic);
         let like_safe = sanitize_like_pattern(topic);
-        // Try fulltext boolean MUST (+word) first
-        if !ft_safe.is_empty() {
-            let ft_terms: String = ft_safe
-                .split_whitespace()
-                .map(|w| format!("+{w}"))
-                .collect::<Vec<_>>()
-                .join(" ");
-            let sql = format!(
-                "SELECT memory_id FROM {table} \
-                 WHERE user_id = ? AND is_active = 1 \
-                   AND MATCH(content) AGAINST('{ft_terms}' IN BOOLEAN MODE) \
-                   AND content LIKE ?"
-            );
-            let like_pat = format!("%{like_safe}%");
-            let rows: Vec<(String,)> = sqlx::query_as(&sql)
-                .bind(user_id)
-                .bind(&like_pat)
-                .fetch_all(&self.pool)
-                .await
-                .unwrap_or_default();
-            if !rows.is_empty() {
-                return Ok(rows.into_iter().map(|r| r.0).collect());
-            }
+        if ft_safe.is_empty() {
+            return Ok(vec![]);
         }
-        // Fallback: LIKE only (handles short tokens that fulltext ignores)
-        let like_pat = format!("%{like_safe}%");
-        let sql2 = format!(
+        let ft_terms: String = ft_safe
+            .split_whitespace()
+            .map(|w| format!("+{w}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let sql = format!(
             "SELECT memory_id FROM {table} \
-             WHERE user_id = ? AND is_active = 1 AND content LIKE ?"
+             WHERE user_id = ? AND is_active = 1 \
+               AND MATCH(content) AGAINST('{ft_terms}' IN BOOLEAN MODE) \
+               AND content LIKE ?"
         );
-        let rows2: Vec<(String,)> = sqlx::query_as(&sql2)
+        let like_pat = format!("%{like_safe}%");
+        let rows: Vec<(String,)> = sqlx::query_as(&sql)
             .bind(user_id)
             .bind(&like_pat)
             .fetch_all(&self.pool)
             .await
             .map_err(db_err)?;
-        Ok(rows2.into_iter().map(|r| r.0).collect())
+        Ok(rows.into_iter().map(|r| r.0).collect())
     }
 
     #[tracing::instrument(skip(self))]

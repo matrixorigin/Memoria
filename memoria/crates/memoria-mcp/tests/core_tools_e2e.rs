@@ -390,6 +390,17 @@ async fn test_purge_no_target() {
     println!("✅ purge no target: {}", text(&r));
 }
 
+// ── 13b. memory_purge: short topic returns validation error ───────────────────
+
+#[tokio::test]
+async fn test_purge_short_topic() {
+    let (svc, uid) = setup().await;
+    let r = call("memory_purge", json!({"topic": "ab"}), &svc, &uid).await;
+    let t = text(&r);
+    assert!(t.contains("at least 3 characters"), "expected validation error, got: {t}");
+    println!("✅ purge short topic rejected: {t}");
+}
+
 // ── 14. memory_profile: returns profile memories ─────────────────────────────
 
 #[tokio::test]
