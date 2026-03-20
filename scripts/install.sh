@@ -200,14 +200,15 @@ if [ -z "$TARGET" ]; then
 fi
 
 TAG="${VERSION:-latest}"
-ASSET="memoria-${TARGET}.tar.gz"
 if [ "$TAG" = "latest" ]; then
-  GH_URL="https://github.com/${REPO}/releases/latest/download/${ASSET}"
-  GH_SUM_URL="https://github.com/${REPO}/releases/latest/download/SHA256SUMS.txt"
-else
-  GH_URL="https://github.com/${REPO}/releases/download/${TAG}/${ASSET}"
-  GH_SUM_URL="https://github.com/${REPO}/releases/download/${TAG}/SHA256SUMS.txt"
+  RESOLVED_TAG=$(curl -sSf -o /dev/null -w '%{redirect_url}' "https://github.com/${REPO}/releases/latest" 2>/dev/null | grep -oE '[^/]+$')
+  if [ -n "$RESOLVED_TAG" ]; then
+    TAG="$RESOLVED_TAG"
+  fi
 fi
+ASSET="memoria-${TARGET}.tar.gz"
+GH_URL="https://github.com/${REPO}/releases/download/${TAG}/${ASSET}"
+GH_SUM_URL="https://github.com/${REPO}/releases/download/${TAG}/SHA256SUMS.txt"
 GHPROXY="${MEMORIA_GHPROXY:-https://ghfast.top}"
 
 if [ "$DRY_RUN" = true ]; then
@@ -231,10 +232,13 @@ fi
 if command -v memoria >/dev/null 2>&1; then
   INSTALLED_VERSION="$(memoria --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
   if [ -n "$INSTALLED_VERSION" ]; then
-    if [ "$TAG" = "latest" ] || [ "$INSTALLED_VERSION" = "$TAG" ] || [ "$INSTALLED_VERSION" = "${TAG#v}" ]; then
-      ok "memoria v${INSTALLED_VERSION} already installed"
+    TARGET_VERSION="${TAG#v}"
+    if [ "$INSTALLED_VERSION" = "$TARGET_VERSION" ]; then
+      ok "memoria v${INSTALLED_VERSION} already installed (latest)"
       SKIP_DOWNLOAD=true
       INSTALL_DIR="$(dirname "$(command -v memoria)")"
+    else
+      info "memoria v${INSTALLED_VERSION} installed, upgrading to v${TARGET_VERSION}"
     fi
   fi
 fi
