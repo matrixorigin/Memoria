@@ -29,7 +29,7 @@ Every memory change is tracked, auditable, and reversible — snapshots, branche
 - **Self-maintaining** — built-in governance detects contradictions, quarantines low-confidence memories
 - **Private by default** — local embedding model option, no data leaves your machine
 
-**Supported Agents:** [Kiro](https://kiro.dev) · [Cursor](https://cursor.sh) · [Claude Code](https://docs.anthropic.com/en/docs/claude-code) · [OpenClaw](plugins/openclaw/README.md) · Any MCP-compatible agent
+**Supported Agents:** [Kiro](https://kiro.dev) · [Cursor](https://cursor.sh) · [Claude Code](https://docs.anthropic.com/en/docs/claude-code) · [Codex](https://openai.com/index/introducing-codex/) · [OpenClaw](plugins/openclaw/README.md) · Any MCP-compatible agent
 
 **Storage Backend:** [MatrixOne](https://github.com/matrixorigin/matrixone) — Distributed database with native vector indexing
 
@@ -74,7 +74,7 @@ cd your-project
 memoria init -i   # Interactive wizard (recommended)
 ```
 
-This creates MCP config + steering rules for your AI tool (Kiro, Cursor, or Claude).
+This creates MCP config + steering rules for your AI tool (Kiro, Cursor, Claude, or Codex).
 
 ### 🦞 OpenClaw Plugin (Already Using OpenClaw?)
 
@@ -179,6 +179,7 @@ AI:  → memory_branch(name="eval_sqlite")
 - Kiro: `.kiro/steering/*.md`
 - Cursor: `.cursor/rules/*.mdc`
 - Claude: `.claude/rules/*.md`
+- Codex: `AGENTS.md`
 
 ### Update Rules
 
@@ -202,7 +203,6 @@ memoria rules --force
 | `memory_purge` | Delete by ID or topic keyword |
 | `memory_list` | List active memories |
 | `memory_profile` | Get user's memory-derived profile |
-| `memory_observe` | Extract and persist memories from conversation messages |
 | `memory_feedback` | Record relevance feedback (useful/irrelevant/outdated/wrong) |
 | `memory_capabilities` | List available memory tools |
 
@@ -229,7 +229,7 @@ memoria rules --force
 | `memory_consolidate` | Detect contradictions (30min cooldown) |
 | `memory_reflect` | Synthesize insights (2h cooldown) |
 
-> `memory_rebuild_index`, `memory_get_retrieval_params`, `memory_tune_params`, `memory_extract_entities`, and `memory_link_entities` are available via REST API but hidden from MCP tool listing — they are ops/debug tools not intended for agent use.
+> `memory_rebuild_index`, `memory_observe`, `memory_get_retrieval_params`, `memory_tune_params`, `memory_extract_entities`, and `memory_link_entities` are available via REST API but hidden from MCP tool listing — they are ops/debug tools not intended for agent use.
 
 Full API details: [API Reference Skill](skills/api-reference/SKILL.md)
 
@@ -266,7 +266,7 @@ If you're an AI agent helping a user set up Memoria:
 
 1. **Load the [Setup Skill](skills/setup/SKILL.md)** — it has step-by-step instructions
 2. **Ask before acting**:
-   - Which AI tool? (Kiro / Cursor / Claude)
+   - Which AI tool? (Kiro / Cursor / Claude / Codex)
    - MatrixOne database? (Docker / Cloud / existing)
    - Embedding service? (OpenAI / SiliconFlow / local)
 3. **Run `memoria init -i`** in the user's project directory

@@ -89,6 +89,23 @@ Before storing a new memory, consider:
 | `memory_retrieve` | Conversation start, or when context is needed | `query`, `top_k` (default 5), `session_id` (optional), `explain` (false = no debug, true = show timing) |
 | `memory_search` | User asks "what do you know about X" or you need to browse | `query`, `top_k` (default 10), `explain` (false = no debug, true = show timing) |
 | `memory_profile` | User asks "what do you know about me" | — |
+| `memory_feedback` | After using a retrieved memory, record if it was helpful | `memory_id`, `signal` (useful/irrelevant/outdated/wrong), `context` (optional) |
+
+**`memory_feedback`**: Call this after retrieval when you can assess whether a memory was helpful. Signals:
+- `useful` — memory helped answer the question or complete the task
+- `irrelevant` — memory was retrieved but not relevant to the query
+- `outdated` — memory contains stale information (consider `memory_correct` instead if you know the new value)
+- `wrong` — memory contains incorrect information (consider `memory_correct` instead if you know the correct value)
+
+**When to call feedback vs other tools**:
+- Memory helped → `memory_feedback(signal="useful")`
+- Memory irrelevant but correct → `memory_feedback(signal="irrelevant")`
+- Memory outdated and you know new value → `memory_correct` (not feedback)
+- Memory outdated but you don't know new value → `memory_feedback(signal="outdated")`
+- Memory wrong and you know correct value → `memory_correct` (not feedback)
+- Memory should be deleted → `memory_purge` (not feedback)
+
+**Impact**: Feedback accumulates over time. With default settings, a memory with 3 `useful` signals ranks ~30% higher in future retrievals. Don't call for every memory — only when you have clear signal.
 
 **`memory_retrieve` vs `memory_search`**: In MCP mode, both use the same retrieval pipeline (graph → hybrid vector+fulltext → fulltext fallback). The differences are:
 - `memory_retrieve` accepts `session_id` for session-scoped boosting; `memory_search` does not
@@ -122,35 +139,17 @@ When `memory_governance` reports snapshot_health with high auto_ratio (>50%), su
 ### Branches (isolated experiments)
 Git-like workflow for memory. `memory_branch(name)` creates, `memory_checkout(name)` switches, `memory_diff(source)` previews changes, `memory_merge(source)` merges back, `memory_branch_delete(name)` cleans up. `memory_branches()` lists all.
 
-### Entity graph (proactive — call when conditions are met)
-| Tool | When to call | Key params |
-|------|-------------|------------|
-| `memory_extract_entities` | **Proactively** after storing ≥ 5 new memories in a session, OR when user discusses a new project/technology/person not yet in the graph | `mode` (default: auto) |
-| `memory_link_entities` | After `extract_entities(mode='candidates')` returns memories — extract entities yourself, then call this | `entities` (JSON string) |
-
-**Trigger heuristics — call `memory_extract_entities` when ANY of these are true:**
-- You stored ≥ 5 memories this session and haven't extracted entities yet
-- User mentions a project, technology, or person by name that you haven't seen in previous `memory_retrieve` results
-- User asks about relationships between concepts ("how does X relate to Y")
-- User starts working on a new codebase or topic area
-
-**Do NOT extract entities when:**
-- Conversation is short (< 3 turns) and no new named entities appeared
-- User is only asking questions, not sharing new information
-- You already ran extraction this session
-
 ### Maintenance
 | Tool | Trigger phrase | Cooldown |
 |------|---------------|----------|
 | `memory_governance` | "clean up memories", "check memory health", or proactively when retrieval returns outdated/contradictory results | 1 hour |
 | `memory_consolidate` | "check for contradictions", "fix conflicts" | 30 min |
 | `memory_reflect` | "find patterns", "summarize what you know" | 2 hours |
-| `memory_rebuild_index` | Only when governance reports `needs_rebuild=True` | — |
 | `memory_snapshot_delete` | When governance reports high snapshot auto_ratio, or user asks to clean snapshots | — |
 
-`memory_reflect` and `memory_extract_entities` support `mode` parameter:
+`memory_reflect` supports `mode` parameter:
 - `auto` (default): uses Memoria's internal LLM if configured, otherwise returns candidates for YOU to process
-- `candidates`: always returns raw data for YOU to synthesize/extract, then store results via `memory_store` or `memory_link_entities`
+- `candidates`: always returns raw data for YOU to synthesize, then store results via `memory_store`
 - `internal`: always uses Memoria's internal LLM (fails if not configured)
 
 
@@ -241,7 +240,6 @@ Run `memory_governance` (1h cooldown) when you notice ANY of these:
 
 After governance, check the response for:
 - `snapshot_health.auto_ratio > 50%` → suggest `memory_snapshot_delete(prefix="auto:")`
-- `needs_rebuild = True` → run `memory_rebuild_index`
 - Quarantined memories → inform user what was quarantined and why
 
 ## Contradiction Resolution
@@ -273,10 +271,6 @@ If too many:
 - `memory_snapshot_delete(older_than="<3 months ago>")` — age-based cleanup
 
 Keep named snapshots the user created explicitly.
-
-## Entity Graph Maintenance
-
-After entity extraction, if mode returns candidates, extract entities yourself and call `memory_link_entities` with the correct JSON format.
 
 ## Reflection Cadence
 
