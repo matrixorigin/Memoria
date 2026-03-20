@@ -81,8 +81,9 @@ services:
       # Governance plugins
       - MEMORIA_GOVERNANCE_PLUGIN_BINDING=${MEMORIA_GOVERNANCE_PLUGIN_BINDING:-default}
       - MEMORIA_GOVERNANCE_PLUGIN_SUBJECT=${MEMORIA_GOVERNANCE_PLUGIN_SUBJECT:-system}
-      # Security
+      # Security & Rate Limiting
       - MEMORIA_API_KEY_SECRET=${MEMORIA_API_KEY_SECRET:-}
+      - MEMORIA_RATE_LIMIT_AUTH_KEYS=${MEMORIA_RATE_LIMIT_AUTH_KEYS:-1000,60}
     depends_on:
       matrixone:
         condition: service_healthy
