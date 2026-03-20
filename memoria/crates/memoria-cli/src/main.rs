@@ -82,6 +82,9 @@ enum Commands {
     },
     /// Start MCP server (embedded or remote mode)
     Mcp {
+        /// AI tool that launched this MCP server (sent as X-Memoria-Tool header)
+        #[arg(long, env = "MEMORIA_TOOL")]
+        tool: Option<ToolName>,
         /// Remote Memoria API URL (remote mode)
         #[arg(long, env = "MEMORIA_API_URL")]
         api_url: Option<String>,
@@ -396,6 +399,7 @@ async fn cmd_serve(db_url: Option<String>, port: u16, master_key: String) -> Res
 
 #[allow(clippy::too_many_arguments)]
 async fn cmd_mcp(
+    tool: Option<String>,
     api_url: Option<String>,
     token: Option<String>,
     db_url: Option<String>,
@@ -425,7 +429,7 @@ async fn cmd_mcp(
         let user = user.clone().unwrap_or_else(|| "default".to_string());
         tracing::info!(api_url = %api_url, user = %user, "Starting Memoria MCP (remote mode)");
         let remote =
-            memoria_mcp::remote::RemoteClient::new(api_url, token.as_deref(), user.clone());
+            memoria_mcp::remote::RemoteClient::new(api_url, token.as_deref(), user.clone(), tool.as_deref());
         return memoria_mcp::run_stdio_remote(remote, user).await;
     }
 
@@ -869,6 +873,7 @@ fn mcp_entry(
     api_url: Option<&str>,
     token: Option<&str>,
     user: &str,
+    tool_name: &str,
     embedding_provider: Option<&str>,
     embedding_model: Option<&str>,
     embedding_dim: Option<&str>,
@@ -921,6 +926,8 @@ fn mcp_entry(
 
     // Use subcommand: memoria mcp [args]
     let mut full_args = vec!["mcp".to_string()];
+    full_args.push("--tool".to_string());
+    full_args.push(tool_name.to_string());
     full_args.extend(args);
 
     let mut entry = serde_json::json!({
@@ -1784,20 +1791,20 @@ fn cmd_init(
     embedding_api_key: Option<String>,
     embedding_base_url: Option<String>,
 ) {
-    let entry = mcp_entry(
-        db_url.as_deref(),
-        api_url.as_deref(),
-        token.as_deref(),
-        &user,
-        embedding_provider.as_deref(),
-        embedding_model.as_deref(),
-        embedding_dim.as_deref(),
-        embedding_api_key.as_deref(),
-        embedding_base_url.as_deref(),
-    );
-
     for tool in &tools {
         println!("\n[{}]", tool);
+        let entry = mcp_entry(
+            db_url.as_deref(),
+            api_url.as_deref(),
+            token.as_deref(),
+            &user,
+            &tool.to_string(),
+            embedding_provider.as_deref(),
+            embedding_model.as_deref(),
+            embedding_dim.as_deref(),
+            embedding_api_key.as_deref(),
+            embedding_base_url.as_deref(),
+        );
         let results = match tool {
             ToolName::Kiro => configure_kiro(project_dir, &entry, force),
             ToolName::Cursor => configure_cursor(project_dir, &entry, force),
@@ -2357,6 +2364,7 @@ fn main() -> Result<()> {
                 .block_on(cmd_serve(db_url, port, master_key))?;
         }
         Commands::Mcp {
+            tool,
             api_url,
             token,
             db_url,
@@ -2376,6 +2384,7 @@ fn main() -> Result<()> {
                 .enable_all()
                 .build()?
                 .block_on(cmd_mcp(
+                    tool.map(|t| t.to_string()),
                     api_url,
                     token,
                     db_url,
