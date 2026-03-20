@@ -10,6 +10,7 @@ use memoria_storage::SqlMemoryStore;
 use memoria_storage::EditLogEntry;
 use moka::future::Cache;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -89,6 +90,58 @@ pub struct PurgeResult {
     pub warning: Option<String>,
 }
 
+/// In-memory access counter that batches DB writes to avoid row-lock contention.
+/// Accumulates counts in a DashMap and flushes every `FLUSH_INTERVAL`.
+struct AccessCounter {
+    pending: Arc<dashmap::DashMap<String, AtomicU64>>,
+}
+
+const ACCESS_FLUSH_INTERVAL: Duration = Duration::from_secs(5);
+
+impl AccessCounter {
+    fn new(store: Arc<SqlMemoryStore>) -> Self {
+        let pending: Arc<dashmap::DashMap<String, AtomicU64>> = Arc::new(dashmap::DashMap::new());
+        let p = pending.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(ACCESS_FLUSH_INTERVAL).await;
+                Self::flush(&p, &store).await;
+            }
+        });
+        Self { pending }
+    }
+
+    fn bump(&self, ids: &[String]) {
+        for id in ids {
+            self.pending
+                .entry(id.clone())
+                .or_insert_with(|| AtomicU64::new(0))
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    async fn flush(
+        pending: &dashmap::DashMap<String, AtomicU64>,
+        store: &SqlMemoryStore,
+    ) {
+        // Drain all entries
+        let batch: Vec<(String, u64)> = pending
+            .iter()
+            .map(|e| (e.key().clone(), e.value().swap(0, Ordering::Relaxed)))
+            .filter(|(_, n)| *n > 0)
+            .collect();
+        // Remove zeroed entries to avoid unbounded growth
+        pending.retain(|_, v| v.load(Ordering::Relaxed) > 0);
+
+        if batch.is_empty() {
+            return;
+        }
+        if let Err(e) = store.bump_access_counts_batch(&batch).await {
+            tracing::warn!("access counter flush failed: {e}");
+        }
+    }
+}
+
 pub struct MemoryService {
     /// Trait-based store for generic ops (used by tests with MockStore)
     pub store: Arc<dyn MemoryStore>,
@@ -99,6 +152,8 @@ pub struct MemoryService {
     pub llm: Option<Arc<LlmClient>>,
     /// Async entity extraction queue (None when sql_store is absent)
     entity_tx: Option<tokio::sync::mpsc::UnboundedSender<EntityJob>>,
+    /// Batched access counter (None in tests)
+    access_counter: Option<AccessCounter>,
     /// Per-user feedback_weight cache (TTL 5 min)
     feedback_weight_cache: Cache<String, f64>,
 }
@@ -124,6 +179,7 @@ impl MemoryService {
             embedder,
             llm: llm.clone(),
             entity_tx: Some(entity_tx),
+            access_counter: Some(AccessCounter::new(store.clone())),
             feedback_weight_cache: Cache::builder()
                 .max_capacity(10_000)
                 .time_to_live(Duration::from_secs(300))
@@ -146,6 +202,7 @@ impl MemoryService {
             embedder,
             llm: llm.clone(),
             entity_tx: Some(entity_tx),
+            access_counter: Some(AccessCounter::new(store.clone())),
             feedback_weight_cache: Cache::builder()
                 .max_capacity(10_000)
                 .time_to_live(Duration::from_secs(300))
@@ -163,6 +220,7 @@ impl MemoryService {
             embedder,
             llm: None,
             entity_tx: None,
+            access_counter: None,
             feedback_weight_cache: Cache::builder()
                 .max_capacity(10_000)
                 .time_to_live(Duration::from_secs(300))
@@ -314,6 +372,7 @@ impl MemoryService {
         observed_at: Option<DateTime<Utc>>,
         initial_confidence: Option<f64>,
     ) -> Result<Memory, MemoriaError> {
+        let t0 = std::time::Instant::now();
         // Sensitivity check — block HIGH tier, redact MEDIUM tier
         let sensitivity = check_sensitivity(content);
         if sensitivity.blocked {
@@ -325,7 +384,8 @@ impl MemoryService {
         let content = sensitivity.redacted_content.as_deref().unwrap_or(content);
 
         let effective_tier = trust_tier.unwrap_or(TrustTier::T1Verified);
-        let embedding = self.embed(content).await;
+        let embedding = self.embed(content).await?;
+        let t_embed = t0.elapsed();
         let memory = Memory {
             memory_id: Uuid::new_v4().simple().to_string(),
             user_id: user_id.to_string(),
@@ -355,6 +415,7 @@ impl MemoryService {
                 // Assumes normalized embeddings (bge-m3, text-embedding-3-* all output unit vectors).
                 let l2_threshold = 0.3162;
                 let mtype = memory.memory_type.to_string();
+                let t1 = std::time::Instant::now();
                 if let Ok(Some((old_id, old_content, _dist))) = sql
                     .find_near_duplicate(
                         &table,
@@ -366,23 +427,38 @@ impl MemoryService {
                     )
                     .await
                 {
+                    let t_dedup = t1.elapsed();
                     if old_content.trim() != memory.content.trim() {
+                        let t2 = std::time::Instant::now();
                         sql.insert_into(&table, &memory).await?;
+                        let t_insert = t2.elapsed();
                         sql.supersede_memory(&table, &old_id, &memory.memory_id)
                             .await?;
                         let payload = serde_json::json!({"content": &memory.content, "type": memory.memory_type.to_string()}).to_string();
                         sql.log_edit(user_id, "inject", Some(&memory.memory_id), Some(&payload), "store_memory:supersede", None).await;
                         self.enqueue_entity_extraction(user_id, &memory.memory_id, &memory.content);
+                        if t0.elapsed().as_secs() >= 1 { tracing::warn!(embed_ms = t_embed.as_millis() as u64, dedup_ms = t_dedup.as_millis() as u64, insert_ms = t_insert.as_millis() as u64, total_ms = t0.elapsed().as_millis() as u64, "store_memory slow (supersede)"); };
                         return Ok(memory);
                     }
                     // Same content — skip storing duplicate
+                    if t0.elapsed().as_secs() >= 1 { tracing::warn!(embed_ms = t_embed.as_millis() as u64, dedup_ms = t_dedup.as_millis() as u64, total_ms = t0.elapsed().as_millis() as u64, "store_memory slow (skip dup)"); };
                     return Ok(memory);
                 }
+                let t_dedup = t1.elapsed();
+                let t2 = std::time::Instant::now();
+                sql.insert_into(&table, &memory).await?;
+                let t_insert = t2.elapsed();
+                let payload = serde_json::json!({"content": &memory.content, "type": memory.memory_type.to_string()}).to_string();
+                sql.log_edit(user_id, "inject", Some(&memory.memory_id), Some(&payload), "store_memory", None).await;
+                self.enqueue_entity_extraction(user_id, &memory.memory_id, &memory.content);
+                if t0.elapsed().as_secs() >= 1 { tracing::warn!(embed_ms = t_embed.as_millis() as u64, dedup_ms = t_dedup.as_millis() as u64, insert_ms = t_insert.as_millis() as u64, total_ms = t0.elapsed().as_millis() as u64, "store_memory slow"); };
+            } else {
+                sql.insert_into(&table, &memory).await?;
+                let payload = serde_json::json!({"content": &memory.content, "type": memory.memory_type.to_string()}).to_string();
+                sql.log_edit(user_id, "inject", Some(&memory.memory_id), Some(&payload), "store_memory", None).await;
+                self.enqueue_entity_extraction(user_id, &memory.memory_id, &memory.content);
+                if t0.elapsed().as_secs() >= 1 { tracing::warn!(embed_ms = t_embed.as_millis() as u64, total_ms = t0.elapsed().as_millis() as u64, "store_memory slow (no embedding)"); };
             }
-            sql.insert_into(&table, &memory).await?;
-            let payload = serde_json::json!({"content": &memory.content, "type": memory.memory_type.to_string()}).to_string();
-            sql.log_edit(user_id, "inject", Some(&memory.memory_id), Some(&payload), "store_memory", None).await;
-            self.enqueue_entity_extraction(user_id, &memory.memory_id, &memory.content);
         } else {
             self.store.insert(&memory).await?;
         }
@@ -457,7 +533,7 @@ impl MemoryService {
         let (mems, _) = self
             .retrieve_inner(user_id, query, top_k, ExplainLevel::None)
             .await?;
-        self.bump_access_counts(&mems).await;
+        self.bump_access_counts(&mems);
         Ok(mems)
     }
 
@@ -471,7 +547,7 @@ impl MemoryService {
         let (mems, explain) = self
             .retrieve_inner(user_id, query, top_k, ExplainLevel::Basic)
             .await?;
-        self.bump_access_counts(&mems).await;
+        self.bump_access_counts(&mems);
         Ok((mems, explain))
     }
 
@@ -484,15 +560,15 @@ impl MemoryService {
         level: ExplainLevel,
     ) -> Result<(Vec<Memory>, RetrievalExplain), MemoriaError> {
         let (mems, explain) = self.retrieve_inner(user_id, query, top_k, level).await?;
-        self.bump_access_counts(&mems).await;
+        self.bump_access_counts(&mems);
         Ok((mems, explain))
     }
 
     /// Fire-and-forget bump of access counts for retrieved memories.
-    async fn bump_access_counts(&self, mems: &[Memory]) {
-        if let Some(sql) = &self.sql_store {
+    fn bump_access_counts(&self, mems: &[Memory]) {
+        if let Some(counter) = &self.access_counter {
             let ids: Vec<String> = mems.iter().map(|m| m.memory_id.clone()).collect();
-            let _ = sql.bump_access_counts(&ids).await;
+            counter.bump(&ids);
         }
     }
 
@@ -517,7 +593,7 @@ impl MemoryService {
 
             // Phase 0: embed query
             let p0_start = std::time::Instant::now();
-            let emb = self.embed(query).await;
+            let emb = self.embed(query).await.unwrap_or(None);
             explain.embedding_ms = p0_start.elapsed().as_secs_f64() * 1000.0;
 
             // Phase 1: graph retrieval (activation-based)
@@ -742,7 +818,7 @@ impl MemoryService {
         }
 
         // Fallback for tests (no sql_store)
-        if let Some(emb) = self.embed(query).await {
+        if let Some(emb) = self.embed(query).await.unwrap_or(None) {
             explain.vector_attempted = true;
             let results = self.store.search_vector(user_id, &emb, top_k).await?;
             if !results.is_empty() {
@@ -815,7 +891,7 @@ impl MemoryService {
             memory_type: old.memory_type.clone(),
             trust_tier: TrustTier::T2Curated,
             initial_confidence: old.initial_confidence,
-            embedding: self.embed(new_content).await,
+            embedding: self.embed(new_content).await?,
             session_id: old.session_id.clone(),
             source_event_ids: vec![format!("correct:{}", memory_id)],
             extra_metadata: None,
@@ -943,12 +1019,30 @@ impl MemoryService {
         self.store.list_active(user_id, limit).await
     }
 
-    pub async fn embed(&self, text: &str) -> Option<Vec<f32>> {
-        self.embedder.as_ref()?.embed(text).await.ok()
+    pub async fn embed(&self, text: &str) -> Result<Option<Vec<f32>>, MemoriaError> {
+        match self.embedder.as_ref() {
+            None => Ok(None),
+            Some(e) => match e.embed(text).await {
+                Ok(v) => Ok(Some(v)),
+                Err(err) => {
+                    tracing::warn!(error = %err, "embedding failed");
+                    Err(MemoriaError::Embedding(err.to_string()))
+                }
+            },
+        }
     }
 
-    pub async fn embed_batch(&self, texts: &[String]) -> Option<Vec<Vec<f32>>> {
-        self.embedder.as_ref()?.embed_batch(texts).await.ok()
+    pub async fn embed_batch(&self, texts: &[String]) -> Result<Option<Vec<Vec<f32>>>, MemoriaError> {
+        match self.embedder.as_ref() {
+            None => Ok(None),
+            Some(e) => match e.embed_batch(texts).await {
+                Ok(v) => Ok(Some(v)),
+                Err(err) => {
+                    tracing::warn!(error = %err, "batch embedding failed");
+                    Err(MemoriaError::Embedding(err.to_string()))
+                }
+            },
+        }
     }
 
     /// Get per-user feedback_weight with caching (TTL 5 min).
@@ -994,7 +1088,7 @@ impl MemoryService {
         }
 
         // Batch embed
-        let embeddings = self.embed_batch(&contents).await;
+        let embeddings = self.embed_batch(&contents).await?;
 
         let mut results = Vec::with_capacity(checked_items.len());
         for (i, (content, mt, session_id, tier)) in checked_items.into_iter().enumerate() {
@@ -1128,7 +1222,10 @@ impl MemoryService {
                 memory_type: mtype,
                 content: content.to_string(),
                 initial_confidence: confidence,
-                embedding: self.embed(content).await,
+                embedding: match self.embed(content).await {
+                    Ok(e) => e,
+                    Err(_) => continue,
+                },
                 source_event_ids: vec![],
                 superseded_by: None,
                 is_active: true,
@@ -1201,7 +1298,7 @@ impl MemoryService {
             mem.content = redacted.clone();
         }
         if mem.embedding.is_none() {
-            mem.embedding = self.embed(&mem.content).await;
+            mem.embedding = self.embed(&mem.content).await?;
         }
 
         if let Some(sql) = &self.sql_store {

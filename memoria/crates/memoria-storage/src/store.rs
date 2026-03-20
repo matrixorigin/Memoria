@@ -1448,6 +1448,27 @@ impl SqlMemoryStore {
         Ok(())
     }
 
+    /// Batch bump with pre-aggregated counts (used by AccessCounter flush).
+    pub async fn bump_access_counts_batch(&self, batch: &[(String, u64)]) -> Result<(), MemoriaError> {
+        if batch.is_empty() {
+            return Ok(());
+        }
+        for chunk in batch.chunks(100) {
+            let placeholders: Vec<String> = chunk.iter().map(|_| "(?, ?, NOW())".to_string()).collect();
+            let sql = format!(
+                "INSERT INTO mem_memories_stats (memory_id, access_count, last_accessed_at) VALUES {} \
+                 ON DUPLICATE KEY UPDATE access_count = access_count + VALUES(access_count), last_accessed_at = NOW()",
+                placeholders.join(", ")
+            );
+            let mut q = sqlx::query(&sql);
+            for (id, count) in chunk {
+                q = q.bind(id).bind(*count as i64);
+            }
+            q.execute(&self.pool).await.map_err(db_err)?;
+        }
+        Ok(())
+    }
+
     /// Reset access_count to 0 for all memories of a user.
     pub async fn reset_access_counts(&self, user_id: &str) -> Result<i64, MemoriaError> {
         let result = sqlx::query(

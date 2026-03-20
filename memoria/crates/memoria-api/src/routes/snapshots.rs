@@ -7,7 +7,7 @@ use serde::Deserialize;
 use serde_json::json;
 use sqlx::Row;
 
-use crate::{auth::AuthUser, models::*, routes::memory::api_err, state::AppState};
+use crate::{auth::AuthUser, models::*, routes::memory::{api_err, api_err_typed}, state::AppState};
 
 #[derive(Deserialize, Default)]
 pub struct ListSnapshotsQuery {
@@ -41,7 +41,7 @@ async fn git_call(
 ) -> Result<serde_json::Value, (StatusCode, String)> {
     let result = memoria_mcp::git_tools::call(tool, args, &state.git, &state.service, user_id)
         .await
-        .map_err(api_err)?;
+        .map_err(api_err_typed)?;
     // Extract text from MCP response
     let text = result["content"][0]["text"]
         .as_str()

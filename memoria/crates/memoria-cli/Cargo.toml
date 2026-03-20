@@ -2,6 +2,7 @@
 name = "memoria-cli"
 version.workspace = true
 edition = "2021"
+default-run = "memoria"
 
 [features]
 default = []
@@ -28,6 +29,8 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+fastrand = "2"
+futures = "0.3"
 tower-http = { workspace = true }
 sqlx = { workspace = true }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking"] }

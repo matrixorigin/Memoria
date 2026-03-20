@@ -10,6 +10,7 @@ use crate::{auth::AuthUser, models::*, state::AppState};
 
 type ApiResult<T> = Result<Json<T>, (StatusCode, String)>;
 pub fn api_err(e: impl std::fmt::Display) -> (StatusCode, String) {
+    tracing::error!(error = %e, "internal server error");
     (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
 }
 
@@ -24,6 +25,9 @@ pub fn api_err_typed(e: memoria_core::MemoriaError) -> (StatusCode, String) {
         Blocked(_) => StatusCode::FORBIDDEN,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     };
+    if status.is_server_error() {
+        tracing::error!(error = %e, "internal server error");
+    }
     (status, e.to_string())
 }
 

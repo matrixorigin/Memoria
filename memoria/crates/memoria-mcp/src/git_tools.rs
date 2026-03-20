@@ -11,8 +11,8 @@
 //! - branch duplicate name rejected (including deleted)
 //! - branch name sanitized to 40 chars
 
-use anyhow::Result;
 use chrono::NaiveDateTime;
+use memoria_core::MemoriaError;
 use memoria_git::GitForDataService;
 use memoria_service::MemoryService;
 use serde_json::{json, Value};
@@ -20,6 +20,16 @@ use sqlx::Row;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use uuid::Uuid;
+
+/// Convert sqlx::Error to MemoriaError::Database
+fn db_err(e: sqlx::Error) -> MemoriaError {
+    MemoriaError::Database(e.to_string())
+}
+
+/// Convert memoria_git errors to MemoriaError
+fn git_err(e: impl std::fmt::Display) -> MemoriaError {
+    MemoriaError::Internal(e.to_string())
+}
 
 const MAX_USER_SNAPSHOTS: i64 = 20;
 const MAX_BRANCHES: i64 = 20;
@@ -85,19 +95,19 @@ fn milestone_internal(name: &str) -> Option<String> {
     }
 }
 
-fn snapshot_store(svc: &Arc<MemoryService>) -> Result<&memoria_storage::SqlMemoryStore> {
+fn snapshot_store(svc: &Arc<MemoryService>) -> Result<&memoria_storage::SqlMemoryStore, MemoriaError> {
     svc.sql_store
         .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("Snapshot ops require SQL store"))
+        .ok_or_else(|| MemoriaError::Internal("Snapshot ops require SQL store".into()))
 }
 
 async fn visible_snapshots_for_user(
     git: &Arc<GitForDataService>,
     svc: &Arc<MemoryService>,
     user_id: &str,
-) -> Result<Vec<VisibleSnapshot>> {
+) -> Result<Vec<VisibleSnapshot>, MemoriaError> {
     let sql = snapshot_store(svc)?;
-    let all = git.list_snapshots().await?;
+    let all = git.list_snapshots().await.map_err(git_err)?;
     let actual_by_name: HashMap<String, memoria_git::Snapshot> = all
         .into_iter()
         .filter(|s| {
@@ -144,12 +154,12 @@ async fn resolve_snapshot_for_user(
     svc: &Arc<MemoryService>,
     user_id: &str,
     name: &str,
-) -> Result<Option<String>> {
+) -> Result<Option<String>, MemoriaError> {
     if let Some(internal) = milestone_internal(name) {
-        return Ok(git.get_snapshot(&internal).await?.map(|_| internal));
+        return Ok(git.get_snapshot(&internal).await.map_err(git_err)?.map(|_| internal));
     }
     if name.starts_with(SAFETY_PREFIX) {
-        return Ok(git.get_snapshot(name).await?.map(|_| name.to_string()));
+        return Ok(git.get_snapshot(name).await.map_err(git_err)?.map(|_| name.to_string()));
     }
 
     let sql = snapshot_store(svc)?;
@@ -287,7 +297,7 @@ pub async fn call(
     git: &Arc<GitForDataService>,
     svc: &Arc<MemoryService>,
     user_id: &str,
-) -> Result<Value> {
+) -> Result<Value, MemoriaError> {
     match name {
         "memory_snapshot" => {
             let user_snapshots = visible_snapshots_for_user(git, svc, user_id)
@@ -303,7 +313,7 @@ pub async fn call(
             let snap_name = args["name"].as_str().unwrap_or("");
             let internal = snap_internal(snap_name);
             let display = snap_display(&internal);
-            let snap = git.create_snapshot(&internal).await?;
+            let snap = git.create_snapshot(&internal).await.map_err(git_err)?;
             snapshot_store(svc)?
                 .register_snapshot(user_id, &display, &snap.snapshot_name)
                 .await?;
@@ -362,7 +372,7 @@ pub async fn call(
                     "%Y-%m-%d %H:%M:%S",
                 )
                 .or_else(|_| NaiveDateTime::parse_from_str(older_than, "%Y-%m-%dT%H:%M:%S"))
-                .map_err(|_| anyhow::anyhow!("older_than must be ISO date e.g. '2026-03-01'"))?;
+                .map_err(|_| MemoriaError::Validation("older_than must be ISO date e.g. '2026-03-01'".into()))?;
                 snaps
                     .iter()
                     .filter(|s| s.timestamp.map(|t| t < cutoff).unwrap_or(false))
@@ -374,7 +384,7 @@ pub async fn call(
 
             let count = to_delete.len();
             for snapshot in &to_delete {
-                git.drop_snapshot(&snapshot.internal_name).await?;
+                git.drop_snapshot(&snapshot.internal_name).await.map_err(git_err)?;
                 if snapshot.registered {
                     sql.deregister_snapshot_by_internal(user_id, &snapshot.internal_name)
                         .await?;
@@ -391,11 +401,11 @@ pub async fn call(
             let snap_name = args["name"].as_str().unwrap_or("");
             let internal = resolve_snapshot_for_user(git, svc, user_id, snap_name)
                 .await?
-                .ok_or_else(|| anyhow::anyhow!("Snapshot '{snap_name}' not found"))?;
+                .ok_or_else(|| MemoriaError::NotFound(format!("Snapshot '{snap_name}'")))?;
             // Restore mem_memories (required) + graph tables (best-effort, like Python)
             git.restore_table_from_snapshot("mem_memories", &internal)
                 .await
-                .map_err(|e| anyhow::anyhow!("Rollback failed: {e}"))?;
+                .map_err(|e| MemoriaError::Internal(format!("Rollback failed: {e}")))?;
             for table in &["memory_graph_nodes", "memory_graph_edges", "mem_edit_log"] {
                 let _ = git.restore_table_from_snapshot(table, &internal).await;
             }
@@ -416,7 +426,7 @@ pub async fn call(
             // from_timestamp validation: must be within last 30 minutes, not future
             if let Some(ts_str) = from_timestamp {
                 let ts = NaiveDateTime::parse_from_str(ts_str, "%Y-%m-%d %H:%M:%S")
-                    .map_err(|_| anyhow::anyhow!("from_timestamp must be 'YYYY-MM-DD HH:MM:SS'"))?;
+                    .map_err(|_| MemoriaError::Validation("from_timestamp must be 'YYYY-MM-DD HH:MM:SS'".into()))?;
                 let now = chrono::Utc::now().naive_utc();
                 if ts > now {
                     return Ok(mcp_text("from_timestamp cannot be in the future"));
@@ -431,7 +441,7 @@ pub async fn call(
             let sql = svc
                 .sql_store
                 .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("Branch ops require SQL store"))?;
+                .ok_or_else(|| MemoriaError::Internal("Branch ops require SQL store".into()))?;
 
             // Global branch limit
             let all_branches = sql.list_branches(user_id).await?;
@@ -449,7 +459,7 @@ pub async fn call(
             .bind(branch_name)
             .fetch_one(git.pool())
             .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+            .map_err(db_err)?;
             let cnt: i64 = dup.try_get("cnt").unwrap_or(0);
             if cnt > 0 {
                 return Ok(mcp_text(&format!("Branch '{branch_name}' already exists.")));
@@ -462,9 +472,10 @@ pub async fn call(
                 // Create branch from snapshot: restore snapshot to temp, then branch
                 let internal = snap_internal(snap);
                 git.create_branch_from_snapshot(&table_name, "mem_memories", &internal)
-                    .await?;
+                    .await
+                    .map_err(git_err)?;
             } else {
-                git.create_branch(&table_name, "mem_memories").await?;
+                git.create_branch(&table_name, "mem_memories").await.map_err(git_err)?;
             }
             sql.register_branch(user_id, branch_name, &table_name)
                 .await?;
@@ -502,14 +513,14 @@ pub async fn call(
             let sql = svc
                 .sql_store
                 .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("Branch ops require SQL store"))?;
+                .ok_or_else(|| MemoriaError::Internal("Branch ops require SQL store".into()))?;
             if branch == "main" {
                 sql.set_active_branch(user_id, "main").await?;
                 return Ok(mcp_text("Switched to branch 'main'"));
             }
             let branches = sql.list_branches(user_id).await?;
             if !branches.iter().any(|(name, _)| name == branch) {
-                return Err(anyhow::anyhow!("Branch '{branch}' not found"));
+                return Err(MemoriaError::NotFound(format!("Branch '{branch}'")));
             }
             sql.set_active_branch(user_id, branch).await?;
             let count = svc.list_active(user_id, 50).await?.len();
@@ -525,21 +536,21 @@ pub async fn call(
                 "append" => "append",
                 "replace" | "accept" => "replace",
                 other => {
-                    return Err(anyhow::anyhow!(
+                    return Err(MemoriaError::Validation(format!(
                         "Unsupported merge strategy '{other}'. Use append, replace, or accept."
-                    ));
+                    )));
                 }
             };
             let sql = svc
                 .sql_store
                 .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("Branch ops require SQL store"))?;
+                .ok_or_else(|| MemoriaError::Internal("Branch ops require SQL store".into()))?;
             let branches = sql.list_branches(user_id).await?;
             let table_name = branches
                 .iter()
                 .find(|(name, _)| name == source_branch)
                 .map(|(_, t)| t.clone())
-                .ok_or_else(|| anyhow::anyhow!("Branch '{source_branch}' not found"))?;
+                .ok_or_else(|| MemoriaError::NotFound(format!("Branch '{source_branch}'")))?;
 
             // Safety limit: count new memories (branch rows not in main by PK)
             let count_sql = format!(
@@ -550,7 +561,7 @@ pub async fn call(
                 .bind(user_id)
                 .fetch_one(git.pool())
                 .await
-                .map_err(|e| anyhow::anyhow!("count failed: {e}"))?
+                .map_err(db_err)?
                 .try_get("cnt")
                 .unwrap_or(0);
             if new_count > 5000 {
@@ -577,7 +588,7 @@ pub async fn call(
                 if new_count > 0 {
                     git.merge_branch(&table_name, "mem_memories")
                         .await
-                        .map_err(|e| anyhow::anyhow!("merge failed: {e}"))?;
+                        .map_err(|e| MemoriaError::Internal(format!("merge failed: {e}")))?;
                 }
                 return Ok(mcp_text(&format!(
                     "Merged branch '{source_branch}' into main ({new_count} new, 0 replaced, 0 skipped)"
@@ -613,7 +624,7 @@ pub async fn call(
                 .bind(user_id)
                 .execute(git.pool())
                 .await
-                .map_err(|e| anyhow::anyhow!("merge insert failed: {e}"))?
+                .map_err(db_err)?
                 .rows_affected();
 
             // Conflict count: branch memories with real embeddings that have semantic match in main
@@ -636,7 +647,7 @@ pub async fn call(
                     .bind(user_id)
                     .fetch_one(git.pool())
                     .await
-                    .map_err(|e| anyhow::anyhow!("conflict count failed: {e}"))?
+                    .map_err(db_err)?
                     .try_get("cnt")
                     .unwrap_or(0);
 
@@ -670,7 +681,7 @@ pub async fn call(
                     .bind(user_id)
                     .execute(git.pool())
                     .await
-                    .map_err(|e| anyhow::anyhow!("merge replace failed: {e}"))?;
+                    .map_err(db_err)?;
                 (conflict_count as u64, 0u64)
             } else {
                 (0u64, conflict_count as u64)
@@ -689,10 +700,10 @@ pub async fn call(
             let sql = svc
                 .sql_store
                 .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("Branch ops require SQL store"))?;
+                .ok_or_else(|| MemoriaError::Internal("Branch ops require SQL store".into()))?;
             let branches = sql.list_branches(user_id).await?;
             if let Some((_, table_name)) = branches.iter().find(|(name, _)| name == branch) {
-                git.drop_branch(table_name).await?;
+                git.drop_branch(table_name).await.map_err(git_err)?;
                 sql.deregister_branch(user_id, branch).await?;
                 let active_table = sql.active_table(user_id).await.unwrap_or_default();
                 if active_table == *table_name {
@@ -710,13 +721,13 @@ pub async fn call(
             let sql = svc
                 .sql_store
                 .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("Branch ops require SQL store"))?;
+                .ok_or_else(|| MemoriaError::Internal("Branch ops require SQL store".into()))?;
             let branches = sql.list_branches(user_id).await?;
             let table_name = branches
                 .iter()
                 .find(|(name, _)| name == source_branch)
                 .map(|(_, t)| t.clone())
-                .ok_or_else(|| anyhow::anyhow!("Branch '{source_branch}' not found"))?;
+                .ok_or_else(|| MemoriaError::NotFound(format!("Branch '{source_branch}'")))?;
 
             // Use native LCA-based diff count, SQL JOIN for row details
             // (native diff output limit returns unknown column types that sqlx can't decode)
@@ -731,7 +742,8 @@ pub async fn call(
             }
             let rows = git
                 .diff_branch_rows(&table_name, "mem_memories", user_id, limit)
-                .await?;
+                .await
+                .map_err(git_err)?;
             let lines: Vec<String> = rows
                 .iter()
                 .map(|r| {
@@ -763,7 +775,7 @@ pub async fn call(
             )))
         }
 
-        _ => Err(anyhow::anyhow!("Unknown git tool: {name}")),
+        _ => Err(MemoriaError::NotFound(format!("Unknown git tool: {name}"))),
     }
 }
 
