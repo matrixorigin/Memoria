@@ -221,11 +221,12 @@ pub fn build_router(state: AppState) -> Router {
             .on_response(|res: &axum::http::Response<_>, latency: std::time::Duration, _span: &tracing::Span| {
                 let status = res.status().as_u16();
                 if status >= 500 {
-                    tracing::error!(status, latency_ms = latency.as_millis(), "5xx");
-                } else if status >= 400 {
-                    tracing::warn!(status, latency_ms = latency.as_millis(), "4xx");
+                    tracing::error!(status, latency_ms = latency.as_millis(), "response");
+                } else if status == 429 {
+                    // rate-limit hits are operationally important
+                    tracing::warn!(status, latency_ms = latency.as_millis(), "response");
                 } else {
-                    tracing::debug!(status, latency_ms = latency.as_millis(), "ok");
+                    tracing::debug!(status, latency_ms = latency.as_millis(), "response");
                 }
             })
         )
