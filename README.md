@@ -197,21 +197,28 @@ memoria rules --force
 |------|-------------|
 | `memory_store` | Store a new memory |
 | `memory_retrieve` | Retrieve relevant memories (call at conversation start) |
+| `memory_search` | Semantic search across all memories |
 | `memory_correct` | Update an existing memory |
 | `memory_purge` | Delete by ID or topic keyword |
-| `memory_search` | Semantic search across all memories |
+| `memory_list` | List active memories |
 | `memory_profile` | Get user's memory-derived profile |
+| `memory_observe` | Extract and persist memories from conversation messages |
 | `memory_feedback` | Record relevance feedback (useful/irrelevant/outdated/wrong) |
+| `memory_capabilities` | List available memory tools |
 
 ### Snapshots & Branches
 
 | Tool | Description |
 |------|-------------|
 | `memory_snapshot` | Create named snapshot |
+| `memory_snapshots` | List snapshots with pagination |
+| `memory_snapshot_delete` | Delete snapshots by name, prefix, or age |
 | `memory_rollback` | Restore to snapshot |
 | `memory_branch` | Create isolated branch |
+| `memory_branches` | List all branches |
 | `memory_checkout` | Switch branch |
 | `memory_merge` | Merge branch back |
+| `memory_branch_delete` | Delete a branch |
 | `memory_diff` | Preview merge changes |
 
 ### Maintenance
@@ -221,7 +228,8 @@ memoria rules --force
 | `memory_governance` | Quarantine low-confidence memories (1h cooldown) |
 | `memory_consolidate` | Detect contradictions (30min cooldown) |
 | `memory_reflect` | Synthesize insights (2h cooldown) |
-| `memory_extract_entities` | Build entity graph |
+
+> `memory_rebuild_index`, `memory_get_retrieval_params`, `memory_tune_params`, `memory_extract_entities`, and `memory_link_entities` are available via REST API but hidden from MCP tool listing — they are ops/debug tools not intended for agent use.
 
 Full API details: [API Reference Skill](skills/api-reference/SKILL.md)
 

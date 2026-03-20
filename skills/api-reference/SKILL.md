@@ -100,9 +100,12 @@ All fields optional. Auto-creates safety snapshot. Response: `{ "purged": N, "sn
 
 | Endpoint | Cooldown | Description |
 |----------|----------|-------------|
+| `POST /v1/governance?force=false` | 1 hour | Quarantine low-confidence, cleanup stale |
 | `POST /v1/consolidate?force=false` | 30 min | Detect contradictions, fix orphans |
 | `POST /v1/reflect?force=false` | 2 hours | Synthesize insights (needs LLM) |
 | `POST /v1/extract-entities` | — | Extract entities, build graph (needs LLM) |
+| `POST /v1/extract-entities/link` | — | Manually link entities to memories |
+| `GET /v1/entities` | — | List user's entities |
 
 LLM-free alternatives: `POST /v1/reflect/candidates`, `POST /v1/extract-entities/candidates` — return raw data for the calling agent to process.
 

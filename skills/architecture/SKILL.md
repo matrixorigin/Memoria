@@ -64,9 +64,12 @@ trait AsyncTaskStore: Send + Sync {
 
 | Group | Tables |
 |-------|--------|
-| Core | `mem_memories`, `mem_snapshots`, `mem_branches`, `memory_graph_nodes`, `memory_graph_edges` |
+| Core | `mem_memories`, `mem_user_state`, `mem_branches`, `mem_snapshots` |
+| Graph | `memory_graph_nodes`, `memory_graph_edges`, `mem_entities`, `mem_memory_entity_links`, `mem_entity_links` |
+| Audit | `mem_edit_log`, `mem_retrieval_feedback`, `mem_memories_stats` |
+| Governance | `mem_governance_cooldown`, `mem_governance_runtime_state`, `mem_user_retrieval_params` |
 | Auth | `mem_api_keys` |
-| Plugin | `mem_plugin_packages`, `mem_plugin_signers`, `mem_plugin_binding_rules`, `mem_plugin_reviews`, `mem_plugin_compatibility`, `mem_plugin_audit_events` |
+| Plugin | `mem_plugin_packages`, `mem_plugin_signers`, `mem_plugin_bindings`, `mem_plugin_binding_rules`, `mem_plugin_reviews`, `mem_plugin_audit_events` |
 | Distributed | `mem_distributed_locks`, `mem_async_tasks` |
 
 ## Config

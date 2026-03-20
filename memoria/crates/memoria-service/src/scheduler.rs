@@ -616,7 +616,7 @@ mod tests {
         async fn create_safety_snapshot(&self, _: &str) -> (Option<String>, Option<String>) {
             (Some("mem_snap_pre_daily_test".into()), None)
         }
-        async fn log_edit(&self, _: &str, _: &str, _: &[&str], _: &str, _: Option<&str>) {}
+        async fn log_edit(&self, _: &str, _: &str, _: Option<&str>, _: Option<&str>, _: &str, _: Option<&str>) {}
     }
 
     struct FallbackStore;
@@ -672,7 +672,7 @@ mod tests {
         async fn create_safety_snapshot(&self, _: &str) -> (Option<String>, Option<String>) {
             (Some("mem_snap_pre_daily_fallback".into()), None)
         }
-        async fn log_edit(&self, _: &str, _: &str, _: &[&str], _: &str, _: Option<&str>) {}
+        async fn log_edit(&self, _: &str, _: &str, _: Option<&str>, _: Option<&str>, _: &str, _: Option<&str>) {}
     }
 
     #[derive(Default)]
@@ -737,7 +737,7 @@ mod tests {
         async fn create_safety_snapshot(&self, _: &str) -> (Option<String>, Option<String>) {
             (None, None)
         }
-        async fn log_edit(&self, _: &str, _: &str, _: &[&str], _: &str, _: Option<&str>) {}
+        async fn log_edit(&self, _: &str, _: &str, _: Option<&str>, _: Option<&str>, _: &str, _: Option<&str>) {}
 
         async fn check_shared_breaker(
             &self,

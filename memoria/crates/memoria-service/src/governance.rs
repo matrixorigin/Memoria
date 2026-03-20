@@ -112,7 +112,8 @@ pub trait GovernanceStore: Send + Sync {
         &self,
         user_id: &str,
         operation: &str,
-        target_ids: &[&str],
+        memory_id: Option<&str>,
+        payload: Option<&str>,
         reason: &str,
         snapshot_before: Option<&str>,
     );
@@ -240,19 +241,12 @@ impl GovernanceStore for SqlMemoryStore {
         &self,
         user_id: &str,
         operation: &str,
-        target_ids: &[&str],
+        memory_id: Option<&str>,
+        payload: Option<&str>,
         reason: &str,
         snapshot_before: Option<&str>,
     ) {
-        SqlMemoryStore::log_edit(
-            self,
-            user_id,
-            operation,
-            target_ids,
-            reason,
-            snapshot_before,
-        )
-        .await;
+        SqlMemoryStore::log_edit(self, user_id, operation, memory_id, payload, reason, snapshot_before).await;
     }
 
     async fn check_shared_breaker(
@@ -435,7 +429,8 @@ impl DefaultGovernanceStrategy {
                             .log_edit(
                                 &user_id,
                                 "governance:archive_working",
-                                &[],
+                                None,
+                                None,
                                 &format!(
                                     "archived {count} stale working memories (>{}h)",
                                     Self::STALE_WORKING_HOURS
@@ -501,7 +496,8 @@ impl DefaultGovernanceStrategy {
                             .log_edit(
                                 user_id,
                                 "governance:cleanup_stale",
-                                &[],
+                                None,
+                                None,
                                 &format!("cleaned {cleaned}"),
                                 state.snapshot_before.as_deref(),
                             )
@@ -560,7 +556,8 @@ impl DefaultGovernanceStrategy {
                             .log_edit(
                                 user_id,
                                 "governance:quarantine",
-                                &[],
+                                None,
+                                None,
                                 &format!("quarantined {count}"),
                                 state.snapshot_before.as_deref(),
                             )
@@ -624,7 +621,8 @@ impl DefaultGovernanceStrategy {
                             .log_edit(
                                 user_id,
                                 "governance:compress_redundant",
-                                &[],
+                                None,
+                                None,
                                 &format!("compressed {count}"),
                                 state.snapshot_before.as_deref(),
                             )
@@ -688,7 +686,8 @@ impl DefaultGovernanceStrategy {
                             .log_edit(
                                 user_id,
                                 "governance:cleanup_orphaned_incrementals",
-                                &[],
+                                None,
+                                None,
                                 &format!("cleaned {count}"),
                                 state.snapshot_before.as_deref(),
                             )
@@ -1339,7 +1338,8 @@ mod tests {
             &self,
             user_id: &str,
             operation: &str,
-            _target_ids: &[&str],
+            _memory_id: Option<&str>,
+            _payload: Option<&str>,
             reason: &str,
             snapshot_before: Option<&str>,
         ) {

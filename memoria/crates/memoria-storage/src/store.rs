@@ -8,6 +8,15 @@ pub(crate) fn db_err(e: sqlx::Error) -> MemoriaError {
     MemoriaError::Database(e.to_string())
 }
 
+/// One entry for [`SqlMemoryStore::batch_log_edit`].
+/// Fields: `(user_id, operation, memory_id, payload, reason, snapshot_before)`.
+pub type EditLogEntry<'a> = (&'a str, &'a str, Option<&'a str>, Option<&'a str>, &'a str, Option<&'a str>);
+
+/// Generate a UUID v7 (time-ordered) as a simple hex string.
+fn uuid7_id() -> String {
+    uuid::Uuid::now_v7().simple().to_string()
+}
+
 /// Sanitize a string for safe interpolation inside a SQL single-quoted literal.
 /// Escapes `'`, `\`, and strips NUL bytes.
 #[allow(dead_code)]
@@ -456,24 +465,39 @@ impl SqlMemoryStore {
         .execute(&self.pool)
         .await;
 
-        // mem_edit_log — audit log for inject/correct/purge/governance operations
+        // mem_edit_log — append-only audit log for inject/correct/purge/governance
         sqlx::query(
             r#"CREATE TABLE IF NOT EXISTS mem_edit_log (
-                edit_id         VARCHAR(64)  PRIMARY KEY,
+                edit_id         VARCHAR(64)  NOT NULL,
                 user_id         VARCHAR(64)  NOT NULL,
+                memory_id       VARCHAR(64)  DEFAULT NULL,
                 operation       VARCHAR(64)  NOT NULL,
-                target_ids      JSON         DEFAULT NULL,
+                payload         JSON         DEFAULT NULL,
                 reason          TEXT         DEFAULT NULL,
                 snapshot_before VARCHAR(64)  DEFAULT NULL,
                 created_at      DATETIME(6)  NOT NULL DEFAULT NOW(),
                 created_by      VARCHAR(64)  NOT NULL,
-                INDEX idx_edit_user (user_id),
-                INDEX idx_edit_operation (operation)
-            )"#,
+                INDEX idx_user_time (user_id, created_at),
+                INDEX idx_memory_time (memory_id, created_at)
+            ) CLUSTER BY (created_at, user_id)"#,
         )
         .execute(&self.pool)
         .await
         .map_err(db_err)?;
+
+        // Migration: add memory_id column to existing mem_edit_log tables
+        let _ = sqlx::query(
+            "ALTER TABLE mem_edit_log ADD COLUMN memory_id VARCHAR(64) DEFAULT NULL",
+        )
+        .execute(&self.pool)
+        .await;
+
+        // Migration: add payload column to existing mem_edit_log tables
+        let _ = sqlx::query(
+            "ALTER TABLE mem_edit_log ADD COLUMN payload JSON DEFAULT NULL",
+        )
+        .execute(&self.pool)
+        .await;
 
         // Graph tables
         self.graph_store().migrate().await?;
@@ -682,24 +706,26 @@ impl SqlMemoryStore {
     }
 
     /// Write an audit record to mem_edit_log. Best-effort — never fails the caller.
+    /// For batch operations, call once per memory_id.
     pub async fn log_edit(
         &self,
         user_id: &str,
         operation: &str,
-        target_ids: &[&str],
+        memory_id: Option<&str>,
+        payload: Option<&str>,
         reason: &str,
         snapshot_before: Option<&str>,
     ) {
-        let tids = serde_json::to_string(target_ids).unwrap_or_else(|_| "[]".to_string());
-        let edit_id = uuid::Uuid::new_v4().simple().to_string();
+        let edit_id = uuid7_id();
         let _ = sqlx::query(
-            "INSERT INTO mem_edit_log (edit_id, user_id, operation, target_ids, reason, snapshot_before, created_by) \
-             VALUES (?, ?, ?, ?, ?, ?, ?)"
+            "INSERT INTO mem_edit_log (edit_id, user_id, memory_id, operation, payload, reason, snapshot_before, created_by) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
         )
         .bind(&edit_id)
         .bind(user_id)
+        .bind(memory_id)
         .bind(operation)
-        .bind(&tids)
+        .bind(payload)
         .bind(reason)
         .bind(snapshot_before)
         .bind(user_id)
@@ -2052,6 +2078,103 @@ impl SqlMemoryStore {
         Ok(())
     }
 
+    /// Batch-insert multiple memories in a single multi-row INSERT statement.
+    /// Falls back to single inserts if the batch is empty.
+    pub async fn batch_insert_into(
+        &self,
+        table: &str,
+        memories: &[&Memory],
+    ) -> Result<(), MemoriaError> {
+        if memories.is_empty() {
+            return Ok(());
+        }
+        // Chunk to avoid oversized SQL statements
+        for chunk in memories.chunks(50) {
+            let placeholders = chunk
+                .iter()
+                .map(|_| "(?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)")
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "INSERT INTO {table} \
+                 (memory_id, user_id, memory_type, content, embedding, session_id, \
+                  source_event_ids, extra_metadata, is_active, superseded_by, \
+                  trust_tier, initial_confidence, observed_at, created_at, updated_at) \
+                 VALUES {placeholders}"
+            );
+            let now = Utc::now().naive_utc();
+            let mut q = sqlx::query(&sql);
+            for m in chunk {
+                let observed_at = m.observed_at.map(|dt| dt.naive_utc()).unwrap_or(now);
+                let created_at = m.created_at.map(|dt| dt.naive_utc()).unwrap_or(now);
+                let source_event_ids = serde_json::to_string(&m.source_event_ids)?;
+                let extra_metadata = m
+                    .extra_metadata
+                    .as_ref()
+                    .map(serde_json::to_string)
+                    .transpose()?
+                    .unwrap_or_else(|| "{}".to_string());
+                let embedding = m
+                    .embedding
+                    .as_deref()
+                    .filter(|v| !v.is_empty())
+                    .map(vec_to_mo);
+                q = q
+                    .bind(m.memory_id.clone())
+                    .bind(m.user_id.clone())
+                    .bind(m.memory_type.to_string())
+                    .bind(m.content.clone())
+                    .bind(embedding)
+                    .bind(m.session_id.clone())
+                    .bind(source_event_ids)
+                    .bind(extra_metadata)
+                    .bind(m.superseded_by.clone())
+                    .bind(m.trust_tier.to_string())
+                    .bind(m.initial_confidence as f32)
+                    .bind(observed_at)
+                    .bind(created_at)
+                    .bind(now);
+            }
+            q.execute(&self.pool).await.map_err(db_err)?;
+        }
+        Ok(())
+    }
+
+    /// Batch-insert multiple edit log entries in a single statement.
+    pub async fn batch_log_edit(
+        &self,
+        entries: &[EditLogEntry<'_>],
+    ) {
+        if entries.is_empty() {
+            return;
+        }
+        for chunk in entries.chunks(50) {
+            let placeholders = chunk
+                .iter()
+                .map(|_| "(?, ?, ?, ?, ?, ?, ?, ?)")
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "INSERT INTO mem_edit_log \
+                 (edit_id, user_id, memory_id, operation, payload, reason, snapshot_before, created_by) \
+                 VALUES {placeholders}"
+            );
+            let mut q = sqlx::query(&sql);
+            for (user_id, operation, memory_id, payload, reason, snapshot_before) in chunk {
+                q = q
+                    .bind(uuid7_id())
+                    .bind(*user_id)
+                    .bind(*memory_id)
+                    .bind(*operation)
+                    .bind(*payload)
+                    .bind(*reason)
+                    .bind(*snapshot_before)
+                    .bind(*user_id);
+            }
+            let _ = q.execute(&self.pool).await;
+        }
+    }
+
     pub async fn list_active_from(
         &self,
         table: &str,
@@ -2422,7 +2545,10 @@ impl SqlMemoryStore {
         memory_id: &str,
         entities: &[(String, String)], // (name, type)
     ) -> Result<(usize, usize), MemoriaError> {
-        // (created, reused)
+        if entities.is_empty() {
+            return Ok((0, 0));
+        }
+        // Fetch existing entity names for this (user, memory) pair
         let existing: std::collections::HashSet<String> = {
             let rows = sqlx::query(
                 "SELECT entity_name FROM mem_entity_links WHERE user_id = ? AND memory_id = ?",
@@ -2436,25 +2562,47 @@ impl SqlMemoryStore {
                 .filter_map(|r| r.try_get::<String, _>("entity_name").ok())
                 .collect()
         };
-        let now = chrono::Utc::now().naive_utc();
-        let mut created = 0usize;
+        // Partition into new vs reused, dedup by lowercased name within the batch
+        let mut seen = std::collections::HashSet::new();
+        let mut to_insert: Vec<(String, &str)> = Vec::new(); // (name_lc, entity_type)
         let mut reused = 0usize;
         for (name, etype) in entities {
             let name_lc = name.to_lowercase();
-            if existing.contains(&name_lc) {
+            if existing.contains(&name_lc) || !seen.insert(name_lc.clone()) {
                 reused += 1;
                 continue;
             }
-            let id = uuid::Uuid::new_v4().to_string().replace('-', "");
-            sqlx::query(
-                "INSERT INTO mem_entity_links (id, user_id, memory_id, entity_name, entity_type, source, created_at) \
-                 VALUES (?, ?, ?, ?, ?, 'manual', ?)"
-            )
-            .bind(&id).bind(user_id).bind(memory_id).bind(&name_lc).bind(etype).bind(now)
-            .execute(&self.pool).await.map_err(db_err)?;
-            created += 1;
+            to_insert.push((name_lc, etype.as_str()));
         }
-        Ok((created, reused))
+        if to_insert.is_empty() {
+            return Ok((0, reused));
+        }
+        let now = chrono::Utc::now().naive_utc();
+        for chunk in to_insert.chunks(50) {
+            let placeholders = chunk
+                .iter()
+                .map(|_| "(?, ?, ?, ?, ?, 'manual', ?)")
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "INSERT INTO mem_entity_links \
+                 (id, user_id, memory_id, entity_name, entity_type, source, created_at) \
+                 VALUES {placeholders}"
+            );
+            let mut q = sqlx::query(&sql);
+            for (name_lc, etype) in chunk {
+                let id = uuid::Uuid::new_v4().to_string().replace('-', "");
+                q = q
+                    .bind(id)
+                    .bind(user_id)
+                    .bind(memory_id)
+                    .bind(name_lc.as_str())
+                    .bind(*etype)
+                    .bind(now);
+            }
+            q.execute(&self.pool).await.map_err(db_err)?;
+        }
+        Ok((to_insert.len(), reused))
     }
 }
 

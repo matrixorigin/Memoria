@@ -147,33 +147,18 @@ When `memory_governance` reports snapshot_health with high auto_ratio (>50%), su
 ### Branches (isolated experiments)
 Git-like workflow for memory. `memory_branch(name)` creates, `memory_checkout(name)` switches, `memory_diff(source)` previews changes, `memory_merge(source)` merges back, `memory_branch_delete(name)` cleans up. `memory_branches()` lists all.
 
-### Entity graph (proactive — call when conditions are met)
-| Tool | When to call | Key params |
-|------|-------------|------------|
-| `memory_extract_entities` | **Proactively** after storing ≥ 5 new memories in a session, OR when user discusses a new project/technology/person not yet in the graph | `mode` (default: auto) |
-| `memory_link_entities` | After `extract_entities(mode='candidates')` returns memories — extract entities yourself, then call this | `entities` (JSON string) |
+### Entity graph
+Entity extraction is automatic — every `memory_store` triggers regex-based extraction, with LLM extraction as a fallback when configured. No manual intervention needed.
 
-**Trigger heuristics — call `memory_extract_entities` when ANY of these are true:**
-- You stored ≥ 5 memories this session and haven't extracted entities yet
-- User mentions a project, technology, or person by name that you haven't seen in previous `memory_retrieve` results
-- User asks about relationships between concepts ("how does X relate to Y")
-- User starts working on a new codebase or topic area
-
-**Do NOT extract entities when:**
-- Conversation is short (< 3 turns) and no new named entities appeared
-- User is only asking questions, not sharing new information
-- You already ran extraction this session
-
-### Maintenance
+### Maintenance (proactive triggers in [memory-hygiene](memory-hygiene.md), manual triggers below)
 | Tool | Trigger phrase | Cooldown |
 |------|---------------|----------|
-| `memory_governance` | "clean up memories", "check memory health", or proactively when retrieval returns outdated/contradictory results | 1 hour |
+| `memory_governance` | "clean up memories", "check memory health", or proactively per [memory-hygiene](memory-hygiene.md) | 1 hour |
 | `memory_consolidate` | "check for contradictions", "fix conflicts" | 30 min |
 | `memory_reflect` | "find patterns", "summarize what you know" | 2 hours |
-| `memory_rebuild_index` | Only when governance reports `needs_rebuild=True` | — |
 | `memory_snapshot_delete` | When governance reports high snapshot auto_ratio, or user asks to clean snapshots | — |
 
-`memory_reflect` and `memory_extract_entities` support `mode` parameter:
+`memory_reflect` supports `mode` parameter:
 - `auto` (default): uses Memoria's internal LLM if configured, otherwise returns candidates for YOU to process
-- `candidates`: always returns raw data for YOU to synthesize/extract, then store results via `memory_store` or `memory_link_entities`
+- `candidates`: always returns raw data for YOU to synthesize, then store results via `memory_store`
 - `internal`: always uses Memoria's internal LLM (fails if not configured)

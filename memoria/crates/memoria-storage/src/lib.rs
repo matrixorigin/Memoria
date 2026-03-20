@@ -6,4 +6,4 @@ pub use graph::{
     backfill_graph, extract_entities, BackfillResult, ConsolidationResult, GraphConsolidator,
     GraphStore,
 };
-pub use store::{FeedbackStats, MemoryFeedback, SqlMemoryStore, TierFeedback, UserRetrievalParams};
+pub use store::{EditLogEntry, FeedbackStats, MemoryFeedback, SqlMemoryStore, TierFeedback, UserRetrievalParams};

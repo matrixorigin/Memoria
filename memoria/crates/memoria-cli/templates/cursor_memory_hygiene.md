@@ -19,7 +19,6 @@ Run `memory_governance` (1h cooldown) when you notice ANY of these:
 
 After governance, check the response for:
 - `snapshot_health.auto_ratio > 50%` → suggest `memory_snapshot_delete(prefix="auto:")`
-- `needs_rebuild = True` → run `memory_rebuild_index`
 - Quarantined memories → inform user what was quarantined and why
 
 ## Contradiction Resolution
@@ -54,7 +53,7 @@ Keep named snapshots the user created explicitly.
 
 ## Entity Graph Maintenance
 
-After entity extraction, if mode returns candidates, extract entities yourself and call `memory_link_entities` with the correct JSON format.
+Entity extraction is automatic — every `memory_store` triggers regex-based extraction, with LLM extraction as a fallback when configured. No manual intervention needed.
 
 ## Reflection Cadence
 
