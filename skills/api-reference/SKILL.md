@@ -100,11 +100,81 @@ All fields optional. Auto-creates safety snapshot. Response: `{ "purged": N, "sn
 
 | Endpoint | Cooldown | Description |
 |----------|----------|-------------|
+| `POST /v1/governance?force=false` | 1 hour | Quarantine low-confidence, cleanup stale |
 | `POST /v1/consolidate?force=false` | 30 min | Detect contradictions, fix orphans |
 | `POST /v1/reflect?force=false` | 2 hours | Synthesize insights (needs LLM) |
 | `POST /v1/extract-entities` | — | Extract entities, build graph (needs LLM) |
+| `POST /v1/extract-entities/link` | — | Manually link entities to memories |
+| `GET /v1/entities` | — | List user's entities |
 
 LLM-free alternatives: `POST /v1/reflect/candidates`, `POST /v1/extract-entities/candidates` — return raw data for the calling agent to process.
+
+## Feedback & Adaptive Retrieval
+
+Feedback signals improve retrieval ranking over time. The system learns which memories are useful/irrelevant for each user.
+
+### How It Works
+
+1. User retrieves memories via `memory_retrieve` or `memory_search`
+2. Agent uses memories to answer questions
+3. Agent calls `memory_feedback` with signal based on outcome
+4. System adjusts `feedback_weight` parameter (auto-tuned daily by governance)
+5. Future retrievals rank memories higher/lower based on accumulated feedback
+
+**Quantified Impact**: With default `feedback_weight=0.1`, a memory with 3 `useful` signals scores ~1.3x higher; one with 2 `wrong` signals scores ~0.9x lower. At `feedback_weight=0.3`, these become ~1.9x and ~0.7x respectively.
+
+### Record Feedback: `POST /v1/memories/{id}/feedback`
+
+```json
+{ "signal": "useful", "context": "helped answer the question" }
+```
+
+Signals: `useful`, `irrelevant`, `outdated`, `wrong`
+
+Returns `201` with `{ "feedback_id": "..." }`
+
+**Errors**:
+- `404`: Memory not found
+- `422`: Invalid signal value
+
+### Get Stats: `GET /v1/feedback/stats`
+
+Returns aggregated feedback counts:
+```json
+{ "useful": 42, "irrelevant": 5, "outdated": 3, "wrong": 1 }
+```
+
+### Get by Tier: `GET /v1/feedback/by-tier`
+
+Returns feedback breakdown by trust tier (T1-T4).
+
+### Tune Parameters: `POST /v1/retrieval-params/tune`
+
+Manually adjust retrieval scoring weights:
+```json
+{ "feedback_weight": 0.15 }
+```
+
+`feedback_weight`: 0.01–0.5 (default 0.1). Higher = feedback has more impact on ranking.
+
+Auto-tuning: `POST /v1/retrieval-params/tune` with empty body triggers automatic tuning based on accumulated feedback.
+
+**Errors**:
+- `422`: `feedback_weight` out of range
+- `200` with `"message"`: Not enough feedback (requires ≥10 signals)
+
+### Get Parameters: `GET /v1/retrieval-params`
+
+Returns current retrieval parameters for the user.
+
+### Related Tools
+
+| Tool | Relationship |
+|------|-------------|
+| `memory_retrieve` / `memory_search` | Feedback affects their ranking results |
+| `memory_correct` | Use instead of `wrong` feedback when content needs fixing |
+| `memory_purge` | Use instead of `outdated` feedback when memory should be deleted |
+| `memory_governance` | Auto-tunes `feedback_weight` daily based on feedback patterns |
 
 ## Episodic Memory
 

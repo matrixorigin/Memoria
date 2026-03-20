@@ -6,6 +6,7 @@ edition = "2021"
 [features]
 default = []
 local-embedding = ["memoria-embedding/local-embedding"]
+otel = ["memoria-api/otel"]
 
 [[bin]]
 name = "memoria"
@@ -34,6 +35,10 @@ ed25519-dalek = { version = "2.1", default-features = false, features = ["std"] 
 base64 = "0.22"
 getrandom = "0.2"
 cliclack = "0.4"
+flate2 = "1.1.9"
+tar = "0.4.45"
+tempfile = "3.27.0"
+self-replace = "1.5.0"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

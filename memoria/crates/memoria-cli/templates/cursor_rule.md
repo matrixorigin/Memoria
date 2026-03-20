@@ -1,5 +1,5 @@
 ---
-description:
+description: USE WHEN working with Memoria memory tools - storing, retrieving, correcting, purging memories
 globs:
 alwaysApply: true
 ---
@@ -11,18 +11,17 @@ alwaysApply: true
 You have persistent memory via MCP tools. Memory survives across conversations.
 
 ## 🔴 MANDATORY: Every conversation start
-Before your first response, run a multi-query bootstrap to load full context:
 
-1. **Primary query** — call `memory_retrieve` with a **semantic query** derived from the user's message.
-2. **Active goals** — `memory_search(query="GOAL ACTIVE")` (if user's message references ongoing work or a previous task)
-3. **User profile** — `memory_profile()` (if user asks about preferences or you need style context)
+Call `memory_retrieve` with a **semantic query** derived from the user's message BEFORE responding.
 
-**Query construction rules:**
-- ✅ **DO**: Extract key concepts from user's question → "benchmark optimization", "graph retrieval bug", "active goals"
-- ❌ **DON'T**: Use meta-queries → "all memories", "everything", "list all", "show me data"
-- When user asks "what do I know" or "我有哪些记忆", query the most recent active context instead (e.g., "recent goals tasks projects")
+**Query rules:**
+- ✅ Extract key concepts → "benchmark optimization", "graph retrieval bug"
+- ❌ Don't use meta-queries → "all memories", "everything", "list all"
 
 **After retrieval:**
+- Results → use as reference, verify against current context
+- "No relevant memories" → normal for new users, proceed
+- ⚠️ warnings → inform user, offer `memory_governance`
 - If results come back → use them as **reference only**. Treat retrieved memories as potentially stale or incomplete — always verify against current context before acting on them. Do NOT blindly trust memory content as ground truth.
 - If "No relevant memories found" → this is normal for new users, proceed without.
 - If ⚠️ health warnings appear → inform the user and offer to run `memory_governance`.
@@ -95,6 +94,35 @@ Before storing a new memory, consider:
 | `memory_retrieve` | Conversation start, or when context is needed | `query`, `top_k` (default 5), `session_id` (optional), `explain` (false = no debug, true = show timing) |
 | `memory_search` | User asks "what do you know about X" or you need to browse | `query`, `top_k` (default 10), `explain` (false = no debug, true = show timing) |
 | `memory_profile` | User asks "what do you know about me" | — |
+| `memory_feedback` | After using a retrieved memory, record if it was helpful | `memory_id`, `signal` (useful/irrelevant/outdated/wrong), `context` (optional) |
+
+**`memory_feedback`**: Call this after retrieval when you can assess whether a memory was helpful. Signals:
+- `useful` — memory helped answer the question or complete the task
+- `irrelevant` — memory was retrieved but not relevant to the query
+- `outdated` — memory contains stale information (consider `memory_correct` instead if you know the new value)
+- `wrong` — memory contains incorrect information (consider `memory_correct` instead if you know the correct value)
+
+**When to call feedback vs other tools**:
+- Memory helped → `memory_feedback(signal="useful")`
+- Memory irrelevant but correct → `memory_feedback(signal="irrelevant")`
+- Memory outdated and you know new value → `memory_correct` (not feedback)
+- Memory outdated but you don't know new value → `memory_feedback(signal="outdated")`
+- Memory wrong and you know correct value → `memory_correct` (not feedback)
+- Memory should be deleted → `memory_purge` (not feedback)
+
+**Example flow**:
+```
+# 1. Retrieve memories
+memories = memory_retrieve(query="database config")
+
+# 2. Use memories to answer user's question
+# ... (memory about "Uses PostgreSQL" helped answer)
+
+# 3. Record feedback for the helpful memory
+memory_feedback(memory_id="abc123", signal="useful", context="answered DB question")
+```
+
+**Impact**: Feedback accumulates over time. With default settings, a memory with 3 `useful` signals ranks ~30% higher in future retrievals. Don't call for every memory — only when you have clear signal.
 
 **`memory_retrieve` vs `memory_search`**: In MCP mode, both use the same retrieval pipeline (graph → hybrid vector+fulltext → fulltext fallback). The differences are:
 - `memory_retrieve` accepts `session_id` for session-scoped boosting; `memory_search` does not
@@ -128,33 +156,18 @@ When `memory_governance` reports snapshot_health with high auto_ratio (>50%), su
 ### Branches (isolated experiments)
 Git-like workflow for memory. `memory_branch(name)` creates, `memory_checkout(name)` switches, `memory_diff(source)` previews changes, `memory_merge(source)` merges back, `memory_branch_delete(name)` cleans up. `memory_branches()` lists all.
 
-### Entity graph (proactive — call when conditions are met)
-| Tool | When to call | Key params |
-|------|-------------|------------|
-| `memory_extract_entities` | **Proactively** after storing ≥ 5 new memories in a session, OR when user discusses a new project/technology/person not yet in the graph | `mode` (default: auto) |
-| `memory_link_entities` | After `extract_entities(mode='candidates')` returns memories — extract entities yourself, then call this | `entities` (JSON string) |
+### Entity graph
+Entity extraction is automatic — every `memory_store` triggers regex-based extraction, with LLM extraction as a fallback when configured. No manual intervention needed.
 
-**Trigger heuristics — call `memory_extract_entities` when ANY of these are true:**
-- You stored ≥ 5 memories this session and haven't extracted entities yet
-- User mentions a project, technology, or person by name that you haven't seen in previous `memory_retrieve` results
-- User asks about relationships between concepts ("how does X relate to Y")
-- User starts working on a new codebase or topic area
-
-**Do NOT extract entities when:**
-- Conversation is short (< 3 turns) and no new named entities appeared
-- User is only asking questions, not sharing new information
-- You already ran extraction this session
-
-### Maintenance
+### Maintenance (proactive triggers in [memory-hygiene](memory-hygiene.md), manual triggers below)
 | Tool | Trigger phrase | Cooldown |
 |------|---------------|----------|
-| `memory_governance` | "clean up memories", "check memory health", or proactively when retrieval returns outdated/contradictory results | 1 hour |
+| `memory_governance` | "clean up memories", "check memory health", or proactively per [memory-hygiene](memory-hygiene.md) | 1 hour |
 | `memory_consolidate` | "check for contradictions", "fix conflicts" | 30 min |
 | `memory_reflect` | "find patterns", "summarize what you know" | 2 hours |
-| `memory_rebuild_index` | Only when governance reports `needs_rebuild=True` | — |
 | `memory_snapshot_delete` | When governance reports high snapshot auto_ratio, or user asks to clean snapshots | — |
 
-`memory_reflect` and `memory_extract_entities` support `mode` parameter:
+`memory_reflect` supports `mode` parameter:
 - `auto` (default): uses Memoria's internal LLM if configured, otherwise returns candidates for YOU to process
-- `candidates`: always returns raw data for YOU to synthesize/extract, then store results via `memory_store` or `memory_link_entities`
+- `candidates`: always returns raw data for YOU to synthesize, then store results via `memory_store`
 - `internal`: always uses Memoria's internal LLM (fails if not configured)

@@ -8,6 +8,15 @@ pub(crate) fn db_err(e: sqlx::Error) -> MemoriaError {
     MemoriaError::Database(e.to_string())
 }
 
+/// One entry for [`SqlMemoryStore::batch_log_edit`].
+/// Fields: `(user_id, operation, memory_id, payload, reason, snapshot_before)`.
+pub type EditLogEntry<'a> = (&'a str, &'a str, Option<&'a str>, Option<&'a str>, &'a str, Option<&'a str>);
+
+/// Generate a UUID v7 (time-ordered) as a simple hex string.
+fn uuid7_id() -> String {
+    uuid::Uuid::now_v7().simple().to_string()
+}
+
 /// Sanitize a string for safe interpolation inside a SQL single-quoted literal.
 /// Escapes `'`, `\`, and strips NUL bytes.
 #[allow(dead_code)]
@@ -87,6 +96,53 @@ pub struct SnapshotRegistration {
     pub created_at: chrono::NaiveDateTime,
 }
 
+/// Aggregated feedback statistics for a user.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct FeedbackStats {
+    pub total: i64,
+    pub useful: i64,
+    pub irrelevant: i64,
+    pub outdated: i64,
+    pub wrong: i64,
+}
+
+/// Feedback breakdown by trust tier.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TierFeedback {
+    pub tier: String,
+    pub signal: String,
+    pub count: i64,
+}
+
+/// Feedback counts for a single memory (denormalized, no JOIN needed).
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct MemoryFeedback {
+    pub useful: i32,
+    pub irrelevant: i32,
+    pub outdated: i32,
+    pub wrong: i32,
+}
+
+/// Per-user adaptive retrieval parameters.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct UserRetrievalParams {
+    pub user_id: String,
+    pub feedback_weight: f64,
+    pub temporal_decay_hours: f64,
+    pub confidence_weight: f64,
+}
+
+impl Default for UserRetrievalParams {
+    fn default() -> Self {
+        Self {
+            user_id: String::new(),
+            feedback_weight: 0.1,
+            temporal_decay_hours: 168.0,
+            confidence_weight: 0.1,
+        }
+    }
+}
+
 impl SqlMemoryStore {
     pub fn new(pool: MySqlPool, embedding_dim: usize) -> Self {
         Self {
@@ -118,8 +174,12 @@ impl SqlMemoryStore {
                 }
             }
         }
+        let max_conns: u32 = std::env::var("DB_MAX_CONNECTIONS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(10);
         let pool = sqlx::mysql::MySqlPoolOptions::new()
-            .max_connections(10)
+            .max_connections(max_conns)
             .idle_timeout(std::time::Duration::from_secs(300))
             .acquire_timeout(std::time::Duration::from_secs(10))
             .connect(database_url)
@@ -361,36 +421,83 @@ impl SqlMemoryStore {
         .await
         .map_err(db_err)?;
 
-        // mem_memories_stats — access_count tracking (separated to reduce write contention)
+        // mem_memories_stats — access_count + feedback tracking (separated to reduce write contention)
         sqlx::query(
             r#"CREATE TABLE IF NOT EXISTS mem_memories_stats (
-                memory_id       VARCHAR(64)  PRIMARY KEY,
-                access_count    INT          NOT NULL DEFAULT 0,
-                last_accessed_at DATETIME(6)
+                memory_id        VARCHAR(64)  PRIMARY KEY,
+                access_count     INT          NOT NULL DEFAULT 0,
+                last_accessed_at DATETIME(6),
+                feedback_useful  INT          NOT NULL DEFAULT 0,
+                feedback_irrelevant INT       NOT NULL DEFAULT 0,
+                feedback_outdated INT         NOT NULL DEFAULT 0,
+                feedback_wrong   INT          NOT NULL DEFAULT 0,
+                last_feedback_at DATETIME(6)
             )"#,
         )
         .execute(&self.pool)
         .await
         .map_err(db_err)?;
 
-        // mem_edit_log — audit log for inject/correct/purge/governance operations
+        // Migration: add feedback columns to existing mem_memories_stats
+        let _ = sqlx::query(
+            "ALTER TABLE mem_memories_stats ADD COLUMN feedback_useful INT NOT NULL DEFAULT 0",
+        )
+        .execute(&self.pool)
+        .await;
+        let _ = sqlx::query(
+            "ALTER TABLE mem_memories_stats ADD COLUMN feedback_irrelevant INT NOT NULL DEFAULT 0",
+        )
+        .execute(&self.pool)
+        .await;
+        let _ = sqlx::query(
+            "ALTER TABLE mem_memories_stats ADD COLUMN feedback_outdated INT NOT NULL DEFAULT 0",
+        )
+        .execute(&self.pool)
+        .await;
+        let _ = sqlx::query(
+            "ALTER TABLE mem_memories_stats ADD COLUMN feedback_wrong INT NOT NULL DEFAULT 0",
+        )
+        .execute(&self.pool)
+        .await;
+        let _ = sqlx::query(
+            "ALTER TABLE mem_memories_stats ADD COLUMN last_feedback_at DATETIME(6)",
+        )
+        .execute(&self.pool)
+        .await;
+
+        // mem_edit_log — append-only audit log for inject/correct/purge/governance
         sqlx::query(
             r#"CREATE TABLE IF NOT EXISTS mem_edit_log (
-                edit_id         VARCHAR(64)  PRIMARY KEY,
+                edit_id         VARCHAR(64)  NOT NULL,
                 user_id         VARCHAR(64)  NOT NULL,
+                memory_id       VARCHAR(64)  DEFAULT NULL,
                 operation       VARCHAR(64)  NOT NULL,
-                target_ids      JSON         DEFAULT NULL,
+                payload         JSON         DEFAULT NULL,
                 reason          TEXT         DEFAULT NULL,
                 snapshot_before VARCHAR(64)  DEFAULT NULL,
                 created_at      DATETIME(6)  NOT NULL DEFAULT NOW(),
                 created_by      VARCHAR(64)  NOT NULL,
-                INDEX idx_edit_user (user_id),
-                INDEX idx_edit_operation (operation)
-            )"#,
+                INDEX idx_user_time (user_id, created_at),
+                INDEX idx_memory_time (memory_id, created_at)
+            ) CLUSTER BY (created_at, user_id)"#,
         )
         .execute(&self.pool)
         .await
         .map_err(db_err)?;
+
+        // Migration: add memory_id column to existing mem_edit_log tables
+        let _ = sqlx::query(
+            "ALTER TABLE mem_edit_log ADD COLUMN memory_id VARCHAR(64) DEFAULT NULL",
+        )
+        .execute(&self.pool)
+        .await;
+
+        // Migration: add payload column to existing mem_edit_log tables
+        let _ = sqlx::query(
+            "ALTER TABLE mem_edit_log ADD COLUMN payload JSON DEFAULT NULL",
+        )
+        .execute(&self.pool)
+        .await;
 
         // Graph tables
         self.graph_store().migrate().await?;
@@ -498,6 +605,37 @@ impl SqlMemoryStore {
             .map_err(db_err)?;
         }
 
+        // mem_retrieval_feedback — explicit relevance feedback for adaptive tuning
+        sqlx::query(
+            r#"CREATE TABLE IF NOT EXISTS mem_retrieval_feedback (
+                id          VARCHAR(64)  PRIMARY KEY,
+                user_id     VARCHAR(64)  NOT NULL,
+                memory_id   VARCHAR(64)  NOT NULL,
+                signal      VARCHAR(16)  NOT NULL,
+                context     TEXT         DEFAULT NULL,
+                created_at  DATETIME(6)  NOT NULL,
+                INDEX idx_feedback_user (user_id, created_at),
+                INDEX idx_feedback_memory (memory_id)
+            )"#,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+
+        // mem_user_retrieval_params — per-user adaptive scoring parameters
+        sqlx::query(
+            r#"CREATE TABLE IF NOT EXISTS mem_user_retrieval_params (
+                user_id              VARCHAR(64)  PRIMARY KEY,
+                feedback_weight      DOUBLE       NOT NULL DEFAULT 0.1,
+                temporal_decay_hours DOUBLE       NOT NULL DEFAULT 168.0,
+                confidence_weight    DOUBLE       NOT NULL DEFAULT 0.1,
+                updated_at           DATETIME(6)  NOT NULL
+            )"#,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+
         Ok(())
     }
 
@@ -568,24 +706,26 @@ impl SqlMemoryStore {
     }
 
     /// Write an audit record to mem_edit_log. Best-effort — never fails the caller.
+    /// For batch operations, call once per memory_id.
     pub async fn log_edit(
         &self,
         user_id: &str,
         operation: &str,
-        target_ids: &[&str],
+        memory_id: Option<&str>,
+        payload: Option<&str>,
         reason: &str,
         snapshot_before: Option<&str>,
     ) {
-        let tids = serde_json::to_string(target_ids).unwrap_or_else(|_| "[]".to_string());
-        let edit_id = uuid::Uuid::new_v4().simple().to_string();
+        let edit_id = uuid7_id();
         let _ = sqlx::query(
-            "INSERT INTO mem_edit_log (edit_id, user_id, operation, target_ids, reason, snapshot_before, created_by) \
-             VALUES (?, ?, ?, ?, ?, ?, ?)"
+            "INSERT INTO mem_edit_log (edit_id, user_id, memory_id, operation, payload, reason, snapshot_before, created_by) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
         )
         .bind(&edit_id)
         .bind(user_id)
+        .bind(memory_id)
         .bind(operation)
-        .bind(&tids)
+        .bind(payload)
         .bind(reason)
         .bind(snapshot_before)
         .bind(user_id)
@@ -1321,6 +1461,239 @@ impl SqlMemoryStore {
         Ok(result.rows_affected() as i64)
     }
 
+    // ── Retrieval feedback ────────────────────────────────────────────────────
+
+    /// Record explicit relevance feedback for a memory.
+    /// signal: "useful" | "irrelevant" | "outdated" | "wrong"
+    pub async fn record_feedback(
+        &self,
+        user_id: &str,
+        memory_id: &str,
+        signal: &str,
+        context: Option<&str>,
+    ) -> Result<String, MemoriaError> {
+        // Validate signal
+        if !["useful", "irrelevant", "outdated", "wrong"].contains(&signal) {
+            return Err(MemoriaError::Validation(format!(
+                "Invalid signal '{}'. Must be one of: useful, irrelevant, outdated, wrong",
+                signal
+            )));
+        }
+        // Verify memory exists and belongs to user
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM mem_memories WHERE memory_id = ? AND user_id = ?",
+        )
+        .bind(memory_id)
+        .bind(user_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(db_err)?;
+        if count == 0 {
+            return Err(MemoriaError::NotFound(format!(
+                "Memory {} not found or not owned by user",
+                memory_id
+            )));
+        }
+
+        let id = uuid::Uuid::new_v4().simple().to_string();
+        sqlx::query(
+            "INSERT INTO mem_retrieval_feedback (id, user_id, memory_id, signal, context, created_at) \
+             VALUES (?, ?, ?, ?, ?, NOW())",
+        )
+        .bind(&id)
+        .bind(user_id)
+        .bind(memory_id)
+        .bind(signal)
+        .bind(context)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+
+        // Update denormalized feedback counters in mem_memories_stats
+        let col = match signal {
+            "useful" => "feedback_useful",
+            "irrelevant" => "feedback_irrelevant",
+            "outdated" => "feedback_outdated",
+            "wrong" => "feedback_wrong",
+            _ => unreachable!(),
+        };
+        let sql = format!(
+            "INSERT INTO mem_memories_stats (memory_id, {col}, last_feedback_at) VALUES (?, 1, NOW()) \
+             ON DUPLICATE KEY UPDATE {col} = {col} + 1, last_feedback_at = NOW()"
+        );
+        sqlx::query(&sql)
+            .bind(memory_id)
+            .execute(&self.pool)
+            .await
+            .map_err(db_err)?;
+
+        Ok(id)
+    }
+
+    /// Get feedback statistics for a user (for adaptive tuning analysis).
+    pub async fn get_feedback_stats(
+        &self,
+        user_id: &str,
+    ) -> Result<FeedbackStats, MemoriaError> {
+        let row: (i64, i64, i64, i64, i64) = sqlx::query_as(
+            "SELECT \
+               COUNT(*) as total, \
+               COALESCE(SUM(CASE WHEN signal = 'useful' THEN 1 ELSE 0 END), 0) as useful, \
+               COALESCE(SUM(CASE WHEN signal = 'irrelevant' THEN 1 ELSE 0 END), 0) as irrelevant, \
+               COALESCE(SUM(CASE WHEN signal = 'outdated' THEN 1 ELSE 0 END), 0) as outdated, \
+               COALESCE(SUM(CASE WHEN signal = 'wrong' THEN 1 ELSE 0 END), 0) as wrong \
+             FROM mem_retrieval_feedback WHERE user_id = ?",
+        )
+        .bind(user_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(FeedbackStats {
+            total: row.0,
+            useful: row.1,
+            irrelevant: row.2,
+            outdated: row.3,
+            wrong: row.4,
+        })
+    }
+
+    /// Get feedback breakdown by trust tier (for adaptive tuning).
+    pub async fn get_feedback_by_tier(
+        &self,
+        user_id: &str,
+    ) -> Result<Vec<TierFeedback>, MemoriaError> {
+        let rows: Vec<(String, String, i64)> = sqlx::query_as(
+            "SELECT m.trust_tier, f.signal, COUNT(*) as cnt \
+             FROM mem_retrieval_feedback f \
+             JOIN mem_memories m ON f.memory_id = m.memory_id \
+             WHERE f.user_id = ? \
+             GROUP BY m.trust_tier, f.signal \
+             ORDER BY m.trust_tier, f.signal",
+        )
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(rows
+            .into_iter()
+            .map(|(tier, signal, count)| TierFeedback { tier, signal, count })
+            .collect())
+    }
+
+    /// Get feedback counts for a single memory (from denormalized stats, no JOIN).
+    pub async fn get_memory_feedback(
+        &self,
+        memory_id: &str,
+    ) -> Result<MemoryFeedback, MemoriaError> {
+        let row: Option<(i32, i32, i32, i32)> = sqlx::query_as(
+            "SELECT feedback_useful, feedback_irrelevant, feedback_outdated, feedback_wrong \
+             FROM mem_memories_stats WHERE memory_id = ?",
+        )
+        .bind(memory_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+
+        Ok(row
+            .map(|(useful, irrelevant, outdated, wrong)| MemoryFeedback {
+                useful,
+                irrelevant,
+                outdated,
+                wrong,
+            })
+            .unwrap_or_default())
+    }
+
+    /// Get feedback counts for multiple memories (batch, for retrieval scoring).
+    pub async fn get_feedback_batch(
+        &self,
+        memory_ids: &[String],
+    ) -> Result<std::collections::HashMap<String, MemoryFeedback>, MemoriaError> {
+        let mut map = std::collections::HashMap::new();
+        if memory_ids.is_empty() {
+            return Ok(map);
+        }
+        for chunk in memory_ids.chunks(500) {
+            let placeholders: Vec<&str> = chunk.iter().map(|_| "?").collect();
+            let sql = format!(
+                "SELECT memory_id, feedback_useful, feedback_irrelevant, feedback_outdated, feedback_wrong \
+                 FROM mem_memories_stats WHERE memory_id IN ({})",
+                placeholders.join(", ")
+            );
+            let mut q = sqlx::query(&sql);
+            for id in chunk {
+                q = q.bind(id);
+            }
+            let rows = q.fetch_all(&self.pool).await.map_err(db_err)?;
+            for row in &rows {
+                let id: String = row.try_get("memory_id").map_err(db_err)?;
+                let useful: i32 = row.try_get("feedback_useful").unwrap_or(0);
+                let irrelevant: i32 = row.try_get("feedback_irrelevant").unwrap_or(0);
+                let outdated: i32 = row.try_get("feedback_outdated").unwrap_or(0);
+                let wrong: i32 = row.try_get("feedback_wrong").unwrap_or(0);
+                map.insert(id, MemoryFeedback { useful, irrelevant, outdated, wrong });
+            }
+        }
+        Ok(map)
+    }
+
+    // ── Per-User Retrieval Parameters ─────────────────────────────────────────
+
+    /// Get user's retrieval parameters, or default if not set.
+    pub async fn get_user_retrieval_params(
+        &self,
+        user_id: &str,
+    ) -> Result<UserRetrievalParams, MemoriaError> {
+        let row = sqlx::query(
+            "SELECT feedback_weight, temporal_decay_hours, confidence_weight \
+             FROM mem_user_retrieval_params WHERE user_id = ?",
+        )
+        .bind(user_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+
+        match row {
+            Some(r) => Ok(UserRetrievalParams {
+                user_id: user_id.to_string(),
+                feedback_weight: r.try_get("feedback_weight").unwrap_or(0.1),
+                temporal_decay_hours: r.try_get("temporal_decay_hours").unwrap_or(168.0),
+                confidence_weight: r.try_get("confidence_weight").unwrap_or(0.1),
+            }),
+            None => Ok(UserRetrievalParams {
+                user_id: user_id.to_string(),
+                ..Default::default()
+            }),
+        }
+    }
+
+    /// Update user's retrieval parameters.
+    pub async fn set_user_retrieval_params(
+        &self,
+        params: &UserRetrievalParams,
+    ) -> Result<(), MemoriaError> {
+        let now = Utc::now().format("%Y-%m-%d %H:%M:%S%.6f").to_string();
+        sqlx::query(
+            "INSERT INTO mem_user_retrieval_params \
+             (user_id, feedback_weight, temporal_decay_hours, confidence_weight, updated_at) \
+             VALUES (?, ?, ?, ?, ?) \
+             ON DUPLICATE KEY UPDATE \
+             feedback_weight = VALUES(feedback_weight), \
+             temporal_decay_hours = VALUES(temporal_decay_hours), \
+             confidence_weight = VALUES(confidence_weight), \
+             updated_at = VALUES(updated_at)",
+        )
+        .bind(&params.user_id)
+        .bind(params.feedback_weight)
+        .bind(params.temporal_decay_hours)
+        .bind(params.confidence_weight)
+        .bind(&now)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
     /// Get access_count for a set of memory IDs.
     pub async fn get_access_counts(
         &self,
@@ -1647,6 +2020,103 @@ impl SqlMemoryStore {
         Ok(())
     }
 
+    /// Batch-insert multiple memories in a single multi-row INSERT statement.
+    /// Falls back to single inserts if the batch is empty.
+    pub async fn batch_insert_into(
+        &self,
+        table: &str,
+        memories: &[&Memory],
+    ) -> Result<(), MemoriaError> {
+        if memories.is_empty() {
+            return Ok(());
+        }
+        // Chunk to avoid oversized SQL statements
+        for chunk in memories.chunks(50) {
+            let placeholders = chunk
+                .iter()
+                .map(|_| "(?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)")
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "INSERT INTO {table} \
+                 (memory_id, user_id, memory_type, content, embedding, session_id, \
+                  source_event_ids, extra_metadata, is_active, superseded_by, \
+                  trust_tier, initial_confidence, observed_at, created_at, updated_at) \
+                 VALUES {placeholders}"
+            );
+            let now = Utc::now().naive_utc();
+            let mut q = sqlx::query(&sql);
+            for m in chunk {
+                let observed_at = m.observed_at.map(|dt| dt.naive_utc()).unwrap_or(now);
+                let created_at = m.created_at.map(|dt| dt.naive_utc()).unwrap_or(now);
+                let source_event_ids = serde_json::to_string(&m.source_event_ids)?;
+                let extra_metadata = m
+                    .extra_metadata
+                    .as_ref()
+                    .map(serde_json::to_string)
+                    .transpose()?
+                    .unwrap_or_else(|| "{}".to_string());
+                let embedding = m
+                    .embedding
+                    .as_deref()
+                    .filter(|v| !v.is_empty())
+                    .map(vec_to_mo);
+                q = q
+                    .bind(m.memory_id.clone())
+                    .bind(m.user_id.clone())
+                    .bind(m.memory_type.to_string())
+                    .bind(m.content.clone())
+                    .bind(embedding)
+                    .bind(m.session_id.clone())
+                    .bind(source_event_ids)
+                    .bind(extra_metadata)
+                    .bind(m.superseded_by.clone())
+                    .bind(m.trust_tier.to_string())
+                    .bind(m.initial_confidence as f32)
+                    .bind(observed_at)
+                    .bind(created_at)
+                    .bind(now);
+            }
+            q.execute(&self.pool).await.map_err(db_err)?;
+        }
+        Ok(())
+    }
+
+    /// Batch-insert multiple edit log entries in a single statement.
+    pub async fn batch_log_edit(
+        &self,
+        entries: &[EditLogEntry<'_>],
+    ) {
+        if entries.is_empty() {
+            return;
+        }
+        for chunk in entries.chunks(50) {
+            let placeholders = chunk
+                .iter()
+                .map(|_| "(?, ?, ?, ?, ?, ?, ?, ?)")
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "INSERT INTO mem_edit_log \
+                 (edit_id, user_id, memory_id, operation, payload, reason, snapshot_before, created_by) \
+                 VALUES {placeholders}"
+            );
+            let mut q = sqlx::query(&sql);
+            for (user_id, operation, memory_id, payload, reason, snapshot_before) in chunk {
+                q = q
+                    .bind(uuid7_id())
+                    .bind(*user_id)
+                    .bind(*memory_id)
+                    .bind(*operation)
+                    .bind(*payload)
+                    .bind(*reason)
+                    .bind(*snapshot_before)
+                    .bind(*user_id);
+            }
+            let _ = q.execute(&self.pool).await;
+        }
+    }
+
     pub async fn list_active_from(
         &self,
         table: &str,
@@ -1832,8 +2302,9 @@ impl SqlMemoryStore {
         query: &str,
         limit: i64,
     ) -> Result<Vec<Memory>, MemoriaError> {
+        let params = self.get_user_retrieval_params(user_id).await.unwrap_or_default();
         let (mems, _) = self
-            .search_hybrid_from_scored(table, user_id, embedding, query, limit)
+            .search_hybrid_from_scored(table, user_id, embedding, query, limit, params.feedback_weight)
             .await?;
         Ok(mems)
     }
@@ -1847,6 +2318,7 @@ impl SqlMemoryStore {
         embedding: &[f32],
         query: &str,
         limit: i64,
+        feedback_weight: f64,
     ) -> Result<(Vec<Memory>, Vec<(String, f64, f64, f64, f64, f64)>), MemoriaError> {
         let fetch_k = (limit * 3).max(20);
         let vec_results = self
@@ -1889,6 +2361,9 @@ impl SqlMemoryStore {
         let ac_ids: Vec<String> = candidates.iter().map(|m| m.memory_id.clone()).collect();
         let ac_map = self.get_access_counts(&ac_ids).await.unwrap_or_default();
 
+        // Fetch feedback for relevance adjustment
+        let fb_map = self.get_feedback_batch(&ac_ids).await.unwrap_or_default();
+
         for m in &mut candidates {
             let vec_score = m.retrieval_score.unwrap_or(0.0);
             let raw_ft = ft_map.get(&m.memory_id).copied().unwrap_or(0.0);
@@ -1914,6 +2389,19 @@ impl SqlMemoryStore {
             if ac > 0 {
                 final_score *= 1.0 + 0.1 * ((1 + ac) as f64).ln();
             }
+
+            // Feedback adjustment: boost useful, penalize negative feedback
+            if let Some(fb) = fb_map.get(&m.memory_id) {
+                let positive = fb.useful as f64;
+                let negative = (fb.irrelevant + fb.outdated + fb.wrong) as f64;
+                // Net feedback score: positive boosts, negative penalizes
+                // Formula: multiplier = 1 + feedback_weight * (useful - 0.5 * negative)
+                let feedback_delta = positive - 0.5 * negative;
+                if feedback_delta.abs() > 0.01 {
+                    final_score *= (1.0 + feedback_weight * feedback_delta).clamp(0.5, 2.0);
+                }
+            }
+
             m.access_count = ac;
             m.retrieval_score = Some(final_score);
             score_breakdown.push((
@@ -1999,7 +2487,10 @@ impl SqlMemoryStore {
         memory_id: &str,
         entities: &[(String, String)], // (name, type)
     ) -> Result<(usize, usize), MemoriaError> {
-        // (created, reused)
+        if entities.is_empty() {
+            return Ok((0, 0));
+        }
+        // Fetch existing entity names for this (user, memory) pair
         let existing: std::collections::HashSet<String> = {
             let rows = sqlx::query(
                 "SELECT entity_name FROM mem_entity_links WHERE user_id = ? AND memory_id = ?",
@@ -2013,25 +2504,47 @@ impl SqlMemoryStore {
                 .filter_map(|r| r.try_get::<String, _>("entity_name").ok())
                 .collect()
         };
-        let now = chrono::Utc::now().naive_utc();
-        let mut created = 0usize;
+        // Partition into new vs reused, dedup by lowercased name within the batch
+        let mut seen = std::collections::HashSet::new();
+        let mut to_insert: Vec<(String, &str)> = Vec::new(); // (name_lc, entity_type)
         let mut reused = 0usize;
         for (name, etype) in entities {
             let name_lc = name.to_lowercase();
-            if existing.contains(&name_lc) {
+            if existing.contains(&name_lc) || !seen.insert(name_lc.clone()) {
                 reused += 1;
                 continue;
             }
-            let id = uuid::Uuid::new_v4().to_string().replace('-', "");
-            sqlx::query(
-                "INSERT INTO mem_entity_links (id, user_id, memory_id, entity_name, entity_type, source, created_at) \
-                 VALUES (?, ?, ?, ?, ?, 'manual', ?)"
-            )
-            .bind(&id).bind(user_id).bind(memory_id).bind(&name_lc).bind(etype).bind(now)
-            .execute(&self.pool).await.map_err(db_err)?;
-            created += 1;
+            to_insert.push((name_lc, etype.as_str()));
         }
-        Ok((created, reused))
+        if to_insert.is_empty() {
+            return Ok((0, reused));
+        }
+        let now = chrono::Utc::now().naive_utc();
+        for chunk in to_insert.chunks(50) {
+            let placeholders = chunk
+                .iter()
+                .map(|_| "(?, ?, ?, ?, ?, 'manual', ?)")
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "INSERT INTO mem_entity_links \
+                 (id, user_id, memory_id, entity_name, entity_type, source, created_at) \
+                 VALUES {placeholders}"
+            );
+            let mut q = sqlx::query(&sql);
+            for (name_lc, etype) in chunk {
+                let id = uuid::Uuid::new_v4().to_string().replace('-', "");
+                q = q
+                    .bind(id)
+                    .bind(user_id)
+                    .bind(memory_id)
+                    .bind(name_lc.as_str())
+                    .bind(*etype)
+                    .bind(now);
+            }
+            q.execute(&self.pool).await.map_err(db_err)?;
+        }
+        Ok((to_insert.len(), reused))
     }
 }
 

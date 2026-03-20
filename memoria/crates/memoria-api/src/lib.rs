@@ -1,5 +1,7 @@
 pub mod auth;
 pub mod models;
+pub mod otel;
+pub mod rate_limit;
 pub mod routes;
 pub mod state;
 
@@ -20,6 +22,8 @@ pub fn build_router(state: AppState) -> Router {
         // Health
         .route("/health", get(routes::memory::health))
         .route("/health/instance", get(routes::memory::health_instance))
+        // Metrics
+        .route("/metrics", get(routes::metrics::prometheus_metrics))
         // Memory CRUD
         .route("/v1/memories", get(routes::memory::list_memories))
         .route("/v1/memories", post(routes::memory::store_memory))
@@ -46,6 +50,25 @@ pub fn build_router(state: AppState) -> Router {
             get(routes::memory::get_profile),
         )
         .route("/v1/observe", post(routes::memory::observe_turn))
+        // Feedback
+        .route(
+            "/v1/memories/:id/feedback",
+            post(routes::memory::record_feedback),
+        )
+        .route("/v1/feedback/stats", get(routes::memory::get_feedback_stats))
+        .route(
+            "/v1/feedback/by-tier",
+            get(routes::memory::get_feedback_by_tier),
+        )
+        // Retrieval params
+        .route(
+            "/v1/retrieval-params",
+            get(routes::memory::get_retrieval_params).put(routes::memory::set_retrieval_params),
+        )
+        .route(
+            "/v1/retrieval-params/tune",
+            post(routes::memory::tune_retrieval_params),
+        )
         // Governance
         .route("/v1/governance", post(routes::governance::governance))
         .route("/v1/consolidate", post(routes::governance::consolidate))
@@ -112,6 +135,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/auth/keys/:id", delete(routes::auth::revoke_key))
         // Admin
         .route("/admin/stats", get(routes::admin::system_stats))
+        .route("/admin/config", get(routes::admin::get_config))
         .route("/admin/users", get(routes::admin::list_users))
         .route(
             "/admin/users/:user_id/stats",
@@ -186,6 +210,25 @@ pub fn build_router(state: AppState) -> Router {
         )
         .with_state(state)
         .layer(DefaultBodyLimit::max(2 * 1024 * 1024)) // 2 MB
+        .layer(tower_http::trace::TraceLayer::new_for_http()
+            .make_span_with(|req: &axum::http::Request<_>| {
+                tracing::info_span!(
+                    "http",
+                    method = %req.method(),
+                    path = %req.uri().path(),
+                )
+            })
+            .on_response(|res: &axum::http::Response<_>, latency: std::time::Duration, _span: &tracing::Span| {
+                let status = res.status().as_u16();
+                if status >= 500 {
+                    tracing::error!(status, latency_ms = latency.as_millis(), "5xx");
+                } else if status >= 400 {
+                    tracing::warn!(status, latency_ms = latency.as_millis(), "4xx");
+                } else {
+                    tracing::debug!(status, latency_ms = latency.as_millis(), "ok");
+                }
+            })
+        )
         .layer(CatchPanicLayer::custom(
             |err: Box<dyn std::any::Any + Send>| {
                 let detail = err

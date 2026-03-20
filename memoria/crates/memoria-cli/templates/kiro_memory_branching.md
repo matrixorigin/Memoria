@@ -1,5 +1,7 @@
 ---
-inclusion: agent_requested
+inclusion: auto
+name: memory-branching
+description: Git-like branching for memory - isolated experiments, tech evaluation, A/B comparison. Use when exploring alternatives or risky changes.
 ---
 
 <!-- memoria-version: 0.1.0-->

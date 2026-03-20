@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.2] - 2026-03-20
+
+### 🐛 Bug Fixes
+
+- Security and snapshot count  (#61) ([eafed50](https://github.com/matrixorigin/Memoria/commit/eafed5001036ff6720281eea5a625b793bcfc036))
+- Flaky ci test (#58) ([c788dc0](https://github.com/matrixorigin/Memoria/commit/c788dc072c3d6541d438d75a35fd8fa1d88a7887))
+
+### 🚀 Features
+
+- Feedback system, adaptive retrieval, governance audit trail, API hardening, and comprehensive e2e tests (#65) ([539fd8a](https://github.com/matrixorigin/Memoria/commit/539fd8a3aa33c8503400f8f824af697f1c59ac53))
+- Add --tool flag to mcp subcommand and fix codex support (#64) ([1701094](https://github.com/matrixorigin/Memoria/commit/1701094a99fa7677d9e2264d1b92a3be6c67db1b))
+- Interactive init prefill, Codex support, self-update, install auto-init (#63) ([6394d8d](https://github.com/matrixorigin/Memoria/commit/6394d8d5b5924a36adf8f5259bfaa436018ef3f2))
+- Enable apikey authentication (#47) ([18c6c17](https://github.com/matrixorigin/Memoria/commit/18c6c17f1029244fd30149159a0c8e19142e57dd))
 ## [0.2.1] - 2026-03-19
 
 ### 🏗️ Build

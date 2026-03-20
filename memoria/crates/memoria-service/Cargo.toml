@@ -25,6 +25,7 @@ ed25519-dalek = { version = "2.1", default-features = false, features = ["std"] 
 tempfile = "3.14"
 prost = "0.13"
 tonic = { version = "0.12", features = ["transport"] }
+moka = { version = "0.12", features = ["future"] }
 
 [dev-dependencies]
 tokio = { workspace = true }

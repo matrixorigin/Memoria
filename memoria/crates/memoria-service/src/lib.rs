@@ -6,6 +6,7 @@ pub mod pipeline;
 pub mod plugin;
 pub mod plugin_registry;
 pub mod scheduler;
+pub mod scoring;
 pub mod service;
 pub mod strategy;
 pub mod strategy_domain;
@@ -37,6 +38,9 @@ pub use plugin::{
 };
 pub use plugin_registry::{GovernancePluginMetadata, PluginRegistry};
 pub use scheduler::GovernanceScheduler;
+pub use scoring::{
+    DefaultScoringPlugin, FeedbackTotals, ScoringPlugin, ScoringStore, TuningResult,
+};
 pub use service::{CandidateScore, ExplainLevel, MemoryService, PurgeResult, RetrievalExplain};
 pub use strategy::{RetrievalStrategy, StrategyRegistry};
 pub use strategy_domain::{StrategyDecision, StrategyEvidence, StrategyReport, StrategyStatus};

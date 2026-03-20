@@ -7,7 +7,10 @@ use memoria_core::{
 use memoria_embedding::llm::ChatMessage;
 use memoria_embedding::LlmClient;
 use memoria_storage::SqlMemoryStore;
+use memoria_storage::EditLogEntry;
+use moka::future::Cache;
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -96,6 +99,8 @@ pub struct MemoryService {
     pub llm: Option<Arc<LlmClient>>,
     /// Async entity extraction queue (None when sql_store is absent)
     entity_tx: Option<tokio::sync::mpsc::UnboundedSender<EntityJob>>,
+    /// Per-user feedback_weight cache (TTL 5 min)
+    feedback_weight_cache: Cache<String, f64>,
 }
 
 /// A pending entity-extraction job pushed from the write path.
@@ -119,6 +124,10 @@ impl MemoryService {
             embedder,
             llm: llm.clone(),
             entity_tx: Some(entity_tx),
+            feedback_weight_cache: Cache::builder()
+                .max_capacity(10_000)
+                .time_to_live(Duration::from_secs(300))
+                .build(),
         };
         Self::spawn_entity_worker(entity_rx, store, llm);
         svc
@@ -137,6 +146,10 @@ impl MemoryService {
             embedder,
             llm: llm.clone(),
             entity_tx: Some(entity_tx),
+            feedback_weight_cache: Cache::builder()
+                .max_capacity(10_000)
+                .time_to_live(Duration::from_secs(300))
+                .build(),
         };
         Self::spawn_entity_worker(entity_rx, store, llm);
         svc
@@ -150,6 +163,10 @@ impl MemoryService {
             embedder,
             llm: None,
             entity_tx: None,
+            feedback_weight_cache: Cache::builder()
+                .max_capacity(10_000)
+                .time_to_live(Duration::from_secs(300))
+                .build(),
         }
     }
 
@@ -180,15 +197,23 @@ impl MemoryService {
                 let graph = store.graph_store();
                 // 1. Regex extraction
                 let entities = memoria_storage::extract_entities(&job.content);
+                let mut links: Vec<(String, String, &str)> = Vec::new();
                 for ent in &entities {
                     if let Ok((eid, _)) = graph
                         .upsert_entity(&job.user_id, &ent.name, &ent.display, &ent.entity_type)
                         .await
                     {
-                        let _ = graph
-                            .upsert_memory_entity_link(&job.memory_id, &eid, &job.user_id, "regex")
-                            .await;
+                        links.push((job.memory_id.clone(), eid, "regex"));
                     }
+                }
+                if !links.is_empty() {
+                    let refs: Vec<(&str, &str, &str)> = links
+                        .iter()
+                        .map(|(m, e, s)| (m.as_str(), e.as_str(), *s))
+                        .collect();
+                    let _ = graph
+                        .batch_upsert_memory_entity_links(&job.user_id, &refs)
+                        .await;
                 }
                 // 2. Hybrid: if regex found few entities and content is long, try LLM
                 if entities.len() < Self::ENTITY_LLM_THRESHOLD
@@ -243,6 +268,7 @@ impl MemoryService {
             Ok(v) => v,
             Err(_) => return,
         };
+        let mut links: Vec<(String, String, &str)> = Vec::new();
         for item in &items {
             let name = item["name"].as_str().unwrap_or("").trim().to_lowercase();
             if name.is_empty() {
@@ -251,10 +277,17 @@ impl MemoryService {
             let display = item["name"].as_str().unwrap_or("").trim().to_string();
             let etype = item["type"].as_str().unwrap_or("concept").to_string();
             if let Ok((eid, _)) = graph.upsert_entity(user_id, &name, &display, &etype).await {
-                let _ = graph
-                    .upsert_memory_entity_link(memory_id, &eid, user_id, "llm")
-                    .await;
+                links.push((memory_id.to_string(), eid, "llm"));
             }
+        }
+        if !links.is_empty() {
+            let refs: Vec<(&str, &str, &str)> = links
+                .iter()
+                .map(|(m, e, s)| (m.as_str(), e.as_str(), *s))
+                .collect();
+            let _ = graph
+                .batch_upsert_memory_entity_links(user_id, &refs)
+                .await;
         }
     }
 
@@ -337,14 +370,8 @@ impl MemoryService {
                         sql.insert_into(&table, &memory).await?;
                         sql.supersede_memory(&table, &old_id, &memory.memory_id)
                             .await?;
-                        sql.log_edit(
-                            user_id,
-                            "inject",
-                            &[memory.memory_id.as_str()],
-                            "store_memory:supersede",
-                            None,
-                        )
-                        .await;
+                        let payload = serde_json::json!({"content": &memory.content, "type": memory.memory_type.to_string()}).to_string();
+                        sql.log_edit(user_id, "inject", Some(&memory.memory_id), Some(&payload), "store_memory:supersede", None).await;
                         self.enqueue_entity_extraction(user_id, &memory.memory_id, &memory.content);
                         return Ok(memory);
                     }
@@ -353,14 +380,8 @@ impl MemoryService {
                 }
             }
             sql.insert_into(&table, &memory).await?;
-            sql.log_edit(
-                user_id,
-                "inject",
-                &[memory.memory_id.as_str()],
-                "store_memory",
-                None,
-            )
-            .await;
+            let payload = serde_json::json!({"content": &memory.content, "type": memory.memory_type.to_string()}).to_string();
+            sql.log_edit(user_id, "inject", Some(&memory.memory_id), Some(&payload), "store_memory", None).await;
             self.enqueue_entity_extraction(user_id, &memory.memory_id, &memory.content);
         } else {
             self.store.insert(&memory).await?;
@@ -491,6 +512,8 @@ impl MemoryService {
 
         if let Some(sql) = &self.sql_store {
             let table = sql.active_table(user_id).await?;
+            // Load per-user feedback_weight lazily — only when needed for scoring
+            // (avoids extra DB query when fulltext fallback has no feedback to apply)
 
             // Phase 0: embed query
             let p0_start = std::time::Instant::now();
@@ -548,7 +571,8 @@ impl MemoryService {
                         explain.vector_attempted = true;
                         let vs_start = std::time::Instant::now();
                         let (vec_results, scores) = if level.at_least(ExplainLevel::Verbose) {
-                            sql.search_hybrid_from_scored(&table, user_id, embedding, query, top_k)
+                            let fw = self.get_feedback_weight(user_id).await;
+                            sql.search_hybrid_from_scored(&table, user_id, embedding, query, top_k, fw)
                                 .await?
                         } else {
                             (
@@ -619,7 +643,8 @@ impl MemoryService {
                 explain.vector_attempted = true;
                 let vs_start = std::time::Instant::now();
                 let (results, scores) = if level.at_least(ExplainLevel::Verbose) {
-                    sql.search_hybrid_from_scored(&table, user_id, embedding, query, top_k)
+                    let fw = self.get_feedback_weight(user_id).await;
+                    sql.search_hybrid_from_scored(&table, user_id, embedding, query, top_k, fw)
                         .await?
                 } else {
                     (
@@ -656,11 +681,38 @@ impl MemoryService {
             // Phase 3: fulltext fallback
             explain.fulltext_attempted = true;
             let ft_start = std::time::Instant::now();
-            let results = sql
+            let mut results = sql
                 .search_fulltext_from(&table, user_id, query, top_k)
                 .await?;
             explain.fulltext_ms = ft_start.elapsed().as_secs_f64() * 1000.0;
             explain.fulltext_hit = !results.is_empty();
+
+            // Apply feedback adjustment to fulltext results
+            if !results.is_empty() {
+                let ids: Vec<String> = results.iter().map(|m| m.memory_id.clone()).collect();
+                if let Ok(fb_map) = sql.get_feedback_batch(&ids).await {
+                    let feedback_weight = self.get_feedback_weight(user_id).await;
+                    for m in &mut results {
+                        if let Some(fb) = fb_map.get(&m.memory_id) {
+                            let positive = fb.useful as f64;
+                            let negative = (fb.irrelevant + fb.outdated + fb.wrong) as f64;
+                            let feedback_delta = positive - 0.5 * negative;
+                            if feedback_delta.abs() > 0.01 {
+                                if let Some(score) = m.retrieval_score.as_mut() {
+                                    *score *= (1.0 + feedback_weight * feedback_delta).clamp(0.5, 2.0);
+                                }
+                            }
+                        }
+                    }
+                    // Re-sort after feedback adjustment
+                    results.sort_by(|a, b| {
+                        b.retrieval_score
+                            .partial_cmp(&a.retrieval_score)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                }
+            }
+
             explain.path = if explain.fulltext_hit {
                 "fulltext"
             } else {
@@ -787,14 +839,11 @@ impl MemoryService {
         self.store.update(&old_updated).await?;
 
         if let Some(sql) = &self.sql_store {
-            sql.log_edit(
-                &user_id,
-                "correct",
-                &[memory_id, new_mem.memory_id.as_str()],
-                "",
-                None,
-            )
-            .await;
+            let payload = serde_json::json!({
+                "new_content": new_content,
+                "new_memory_id": &new_mem.memory_id,
+            }).to_string();
+            sql.log_edit(&user_id, "correct", Some(memory_id), Some(&payload), "", None).await;
         }
 
         Ok(new_mem)
@@ -803,8 +852,7 @@ impl MemoryService {
     pub async fn purge(&self, user_id: &str, memory_id: &str) -> Result<PurgeResult, MemoriaError> {
         let (snap, warning) = if let Some(sql) = &self.sql_store {
             let (s, w) = sql.create_safety_snapshot("purge").await;
-            sql.log_edit(user_id, "purge", &[memory_id], "", s.as_deref())
-                .await;
+            sql.log_edit(user_id, "purge", Some(memory_id), None, "", s.as_deref()).await;
             (s, w)
         } else {
             (None, None)
@@ -832,8 +880,11 @@ impl MemoryService {
             self.store.soft_delete(id).await?;
         }
         if let Some(sql) = &self.sql_store {
-            sql.log_edit(user_id, "purge", ids, "", snap.as_deref())
-                .await;
+            let entries: Vec<EditLogEntry<'_>> = ids
+                .iter()
+                .map(|id| (user_id, "purge", Some(*id), None, "", snap.as_deref()))
+                .collect();
+            sql.batch_log_edit(&entries).await;
         }
         Ok(PurgeResult {
             purged: ids.len(),
@@ -856,15 +907,12 @@ impl MemoryService {
                 self.store.soft_delete(id).await?;
                 let _ = sql.graph_store().deactivate_by_memory_id(id).await;
             }
-            let id_refs: Vec<&str> = ids.iter().map(|s| s.as_str()).collect();
-            sql.log_edit(
-                user_id,
-                "purge",
-                &id_refs,
-                &format!("topic:{topic}"),
-                snap.as_deref(),
-            )
-            .await;
+            let reason = format!("topic:{topic}");
+            let entries: Vec<EditLogEntry<'_>> = ids
+                .iter()
+                .map(|id| (user_id, "purge", Some(id.as_str()), None, reason.as_str(), snap.as_deref()))
+                .collect();
+            sql.batch_log_edit(&entries).await;
             Ok(PurgeResult {
                 purged: ids.len(),
                 snapshot_name: snap,
@@ -901,6 +949,22 @@ impl MemoryService {
 
     pub async fn embed_batch(&self, texts: &[String]) -> Option<Vec<Vec<f32>>> {
         self.embedder.as_ref()?.embed_batch(texts).await.ok()
+    }
+
+    /// Get per-user feedback_weight with caching (TTL 5 min).
+    pub async fn get_feedback_weight(&self, user_id: &str) -> f64 {
+        if let Some(fw) = self.feedback_weight_cache.get(user_id).await {
+            return fw;
+        }
+        let fw = if let Some(sql) = &self.sql_store {
+            sql.get_user_retrieval_params(user_id).await
+                .map(|p| p.feedback_weight)
+                .unwrap_or(0.1)
+        } else {
+            0.1
+        };
+        self.feedback_weight_cache.insert(user_id.to_string(), fw).await;
+        fw
     }
 
     /// Batch store with single embedding API call for all memories.
@@ -955,18 +1019,27 @@ impl MemoryService {
                 trust_tier: effective_tier,
                 retrieval_score: None,
             };
-            if let Some(sql) = &self.sql_store {
-                let table = sql.active_table(user_id).await?;
-                sql.insert_into(&table, &memory).await?;
-            } else {
-                self.store.insert(&memory).await?;
-            }
             results.push(memory);
         }
         if let Some(sql) = &self.sql_store {
-            let ids: Vec<&str> = results.iter().map(|m| m.memory_id.as_str()).collect();
-            sql.log_edit(user_id, "inject", &ids, "store_batch", None)
-                .await;
+            let table = sql.active_table(user_id).await?;
+            let refs: Vec<&Memory> = results.iter().collect();
+            sql.batch_insert_into(&table, &refs).await?;
+            let payloads: Vec<String> = results
+                .iter()
+                .map(|m| serde_json::json!({"content": &m.content, "type": m.memory_type.to_string()}).to_string())
+                .collect();
+            let log_entries: Vec<EditLogEntry<'_>> =
+                results
+                    .iter()
+                    .zip(payloads.iter())
+                    .map(|(m, p)| (user_id, "inject", Some(m.memory_id.as_str()), Some(p.as_str()), "store_batch", None))
+                    .collect();
+            sql.batch_log_edit(&log_entries).await;
+        } else {
+            for m in &results {
+                self.store.insert(m).await?;
+            }
         }
         Ok(results)
     }
@@ -1245,3 +1318,48 @@ Confidence guide:
 Do NOT extract: greetings, pure meta-conversation.
 If nothing worth remembering, return [].
 "#;
+
+// ── Feedback methods ──────────────────────────────────────────────────────────
+
+impl MemoryService {
+    /// Record explicit relevance feedback for a memory.
+    /// signal: "useful" | "irrelevant" | "outdated" | "wrong"
+    pub async fn record_feedback(
+        &self,
+        user_id: &str,
+        memory_id: &str,
+        signal: &str,
+        context: Option<&str>,
+    ) -> Result<String, MemoriaError> {
+        let sql = self
+            .sql_store
+            .as_ref()
+            .ok_or_else(|| MemoriaError::Internal("Feedback requires SQL store".into()))?;
+        sql.record_feedback(user_id, memory_id, signal, context)
+            .await
+    }
+
+    /// Get feedback statistics for a user.
+    pub async fn get_feedback_stats(
+        &self,
+        user_id: &str,
+    ) -> Result<memoria_storage::FeedbackStats, MemoriaError> {
+        let sql = self
+            .sql_store
+            .as_ref()
+            .ok_or_else(|| MemoriaError::Internal("Feedback requires SQL store".into()))?;
+        sql.get_feedback_stats(user_id).await
+    }
+
+    /// Get feedback breakdown by trust tier.
+    pub async fn get_feedback_by_tier(
+        &self,
+        user_id: &str,
+    ) -> Result<Vec<memoria_storage::TierFeedback>, MemoriaError> {
+        let sql = self
+            .sql_store
+            .as_ref()
+            .ok_or_else(|| MemoriaError::Internal("Feedback requires SQL store".into()))?;
+        sql.get_feedback_by_tier(user_id).await
+    }
+}

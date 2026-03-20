@@ -18,16 +18,34 @@ fn uid() -> String {
     format!("api_test_{}", uuid::Uuid::new_v4().simple())
 }
 
-/// Returns LlmClient if LLM_API_KEY is set, else None.
-fn try_llm() -> Option<Arc<memoria_embedding::LlmClient>> {
-    let key = std::env::var("LLM_API_KEY")
-        .ok()
-        .filter(|s| !s.is_empty())?;
-    let base = std::env::var("LLM_BASE_URL").unwrap_or_else(|_| "https://api.openai.com/v1".into());
-    let model = std::env::var("LLM_MODEL").unwrap_or_else(|_| "gpt-4o-mini".into());
-    Some(Arc::new(memoria_embedding::LlmClient::new(
-        key, base, model,
-    )))
+fn episodic_rules() -> Vec<memoria_test_utils::PromptRule> {
+    vec![
+        (
+            "Respond with a JSON object containing: topic, action, outcome",
+            json!({
+                "topic": "Deterministic validation of session workflows",
+                "action": "Stored session memories and generated an episodic summary with a local fake LLM",
+                "outcome": "The session summary path completed and persisted an episodic memory"
+            }),
+        ),
+        (
+            "Respond with a JSON object: {\"points\"",
+            json!({
+                "points": [
+                    "Validated session summary path",
+                    "Used local fake LLM",
+                    "Stored episodic memory"
+                ]
+            }),
+        ),
+    ]
+}
+
+async fn spawn_fake_llm() -> (
+    Arc<memoria_embedding::LlmClient>,
+    tokio::sync::oneshot::Sender<()>,
+) {
+    memoria_test_utils::spawn_fake_llm(episodic_rules()).await
 }
 
 /// Returns (key, base_url, model) if EMBEDDING_API_KEY is set, else None.
@@ -1155,7 +1173,7 @@ async fn test_remote_store_retrieve() {
     let (base, _) = spawn_api_for_remote().await;
     let uid = uid();
 
-    let remote = RemoteClient::new(&base, None, uid.clone());
+    let remote = RemoteClient::new(&base, None, uid.clone(), None);
 
     // Store
     let r = remote
@@ -1197,7 +1215,7 @@ async fn test_remote_correct_purge() {
 
     let (base, _) = spawn_api_for_remote().await;
     let uid = uid();
-    let remote = RemoteClient::new(&base, None, uid.clone());
+    let remote = RemoteClient::new(&base, None, uid.clone(), None);
 
     // Store
     let r = remote
@@ -1244,7 +1262,7 @@ async fn test_remote_governance() {
 
     let (base, _) = spawn_api_for_remote().await;
     let uid = uid();
-    let remote = RemoteClient::new(&base, None, uid.clone());
+    let remote = RemoteClient::new(&base, None, uid.clone(), None);
 
     let r = remote
         .call("memory_governance", json!({"force": true}))
@@ -1264,7 +1282,7 @@ async fn test_remote_capabilities() {
 
     let (base, _) = spawn_api_for_remote().await;
     let uid = uid();
-    let remote = RemoteClient::new(&base, None, uid.clone());
+    let remote = RemoteClient::new(&base, None, uid.clone(), None);
 
     let r = remote
         .call("memory_capabilities", json!({}))
@@ -1283,7 +1301,7 @@ async fn test_remote_list_search_profile() {
     use memoria_mcp::remote::RemoteClient;
     let (base, _) = spawn_api_for_remote().await;
     let uid = uid();
-    let remote = RemoteClient::new(&base, None, uid.clone());
+    let remote = RemoteClient::new(&base, None, uid.clone(), None);
 
     remote
         .call(
@@ -1339,7 +1357,7 @@ async fn test_remote_snapshot_branch() {
     use memoria_mcp::remote::RemoteClient;
     let (base, _) = spawn_api_for_remote().await;
     let uid = uid();
-    let remote = RemoteClient::new(&base, None, uid.clone());
+    let remote = RemoteClient::new(&base, None, uid.clone(), None);
 
     // Store a memory first
     remote
@@ -1458,7 +1476,7 @@ async fn test_remote_reflect_extract_entities() {
     use memoria_mcp::remote::RemoteClient;
     let (base, _) = spawn_api_for_remote().await;
     let uid = uid();
-    let remote = RemoteClient::new(&base, None, uid.clone());
+    let remote = RemoteClient::new(&base, None, uid.clone(), None);
 
     remote
         .call(
@@ -1658,25 +1676,46 @@ async fn test_governance_pollution_detection() {
 
 #[tokio::test]
 async fn test_reflect_with_llm() {
-    let Some(llm) = try_llm() else {
-        println!("⏭️  test_reflect_with_llm skipped (LLM_API_KEY not set)");
-        return;
-    };
+    let (llm, _shutdown) = spawn_fake_llm().await;
     let (base, client) = spawn_server_with_llm(llm).await;
     let uid = uid();
 
-    for content in [
+    let store = memoria_storage::SqlMemoryStore::connect(&db_url(), test_dim())
+        .await
+        .expect("connect");
+    store.migrate().await.expect("migrate");
+    let graph = store.graph_store();
+    for (idx, content) in [
         "Project uses Rust for all backend services",
         "MatrixOne is the primary database",
-        "Team deploys with Docker Compose",
-    ] {
-        client
-            .post(format!("{base}/v1/memories"))
-            .header("X-User-Id", &uid)
-            .json(&json!({"content": content, "memory_type": "semantic"}))
-            .send()
-            .await
-            .unwrap();
+        "Validation emphasizes deterministic test loops",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        graph.create_node(&memoria_storage::GraphNode {
+            node_id: format!("reflect_node_{idx}_{}", &uuid::Uuid::new_v4().simple().to_string()[..8]),
+            user_id: uid.clone(),
+            node_type: memoria_storage::NodeType::Semantic,
+            content: content.to_string(),
+            entity_type: None,
+            embedding: None,
+            memory_id: None,
+            session_id: Some("llm_cluster".to_string()),
+            confidence: 0.8,
+            trust_tier: "T3".to_string(),
+            importance: 0.5,
+            source_nodes: vec![],
+            conflicts_with: None,
+            conflict_resolution: None,
+            access_count: 0,
+            cross_session_count: 0,
+            is_active: true,
+            superseded_by: None,
+            created_at: Some(chrono::Utc::now().naive_utc()),
+        })
+        .await
+        .expect("create graph node");
     }
 
     let r = client
@@ -1692,10 +1731,29 @@ async fn test_reflect_with_llm() {
         r.status()
     );
     let body: serde_json::Value = r.json().await.unwrap();
-    // Either synthesized scenes or returned candidates
     assert!(
-        body.get("scenes_created").is_some() || body.get("candidates").is_some(),
-        "reflect LLM response: {body}"
+        body["scenes_created"].as_u64().unwrap_or(0) >= 1,
+        "reflect should synthesize at least one scene: {body}"
+    );
+
+    let r = client
+        .get(format!("{base}/v1/memories"))
+        .header("X-User-Id", &uid)
+        .query(&[("limit", "20")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let list_body: serde_json::Value = r.json().await.unwrap();
+    let items = list_body["items"].as_array().expect("items array");
+    assert!(
+        items.iter().any(|m| {
+            m["content"]
+                .as_str()
+                .unwrap_or("")
+                .contains("Prefer deterministic validation")
+        }),
+        "reflected memory should be written back: {list_body}"
     );
     println!(
         "✅ reflect with LLM: scenes_created={}",
@@ -1705,16 +1763,20 @@ async fn test_reflect_with_llm() {
 
 #[tokio::test]
 async fn test_extract_entities_with_llm() {
-    let Some(llm) = try_llm() else {
-        println!("⏭️  test_extract_entities_with_llm skipped (LLM_API_KEY not set)");
-        return;
-    };
+    let (llm, _shutdown) = spawn_fake_llm().await;
     let (base, client) = spawn_server_with_llm(llm).await;
     let uid = uid();
 
-    client.post(format!("{base}/v1/memories"))
-        .header("X-User-Id", &uid).json(&json!({"content": "Alice works on the Rust rewrite of Memoria using MatrixOne", "memory_type": "semantic"}))
-        .send().await.unwrap();
+    client
+        .post(format!("{base}/v1/memories"))
+        .header("X-User-Id", &uid)
+        .json(&json!({
+            "content": "our stack relies on alphamesh for routing and deltafabric for caching",
+            "memory_type": "semantic"
+        }))
+        .send()
+        .await
+        .unwrap();
 
     let r = client
         .post(format!("{base}/v1/extract-entities"))
@@ -1729,9 +1791,30 @@ async fn test_extract_entities_with_llm() {
         r.status()
     );
     let body: serde_json::Value = r.json().await.unwrap();
+    assert_eq!(body["status"], "done", "extract LLM response: {body}");
     assert!(
-        body["status"] == "done" || body["status"] == "complete",
-        "extract LLM response: {body}"
+        body["entities_found"].as_u64().unwrap_or(0) >= 2,
+        "fake LLM should create entities: {body}"
+    );
+
+    let r = client
+        .get(format!("{base}/v1/entities"))
+        .header("X-User-Id", &uid)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let entities_body: serde_json::Value = r.json().await.unwrap();
+    let empty_entities = Vec::new();
+    let names: Vec<&str> = entities_body["entities"]
+        .as_array()
+        .unwrap_or(&empty_entities)
+        .iter()
+        .filter_map(|e| e["name"].as_str())
+        .collect();
+    assert!(
+        names.contains(&"alphamesh") && names.contains(&"deltafabric"),
+        "LLM-extracted entities should be persisted: {entities_body}"
     );
     println!(
         "✅ extract_entities with LLM: entities_found={}",
@@ -1744,7 +1827,7 @@ async fn test_remote_consolidate() {
     use memoria_mcp::remote::RemoteClient;
     let (base, _) = spawn_api_for_remote().await;
     let uid = uid();
-    let remote = RemoteClient::new(&base, None, uid.clone());
+    let remote = RemoteClient::new(&base, None, uid.clone(), None);
 
     let r = remote
         .call("memory_consolidate", json!({"force": true}))
@@ -1763,7 +1846,7 @@ async fn test_remote_correct_by_query() {
     use memoria_mcp::remote::RemoteClient;
     let (base, _) = spawn_api_for_remote().await;
     let uid = uid();
-    let remote = RemoteClient::new(&base, None, uid.clone());
+    let remote = RemoteClient::new(&base, None, uid.clone(), None);
 
     remote
         .call(
@@ -1797,7 +1880,7 @@ async fn test_remote_purge_by_topic() {
     use memoria_mcp::remote::RemoteClient;
     let (base, _) = spawn_api_for_remote().await;
     let uid = uid();
-    let remote = RemoteClient::new(&base, None, uid.clone());
+    let remote = RemoteClient::new(&base, None, uid.clone(), None);
 
     remote
         .call("memory_store", json!({"content": "topic purge test alpha"}))
@@ -1911,12 +1994,7 @@ async fn spawn_server_with_embedding(
 
 #[tokio::test]
 async fn test_episodic_no_memories_returns_error() {
-    // This test requires LLM — skip if not configured
-    let Some(llm) = try_llm() else {
-        println!("⏭️  test_episodic_no_memories skipped (LLM_API_KEY not set)");
-        return;
-    };
-
+    let (llm, _shutdown) = spawn_fake_llm().await;
     let (base, client) = spawn_server_with_llm(llm).await;
     let uid = uid();
 
@@ -1953,11 +2031,7 @@ async fn test_episodic_async_task_polling() {
 
 #[tokio::test]
 async fn test_episodic_with_llm_sync() {
-    let Some(llm) = try_llm() else {
-        println!("⏭️  test_episodic_with_llm_sync skipped (LLM_API_KEY not set)");
-        return;
-    };
-
+    let (llm, _shutdown) = spawn_fake_llm().await;
     let (base, client) = spawn_server_with_llm(llm).await;
     let uid = uid();
     let session_id = format!(
@@ -1997,9 +2071,13 @@ async fn test_episodic_with_llm_sync() {
     assert!(
         body["content"]
             .as_str()
-            .map(|c| c.contains("Session Summary"))
+            .map(|c| c.contains("Deterministic validation of session workflows"))
             .unwrap_or(false),
-        "content should contain 'Session Summary': {body}"
+        "content should contain fake LLM topic: {body}"
+    );
+    assert_eq!(
+        body["metadata"]["topic"].as_str().unwrap_or(""),
+        "Deterministic validation of session workflows"
     );
     println!(
         "✅ episodic with LLM sync: memory_id={}",
@@ -2010,6 +2088,73 @@ async fn test_episodic_with_llm_sync() {
         &body["content"].as_str().unwrap_or("")
             [..100.min(body["content"].as_str().unwrap_or("").len())]
     );
+}
+
+#[tokio::test]
+async fn test_episodic_with_llm_async() {
+    let (llm, _shutdown) = spawn_fake_llm().await;
+    let (base, client) = spawn_server_with_llm(llm).await;
+    let uid = uid();
+    let session_id = format!("ep_async_{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
+
+    for content in [
+        "Validated scheduler fallback behavior",
+        "Verified deterministic reflection write-back",
+    ] {
+        client
+            .post(format!("{base}/v1/memories"))
+            .header("X-User-Id", &uid)
+            .json(&json!({"content": content, "session_id": session_id}))
+            .send()
+            .await
+            .unwrap();
+    }
+
+    let r = client
+        .post(format!("{base}/v1/sessions/{session_id}/summary"))
+        .header("X-User-Id", &uid)
+        .json(&json!({"mode": "full", "sync": false}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let body: serde_json::Value = r.json().await.unwrap();
+    let task_id = body["task_id"].as_str().expect("task_id").to_string();
+
+    let mut result = None;
+    for attempt in 0..60 {
+        let poll = client
+            .get(format!("{base}/v1/tasks/{task_id}"))
+            .header("X-User-Id", &uid)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(poll.status(), 200);
+        let task: serde_json::Value = poll.json().await.unwrap();
+        match task["status"].as_str().unwrap_or("") {
+            "completed" => {
+                result = Some(task["result"].clone());
+                break;
+            }
+            "failed" => panic!("async episodic task failed on attempt {attempt}: {task}"),
+            status => {
+                if attempt == 59 {
+                    panic!("async episodic task timed out after 60 polls, last status={status}: {task}");
+                }
+                tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+            }
+        }
+    }
+
+    let result = result.expect("async episodic task should complete");
+    assert!(
+        result["content"]
+            .as_str()
+            .unwrap_or("")
+            .contains("Deterministic validation of session workflows"),
+        "async summary should persist fake LLM content: {result}"
+    );
+    println!("✅ episodic with LLM async: task_id={task_id}");
 }
 
 // ── Admin API ─────────────────────────────────────────────────────────────────
@@ -3264,7 +3409,7 @@ async fn test_remote_snapshot_detail_and_diff() {
     use memoria_mcp::remote::RemoteClient;
     let (base, _) = spawn_api_for_remote().await;
     let uid = uid();
-    let remote = RemoteClient::new(&base, None, uid.clone());
+    let remote = RemoteClient::new(&base, None, uid.clone(), None);
 
     // Store memories
     remote
@@ -4136,4 +4281,843 @@ async fn test_distributed_async_task_fail() {
     assert_eq!(task.error.unwrap()["message"], "boom");
 
     println!("✅ async task failure recorded correctly");
+}
+
+
+// ── Feedback API tests ────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_api_feedback_record() {
+    let (base, client) = spawn_server().await;
+    let uid = uid();
+
+    // Store a memory first
+    let r = client
+        .post(format!("{base}/v1/memories"))
+        .header("X-User-Id", &uid)
+        .json(&json!({"content": "API feedback test memory", "memory_type": "semantic"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 201);
+    let body: Value = r.json().await.unwrap();
+    let memory_id = body["memory_id"].as_str().unwrap();
+
+    // Record feedback
+    let r = client
+        .post(format!("{base}/v1/memories/{memory_id}/feedback"))
+        .header("X-User-Id", &uid)
+        .json(&json!({"signal": "useful", "context": "very helpful"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 201);
+    let body: Value = r.json().await.unwrap();
+    assert!(!body["feedback_id"].as_str().unwrap().is_empty());
+    assert_eq!(body["memory_id"], memory_id);
+    assert_eq!(body["signal"], "useful");
+
+    println!("✅ POST /v1/memories/:id/feedback");
+}
+
+#[tokio::test]
+async fn test_api_feedback_invalid_signal() {
+    let (base, client) = spawn_server().await;
+    let uid = uid();
+
+    // Store a memory
+    let r = client
+        .post(format!("{base}/v1/memories"))
+        .header("X-User-Id", &uid)
+        .json(&json!({"content": "Invalid signal test", "memory_type": "semantic"}))
+        .send()
+        .await
+        .unwrap();
+    let body: Value = r.json().await.unwrap();
+    let memory_id = body["memory_id"].as_str().unwrap();
+
+    // Try invalid signal
+    let r = client
+        .post(format!("{base}/v1/memories/{memory_id}/feedback"))
+        .header("X-User-Id", &uid)
+        .json(&json!({"signal": "bad_signal"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 422); // Validation error for invalid signal
+    println!("✅ POST /v1/memories/:id/feedback rejects invalid signal");
+}
+
+#[tokio::test]
+async fn test_api_feedback_nonexistent_memory() {
+    let (base, client) = spawn_server().await;
+    let uid = uid();
+
+    let r = client
+        .post(format!("{base}/v1/memories/nonexistent_id_12345/feedback"))
+        .header("X-User-Id", &uid)
+        .json(&json!({"signal": "useful"}))
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_client_error() || r.status().is_server_error());
+    println!("✅ POST /v1/memories/:id/feedback rejects nonexistent memory");
+}
+
+#[tokio::test]
+async fn test_api_feedback_stats() {
+    let (base, client) = spawn_server().await;
+    let uid = uid();
+
+    // Store memories and give feedback
+    for signal in &["useful", "useful", "irrelevant", "outdated"] {
+        let r = client
+            .post(format!("{base}/v1/memories"))
+            .header("X-User-Id", &uid)
+            .json(&json!({"content": format!("Stats test {signal}"), "memory_type": "semantic"}))
+            .send()
+            .await
+            .unwrap();
+        let body: Value = r.json().await.unwrap();
+        let memory_id = body["memory_id"].as_str().unwrap();
+
+        client
+            .post(format!("{base}/v1/memories/{memory_id}/feedback"))
+            .header("X-User-Id", &uid)
+            .json(&json!({"signal": signal}))
+            .send()
+            .await
+            .unwrap();
+    }
+
+    // Get stats
+    let r = client
+        .get(format!("{base}/v1/feedback/stats"))
+        .header("X-User-Id", &uid)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let body: Value = r.json().await.unwrap();
+    assert_eq!(body["total"], 4);
+    assert_eq!(body["useful"], 2);
+    assert_eq!(body["irrelevant"], 1);
+    assert_eq!(body["outdated"], 1);
+    assert_eq!(body["wrong"], 0);
+
+    println!("✅ GET /v1/feedback/stats: {body}");
+}
+
+#[tokio::test]
+async fn test_api_feedback_by_tier() {
+    let (base, client) = spawn_server().await;
+    let uid = uid();
+
+    // Store memories with different tiers and give feedback
+    for (tier, signal) in &[("T1", "useful"), ("T2", "useful"), ("T3", "irrelevant")] {
+        let r = client
+            .post(format!("{base}/v1/memories"))
+            .header("X-User-Id", &uid)
+            .json(&json!({
+                "content": format!("Tier {tier} test"),
+                "memory_type": "semantic",
+                "trust_tier": tier
+            }))
+            .send()
+            .await
+            .unwrap();
+        let body: Value = r.json().await.unwrap();
+        let memory_id = body["memory_id"].as_str().unwrap();
+
+        client
+            .post(format!("{base}/v1/memories/{memory_id}/feedback"))
+            .header("X-User-Id", &uid)
+            .json(&json!({"signal": signal}))
+            .send()
+            .await
+            .unwrap();
+    }
+
+    // Get breakdown by tier
+    let r = client
+        .get(format!("{base}/v1/feedback/by-tier"))
+        .header("X-User-Id", &uid)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let body: Value = r.json().await.unwrap();
+    let breakdown = body["breakdown"].as_array().unwrap();
+    assert!(!breakdown.is_empty(), "should have tier breakdown");
+
+    println!("✅ GET /v1/feedback/by-tier: {} entries", breakdown.len());
+}
+
+
+// ── Retrieval Params API Tests ────────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_api_get_retrieval_params() {
+    let (base, client) = spawn_server().await;
+    let uid = uid();
+
+    let r = client
+        .get(format!("{base}/v1/retrieval-params"))
+        .header("X-User-Id", &uid)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let body: Value = r.json().await.unwrap();
+
+    // Should return default params
+    assert_eq!(body["feedback_weight"], 0.1);
+    assert_eq!(body["temporal_decay_hours"], 168.0);
+    assert_eq!(body["confidence_weight"], 0.1);
+
+    println!("✅ GET /v1/retrieval-params: {body}");
+}
+
+#[tokio::test]
+async fn test_api_set_retrieval_params() {
+    let (base, client) = spawn_server().await;
+    let uid = uid();
+
+    // Set custom params
+    let r = client
+        .put(format!("{base}/v1/retrieval-params"))
+        .header("X-User-Id", &uid)
+        .json(&json!({
+            "feedback_weight": 0.15,
+            "temporal_decay_hours": 200.0
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let body: Value = r.json().await.unwrap();
+
+    assert!((body["feedback_weight"].as_f64().unwrap() - 0.15).abs() < 0.001);
+    assert!((body["temporal_decay_hours"].as_f64().unwrap() - 200.0).abs() < 0.1);
+
+    // Verify persisted
+    let r = client
+        .get(format!("{base}/v1/retrieval-params"))
+        .header("X-User-Id", &uid)
+        .send()
+        .await
+        .unwrap();
+    let body: Value = r.json().await.unwrap();
+    assert!((body["feedback_weight"].as_f64().unwrap() - 0.15).abs() < 0.001);
+
+    println!("✅ PUT /v1/retrieval-params: params updated and persisted");
+}
+
+#[tokio::test]
+async fn test_api_tune_retrieval_params() {
+    let (base, client) = spawn_server().await;
+    let uid = uid();
+
+    // Without enough feedback, should not tune
+    let r = client
+        .post(format!("{base}/v1/retrieval-params/tune"))
+        .header("X-User-Id", &uid)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let body: Value = r.json().await.unwrap();
+    assert_eq!(body["tuned"], false);
+
+    println!("✅ POST /v1/retrieval-params/tune: {}", body["message"]);
+}
+
+#[tokio::test]
+async fn test_api_tune_with_feedback() {
+    let (base, client) = spawn_server().await;
+    let uid = uid();
+
+    // Create a memory
+    let r = client
+        .post(format!("{base}/v1/memories"))
+        .header("X-User-Id", &uid)
+        .json(&json!({
+            "content": "Test memory for tuning API",
+            "memory_type": "semantic"
+        }))
+        .send()
+        .await
+        .unwrap();
+    let body: Value = r.json().await.unwrap();
+    let memory_id = body["memory_id"].as_str().unwrap();
+
+    // Add 12 useful feedback signals
+    for _ in 0..12 {
+        client
+            .post(format!("{base}/v1/memories/{memory_id}/feedback"))
+            .header("X-User-Id", &uid)
+            .json(&json!({"signal": "useful"}))
+            .send()
+            .await
+            .unwrap();
+    }
+
+    // Now tune should work
+    let r = client
+        .post(format!("{base}/v1/retrieval-params/tune"))
+        .header("X-User-Id", &uid)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let body: Value = r.json().await.unwrap();
+    assert_eq!(body["tuned"], true);
+
+    let old_weight = body["old_params"]["feedback_weight"].as_f64().unwrap();
+    let new_weight = body["new_params"]["feedback_weight"].as_f64().unwrap();
+    assert!(new_weight >= old_weight, "feedback_weight should increase with positive feedback");
+
+    println!("✅ POST /v1/retrieval-params/tune: {:.3} → {:.3}", old_weight, new_weight);
+}
+
+// ── Prometheus metrics ────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_api_metrics() {
+    let (base, client) = spawn_server().await;
+    let r = client.get(format!("{base}/metrics")).send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    let body = r.text().await.unwrap();
+    assert!(body.contains("memoria_memories_total"), "missing memoria_memories_total");
+    assert!(body.contains("memoria_users_total"), "missing memoria_users_total");
+    assert!(body.contains("memoria_auth_failures_total"), "missing auth_failures counter");
+    println!("✅ GET /metrics: {} bytes", body.len());
+}
+
+// ── Snapshot rollback ─────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_api_snapshot_rollback() {
+    let (base, client) = spawn_server().await;
+    let uid = uid();
+
+    // Store a memory
+    let r = client
+        .post(format!("{base}/v1/memories"))
+        .header("X-User-Id", &uid)
+        .json(&json!({"content": "before rollback", "memory_type": "semantic"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 201);
+
+    // Create snapshot
+    let snap = format!("rb_{}", &uuid::Uuid::new_v4().simple().to_string()[..6]);
+    let r = client
+        .post(format!("{base}/v1/snapshots"))
+        .header("X-User-Id", &uid)
+        .json(&json!({"name": snap}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 201);
+
+    // Store another memory (after snapshot)
+    let r = client
+        .post(format!("{base}/v1/memories"))
+        .header("X-User-Id", &uid)
+        .json(&json!({"content": "after snapshot", "memory_type": "semantic"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 201);
+
+    // Rollback
+    let r = client
+        .post(format!("{base}/v1/snapshots/{snap}/rollback"))
+        .header("X-User-Id", &uid)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let body: Value = r.json().await.unwrap();
+    assert!(
+        body["result"].as_str().unwrap_or("").to_lowercase().contains("roll"),
+        "rollback response: {body}"
+    );
+    println!("✅ POST /v1/snapshots/:name/rollback: {}", body["result"]);
+}
+
+// ── Entity list ───────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_api_entities() {
+    let (base, client) = spawn_server().await;
+    let uid = uid();
+
+    // Store a memory to trigger entity extraction
+    let r = client
+        .post(format!("{base}/v1/memories"))
+        .header("X-User-Id", &uid)
+        .json(&json!({"content": "We use PostgreSQL and Redis for caching", "memory_type": "semantic"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 201);
+
+    let r = client
+        .get(format!("{base}/v1/entities"))
+        .header("X-User-Id", &uid)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let body: Value = r.json().await.unwrap();
+    assert!(body["entities"].is_array(), "entities should be an array");
+    println!("✅ GET /v1/entities: {} entities", body["entities"].as_array().unwrap().len());
+}
+
+// ── Admin config ──────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_api_admin_config() {
+    let mk = format!("mk_{}", uuid::Uuid::new_v4().simple());
+    let (base, client) = spawn_server_with_master_key(&mk).await;
+
+    // Without master key → 401
+    let r = client.get(format!("{base}/admin/config")).send().await.unwrap();
+    assert_eq!(r.status(), 401);
+
+    // With master key → 200
+    let r = client
+        .get(format!("{base}/admin/config"))
+        .header("Authorization", format!("Bearer {mk}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let body: Value = r.json().await.unwrap();
+    assert!(body["db_name"].is_string(), "missing db_name");
+    assert!(body["embedding_dim"].is_number(), "missing embedding_dim");
+    // Password should be redacted
+    let db_url = body["db_url"].as_str().unwrap_or("");
+    assert!(db_url.contains("***") || !db_url.contains("@"), "db password not redacted: {db_url}");
+    println!("✅ GET /admin/config: db_name={}", body["db_name"]);
+}
+
+#[tokio::test]
+async fn test_api_admin_config_forbidden() {
+    let mk = format!("mk_{}", uuid::Uuid::new_v4().simple());
+    let (base, client) = spawn_server_with_master_key(&mk).await;
+
+    // Create an API key (non-master)
+    let auth = format!("Bearer {mk}");
+    let r = client
+        .post(format!("{base}/auth/keys"))
+        .header("Authorization", &auth)
+        .json(&json!({"user_id": "bob", "name": "test"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 201);
+    let raw_key = r.json::<Value>().await.unwrap()["raw_key"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Non-master API key → 403
+    let r = client
+        .get(format!("{base}/admin/config"))
+        .header("Authorization", format!("Bearer {raw_key}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 403);
+    println!("✅ GET /admin/config: non-master key → 403");
+}
+
+// ── Concurrency: parallel stores to same user ─────────────────────────────────
+
+#[tokio::test]
+async fn test_concurrent_stores() {
+    let (base, client) = spawn_server().await;
+    let uid = uid();
+    let client = Arc::new(client);
+    let n = 20;
+
+    let mut handles = Vec::new();
+    for i in 0..n {
+        let c = client.clone();
+        let b = base.clone();
+        let u = uid.clone();
+        handles.push(tokio::spawn(async move {
+            c.post(format!("{b}/v1/memories"))
+                .header("X-User-Id", &u)
+                .json(&json!({"content": format!("concurrent fact #{i}"), "memory_type": "semantic"}))
+                .send()
+                .await
+                .unwrap()
+        }));
+    }
+    let mut ok = 0;
+    for h in handles {
+        let r = h.await.unwrap();
+        if r.status() == 201 {
+            ok += 1;
+        }
+    }
+    assert_eq!(ok, n, "all concurrent stores should succeed");
+
+    // Verify all persisted
+    let r = client
+        .get(format!("{base}/v1/memories"))
+        .header("X-User-Id", &uid)
+        .query(&[("limit", "100")])
+        .send()
+        .await
+        .unwrap();
+    let body: Value = r.json().await.unwrap();
+    let count = body["items"].as_array().unwrap().len();
+    assert!(count >= n, "expected >= {n} memories, got {count}");
+    println!("✅ concurrent stores: {ok}/{n} succeeded, {count} persisted");
+}
+
+// ── Concurrency: entity extraction race condition ─────────────────────────────
+
+#[tokio::test]
+async fn test_concurrent_entity_upsert() {
+    let (base, client) = spawn_server().await;
+    let uid = uid();
+    let client = Arc::new(client);
+
+    // All memories mention "Redis" — triggers concurrent upsert_entity for same entity
+    let mut handles = Vec::new();
+    for i in 0..10 {
+        let c = client.clone();
+        let b = base.clone();
+        let u = uid.clone();
+        handles.push(tokio::spawn(async move {
+            c.post(format!("{b}/v1/memories"))
+                .header("X-User-Id", &u)
+                .json(&json!({"content": format!("Redis is used for caching scenario {i}"), "memory_type": "semantic"}))
+                .send()
+                .await
+                .unwrap()
+        }));
+    }
+    for h in handles {
+        let r = h.await.unwrap();
+        assert_eq!(r.status(), 201, "concurrent entity upsert should not fail");
+    }
+
+    // Verify entity exists (no duplicates crashed it)
+    let r = client
+        .get(format!("{base}/v1/entities"))
+        .header("X-User-Id", &uid)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    println!("✅ concurrent entity upsert: no race condition errors");
+}
+
+// ── Pressure: batch store at limit ────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_batch_store_at_limit() {
+    let (base, client) = spawn_server().await;
+    let uid = uid();
+
+    let memories: Vec<_> = (0..100)
+        .map(|i| json!({"content": format!("batch item {i}"), "memory_type": "semantic"}))
+        .collect();
+
+    let r = client
+        .post(format!("{base}/v1/memories/batch"))
+        .header("X-User-Id", &uid)
+        .json(&json!({"memories": memories}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 201);
+    let body: Value = r.json().await.unwrap();
+    assert_eq!(body.as_array().unwrap().len(), 100);
+
+    // Over limit → 422
+    let memories_over: Vec<_> = (0..101)
+        .map(|i| json!({"content": format!("over {i}"), "memory_type": "semantic"}))
+        .collect();
+    let r = client
+        .post(format!("{base}/v1/memories/batch"))
+        .header("X-User-Id", &uid)
+        .json(&json!({"memories": memories_over}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 422);
+    println!("✅ batch store: 100 ok, 101 rejected");
+}
+
+// ── Concurrency: parallel feedback on same memory ─────────────────────────────
+
+#[tokio::test]
+async fn test_concurrent_feedback() {
+    let (base, client) = spawn_server().await;
+    let uid = uid();
+    let client = Arc::new(client);
+
+    // Create a memory
+    let r = client
+        .post(format!("{base}/v1/memories"))
+        .header("X-User-Id", &uid)
+        .json(&json!({"content": "shared memory for feedback", "memory_type": "semantic"}))
+        .send()
+        .await
+        .unwrap();
+    let mid = r.json::<Value>().await.unwrap()["memory_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // 10 concurrent feedback signals
+    let mut handles = Vec::new();
+    for i in 0..10 {
+        let c = client.clone();
+        let b = base.clone();
+        let u = uid.clone();
+        let m = mid.clone();
+        let signal = if i % 2 == 0 { "useful" } else { "irrelevant" };
+        handles.push(tokio::spawn(async move {
+            c.post(format!("{b}/v1/memories/{m}/feedback"))
+                .header("X-User-Id", &u)
+                .json(&json!({"signal": signal}))
+                .send()
+                .await
+                .unwrap()
+        }));
+    }
+    for h in handles {
+        let r = h.await.unwrap();
+        assert!(r.status() == 200 || r.status() == 201, "concurrent feedback should succeed, got {}", r.status());
+    }
+
+    // Verify stats reflect all signals
+    let r = client
+        .get(format!("{base}/v1/feedback/stats"))
+        .header("X-User-Id", &uid)
+        .send()
+        .await
+        .unwrap();
+    let body: Value = r.json().await.unwrap();
+    let total = body["total"].as_i64().unwrap();
+    assert_eq!(total, 10, "all 10 feedback signals should be recorded");
+    println!("✅ concurrent feedback: {total} signals recorded");
+}
+
+// ── Graceful degradation ──────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_graceful_degradation() {
+    let (base, client) = spawn_server().await;
+    let uid = uid();
+
+    // Rollback to nonexistent snapshot → error, not crash
+    let r = client
+        .post(format!("{base}/v1/snapshots/nonexistent_snap_xyz/rollback"))
+        .header("X-User-Id", &uid)
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_client_error() || r.status().is_server_error());
+
+    // Feedback on nonexistent memory → 404
+    let r = client
+        .post(format!("{base}/v1/memories/nonexistent_id/feedback"))
+        .header("X-User-Id", &uid)
+        .json(&json!({"signal": "useful"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 404);
+
+    // Store → purge → correct the purged memory → should fail gracefully
+    let r = client
+        .post(format!("{base}/v1/memories"))
+        .header("X-User-Id", &uid)
+        .json(&json!({"content": "ephemeral", "memory_type": "semantic"}))
+        .send()
+        .await
+        .unwrap();
+    let mid = r.json::<Value>().await.unwrap()["memory_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    client
+        .delete(format!("{base}/v1/memories/{mid}"))
+        .header("X-User-Id", &uid)
+        .send()
+        .await
+        .unwrap();
+
+    let r = client
+        .put(format!("{base}/v1/memories/{mid}"))
+        .header("X-User-Id", &uid)
+        .json(&json!({"new_content": "updated", "reason": "test"}))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        r.status() == 404 || r.status().is_client_error() || r.status().is_server_error(),
+        "correct after purge should fail gracefully, got {}",
+        r.status()
+    );
+
+    println!("✅ graceful degradation: all error cases handled without panic");
+}
+
+// ── last_used_at batched flush (#62) ─────────────────────────────────────────
+
+/// Verify that the LastUsedBatcher correctly coalesces multiple mark_used calls
+/// and flushes them in a single batch UPDATE.
+#[tokio::test]
+async fn test_last_used_batcher_coalesces_and_flushes() {
+    use memoria_api::auth::LastUsedBatcher;
+    use memoria_storage::SqlMemoryStore;
+    use sha2::{Digest, Sha256};
+
+    let mk = "test-master-batcher";
+    let (base, client) = spawn_server_with_master_key(mk).await;
+    let auth = format!("Bearer {mk}");
+
+    // Create 3 API keys
+    let mut keys = Vec::new();
+    for i in 0..3 {
+        let raw = create_api_key_for_user(
+            &client,
+            &base,
+            &auth,
+            &format!("batcher_user_{i}"),
+            &format!("key_{i}"),
+        )
+        .await;
+        keys.push(raw);
+    }
+
+    // Build a batcher and mark all 3 keys as used
+    let batcher = LastUsedBatcher::new();
+    let hashes: Vec<String> = keys
+        .iter()
+        .map(|k| format!("{:x}", Sha256::digest(k.as_bytes())))
+        .collect();
+    for h in &hashes {
+        batcher.mark_used(h.clone());
+    }
+
+    // Verify all 3 are pending
+    // (We can't inspect the internal set directly, but we can flush and verify DB)
+
+    // Connect to DB and flush
+    let store = SqlMemoryStore::connect(&db_url(), test_dim())
+        .await
+        .expect("connect");
+    batcher.flush(store.pool()).await;
+
+    // Verify last_used_at was updated for all 3 keys
+    for hash in &hashes {
+        let row: Option<(Option<chrono::NaiveDateTime>,)> = sqlx::query_as(
+            "SELECT last_used_at FROM mem_api_keys WHERE key_hash = ?",
+        )
+        .bind(hash)
+        .fetch_optional(store.pool())
+        .await
+        .expect("query");
+        let (last_used,) = row.expect("key should exist");
+        assert!(last_used.is_some(), "last_used_at should be set after flush for hash {}", &hash[..8]);
+    }
+
+    // Flush again — should be a no-op (pending set is drained)
+    batcher.flush(store.pool()).await;
+
+    // Mark one key again and flush — only that one should be updated
+    batcher.mark_used(hashes[0].clone());
+    batcher.flush(store.pool()).await;
+
+    println!("✅ test_last_used_batcher_coalesces_and_flushes: batch UPDATE works correctly");
+}
+
+/// Verify that API key auth works with the dedicated auth pool and that
+/// last_used_at is updated via the batcher (not per-request fire-and-forget).
+#[tokio::test]
+async fn test_api_key_auth_uses_batcher_not_fire_and_forget() {
+    let mk = "test-master-batcher-auth";
+    let db = db_url();
+
+    // Spawn server WITH init_auth_pool
+    use memoria_git::GitForDataService;
+    use memoria_service::{Config, MemoryService};
+    use memoria_storage::SqlMemoryStore;
+    use sqlx::mysql::MySqlPool;
+
+    let cfg = Config::from_env();
+    let store = SqlMemoryStore::connect(&db, test_dim())
+        .await
+        .expect("connect");
+    store.migrate().await.expect("migrate");
+    let pool = MySqlPool::connect(&db).await.expect("pool");
+    let git = Arc::new(GitForDataService::new(pool, &cfg.db_name));
+    let service = Arc::new(MemoryService::new_sql_with_llm(Arc::new(store), None, None));
+    let state = memoria_api::AppState::new(service, git, mk.to_string())
+        .init_auth_pool(&db)
+        .await;
+
+    let batcher = state.last_used_batcher.clone();
+    let app = memoria_api::build_router(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let base = format!("http://127.0.0.1:{port}");
+    let auth = format!("Bearer {mk}");
+
+    // Create an API key
+    let raw_key = create_api_key_for_user(&client, &base, &auth, "batcher_e2e_user", "e2e_key").await;
+
+    // Use the API key to make a request (cache miss → DB lookup → batcher.mark_used)
+    let r = client
+        .get(format!("{base}/v1/memories"))
+        .header("Authorization", format!("Bearer {raw_key}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200, "API key auth should succeed");
+
+    // Make another request (cache hit → batcher.mark_used, no DB)
+    let r = client
+        .get(format!("{base}/v1/memories"))
+        .header("Authorization", format!("Bearer {raw_key}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200, "Cached API key auth should succeed");
+
+    // Manually flush the batcher to verify last_used_at is updated
+    let verify_store = SqlMemoryStore::connect(&db, test_dim())
+        .await
+        .expect("connect");
+    batcher.flush(verify_store.pool()).await;
+
+    let key_hash = format!("{:x}", <sha2::Sha256 as sha2::Digest>::digest(raw_key.as_bytes()));
+    let row: Option<(Option<chrono::NaiveDateTime>,)> = sqlx::query_as(
+        "SELECT last_used_at FROM mem_api_keys WHERE key_hash = ?",
+    )
+    .bind(&key_hash)
+    .fetch_optional(verify_store.pool())
+    .await
+    .expect("query");
+    let (last_used,) = row.expect("key should exist");
+    assert!(last_used.is_some(), "last_used_at should be set after batcher flush");
+
+    println!("✅ test_api_key_auth_uses_batcher_not_fire_and_forget: auth pool + batcher works");
 }

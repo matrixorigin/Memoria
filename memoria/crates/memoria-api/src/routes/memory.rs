@@ -13,6 +13,20 @@ pub fn api_err(e: impl std::fmt::Display) -> (StatusCode, String) {
     (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
 }
 
+/// Map MemoriaError to proper HTTP status codes.
+pub fn api_err_typed(e: memoria_core::MemoriaError) -> (StatusCode, String) {
+    use memoria_core::MemoriaError::*;
+    let status = match &e {
+        NotFound(_) => StatusCode::NOT_FOUND,
+        Validation(_) | InvalidMemoryType(_) | InvalidTrustTier(_) => {
+            StatusCode::UNPROCESSABLE_ENTITY
+        }
+        Blocked(_) => StatusCode::FORBIDDEN,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    (status, e.to_string())
+}
+
 #[derive(Deserialize, Default)]
 pub struct ListQuery {
     pub memory_type: Option<String>,
@@ -28,11 +42,22 @@ pub async fn health() -> &'static str {
     "ok"
 }
 
-pub async fn health_instance(State(state): State<AppState>) -> Json<serde_json::Value> {
-    Json(serde_json::json!({
-        "status": "ok",
+pub async fn health_instance(State(state): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
+    let db_ok = if let Some(sql) = &state.service.sql_store {
+        sqlx::query("SELECT 1")
+            .execute(sql.pool())
+            .await
+            .is_ok()
+    } else {
+        false
+    };
+    let status = if db_ok { "ok" } else { "degraded" };
+    let code = if db_ok { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE };
+    (code, Json(serde_json::json!({
+        "status": status,
         "instance_id": state.instance_id,
-    }))
+        "db": db_ok,
+    })))
 }
 
 pub async fn list_memories(
@@ -71,6 +96,12 @@ pub async fn store_memory(
     AuthUser { user_id, .. }: AuthUser,
     Json(req): Json<StoreRequest>,
 ) -> Result<(StatusCode, Json<MemoryResponse>), (StatusCode, String)> {
+    if req.content.is_empty() {
+        return Err((StatusCode::UNPROCESSABLE_ENTITY, "content must not be empty".into()));
+    }
+    if req.content.len() > 32_768 {
+        return Err((StatusCode::UNPROCESSABLE_ENTITY, "content exceeds 32 KiB limit".into()));
+    }
     let mt =
         parse_memory_type(&req.memory_type).map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e))?;
     let tier = req
@@ -97,7 +128,12 @@ pub async fn store_memory(
             req.initial_confidence,
         )
         .await
-        .map_err(api_err)?;
+        .map_err(|e| {
+            if matches!(e, memoria_core::MemoriaError::Blocked(_)) {
+                crate::routes::metrics::SENSITIVITY_BLOCKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            api_err_typed(e)
+        })?;
     Ok((StatusCode::CREATED, Json(m.into())))
 }
 
@@ -106,6 +142,14 @@ pub async fn batch_store(
     AuthUser { user_id, .. }: AuthUser,
     Json(req): Json<BatchStoreRequest>,
 ) -> Result<(StatusCode, Json<Vec<MemoryResponse>>), (StatusCode, String)> {
+    if req.memories.len() > 100 {
+        return Err((StatusCode::UNPROCESSABLE_ENTITY, "batch exceeds 100 items".into()));
+    }
+    for m in &req.memories {
+        if m.content.len() > 32_768 {
+            return Err((StatusCode::UNPROCESSABLE_ENTITY, "content exceeds 32 KiB limit".into()));
+        }
+    }
     let items: Vec<_> = req
         .memories
         .into_iter()
@@ -146,6 +190,7 @@ pub async fn retrieve(
     AuthUser { user_id, .. }: AuthUser,
     Json(req): Json<RetrieveRequest>,
 ) -> ApiResult<serde_json::Value> {
+    let top_k = req.top_k.clamp(1, 100);
     let level = memoria_service::ExplainLevel::from_str_or_bool(&req.explain);
     let filter_session = req
         .session_id
@@ -162,7 +207,7 @@ pub async fn retrieve(
     if level != memoria_service::ExplainLevel::None {
         let (results, explain) = state
             .service
-            .retrieve_explain_level(&user_id, &req.query, req.top_k, level)
+            .retrieve_explain_level(&user_id, &req.query, top_k, level)
             .await
             .map_err(api_err)?;
         let items: Vec<MemoryResponse> =
@@ -173,7 +218,7 @@ pub async fn retrieve(
     } else {
         let results = state
             .service
-            .retrieve(&user_id, &req.query, req.top_k)
+            .retrieve(&user_id, &req.query, top_k)
             .await
             .map_err(api_err)?;
         let items: Vec<MemoryResponse> =
@@ -187,11 +232,12 @@ pub async fn search(
     AuthUser { user_id, .. }: AuthUser,
     Json(req): Json<RetrieveRequest>,
 ) -> ApiResult<serde_json::Value> {
+    let top_k = req.top_k.clamp(1, 100);
     let level = memoria_service::ExplainLevel::from_str_or_bool(&req.explain);
     if level != memoria_service::ExplainLevel::None {
         let (results, explain) = state
             .service
-            .search_explain_level(&user_id, &req.query, req.top_k, level)
+            .search_explain_level(&user_id, &req.query, top_k, level)
             .await
             .map_err(api_err)?;
         let items: Vec<MemoryResponse> = results.into_iter().map(Into::into).collect();
@@ -201,7 +247,7 @@ pub async fn search(
     } else {
         let results = state
             .service
-            .search(&user_id, &req.query, req.top_k)
+            .search(&user_id, &req.query, top_k)
             .await
             .map_err(api_err)?;
         Ok(Json(serde_json::json!(results
@@ -596,4 +642,155 @@ pub async fn run_pipeline(
         "memories_redacted": result.memories_redacted,
         "errors": result.errors,
     })))
+}
+
+// ── Feedback ──────────────────────────────────────────────────────────────────
+
+#[derive(serde::Deserialize)]
+pub struct FeedbackRequest {
+    pub signal: String,
+    pub context: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+pub struct FeedbackResponse {
+    pub feedback_id: String,
+    pub memory_id: String,
+    pub signal: String,
+}
+
+/// POST /v1/memories/:id/feedback — record explicit relevance feedback.
+pub async fn record_feedback(
+    State(state): State<AppState>,
+    AuthUser { user_id, .. }: AuthUser,
+    Path(memory_id): Path<String>,
+    Json(req): Json<FeedbackRequest>,
+) -> Result<(StatusCode, Json<FeedbackResponse>), (StatusCode, String)> {
+    let feedback_id = state
+        .service
+        .record_feedback(&user_id, &memory_id, &req.signal, req.context.as_deref())
+        .await
+        .map_err(api_err_typed)?;
+    Ok((
+        StatusCode::CREATED,
+        Json(FeedbackResponse {
+            feedback_id,
+            memory_id,
+            signal: req.signal,
+        }),
+    ))
+}
+
+/// GET /v1/feedback/stats — get feedback statistics for the user.
+pub async fn get_feedback_stats(
+    State(state): State<AppState>,
+    AuthUser { user_id, .. }: AuthUser,
+) -> ApiResult<serde_json::Value> {
+    let stats = state
+        .service
+        .get_feedback_stats(&user_id)
+        .await
+        .map_err(api_err)?;
+    Ok(Json(serde_json::json!(stats)))
+}
+
+/// GET /v1/feedback/by-tier — get feedback breakdown by trust tier.
+pub async fn get_feedback_by_tier(
+    State(state): State<AppState>,
+    AuthUser { user_id, .. }: AuthUser,
+) -> ApiResult<serde_json::Value> {
+    let breakdown = state
+        .service
+        .get_feedback_by_tier(&user_id)
+        .await
+        .map_err(api_err)?;
+    Ok(Json(serde_json::json!({"breakdown": breakdown})))
+}
+
+/// GET /v1/retrieval-params — get user's adaptive retrieval parameters.
+pub async fn get_retrieval_params(
+    State(state): State<AppState>,
+    AuthUser { user_id, .. }: AuthUser,
+) -> ApiResult<serde_json::Value> {
+    let sql = state
+        .service
+        .sql_store
+        .as_ref()
+        .ok_or_else(|| (StatusCode::SERVICE_UNAVAILABLE, "SQL store not available".to_string()))?;
+    let params = sql
+        .get_user_retrieval_params(&user_id)
+        .await
+        .map_err(api_err)?;
+    Ok(Json(serde_json::to_value(params).unwrap()))
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct SetRetrievalParamsRequest {
+    pub feedback_weight: Option<f64>,
+    pub temporal_decay_hours: Option<f64>,
+    pub confidence_weight: Option<f64>,
+}
+
+/// PUT /v1/retrieval-params — update user's adaptive retrieval parameters.
+pub async fn set_retrieval_params(
+    State(state): State<AppState>,
+    AuthUser { user_id, .. }: AuthUser,
+    Json(req): Json<SetRetrievalParamsRequest>,
+) -> ApiResult<serde_json::Value> {
+    let sql = state
+        .service
+        .sql_store
+        .as_ref()
+        .ok_or_else(|| (StatusCode::SERVICE_UNAVAILABLE, "SQL store not available".to_string()))?;
+
+    let mut params = sql
+        .get_user_retrieval_params(&user_id)
+        .await
+        .map_err(api_err)?;
+
+    if let Some(v) = req.feedback_weight {
+        params.feedback_weight = v.clamp(0.01, 0.5);
+    }
+    if let Some(v) = req.temporal_decay_hours {
+        params.temporal_decay_hours = v.clamp(1.0, 720.0);
+    }
+    if let Some(v) = req.confidence_weight {
+        params.confidence_weight = v.clamp(0.0, 0.5);
+    }
+
+    sql.set_user_retrieval_params(&params).await.map_err(api_err)?;
+    Ok(Json(serde_json::to_value(params).unwrap()))
+}
+
+/// POST /v1/retrieval-params/tune — trigger auto-tuning of retrieval parameters.
+pub async fn tune_retrieval_params(
+    State(state): State<AppState>,
+    AuthUser { user_id, .. }: AuthUser,
+) -> ApiResult<serde_json::Value> {
+    use memoria_service::scoring::{DefaultScoringPlugin, ScoringPlugin};
+
+    let sql = state
+        .service
+        .sql_store
+        .as_ref()
+        .ok_or_else(|| (StatusCode::SERVICE_UNAVAILABLE, "SQL store not available".to_string()))?;
+
+    let old_params = sql
+        .get_user_retrieval_params(&user_id)
+        .await
+        .map_err(api_err)?;
+
+    let plugin = DefaultScoringPlugin;
+    match plugin.tune_params(sql.as_ref(), &user_id).await.map_err(api_err)? {
+        Some(new_params) => Ok(Json(serde_json::json!({
+            "tuned": true,
+            "old_params": old_params,
+            "new_params": new_params
+        }))),
+        None => Ok(Json(serde_json::json!({
+            "tuned": false,
+            "message": "Not enough feedback to tune parameters (minimum 10 feedback signals required)",
+            "current_params": old_params
+        }))),
+    }
 }

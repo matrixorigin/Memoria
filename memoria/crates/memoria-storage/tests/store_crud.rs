@@ -337,3 +337,117 @@ async fn test_null_optional_fields() {
     assert_eq!(got.source_event_ids, Vec::<String>::new());
     println!("✅ null_optional_fields: all NULLs round-trip correctly");
 }
+
+// ── insert_entity_links batch optimization tests ─────────────────────────────
+
+#[tokio::test]
+async fn test_insert_entity_links_empty() {
+    let (store, uid) = setup().await;
+    let mid = Uuid::new_v4().simple().to_string();
+    let (created, reused) = store.insert_entity_links(&uid, &mid, &[]).await.unwrap();
+    assert_eq!(created, 0);
+    assert_eq!(reused, 0);
+    println!("✅ insert_entity_links: empty input returns (0, 0)");
+}
+
+#[tokio::test]
+async fn test_insert_entity_links_batch() {
+    let (store, uid) = setup().await;
+    let mid = Uuid::new_v4().simple().to_string();
+    let entities = vec![
+        ("Rust".to_string(), "tech".to_string()),
+        ("MatrixOne".to_string(), "tech".to_string()),
+        ("Memoria".to_string(), "project".to_string()),
+    ];
+    let (created, reused) = store.insert_entity_links(&uid, &mid, &entities).await.unwrap();
+    assert_eq!(created, 3);
+    assert_eq!(reused, 0);
+
+    // Verify all 3 exist in DB
+    let rows = sqlx::query("SELECT entity_name FROM mem_entity_links WHERE user_id = ? AND memory_id = ? ORDER BY entity_name")
+        .bind(&uid).bind(&mid)
+        .fetch_all(store.pool()).await.unwrap();
+    let names: Vec<String> = rows.iter().map(|r| sqlx::Row::get::<String, _>(r, "entity_name")).collect();
+    assert_eq!(names, vec!["matrixone", "memoria", "rust"]);
+    println!("✅ insert_entity_links: batch of 3 inserted in single statement");
+}
+
+#[tokio::test]
+async fn test_insert_entity_links_dedup_existing() {
+    let (store, uid) = setup().await;
+    let mid = Uuid::new_v4().simple().to_string();
+    let entities = vec![
+        ("Rust".to_string(), "tech".to_string()),
+        ("Go".to_string(), "tech".to_string()),
+    ];
+    let (created, _) = store.insert_entity_links(&uid, &mid, &entities).await.unwrap();
+    assert_eq!(created, 2);
+
+    // Insert again with overlap + new
+    let entities2 = vec![
+        ("Rust".to_string(), "tech".to_string()),   // existing
+        ("Python".to_string(), "tech".to_string()),  // new
+    ];
+    let (created2, reused2) = store.insert_entity_links(&uid, &mid, &entities2).await.unwrap();
+    assert_eq!(created2, 1, "only Python should be new");
+    assert_eq!(reused2, 1, "Rust should be reused");
+
+    let rows = sqlx::query("SELECT COUNT(*) as cnt FROM mem_entity_links WHERE user_id = ? AND memory_id = ?")
+        .bind(&uid).bind(&mid)
+        .fetch_one(store.pool()).await.unwrap();
+    let cnt: i64 = sqlx::Row::get(&rows, "cnt");
+    assert_eq!(cnt, 3, "total should be 3 (rust, go, python)");
+    println!("✅ insert_entity_links: dedup existing entities correctly");
+}
+
+#[tokio::test]
+async fn test_insert_entity_links_dedup_within_batch() {
+    let (store, uid) = setup().await;
+    let mid = Uuid::new_v4().simple().to_string();
+    // Same entity name twice in one batch (different case)
+    let entities = vec![
+        ("Rust".to_string(), "tech".to_string()),
+        ("rust".to_string(), "tech".to_string()),
+        ("RUST".to_string(), "tech".to_string()),
+    ];
+    let (created, reused) = store.insert_entity_links(&uid, &mid, &entities).await.unwrap();
+    assert_eq!(created, 1, "only one 'rust' should be inserted");
+    assert_eq!(reused, 2, "two duplicates within batch");
+    println!("✅ insert_entity_links: dedup within batch (case-insensitive)");
+}
+
+#[tokio::test]
+async fn test_insert_entity_links_case_insensitive() {
+    let (store, uid) = setup().await;
+    let mid = Uuid::new_v4().simple().to_string();
+    let entities = vec![("MatrixOne".to_string(), "tech".to_string())];
+    store.insert_entity_links(&uid, &mid, &entities).await.unwrap();
+
+    // Query back — should be lowercased
+    let rows = sqlx::query("SELECT entity_name FROM mem_entity_links WHERE user_id = ? AND memory_id = ?")
+        .bind(&uid).bind(&mid)
+        .fetch_all(store.pool()).await.unwrap();
+    let name: String = sqlx::Row::get(&rows[0], "entity_name");
+    assert_eq!(name, "matrixone", "entity name should be lowercased");
+    println!("✅ insert_entity_links: names stored as lowercase");
+}
+
+#[tokio::test]
+async fn test_insert_entity_links_large_batch_chunking() {
+    let (store, uid) = setup().await;
+    let mid = Uuid::new_v4().simple().to_string();
+    // 120 entities — should be split into 3 chunks (50+50+20)
+    let entities: Vec<(String, String)> = (0..120)
+        .map(|i| (format!("entity_{i}"), "concept".to_string()))
+        .collect();
+    let (created, reused) = store.insert_entity_links(&uid, &mid, &entities).await.unwrap();
+    assert_eq!(created, 120);
+    assert_eq!(reused, 0);
+
+    let rows = sqlx::query("SELECT COUNT(*) as cnt FROM mem_entity_links WHERE user_id = ? AND memory_id = ?")
+        .bind(&uid).bind(&mid)
+        .fetch_one(store.pool()).await.unwrap();
+    let cnt: i64 = sqlx::Row::get(&rows, "cnt");
+    assert_eq!(cnt, 120);
+    println!("✅ insert_entity_links: 120 entities chunked correctly");
+}

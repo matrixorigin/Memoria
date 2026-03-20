@@ -74,6 +74,16 @@ services:
       - LLM_API_KEY=${MEMORIA_LLM_API_KEY:-}
       - LLM_BASE_URL=${MEMORIA_LLM_BASE_URL:-}
       - LLM_MODEL=${MEMORIA_LLM_MODEL:-gpt-4o-mini}
+      # Distributed coordination
+      - MEMORIA_INSTANCE_ID=${MEMORIA_INSTANCE_ID:-}
+      - MEMORIA_LOCK_TTL_SECS=${MEMORIA_LOCK_TTL_SECS:-120}
+      - MEMORIA_GOVERNANCE_ENABLED=${MEMORIA_GOVERNANCE_ENABLED:-false}
+      # Governance plugins
+      - MEMORIA_GOVERNANCE_PLUGIN_BINDING=${MEMORIA_GOVERNANCE_PLUGIN_BINDING:-default}
+      - MEMORIA_GOVERNANCE_PLUGIN_SUBJECT=${MEMORIA_GOVERNANCE_PLUGIN_SUBJECT:-system}
+      # Security & Rate Limiting
+      - MEMORIA_API_KEY_SECRET=${MEMORIA_API_KEY_SECRET:-}
+      - MEMORIA_RATE_LIMIT_AUTH_KEYS=${MEMORIA_RATE_LIMIT_AUTH_KEYS:-1000,60}
     depends_on:
       matrixone:
         condition: service_healthy

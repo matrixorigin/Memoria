@@ -430,30 +430,31 @@ impl GraphStore {
         display_name: &str,
         entity_type: &str,
     ) -> Result<(String, bool), MemoriaError> {
-        // Check existing
-        let existing =
-            sqlx::query("SELECT entity_id FROM mem_entities WHERE user_id = ? AND name = ?")
-                .bind(user_id)
-                .bind(name)
-                .fetch_optional(&self.pool)
-                .await
-                .map_err(db_err)?;
-
-        if let Some(row) = existing {
-            let id: String = row.try_get("entity_id").map_err(db_err)?;
-            return Ok((id, false));
-        }
-
+        // Try INSERT first; on duplicate (user_id, name) catch the error and SELECT.
         let entity_id = new_id()[..32].to_string();
         let now = chrono::Utc::now().naive_utc();
-        sqlx::query(
+        let res = sqlx::query(
             "INSERT INTO mem_entities (entity_id, user_id, name, display_name, entity_type, created_at) \
              VALUES (?,?,?,?,?,?)"
         )
         .bind(&entity_id).bind(user_id).bind(name).bind(display_name)
         .bind(entity_type).bind(now)
-        .execute(&self.pool).await.map_err(db_err)?;
-        Ok((entity_id, true))
+        .execute(&self.pool).await;
+
+        match res {
+            Ok(_) => Ok((entity_id, true)),
+            Err(sqlx::Error::Database(e))
+                if e.message().contains("Duplicate entry") =>
+            {
+                // Duplicate on unique key — fetch existing
+                let row = sqlx::query("SELECT entity_id FROM mem_entities WHERE user_id = ? AND name = ?")
+                    .bind(user_id).bind(name)
+                    .fetch_one(&self.pool).await.map_err(db_err)?;
+                let id: String = row.try_get("entity_id").map_err(db_err)?;
+                Ok((id, false))
+            }
+            Err(e) => Err(db_err(e)),
+        }
     }
 
     pub async fn upsert_memory_entity_link(
@@ -485,6 +486,50 @@ impl GraphStore {
         .execute(&self.pool)
         .await
         .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// Batch-upsert multiple memory↔entity links in a single multi-row INSERT.
+    /// Each entry: (memory_id, entity_id, source).
+    /// `user_id` is shared across all entries.
+    pub async fn batch_upsert_memory_entity_links(
+        &self,
+        user_id: &str,
+        links: &[(&str, &str, &str)], // (memory_id, entity_id, source)
+    ) -> Result<(), MemoriaError> {
+        if links.is_empty() {
+            return Ok(());
+        }
+        let now = chrono::Utc::now().naive_utc();
+        for chunk in links.chunks(50) {
+            let placeholders = chunk
+                .iter()
+                .map(|_| "(?,?,?,?,?,?)")
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "INSERT INTO mem_memory_entity_links \
+                 (memory_id, entity_id, user_id, source, weight, created_at) \
+                 VALUES {placeholders} \
+                 ON DUPLICATE KEY UPDATE source = VALUES(source), weight = VALUES(weight)"
+            );
+            let mut q = sqlx::query(&sql);
+            for (memory_id, entity_id, source) in chunk {
+                let weight: f32 = match *source {
+                    "manual" => 1.0,
+                    "llm" => 0.9,
+                    _ => 0.8,
+                };
+                q = q
+                    .bind(*memory_id)
+                    .bind(*entity_id)
+                    .bind(user_id)
+                    .bind(*source)
+                    .bind(weight)
+                    .bind(now);
+            }
+            q.execute(&self.pool).await.map_err(db_err)?;
+        }
         Ok(())
     }
 

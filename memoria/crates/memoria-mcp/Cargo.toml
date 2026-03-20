@@ -34,6 +34,7 @@ memoria-core = { workspace = true }
 memoria-storage = { workspace = true }
 memoria-embedding = { workspace = true }
 memoria-api = { path = "../memoria-api" }
+memoria-test-utils = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
 sqlx = { workspace = true }

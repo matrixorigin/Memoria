@@ -9,10 +9,11 @@ members = [
     "crates/memoria-api",
     "crates/memoria-mcp",
     "crates/memoria-cli",
+    "crates/memoria-test-utils",
 ]
 
 [workspace.package]
-version = "0.2.1"
+version = "0.2.2"
 rust-version = "1.85"
 
 [workspace.dependencies]
@@ -27,9 +28,13 @@ thiserror = "1.0"
 anyhow = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+opentelemetry = { version = "0.28", default-features = false, features = ["trace"] }
+opentelemetry_sdk = { version = "0.28", default-features = false, features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.28", default-features = false, features = ["grpc-tonic", "trace"] }
+tracing-opentelemetry = "0.29"
 clap = { version = "4.5", features = ["derive", "env"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-uuid = { version = "1.0", features = ["v4"] }
+uuid = { version = "1.0", features = ["v4", "v7"] }
 async-trait = "0.1"
 tower = "0.4"
 tower-http = { version = "0.5", features = ["trace", "cors", "catch-panic"] }
@@ -42,6 +47,7 @@ memoria-service = { path = "crates/memoria-service" }
 memoria-git = { path = "crates/memoria-git" }
 memoria-api = { path = "crates/memoria-api" }
 memoria-mcp = { path = "crates/memoria-mcp" }
+memoria-test-utils = { path = "crates/memoria-test-utils" }
 
 [patch.crates-io]
 # MatrixOne returns type code 0xf1 for JSON columns in `data branch diff` output,

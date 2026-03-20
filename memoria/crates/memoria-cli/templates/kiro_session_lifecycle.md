@@ -1,5 +1,7 @@
 ---
-inclusion: always
+inclusion: auto
+name: session-lifecycle
+description: Detailed session lifecycle management - bootstrap, mid-session re-retrieval, wrap-up cleanup. Use when starting conversations or managing session state.
 ---
 
 <!-- memoria-version: 0.1.0-->

@@ -1,6 +1,6 @@
 ---
 name: setup
-description: Install Memoria and configure MCP for AI tools (Kiro, Cursor, Claude Code). Decision tree for embedded vs remote mode, database, embedding provider. Use when helping users set up Memoria.
+description: Install Memoria and configure MCP for AI tools (Kiro, Cursor, Claude Code, Codex). Decision tree for embedded vs remote mode, database, embedding provider. Use when helping users set up Memoria.
 ---
 
 ## Decision Tree
@@ -14,12 +14,13 @@ Ask: "Are you setting up your own instance, or connecting to an existing Memoria
 
 ### Step 2: Which AI tool?
 
-Ask: "Kiro, Cursor, or Claude Code?"
+Ask: "Kiro, Cursor, Claude Code, or Codex?"
 
 Config files generated:
 - Kiro: `.kiro/settings/mcp.json` + `.kiro/steering/memory.md`
 - Cursor: `.cursor/mcp.json` + `.cursor/rules/memory.mdc`
 - Claude: `.mcp.json` + `CLAUDE.md`
+- Codex: `~/.codex/config.toml` + `AGENTS.md`
 
 ### Step 3: MatrixOne database?
 

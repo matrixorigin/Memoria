@@ -13,7 +13,7 @@ pub struct RemoteClient {
 }
 
 impl RemoteClient {
-    pub fn new(api_url: &str, token: Option<&str>, user_id: String) -> Self {
+    pub fn new(api_url: &str, token: Option<&str>, user_id: String, tool: Option<&str>) -> Self {
         let mut headers = reqwest::header::HeaderMap::new();
         if let Some(t) = token {
             if let Ok(v) = reqwest::header::HeaderValue::from_str(&format!("Bearer {t}")) {
@@ -23,6 +23,12 @@ impl RemoteClient {
         // Set X-User-Id header
         if let Ok(v) = reqwest::header::HeaderValue::from_str(&user_id) {
             headers.insert("X-User-Id", v);
+        }
+        // Set X-Memoria-Tool header (kiro / cursor / claude / codex)
+        if let Some(t) = tool {
+            if let Ok(v) = reqwest::header::HeaderValue::from_str(t) {
+                headers.insert("X-Memoria-Tool", v);
+            }
         }
         let client = Client::builder()
             .default_headers(headers)
@@ -229,11 +235,42 @@ impl RemoteClient {
             "memory_capabilities" => Ok(Self::mcp_text(
                 "Available tools: memory_store, memory_retrieve, memory_search, \
                  memory_correct, memory_purge, memory_profile, memory_list, \
-                 memory_capabilities, memory_governance, memory_rebuild_index, \
-                 memory_consolidate, memory_reflect, memory_extract_entities, \
-                 memory_link_entities, memory_observe \
+                 memory_capabilities, memory_governance, memory_consolidate, \
+                 memory_reflect, memory_feedback \
                  [remote mode — connected to Memoria API server]",
             )),
+
+            "memory_get_retrieval_params" => {
+                let r = self.client.get(self.url("/v1/retrieval-params")).send().await?;
+                let body = Self::parse_response(r).await?;
+                Ok(Self::mcp_text(&serde_json::to_string_pretty(&body)?))
+            }
+
+            "memory_tune_params" => {
+                let r = self
+                    .client
+                    .post(self.url("/v1/retrieval-params/tune"))
+                    .send()
+                    .await?;
+                let body = Self::parse_response(r).await?;
+                if body["tuned"].as_bool().unwrap_or(false) {
+                    let old = &body["old_params"];
+                    let new = &body["new_params"];
+                    Ok(Self::mcp_text(&format!(
+                        "Parameters tuned:\n  feedback_weight: {:.3} → {:.3}\n  temporal_decay_hours: {:.1} → {:.1}\n  confidence_weight: {:.3} → {:.3}",
+                        old["feedback_weight"].as_f64().unwrap_or(0.0),
+                        new["feedback_weight"].as_f64().unwrap_or(0.0),
+                        old["temporal_decay_hours"].as_f64().unwrap_or(0.0),
+                        new["temporal_decay_hours"].as_f64().unwrap_or(0.0),
+                        old["confidence_weight"].as_f64().unwrap_or(0.0),
+                        new["confidence_weight"].as_f64().unwrap_or(0.0)
+                    )))
+                } else {
+                    Ok(Self::mcp_text(
+                        body["message"].as_str().unwrap_or("Not enough feedback to tune parameters")
+                    ))
+                }
+            }
 
             "memory_governance" => {
                 let r = self
@@ -509,6 +546,27 @@ impl RemoteClient {
                     .await?;
                 let body = Self::parse_response(r).await?;
                 Ok(Self::mcp_json(&body))
+            }
+
+            "memory_feedback" => {
+                let memory_id = args["memory_id"].as_str().unwrap_or("");
+                let signal = args["signal"].as_str().unwrap_or("");
+                let r = self
+                    .client
+                    .post(self.url(&format!("/v1/memories/{memory_id}/feedback")))
+                    .json(&json!({
+                        "signal": signal,
+                        "context": args["context"],
+                    }))
+                    .send()
+                    .await?;
+                let body = Self::parse_response(r).await?;
+                Ok(Self::mcp_text(&format!(
+                    "Recorded feedback: memory={}, signal={}, feedback_id={}",
+                    memory_id,
+                    signal,
+                    body["feedback_id"].as_str().unwrap_or("")
+                )))
             }
 
             _ => Ok(Self::mcp_text(&format!("Unknown tool: {name}"))),

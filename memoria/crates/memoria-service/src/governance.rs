@@ -38,6 +38,7 @@ pub struct GovernanceRunSummary {
     pub vector_index_rows: i64,
     pub snapshots_cleaned: i64,
     pub orphan_branches_cleaned: i64,
+    pub users_tuned: i64,
 }
 
 #[derive(Debug, Default, Clone, PartialEq)]
@@ -111,7 +112,8 @@ pub trait GovernanceStore: Send + Sync {
         &self,
         user_id: &str,
         operation: &str,
-        target_ids: &[&str],
+        memory_id: Option<&str>,
+        payload: Option<&str>,
         reason: &str,
         snapshot_before: Option<&str>,
     );
@@ -143,6 +145,12 @@ pub trait GovernanceStore: Send + Sync {
         _task: GovernanceTask,
     ) -> Result<(), MemoriaError> {
         Ok(())
+    }
+
+    /// Auto-tune retrieval parameters for a user based on feedback history.
+    /// Returns true if parameters were updated.
+    async fn tune_user_retrieval_params(&self, _user_id: &str) -> Result<bool, MemoriaError> {
+        Ok(false)
     }
 }
 
@@ -233,19 +241,12 @@ impl GovernanceStore for SqlMemoryStore {
         &self,
         user_id: &str,
         operation: &str,
-        target_ids: &[&str],
+        memory_id: Option<&str>,
+        payload: Option<&str>,
         reason: &str,
         snapshot_before: Option<&str>,
     ) {
-        SqlMemoryStore::log_edit(
-            self,
-            user_id,
-            operation,
-            target_ids,
-            reason,
-            snapshot_before,
-        )
-        .await;
+        SqlMemoryStore::log_edit(self, user_id, operation, memory_id, payload, reason, snapshot_before).await;
     }
 
     async fn check_shared_breaker(
@@ -279,6 +280,16 @@ impl GovernanceStore for SqlMemoryStore {
         task: GovernanceTask,
     ) -> Result<(), MemoriaError> {
         SqlMemoryStore::clear_governance_runtime_breaker(self, strategy_key, task.as_str()).await
+    }
+
+    async fn tune_user_retrieval_params(&self, user_id: &str) -> Result<bool, MemoriaError> {
+        use crate::scoring::{DefaultScoringPlugin, ScoringPlugin};
+
+        let plugin = DefaultScoringPlugin;
+        match plugin.tune_params(self, user_id).await? {
+            Some(_) => Ok(true),
+            None => Ok(false),
+        }
     }
 }
 
@@ -418,7 +429,8 @@ impl DefaultGovernanceStrategy {
                             .log_edit(
                                 &user_id,
                                 "governance:archive_working",
-                                &[],
+                                None,
+                                Some(&format!("{{\"archived\":{count},\"threshold_hours\":{}}}", Self::STALE_WORKING_HOURS)),
                                 &format!(
                                     "archived {count} stale working memories (>{}h)",
                                     Self::STALE_WORKING_HOURS
@@ -484,7 +496,8 @@ impl DefaultGovernanceStrategy {
                             .log_edit(
                                 user_id,
                                 "governance:cleanup_stale",
-                                &[],
+                                None,
+                                Some(&format!("{{\"cleaned_stale\":{cleaned}}}")),
                                 &format!("cleaned {cleaned}"),
                                 state.snapshot_before.as_deref(),
                             )
@@ -543,7 +556,8 @@ impl DefaultGovernanceStrategy {
                             .log_edit(
                                 user_id,
                                 "governance:quarantine",
-                                &[],
+                                None,
+                                Some(&format!("{{\"quarantined\":{count}}}")),
                                 &format!("quarantined {count}"),
                                 state.snapshot_before.as_deref(),
                             )
@@ -607,7 +621,8 @@ impl DefaultGovernanceStrategy {
                             .log_edit(
                                 user_id,
                                 "governance:compress_redundant",
-                                &[],
+                                None,
+                                Some(&format!("{{\"compressed\":{count}}}")),
                                 &format!("compressed {count}"),
                                 state.snapshot_before.as_deref(),
                             )
@@ -671,7 +686,8 @@ impl DefaultGovernanceStrategy {
                             .log_edit(
                                 user_id,
                                 "governance:cleanup_orphaned_incrementals",
-                                &[],
+                                None,
+                                Some(&format!("{{\"cleaned_orphaned\":{count}}}")),
                                 &format!("cleaned {count}"),
                                 state.snapshot_before.as_deref(),
                             )
@@ -816,6 +832,39 @@ impl DefaultGovernanceStrategy {
         }
     }
 
+    async fn tune_retrieval_params_operation(
+        &self,
+        users: &[String],
+        store: &dyn GovernanceStore,
+        state: &mut ExecutionState,
+    ) {
+        let mut tuned_count = 0i64;
+        for user_id in users {
+            match store.tune_user_retrieval_params(user_id).await {
+                Ok(true) => tuned_count += 1,
+                Ok(false) => {} // Not enough feedback, skip
+                Err(err) => record_warning(
+                    GovernanceTask::Daily,
+                    Some(user_id),
+                    "tune_retrieval_params",
+                    &err,
+                    &mut state.warnings,
+                ),
+            }
+        }
+        state.summary.users_tuned = tuned_count;
+        if tuned_count > 0 {
+            state.decisions.push(governance_decision(
+                GovernanceTask::Daily,
+                "tune_retrieval_params",
+                format!("Auto-tuned retrieval parameters for {tuned_count} users"),
+                Some(1.0),
+                vec![],
+                state.snapshot_before.as_deref(),
+            ));
+        }
+    }
+
     async fn run_hourly(
         &self,
         store: &dyn GovernanceStore,
@@ -843,6 +892,8 @@ impl DefaultGovernanceStrategy {
         self.cleanup_orphaned_incrementals_operation(&plan.users, store, state)
             .await;
         self.cleanup_async_tasks_operation(store, state).await;
+        self.tune_retrieval_params_operation(&plan.users, store, state)
+            .await;
     }
 
     async fn run_weekly(
@@ -1006,6 +1057,10 @@ impl GovernanceStrategy for DefaultGovernanceStrategy {
         metrics.insert(
             "governance.orphan_branches_cleaned".to_string(),
             state.summary.orphan_branches_cleaned as f64,
+        );
+        metrics.insert(
+            "governance.users_tuned".to_string(),
+            state.summary.users_tuned as f64,
         );
         metrics.insert(
             "governance.snapshot_created".to_string(),
@@ -1283,7 +1338,8 @@ mod tests {
             &self,
             user_id: &str,
             operation: &str,
-            _target_ids: &[&str],
+            _memory_id: Option<&str>,
+            _payload: Option<&str>,
             reason: &str,
             snapshot_before: Option<&str>,
         ) {
@@ -1331,6 +1387,7 @@ mod tests {
                 vector_index_rows: 0,
                 snapshots_cleaned: 0,
                 orphan_branches_cleaned: 0,
+                users_tuned: 0,
             }
         );
         assert_eq!(execution.report.status, StrategyStatus::Success);
@@ -1510,5 +1567,64 @@ mod tests {
         };
 
         assert_governance_contract(&StaticContractStrategy, &store, GovernanceTask::Hourly).await;
+    }
+
+    /// Gap: tune failure for one user must not block other users' tuning.
+    #[tokio::test]
+    async fn daily_tune_failure_for_one_user_does_not_block_others() {
+        struct TuneStore {
+            users: Vec<String>,
+            failing_user: String,
+            tuned: Mutex<Vec<String>>,
+        }
+
+        #[async_trait]
+        impl GovernanceStore for TuneStore {
+            async fn list_active_users(&self) -> Result<Vec<String>, MemoriaError> {
+                Ok(self.users.clone())
+            }
+            async fn cleanup_tool_results(&self, _: i64) -> Result<i64, MemoriaError> { Ok(0) }
+            async fn cleanup_async_tasks(&self, _: i64) -> Result<i64, MemoriaError> { Ok(0) }
+            async fn archive_stale_working(&self, _: i64) -> Result<Vec<(String, i64)>, MemoriaError> { Ok(vec![]) }
+            async fn cleanup_stale(&self, _: &str) -> Result<i64, MemoriaError> { Ok(0) }
+            async fn quarantine_low_confidence(&self, _: &str) -> Result<i64, MemoriaError> { Ok(0) }
+            async fn compress_redundant(&self, _: &str, _: f64, _: i64, _: usize) -> Result<i64, MemoriaError> { Ok(0) }
+            async fn cleanup_orphaned_incrementals(&self, _: &str, _: i64) -> Result<i64, MemoriaError> { Ok(0) }
+            async fn rebuild_vector_index(&self, _: &str) -> Result<i64, MemoriaError> { Ok(0) }
+            async fn cleanup_snapshots(&self, _: usize) -> Result<i64, MemoriaError> { Ok(0) }
+            async fn cleanup_orphan_branches(&self) -> Result<i64, MemoriaError> { Ok(0) }
+            async fn create_safety_snapshot(&self, _: &str) -> (Option<String>, Option<String>) { (None, None) }
+            async fn log_edit(&self, _: &str, _: &str, _: Option<&str>, _: Option<&str>, _: &str, _: Option<&str>) {}
+
+            async fn tune_user_retrieval_params(&self, user_id: &str) -> Result<bool, MemoriaError> {
+                if user_id == self.failing_user {
+                    return Err(MemoriaError::Database("tune exploded".into()));
+                }
+                self.tuned.lock().unwrap().push(user_id.to_string());
+                Ok(true)
+            }
+        }
+
+        let store = TuneStore {
+            users: vec!["u1".into(), "u2".into(), "u3".into()],
+            failing_user: "u2".into(),
+            tuned: Mutex::new(vec![]),
+        };
+
+        let execution = DefaultGovernanceStrategy
+            .run(&store, GovernanceTask::Daily)
+            .await
+            .expect("daily should not fail even if one user's tune fails");
+
+        // u1 and u3 should have been tuned despite u2 failing
+        let tuned = store.tuned.lock().unwrap().clone();
+        assert!(tuned.contains(&"u1".to_string()), "u1 should be tuned");
+        assert!(tuned.contains(&"u3".to_string()), "u3 should be tuned");
+        assert!(!tuned.contains(&"u2".to_string()), "u2 should have failed");
+        assert_eq!(execution.summary.users_tuned, 2);
+
+        // Report should be degraded with a warning about u2
+        assert_eq!(execution.report.status, StrategyStatus::Degraded);
+        assert!(execution.report.warnings.iter().any(|w| w.contains("tune_retrieval_params") && w.contains("u2")));
     }
 }

@@ -783,3 +783,179 @@ async fn test_entity_link_weights_by_source() {
     }
     println!("✅ entity link weights: regex=0.8, llm=0.9, manual=1.0");
 }
+
+// ── batch_upsert_memory_entity_links tests ───────────────────────────────────
+
+#[tokio::test]
+async fn test_batch_upsert_entity_links_empty() {
+    let (store, uid) = setup_graph().await;
+    store
+        .batch_upsert_memory_entity_links(&uid, &[])
+        .await
+        .expect("empty batch should succeed");
+    println!("✅ batch_upsert_memory_entity_links: empty input OK");
+}
+
+#[tokio::test]
+async fn test_batch_upsert_entity_links_basic() {
+    let (store, uid) = setup_graph().await;
+    let (eid1, _) = store.upsert_entity(&uid, "rust", "Rust", "tech").await.unwrap();
+    let (eid2, _) = store.upsert_entity(&uid, "go", "Go", "tech").await.unwrap();
+    let mid = format!("mem_{}", uuid::Uuid::new_v4().simple());
+
+    let links: Vec<(&str, &str, &str)> = vec![
+        (&mid, &eid1, "regex"),
+        (&mid, &eid2, "llm"),
+    ];
+    store
+        .batch_upsert_memory_entity_links(&uid, &links)
+        .await
+        .expect("batch upsert");
+
+    // Verify both links exist
+    let rows = sqlx::query(
+        "SELECT entity_id, source, weight FROM mem_memory_entity_links WHERE user_id = ? AND memory_id = ? ORDER BY weight"
+    )
+    .bind(&uid).bind(&mid)
+    .fetch_all(store.pool()).await.unwrap();
+
+    use sqlx::Row;
+    assert_eq!(rows.len(), 2);
+    let w0: f32 = rows[0].get("weight");
+    let w1: f32 = rows[1].get("weight");
+    assert!((w0 - 0.8).abs() < 0.01, "regex weight should be 0.8");
+    assert!((w1 - 0.9).abs() < 0.01, "llm weight should be 0.9");
+    println!("✅ batch_upsert_memory_entity_links: 2 links with correct weights");
+}
+
+#[tokio::test]
+async fn test_batch_upsert_entity_links_idempotent() {
+    let (store, uid) = setup_graph().await;
+    let (eid, _) = store.upsert_entity(&uid, "matrixone", "MatrixOne", "tech").await.unwrap();
+    let mid = format!("mem_{}", uuid::Uuid::new_v4().simple());
+
+    let links: Vec<(&str, &str, &str)> = vec![(&mid, &eid, "regex")];
+    store.batch_upsert_memory_entity_links(&uid, &links).await.unwrap();
+    // Upsert again — should not fail (ON DUPLICATE KEY UPDATE)
+    store.batch_upsert_memory_entity_links(&uid, &links).await.unwrap();
+
+    let rows = sqlx::query(
+        "SELECT COUNT(*) as cnt FROM mem_memory_entity_links WHERE user_id = ? AND memory_id = ? AND entity_id = ?"
+    )
+    .bind(&uid).bind(&mid).bind(&eid)
+    .fetch_one(store.pool()).await.unwrap();
+    use sqlx::Row;
+    let cnt: i64 = rows.get("cnt");
+    assert_eq!(cnt, 1, "should still be exactly 1 link");
+    println!("✅ batch_upsert_memory_entity_links: idempotent (no duplicates)");
+}
+
+#[tokio::test]
+async fn test_batch_upsert_entity_links_source_upgrade() {
+    let (store, uid) = setup_graph().await;
+    let (eid, _) = store.upsert_entity(&uid, "tokio", "Tokio", "tech").await.unwrap();
+    let mid = format!("mem_{}", uuid::Uuid::new_v4().simple());
+
+    // First insert with regex (weight 0.8)
+    let links: Vec<(&str, &str, &str)> = vec![(&mid, &eid, "regex")];
+    store.batch_upsert_memory_entity_links(&uid, &links).await.unwrap();
+
+    // Upsert with manual (weight 1.0) — should update
+    let links2: Vec<(&str, &str, &str)> = vec![(&mid, &eid, "manual")];
+    store.batch_upsert_memory_entity_links(&uid, &links2).await.unwrap();
+
+    use sqlx::Row;
+    let row = sqlx::query(
+        "SELECT source, weight FROM mem_memory_entity_links WHERE memory_id = ? AND entity_id = ?"
+    )
+    .bind(&mid).bind(&eid)
+    .fetch_one(store.pool()).await.unwrap();
+    let source: String = row.get("source");
+    let weight: f32 = row.get("weight");
+    assert_eq!(source, "manual");
+    assert!((weight - 1.0).abs() < 0.01, "weight should be updated to 1.0");
+    println!("✅ batch_upsert_memory_entity_links: source/weight updated on conflict");
+}
+
+#[tokio::test]
+async fn test_batch_upsert_entity_links_large_batch() {
+    let (store, uid) = setup_graph().await;
+    // Create 80 entities and link them all to one memory
+    let mut entity_ids = Vec::new();
+    for i in 0..80 {
+        let (eid, _) = store
+            .upsert_entity(&uid, &format!("ent_{i}"), &format!("Ent {i}"), "concept")
+            .await
+            .unwrap();
+        entity_ids.push(eid);
+    }
+    let mid = format!("mem_{}", uuid::Uuid::new_v4().simple());
+    let links: Vec<(&str, &str, &str)> = entity_ids
+        .iter()
+        .map(|eid| (mid.as_str(), eid.as_str(), "regex"))
+        .collect();
+    store
+        .batch_upsert_memory_entity_links(&uid, &links)
+        .await
+        .expect("large batch should succeed (chunked into 50+30)");
+
+    use sqlx::Row;
+    let row = sqlx::query(
+        "SELECT COUNT(*) as cnt FROM mem_memory_entity_links WHERE user_id = ? AND memory_id = ?"
+    )
+    .bind(&uid).bind(&mid)
+    .fetch_one(store.pool()).await.unwrap();
+    let cnt: i64 = row.get("cnt");
+    assert_eq!(cnt, 80);
+    println!("✅ batch_upsert_memory_entity_links: 80 links chunked correctly");
+}
+
+#[tokio::test]
+async fn test_batch_upsert_entity_links_mixed_sources() {
+    let (store, uid) = setup_graph().await;
+    let (eid1, _) = store.upsert_entity(&uid, "a", "A", "tech").await.unwrap();
+    let (eid2, _) = store.upsert_entity(&uid, "b", "B", "tech").await.unwrap();
+    let (eid3, _) = store.upsert_entity(&uid, "c", "C", "tech").await.unwrap();
+    let mid = format!("mem_{}", uuid::Uuid::new_v4().simple());
+
+    let links: Vec<(&str, &str, &str)> = vec![
+        (&mid, &eid1, "regex"),
+        (&mid, &eid2, "llm"),
+        (&mid, &eid3, "manual"),
+    ];
+    store.batch_upsert_memory_entity_links(&uid, &links).await.unwrap();
+
+    use sqlx::Row;
+    let rows = sqlx::query(
+        "SELECT source, weight FROM mem_memory_entity_links WHERE user_id = ? AND memory_id = ? ORDER BY weight"
+    )
+    .bind(&uid).bind(&mid)
+    .fetch_all(store.pool()).await.unwrap();
+    assert_eq!(rows.len(), 3);
+    let sources: Vec<String> = rows.iter().map(|r| r.get("source")).collect();
+    assert_eq!(sources, vec!["regex", "llm", "manual"]);
+    println!("✅ batch_upsert_memory_entity_links: mixed sources with correct weights");
+}
+
+#[tokio::test]
+async fn test_batch_upsert_entity_links_multiple_memories() {
+    let (store, uid) = setup_graph().await;
+    let (eid, _) = store.upsert_entity(&uid, "shared_entity", "SharedEntity", "concept").await.unwrap();
+    let mid1 = format!("mem1_{}", uuid::Uuid::new_v4().simple());
+    let mid2 = format!("mem2_{}", uuid::Uuid::new_v4().simple());
+
+    // Same entity linked to two different memories in one batch
+    let links: Vec<(&str, &str, &str)> = vec![
+        (&mid1, &eid, "regex"),
+        (&mid2, &eid, "llm"),
+    ];
+    store.batch_upsert_memory_entity_links(&uid, &links).await.unwrap();
+
+    let rows = sqlx::query(
+        "SELECT memory_id, source FROM mem_memory_entity_links WHERE user_id = ? AND entity_id = ? ORDER BY memory_id"
+    )
+    .bind(&uid).bind(&eid)
+    .fetch_all(store.pool()).await.unwrap();
+    assert_eq!(rows.len(), 2, "entity should be linked to 2 memories");
+    println!("✅ batch_upsert_memory_entity_links: one entity linked to multiple memories");
+}
