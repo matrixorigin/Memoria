@@ -89,6 +89,15 @@ Before storing a new memory, consider:
 | `memory_retrieve` | Conversation start, or when context is needed | `query`, `top_k` (default 5), `session_id` (optional), `explain` (false = no debug, true = show timing) |
 | `memory_search` | User asks "what do you know about X" or you need to browse | `query`, `top_k` (default 10), `explain` (false = no debug, true = show timing) |
 | `memory_profile` | User asks "what do you know about me" | — |
+| `memory_feedback` | After using a retrieved memory, record if it was helpful | `memory_id`, `signal` (useful/irrelevant/outdated/wrong), `context` (optional) |
+
+**`memory_feedback`**: Call this after retrieval when you can assess whether a memory was helpful. Signals:
+- `useful` — memory helped answer the question or complete the task
+- `irrelevant` — memory was retrieved but not relevant to the query
+- `outdated` — memory contains stale information
+- `wrong` — memory contains incorrect information
+
+Feedback improves future retrieval ranking. Don't call for every memory — only when you have clear signal.
 
 **`memory_retrieve` vs `memory_search`**: In MCP mode, both use the same retrieval pipeline (graph → hybrid vector+fulltext → fulltext fallback). The differences are:
 - `memory_retrieve` accepts `session_id` for session-scoped boosting; `memory_search` does not

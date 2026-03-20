@@ -201,6 +201,7 @@ memoria rules --force
 | `memory_purge` | Delete by ID or topic keyword |
 | `memory_search` | Semantic search across all memories |
 | `memory_profile` | Get user's memory-derived profile |
+| `memory_feedback` | Record relevance feedback (useful/irrelevant/outdated/wrong) |
 
 ### Snapshots & Branches
 

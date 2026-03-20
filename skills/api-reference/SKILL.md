@@ -106,6 +106,46 @@ All fields optional. Auto-creates safety snapshot. Response: `{ "purged": N, "sn
 
 LLM-free alternatives: `POST /v1/reflect/candidates`, `POST /v1/extract-entities/candidates` — return raw data for the calling agent to process.
 
+## Feedback & Adaptive Retrieval
+
+Feedback signals improve retrieval ranking over time. The system learns which memories are useful/irrelevant for each user.
+
+### Record Feedback: `POST /v1/memories/{id}/feedback`
+
+```json
+{ "signal": "useful", "context": "helped answer the question" }
+```
+
+Signals: `useful`, `irrelevant`, `outdated`, `wrong`
+
+Returns `201` with `{ "feedback_id": "..." }`
+
+### Get Stats: `GET /v1/feedback/stats`
+
+Returns aggregated feedback counts:
+```json
+{ "useful": 42, "irrelevant": 5, "outdated": 3, "wrong": 1 }
+```
+
+### Get by Tier: `GET /v1/feedback/by-tier`
+
+Returns feedback breakdown by trust tier (T1-T4).
+
+### Tune Parameters: `POST /v1/retrieval-params/tune`
+
+Manually adjust retrieval scoring weights:
+```json
+{ "feedback_weight": 0.15 }
+```
+
+`feedback_weight`: 0.01–0.5 (default 0.1). Higher = feedback has more impact on ranking.
+
+Auto-tuning: `POST /v1/retrieval-params/tune` with empty body triggers automatic tuning based on accumulated feedback (requires ≥10 feedback signals).
+
+### Get Parameters: `GET /v1/retrieval-params`
+
+Returns current retrieval parameters for the user.
+
 ## Episodic Memory
 
 ### Generate Summary: `POST /v1/sessions/{session_id}/summary`
