@@ -4590,3 +4590,243 @@ async fn test_api_admin_config_forbidden() {
     assert_eq!(r.status(), 403);
     println!("✅ GET /admin/config: non-master key → 403");
 }
+
+// ── Concurrency: parallel stores to same user ─────────────────────────────────
+
+#[tokio::test]
+async fn test_concurrent_stores() {
+    let (base, client) = spawn_server().await;
+    let uid = uid();
+    let client = Arc::new(client);
+    let n = 20;
+
+    let mut handles = Vec::new();
+    for i in 0..n {
+        let c = client.clone();
+        let b = base.clone();
+        let u = uid.clone();
+        handles.push(tokio::spawn(async move {
+            c.post(format!("{b}/v1/memories"))
+                .header("X-User-Id", &u)
+                .json(&json!({"content": format!("concurrent fact #{i}"), "memory_type": "semantic"}))
+                .send()
+                .await
+                .unwrap()
+        }));
+    }
+    let mut ok = 0;
+    for h in handles {
+        let r = h.await.unwrap();
+        if r.status() == 201 {
+            ok += 1;
+        }
+    }
+    assert_eq!(ok, n, "all concurrent stores should succeed");
+
+    // Verify all persisted
+    let r = client
+        .get(format!("{base}/v1/memories"))
+        .header("X-User-Id", &uid)
+        .query(&[("limit", "100")])
+        .send()
+        .await
+        .unwrap();
+    let body: Value = r.json().await.unwrap();
+    let count = body["items"].as_array().unwrap().len();
+    assert!(count >= n, "expected >= {n} memories, got {count}");
+    println!("✅ concurrent stores: {ok}/{n} succeeded, {count} persisted");
+}
+
+// ── Concurrency: entity extraction race condition ─────────────────────────────
+
+#[tokio::test]
+async fn test_concurrent_entity_upsert() {
+    let (base, client) = spawn_server().await;
+    let uid = uid();
+    let client = Arc::new(client);
+
+    // All memories mention "Redis" — triggers concurrent upsert_entity for same entity
+    let mut handles = Vec::new();
+    for i in 0..10 {
+        let c = client.clone();
+        let b = base.clone();
+        let u = uid.clone();
+        handles.push(tokio::spawn(async move {
+            c.post(format!("{b}/v1/memories"))
+                .header("X-User-Id", &u)
+                .json(&json!({"content": format!("Redis is used for caching scenario {i}"), "memory_type": "semantic"}))
+                .send()
+                .await
+                .unwrap()
+        }));
+    }
+    for h in handles {
+        let r = h.await.unwrap();
+        assert_eq!(r.status(), 201, "concurrent entity upsert should not fail");
+    }
+
+    // Verify entity exists (no duplicates crashed it)
+    let r = client
+        .get(format!("{base}/v1/entities"))
+        .header("X-User-Id", &uid)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    println!("✅ concurrent entity upsert: no race condition errors");
+}
+
+// ── Pressure: batch store at limit ────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_batch_store_at_limit() {
+    let (base, client) = spawn_server().await;
+    let uid = uid();
+
+    let memories: Vec<_> = (0..100)
+        .map(|i| json!({"content": format!("batch item {i}"), "memory_type": "semantic"}))
+        .collect();
+
+    let r = client
+        .post(format!("{base}/v1/memories/batch"))
+        .header("X-User-Id", &uid)
+        .json(&json!({"memories": memories}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 201);
+    let body: Value = r.json().await.unwrap();
+    assert_eq!(body.as_array().unwrap().len(), 100);
+
+    // Over limit → 422
+    let memories_over: Vec<_> = (0..101)
+        .map(|i| json!({"content": format!("over {i}"), "memory_type": "semantic"}))
+        .collect();
+    let r = client
+        .post(format!("{base}/v1/memories/batch"))
+        .header("X-User-Id", &uid)
+        .json(&json!({"memories": memories_over}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 422);
+    println!("✅ batch store: 100 ok, 101 rejected");
+}
+
+// ── Concurrency: parallel feedback on same memory ─────────────────────────────
+
+#[tokio::test]
+async fn test_concurrent_feedback() {
+    let (base, client) = spawn_server().await;
+    let uid = uid();
+    let client = Arc::new(client);
+
+    // Create a memory
+    let r = client
+        .post(format!("{base}/v1/memories"))
+        .header("X-User-Id", &uid)
+        .json(&json!({"content": "shared memory for feedback", "memory_type": "semantic"}))
+        .send()
+        .await
+        .unwrap();
+    let mid = r.json::<Value>().await.unwrap()["memory_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // 10 concurrent feedback signals
+    let mut handles = Vec::new();
+    for i in 0..10 {
+        let c = client.clone();
+        let b = base.clone();
+        let u = uid.clone();
+        let m = mid.clone();
+        let signal = if i % 2 == 0 { "useful" } else { "irrelevant" };
+        handles.push(tokio::spawn(async move {
+            c.post(format!("{b}/v1/memories/{m}/feedback"))
+                .header("X-User-Id", &u)
+                .json(&json!({"signal": signal}))
+                .send()
+                .await
+                .unwrap()
+        }));
+    }
+    for h in handles {
+        let r = h.await.unwrap();
+        assert!(r.status() == 200 || r.status() == 201, "concurrent feedback should succeed, got {}", r.status());
+    }
+
+    // Verify stats reflect all signals
+    let r = client
+        .get(format!("{base}/v1/feedback/stats"))
+        .header("X-User-Id", &uid)
+        .send()
+        .await
+        .unwrap();
+    let body: Value = r.json().await.unwrap();
+    let total = body["total"].as_i64().unwrap();
+    assert_eq!(total, 10, "all 10 feedback signals should be recorded");
+    println!("✅ concurrent feedback: {total} signals recorded");
+}
+
+// ── Graceful degradation ──────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_graceful_degradation() {
+    let (base, client) = spawn_server().await;
+    let uid = uid();
+
+    // Rollback to nonexistent snapshot → error, not crash
+    let r = client
+        .post(format!("{base}/v1/snapshots/nonexistent_snap_xyz/rollback"))
+        .header("X-User-Id", &uid)
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_client_error() || r.status().is_server_error());
+
+    // Feedback on nonexistent memory → 404
+    let r = client
+        .post(format!("{base}/v1/memories/nonexistent_id/feedback"))
+        .header("X-User-Id", &uid)
+        .json(&json!({"signal": "useful"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 404);
+
+    // Store → purge → correct the purged memory → should fail gracefully
+    let r = client
+        .post(format!("{base}/v1/memories"))
+        .header("X-User-Id", &uid)
+        .json(&json!({"content": "ephemeral", "memory_type": "semantic"}))
+        .send()
+        .await
+        .unwrap();
+    let mid = r.json::<Value>().await.unwrap()["memory_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    client
+        .delete(format!("{base}/v1/memories/{mid}"))
+        .header("X-User-Id", &uid)
+        .send()
+        .await
+        .unwrap();
+
+    let r = client
+        .put(format!("{base}/v1/memories/{mid}"))
+        .header("X-User-Id", &uid)
+        .json(&json!({"new_content": "updated", "reason": "test"}))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        r.status() == 404 || r.status().is_client_error() || r.status().is_server_error(),
+        "correct after purge should fail gracefully, got {}",
+        r.status()
+    );
+
+    println!("✅ graceful degradation: all error cases handled without panic");
+}
