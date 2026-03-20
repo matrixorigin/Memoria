@@ -183,6 +183,12 @@ async fn validate_api_key(token: &str, state: &AppState) -> Option<String> {
     let sql = state.service.sql_store.as_ref()?;
     let key_hash = format!("{:x}", Sha256::digest(token.as_bytes()));
 
+    // Rate limit check (before cache, to count all attempts)
+    if !state.rate_limiter.allow(&key_hash).await {
+        crate::routes::metrics::AUTH_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return None;
+    }
+
     // Check cache first — no DB hit at all
     if let Some(user_id) = state.api_key_cache.get(&key_hash).await {
         // Still enqueue last_used_at update (batched, no DB pressure)

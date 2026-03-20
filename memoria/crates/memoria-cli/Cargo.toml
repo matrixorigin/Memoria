@@ -6,6 +6,7 @@ edition = "2021"
 [features]
 default = []
 local-embedding = ["memoria-embedding/local-embedding"]
+otel = ["memoria-api/otel"]
 
 [[bin]]
 name = "memoria"

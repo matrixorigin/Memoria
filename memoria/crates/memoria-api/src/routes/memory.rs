@@ -42,11 +42,22 @@ pub async fn health() -> &'static str {
     "ok"
 }
 
-pub async fn health_instance(State(state): State<AppState>) -> Json<serde_json::Value> {
-    Json(serde_json::json!({
-        "status": "ok",
+pub async fn health_instance(State(state): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
+    let db_ok = if let Some(sql) = &state.service.sql_store {
+        sqlx::query("SELECT 1")
+            .execute(sql.pool())
+            .await
+            .is_ok()
+    } else {
+        false
+    };
+    let status = if db_ok { "ok" } else { "degraded" };
+    let code = if db_ok { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE };
+    (code, Json(serde_json::json!({
+        "status": status,
         "instance_id": state.instance_id,
-    }))
+        "db": db_ok,
+    })))
 }
 
 pub async fn list_memories(
