@@ -173,6 +173,9 @@ The generated `mcp.json` includes all environment variables (empty = not configu
 Use the native OpenClaw plugin guide: [OpenClaw Plugin Setup](plugins/openclaw/README.md).
 
 ```bash
+# ensure memoria CLI exists (required as MCP bridge)
+command -v memoria >/dev/null || curl -sSL https://raw.githubusercontent.com/matrixorigin/Memoria/main/scripts/install.sh | bash -s -- -y -d ~/.local/bin
+
 # npm path
 openclaw plugins install @matrixorigin/memory-memoria
 openclaw plugins enable memory-memoria

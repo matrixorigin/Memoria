@@ -37,6 +37,12 @@ openclaw plugins uninstall memory-memoria
 ```
 
 ```bash
+# A0.5. Ensure memoria CLI exists (required even for cloud mode)
+command -v memoria >/dev/null || \
+  curl -sSL https://raw.githubusercontent.com/matrixorigin/Memoria/main/scripts/install.sh | bash -s -- -y -d ~/.local/bin
+```
+
+```bash
 # A1. Install plugin from npm
 openclaw plugins install @matrixorigin/memory-memoria
 openclaw plugins enable memory-memoria
@@ -78,17 +84,19 @@ Use:
 - apiKey: <MEMORIA_API_KEY>
 
 Execute exactly:
-1) Try npm install first:
+1) Ensure memoria CLI exists:
+   command -v memoria >/dev/null || curl -sSL https://raw.githubusercontent.com/matrixorigin/Memoria/main/scripts/install.sh | bash -s -- -y -d ~/.local/bin
+2) Try npm install first:
    openclaw plugins install @matrixorigin/memory-memoria
-2) If step 1 fails, fallback:
+3) If step 2 fails, fallback:
    mkdir -p ~/.openclaw/plugins-src
    if [ ! -d ~/.openclaw/plugins-src/Memoria/.git ]; then git clone https://github.com/matrixorigin/Memoria.git ~/.openclaw/plugins-src/Memoria; else git -C ~/.openclaw/plugins-src/Memoria pull --ff-only; fi
    openclaw plugins install --link ~/.openclaw/plugins-src/Memoria/plugins/openclaw
-3) Enable plugin:
+4) Enable plugin:
    openclaw plugins enable memory-memoria
-4) Connect cloud:
+5) Connect cloud:
    openclaw memoria connect --mode cloud --api-url <MEMORIA_API_URL> --api-key <MEMORIA_API_KEY>
-5) Verify:
+6) Verify:
    openclaw memoria health
 
 Output requirements:

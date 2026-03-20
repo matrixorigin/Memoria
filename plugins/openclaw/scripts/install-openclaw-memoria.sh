@@ -2,7 +2,7 @@
 set -euo pipefail
 
 PLUGIN_ID="memory-memoria"
-DEFAULT_REPO_URL="https://github.com/matrixorigin/openclaw-memoria.git"
+DEFAULT_REPO_URL="https://github.com/matrixorigin/Memoria.git"
 DEFAULT_REPO_REF="main"
 DEFAULT_MEMORIA_VERSION="v0.1.0"
 
@@ -434,6 +434,13 @@ if [[ -z "${SOURCE_DIR}" ]]; then
 else
   SOURCE_DIR="$(cd -- "${SOURCE_DIR}" && pwd)"
   log "Using existing checkout: ${SOURCE_DIR}"
+fi
+
+if [[ ! -f "${SOURCE_DIR}/openclaw.plugin.json" || ! -f "${SOURCE_DIR}/package.json" ]]; then
+  if [[ -f "${SOURCE_DIR}/plugins/openclaw/openclaw.plugin.json" && -f "${SOURCE_DIR}/plugins/openclaw/package.json" ]]; then
+    SOURCE_DIR="${SOURCE_DIR}/plugins/openclaw"
+    log "Resolved plugin source directory: ${SOURCE_DIR}"
+  fi
 fi
 
 [[ -f "${SOURCE_DIR}/openclaw.plugin.json" ]] || fail "Missing openclaw.plugin.json in ${SOURCE_DIR}"

@@ -97,6 +97,30 @@ function runLocalCommand(command: string, args: string[]) {
   }
 }
 
+function isExecutableAvailable(command: string): boolean {
+  const probe = spawnSync(command, ["--version"], {
+    cwd: PLUGIN_ROOT,
+    env: process.env,
+    stdio: ["ignore", "ignore", "ignore"],
+  });
+
+  if (probe.error && "code" in probe.error && probe.error.code === "ENOENT") {
+    return false;
+  }
+  return true;
+}
+
+function assertMemoriaExecutableAvailable(command: string, mode: "cloud" | "local") {
+  if (isExecutableAvailable(command)) {
+    return;
+  }
+  const installHint =
+    "curl -sSL https://raw.githubusercontent.com/matrixorigin/Memoria/main/scripts/install.sh | bash -s -- -y -d ~/.local/bin";
+  throw new Error(
+    `Memoria executable '${command}' was not found. Install Memoria CLI first (${installHint}), or rerun with --memoria-bin <path>. This plugin uses local memoria CLI as the MCP bridge even in mode=${mode}.`,
+  );
+}
+
 function objectSchema(
   properties: Record<string, unknown>,
   required: string[] = [],
@@ -1846,12 +1870,14 @@ const plugin = {
             const openclawBin = resolveOpenClawBinFromProcess();
             const configValidateEnabled = opts.skipValidate !== true;
             const healthCheckEnabled = opts.skipHealthCheck !== true;
+            const effectiveMemoriaExecutable = normalizedMemoriaBin ?? config.memoriaExecutable;
 
             if (configValidateEnabled) {
               runLocalCommand(openclawBin, ["config", "validate"]);
             }
 
             if (healthCheckEnabled) {
+              assertMemoriaExecutableAvailable(effectiveMemoriaExecutable, mode);
               const healthArgs = ["memoria", "health"];
               if (normalizedUserId) {
                 healthArgs.push("--user-id", normalizedUserId);
