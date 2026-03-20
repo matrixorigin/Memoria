@@ -2265,7 +2265,7 @@ impl SqlMemoryStore {
              WHERE user_id = ? AND is_active = 1 {type_filter}\
                AND embedding IS NOT NULL AND vector_dims(embedding) > 0 \
                AND memory_id != ? \
-             ORDER BY l2_dist ASC LIMIT 1"
+             ORDER BY l2_dist ASC LIMIT 1 by rank with option 'mode=pre'"
         );
         let mut q = sqlx::query(&sql).bind(user_id);
         if let Some(mt) = memory_type {
@@ -2594,7 +2594,7 @@ impl SqlMemoryStore {
              FROM {table} \
              WHERE user_id = '{}' AND is_active = 1 AND embedding IS NOT NULL{type_clause} \
              ORDER BY l2_distance(embedding, '{vec_literal}') ASC \
-             LIMIT {}",
+             LIMIT {} by rank with option 'mode=pre'",
             sanitize_sql_literal(user_id),
             limit
         );

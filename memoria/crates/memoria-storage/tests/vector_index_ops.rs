@@ -1,10 +1,17 @@
 use memoria_storage::SqlMemoryStore;
 
+fn test_dim() -> usize {
+    std::env::var("EMBEDDING_DIM")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1024)
+}
+
 async fn setup() -> SqlMemoryStore {
     let database_url = std::env::var("TEST_DATABASE_URL")
         .unwrap_or_else(|_| "mysql://root:111@localhost:6001/memoria_test".to_string());
     let instance_id = uuid::Uuid::new_v4().to_string();
-    let store = SqlMemoryStore::connect(&database_url, 1536, instance_id)
+    let store = SqlMemoryStore::connect(&database_url, test_dim(), instance_id)
         .await
         .expect("Failed to connect");
     store.migrate().await.expect("Failed to migrate");
@@ -229,4 +236,93 @@ async fn test_rebuild_failure_exponential_backoff() {
     assert_eq!(cooldown4, 300, "After success, should reset to 5min");
 
     println!("✅ Exponential backoff test passed");
+}
+
+/// Test: multi-user vector search with pre-filter mode.
+/// 1. Insert memories for two different users.
+/// 2. Build IVF index after data import.
+/// 3. Verify each user only gets their own results.
+#[tokio::test]
+async fn test_vector_search_pre_filter_multi_user() {
+    let store = setup().await;
+    let dim = test_dim();
+
+    let uid_a = format!("vec_pre_a_{}", &uuid::Uuid::new_v4().to_string()[..8]);
+    let uid_b = format!("vec_pre_b_{}", &uuid::Uuid::new_v4().to_string()[..8]);
+
+    // Build a dim-matched embedding with a hot dimension at index `hot`
+    let make_emb = |hot: usize| -> Vec<f32> {
+        assert!(hot < dim, "hot index {hot} exceeds embedding dim {dim}");
+        let mut v = vec![0.0f32; dim];
+        v[hot] = 1.0;
+        v
+    };
+
+    let insert = |uid: String, content: String, emb: Vec<f32>| {
+        let pool = store.pool().clone();
+        let mid = uuid::Uuid::new_v4().simple().to_string();
+        let vec_lit = format!("[{}]", emb.iter().map(|f| f.to_string()).collect::<Vec<_>>().join(","));
+        async move {
+            sqlx::query(&format!(
+                "INSERT INTO mem_memories \
+                 (memory_id, user_id, memory_type, content, embedding, is_active, \
+                  initial_confidence, source_event_ids, observed_at, created_at) \
+                 VALUES (?, ?, 'semantic', ?, '{vec_lit}', 1, 0.9, '[]', NOW(), NOW())"
+            ))
+            .bind(&mid)
+            .bind(&uid)
+            .bind(&content)
+            .execute(&pool)
+            .await
+            .expect("insert");
+            mid
+        }
+    };
+
+    // User A: two memories (hot dims 0, 1)
+    insert(uid_a.clone(), "user A memory 1".into(), make_emb(0)).await;
+    insert(uid_a.clone(), "user A memory 2".into(), make_emb(1)).await;
+    // User B: memory in a different direction (hot dim 2)
+    insert(uid_b.clone(), "user B memory 1".into(), make_emb(2)).await;
+
+    // Build IVF index after data import
+    let indexed = store.rebuild_vector_index("mem_memories").await.expect("rebuild");
+    assert!(indexed > 0, "expected at least 1 indexed row, got {indexed}");
+
+    // Query close to user A's memories
+    let query = make_emb(0);
+
+    let results_a = store
+        .search_vector_from("mem_memories", &uid_a, &query, 10)
+        .await
+        .expect("search user A");
+
+    let results_b = store
+        .search_vector_from("mem_memories", &uid_b, &query, 10)
+        .await
+        .expect("search user B");
+
+    assert!(!results_a.is_empty(), "user A should have results");
+    assert!(
+        results_a.iter().all(|m| m.user_id == uid_a),
+        "user A results must only contain user A memories"
+    );
+
+    assert!(!results_b.is_empty(), "user B should have results");
+    assert!(
+        results_b.iter().all(|m| m.user_id == uid_b),
+        "user B results must only contain user B memories"
+    );
+
+    let a_ids: std::collections::HashSet<_> = results_a.iter().map(|m| &m.memory_id).collect();
+    let b_ids: std::collections::HashSet<_> = results_b.iter().map(|m| &m.memory_id).collect();
+    assert!(a_ids.is_disjoint(&b_ids), "results must not overlap between users");
+
+    // Cleanup
+    sqlx::query("DELETE FROM mem_memories WHERE user_id = ? OR user_id = ?")
+        .bind(&uid_a)
+        .bind(&uid_b)
+        .execute(store.pool())
+        .await
+        .ok();
 }
