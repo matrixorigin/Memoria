@@ -144,22 +144,6 @@ pub fn list() -> Value {
                 },
                 "required": ["memory_id", "signal"]
             }
-        },
-        {
-            "name": "memory_observe",
-            "description": "Observe a conversation turn and extract memories from messages. Stores assistant/user messages as semantic memories.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "messages": {
-                        "type": "array",
-                        "items": {"type": "object"},
-                        "description": "Array of {role, content} message objects"
-                    },
-                    "session_id": {"type": "string"}
-                },
-                "required": ["messages"]
-            }
         }
     ])
 }
@@ -404,10 +388,8 @@ pub async fn call(
         "memory_capabilities" => Ok(mcp_text(
             "Available tools: memory_store, memory_retrieve, memory_search, \
              memory_correct, memory_purge, memory_profile, memory_list, \
-             memory_capabilities, memory_governance, memory_rebuild_index, \
-             memory_consolidate, memory_reflect, memory_extract_entities, \
-             memory_link_entities, memory_feedback, memory_get_retrieval_params, \
-             memory_tune_params, memory_observe",
+             memory_capabilities, memory_governance, memory_consolidate, \
+             memory_reflect, memory_feedback",
         )),
 
         "memory_governance" => {

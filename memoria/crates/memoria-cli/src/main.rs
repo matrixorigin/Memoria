@@ -382,7 +382,10 @@ async fn cmd_serve(db_url: Option<String>, port: u16, master_key: String) -> Res
     ));
     Arc::new(memoria_service::GovernanceScheduler::from_config(service.clone(), &cfg).await?)
         .start();
-    let state = AppState::new(service, git, master_key).with_instance_id(cfg.instance_id.clone());
+    let state = AppState::new(service, git, master_key)
+        .with_instance_id(cfg.instance_id.clone())
+        .init_auth_pool(&cfg.db_url)
+        .await;
 
     let app = build_router(state).layer(TraceLayer::new_for_http());
     let addr = format!("0.0.0.0:{}", port);

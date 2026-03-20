@@ -483,8 +483,20 @@ async fn test_capabilities() {
         "memory_correct",
         "memory_purge",
         "memory_profile",
+        "memory_feedback",
     ] {
         assert!(t.contains(tool), "missing {tool}: {t}");
+    }
+    // Hidden ops/debug tools must NOT appear in capabilities
+    for hidden in &[
+        "memory_rebuild_index",
+        "memory_extract_entities",
+        "memory_link_entities",
+        "memory_get_retrieval_params",
+        "memory_tune_params",
+        "memory_observe",
+    ] {
+        assert!(!t.contains(hidden), "hidden tool {hidden} should not be in capabilities: {t}");
     }
     println!("✅ capabilities: {t}");
 }

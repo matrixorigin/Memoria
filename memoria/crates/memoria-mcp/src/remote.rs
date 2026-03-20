@@ -229,10 +229,8 @@ impl RemoteClient {
             "memory_capabilities" => Ok(Self::mcp_text(
                 "Available tools: memory_store, memory_retrieve, memory_search, \
                  memory_correct, memory_purge, memory_profile, memory_list, \
-                 memory_capabilities, memory_governance, memory_rebuild_index, \
-                 memory_consolidate, memory_reflect, memory_extract_entities, \
-                 memory_link_entities, memory_feedback, memory_get_retrieval_params, \
-                 memory_tune_params, memory_observe \
+                 memory_capabilities, memory_governance, memory_consolidate, \
+                 memory_reflect, memory_feedback \
                  [remote mode — connected to Memoria API server]",
             )),
 

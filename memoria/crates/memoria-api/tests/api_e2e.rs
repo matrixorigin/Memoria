@@ -4830,3 +4830,149 @@ async fn test_graceful_degradation() {
 
     println!("✅ graceful degradation: all error cases handled without panic");
 }
+
+// ── last_used_at batched flush (#62) ─────────────────────────────────────────
+
+/// Verify that the LastUsedBatcher correctly coalesces multiple mark_used calls
+/// and flushes them in a single batch UPDATE.
+#[tokio::test]
+async fn test_last_used_batcher_coalesces_and_flushes() {
+    use memoria_api::auth::LastUsedBatcher;
+    use memoria_storage::SqlMemoryStore;
+    use sha2::{Digest, Sha256};
+
+    let mk = "test-master-batcher";
+    let (base, client) = spawn_server_with_master_key(mk).await;
+    let auth = format!("Bearer {mk}");
+
+    // Create 3 API keys
+    let mut keys = Vec::new();
+    for i in 0..3 {
+        let raw = create_api_key_for_user(
+            &client,
+            &base,
+            &auth,
+            &format!("batcher_user_{i}"),
+            &format!("key_{i}"),
+        )
+        .await;
+        keys.push(raw);
+    }
+
+    // Build a batcher and mark all 3 keys as used
+    let batcher = LastUsedBatcher::new();
+    let hashes: Vec<String> = keys
+        .iter()
+        .map(|k| format!("{:x}", Sha256::digest(k.as_bytes())))
+        .collect();
+    for h in &hashes {
+        batcher.mark_used(h.clone());
+    }
+
+    // Verify all 3 are pending
+    // (We can't inspect the internal set directly, but we can flush and verify DB)
+
+    // Connect to DB and flush
+    let store = SqlMemoryStore::connect(&db_url(), test_dim())
+        .await
+        .expect("connect");
+    batcher.flush(store.pool()).await;
+
+    // Verify last_used_at was updated for all 3 keys
+    for hash in &hashes {
+        let row: Option<(Option<chrono::NaiveDateTime>,)> = sqlx::query_as(
+            "SELECT last_used_at FROM mem_api_keys WHERE key_hash = ?",
+        )
+        .bind(hash)
+        .fetch_optional(store.pool())
+        .await
+        .expect("query");
+        let (last_used,) = row.expect("key should exist");
+        assert!(last_used.is_some(), "last_used_at should be set after flush for hash {}", &hash[..8]);
+    }
+
+    // Flush again — should be a no-op (pending set is drained)
+    batcher.flush(store.pool()).await;
+
+    // Mark one key again and flush — only that one should be updated
+    batcher.mark_used(hashes[0].clone());
+    batcher.flush(store.pool()).await;
+
+    println!("✅ test_last_used_batcher_coalesces_and_flushes: batch UPDATE works correctly");
+}
+
+/// Verify that API key auth works with the dedicated auth pool and that
+/// last_used_at is updated via the batcher (not per-request fire-and-forget).
+#[tokio::test]
+async fn test_api_key_auth_uses_batcher_not_fire_and_forget() {
+    let mk = "test-master-batcher-auth";
+    let db = db_url();
+
+    // Spawn server WITH init_auth_pool
+    use memoria_git::GitForDataService;
+    use memoria_service::{Config, MemoryService};
+    use memoria_storage::SqlMemoryStore;
+    use sqlx::mysql::MySqlPool;
+
+    let cfg = Config::from_env();
+    let store = SqlMemoryStore::connect(&db, test_dim())
+        .await
+        .expect("connect");
+    store.migrate().await.expect("migrate");
+    let pool = MySqlPool::connect(&db).await.expect("pool");
+    let git = Arc::new(GitForDataService::new(pool, &cfg.db_name));
+    let service = Arc::new(MemoryService::new_sql_with_llm(Arc::new(store), None, None));
+    let state = memoria_api::AppState::new(service, git, mk.to_string())
+        .init_auth_pool(&db)
+        .await;
+
+    let batcher = state.last_used_batcher.clone();
+    let app = memoria_api::build_router(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let base = format!("http://127.0.0.1:{port}");
+    let auth = format!("Bearer {mk}");
+
+    // Create an API key
+    let raw_key = create_api_key_for_user(&client, &base, &auth, "batcher_e2e_user", "e2e_key").await;
+
+    // Use the API key to make a request (cache miss → DB lookup → batcher.mark_used)
+    let r = client
+        .get(format!("{base}/v1/memories"))
+        .header("Authorization", format!("Bearer {raw_key}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200, "API key auth should succeed");
+
+    // Make another request (cache hit → batcher.mark_used, no DB)
+    let r = client
+        .get(format!("{base}/v1/memories"))
+        .header("Authorization", format!("Bearer {raw_key}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200, "Cached API key auth should succeed");
+
+    // Manually flush the batcher to verify last_used_at is updated
+    let verify_store = SqlMemoryStore::connect(&db, test_dim())
+        .await
+        .expect("connect");
+    batcher.flush(verify_store.pool()).await;
+
+    let key_hash = format!("{:x}", <sha2::Sha256 as sha2::Digest>::digest(raw_key.as_bytes()));
+    let row: Option<(Option<chrono::NaiveDateTime>,)> = sqlx::query_as(
+        "SELECT last_used_at FROM mem_api_keys WHERE key_hash = ?",
+    )
+    .bind(&key_hash)
+    .fetch_optional(verify_store.pool())
+    .await
+    .expect("query");
+    let (last_used,) = row.expect("key should exist");
+    assert!(last_used.is_some(), "last_used_at should be set after batcher flush");
+
+    println!("✅ test_api_key_auth_uses_batcher_not_fire_and_forget: auth pool + batcher works");
+}

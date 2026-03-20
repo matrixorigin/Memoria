@@ -97,22 +97,22 @@ fn make_service() -> Arc<MemoryService> {
 async fn test_tools_list() {
     let tools = memoria_mcp::tools::list();
     let arr = tools.as_array().unwrap();
-    assert_eq!(arr.len(), 13);
+    assert_eq!(arr.len(), 12);
     let names: Vec<&str> = arr.iter().map(|t| t["name"].as_str().unwrap()).collect();
     assert!(names.contains(&"memory_store"));
     assert!(names.contains(&"memory_retrieve"));
     assert!(names.contains(&"memory_correct"));
     assert!(names.contains(&"memory_purge"));
     assert!(names.contains(&"memory_governance"));
-    assert!(names.contains(&"memory_observe"));
     assert!(names.contains(&"memory_feedback"));
-    // 5 tools hidden from listing: rebuild_index, get_retrieval_params, tune_params, extract_entities, link_entities
+    // 6 tools hidden from listing: rebuild_index, get_retrieval_params, tune_params, extract_entities, link_entities, observe
     assert!(!names.contains(&"memory_rebuild_index"));
     assert!(!names.contains(&"memory_get_retrieval_params"));
     assert!(!names.contains(&"memory_tune_params"));
     assert!(!names.contains(&"memory_extract_entities"));
     assert!(!names.contains(&"memory_link_entities"));
-    println!("✅ tools_list: 13 tools (5 hidden)");
+    assert!(!names.contains(&"memory_observe"));
+    println!("✅ tools_list: 12 tools (6 hidden)");
 }
 
 #[tokio::test]
