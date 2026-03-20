@@ -207,8 +207,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_tune_params_negative_feedback_decreases_weight() {
-        use std::collections::HashMap;
-
         // Mock ScoringStore with mostly negative feedback (negative_ratio > 0.5)
         struct MockStore {
             totals: FeedbackTotals,
