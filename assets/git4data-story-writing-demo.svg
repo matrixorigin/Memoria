@@ -145,7 +145,13 @@
 
       .caption {
         fill: #d5e1ee;
+        font-size: 15px;
+      }
+
+      .captionCode {
+        font-family: 'SF Mono', 'Fira Code', Consolas, monospace;
         font-size: 14px;
+        letter-spacing: -0.3px;
       }
 
       .noteGreen {
@@ -221,6 +227,13 @@
       .caption-continue { animation: captionContinue 28s ease-in-out infinite; }
       .caption-rollback { animation: captionRollback 28s ease-in-out infinite; }
       .caption-renew { animation: captionRenew 28s ease-in-out infinite; }
+
+      .capPillBranchRect { animation: capBranchHL 28s ease-in-out infinite; }
+      .capPillMergeRect { animation: capMergeHL 28s ease-in-out infinite; }
+      .capPillRollbackRect { animation: capRollbackHL 28s ease-in-out infinite; }
+      .capPillBranchText { animation: capBranchTextHL 28s ease-in-out infinite; }
+      .capPillMergeText { animation: capMergeTextHL 28s ease-in-out infinite; }
+      .capPillRollbackText { animation: capRollbackTextHL 28s ease-in-out infinite; }
 
       @keyframes seg1 {
         0% { opacity: 1; stroke-dashoffset: 100; }
@@ -382,6 +395,37 @@
       @keyframes captionContinue { 0%, 76% { opacity: 0; } 77%, 88% { opacity: 1; } 89%, 100% { opacity: 0; } }
       @keyframes captionRollback { 0%, 88% { opacity: 0; } 89%, 96% { opacity: 1; } 97%, 100% { opacity: 0; } }
       @keyframes captionRenew { 0%, 96% { opacity: 0; } 97%, 100% { opacity: 1; } }
+
+      @keyframes capBranchHL {
+        0%, 28% { fill: rgba(255,255,255,0.045); stroke: rgba(255,255,255,0.08); }
+        30%, 56% { fill: rgba(139,108,255,0.22); stroke: rgba(139,108,255,0.55); }
+        58%, 100% { fill: rgba(255,255,255,0.045); stroke: rgba(255,255,255,0.08); }
+      }
+      @keyframes capMergeHL {
+        0%, 46% { fill: rgba(255,255,255,0.045); stroke: rgba(255,255,255,0.08); }
+        48%, 62% { fill: rgba(118,215,181,0.22); stroke: rgba(118,215,181,0.55); }
+        64%, 100% { fill: rgba(255,255,255,0.045); stroke: rgba(255,255,255,0.08); }
+      }
+      @keyframes capRollbackHL {
+        0%, 85% { fill: rgba(255,255,255,0.045); stroke: rgba(255,255,255,0.08); }
+        87%, 95% { fill: rgba(255,138,138,0.2); stroke: rgba(255,138,138,0.5); }
+        97%, 100% { fill: rgba(255,255,255,0.045); stroke: rgba(255,255,255,0.08); }
+      }
+      @keyframes capBranchTextHL {
+        0%, 28% { fill: #e7eef7; }
+        30%, 56% { fill: #c4b5ff; }
+        58%, 100% { fill: #e7eef7; }
+      }
+      @keyframes capMergeTextHL {
+        0%, 46% { fill: #e7eef7; }
+        48%, 62% { fill: #76d7b5; }
+        64%, 100% { fill: #e7eef7; }
+      }
+      @keyframes capRollbackTextHL {
+        0%, 85% { fill: #e7eef7; }
+        87%, 95% { fill: #ff8a8a; }
+        97%, 100% { fill: #e7eef7; }
+      }
     </style>
   </defs>
 
@@ -398,15 +442,15 @@
 
   <text x="72" y="112" class="label">Secure · Auditable · Programmable Memory for AI Agents</text>
   <text x="72" y="156" class="title">Memoria lets AI branch, merge, and roll back memory safely</text>
-  <text x="72" y="188" class="subtitle">This writing loop visualizes Memoria's Git-for-Data model: branch an alternate story arc, merge it into canon when it works, then roll back a weak ending and continue from a stronger state.</text>
+  <text x="72" y="188" class="subtitle">Watch Memoria's Git-for-Data model handle branching, merging, and rollback — in a story-writing workflow.</text>
 
   <g>
-    <rect x="1014" y="128" width="88" height="28" rx="14" class="capPill"/>
-    <text x="1058" y="146" text-anchor="middle" class="capPillText">Branch</text>
-    <rect x="1114" y="128" width="86" height="28" rx="14" class="capPill"/>
-    <text x="1157" y="146" text-anchor="middle" class="capPillText">Merge</text>
-    <rect x="1212" y="128" width="102" height="28" rx="14" class="capPill"/>
-    <text x="1263" y="146" text-anchor="middle" class="capPillText">Rollback</text>
+    <rect x="1014" y="128" width="88" height="28" rx="14" class="capPill capPillBranchRect"/>
+    <text x="1058" y="146" text-anchor="middle" class="capPillText capPillBranchText">Branch</text>
+    <rect x="1114" y="128" width="86" height="28" rx="14" class="capPill capPillMergeRect"/>
+    <text x="1157" y="146" text-anchor="middle" class="capPillText capPillMergeText">Merge</text>
+    <rect x="1212" y="128" width="102" height="28" rx="14" class="capPill capPillRollbackRect"/>
+    <text x="1263" y="146" text-anchor="middle" class="capPillText capPillRollbackText">Rollback</text>
   </g>
 
   <rect x="60" y="216" width="1280" height="534" rx="30" class="panel"/>
@@ -565,14 +609,14 @@
     <text x="1228" y="411" class="cardText">toward the hidden cove.</text>
   </g>
 
-  <g class="caption-main hidden"><text x="94" y="708" class="caption">The main storyline grows beat by beat.</text></g>
-  <g class="caption-idea hidden"><text x="94" y="708" class="caption">A new idea appears: what if Mira stays instead of leaving?</text></g>
-  <g class="caption-branch hidden"><text x="94" y="708" class="caption">A detached branch explores two alternate beats without touching the main plot.</text></g>
-  <g class="caption-merge hidden"><text x="94" y="708" class="caption">The branch glides back in and merges because the new direction works better.</text></g>
-  <g class="caption-continue hidden"><text x="94" y="708" class="caption">Writing continues on main through Beat 6, then two more beats are tried.</text></g>
-  <g class="caption-rollback hidden"><text x="94" y="708" class="caption">Those two turns feel wrong, so the story calmly returns to Beat 6.</text></g>
-  <g class="caption-renew hidden"><text x="94" y="708" class="caption">From Beat 6, a better new ending begins to grow.</text></g>
+  <line x1="90" y1="690" x2="1310" y2="690" stroke="rgba(255,255,255,0.06)" stroke-width="1"/>
+  <g class="caption-main hidden"><text x="94" y="714" class="caption">Building the main memory timeline, beat by beat.</text></g>
+  <g class="caption-idea hidden"><text x="94" y="714" class="caption">A new idea sparks — what if Mira stays instead of leaving?</text></g>
+  <g class="caption-branch hidden"><text x="94" y="714" class="caption"><tspan class="captionCode" fill="#c4b5ff">memoria.branch('what-if-she-stays')</tspan><tspan> — explore without touching canon</tspan></text></g>
+  <g class="caption-merge hidden"><text x="94" y="714" class="caption"><tspan class="captionCode" fill="#76d7b5">memoria.merge('what-if-she-stays')</tspan><tspan> — the better path becomes canon</tspan></text></g>
+  <g class="caption-continue hidden"><text x="94" y="714" class="caption">New beats committed to main memory. The story moves forward.</text></g>
+  <g class="caption-rollback hidden"><text x="94" y="714" class="caption"><tspan class="captionCode" fill="#ff8a8a">memoria.rollback(to='beat-6')</tspan><tspan> — discard weak turns, resume from strength</tspan></text></g>
+  <g class="caption-renew hidden"><text x="94" y="714" class="caption">Every change is safe to try, easy to undo. That's Git for Data.</text></g>
 
-  <rect x="60" y="770" width="90" height="28" rx="14" fill="rgba(255,255,255,0.07)"/>
-  <text x="105" y="789" text-anchor="middle" class="caption">28s loop</text>
+
 </svg>
