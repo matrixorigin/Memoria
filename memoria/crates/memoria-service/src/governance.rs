@@ -1568,4 +1568,63 @@ mod tests {
 
         assert_governance_contract(&StaticContractStrategy, &store, GovernanceTask::Hourly).await;
     }
+
+    /// Gap: tune failure for one user must not block other users' tuning.
+    #[tokio::test]
+    async fn daily_tune_failure_for_one_user_does_not_block_others() {
+        struct TuneStore {
+            users: Vec<String>,
+            failing_user: String,
+            tuned: Mutex<Vec<String>>,
+        }
+
+        #[async_trait]
+        impl GovernanceStore for TuneStore {
+            async fn list_active_users(&self) -> Result<Vec<String>, MemoriaError> {
+                Ok(self.users.clone())
+            }
+            async fn cleanup_tool_results(&self, _: i64) -> Result<i64, MemoriaError> { Ok(0) }
+            async fn cleanup_async_tasks(&self, _: i64) -> Result<i64, MemoriaError> { Ok(0) }
+            async fn archive_stale_working(&self, _: i64) -> Result<Vec<(String, i64)>, MemoriaError> { Ok(vec![]) }
+            async fn cleanup_stale(&self, _: &str) -> Result<i64, MemoriaError> { Ok(0) }
+            async fn quarantine_low_confidence(&self, _: &str) -> Result<i64, MemoriaError> { Ok(0) }
+            async fn compress_redundant(&self, _: &str, _: f64, _: i64, _: usize) -> Result<i64, MemoriaError> { Ok(0) }
+            async fn cleanup_orphaned_incrementals(&self, _: &str, _: i64) -> Result<i64, MemoriaError> { Ok(0) }
+            async fn rebuild_vector_index(&self, _: &str) -> Result<i64, MemoriaError> { Ok(0) }
+            async fn cleanup_snapshots(&self, _: usize) -> Result<i64, MemoriaError> { Ok(0) }
+            async fn cleanup_orphan_branches(&self) -> Result<i64, MemoriaError> { Ok(0) }
+            async fn create_safety_snapshot(&self, _: &str) -> (Option<String>, Option<String>) { (None, None) }
+            async fn log_edit(&self, _: &str, _: &str, _: Option<&str>, _: Option<&str>, _: &str, _: Option<&str>) {}
+
+            async fn tune_user_retrieval_params(&self, user_id: &str) -> Result<bool, MemoriaError> {
+                if user_id == self.failing_user {
+                    return Err(MemoriaError::Database("tune exploded".into()));
+                }
+                self.tuned.lock().unwrap().push(user_id.to_string());
+                Ok(true)
+            }
+        }
+
+        let store = TuneStore {
+            users: vec!["u1".into(), "u2".into(), "u3".into()],
+            failing_user: "u2".into(),
+            tuned: Mutex::new(vec![]),
+        };
+
+        let execution = DefaultGovernanceStrategy
+            .run(&store, GovernanceTask::Daily)
+            .await
+            .expect("daily should not fail even if one user's tune fails");
+
+        // u1 and u3 should have been tuned despite u2 failing
+        let tuned = store.tuned.lock().unwrap().clone();
+        assert!(tuned.contains(&"u1".to_string()), "u1 should be tuned");
+        assert!(tuned.contains(&"u3".to_string()), "u3 should be tuned");
+        assert!(!tuned.contains(&"u2".to_string()), "u2 should have failed");
+        assert_eq!(execution.summary.users_tuned, 2);
+
+        // Report should be degraded with a warning about u2
+        assert_eq!(execution.report.status, StrategyStatus::Degraded);
+        assert!(execution.report.warnings.iter().any(|w| w.contains("tune_retrieval_params") && w.contains("u2")));
+    }
 }

@@ -262,4 +262,62 @@ mod tests {
             "weight should be clamped at 0.05: got {:.4}", result4.feedback_weight
         );
     }
+
+    /// Verify that different feedback_weight values produce measurably different
+    /// ranking outcomes for the same feedback signals.
+    #[test]
+    fn test_feedback_weight_affects_ranking_spread() {
+        let plugin = DefaultScoringPlugin;
+        let fb = MemoryFeedback { useful: 3, wrong: 1, ..Default::default() };
+        // net delta = 3 - 0.5*1 = 2.5
+
+        let weights = [0.05, 0.1, 0.15, 0.2];
+        let scores: Vec<f64> = weights
+            .iter()
+            .map(|&w| {
+                let p = UserRetrievalParams { feedback_weight: w, ..Default::default() };
+                plugin.adjust_score(1.0, &fb, &p)
+            })
+            .collect();
+
+        // Each higher weight must produce a strictly higher score
+        for i in 1..scores.len() {
+            assert!(
+                scores[i] > scores[i - 1],
+                "weight {:.2} score {:.4} should > weight {:.2} score {:.4}",
+                weights[i], scores[i], weights[i - 1], scores[i - 1]
+            );
+        }
+
+        // Verify exact values: multiplier = 1 + weight * 2.5
+        assert!((scores[0] - 1.125).abs() < 0.001, "w=0.05: {}", scores[0]);
+        assert!((scores[1] - 1.25).abs() < 0.001, "w=0.10: {}", scores[1]);
+        assert!((scores[2] - 1.375).abs() < 0.001, "w=0.15: {}", scores[2]);
+        assert!((scores[3] - 1.5).abs() < 0.001, "w=0.20: {}", scores[3]);
+    }
+
+    /// Verify that two memories with identical base scores but different feedback
+    /// produce the correct relative ordering.
+    #[test]
+    fn test_feedback_ranking_order_with_equal_base_scores() {
+        let plugin = DefaultScoringPlugin;
+        let params = UserRetrievalParams::default(); // weight=0.1
+
+        let base = 0.85;
+        let fb_positive = MemoryFeedback { useful: 4, ..Default::default() };
+        let fb_neutral = MemoryFeedback::default();
+        let fb_negative = MemoryFeedback { irrelevant: 2, wrong: 2, ..Default::default() };
+
+        let s_pos = plugin.adjust_score(base, &fb_positive, &params);
+        let s_neu = plugin.adjust_score(base, &fb_neutral, &params);
+        let s_neg = plugin.adjust_score(base, &fb_negative, &params);
+
+        assert!(s_pos > s_neu, "positive {s_pos} > neutral {s_neu}");
+        assert!(s_neu > s_neg, "neutral {s_neu} > negative {s_neg}");
+
+        // Exact: pos = 0.85 * 1.4 = 1.19, neu = 0.85, neg = 0.85 * 0.8 = 0.68
+        assert!((s_pos - 1.19).abs() < 0.001);
+        assert!((s_neu - 0.85).abs() < 0.001);
+        assert!((s_neg - 0.68).abs() < 0.001);
+    }
 }
