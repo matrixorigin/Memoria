@@ -916,6 +916,7 @@ impl MemoryService {
         // Store new memory
         self.store.insert(&new_mem).await?;
 
+        let user_id = old.user_id.clone();
         // Deactivate old and link to new via superseded_by
         // Only update superseded_by — avoid touching content to skip fulltext index rebuild
         self.store.soft_delete(memory_id).await?;
