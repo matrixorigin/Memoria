@@ -24,7 +24,7 @@ fn uid() -> String {
 }
 
 async fn setup() -> (Arc<MemoryService>, Arc<SqlMemoryStore>, String) {
-    let store = SqlMemoryStore::connect(&db_url(), test_dim())
+    let store = SqlMemoryStore::connect(&db_url(), test_dim(), uuid::Uuid::new_v4().to_string())
         .await
         .expect("connect");
     store.migrate().await.expect("migrate");
@@ -1205,7 +1205,7 @@ async fn test_duplicate_instance_id_lock_is_exclusive() {
     use memoria_service::distributed::DistributedLock;
     use std::time::Duration;
 
-    let store = SqlMemoryStore::connect(&db_url(), test_dim())
+    let store = SqlMemoryStore::connect(&db_url(), test_dim(), uuid::Uuid::new_v4().to_string())
         .await
         .expect("connect");
     store.migrate().await.expect("migrate");

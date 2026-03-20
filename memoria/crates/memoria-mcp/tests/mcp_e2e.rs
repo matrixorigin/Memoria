@@ -19,7 +19,7 @@ async fn make_service() -> (Arc<MemoryService>, String) {
         .parse()
         .unwrap_or(1024);
 
-    let store = SqlMemoryStore::connect(&db_url, dim)
+    let store = SqlMemoryStore::connect(&db_url, dim, uuid::Uuid::new_v4().to_string())
         .await
         .expect("connect");
     store.migrate().await.expect("migrate");
@@ -188,7 +188,7 @@ async fn make_git_service() -> (
         .parse()
         .unwrap_or(1024);
 
-    let store = SqlMemoryStore::connect(&db_url, dim)
+    let store = SqlMemoryStore::connect(&db_url, dim, uuid::Uuid::new_v4().to_string())
         .await
         .expect("connect");
     store.migrate().await.expect("migrate");

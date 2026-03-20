@@ -500,7 +500,7 @@ async fn test_store_creates_graph_node() {
 
     let db_url = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "mysql://root:111@localhost:6001/memoria".to_string());
-    let sql = SqlMemoryStore::connect(&db_url, test_dim())
+    let sql = SqlMemoryStore::connect(&db_url, test_dim(), uuid::Uuid::new_v4().to_string())
         .await
         .expect("connect");
     sql.migrate().await.expect("migrate");
@@ -562,7 +562,7 @@ async fn test_correct_updates_graph_node() {
 
     let db_url = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "mysql://root:111@localhost:6001/memoria".to_string());
-    let sql = SqlMemoryStore::connect(&db_url, test_dim())
+    let sql = SqlMemoryStore::connect(&db_url, test_dim(), uuid::Uuid::new_v4().to_string())
         .await
         .expect("connect");
     sql.migrate().await.expect("migrate");
@@ -627,7 +627,7 @@ async fn test_purge_deactivates_graph_node() {
 
     let db_url = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "mysql://root:111@localhost:6001/memoria".to_string());
-    let sql = SqlMemoryStore::connect(&db_url, test_dim())
+    let sql = SqlMemoryStore::connect(&db_url, test_dim(), uuid::Uuid::new_v4().to_string())
         .await
         .expect("connect");
     sql.migrate().await.expect("migrate");
@@ -714,7 +714,7 @@ async fn test_entity_link_weights_by_source() {
 
     let db_url = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "mysql://root:111@localhost:6001/memoria".to_string());
-    let sql = SqlMemoryStore::connect(&db_url, test_dim())
+    let sql = SqlMemoryStore::connect(&db_url, test_dim(), uuid::Uuid::new_v4().to_string())
         .await
         .expect("connect");
     sql.migrate().await.expect("migrate");

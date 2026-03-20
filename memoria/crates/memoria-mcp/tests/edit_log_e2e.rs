@@ -35,7 +35,7 @@ async fn setup() -> (
 ) {
     let pool = MySqlPool::connect(&db_url()).await.expect("pool");
     let db_name = db_url().rsplit('/').next().unwrap_or("memoria").to_string();
-    let store = SqlMemoryStore::connect(&db_url(), test_dim())
+    let store = SqlMemoryStore::connect(&db_url(), test_dim(), uuid::Uuid::new_v4().to_string())
         .await
         .expect("store");
     store.migrate().await.expect("migrate");
@@ -624,7 +624,7 @@ async fn spawn_server() -> (String, reqwest::Client, MySqlPool) {
 
     let cfg = Config::from_env();
     let db = db_url();
-    let store = SqlMemoryStore::connect(&db, test_dim())
+    let store = SqlMemoryStore::connect(&db, test_dim(), uuid::Uuid::new_v4().to_string())
         .await
         .expect("connect");
     store.migrate().await.expect("migrate");

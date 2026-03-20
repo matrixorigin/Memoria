@@ -25,7 +25,8 @@ fn dim_vec(idx: usize, val: f32) -> Vec<f32> {
 async fn setup() -> (SqlMemoryStore, String) {
     let url = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "mysql://root:111@localhost:6001/memoria".to_string());
-    let store = SqlMemoryStore::connect(&url, test_dim())
+    let instance_id = uuid::Uuid::new_v4().to_string();
+    let store = SqlMemoryStore::connect(&url, test_dim(), instance_id)
         .await
         .expect("connect");
     store.migrate().await.expect("migrate");

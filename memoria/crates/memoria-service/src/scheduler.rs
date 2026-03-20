@@ -613,6 +613,9 @@ mod tests {
         async fn cleanup_orphan_branches(&self) -> Result<i64, crate::MemoriaError> {
             Ok(0)
         }
+        async fn cleanup_orphan_stats(&self) -> Result<i64, crate::MemoriaError> {
+            Ok(0)
+        }
         async fn create_safety_snapshot(&self, _: &str) -> (Option<String>, Option<String>) {
             (Some("mem_snap_pre_daily_test".into()), None)
         }
@@ -667,6 +670,9 @@ mod tests {
             Ok(0)
         }
         async fn cleanup_orphan_branches(&self) -> Result<i64, crate::MemoriaError> {
+            Ok(0)
+        }
+        async fn cleanup_orphan_stats(&self) -> Result<i64, crate::MemoriaError> {
             Ok(0)
         }
         async fn create_safety_snapshot(&self, _: &str) -> (Option<String>, Option<String>) {
@@ -732,6 +738,9 @@ mod tests {
             Ok(0)
         }
         async fn cleanup_orphan_branches(&self) -> Result<i64, crate::MemoriaError> {
+            Ok(0)
+        }
+        async fn cleanup_orphan_stats(&self) -> Result<i64, crate::MemoriaError> {
             Ok(0)
         }
         async fn create_safety_snapshot(&self, _: &str) -> (Option<String>, Option<String>) {

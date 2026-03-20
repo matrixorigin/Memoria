@@ -224,6 +224,9 @@ impl GovernanceStore for NoopStore {
     async fn cleanup_orphan_branches(&self) -> Result<i64, MemoriaError> {
         Ok(0)
     }
+    async fn cleanup_orphan_stats(&self) -> Result<i64, MemoriaError> {
+        Ok(0)
+    }
     async fn create_safety_snapshot(&self, _: &str) -> (Option<String>, Option<String>) {
         (None, None)
     }
@@ -333,7 +336,8 @@ async fn spawn_grpc_runtime() -> (String, tokio::sync::oneshot::Sender<()>) {
 
 #[tokio::test]
 async fn repository_requires_review_before_activation_and_startup_load() {
-    let store = SqlMemoryStore::connect(&db_url(), test_dim())
+    let instance_id = uuid::Uuid::new_v4().to_string();
+    let store = SqlMemoryStore::connect(&db_url(), test_dim(), instance_id)
         .await
         .unwrap();
     store.migrate().await.unwrap();
@@ -434,7 +438,8 @@ async fn repository_requires_review_before_activation_and_startup_load() {
 
 #[tokio::test]
 async fn repository_binding_rules_support_semver_selection_and_subject_freeze() {
-    let store = SqlMemoryStore::connect(&db_url(), test_dim())
+    let instance_id = uuid::Uuid::new_v4().to_string();
+    let store = SqlMemoryStore::connect(&db_url(), test_dim(), instance_id)
         .await
         .unwrap();
     store.migrate().await.unwrap();
@@ -543,7 +548,8 @@ async fn repository_binding_rules_support_semver_selection_and_subject_freeze() 
 
 #[tokio::test]
 async fn repository_loads_grpc_plugin_from_shared_binding() {
-    let store = SqlMemoryStore::connect(&db_url(), test_dim())
+    let instance_id = uuid::Uuid::new_v4().to_string();
+    let store = SqlMemoryStore::connect(&db_url(), test_dim(), instance_id)
         .await
         .unwrap();
     store.migrate().await.unwrap();

@@ -76,7 +76,8 @@ async fn create_branch_table(pool: &sqlx::MySqlPool, table: &str, dim: usize) {
 
 async fn setup() -> SqlMemoryStore {
     let pool = MySqlPool::connect(&db_url()).await.expect("connect");
-    let store = SqlMemoryStore::new(pool, test_dim());
+    let instance_id = uuid::Uuid::new_v4().to_string();
+    let store = SqlMemoryStore::new(pool, test_dim(), instance_id);
     store.migrate().await.expect("migrate");
     store
 }

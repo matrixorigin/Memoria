@@ -367,7 +367,7 @@ async fn cmd_serve(db_url: Option<String>, port: u16, master_key: String) -> Res
         "Starting Memoria API server"
     );
 
-    let store = SqlMemoryStore::connect(&cfg.db_url, cfg.embedding_dim).await?;
+    let store = SqlMemoryStore::connect(&cfg.db_url, cfg.embedding_dim, cfg.instance_id.clone()).await?;
     store.migrate().await?;
 
     let pool = MySqlPool::connect(&cfg.db_url).await?;
@@ -476,7 +476,7 @@ async fn cmd_mcp(
         "Starting Memoria MCP (embedded mode)"
     );
 
-    let store = SqlMemoryStore::connect(&cfg.db_url, cfg.embedding_dim).await?;
+    let store = SqlMemoryStore::connect(&cfg.db_url, cfg.embedding_dim, cfg.instance_id.clone()).await?;
     store.migrate().await?;
 
     let pool = MySqlPool::connect(&cfg.db_url).await?;
@@ -543,7 +543,7 @@ async fn cmd_plugin(command: PluginCommands) -> Result<()> {
     if let Some(db_url) = cfg_db_url {
         cfg.db_url = db_url;
     }
-    let store = SqlMemoryStore::connect(&cfg.db_url, cfg.embedding_dim).await?;
+    let store = SqlMemoryStore::connect(&cfg.db_url, cfg.embedding_dim, cfg.instance_id.clone()).await?;
     store.migrate().await?;
 
     match command {

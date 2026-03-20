@@ -104,6 +104,9 @@ pub trait GovernanceStore: Send + Sync {
     /// Remove leftover sandbox branches.
     async fn cleanup_orphan_branches(&self) -> Result<i64, MemoriaError>;
 
+    /// Remove orphaned stats records (stats without corresponding memory).
+    async fn cleanup_orphan_stats(&self) -> Result<i64, MemoriaError>;
+
     /// Create a rollback snapshot before destructive governance work begins.
     async fn create_safety_snapshot(&self, operation: &str) -> (Option<String>, Option<String>);
 
@@ -231,6 +234,10 @@ impl GovernanceStore for SqlMemoryStore {
 
     async fn cleanup_orphan_branches(&self) -> Result<i64, MemoriaError> {
         SqlMemoryStore::cleanup_orphan_branches(self).await
+    }
+
+    async fn cleanup_orphan_stats(&self) -> Result<i64, MemoriaError> {
+        SqlMemoryStore::cleanup_orphan_stats(self).await
     }
 
     async fn create_safety_snapshot(&self, operation: &str) -> (Option<String>, Option<String>) {
@@ -832,6 +839,37 @@ impl DefaultGovernanceStrategy {
         }
     }
 
+    async fn cleanup_orphan_stats_operation(
+        &self,
+        plan: &GovernancePlan,
+        store: &dyn GovernanceStore,
+        state: &mut ExecutionState,
+    ) {
+        match store.cleanup_orphan_stats().await {
+            Ok(value) => {
+                state.decisions.push(governance_decision(
+                    GovernanceTask::Weekly,
+                    "cleanup_orphan_stats",
+                    format!("Removed {value} orphaned stats records"),
+                    Some(if value > 0 { 1.0 } else { 0.0 }),
+                    vec![task_evidence(
+                        GovernanceTask::Weekly,
+                        &plan.users,
+                        "Weekly stats cleanup completed".to_string(),
+                    )],
+                    state.snapshot_before.as_deref(),
+                ));
+            }
+            Err(err) => record_warning(
+                GovernanceTask::Weekly,
+                None,
+                "cleanup_orphan_stats",
+                &err,
+                &mut state.warnings,
+            ),
+        }
+    }
+
     async fn tune_retrieval_params_operation(
         &self,
         users: &[String],
@@ -906,6 +944,8 @@ impl DefaultGovernanceStrategy {
             .await;
         self.cleanup_snapshots_operation(plan, store, state).await;
         self.cleanup_orphan_branches_operation(plan, store, state)
+            .await;
+        self.cleanup_orphan_stats_operation(plan, store, state)
             .await;
     }
 }
@@ -1326,6 +1366,12 @@ mod tests {
             Ok(self.cleanup_orphan_branches_result)
         }
 
+        async fn cleanup_orphan_stats(&self) -> Result<i64, MemoriaError> {
+            self.record("cleanup_orphan_stats");
+            self.fail_if_requested("cleanup_orphan_stats")?;
+            Ok(0)
+        }
+
         async fn create_safety_snapshot(
             &self,
             operation: &str,
@@ -1593,6 +1639,7 @@ mod tests {
             async fn rebuild_vector_index(&self, _: &str) -> Result<i64, MemoriaError> { Ok(0) }
             async fn cleanup_snapshots(&self, _: usize) -> Result<i64, MemoriaError> { Ok(0) }
             async fn cleanup_orphan_branches(&self) -> Result<i64, MemoriaError> { Ok(0) }
+            async fn cleanup_orphan_stats(&self) -> Result<i64, MemoriaError> { Ok(0) }
             async fn create_safety_snapshot(&self, _: &str) -> (Option<String>, Option<String>) { (None, None) }
             async fn log_edit(&self, _: &str, _: &str, _: Option<&str>, _: Option<&str>, _: &str, _: Option<&str>) {}
 

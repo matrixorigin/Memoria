@@ -69,7 +69,7 @@ async fn spawn_server() -> (String, reqwest::Client) {
     let cfg = Config::from_env();
     let db = db_url();
 
-    let store = SqlMemoryStore::connect(&db, test_dim())
+    let store = SqlMemoryStore::connect(&db, test_dim(), uuid::Uuid::new_v4().to_string())
         .await
         .expect("connect");
     store.migrate().await.expect("migrate");
@@ -362,7 +362,7 @@ async fn spawn_server_with_master_key(master_key: &str) -> (String, reqwest::Cli
 
     let cfg = Config::from_env();
     let db = db_url();
-    let store = SqlMemoryStore::connect(&db, test_dim())
+    let store = SqlMemoryStore::connect(&db, test_dim(), uuid::Uuid::new_v4().to_string())
         .await
         .expect("connect");
     store.migrate().await.expect("migrate");
@@ -653,7 +653,7 @@ async fn test_api_key_cannot_get_other_users_task_status() {
     let attacker_key =
         create_api_key_for_user(&client, &base, &auth, &attacker_id, "attacker-task").await;
 
-    let store = SqlMemoryStore::connect(&db_url(), test_dim())
+    let store = SqlMemoryStore::connect(&db_url(), test_dim(), uuid::Uuid::new_v4().to_string())
         .await
         .expect("connect");
     store.migrate().await.expect("migrate");
@@ -1680,7 +1680,7 @@ async fn test_reflect_with_llm() {
     let (base, client) = spawn_server_with_llm(llm).await;
     let uid = uid();
 
-    let store = memoria_storage::SqlMemoryStore::connect(&db_url(), test_dim())
+    let store = memoria_storage::SqlMemoryStore::connect(&db_url(), test_dim(), uuid::Uuid::new_v4().to_string())
         .await
         .expect("connect");
     store.migrate().await.expect("migrate");
@@ -1938,7 +1938,7 @@ async fn spawn_server_with_llm(
 
     let cfg = Config::from_env();
     let db = db_url();
-    let store = SqlMemoryStore::connect(&db, test_dim())
+    let store = SqlMemoryStore::connect(&db, test_dim(), uuid::Uuid::new_v4().to_string())
         .await
         .expect("connect");
     store.migrate().await.expect("migrate");
@@ -1972,7 +1972,7 @@ async fn spawn_server_with_embedding(
 
     let cfg = Config::from_env();
     let db = db_url();
-    let store = SqlMemoryStore::connect(&db, 1024).await.expect("connect");
+    let store = SqlMemoryStore::connect(&db, 1024, uuid::Uuid::new_v4().to_string()).await.expect("connect");
     store.migrate().await.expect("migrate");
     let pool = MySqlPool::connect(&db).await.expect("pool");
     let git = Arc::new(GitForDataService::new(pool, &cfg.db_name));
@@ -3957,7 +3957,7 @@ async fn spawn_server_with_instance(instance_id: &str) -> (String, reqwest::Clie
     let cfg = Config::from_env();
     let db = db_url();
 
-    let store = SqlMemoryStore::connect(&db, test_dim())
+    let store = SqlMemoryStore::connect(&db, test_dim(), uuid::Uuid::new_v4().to_string())
         .await
         .expect("connect");
     store.migrate().await.expect("migrate");
@@ -4084,7 +4084,7 @@ async fn test_distributed_lock_acquire_release() {
     use std::time::Duration;
 
     let db = db_url();
-    let store = SqlMemoryStore::connect(&db, test_dim())
+    let store = SqlMemoryStore::connect(&db, test_dim(), uuid::Uuid::new_v4().to_string())
         .await
         .expect("connect");
     store.migrate().await.expect("migrate");
@@ -4137,7 +4137,7 @@ async fn test_distributed_lock_expiry() {
     use std::time::Duration;
 
     let db = db_url();
-    let store = SqlMemoryStore::connect(&db, test_dim())
+    let store = SqlMemoryStore::connect(&db, test_dim(), uuid::Uuid::new_v4().to_string())
         .await
         .expect("connect");
     store.migrate().await.expect("migrate");
@@ -4175,7 +4175,7 @@ async fn test_distributed_lock_renew() {
     use std::time::Duration;
 
     let db = db_url();
-    let store = SqlMemoryStore::connect(&db, test_dim())
+    let store = SqlMemoryStore::connect(&db, test_dim(), uuid::Uuid::new_v4().to_string())
         .await
         .expect("connect");
     store.migrate().await.expect("migrate");
@@ -4212,7 +4212,7 @@ async fn test_distributed_async_task_cross_instance() {
     use memoria_storage::SqlMemoryStore;
 
     let db = db_url();
-    let store = SqlMemoryStore::connect(&db, test_dim())
+    let store = SqlMemoryStore::connect(&db, test_dim(), uuid::Uuid::new_v4().to_string())
         .await
         .expect("connect");
     store.migrate().await.expect("migrate");
@@ -4257,7 +4257,7 @@ async fn test_distributed_async_task_fail() {
     use memoria_storage::SqlMemoryStore;
 
     let db = db_url();
-    let store = SqlMemoryStore::connect(&db, test_dim())
+    let store = SqlMemoryStore::connect(&db, test_dim(), uuid::Uuid::new_v4().to_string())
         .await
         .expect("connect");
     store.migrate().await.expect("migrate");
@@ -5018,7 +5018,7 @@ async fn test_last_used_batcher_coalesces_and_flushes() {
     // (We can't inspect the internal set directly, but we can flush and verify DB)
 
     // Connect to DB and flush
-    let store = SqlMemoryStore::connect(&db_url(), test_dim())
+    let store = SqlMemoryStore::connect(&db_url(), test_dim(), uuid::Uuid::new_v4().to_string())
         .await
         .expect("connect");
     batcher.flush(store.pool()).await;
@@ -5060,7 +5060,7 @@ async fn test_api_key_auth_uses_batcher_not_fire_and_forget() {
     use sqlx::mysql::MySqlPool;
 
     let cfg = Config::from_env();
-    let store = SqlMemoryStore::connect(&db, test_dim())
+    let store = SqlMemoryStore::connect(&db, test_dim(), uuid::Uuid::new_v4().to_string())
         .await
         .expect("connect");
     store.migrate().await.expect("migrate");
@@ -5103,7 +5103,7 @@ async fn test_api_key_auth_uses_batcher_not_fire_and_forget() {
     assert_eq!(r.status(), 200, "Cached API key auth should succeed");
 
     // Manually flush the batcher to verify last_used_at is updated
-    let verify_store = SqlMemoryStore::connect(&db, test_dim())
+    let verify_store = SqlMemoryStore::connect(&db, test_dim(), uuid::Uuid::new_v4().to_string())
         .await
         .expect("connect");
     batcher.flush(verify_store.pool()).await;

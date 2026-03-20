@@ -16,7 +16,8 @@ async fn setup() -> (GitForDataService, String) {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(384);
-    SqlMemoryStore::new(pool.clone(), dim)
+    let instance_id = uuid::Uuid::new_v4().to_string();
+    SqlMemoryStore::new(pool.clone(), dim, instance_id)
         .migrate()
         .await
         .expect("migrate");

@@ -156,6 +156,8 @@ pub struct MemoryService {
     access_counter: Option<AccessCounter>,
     /// Per-user feedback_weight cache (TTL 5 min)
     feedback_weight_cache: Cache<String, f64>,
+    /// Vector index monitor (None in tests)
+    vector_monitor: Option<Arc<crate::vector_index_monitor::VectorIndexMonitor>>,
 }
 
 /// A pending entity-extraction job pushed from the write path.
@@ -172,21 +174,7 @@ impl MemoryService {
         embedder: Option<Arc<dyn EmbeddingProvider>>,
     ) -> Self {
         let llm = LlmClient::from_env().map(Arc::new);
-        let (entity_tx, entity_rx) = tokio::sync::mpsc::unbounded_channel();
-        let svc = Self {
-            store: store.clone(),
-            sql_store: Some(store.clone()),
-            embedder,
-            llm: llm.clone(),
-            entity_tx: Some(entity_tx),
-            access_counter: Some(AccessCounter::new(store.clone())),
-            feedback_weight_cache: Cache::builder()
-                .max_capacity(10_000)
-                .time_to_live(Duration::from_secs(300))
-                .build(),
-        };
-        Self::spawn_entity_worker(entity_rx, store, llm);
-        svc
+        Self::new_sql_with_llm(store, embedder, llm)
     }
 
     /// Production constructor with explicit LLM client.
@@ -196,6 +184,17 @@ impl MemoryService {
         llm: Option<Arc<LlmClient>>,
     ) -> Self {
         let (entity_tx, entity_rx) = tokio::sync::mpsc::unbounded_channel();
+        
+        // 启动 vector index monitor + rebuild worker
+        let (rebuild_tx, rebuild_rx) = tokio::sync::mpsc::unbounded_channel();
+        crate::vector_index_monitor::init_coarse_clock();
+        let vector_monitor = Arc::new(crate::vector_index_monitor::VectorIndexMonitor::new(
+            "mem_memories".to_string(),
+            rebuild_tx,
+        ));
+        let worker = crate::rebuild_worker::RebuildWorker::new(store.clone(), rebuild_rx);
+        tokio::spawn(async move { worker.run().await });
+        
         let svc = Self {
             store: store.clone(),
             sql_store: Some(store.clone()),
@@ -207,6 +206,7 @@ impl MemoryService {
                 .max_capacity(10_000)
                 .time_to_live(Duration::from_secs(300))
                 .build(),
+            vector_monitor: Some(vector_monitor),
         };
         Self::spawn_entity_worker(entity_rx, store, llm);
         svc
@@ -225,6 +225,7 @@ impl MemoryService {
                 .max_capacity(10_000)
                 .time_to_live(Duration::from_secs(300))
                 .build(),
+            vector_monitor: None,
         }
     }
 
@@ -559,8 +560,16 @@ impl MemoryService {
         top_k: i64,
         level: ExplainLevel,
     ) -> Result<(Vec<Memory>, RetrievalExplain), MemoriaError> {
+        let start = std::time::Instant::now();
         let (mems, explain) = self.retrieve_inner(user_id, query, top_k, level).await?;
         self.bump_access_counts(&mems);
+        
+        // 记录查询到 vector monitor（轻量级，无阻塞）
+        if let Some(monitor) = &self.vector_monitor {
+            let elapsed_ms = start.elapsed().as_millis() as u64;
+            monitor.record_query(elapsed_ms, mems.len());
+        }
+        
         Ok((mems, explain))
     }
 

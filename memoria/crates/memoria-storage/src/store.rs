@@ -87,6 +87,7 @@ fn mo_to_vec(s: &str) -> Result<Vec<f32>, MemoriaError> {
 pub struct SqlMemoryStore {
     pool: MySqlPool,
     embedding_dim: usize,
+    instance_id: String,
 }
 
 #[derive(Debug, Clone)]
@@ -144,10 +145,11 @@ impl Default for UserRetrievalParams {
 }
 
 impl SqlMemoryStore {
-    pub fn new(pool: MySqlPool, embedding_dim: usize) -> Self {
+    pub fn new(pool: MySqlPool, embedding_dim: usize, instance_id: String) -> Self {
         Self {
             pool,
             embedding_dim,
+            instance_id,
         }
     }
 
@@ -159,7 +161,11 @@ impl SqlMemoryStore {
         crate::graph::GraphStore::new(self.pool.clone(), self.embedding_dim)
     }
 
-    pub async fn connect(database_url: &str, embedding_dim: usize) -> Result<Self, MemoriaError> {
+    pub async fn connect(
+        database_url: &str,
+        embedding_dim: usize,
+        instance_id: String,
+    ) -> Result<Self, MemoriaError> {
         // Auto-create database if it doesn't exist
         if let Some((base_url, db_name)) = database_url.rsplit_once('/') {
             if !db_name.is_empty() {
@@ -187,7 +193,7 @@ impl SqlMemoryStore {
             .connect(database_url)
             .await
             .map_err(db_err)?;
-        Ok(Self::new(pool, embedding_dim))
+        Ok(Self::new(pool, embedding_dim, instance_id))
     }
 
     pub async fn migrate(&self) -> Result<(), MemoriaError> {
@@ -1305,6 +1311,7 @@ impl SqlMemoryStore {
 
     /// Rebuild IVF vector index for a table. lists = max(1, rows/50), capped at 1024.
     pub async fn rebuild_vector_index(&self, table: &str) -> Result<i64, MemoriaError> {
+        Self::validate_table_name(table)?;
         let row: (i64,) = sqlx::query_as(&format!(
             "SELECT COUNT(*) FROM {table} WHERE embedding IS NOT NULL"
         ))
@@ -1482,6 +1489,237 @@ impl SqlMemoryStore {
         .await
         .map_err(db_err)?;
         Ok(result.rows_affected() as i64)
+    }
+
+    /// Clean up orphaned stats records (stats without corresponding memory).
+    pub async fn cleanup_orphan_stats(&self) -> Result<i64, MemoriaError> {
+        let result = sqlx::query(
+            "DELETE s FROM mem_memories_stats s \
+             LEFT JOIN mem_memories m ON s.memory_id = m.memory_id \
+             WHERE m.memory_id IS NULL",
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(result.rows_affected() as i64)
+    }
+
+    /// Validate table name to prevent SQL injection
+    fn validate_table_name(table: &str) -> Result<(), MemoriaError> {
+        // 只允许字母、数字、下划线
+        if !table.chars().all(|c| c.is_alphanumeric() || c == '_') {
+            return Err(MemoriaError::Validation(
+                format!("Invalid table name: {}", table),
+            ));
+        }
+        // 白名单验证（允许 mem_ 和 test_ 前缀）
+        if !table.starts_with("mem_") && !table.starts_with("test_") {
+            return Err(MemoriaError::Validation(
+                format!("Table not allowed for vector index operations: {}", table),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Check if vector index needs rebuild and is not in cooldown.
+    /// Returns (should_rebuild, current_row_count, cooldown_remaining_secs)
+    pub async fn should_rebuild_vector_index(
+        &self,
+        table: &str,
+    ) -> Result<(bool, i64, Option<i64>), MemoriaError> {
+        Self::validate_table_name(table)?;
+        let key = format!("vector_index_rebuild:{table}");
+
+        // 1. 检查冷却
+        let cooldown_check: Option<(chrono::NaiveDateTime,)> = sqlx::query_as(
+            "SELECT circuit_open_until FROM mem_governance_runtime_state \
+             WHERE strategy_key = ? AND task = 'rebuild'",
+        )
+        .bind(&key)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+
+        if let Some((until,)) = cooldown_check {
+            let now = chrono::Utc::now().naive_utc();
+            if until > now {
+                let remaining = (until - now).num_seconds();
+                return Ok((false, 0, Some(remaining)));
+            }
+        }
+
+        // 2. 查当前行数（表可能不存在）
+        let current_rows: i64 = sqlx::query_scalar(&format!(
+            "SELECT COUNT(*) FROM {table} WHERE embedding IS NOT NULL"
+        ))
+        .fetch_one(&self.pool)
+        .await
+        .unwrap_or_default(); // 表不存在或查询失败，返回0
+
+        // 3. 查上次重建时的行数
+        let last_rows: Option<(i32,)> = sqlx::query_as(
+            "SELECT failure_count FROM mem_governance_runtime_state \
+             WHERE strategy_key = ? AND task = 'rebuild'",
+        )
+        .bind(&key)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+
+        let last_rows = last_rows.map(|(c,)| c as i64).unwrap_or(0);
+
+        // 4. 判断是否需要重建
+        let should_rebuild = if current_rows < 500 {
+            false // 小数据集不需要 IVF
+        } else if last_rows == 0 {
+            true // 首次重建
+        } else {
+            let growth_ratio = (current_rows - last_rows) as f64 / last_rows as f64;
+            growth_ratio > 0.2 // 增长超过 20%
+        };
+
+        Ok((should_rebuild, current_rows, None))
+    }
+
+    /// Record vector index rebuild and set adaptive cooldown.
+    pub async fn record_vector_index_rebuild(
+        &self,
+        table: &str,
+        row_count: i64,
+        cooldown_secs: i64,
+    ) -> Result<(), MemoriaError> {
+        Self::validate_table_name(table)?;
+        let key = format!("vector_index_rebuild:{table}");
+
+        let cooldown_until =
+            chrono::Utc::now().naive_utc() + chrono::Duration::seconds(cooldown_secs);
+
+        sqlx::query(
+            "INSERT INTO mem_governance_runtime_state \
+             (strategy_key, task, failure_count, circuit_open_until, updated_at) \
+             VALUES (?, 'rebuild', ?, ?, NOW()) \
+             ON DUPLICATE KEY UPDATE \
+             failure_count = VALUES(failure_count), \
+             circuit_open_until = VALUES(circuit_open_until), \
+             updated_at = NOW()",
+        )
+        .bind(&key)
+        .bind(row_count as i32) // 复用 failure_count 字段存行数
+        .bind(cooldown_until)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+
+        Ok(())
+    }
+
+    /// Record vector index rebuild failure with exponential backoff.
+    /// Returns the cooldown seconds applied.
+    pub async fn record_vector_index_rebuild_failure(
+        &self,
+        table: &str,
+    ) -> Result<i64, MemoriaError> {
+        Self::validate_table_name(table)?;
+        let key = format!("vector_index_rebuild:{table}");
+
+        // 查询当前失败次数（存储在 failure_count 的负数）
+        let current_failures: Option<(i32,)> = sqlx::query_as(
+            "SELECT failure_count FROM mem_governance_runtime_state \
+             WHERE strategy_key = ? AND task = 'rebuild' AND failure_count < 0",
+        )
+        .bind(&key)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+
+        let failure_count = current_failures.map(|(c,)| -c).unwrap_or(0) + 1;
+
+        // 指数退避：5分钟 → 15分钟 → 1小时
+        let cooldown_secs = match failure_count {
+            1 => 300,      // 5分钟
+            2 => 900,      // 15分钟
+            _ => 3600,     // 1小时
+        };
+
+        let cooldown_until =
+            chrono::Utc::now().naive_utc() + chrono::Duration::seconds(cooldown_secs);
+
+        sqlx::query(
+            "INSERT INTO mem_governance_runtime_state \
+             (strategy_key, task, failure_count, circuit_open_until, updated_at) \
+             VALUES (?, 'rebuild', ?, ?, NOW()) \
+             ON DUPLICATE KEY UPDATE \
+             failure_count = VALUES(failure_count), \
+             circuit_open_until = VALUES(circuit_open_until), \
+             updated_at = NOW()",
+        )
+        .bind(&key)
+        .bind(-(failure_count as i32)) // 负数表示失败次数
+        .bind(cooldown_until)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+
+        Ok(cooldown_secs)
+    }
+
+    /// Try to acquire a distributed lock (returns true if acquired).
+    pub async fn try_acquire_lock(&self, key: &str, ttl_secs: i64) -> Result<bool, MemoriaError> {
+        let expires_at = chrono::Utc::now().naive_utc() + chrono::Duration::seconds(ttl_secs);
+        
+        // 方案1：尝试更新过期的锁
+        let update_result = sqlx::query(
+            "UPDATE mem_distributed_locks \
+             SET holder_id = ?, acquired_at = NOW(), expires_at = ? \
+             WHERE lock_key = ? AND expires_at < NOW()",
+        )
+        .bind(&self.instance_id)
+        .bind(expires_at)
+        .bind(key)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+
+        if update_result.rows_affected() > 0 {
+            return Ok(true); // 成功更新过期锁
+        }
+
+        // 方案2：尝试插入新锁
+        let insert_result = sqlx::query(
+            "INSERT INTO mem_distributed_locks (lock_key, holder_id, acquired_at, expires_at) \
+             VALUES (?, ?, NOW(), ?)",
+        )
+        .bind(key)
+        .bind(&self.instance_id)
+        .bind(expires_at)
+        .execute(&self.pool)
+        .await;
+
+        match insert_result {
+            Ok(_) => Ok(true), // 成功插入新锁
+            Err(e) => {
+                // 检查是否是主键冲突（锁已存在且未过期）
+                let err_str = e.to_string();
+                if err_str.contains("Duplicate") || err_str.contains("1062") {
+                    Ok(false)
+                } else {
+                    Err(db_err(e))
+                }
+            }
+        }
+    }
+
+    /// Release a distributed lock.
+    pub async fn release_lock(&self, key: &str) -> Result<(), MemoriaError> {
+        sqlx::query(
+            "DELETE FROM mem_distributed_locks WHERE lock_key = ? AND holder_id = ?",
+        )
+        .bind(key)
+        .bind(&self.instance_id)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(())
     }
 
     // ── Retrieval feedback ────────────────────────────────────────────────────
