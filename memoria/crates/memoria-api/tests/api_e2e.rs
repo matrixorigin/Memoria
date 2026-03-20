@@ -4199,7 +4199,7 @@ async fn test_api_feedback_invalid_signal() {
         .send()
         .await
         .unwrap();
-    assert_eq!(r.status(), 500); // Internal error for invalid signal
+    assert_eq!(r.status(), 422); // Validation error for invalid signal
     println!("✅ POST /v1/memories/:id/feedback rejects invalid signal");
 }
 
@@ -4433,4 +4433,160 @@ async fn test_api_tune_with_feedback() {
     assert!(new_weight >= old_weight, "feedback_weight should increase with positive feedback");
 
     println!("✅ POST /v1/retrieval-params/tune: {:.3} → {:.3}", old_weight, new_weight);
+}
+
+// ── Prometheus metrics ────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_api_metrics() {
+    let (base, client) = spawn_server().await;
+    let r = client.get(format!("{base}/metrics")).send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    let body = r.text().await.unwrap();
+    assert!(body.contains("memoria_memories_total"), "missing memoria_memories_total");
+    assert!(body.contains("memoria_users_total"), "missing memoria_users_total");
+    assert!(body.contains("memoria_auth_failures_total"), "missing auth_failures counter");
+    println!("✅ GET /metrics: {} bytes", body.len());
+}
+
+// ── Snapshot rollback ─────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_api_snapshot_rollback() {
+    let (base, client) = spawn_server().await;
+    let uid = uid();
+
+    // Store a memory
+    let r = client
+        .post(format!("{base}/v1/memories"))
+        .header("X-User-Id", &uid)
+        .json(&json!({"content": "before rollback", "memory_type": "semantic"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 201);
+
+    // Create snapshot
+    let snap = format!("rb_{}", &uuid::Uuid::new_v4().simple().to_string()[..6]);
+    let r = client
+        .post(format!("{base}/v1/snapshots"))
+        .header("X-User-Id", &uid)
+        .json(&json!({"name": snap}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 201);
+
+    // Store another memory (after snapshot)
+    let r = client
+        .post(format!("{base}/v1/memories"))
+        .header("X-User-Id", &uid)
+        .json(&json!({"content": "after snapshot", "memory_type": "semantic"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 201);
+
+    // Rollback
+    let r = client
+        .post(format!("{base}/v1/snapshots/{snap}/rollback"))
+        .header("X-User-Id", &uid)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let body: Value = r.json().await.unwrap();
+    assert!(
+        body["result"].as_str().unwrap_or("").to_lowercase().contains("roll"),
+        "rollback response: {body}"
+    );
+    println!("✅ POST /v1/snapshots/:name/rollback: {}", body["result"]);
+}
+
+// ── Entity list ───────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_api_entities() {
+    let (base, client) = spawn_server().await;
+    let uid = uid();
+
+    // Store a memory to trigger entity extraction
+    let r = client
+        .post(format!("{base}/v1/memories"))
+        .header("X-User-Id", &uid)
+        .json(&json!({"content": "We use PostgreSQL and Redis for caching", "memory_type": "semantic"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 201);
+
+    let r = client
+        .get(format!("{base}/v1/entities"))
+        .header("X-User-Id", &uid)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let body: Value = r.json().await.unwrap();
+    assert!(body["entities"].is_array(), "entities should be an array");
+    println!("✅ GET /v1/entities: {} entities", body["entities"].as_array().unwrap().len());
+}
+
+// ── Admin config ──────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_api_admin_config() {
+    let mk = format!("mk_{}", uuid::Uuid::new_v4().simple());
+    let (base, client) = spawn_server_with_master_key(&mk).await;
+
+    // Without master key → 401
+    let r = client.get(format!("{base}/admin/config")).send().await.unwrap();
+    assert_eq!(r.status(), 401);
+
+    // With master key → 200
+    let r = client
+        .get(format!("{base}/admin/config"))
+        .header("Authorization", format!("Bearer {mk}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let body: Value = r.json().await.unwrap();
+    assert!(body["db_name"].is_string(), "missing db_name");
+    assert!(body["embedding_dim"].is_number(), "missing embedding_dim");
+    // Password should be redacted
+    let db_url = body["db_url"].as_str().unwrap_or("");
+    assert!(db_url.contains("***") || !db_url.contains("@"), "db password not redacted: {db_url}");
+    println!("✅ GET /admin/config: db_name={}", body["db_name"]);
+}
+
+#[tokio::test]
+async fn test_api_admin_config_forbidden() {
+    let mk = format!("mk_{}", uuid::Uuid::new_v4().simple());
+    let (base, client) = spawn_server_with_master_key(&mk).await;
+
+    // Create an API key (non-master)
+    let auth = format!("Bearer {mk}");
+    let r = client
+        .post(format!("{base}/auth/keys"))
+        .header("Authorization", &auth)
+        .json(&json!({"user_id": "bob", "name": "test"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 201);
+    let raw_key = r.json::<Value>().await.unwrap()["raw_key"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Non-master API key → 403
+    let r = client
+        .get(format!("{base}/admin/config"))
+        .header("Authorization", format!("Bearer {raw_key}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 403);
+    println!("✅ GET /admin/config: non-master key → 403");
 }

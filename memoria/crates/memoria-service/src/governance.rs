@@ -430,7 +430,7 @@ impl DefaultGovernanceStrategy {
                                 &user_id,
                                 "governance:archive_working",
                                 None,
-                                None,
+                                Some(&format!("{{\"archived\":{count},\"threshold_hours\":{}}}", Self::STALE_WORKING_HOURS)),
                                 &format!(
                                     "archived {count} stale working memories (>{}h)",
                                     Self::STALE_WORKING_HOURS
@@ -497,7 +497,7 @@ impl DefaultGovernanceStrategy {
                                 user_id,
                                 "governance:cleanup_stale",
                                 None,
-                                None,
+                                Some(&format!("{{\"cleaned_stale\":{cleaned}}}")),
                                 &format!("cleaned {cleaned}"),
                                 state.snapshot_before.as_deref(),
                             )
@@ -557,7 +557,7 @@ impl DefaultGovernanceStrategy {
                                 user_id,
                                 "governance:quarantine",
                                 None,
-                                None,
+                                Some(&format!("{{\"quarantined\":{count}}}")),
                                 &format!("quarantined {count}"),
                                 state.snapshot_before.as_deref(),
                             )
@@ -622,7 +622,7 @@ impl DefaultGovernanceStrategy {
                                 user_id,
                                 "governance:compress_redundant",
                                 None,
-                                None,
+                                Some(&format!("{{\"compressed\":{count}}}")),
                                 &format!("compressed {count}"),
                                 state.snapshot_before.as_deref(),
                             )
@@ -687,7 +687,7 @@ impl DefaultGovernanceStrategy {
                                 user_id,
                                 "governance:cleanup_orphaned_incrementals",
                                 None,
-                                None,
+                                Some(&format!("{{\"cleaned_orphaned\":{count}}}")),
                                 &format!("cleaned {count}"),
                                 state.snapshot_before.as_deref(),
                             )

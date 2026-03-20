@@ -433,22 +433,24 @@ pub async fn call(
 
             // Audit log for quarantine/cleanup
             if quarantined > 0 {
+                let payload = serde_json::json!({"quarantined": quarantined}).to_string();
                 sql.log_edit(
                     user_id,
                     "governance:quarantine",
                     None,
-                    None,
+                    Some(&payload),
                     &format!("quarantined {quarantined}"),
                     None,
                 )
                 .await;
             }
             if cleaned > 0 {
+                let payload = serde_json::json!({"cleaned_stale": cleaned}).to_string();
                 sql.log_edit(
                     user_id,
                     "governance:cleanup",
                     None,
-                    None,
+                    Some(&payload),
                     &format!("cleaned_stale {cleaned}"),
                     None,
                 )

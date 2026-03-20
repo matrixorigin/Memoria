@@ -19,13 +19,6 @@ pub trait ScoringStore: Send + Sync {
     /// Update user's retrieval parameters.
     async fn set_user_params(&self, params: &UserRetrievalParams) -> Result<(), MemoriaError>;
 
-    /// Get feedback history for tuning: (memory_id, signal, count).
-    async fn get_feedback_history(
-        &self,
-        user_id: &str,
-        limit: i64,
-    ) -> Result<Vec<(String, String, i64)>, MemoriaError>;
-
     /// Get total feedback counts for a user.
     async fn get_feedback_totals(&self, user_id: &str) -> Result<FeedbackTotals, MemoriaError>;
 }
@@ -40,17 +33,14 @@ impl ScoringStore for SqlMemoryStore {
         self.set_user_retrieval_params(params).await
     }
 
-    async fn get_feedback_history(
-        &self,
-        user_id: &str,
-        limit: i64,
-    ) -> Result<Vec<(String, String, i64)>, MemoriaError> {
-        self.get_user_feedback_history(user_id, limit).await
-    }
-
     async fn get_feedback_totals(&self, user_id: &str) -> Result<FeedbackTotals, MemoriaError> {
-        let (useful, irrelevant, outdated, wrong) = self.get_user_feedback_totals(user_id).await?;
-        Ok(FeedbackTotals { useful, irrelevant, outdated, wrong })
+        let stats = self.get_feedback_stats(user_id).await?;
+        Ok(FeedbackTotals {
+            useful: stats.useful,
+            irrelevant: stats.irrelevant,
+            outdated: stats.outdated,
+            wrong: stats.wrong,
+        })
     }
 }
 
@@ -220,9 +210,6 @@ mod tests {
             async fn set_user_params(&self, p: &UserRetrievalParams) -> Result<(), MemoriaError> {
                 *self.params.lock().unwrap() = p.clone();
                 Ok(())
-            }
-            async fn get_feedback_history(&self, _: &str, _: i64) -> Result<Vec<(String, String, i64)>, MemoriaError> {
-                Ok(vec![])
             }
             async fn get_feedback_totals(&self, _: &str) -> Result<FeedbackTotals, MemoriaError> {
                 Ok(self.totals.clone())

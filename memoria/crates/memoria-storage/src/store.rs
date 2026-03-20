@@ -1474,7 +1474,7 @@ impl SqlMemoryStore {
     ) -> Result<String, MemoriaError> {
         // Validate signal
         if !["useful", "irrelevant", "outdated", "wrong"].contains(&signal) {
-            return Err(MemoriaError::Internal(format!(
+            return Err(MemoriaError::Validation(format!(
                 "Invalid signal '{}'. Must be one of: useful, irrelevant, outdated, wrong",
                 signal
             )));
@@ -1538,10 +1538,10 @@ impl SqlMemoryStore {
         let row: (i64, i64, i64, i64, i64) = sqlx::query_as(
             "SELECT \
                COUNT(*) as total, \
-               SUM(CASE WHEN signal = 'useful' THEN 1 ELSE 0 END) as useful, \
-               SUM(CASE WHEN signal = 'irrelevant' THEN 1 ELSE 0 END) as irrelevant, \
-               SUM(CASE WHEN signal = 'outdated' THEN 1 ELSE 0 END) as outdated, \
-               SUM(CASE WHEN signal = 'wrong' THEN 1 ELSE 0 END) as wrong \
+               COALESCE(SUM(CASE WHEN signal = 'useful' THEN 1 ELSE 0 END), 0) as useful, \
+               COALESCE(SUM(CASE WHEN signal = 'irrelevant' THEN 1 ELSE 0 END), 0) as irrelevant, \
+               COALESCE(SUM(CASE WHEN signal = 'outdated' THEN 1 ELSE 0 END), 0) as outdated, \
+               COALESCE(SUM(CASE WHEN signal = 'wrong' THEN 1 ELSE 0 END), 0) as wrong \
              FROM mem_retrieval_feedback WHERE user_id = ?",
         )
         .bind(user_id)
@@ -1692,64 +1692,6 @@ impl SqlMemoryStore {
         .await
         .map_err(db_err)?;
         Ok(())
-    }
-
-    /// Get feedback history for a user (for auto-tuning analysis).
-    pub async fn get_user_feedback_history(
-        &self,
-        user_id: &str,
-        limit: i64,
-    ) -> Result<Vec<(String, String, i64)>, MemoriaError> {
-        // Returns (memory_id, signal, count) grouped by memory and signal
-        let rows = sqlx::query(
-            "SELECT memory_id, signal, COUNT(*) as cnt \
-             FROM mem_retrieval_feedback \
-             WHERE user_id = ? \
-             GROUP BY memory_id, signal \
-             ORDER BY cnt DESC \
-             LIMIT ?",
-        )
-        .bind(user_id)
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(db_err)?;
-
-        rows.iter()
-            .map(|r| {
-                Ok((
-                    r.try_get::<String, _>("memory_id").map_err(db_err)?,
-                    r.try_get::<String, _>("signal").map_err(db_err)?,
-                    r.try_get::<i64, _>("cnt").map_err(db_err)?,
-                ))
-            })
-            .collect()
-    }
-
-    /// Get total feedback counts for a user (aggregated by signal type).
-    pub async fn get_user_feedback_totals(
-        &self,
-        user_id: &str,
-    ) -> Result<(i64, i64, i64, i64), MemoriaError> {
-        let row = sqlx::query(
-            "SELECT \
-             SUM(CASE WHEN signal = 'useful' THEN 1 ELSE 0 END) as useful, \
-             SUM(CASE WHEN signal = 'irrelevant' THEN 1 ELSE 0 END) as irrelevant, \
-             SUM(CASE WHEN signal = 'outdated' THEN 1 ELSE 0 END) as outdated, \
-             SUM(CASE WHEN signal = 'wrong' THEN 1 ELSE 0 END) as wrong \
-             FROM mem_retrieval_feedback WHERE user_id = ?",
-        )
-        .bind(user_id)
-        .fetch_one(&self.pool)
-        .await
-        .map_err(db_err)?;
-
-        Ok((
-            row.try_get::<i64, _>("useful").unwrap_or(0),
-            row.try_get::<i64, _>("irrelevant").unwrap_or(0),
-            row.try_get::<i64, _>("outdated").unwrap_or(0),
-            row.try_get::<i64, _>("wrong").unwrap_or(0),
-        ))
     }
 
     /// Get access_count for a set of memory IDs.

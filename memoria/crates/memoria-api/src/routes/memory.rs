@@ -13,6 +13,20 @@ pub fn api_err(e: impl std::fmt::Display) -> (StatusCode, String) {
     (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
 }
 
+/// Map MemoriaError to proper HTTP status codes.
+pub fn api_err_typed(e: memoria_core::MemoriaError) -> (StatusCode, String) {
+    use memoria_core::MemoriaError::*;
+    let status = match &e {
+        NotFound(_) => StatusCode::NOT_FOUND,
+        Validation(_) | InvalidMemoryType(_) | InvalidTrustTier(_) => {
+            StatusCode::UNPROCESSABLE_ENTITY
+        }
+        Blocked(_) => StatusCode::FORBIDDEN,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    (status, e.to_string())
+}
+
 #[derive(Deserialize, Default)]
 pub struct ListQuery {
     pub memory_type: Option<String>,
@@ -107,7 +121,7 @@ pub async fn store_memory(
             if matches!(e, memoria_core::MemoriaError::Blocked(_)) {
                 crate::routes::metrics::SENSITIVITY_BLOCKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
-            api_err(e)
+            api_err_typed(e)
         })?;
     Ok((StatusCode::CREATED, Json(m.into())))
 }
@@ -645,7 +659,7 @@ pub async fn record_feedback(
         .service
         .record_feedback(&user_id, &memory_id, &req.signal, req.context.as_deref())
         .await
-        .map_err(api_err)?;
+        .map_err(api_err_typed)?;
     Ok((
         StatusCode::CREATED,
         Json(FeedbackResponse {
