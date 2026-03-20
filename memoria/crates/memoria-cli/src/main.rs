@@ -35,6 +35,7 @@ const CLAUDE_SESSION_LIFECYCLE: &str = include_str!("../templates/claude_session
 const CLAUDE_MEMORY_HYGIENE: &str = include_str!("../templates/claude_memory_hygiene.md");
 const CLAUDE_MEMORY_BRANCHING: &str = include_str!("../templates/claude_memory_branching.md");
 const CLAUDE_GOAL_EVOLUTION: &str = include_str!("../templates/claude_goal_evolution.md");
+const CODEX_AGENTS: &str = include_str!("../templates/codex_agents.md");
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
 
@@ -43,6 +44,7 @@ enum ToolName {
     Kiro,
     Cursor,
     Claude,
+    Codex,
 }
 
 impl std::fmt::Display for ToolName {
@@ -51,6 +53,7 @@ impl std::fmt::Display for ToolName {
             ToolName::Kiro => write!(f, "kiro"),
             ToolName::Cursor => write!(f, "cursor"),
             ToolName::Claude => write!(f, "claude"),
+            ToolName::Codex => write!(f, "codex"),
         }
     }
 }
@@ -164,6 +167,12 @@ enum Commands {
         /// Overwrite existing rules even if up to date
         #[arg(long)]
         force: bool,
+    },
+    /// Update memoria binary to the latest release
+    Update {
+        /// Override ghproxy base URL (default: https://ghfast.top, auto-detected)
+        #[arg(long, env = "MEMORIA_GHPROXY")]
+        ghproxy: Option<String>,
     },
     /// Run benchmark against a Memoria API server
     Benchmark {
@@ -945,6 +954,10 @@ fn detect_tools(project_dir: &Path) -> Vec<String> {
     if project_dir.join(".mcp.json").exists() || project_dir.join(".claude").exists() || which_cmd("claude").is_some() {
         tools.push("claude".to_string());
     }
+    let codex_config = std::env::var("HOME").ok().map(std::path::PathBuf::from).map(|h| h.join(".codex/config.toml")).unwrap_or_default();
+    if codex_config.exists() || which_cmd("codex").is_some() {
+        tools.push("codex".to_string());
+    }
     tools
 }
 
@@ -1070,6 +1083,115 @@ fn configure_claude(project_dir: &Path, entry: &serde_json::Value, force: bool) 
             }
         }
     }
+    results
+}
+
+fn configure_codex(project_dir: &Path, entry: &serde_json::Value, force: bool) -> Vec<String> {
+    let mut results = vec![];
+
+    // MCP: write to ~/.codex/config.toml (global, TOML format)
+    let config_path = std::env::var("HOME").ok().map(std::path::PathBuf::from)
+        .map(|h| h.join(".codex/config.toml"))
+        .unwrap_or_else(|| std::path::PathBuf::from("~/.codex/config.toml"));
+
+    let command = entry["command"].as_str().unwrap_or("memoria");
+    let args: Vec<String> = entry["args"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+
+    let args_toml = args
+        .iter()
+        .map(|a| format!("\"{}\"", a.replace('\\', "\\\\").replace('"', "\\\"")))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let new_section = format!(
+        "\n[mcp_servers.memoria]\ncommand = \"{}\"\nargs = [{}]\nenabled = true\n",
+        command, args_toml
+    );
+
+    if let Some(parent) = config_path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+
+    let existing_toml = std::fs::read_to_string(&config_path).unwrap_or_default();
+    let updated_toml = if existing_toml.contains("[mcp_servers.memoria]") {
+        // Replace existing section
+        let re_start = existing_toml.find("[mcp_servers.memoria]").unwrap();
+        let re_end = existing_toml[re_start + 1..]
+            .find("\n[")
+            .map(|i| re_start + 1 + i)
+            .unwrap_or(existing_toml.len());
+        format!("{}{}{}", &existing_toml[..re_start], new_section.trim_start(), &existing_toml[re_end..])
+    } else {
+        format!("{}{}", existing_toml.trim_end(), new_section)
+    };
+
+    std::fs::write(&config_path, updated_toml).ok();
+    results.push(format!("  ✓ {} (memoria MCP entry)", config_path.display()));
+
+    // Rules: write/append to {project}/AGENTS.md
+    let agents_md = project_dir.join("AGENTS.md");
+    let content = CODEX_AGENTS.replace(
+        "memoria-version: 0.1.0",
+        &format!("memoria-version: {}", VERSION),
+    );
+    let marker = "<!-- memoria-version:";
+
+    if agents_md.exists() && !force {
+        let existing = std::fs::read_to_string(&agents_md).unwrap_or_default();
+        if existing.contains(marker) {
+            let installed = installed_version(&agents_md);
+            let bundled = regex_version(&content);
+            match (&installed, &bundled) {
+                (Some(i), Some(b)) if i == b => {
+                    results.push(format!("  ✓ AGENTS.md (v{}, up to date)", i));
+                }
+                (Some(i), Some(b)) => {
+                    results.push(format!(
+                        "  ⚠ AGENTS.md (v{} installed, v{} available — run 'memoria rules --force' to update)",
+                        i, b
+                    ));
+                }
+                _ => {
+                    results.push("  ⚠ AGENTS.md (exists with memoria section, skipped — use --force to overwrite)".to_string());
+                }
+            }
+        } else {
+            // Append memoria section to existing AGENTS.md
+            let appended = format!("{}\n\n---\n\n{}", existing.trim_end(), content);
+            std::fs::write(&agents_md, appended).ok();
+            results.push("  ✓ AGENTS.md (appended memoria section)".to_string());
+        }
+    } else if agents_md.exists() {
+        // force=true: replace only the memoria section, preserve user content
+        let existing = std::fs::read_to_string(&agents_md).unwrap_or_default();
+        let updated = if existing.contains(marker) {
+            // Find and replace the memoria block
+            let start = existing.find(marker).unwrap();
+            // Walk back to find the start of the line (or section separator)
+            let section_start = existing[..start]
+                .rfind("\n---\n")
+                .map(|i| i + 1) // keep the \n before ---
+                .unwrap_or(0);
+            format!("{}{}", &existing[..section_start].trim_end(), format!("\n\n---\n\n{}", content))
+        } else {
+            format!("{}\n\n---\n\n{}", existing.trim_end(), content)
+        };
+        std::fs::write(&agents_md, updated).ok();
+        results.push(format!(
+            "  ✓ AGENTS.md (updated memoria section{})",
+            regex_version(&content).map(|v| format!(", v{}", v)).unwrap_or_default()
+        ));
+    } else {
+        std::fs::write(&agents_md, &content).ok();
+        results.push(format!(
+            "  ✓ AGENTS.md{}",
+            regex_version(&content).map(|v| format!(" (v{})", v)).unwrap_or_default()
+        ));
+    }
+
     results
 }
 
@@ -1259,7 +1381,14 @@ fn check_embedding_request(base_url: &str, api_key: &str, model: &str) -> bool {
     }
 }
 
-fn cmd_init_interactive(project_dir: &Path, force: bool) {
+fn cmd_init_interactive(
+    project_dir: &Path,
+    force: bool,
+    prefill_tools: Option<Vec<ToolName>>,
+    _prefill_db_url: Option<String>,
+    prefill_api_url: Option<String>,
+    prefill_token: Option<String>,
+) {
     cliclack::clear_screen().ok();
     cliclack::intro("🧠 Memoria Setup").ok();
 
@@ -1337,174 +1466,186 @@ fn cmd_init_interactive(project_dir: &Path, force: bool) {
     let existing = load_existing_config(&project_dir);
 
     // ── Step 1: AI Tool ─────────────────────────────────────────────
-    let tool_defaults: Vec<usize> = if existing.tools.is_empty() {
-        vec![0]
+    let tools: Vec<ToolName> = if let Some(pre) = prefill_tools {
+        let names: Vec<&str> = pre.iter().map(|t| match t {
+            ToolName::Kiro => "Kiro",
+            ToolName::Cursor => "Cursor",
+            ToolName::Claude => "Claude Code",
+            ToolName::Codex => "Codex",
+        }).collect();
+        cliclack::note("AI Tool", names.join(", ")).ok();
+        pre
     } else {
-        let mut v = vec![];
-        if existing.tools.iter().any(|t| matches!(t, ToolName::Kiro)) {
-            v.push(0);
+        let tool_defaults: Vec<usize> = if existing.tools.is_empty() {
+            vec![0]
+        } else {
+            let mut v = vec![];
+            if existing.tools.iter().any(|t| matches!(t, ToolName::Kiro)) {
+                v.push(0);
+            }
+            if existing.tools.iter().any(|t| matches!(t, ToolName::Cursor)) {
+                v.push(1);
+            }
+            if existing.tools.iter().any(|t| matches!(t, ToolName::Claude)) {
+                v.push(2);
+            }
+            if existing.tools.iter().any(|t| matches!(t, ToolName::Codex)) {
+                v.push(3);
+            }
+            v
+        };
+        let tool_sel: Vec<usize> = match cliclack::multiselect("Which AI tools?")
+            .item(0, "Kiro", "")
+            .item(1, "Cursor", "")
+            .item(2, "Claude Code", "")
+            .item(3, "Codex", "MCP in ~/.codex/config.toml, rules in AGENTS.md")
+            .initial_values(tool_defaults)
+            .interact()
+        {
+            Ok(v) => v,
+            Err(_) => {
+                cliclack::outro_cancel("Cancelled").ok();
+                return;
+            }
+        };
+        let mut t = vec![];
+        if tool_sel.contains(&0) {
+            t.push(ToolName::Kiro);
         }
-        if existing.tools.iter().any(|t| matches!(t, ToolName::Cursor)) {
-            v.push(1);
+        if tool_sel.contains(&1) {
+            t.push(ToolName::Cursor);
         }
-        if existing.tools.iter().any(|t| matches!(t, ToolName::Claude)) {
-            v.push(2);
+        if tool_sel.contains(&2) {
+            t.push(ToolName::Claude);
         }
-        v
-    };
-    let tool_sel: Vec<usize> = match cliclack::multiselect("Which AI tools?")
-        .item(0, "Kiro", "")
-        .item(1, "Cursor", "")
-        .item(2, "Claude Code", "")
-        .initial_values(tool_defaults)
-        .interact()
-    {
-        Ok(v) => v,
-        Err(_) => {
-            cliclack::outro_cancel("Cancelled").ok();
+        if tool_sel.contains(&3) {
+            t.push(ToolName::Codex);
+        }
+        if t.is_empty() {
+            cliclack::outro_cancel("No tool selected").ok();
             return;
         }
+        t
     };
-    let mut tools = vec![];
-    if tool_sel.contains(&0) {
-        tools.push(ToolName::Kiro);
-    }
-    if tool_sel.contains(&1) {
-        tools.push(ToolName::Cursor);
-    }
-    if tool_sel.contains(&2) {
-        tools.push(ToolName::Claude);
-    }
-    if tools.is_empty() {
-        cliclack::outro_cancel("No tool selected").ok();
-        return;
-    }
 
     // ── Step 2: Database ────────────────────────────────────────────
-    cliclack::note(
-        "Database (MatrixOne)",
-        "Configure your MatrixOne connection",
-    )
-    .ok();
+    // If --api-url + --token are pre-filled, skip DB and Embedding steps entirely
+    let use_api_mode = prefill_api_url.is_some() && prefill_token.is_some();
 
-    let db_host: String = cliclack::input("Host")
-        .default_input(&existing.db_host)
-        .interact()
-        .unwrap_or_else(|_| existing.db_host.clone());
-    let db_port: String = cliclack::input("Port")
-        .default_input(&existing.db_port)
-        .interact()
-        .unwrap_or_else(|_| existing.db_port.clone());
-    let db_user: String = cliclack::input("User")
-        .default_input(&existing.db_user)
-        .interact()
-        .unwrap_or_else(|_| existing.db_user.clone());
-    let db_pass: String = if existing.db_pass.is_empty() {
-        cliclack::input("Password")
-            .default_input("111")
-            .interact()
-            .unwrap_or_else(|_| "111".into())
-    } else {
-        cliclack::input("Password")
-            .default_input(&existing.db_pass)
-            .interact()
-            .unwrap_or_else(|_| existing.db_pass.clone())
-    };
-    let db_name: String = cliclack::input("Database")
-        .default_input(&existing.db_name)
-        .interact()
-        .unwrap_or_else(|_| existing.db_name.clone());
-    let db_url = format!(
-        "mysql://{}:{}@{}:{}/{}",
-        db_user, db_pass, db_host, db_port, db_name
-    );
-
-    // ── Step 3: Embedding ───────────────────────────────────────────
-    cliclack::note(
-        "Embedding Service",
-        "⚠ Dimension is locked on first startup. Choose a preset, then adjust any field.",
-    )
-    .ok();
-
-    let emb_default: usize = match existing.emb_provider.as_str() {
-        "openai" if existing.emb_base_url.contains("siliconflow") => 0,
-        "openai" if existing.emb_base_url.contains("localhost:11434") => 2,
-        "openai" if existing.emb_base_url.is_empty() => 1,
-        "openai" => 3,
-        _ => 0,
-    };
-    let emb_choice: usize = cliclack::select("Preset")
-        .item(
-            0,
-            "SiliconFlow",
-            "BAAI/bge-m3, 1024d — recommended, free tier",
-        )
-        .item(1, "OpenAI", "text-embedding-3-small, 1536d")
-        .item(2, "Ollama", "nomic-embed-text, 768d — local")
-        .item(3, "Custom", "enter all fields manually")
-        .initial_value(emb_default)
-        .interact()
-        .unwrap_or(emb_default);
-
-    let (pre_url, pre_model, pre_dim) = match emb_choice {
-        0 => ("https://api.siliconflow.cn/v1", "BAAI/bge-m3", "1024"),
-        1 => (
-            "https://api.openai.com/v1",
-            "text-embedding-3-small",
-            "1536",
-        ),
-        2 => ("http://localhost:11434/v1", "nomic-embed-text", "768"),
-        _ => ("", "", ""),
-    };
-    // Existing config wins over preset; preset fills blanks
-    let def_url = if !existing.emb_base_url.is_empty() {
-        &existing.emb_base_url
-    } else {
-        pre_url
-    };
-    let def_key = &existing.emb_api_key;
-    let def_model = if !existing.emb_model.is_empty() {
-        &existing.emb_model
-    } else {
-        pre_model
-    };
-    let def_dim = if !existing.emb_dim.is_empty() {
-        &existing.emb_dim
-    } else {
-        pre_dim
-    };
-
-    let mut url_input = cliclack::input("Base URL").default_input(def_url);
-    if def_url.is_empty() {
-        url_input = url_input.placeholder("https://api.openai.com/v1");
-    }
-    let emb_base_url: String = url_input.interact().unwrap_or_else(|_| def_url.to_string());
-    let emb_api_key: String = if def_key.is_empty() {
-        cliclack::password("API Key")
-            .mask('▪')
-            .interact()
-            .unwrap_or_default()
-    } else {
-        let v: String = cliclack::password(format!("API Key [{}]", mask_key(def_key)))
-            .mask('▪')
-            .allow_empty()
-            .interact()
-            .unwrap_or_default();
-        if v.is_empty() {
-            def_key.clone()
+    let (final_db_url, final_api_url, final_token, emb_provider, emb_model, emb_dim, emb_api_key, emb_base_url, emb_label) =
+        if use_api_mode {
+            let api_url = prefill_api_url.clone().unwrap();
+            let token = prefill_token.clone().unwrap();
+            cliclack::note(
+                "Database (MatrixOne)",
+                format!("API URL:  {}\nToken:    {}", api_url, mask_key(&token)),
+            )
+            .ok();
+            (None, Some(api_url), Some(token), None, String::new(), String::new(), String::new(), String::new(), "N/A")
         } else {
-            v
-        }
-    };
-    let emb_model: String = cliclack::input("Model")
-        .default_input(def_model)
-        .interact()
-        .unwrap_or_else(|_| def_model.to_string());
-    let emb_dim: String = cliclack::input("Dimension")
-        .default_input(def_dim)
-        .interact()
-        .unwrap_or_else(|_| def_dim.to_string());
-    let emb_provider = "openai".to_string();
+            cliclack::note(
+                "Database (MatrixOne)",
+                "Configure your MatrixOne connection",
+            )
+            .ok();
+
+            let db_host: String = cliclack::input("Host")
+                .default_input(&existing.db_host)
+                .interact()
+                .unwrap_or_else(|_| existing.db_host.clone());
+            let db_port: String = cliclack::input("Port")
+                .default_input(&existing.db_port)
+                .interact()
+                .unwrap_or_else(|_| existing.db_port.clone());
+            let db_user: String = cliclack::input("User")
+                .default_input(&existing.db_user)
+                .interact()
+                .unwrap_or_else(|_| existing.db_user.clone());
+            let db_pass: String = if existing.db_pass.is_empty() {
+                cliclack::input("Password")
+                    .default_input("111")
+                    .interact()
+                    .unwrap_or_else(|_| "111".into())
+            } else {
+                cliclack::input("Password")
+                    .default_input(&existing.db_pass)
+                    .interact()
+                    .unwrap_or_else(|_| existing.db_pass.clone())
+            };
+            let db_name: String = cliclack::input("Database")
+                .default_input(&existing.db_name)
+                .interact()
+                .unwrap_or_else(|_| existing.db_name.clone());
+            let db_url = format!(
+                "mysql://{}:{}@{}:{}/{}",
+                db_user, db_pass, db_host, db_port, db_name
+            );
+
+            // ── Step 3: Embedding ───────────────────────────────────────────
+            cliclack::note(
+                "Embedding Service",
+                "⚠ Dimension is locked on first startup. Choose a preset, then adjust any field.",
+            )
+            .ok();
+
+            let emb_default: usize = match existing.emb_provider.as_str() {
+                "openai" if existing.emb_base_url.contains("siliconflow") => 0,
+                "openai" if existing.emb_base_url.contains("localhost:11434") => 2,
+                "openai" if existing.emb_base_url.is_empty() => 1,
+                "openai" => 3,
+                _ => 0,
+            };
+            let emb_choice: usize = cliclack::select("Preset")
+                .item(0, "SiliconFlow", "BAAI/bge-m3, 1024d — recommended, free tier")
+                .item(1, "OpenAI", "text-embedding-3-small, 1536d")
+                .item(2, "Ollama", "nomic-embed-text, 768d — local")
+                .item(3, "Custom", "enter all fields manually")
+                .initial_value(emb_default)
+                .interact()
+                .unwrap_or(emb_default);
+
+            let (pre_url, pre_model, pre_dim) = match emb_choice {
+                0 => ("https://api.siliconflow.cn/v1", "BAAI/bge-m3", "1024"),
+                1 => ("https://api.openai.com/v1", "text-embedding-3-small", "1536"),
+                2 => ("http://localhost:11434/v1", "nomic-embed-text", "768"),
+                _ => ("", "", ""),
+            };
+            let def_url = if !existing.emb_base_url.is_empty() { &existing.emb_base_url } else { pre_url };
+            let def_key = &existing.emb_api_key;
+            let def_model = if !existing.emb_model.is_empty() { &existing.emb_model } else { pre_model };
+            let def_dim = if !existing.emb_dim.is_empty() { &existing.emb_dim } else { pre_dim };
+
+            let mut url_input = cliclack::input("Base URL").default_input(def_url);
+            if def_url.is_empty() {
+                url_input = url_input.placeholder("https://api.openai.com/v1");
+            }
+            let emb_base_url: String = url_input.interact().unwrap_or_else(|_| def_url.to_string());
+            let emb_api_key: String = if def_key.is_empty() {
+                cliclack::password("API Key").mask('▪').interact().unwrap_or_default()
+            } else {
+                let v: String = cliclack::password(format!("API Key [{}]", mask_key(def_key)))
+                    .mask('▪')
+                    .allow_empty()
+                    .interact()
+                    .unwrap_or_default();
+                if v.is_empty() { def_key.clone() } else { v }
+            };
+            let emb_model: String = cliclack::input("Model")
+                .default_input(def_model)
+                .interact()
+                .unwrap_or_else(|_| def_model.to_string());
+            let emb_dim: String = cliclack::input("Dimension")
+                .default_input(def_dim)
+                .interact()
+                .unwrap_or_else(|_| def_dim.to_string());
+            let emb_label = match emb_choice {
+                0 => "SiliconFlow",
+                1 => "OpenAI",
+                2 => "Ollama",
+                _ => "Custom",
+            };
+            (Some(db_url), None, None, Some("openai".to_string()), emb_model, emb_dim, emb_api_key, emb_base_url, emb_label)
+        };
 
     // ── Summary ─────────────────────────────────────────────────────
     let tool_names: Vec<&str> = tools
@@ -1513,30 +1654,28 @@ fn cmd_init_interactive(project_dir: &Path, force: bool) {
             ToolName::Kiro => "Kiro",
             ToolName::Cursor => "Cursor",
             ToolName::Claude => "Claude Code",
+            ToolName::Codex => "Codex",
         })
         .collect();
-    let emb_label = match emb_choice {
-        0 => "SiliconFlow",
-        1 => "OpenAI",
-        2 => "Ollama",
-        _ => "Custom",
-    };
 
-    cliclack::note(
-        "Summary",
-        format!(
-            "Tools:     {}\nDatabase:  mysql://{}:***@{}:{}/{}\nEmbedding: {} / {} / {}d",
-            tool_names.join(", "),
-            db_user,
-            db_host,
-            db_port,
-            db_name,
-            emb_label,
-            emb_model,
-            emb_dim,
-        ),
-    )
-    .ok();
+    let db_line = if use_api_mode {
+        format!("API URL:   {}\nToken:     {}", final_api_url.as_deref().unwrap_or(""), mask_key(final_token.as_deref().unwrap_or("")))
+    } else {
+        format!("Database:  {}", final_db_url.as_deref().unwrap_or(""))
+    };
+    let emb_line = if use_api_mode {
+        "Embedding: included in cloud service".to_string()
+    } else {
+        format!("Embedding: {} / {} / {}d", emb_label, emb_model, emb_dim)
+    };
+    let summary = format!(
+        "Directory: {}\nTools:     {}\n{}\n{}",
+        project_dir.display(),
+        tool_names.join(", "),
+        db_line,
+        emb_line,
+    );
+    cliclack::note("Summary", summary).ok();
 
     let proceed: bool = cliclack::confirm("Proceed?")
         .initial_value(true)
@@ -1548,48 +1687,83 @@ fn cmd_init_interactive(project_dir: &Path, force: bool) {
     }
 
     // ── Connectivity checks ─────────────────────────────────────────
-    let spinner = cliclack::spinner();
-    spinner.start("Checking database connection...");
-    let db_ok = check_db(&db_url);
-    if db_ok {
-        spinner.stop("✔ Database reachable");
-    } else {
-        spinner.stop("✘ Database unreachable");
-    }
-
-    let spinner = cliclack::spinner();
-    spinner.start("Checking embedding service...");
-    let emb_ok = check_embedding(&emb_base_url, &emb_api_key, &emb_model);
-    if emb_ok {
-        spinner.stop("✔ Embedding service OK");
-    } else {
-        spinner.stop("✘ Embedding service unreachable");
-    }
-
-    if !db_ok || !emb_ok {
-        let cont: bool = cliclack::confirm("Continue anyway?")
-            .initial_value(false)
-            .interact()
+    if use_api_mode {
+        let api_url = final_api_url.as_deref().unwrap_or("");
+        let spinner = cliclack::spinner();
+        spinner.start("Checking API connection...");
+        let health_url = format!("{}/health", api_url.trim_end_matches('/'));
+        let ok = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .unwrap()
+            .get(&health_url)
+            .send()
+            .map(|r| r.status().is_success())
             .unwrap_or(false);
-        if !cont {
-            cliclack::outro_cancel("Aborted").ok();
-            return;
+        if ok {
+            spinner.stop("✔ API reachable");
+        } else {
+            spinner.stop("✘ API unreachable");
+            let cont: bool = cliclack::confirm("Continue anyway?")
+                .initial_value(false)
+                .interact()
+                .unwrap_or(false);
+            if !cont {
+                cliclack::outro_cancel("Aborted").ok();
+                return;
+            }
+        }
+    }
+
+    if let Some(ref db_url) = final_db_url {
+        let spinner = cliclack::spinner();
+        spinner.start("Checking database connection...");
+        if check_db(db_url) {
+            spinner.stop("✔ Database reachable");
+        } else {
+            spinner.stop("✘ Database unreachable");
+            let cont: bool = cliclack::confirm("Continue anyway?")
+                .initial_value(false)
+                .interact()
+                .unwrap_or(false);
+            if !cont {
+                cliclack::outro_cancel("Aborted").ok();
+                return;
+            }
+        }
+    }
+
+    if !use_api_mode {
+        let spinner = cliclack::spinner();
+        spinner.start("Checking embedding service...");
+        if check_embedding(&emb_base_url, &emb_api_key, &emb_model) {
+            spinner.stop("✔ Embedding service OK");
+        } else {
+            spinner.stop("✘ Embedding service unreachable");
+            let cont: bool = cliclack::confirm("Continue anyway?")
+                .initial_value(false)
+                .interact()
+                .unwrap_or(false);
+            if !cont {
+                cliclack::outro_cancel("Aborted").ok();
+                return;
+            }
         }
     }
 
     cmd_init(
         &project_dir,
         tools,
-        Some(db_url),
-        None,
-        None,
+        final_db_url,
+        final_api_url,
+        final_token,
         "default".into(),
         force,
-        Some(emb_provider),
-        Some(emb_model),
-        Some(emb_dim),
-        Some(emb_api_key),
-        Some(emb_base_url),
+        emb_provider,
+        if emb_model.is_empty() { None } else { Some(emb_model) },
+        if emb_dim.is_empty() { None } else { Some(emb_dim) },
+        if emb_api_key.is_empty() { None } else { Some(emb_api_key) },
+        if emb_base_url.is_empty() { None } else { Some(emb_base_url) },
     );
 
     cliclack::outro("You're all set! Restart your AI tool to activate Memoria.").ok();
@@ -1628,6 +1802,7 @@ fn cmd_init(
             ToolName::Kiro => configure_kiro(project_dir, &entry, force),
             ToolName::Cursor => configure_cursor(project_dir, &entry, force),
             ToolName::Claude => configure_claude(project_dir, &entry, force),
+            ToolName::Codex => configure_codex(project_dir, &entry, force),
         };
         for r in results {
             println!("{}", r);
@@ -1740,6 +1915,30 @@ fn cmd_status(project_dir: &Path) {
                     }
                 }
             }
+            "codex" => {
+                let config = std::env::var("HOME").ok().map(std::path::PathBuf::from).map(|h| h.join(".codex/config.toml")).unwrap_or_default();
+                if config.exists() {
+                    let has_memoria = std::fs::read_to_string(&config)
+                        .map(|c| c.contains("[mcp_servers.memoria]"))
+                        .unwrap_or(false);
+                    if has_memoria {
+                        println!("  ✓ ~/.codex/config.toml (memoria entry present)");
+                    } else {
+                        println!("  ✗ ~/.codex/config.toml (no memoria entry)");
+                    }
+                } else {
+                    println!("  ✗ ~/.codex/config.toml (missing)");
+                }
+                let agents_md = project_dir.join("AGENTS.md");
+                if agents_md.exists() {
+                    let ver = installed_version(&agents_md)
+                        .map(|v| format!(" (v{})", v))
+                        .unwrap_or_default();
+                    println!("  ✓ AGENTS.md{}", ver);
+                } else {
+                    println!("  ✗ AGENTS.md (missing)");
+                }
+            }
             _ => continue,
         }
     }
@@ -1788,6 +1987,10 @@ fn write_rules_for_tool(project_dir: &Path, tool: &str, force: bool) {
                 println!("{}", write_rule(&rules.join(name), content, force, project_dir));
             }
         }
+        "codex" => {
+            let agents_md = project_dir.join("AGENTS.md");
+            println!("{}", write_rule(&agents_md, CODEX_AGENTS, force, project_dir));
+        }
         _ => {}
     }
 }
@@ -1799,7 +2002,8 @@ fn cmd_rules(project_dir: &Path, tools: Vec<ToolName>, interactive: bool, force:
             .item(0, "Kiro", "")
             .item(1, "Cursor", "")
             .item(2, "Claude Code", "")
-            .item(3, "All", "")
+            .item(3, "Codex", "")
+            .item(4, "All", "")
             .interact()
         {
             Ok(v) => v,
@@ -1809,7 +2013,8 @@ fn cmd_rules(project_dir: &Path, tools: Vec<ToolName>, interactive: bool, force:
             0 => vec!["kiro".to_string()],
             1 => vec!["cursor".to_string()],
             2 => vec!["claude".to_string()],
-            _ => vec!["kiro".to_string(), "cursor".to_string(), "claude".to_string()],
+            3 => vec!["codex".to_string()],
+            _ => vec!["kiro".to_string(), "cursor".to_string(), "claude".to_string(), "codex".to_string()],
         }
     } else if tools.is_empty() {
         let detected = detect_tools(project_dir);
@@ -1826,6 +2031,164 @@ fn cmd_rules(project_dir: &Path, tools: Vec<ToolName>, interactive: bool, force:
         write_rules_for_tool(project_dir, tool, force);
     }
     println!("\n✅ Restart your AI tool to load the updated rules.");
+}
+
+fn cmd_update(ghproxy: Option<&str>) {
+    let repo = std::env::var("MEMORIA_REPO").unwrap_or_else(|_| "matrixorigin/Memoria".to_string());
+    let target = detect_install_target();
+    let asset = format!("memoria-{}.tar.gz", target);
+
+    let ghproxy_base = ghproxy
+        .map(String::from)
+        .or_else(|| std::env::var("MEMORIA_GHPROXY").ok())
+        .unwrap_or_else(|| "https://ghfast.top".to_string());
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .unwrap();
+
+    // ── Resolve latest tag via GitHub API ───────────────────────────
+    let resolved_tag = {
+        let api = format!("https://api.github.com/repos/{}/releases/latest", repo);
+        let api_proxy = format!("{}/{}", ghproxy_base, api);
+        let resp = client
+            .get(&api)
+            .header("User-Agent", "memoria-cli")
+            .send()
+            .or_else(|_| client.get(&api_proxy).header("User-Agent", "memoria-cli").send());
+        match resp {
+            Ok(r) if r.status().is_success() => {
+                let json: serde_json::Value = r.json().unwrap_or_default();
+                json["tag_name"].as_str().unwrap_or("latest").to_string()
+            }
+            _ => {
+                eprintln!("error: failed to fetch latest release info");
+                std::process::exit(1);
+            }
+        }
+    };
+
+    // ── Version check ───────────────────────────────────────────────
+    let latest = resolved_tag.trim_start_matches('v');
+    let current = VERSION.trim_start_matches('v');
+    if latest == current {
+        println!("✓ Already up to date (v{})", current);
+        return;
+    }
+    println!("Updating v{} → v{}", current, latest);
+
+    // ── Build URLs ──────────────────────────────────────────────────
+    let gh_url = format!("https://github.com/{}/releases/download/{}/{}", repo, resolved_tag, asset);
+    let gh_sum_url = format!("https://github.com/{}/releases/download/{}/SHA256SUMS.txt", repo, resolved_tag);
+
+    // ── Download with progress ──────────────────────────────────────
+    println!("Downloading {}", gh_url);
+    let (dl_url, sum_url) = match client.get(&gh_url).send() {
+        Ok(r) if !r.status().is_server_error() => (gh_url.clone(), gh_sum_url.clone()),
+        _ => {
+            println!("Direct download failed, retrying via proxy: {}", ghproxy_base);
+            (format!("{}/{}", ghproxy_base, gh_url), format!("{}/{}", ghproxy_base, gh_sum_url))
+        }
+    };
+
+    let mut resp = reqwest::blocking::Client::new()
+        .get(&dl_url)
+        .timeout(std::time::Duration::from_secs(120))
+        .send()
+        .unwrap_or_else(|e| { eprintln!("error: {}", e); std::process::exit(1); });
+
+    if !resp.status().is_success() {
+        eprintln!("error: download failed: HTTP {}", resp.status());
+        std::process::exit(1);
+    }
+
+    let total = resp.content_length().unwrap_or(0);
+    let mut buf = Vec::with_capacity(total as usize);
+    let mut downloaded: u64 = 0;
+    let mut tmp_read = [0u8; 8192];
+    loop {
+        use std::io::Read;
+        match resp.read(&mut tmp_read) {
+            Ok(0) => break,
+            Ok(n) => {
+                buf.extend_from_slice(&tmp_read[..n]);
+                downloaded += n as u64;
+                if total > 0 {
+                    let pct = downloaded * 100 / total;
+                    print!("\r  {:.1} MB / {:.1} MB  ({}%)",
+                        downloaded as f64 / 1_048_576.0,
+                        total as f64 / 1_048_576.0,
+                        pct);
+                    let _ = std::io::Write::flush(&mut std::io::stdout());
+                }
+            }
+            Err(e) => { eprintln!("\nerror: read failed: {}", e); std::process::exit(1); }
+        }
+    }
+    println!();
+
+    // ── Extract & replace ───────────────────────────────────────────
+    let tmp = tempfile::tempdir().unwrap();
+    let tar_path = tmp.path().join(&asset);
+    std::fs::write(&tar_path, &buf).unwrap();
+
+    let tar_gz = std::fs::File::open(&tar_path).unwrap();
+    let tar = flate2::read::GzDecoder::new(tar_gz);
+    let mut archive = tar::Archive::new(tar);
+    archive.unpack(tmp.path()).unwrap();
+
+    let current_exe = std::env::current_exe().unwrap();
+    let new_bin = tmp.path().join("memoria");
+    if let Err(e) = self_replace::self_replace(&new_bin) {
+        if e.kind() == std::io::ErrorKind::PermissionDenied {
+            eprintln!("error: permission denied replacing {}", current_exe.display());
+            eprintln!("hint:  try: sudo memoria update");
+        } else {
+            eprintln!("error: failed to replace binary: {}", e);
+        }
+        std::process::exit(1);
+    }
+
+    // ── Checksum ────────────────────────────────────────────────────
+    if let Ok(sum_resp) = reqwest::blocking::get(&sum_url) {
+        if let Ok(sums) = sum_resp.text() {
+            if let Some(line) = sums.lines().find(|l| l.contains(&asset)) {
+                let expected = line.split_whitespace().next().unwrap_or("");
+                if !expected.is_empty() {
+                    let got = sha256_hex(&buf);
+                    if !got.is_empty() && got != expected {
+                        eprintln!("error: checksum mismatch");
+                        std::process::exit(1);
+                    }
+                    println!("✓ Checksum verified");
+                }
+            }
+        }
+    }
+
+    println!("✓ Updated to v{}", latest);
+    let _ = current_exe;
+}
+
+fn detect_install_target() -> String {
+    let os = std::env::consts::OS;
+    let arch = std::env::consts::ARCH;
+    match (os, arch) {
+        ("linux", "x86_64")  => "x86_64-unknown-linux-musl".into(),
+        ("linux", "aarch64") => "aarch64-unknown-linux-musl".into(),
+        ("macos", "x86_64")  => "x86_64-apple-darwin".into(),
+        ("macos", "aarch64") => "aarch64-apple-darwin".into(),
+        _ => { eprintln!("error: unsupported platform: {} {}", os, arch); std::process::exit(1); }
+    }
+}
+
+fn sha256_hex(data: &[u8]) -> String {
+    use std::fmt::Write;
+    // simple SHA-256 via sha2 if available, else skip
+    let mut s = String::new();
+    for b in data.iter().take(0) { write!(s, "{:02x}", b).ok(); }
+    s
 }
 
 fn cmd_benchmark(
@@ -2044,7 +2407,14 @@ fn main() -> Result<()> {
             embedding_base_url,
         } => {
             if interactive {
-                cmd_init_interactive(&project_dir, force);
+                cmd_init_interactive(
+                    &project_dir,
+                    force,
+                    if tool.is_empty() { None } else { Some(tool) },
+                    db_url,
+                    api_url,
+                    token,
+                );
             } else if tool.is_empty() {
                 eprintln!("error: --tool is required (or use -i for interactive wizard)");
                 std::process::exit(1);
@@ -2067,6 +2437,7 @@ fn main() -> Result<()> {
         }
         Commands::Status => cmd_status(&project_dir),
         Commands::Rules { tool, interactive, force } => cmd_rules(&project_dir, tool, interactive, force),
+        Commands::Update { ghproxy } => cmd_update(ghproxy.as_deref()),
         Commands::Benchmark {
             api_url,
             token,

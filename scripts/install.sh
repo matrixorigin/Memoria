@@ -15,6 +15,7 @@
 # Env:
 #   MEMORIA_REPO        GitHub repo (default: matrixorigin/Memoria)
 #   MEMORIA_VERSION     Version tag (default: latest)
+#   MEMORIA_GHPROXY     ghproxy base URL (default: https://ghfast.top, auto-detected)
 
 set -eu
 
@@ -191,15 +192,16 @@ fi
 TAG="${VERSION:-latest}"
 ASSET="memoria-${TARGET}.tar.gz"
 if [ "$TAG" = "latest" ]; then
-  URL="https://github.com/${REPO}/releases/latest/download/${ASSET}"
-  SUM_URL="https://github.com/${REPO}/releases/latest/download/SHA256SUMS.txt"
+  GH_URL="https://github.com/${REPO}/releases/latest/download/${ASSET}"
+  GH_SUM_URL="https://github.com/${REPO}/releases/latest/download/SHA256SUMS.txt"
 else
-  URL="https://github.com/${REPO}/releases/download/${TAG}/${ASSET}"
-  SUM_URL="https://github.com/${REPO}/releases/download/${TAG}/SHA256SUMS.txt"
+  GH_URL="https://github.com/${REPO}/releases/download/${TAG}/${ASSET}"
+  GH_SUM_URL="https://github.com/${REPO}/releases/download/${TAG}/SHA256SUMS.txt"
 fi
+GHPROXY="${MEMORIA_GHPROXY:-https://ghfast.top}"
 
 if [ "$DRY_RUN" = true ]; then
-  echo "URL: $URL"
+  echo "URL: $GH_URL"
   exit 0
 fi
 
@@ -245,12 +247,21 @@ fi
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
-info "Downloading ${BLUE}${URL}${NC}"
-curl -fL# -o "$TMP/$ASSET" "$URL" || {
-  error "Download failed — check that version '${TAG}' exists"
-  info "Available releases: ${BLUE}https://github.com/${REPO}/releases${NC}"
-  exit 1
-}
+info "Downloading ${BLUE}${GH_URL}${NC}"
+if ! curl -fL# --max-time 10 -o "$TMP/$ASSET" "$GH_URL" 2>/dev/null; then
+  warn "Direct download failed, retrying via proxy: ${GHPROXY}"
+  URL="${GHPROXY}/${GH_URL}"
+  SUM_URL="${GHPROXY}/${GH_SUM_URL}"
+  info "Downloading ${BLUE}${URL}${NC}"
+  curl -fL# -o "$TMP/$ASSET" "$URL" || {
+    error "Download failed — check that version '${TAG}' exists"
+    info "Available releases: ${BLUE}https://github.com/${REPO}/releases${NC}"
+    exit 1
+  }
+else
+  URL="$GH_URL"
+  SUM_URL="$GH_SUM_URL"
+fi
 
 # ── Verify checksum ─────────────────────────────────────────────────
 
