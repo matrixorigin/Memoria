@@ -2458,6 +2458,10 @@ impl SqlMemoryStore {
 
     // ── Entity links ──────────────────────────────────────────────────────────
 
+    // TODO(perf): When mem_entity_links grows large, add indexes:
+    //   - (user_id, memory_id) for get_linked_memory_ids
+    //   - (user_id, entity_name, entity_type) for get_entity_names
+
     /// Returns memory_ids that already have entity links for a user.
     pub async fn get_linked_memory_ids(
         &self,
