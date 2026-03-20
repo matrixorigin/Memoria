@@ -61,10 +61,17 @@ impl FromRequestParts<AppState> for AuthUser {
             else if let Some(uid) = validate_api_key(token, state).await {
                 return Ok(AuthUser { user_id: uid, is_master: false });
             } else {
+                crate::routes::metrics::AUTH_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                warn!(
+                    token_prefix = &token[..token.len().min(8)],
+                    "auth: invalid token"
+                );
                 return Err((StatusCode::UNAUTHORIZED, "Invalid token".to_string()));
             }
         } else if !state.master_key.is_empty() {
             // master_key is configured but caller sent no Bearer token
+            crate::routes::metrics::AUTH_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            warn!("auth: missing Bearer token");
             return Err((StatusCode::UNAUTHORIZED, "Missing Bearer token".to_string()));
         }
         // Reached here: master key validated, or no-auth open mode (master_key not configured)

@@ -3,11 +3,20 @@
 //! Exposes key operational metrics in Prometheus text exposition format.
 //! No external crate needed — we emit the text format directly.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 
 use crate::AppState;
+
+// ── Process-lifetime counters (no external crate needed) ─────────────────────
+
+/// Incremented on every 401/403 response from the auth extractor.
+pub static AUTH_FAILURES: AtomicU64 = AtomicU64::new(0);
+/// Incremented when sensitivity filter blocks a store request.
+pub static SENSITIVITY_BLOCKS: AtomicU64 = AtomicU64::new(0);
 
 /// GET /metrics — Prometheus text exposition format.
 pub async fn prometheus_metrics(State(state): State<AppState>) -> Response {
@@ -148,6 +157,17 @@ async fn collect_metrics(state: &AppState) -> Result<String, String> {
         state.instance_id,
         env!("CARGO_PKG_VERSION")
     ));
+
+    // ── Security counters ─────────────────────────────────────────────────
+    let auth_failures = AUTH_FAILURES.load(Ordering::Relaxed);
+    out.push_str("# HELP memoria_auth_failures_total Authentication failures (401/403).\n");
+    out.push_str("# TYPE memoria_auth_failures_total counter\n");
+    out.push_str(&format!("memoria_auth_failures_total {auth_failures}\n"));
+
+    let sensitivity_blocks = SENSITIVITY_BLOCKS.load(Ordering::Relaxed);
+    out.push_str("# HELP memoria_sensitivity_blocks_total Requests blocked by sensitivity filter.\n");
+    out.push_str("# TYPE memoria_sensitivity_blocks_total counter\n");
+    out.push_str(&format!("memoria_sensitivity_blocks_total {sensitivity_blocks}\n"));
 
     Ok(out)
 }

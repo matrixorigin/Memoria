@@ -71,6 +71,12 @@ pub async fn store_memory(
     AuthUser { user_id, .. }: AuthUser,
     Json(req): Json<StoreRequest>,
 ) -> Result<(StatusCode, Json<MemoryResponse>), (StatusCode, String)> {
+    if req.content.is_empty() {
+        return Err((StatusCode::UNPROCESSABLE_ENTITY, "content must not be empty".into()));
+    }
+    if req.content.len() > 32_768 {
+        return Err((StatusCode::UNPROCESSABLE_ENTITY, "content exceeds 32 KiB limit".into()));
+    }
     let mt =
         parse_memory_type(&req.memory_type).map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e))?;
     let tier = req
@@ -97,7 +103,12 @@ pub async fn store_memory(
             req.initial_confidence,
         )
         .await
-        .map_err(api_err)?;
+        .map_err(|e| {
+            if matches!(e, memoria_core::MemoriaError::Blocked(_)) {
+                crate::routes::metrics::SENSITIVITY_BLOCKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            api_err(e)
+        })?;
     Ok((StatusCode::CREATED, Json(m.into())))
 }
 
@@ -106,6 +117,14 @@ pub async fn batch_store(
     AuthUser { user_id, .. }: AuthUser,
     Json(req): Json<BatchStoreRequest>,
 ) -> Result<(StatusCode, Json<Vec<MemoryResponse>>), (StatusCode, String)> {
+    if req.memories.len() > 100 {
+        return Err((StatusCode::UNPROCESSABLE_ENTITY, "batch exceeds 100 items".into()));
+    }
+    for m in &req.memories {
+        if m.content.len() > 32_768 {
+            return Err((StatusCode::UNPROCESSABLE_ENTITY, "content exceeds 32 KiB limit".into()));
+        }
+    }
     let items: Vec<_> = req
         .memories
         .into_iter()
@@ -146,6 +165,7 @@ pub async fn retrieve(
     AuthUser { user_id, .. }: AuthUser,
     Json(req): Json<RetrieveRequest>,
 ) -> ApiResult<serde_json::Value> {
+    let top_k = req.top_k.clamp(1, 100);
     let level = memoria_service::ExplainLevel::from_str_or_bool(&req.explain);
     let filter_session = req
         .session_id
@@ -162,7 +182,7 @@ pub async fn retrieve(
     if level != memoria_service::ExplainLevel::None {
         let (results, explain) = state
             .service
-            .retrieve_explain_level(&user_id, &req.query, req.top_k, level)
+            .retrieve_explain_level(&user_id, &req.query, top_k, level)
             .await
             .map_err(api_err)?;
         let items: Vec<MemoryResponse> =
@@ -173,7 +193,7 @@ pub async fn retrieve(
     } else {
         let results = state
             .service
-            .retrieve(&user_id, &req.query, req.top_k)
+            .retrieve(&user_id, &req.query, top_k)
             .await
             .map_err(api_err)?;
         let items: Vec<MemoryResponse> =
@@ -187,11 +207,12 @@ pub async fn search(
     AuthUser { user_id, .. }: AuthUser,
     Json(req): Json<RetrieveRequest>,
 ) -> ApiResult<serde_json::Value> {
+    let top_k = req.top_k.clamp(1, 100);
     let level = memoria_service::ExplainLevel::from_str_or_bool(&req.explain);
     if level != memoria_service::ExplainLevel::None {
         let (results, explain) = state
             .service
-            .search_explain_level(&user_id, &req.query, req.top_k, level)
+            .search_explain_level(&user_id, &req.query, top_k, level)
             .await
             .map_err(api_err)?;
         let items: Vec<MemoryResponse> = results.into_iter().map(Into::into).collect();
@@ -201,7 +222,7 @@ pub async fn search(
     } else {
         let results = state
             .service
-            .search(&user_id, &req.query, req.top_k)
+            .search(&user_id, &req.query, top_k)
             .await
             .map_err(api_err)?;
         Ok(Json(serde_json::json!(results
