@@ -9,6 +9,7 @@ members = [
     "crates/memoria-api",
     "crates/memoria-mcp",
     "crates/memoria-cli",
+    "crates/memoria-test-utils",
 ]
 
 [workspace.package]
@@ -46,6 +47,7 @@ memoria-service = { path = "crates/memoria-service" }
 memoria-git = { path = "crates/memoria-git" }
 memoria-api = { path = "crates/memoria-api" }
 memoria-mcp = { path = "crates/memoria-mcp" }
+memoria-test-utils = { path = "crates/memoria-test-utils" }
 
 [patch.crates-io]
 # MatrixOne returns type code 0xf1 for JSON columns in `data branch diff` output,

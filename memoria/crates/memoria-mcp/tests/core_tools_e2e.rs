@@ -26,16 +26,11 @@ fn uid() -> String {
     format!("ct_{}", &Uuid::new_v4().simple().to_string()[..8])
 }
 
-/// Returns LlmClient if LLM_API_KEY is set, else None.
-fn try_llm() -> Option<Arc<memoria_embedding::LlmClient>> {
-    let key = std::env::var("LLM_API_KEY")
-        .ok()
-        .filter(|s| !s.is_empty())?;
-    let base = std::env::var("LLM_BASE_URL").unwrap_or_else(|_| "https://api.openai.com/v1".into());
-    let model = std::env::var("LLM_MODEL").unwrap_or_else(|_| "gpt-4o-mini".into());
-    Some(Arc::new(memoria_embedding::LlmClient::new(
-        key, base, model,
-    )))
+async fn spawn_fake_llm() -> (
+    Arc<memoria_embedding::LlmClient>,
+    tokio::sync::oneshot::Sender<()>,
+) {
+    memoria_test_utils::spawn_fake_llm(vec![]).await
 }
 
 async fn setup() -> (Arc<MemoryService>, String) {
@@ -963,28 +958,46 @@ async fn test_extract_entities_internal_no_llm_returns_error() {
     println!("✅ extract_entities internal without LLM: {t}");
 }
 
-// ── 31. reflect with LLM (skipped if LLM_API_KEY not set) ────────────────────
+// ── 31. reflect with LLM — deterministic fake runtime ────────────────────────
 
 #[tokio::test]
 async fn test_reflect_with_llm_if_configured() {
-    let Some(llm) = try_llm() else {
-        println!("⏭️  test_reflect_with_llm skipped (LLM_API_KEY not set)");
-        return;
-    };
+    let (llm, _shutdown) = spawn_fake_llm().await;
     let (svc, uid) = setup_with_llm(Some(llm)).await;
 
-    for i in 0..4 {
-        let sid = if i < 2 { "llm_s1" } else { "llm_s2" };
-        call(
-            "memory_store",
-            json!({
-                "content": format!("Memory {} for LLM reflect test", i),
-                "session_id": sid
-            }),
-            &svc,
-            &uid,
-        )
-        .await;
+    let sql = svc.sql_store.as_ref().expect("sql store");
+    let graph = sql.graph_store();
+    for (idx, content) in [
+        "Uses Rust for backend",
+        "Prefers async patterns",
+        "MatrixOne as database",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        graph.create_node(&memoria_storage::GraphNode {
+            node_id: format!("reflect_node_{idx}_{}", &Uuid::new_v4().simple().to_string()[..8]),
+            user_id: uid.clone(),
+            node_type: memoria_storage::NodeType::Semantic,
+            content: content.to_string(),
+            entity_type: None,
+            embedding: None,
+            memory_id: None,
+            session_id: Some("llm_cluster".to_string()),
+            confidence: 0.8,
+            trust_tier: "T3".to_string(),
+            importance: 0.5,
+            source_nodes: vec![],
+            conflicts_with: None,
+            conflict_resolution: None,
+            access_count: 0,
+            cross_session_count: 0,
+            is_active: true,
+            superseded_by: None,
+            created_at: Some(chrono::Utc::now().naive_utc()),
+        })
+        .await
+        .unwrap();
     }
 
     let r = call(
@@ -996,25 +1009,38 @@ async fn test_reflect_with_llm_if_configured() {
     .await;
     let t = text(&r);
     assert!(
-        t.contains("scenes_created") || t.contains("cluster") || t.contains("No memory"),
+        t.contains("scenes_created=1"),
         "with LLM should return reflect result, got: {t}"
+    );
+
+    let rows = sqlx::query("SELECT content FROM mem_memories WHERE user_id = ? AND is_active = 1")
+        .bind(&uid)
+        .fetch_all(sql.pool())
+        .await
+        .unwrap();
+    let contents: Vec<String> = rows
+        .iter()
+        .filter_map(|row| row.try_get::<String, _>("content").ok())
+        .collect();
+    assert!(
+        contents
+            .iter()
+            .any(|c| c.contains("Prefer deterministic validation")),
+        "reflect should store synthesized memory: {contents:?}"
     );
     println!("✅ reflect with LLM: {t}");
 }
 
-// ── 32. extract_entities with LLM (skipped if LLM_API_KEY not set) ───────────
+// ── 32. extract_entities with LLM — deterministic fake runtime ───────────────
 
 #[tokio::test]
 async fn test_extract_entities_with_llm_if_configured() {
-    let Some(llm) = try_llm() else {
-        println!("⏭️  test_extract_entities_with_llm skipped (LLM_API_KEY not set)");
-        return;
-    };
+    let (llm, _shutdown) = spawn_fake_llm().await;
     let (svc, uid) = setup_with_llm(Some(llm)).await;
 
     call(
         "memory_store",
-        json!({"content": "Project uses Rust and MatrixOne database"}),
+        json!({"content": "our stack relies on alphamesh for routing and deltafabric for caching"}),
         &svc,
         &uid,
     )
@@ -1029,9 +1055,20 @@ async fn test_extract_entities_with_llm_if_configured() {
     .await;
     let t = text(&r);
     let parsed: serde_json::Value = serde_json::from_str(&t).unwrap_or(serde_json::Value::Null);
+    assert_eq!(parsed["status"], "done", "with LLM should return done, got: {t}");
     assert!(
-        parsed["status"] == "done" || parsed["status"] == "complete",
-        "with LLM should return done or complete, got: {t}"
+        parsed["entities_found"].as_u64().unwrap_or(0) >= 2,
+        "fake LLM should create entities: {t}"
+    );
+
+    let sql = svc.sql_store.as_ref().expect("sql store");
+    let graph = sql.graph_store();
+    let entities = graph.get_user_entities(&uid).await.unwrap();
+    let names: Vec<String> = entities.iter().map(|(name, _)| name.clone()).collect();
+    assert!(
+        names.iter().any(|name| name == "alphamesh")
+            && names.iter().any(|name| name == "deltafabric"),
+        "LLM extraction should persist entities: {names:?}"
     );
     println!("✅ extract_entities with LLM: {t}");
 }

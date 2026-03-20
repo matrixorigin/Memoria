@@ -48,5 +48,6 @@ serde_json = { workspace = true }
 reqwest = { workspace = true }
 memoria-mcp = { workspace = true }
 memoria-service = { workspace = true }
+memoria-test-utils = { workspace = true }
 ed25519-dalek = { version = "2.1", default-features = false, features = ["std"] }
 uuid = { workspace = true }

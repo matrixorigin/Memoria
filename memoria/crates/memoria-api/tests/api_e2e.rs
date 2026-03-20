@@ -18,16 +18,34 @@ fn uid() -> String {
     format!("api_test_{}", uuid::Uuid::new_v4().simple())
 }
 
-/// Returns LlmClient if LLM_API_KEY is set, else None.
-fn try_llm() -> Option<Arc<memoria_embedding::LlmClient>> {
-    let key = std::env::var("LLM_API_KEY")
-        .ok()
-        .filter(|s| !s.is_empty())?;
-    let base = std::env::var("LLM_BASE_URL").unwrap_or_else(|_| "https://api.openai.com/v1".into());
-    let model = std::env::var("LLM_MODEL").unwrap_or_else(|_| "gpt-4o-mini".into());
-    Some(Arc::new(memoria_embedding::LlmClient::new(
-        key, base, model,
-    )))
+fn episodic_rules() -> Vec<memoria_test_utils::PromptRule> {
+    vec![
+        (
+            "Respond with a JSON object containing: topic, action, outcome",
+            json!({
+                "topic": "Deterministic validation of session workflows",
+                "action": "Stored session memories and generated an episodic summary with a local fake LLM",
+                "outcome": "The session summary path completed and persisted an episodic memory"
+            }),
+        ),
+        (
+            "Respond with a JSON object: {\"points\"",
+            json!({
+                "points": [
+                    "Validated session summary path",
+                    "Used local fake LLM",
+                    "Stored episodic memory"
+                ]
+            }),
+        ),
+    ]
+}
+
+async fn spawn_fake_llm() -> (
+    Arc<memoria_embedding::LlmClient>,
+    tokio::sync::oneshot::Sender<()>,
+) {
+    memoria_test_utils::spawn_fake_llm(episodic_rules()).await
 }
 
 /// Returns (key, base_url, model) if EMBEDDING_API_KEY is set, else None.
@@ -1658,25 +1676,46 @@ async fn test_governance_pollution_detection() {
 
 #[tokio::test]
 async fn test_reflect_with_llm() {
-    let Some(llm) = try_llm() else {
-        println!("⏭️  test_reflect_with_llm skipped (LLM_API_KEY not set)");
-        return;
-    };
+    let (llm, _shutdown) = spawn_fake_llm().await;
     let (base, client) = spawn_server_with_llm(llm).await;
     let uid = uid();
 
-    for content in [
+    let store = memoria_storage::SqlMemoryStore::connect(&db_url(), test_dim())
+        .await
+        .expect("connect");
+    store.migrate().await.expect("migrate");
+    let graph = store.graph_store();
+    for (idx, content) in [
         "Project uses Rust for all backend services",
         "MatrixOne is the primary database",
-        "Team deploys with Docker Compose",
-    ] {
-        client
-            .post(format!("{base}/v1/memories"))
-            .header("X-User-Id", &uid)
-            .json(&json!({"content": content, "memory_type": "semantic"}))
-            .send()
-            .await
-            .unwrap();
+        "Validation emphasizes deterministic test loops",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        graph.create_node(&memoria_storage::GraphNode {
+            node_id: format!("reflect_node_{idx}_{}", &uuid::Uuid::new_v4().simple().to_string()[..8]),
+            user_id: uid.clone(),
+            node_type: memoria_storage::NodeType::Semantic,
+            content: content.to_string(),
+            entity_type: None,
+            embedding: None,
+            memory_id: None,
+            session_id: Some("llm_cluster".to_string()),
+            confidence: 0.8,
+            trust_tier: "T3".to_string(),
+            importance: 0.5,
+            source_nodes: vec![],
+            conflicts_with: None,
+            conflict_resolution: None,
+            access_count: 0,
+            cross_session_count: 0,
+            is_active: true,
+            superseded_by: None,
+            created_at: Some(chrono::Utc::now().naive_utc()),
+        })
+        .await
+        .expect("create graph node");
     }
 
     let r = client
@@ -1692,10 +1731,29 @@ async fn test_reflect_with_llm() {
         r.status()
     );
     let body: serde_json::Value = r.json().await.unwrap();
-    // Either synthesized scenes or returned candidates
     assert!(
-        body.get("scenes_created").is_some() || body.get("candidates").is_some(),
-        "reflect LLM response: {body}"
+        body["scenes_created"].as_u64().unwrap_or(0) >= 1,
+        "reflect should synthesize at least one scene: {body}"
+    );
+
+    let r = client
+        .get(format!("{base}/v1/memories"))
+        .header("X-User-Id", &uid)
+        .query(&[("limit", "20")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let list_body: serde_json::Value = r.json().await.unwrap();
+    let items = list_body["items"].as_array().expect("items array");
+    assert!(
+        items.iter().any(|m| {
+            m["content"]
+                .as_str()
+                .unwrap_or("")
+                .contains("Prefer deterministic validation")
+        }),
+        "reflected memory should be written back: {list_body}"
     );
     println!(
         "✅ reflect with LLM: scenes_created={}",
@@ -1705,16 +1763,20 @@ async fn test_reflect_with_llm() {
 
 #[tokio::test]
 async fn test_extract_entities_with_llm() {
-    let Some(llm) = try_llm() else {
-        println!("⏭️  test_extract_entities_with_llm skipped (LLM_API_KEY not set)");
-        return;
-    };
+    let (llm, _shutdown) = spawn_fake_llm().await;
     let (base, client) = spawn_server_with_llm(llm).await;
     let uid = uid();
 
-    client.post(format!("{base}/v1/memories"))
-        .header("X-User-Id", &uid).json(&json!({"content": "Alice works on the Rust rewrite of Memoria using MatrixOne", "memory_type": "semantic"}))
-        .send().await.unwrap();
+    client
+        .post(format!("{base}/v1/memories"))
+        .header("X-User-Id", &uid)
+        .json(&json!({
+            "content": "our stack relies on alphamesh for routing and deltafabric for caching",
+            "memory_type": "semantic"
+        }))
+        .send()
+        .await
+        .unwrap();
 
     let r = client
         .post(format!("{base}/v1/extract-entities"))
@@ -1729,9 +1791,30 @@ async fn test_extract_entities_with_llm() {
         r.status()
     );
     let body: serde_json::Value = r.json().await.unwrap();
+    assert_eq!(body["status"], "done", "extract LLM response: {body}");
     assert!(
-        body["status"] == "done" || body["status"] == "complete",
-        "extract LLM response: {body}"
+        body["entities_found"].as_u64().unwrap_or(0) >= 2,
+        "fake LLM should create entities: {body}"
+    );
+
+    let r = client
+        .get(format!("{base}/v1/entities"))
+        .header("X-User-Id", &uid)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let entities_body: serde_json::Value = r.json().await.unwrap();
+    let empty_entities = Vec::new();
+    let names: Vec<&str> = entities_body["entities"]
+        .as_array()
+        .unwrap_or(&empty_entities)
+        .iter()
+        .filter_map(|e| e["name"].as_str())
+        .collect();
+    assert!(
+        names.contains(&"alphamesh") && names.contains(&"deltafabric"),
+        "LLM-extracted entities should be persisted: {entities_body}"
     );
     println!(
         "✅ extract_entities with LLM: entities_found={}",
@@ -1911,12 +1994,7 @@ async fn spawn_server_with_embedding(
 
 #[tokio::test]
 async fn test_episodic_no_memories_returns_error() {
-    // This test requires LLM — skip if not configured
-    let Some(llm) = try_llm() else {
-        println!("⏭️  test_episodic_no_memories skipped (LLM_API_KEY not set)");
-        return;
-    };
-
+    let (llm, _shutdown) = spawn_fake_llm().await;
     let (base, client) = spawn_server_with_llm(llm).await;
     let uid = uid();
 
@@ -1953,11 +2031,7 @@ async fn test_episodic_async_task_polling() {
 
 #[tokio::test]
 async fn test_episodic_with_llm_sync() {
-    let Some(llm) = try_llm() else {
-        println!("⏭️  test_episodic_with_llm_sync skipped (LLM_API_KEY not set)");
-        return;
-    };
-
+    let (llm, _shutdown) = spawn_fake_llm().await;
     let (base, client) = spawn_server_with_llm(llm).await;
     let uid = uid();
     let session_id = format!(
@@ -1997,9 +2071,13 @@ async fn test_episodic_with_llm_sync() {
     assert!(
         body["content"]
             .as_str()
-            .map(|c| c.contains("Session Summary"))
+            .map(|c| c.contains("Deterministic validation of session workflows"))
             .unwrap_or(false),
-        "content should contain 'Session Summary': {body}"
+        "content should contain fake LLM topic: {body}"
+    );
+    assert_eq!(
+        body["metadata"]["topic"].as_str().unwrap_or(""),
+        "Deterministic validation of session workflows"
     );
     println!(
         "✅ episodic with LLM sync: memory_id={}",
@@ -2010,6 +2088,73 @@ async fn test_episodic_with_llm_sync() {
         &body["content"].as_str().unwrap_or("")
             [..100.min(body["content"].as_str().unwrap_or("").len())]
     );
+}
+
+#[tokio::test]
+async fn test_episodic_with_llm_async() {
+    let (llm, _shutdown) = spawn_fake_llm().await;
+    let (base, client) = spawn_server_with_llm(llm).await;
+    let uid = uid();
+    let session_id = format!("ep_async_{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
+
+    for content in [
+        "Validated scheduler fallback behavior",
+        "Verified deterministic reflection write-back",
+    ] {
+        client
+            .post(format!("{base}/v1/memories"))
+            .header("X-User-Id", &uid)
+            .json(&json!({"content": content, "session_id": session_id}))
+            .send()
+            .await
+            .unwrap();
+    }
+
+    let r = client
+        .post(format!("{base}/v1/sessions/{session_id}/summary"))
+        .header("X-User-Id", &uid)
+        .json(&json!({"mode": "full", "sync": false}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let body: serde_json::Value = r.json().await.unwrap();
+    let task_id = body["task_id"].as_str().expect("task_id").to_string();
+
+    let mut result = None;
+    for attempt in 0..60 {
+        let poll = client
+            .get(format!("{base}/v1/tasks/{task_id}"))
+            .header("X-User-Id", &uid)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(poll.status(), 200);
+        let task: serde_json::Value = poll.json().await.unwrap();
+        match task["status"].as_str().unwrap_or("") {
+            "completed" => {
+                result = Some(task["result"].clone());
+                break;
+            }
+            "failed" => panic!("async episodic task failed on attempt {attempt}: {task}"),
+            status => {
+                if attempt == 59 {
+                    panic!("async episodic task timed out after 60 polls, last status={status}: {task}");
+                }
+                tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+            }
+        }
+    }
+
+    let result = result.expect("async episodic task should complete");
+    assert!(
+        result["content"]
+            .as_str()
+            .unwrap_or("")
+            .contains("Deterministic validation of session workflows"),
+        "async summary should persist fake LLM content: {result}"
+    );
+    println!("✅ episodic with LLM async: task_id={task_id}");
 }
 
 // ── Admin API ─────────────────────────────────────────────────────────────────

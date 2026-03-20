@@ -2103,6 +2103,7 @@ dependencies = [
  "memoria-mcp",
  "memoria-service",
  "memoria-storage",
+ "memoria-test-utils",
  "moka",
  "opentelemetry",
  "opentelemetry-otlp",
@@ -2217,6 +2218,7 @@ dependencies = [
  "memoria-git",
  "memoria-service",
  "memoria-storage",
+ "memoria-test-utils",
  "reqwest",
  "serde",
  "serde_json",
@@ -2272,6 +2274,16 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "memoria-test-utils"
+version = "0.2.2"
+dependencies = [
+ "axum",
+ "memoria-embedding",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
