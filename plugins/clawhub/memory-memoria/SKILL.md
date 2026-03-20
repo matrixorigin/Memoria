@@ -1,5 +1,5 @@
 ---
-name: matrixorigin-memoria
+name: memory-memoria
 description: Durable memory skill pack for Memoria. Covers setup, memory operations, snapshots and branches, REST and MCP usage, deployment, OpenClaw integration, plugin development, local embedding, release flow, and codebase navigation.
 version: 0.1.0
 metadata:
@@ -14,7 +14,7 @@ metadata:
     homepage: https://github.com/matrixorigin/Memoria
 ---
 
-# MatrixOrigin Memoria
+# Memory (Memoria)
 
 Use this skill when the task involves Memoria as a product, backend, plugin, or codebase.
 
