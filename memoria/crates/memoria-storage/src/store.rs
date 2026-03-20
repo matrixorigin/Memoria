@@ -174,10 +174,12 @@ impl SqlMemoryStore {
                 }
             }
         }
+        const DB_MAX_CONNECTIONS_UPPER: u32 = 512;
         let max_conns: u32 = std::env::var("DB_MAX_CONNECTIONS")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(10);
+            .unwrap_or(32)
+            .clamp(1, DB_MAX_CONNECTIONS_UPPER);
         let pool = sqlx::mysql::MySqlPoolOptions::new()
             .max_connections(max_conns)
             .idle_timeout(std::time::Duration::from_secs(300))

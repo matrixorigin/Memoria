@@ -4,12 +4,13 @@
 //! No external crate needed — we emit the text format directly.
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 
-use crate::AppState;
+use crate::{state::CachedMetrics, AppState};
 
 // ── Process-lifetime counters (no external crate needed) ─────────────────────
 
@@ -24,14 +25,30 @@ pub async fn prometheus_metrics(State(state): State<AppState>) -> Response {
         Ok(body) => (
             StatusCode::OK,
             [("content-type", "text/plain; version=0.0.4; charset=utf-8")],
-            body,
+            body.as_ref().to_owned(),
         )
             .into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
 }
 
-async fn collect_metrics(state: &AppState) -> Result<String, String> {
+async fn collect_metrics(state: &AppState) -> Result<Arc<String>, String> {
+    {
+        let cache = state.metrics_cache.read().await;
+        if let Some(snapshot) = cache.as_ref() {
+            if snapshot.generated_at.elapsed() < state.metrics_cache_ttl {
+                return Ok(snapshot.body.clone());
+            }
+        }
+    }
+
+    let mut cache = state.metrics_cache.write().await;
+    if let Some(snapshot) = cache.as_ref() {
+        if snapshot.generated_at.elapsed() < state.metrics_cache_ttl {
+            return Ok(snapshot.body.clone());
+        }
+    }
+
     let sql = state
         .service
         .sql_store
@@ -186,5 +203,11 @@ async fn collect_metrics(state: &AppState) -> Result<String, String> {
     out.push_str("# TYPE memoria_sensitivity_blocks_total counter\n");
     out.push_str(&format!("memoria_sensitivity_blocks_total {sensitivity_blocks}\n"));
 
-    Ok(out)
+    let body = Arc::new(out);
+    *cache = Some(CachedMetrics {
+        body: body.clone(),
+        generated_at: std::time::Instant::now(),
+    });
+
+    Ok(body)
 }
