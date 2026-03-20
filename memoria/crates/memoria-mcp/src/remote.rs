@@ -13,7 +13,7 @@ pub struct RemoteClient {
 }
 
 impl RemoteClient {
-    pub fn new(api_url: &str, token: Option<&str>, user_id: String) -> Self {
+    pub fn new(api_url: &str, token: Option<&str>, user_id: String, tool: Option<&str>) -> Self {
         let mut headers = reqwest::header::HeaderMap::new();
         if let Some(t) = token {
             if let Ok(v) = reqwest::header::HeaderValue::from_str(&format!("Bearer {t}")) {
@@ -23,6 +23,12 @@ impl RemoteClient {
         // Set X-User-Id header
         if let Ok(v) = reqwest::header::HeaderValue::from_str(&user_id) {
             headers.insert("X-User-Id", v);
+        }
+        // Set X-Memoria-Tool header (kiro / cursor / claude / codex)
+        if let Some(t) = tool {
+            if let Ok(v) = reqwest::header::HeaderValue::from_str(t) {
+                headers.insert("X-Memoria-Tool", v);
+            }
         }
         let client = Client::builder()
             .default_headers(headers)
