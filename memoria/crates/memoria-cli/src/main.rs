@@ -1114,10 +1114,11 @@ fn configure_codex(project_dir: &Path, entry: &serde_json::Value, force: bool) -
         .join(", ");
 
     let new_section = if let Some(env) = entry["env"].as_object().filter(|e| !e.is_empty()) {
-        let env_lines: String = env
-            .iter()
-            .map(|(k, v)| format!("\n{} = \"{}\"", k, v.as_str().unwrap_or("")))
-            .collect();
+        let env_lines: String = env.iter().fold(String::new(), |mut s, (k, v)| {
+            use std::fmt::Write;
+            let _ = write!(s, "\n{} = \"{}\"", k, v.as_str().unwrap_or(""));
+            s
+        });
         format!(
             "\n[mcp_servers.memoria]\ncommand = \"{}\"\nargs = [{}]\nenabled = true\n\n[mcp_servers.memoria.env]{}",
             command, args_toml, env_lines
