@@ -1155,7 +1155,7 @@ async fn test_remote_store_retrieve() {
     let (base, _) = spawn_api_for_remote().await;
     let uid = uid();
 
-    let remote = RemoteClient::new(&base, None, uid.clone());
+    let remote = RemoteClient::new(&base, None, uid.clone(), None);
 
     // Store
     let r = remote
@@ -1197,7 +1197,7 @@ async fn test_remote_correct_purge() {
 
     let (base, _) = spawn_api_for_remote().await;
     let uid = uid();
-    let remote = RemoteClient::new(&base, None, uid.clone());
+    let remote = RemoteClient::new(&base, None, uid.clone(), None);
 
     // Store
     let r = remote
@@ -1244,7 +1244,7 @@ async fn test_remote_governance() {
 
     let (base, _) = spawn_api_for_remote().await;
     let uid = uid();
-    let remote = RemoteClient::new(&base, None, uid.clone());
+    let remote = RemoteClient::new(&base, None, uid.clone(), None);
 
     let r = remote
         .call("memory_governance", json!({"force": true}))
@@ -1264,7 +1264,7 @@ async fn test_remote_capabilities() {
 
     let (base, _) = spawn_api_for_remote().await;
     let uid = uid();
-    let remote = RemoteClient::new(&base, None, uid.clone());
+    let remote = RemoteClient::new(&base, None, uid.clone(), None);
 
     let r = remote
         .call("memory_capabilities", json!({}))
@@ -1283,7 +1283,7 @@ async fn test_remote_list_search_profile() {
     use memoria_mcp::remote::RemoteClient;
     let (base, _) = spawn_api_for_remote().await;
     let uid = uid();
-    let remote = RemoteClient::new(&base, None, uid.clone());
+    let remote = RemoteClient::new(&base, None, uid.clone(), None);
 
     remote
         .call(
@@ -1339,7 +1339,7 @@ async fn test_remote_snapshot_branch() {
     use memoria_mcp::remote::RemoteClient;
     let (base, _) = spawn_api_for_remote().await;
     let uid = uid();
-    let remote = RemoteClient::new(&base, None, uid.clone());
+    let remote = RemoteClient::new(&base, None, uid.clone(), None);
 
     // Store a memory first
     remote
@@ -1458,7 +1458,7 @@ async fn test_remote_reflect_extract_entities() {
     use memoria_mcp::remote::RemoteClient;
     let (base, _) = spawn_api_for_remote().await;
     let uid = uid();
-    let remote = RemoteClient::new(&base, None, uid.clone());
+    let remote = RemoteClient::new(&base, None, uid.clone(), None);
 
     remote
         .call(
@@ -1744,7 +1744,7 @@ async fn test_remote_consolidate() {
     use memoria_mcp::remote::RemoteClient;
     let (base, _) = spawn_api_for_remote().await;
     let uid = uid();
-    let remote = RemoteClient::new(&base, None, uid.clone());
+    let remote = RemoteClient::new(&base, None, uid.clone(), None);
 
     let r = remote
         .call("memory_consolidate", json!({"force": true}))
@@ -1763,7 +1763,7 @@ async fn test_remote_correct_by_query() {
     use memoria_mcp::remote::RemoteClient;
     let (base, _) = spawn_api_for_remote().await;
     let uid = uid();
-    let remote = RemoteClient::new(&base, None, uid.clone());
+    let remote = RemoteClient::new(&base, None, uid.clone(), None);
 
     remote
         .call(
@@ -1797,7 +1797,7 @@ async fn test_remote_purge_by_topic() {
     use memoria_mcp::remote::RemoteClient;
     let (base, _) = spawn_api_for_remote().await;
     let uid = uid();
-    let remote = RemoteClient::new(&base, None, uid.clone());
+    let remote = RemoteClient::new(&base, None, uid.clone(), None);
 
     remote
         .call("memory_store", json!({"content": "topic purge test alpha"}))
@@ -3264,7 +3264,7 @@ async fn test_remote_snapshot_detail_and_diff() {
     use memoria_mcp::remote::RemoteClient;
     let (base, _) = spawn_api_for_remote().await;
     let uid = uid();
-    let remote = RemoteClient::new(&base, None, uid.clone());
+    let remote = RemoteClient::new(&base, None, uid.clone(), None);
 
     // Store memories
     remote
