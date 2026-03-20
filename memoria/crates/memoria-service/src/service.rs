@@ -7,7 +7,9 @@ use memoria_core::{
 use memoria_embedding::llm::ChatMessage;
 use memoria_embedding::LlmClient;
 use memoria_storage::SqlMemoryStore;
+use moka::future::Cache;
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -96,6 +98,8 @@ pub struct MemoryService {
     pub llm: Option<Arc<LlmClient>>,
     /// Async entity extraction queue (None when sql_store is absent)
     entity_tx: Option<tokio::sync::mpsc::UnboundedSender<EntityJob>>,
+    /// Per-user feedback_weight cache (TTL 5 min)
+    feedback_weight_cache: Cache<String, f64>,
 }
 
 /// A pending entity-extraction job pushed from the write path.
@@ -119,6 +123,10 @@ impl MemoryService {
             embedder,
             llm: llm.clone(),
             entity_tx: Some(entity_tx),
+            feedback_weight_cache: Cache::builder()
+                .max_capacity(10_000)
+                .time_to_live(Duration::from_secs(300))
+                .build(),
         };
         Self::spawn_entity_worker(entity_rx, store, llm);
         svc
@@ -137,6 +145,10 @@ impl MemoryService {
             embedder,
             llm: llm.clone(),
             entity_tx: Some(entity_tx),
+            feedback_weight_cache: Cache::builder()
+                .max_capacity(10_000)
+                .time_to_live(Duration::from_secs(300))
+                .build(),
         };
         Self::spawn_entity_worker(entity_rx, store, llm);
         svc
@@ -150,6 +162,10 @@ impl MemoryService {
             embedder,
             llm: None,
             entity_tx: None,
+            feedback_weight_cache: Cache::builder()
+                .max_capacity(10_000)
+                .time_to_live(Duration::from_secs(300))
+                .build(),
         }
     }
 
@@ -550,8 +566,7 @@ impl MemoryService {
                         explain.vector_attempted = true;
                         let vs_start = std::time::Instant::now();
                         let (vec_results, scores) = if level.at_least(ExplainLevel::Verbose) {
-                            let fw = sql.get_user_retrieval_params(user_id).await
-                                .map(|p| p.feedback_weight).unwrap_or(0.1);
+                            let fw = self.get_feedback_weight(user_id).await;
                             sql.search_hybrid_from_scored(&table, user_id, embedding, query, top_k, fw)
                                 .await?
                         } else {
@@ -623,8 +638,7 @@ impl MemoryService {
                 explain.vector_attempted = true;
                 let vs_start = std::time::Instant::now();
                 let (results, scores) = if level.at_least(ExplainLevel::Verbose) {
-                    let fw = sql.get_user_retrieval_params(user_id).await
-                        .map(|p| p.feedback_weight).unwrap_or(0.1);
+                    let fw = self.get_feedback_weight(user_id).await;
                     sql.search_hybrid_from_scored(&table, user_id, embedding, query, top_k, fw)
                         .await?
                 } else {
@@ -672,8 +686,7 @@ impl MemoryService {
             if !results.is_empty() {
                 let ids: Vec<String> = results.iter().map(|m| m.memory_id.clone()).collect();
                 if let Ok(fb_map) = sql.get_feedback_batch(&ids).await {
-                    let feedback_weight = sql.get_user_retrieval_params(user_id).await
-                        .map(|p| p.feedback_weight).unwrap_or(0.1);
+                    let feedback_weight = self.get_feedback_weight(user_id).await;
                     for m in &mut results {
                         if let Some(fb) = fb_map.get(&m.memory_id) {
                             let positive = fb.useful as f64;
@@ -935,6 +948,22 @@ impl MemoryService {
 
     pub async fn embed_batch(&self, texts: &[String]) -> Option<Vec<Vec<f32>>> {
         self.embedder.as_ref()?.embed_batch(texts).await.ok()
+    }
+
+    /// Get per-user feedback_weight with caching (TTL 5 min).
+    pub async fn get_feedback_weight(&self, user_id: &str) -> f64 {
+        if let Some(fw) = self.feedback_weight_cache.get(user_id).await {
+            return fw;
+        }
+        let fw = if let Some(sql) = &self.sql_store {
+            sql.get_user_retrieval_params(user_id).await
+                .map(|p| p.feedback_weight)
+                .unwrap_or(0.1)
+        } else {
+            0.1
+        };
+        self.feedback_weight_cache.insert(user_id.to_string(), fw).await;
+        fw
     }
 
     /// Batch store with single embedding API call for all memories.

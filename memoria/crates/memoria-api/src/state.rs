@@ -1,6 +1,8 @@
 use memoria_git::GitForDataService;
 use memoria_service::{AsyncTaskStore, MemoryService};
+use moka::future::Cache;
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::warn;
 
 #[derive(Clone)]
@@ -13,6 +15,8 @@ pub struct AppState {
     pub task_store: Option<Arc<dyn AsyncTaskStore>>,
     /// Instance identifier for distributed coordination
     pub instance_id: String,
+    /// API key hash -> user_id cache (TTL 5 min)
+    pub api_key_cache: Cache<String, String>,
 }
 
 impl AppState {
@@ -34,6 +38,10 @@ impl AppState {
             master_key,
             task_store,
             instance_id: "single".into(),
+            api_key_cache: Cache::builder()
+                .max_capacity(10_000)
+                .time_to_live(Duration::from_secs(300))
+                .build(),
         }
     }
 

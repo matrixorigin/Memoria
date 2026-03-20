@@ -100,6 +100,11 @@ async fn validate_api_key(token: &str, state: &AppState) -> Option<String> {
     let sql = state.service.sql_store.as_ref()?;
     let key_hash = format!("{:x}", Sha256::digest(token.as_bytes()));
 
+    // Check cache first
+    if let Some(user_id) = state.api_key_cache.get(&key_hash).await {
+        return Some(user_id);
+    }
+
     let row = sqlx::query(
         "SELECT user_id FROM mem_api_keys \
          WHERE key_hash = ? AND is_active = 1 \
@@ -111,9 +116,14 @@ async fn validate_api_key(token: &str, state: &AppState) -> Option<String> {
     .map_err(|e| warn!("validate_api_key: DB query failed: {e}"))
     .ok()??;
 
+    let user_id: String = row.try_get("user_id").ok()?;
+
+    // Cache the result
+    state.api_key_cache.insert(key_hash.clone(), user_id.clone()).await;
+
     // Update last_used_at (fire-and-forget)
     let pool = sql.pool().clone();
-    let hash = key_hash.clone();
+    let hash = key_hash;
     tokio::spawn(async move {
         if let Err(e) = sqlx::query("UPDATE mem_api_keys SET last_used_at = NOW(6) WHERE key_hash = ?")
             .bind(&hash)
@@ -124,5 +134,5 @@ async fn validate_api_key(token: &str, state: &AppState) -> Option<String> {
         }
     });
 
-    row.try_get::<String, _>("user_id").ok()
+    Some(user_id)
 }

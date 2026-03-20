@@ -230,7 +230,7 @@ pub async fn rotate_key(
     })?;
 
     let old = sqlx::query(
-        "SELECT user_id, name, expires_at FROM mem_api_keys WHERE key_id = ? AND is_active = 1",
+        "SELECT user_id, name, expires_at, key_hash FROM mem_api_keys WHERE key_id = ? AND is_active = 1",
     )
     .bind(&key_id)
     .fetch_optional(sql.pool())
@@ -245,6 +245,11 @@ pub async fn rotate_key(
 
     let name: String = old.try_get("name").map_err(api_err)?;
     let expires_at: Option<chrono::NaiveDateTime> = old.try_get("expires_at").ok().flatten();
+
+    // Invalidate cache before DB update
+    if let Ok(key_hash) = old.try_get::<String, _>("key_hash") {
+        state.api_key_cache.invalidate(&key_hash).await;
+    }
 
     // Deactivate old
     sqlx::query("UPDATE mem_api_keys SET is_active = 0 WHERE key_id = ?")
@@ -295,7 +300,7 @@ pub async fn revoke_key(
         )
     })?;
 
-    let row = sqlx::query("SELECT user_id FROM mem_api_keys WHERE key_id = ?")
+    let row = sqlx::query("SELECT user_id, key_hash FROM mem_api_keys WHERE key_id = ?")
         .bind(&key_id)
         .fetch_optional(sql.pool())
         .await
@@ -305,6 +310,11 @@ pub async fn revoke_key(
     let owner: String = row.try_get("user_id").map_err(api_err)?;
     if owner != user_id && !is_master {
         return Err((StatusCode::FORBIDDEN, "Not your key".to_string()));
+    }
+
+    // Invalidate cache before DB update
+    if let Ok(key_hash) = row.try_get::<String, _>("key_hash") {
+        state.api_key_cache.invalidate(&key_hash).await;
     }
 
     sqlx::query("UPDATE mem_api_keys SET is_active = 0 WHERE key_id = ?")
