@@ -1,5 +1,7 @@
 ---
-inclusion: agent_requested
+inclusion: auto
+name: memory-hygiene
+description: Memory health management - governance triggers, contradiction resolution, snapshot cleanup. Use when memory seems noisy or contradictory.
 ---
 
 <!-- memoria-version: 0.1.0-->

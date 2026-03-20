@@ -5,21 +5,17 @@
 You have persistent memory via MCP tools. Memory survives across conversations.
 
 ## 🔴 MANDATORY: Every conversation start
-Before your first response, run a multi-query bootstrap to load full context:
 
-1. **Primary query** — call `memory_retrieve` with a **semantic query** derived from the user's message.
-2. **Active goals** — `memory_search(query="GOAL ACTIVE")` (if user's message references ongoing work or a previous task)
-3. **User profile** — `memory_profile()` (if user asks about preferences or you need style context)
+Call `memory_retrieve` with a **semantic query** derived from the user's message BEFORE responding.
 
-**Query construction rules:**
-- ✅ **DO**: Extract key concepts from user's question → "benchmark optimization", "graph retrieval bug", "active goals"
-- ❌ **DON'T**: Use meta-queries → "all memories", "everything", "list all", "show me data"
-- When user asks "what do I know" or "我有哪些记忆", query the most recent active context instead (e.g., "recent goals tasks projects")
+**Query rules:**
+- ✅ Extract key concepts → "benchmark optimization", "graph retrieval bug"
+- ❌ Don't use meta-queries → "all memories", "everything", "list all"
 
 **After retrieval:**
-- If results come back → use them as **reference only**. Treat retrieved memories as potentially stale or incomplete — always verify against current context before acting on them. Do NOT blindly trust memory content as ground truth.
-- If "No relevant memories found" → this is normal for new users, proceed without.
-- If ⚠️ health warnings appear → inform the user and offer to run `memory_governance`.
+- Results → use as reference, verify against current context
+- "No relevant memories" → normal for new users, proceed
+- ⚠️ warnings → inform user, offer `memory_governance`
 
 ## 🔴 MANDATORY: Every conversation turn
 After responding, decide if anything is worth remembering:
@@ -94,10 +90,30 @@ Before storing a new memory, consider:
 **`memory_feedback`**: Call this after retrieval when you can assess whether a memory was helpful. Signals:
 - `useful` — memory helped answer the question or complete the task
 - `irrelevant` — memory was retrieved but not relevant to the query
-- `outdated` — memory contains stale information
-- `wrong` — memory contains incorrect information
+- `outdated` — memory contains stale information (consider `memory_correct` instead if you know the new value)
+- `wrong` — memory contains incorrect information (consider `memory_correct` instead if you know the correct value)
 
-Feedback improves future retrieval ranking. Don't call for every memory — only when you have clear signal.
+**When to call feedback vs other tools**:
+- Memory helped → `memory_feedback(signal="useful")`
+- Memory irrelevant but correct → `memory_feedback(signal="irrelevant")`
+- Memory outdated and you know new value → `memory_correct` (not feedback)
+- Memory outdated but you don't know new value → `memory_feedback(signal="outdated")`
+- Memory wrong and you know correct value → `memory_correct` (not feedback)
+- Memory should be deleted → `memory_purge` (not feedback)
+
+**Example flow**:
+```
+# 1. Retrieve memories
+memories = memory_retrieve(query="database config")
+
+# 2. Use memories to answer user's question
+# ... (memory about "Uses PostgreSQL" helped answer)
+
+# 3. Record feedback for the helpful memory
+memory_feedback(memory_id="abc123", signal="useful", context="answered DB question")
+```
+
+**Impact**: Feedback accumulates over time. With default settings, a memory with 3 `useful` signals ranks ~30% higher in future retrievals. Don't call for every memory — only when you have clear signal.
 
 **`memory_retrieve` vs `memory_search`**: In MCP mode, both use the same retrieval pipeline (graph → hybrid vector+fulltext → fulltext fallback). The differences are:
 - `memory_retrieve` accepts `session_id` for session-scoped boosting; `memory_search` does not

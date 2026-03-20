@@ -1,7 +1,7 @@
 ---
 description: USE WHEN managing memory across conversation phases - bootstrap retrieval at start, mid-session re-retrieval, and wrap-up cleanup
 globs:
-alwaysApply: true
+alwaysApply: false
 ---
 
 <!-- memoria-version: 0.1.0-->
