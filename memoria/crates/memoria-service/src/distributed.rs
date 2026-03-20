@@ -97,7 +97,7 @@ impl DistributedLock for SqlMemoryStore {
             return Ok(true);
         }
 
-        // Row exists — check if we already own it (re-entrant)
+        // Row exists — check if we already own it (re-entrant within same process)
         let current_holder: Option<(String,)> = sqlx::query_as(
             "SELECT holder_id FROM mem_distributed_locks WHERE lock_key = ? AND holder_id = ? AND expires_at > NOW()"
         )

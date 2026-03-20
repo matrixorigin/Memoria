@@ -1133,3 +1133,119 @@ async fn test_tuning_affects_scoring() {
         default_score, score_default, score_custom);
     println!("✅ test_tuning_affects_scoring: per-user params affect scoring math");
 }
+
+// ── 21. Governance daily task updates feedback_weight in DB ───────────────────
+
+#[tokio::test]
+async fn test_governance_daily_tunes_params_in_db() {
+    use memoria_service::{
+        governance::{DefaultGovernanceStrategy, GovernanceTask},
+        GovernanceStrategy,
+    };
+
+    let (_svc, store, uid) = setup().await;
+
+    // Store a memory and add 12 useful feedback signals (above MIN_FEEDBACK_FOR_TUNING=10)
+    let result = call(
+        "memory_store",
+        json!({"content": "governance tuning e2e test memory", "memory_type": "semantic"}),
+        &_svc,
+        &uid,
+    )
+    .await;
+    let mem_id = text(&result)
+        .strip_prefix("Stored memory ")
+        .and_then(|s| s.split(':').next())
+        .unwrap_or("unknown")
+        .to_string();
+
+    for _ in 0..12 {
+        store.record_feedback(&uid, &mem_id, "useful", None).await.unwrap();
+    }
+
+    // Capture baseline
+    let before = store.get_user_retrieval_params(&uid).await.unwrap();
+
+    // Run governance daily task directly (no scheduler needed)
+    let strategy: Arc<dyn GovernanceStrategy> = Arc::new(DefaultGovernanceStrategy);
+    let execution = strategy.run(store.as_ref(), GovernanceTask::Daily).await.unwrap();
+
+    // Verify the task reported tuning
+    assert!(
+        execution.summary.users_tuned > 0,
+        "Daily task should have tuned at least one user, got users_tuned={}",
+        execution.summary.users_tuned
+    );
+
+    // Verify DB was actually updated
+    let after = store.get_user_retrieval_params(&uid).await.unwrap();
+    assert!(
+        after.feedback_weight >= before.feedback_weight,
+        "feedback_weight should increase after 100% useful feedback: {:.3} -> {:.3}",
+        before.feedback_weight,
+        after.feedback_weight
+    );
+    assert!(
+        (after.feedback_weight - before.feedback_weight * 1.1).abs() < 0.001
+            || after.feedback_weight == 0.2, // clamped at max
+        "Expected 10% increase or max cap: got {:.4}",
+        after.feedback_weight
+    );
+
+    println!(
+        "✅ test_governance_daily_tunes_params_in_db: {:.3} → {:.3}, users_tuned={}",
+        before.feedback_weight, after.feedback_weight, execution.summary.users_tuned
+    );
+}
+
+// ── 22. Duplicate instance_id: two processes with same config get distinct holder IDs ──
+
+#[tokio::test]
+async fn test_duplicate_instance_id_lock_is_exclusive() {
+    use memoria_service::distributed::DistributedLock;
+    use std::time::Duration;
+
+    let store = SqlMemoryStore::connect(&db_url(), test_dim())
+        .await
+        .expect("connect");
+    store.migrate().await.expect("migrate");
+    let store = Arc::new(store);
+
+    let lock_key = format!("test:dup_instance:{}", uid());
+
+    // Simulate two processes that both set MEMORIA_INSTANCE_ID=same-name.
+    // Config::from_env() appends PID, so their actual holder_ids differ:
+    //   process A → "same-name-1234"
+    //   process B → "same-name-5678"
+    let holder_a = "same-name-1234"; // simulated: base + pid_a
+    let holder_b = "same-name-5678"; // simulated: base + pid_b
+
+    // A acquires
+    let acquired_a = store
+        .try_acquire(&lock_key, holder_a, Duration::from_secs(60))
+        .await
+        .unwrap();
+    assert!(acquired_a, "Process A should acquire the lock");
+
+    // B (different PID, same base name) must NOT acquire
+    let acquired_b = store
+        .try_acquire(&lock_key, holder_b, Duration::from_secs(60))
+        .await
+        .unwrap();
+    assert!(
+        !acquired_b,
+        "Process B with same base instance_id must be excluded (different PID → different holder)"
+    );
+
+    // Verify Config::from_env() actually appends PID
+    let cfg = memoria_service::Config::from_env();
+    let pid = std::process::id().to_string();
+    assert!(
+        cfg.instance_id.ends_with(&format!("-{pid}")),
+        "instance_id should end with -{pid}, got: {}",
+        cfg.instance_id
+    );
+
+    store.release(&lock_key, holder_a).await.unwrap();
+    println!("✅ test_duplicate_instance_id_lock_is_exclusive: PID suffix prevents duplicate-ID bypass");
+}
