@@ -1175,7 +1175,7 @@ fn configure_codex(project_dir: &Path, entry: &serde_json::Value, force: bool) -
                 .rfind("\n---\n")
                 .map(|i| i + 1) // keep the \n before ---
                 .unwrap_or(0);
-            format!("{}{}", &existing[..section_start].trim_end(), format!("\n\n---\n\n{}", content))
+            format!("{}\n\n---\n\n{}", &existing[..section_start].trim_end(), content)
         } else {
             format!("{}\n\n---\n\n{}", existing.trim_end(), content)
         };
