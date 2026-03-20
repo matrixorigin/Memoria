@@ -502,38 +502,35 @@
     <line x1="260" y1="520" x2="260" y2="396" class="connector"/>
     <circle cx="260" cy="520" r="8" class="node"/>
     <rect x="178" y="324" width="168" height="72" rx="18" class="card"/>
-    <text x="202" y="350" class="cardTitle">Beat 1</text>
-    <text x="202" y="373" class="cardText">Mira inherits</text>
-    <text x="202" y="393" class="cardText">the lighthouse.</text>
+    <text x="196" y="348" class="cardTitle">Beat 1</text>
+    <text x="196" y="366" class="cardText">Mira inherits</text>
+    <text x="196" y="382" class="cardText">the lighthouse.</text>
   </g>
 
   <g class="beat2 hidden">
     <line x1="410" y1="520" x2="410" y2="306" class="connector"/>
     <circle cx="410" cy="520" r="8" class="node"/>
     <rect x="326" y="234" width="172" height="72" rx="18" class="card"/>
-    <text x="350" y="260" class="cardTitle">Beat 2</text>
-    <text x="350" y="283" class="cardText">A storm traps the</text>
-    <text x="350" y="303" class="cardText">harbor overnight.</text>
+    <text x="344" y="258" class="cardTitle">Beat 2</text>
+    <text x="344" y="276" class="cardText">A storm traps the</text>
+    <text x="344" y="292" class="cardText">harbor overnight.</text>
   </g>
 
   <g class="beat3 hidden">
     <line x1="560" y1="520" x2="560" y2="376" class="connector"/>
     <circle cx="560" cy="520" r="8" class="node"/>
     <rect x="474" y="304" width="172" height="72" rx="18" class="card"/>
-    <text x="498" y="330" class="cardTitle">Beat 3</text>
-    <text x="498" y="353" class="cardText">She plans to leave</text>
-    <text x="498" y="373" class="cardText">before dawn.</text>
+    <text x="492" y="328" class="cardTitle">Beat 3</text>
+    <text x="492" y="346" class="cardText">She plans to leave</text>
+    <text x="492" y="362" class="cardText">before dawn.</text>
   </g>
 
   <g class="idea hidden">
-    <line x1="624" y1="424" x2="624" y2="414" stroke="#fbbf24" stroke-width="2.4" stroke-linecap="round"/>
-    <line x1="605" y1="431" x2="598" y2="423" stroke="#fbbf24" stroke-width="2.4" stroke-linecap="round"/>
-    <line x1="643" y1="431" x2="650" y2="423" stroke="#fbbf24" stroke-width="2.4" stroke-linecap="round"/>
-    <line x1="597" y1="452" x2="587" y2="452" stroke="#fbbf24" stroke-width="2.4" stroke-linecap="round"/>
-    <line x1="651" y1="452" x2="661" y2="452" stroke="#fbbf24" stroke-width="2.4" stroke-linecap="round"/>
-    <line x1="605" y1="473" x2="598" y2="481" stroke="#fbbf24" stroke-width="2.4" stroke-linecap="round"/>
-    <line x1="643" y1="473" x2="650" y2="481" stroke="#fbbf24" stroke-width="2.4" stroke-linecap="round"/>
-    <circle cx="624" cy="452" r="18" fill="rgba(245,158,11,0.18)" stroke="rgba(245,158,11,0.54)" stroke-width="1.6"/>
+    <line x1="629" y1="428" x2="629" y2="418" stroke="#fbbf24" stroke-width="2.4" stroke-linecap="round"/>
+    <line x1="617" y1="433" x2="611" y2="426" stroke="#fbbf24" stroke-width="2.4" stroke-linecap="round"/>
+    <line x1="641" y1="433" x2="647" y2="426" stroke="#fbbf24" stroke-width="2.4" stroke-linecap="round"/>
+    <line x1="613" y1="445" x2="603" y2="445" stroke="#fbbf24" stroke-width="2.4" stroke-linecap="round"/>
+    <line x1="645" y1="445" x2="655" y2="445" stroke="#fbbf24" stroke-width="2.4" stroke-linecap="round"/>
     <path d="M617 445 C617 438, 622 433, 629 433 C636 433, 641 438, 641 445 C641 450, 638 453, 634 457 C632 459, 631 462, 631 466 L627 466 C627 462, 626 459, 624 457 C620 453, 617 450, 617 445 Z" fill="#fbbf24"/>
     <rect x="624" y="467" width="10" height="6" rx="3" fill="#fbbf24"/>
   </g>
@@ -565,45 +562,45 @@
     <line x1="720" y1="520" x2="720" y2="286" class="connector"/>
     <circle cx="720" cy="520" r="8" class="nodeMerged"/>
     <rect x="634" y="214" width="176" height="72" rx="18" class="cardMerged"/>
-    <text x="658" y="240" class="cardTitle">Beat 4</text>
-    <text x="658" y="263" class="cardText">The branch wins:</text>
-    <text x="658" y="283" class="cardText">she stays instead.</text>
+    <text x="652" y="238" class="cardTitle">Beat 4</text>
+    <text x="652" y="256" class="cardText">The branch wins:</text>
+    <text x="652" y="272" class="cardText">she stays instead.</text>
   </g>
 
   <g class="beat5 hidden">
     <line x1="880" y1="520" x2="880" y2="376" class="connector"/>
     <circle cx="880" cy="520" r="8" class="nodeMerged"/>
     <rect x="794" y="304" width="176" height="72" rx="18" class="cardMerged"/>
-    <text x="818" y="330" class="cardTitle">Beat 5</text>
-    <text x="818" y="353" class="cardText">She lights the tower</text>
-    <text x="818" y="373" class="cardText">and saves the harbor.</text>
+    <text x="812" y="328" class="cardTitle">Beat 5</text>
+    <text x="812" y="346" class="cardText">She lights the tower</text>
+    <text x="812" y="362" class="cardText">and saves the harbor.</text>
   </g>
 
   <g class="beat6 hidden">
     <line x1="1040" y1="520" x2="1040" y2="306" class="connector"/>
     <circle cx="1040" cy="520" r="8" class="nodeMerged"/>
     <rect x="952" y="234" width="180" height="72" rx="18" class="cardMerged"/>
-    <text x="976" y="260" class="cardTitle">Beat 6</text>
-    <text x="976" y="283" class="cardText">The town asks Mira</text>
-    <text x="976" y="303" class="cardText">to remain as keeper.</text>
+    <text x="970" y="258" class="cardTitle">Beat 6</text>
+    <text x="970" y="276" class="cardText">The town asks Mira</text>
+    <text x="970" y="292" class="cardText">to remain as keeper.</text>
   </g>
 
   <g class="draft7 hidden">
     <line x1="1190" y1="520" x2="1190" y2="396" class="connector"/>
     <circle cx="1190" cy="520" r="8" class="nodeGhost"/>
     <rect x="1102" y="324" width="176" height="72" rx="18" class="card"/>
-    <text x="1126" y="350" class="cardTitle">Beat 7</text>
-    <text x="1126" y="373" class="cardText">A romance subplot</text>
-    <text x="1126" y="393" class="cardText">takes over.</text>
+    <text x="1120" y="348" class="cardTitle">Beat 7</text>
+    <text x="1120" y="366" class="cardText">A romance subplot</text>
+    <text x="1120" y="382" class="cardText">takes over.</text>
   </g>
 
   <g class="draft8 hidden">
     <line x1="1310" y1="520" x2="1310" y2="306" class="connector"/>
     <circle cx="1310" cy="520" r="8" class="nodeGhost"/>
     <rect x="1212" y="214" width="176" height="72" rx="18" class="card"/>
-    <text x="1236" y="240" class="cardTitle">Beat 8</text>
-    <text x="1236" y="263" class="cardText">An unrelated</text>
-    <text x="1236" y="283" class="cardText">courtroom twist.</text>
+    <text x="1230" y="238" class="cardTitle">Beat 8</text>
+    <text x="1230" y="256" class="cardText">An unrelated</text>
+    <text x="1230" y="272" class="cardText">courtroom twist.</text>
   </g>
 
   <g class="rollback hidden">
@@ -616,18 +613,18 @@
     <line x1="1190" y1="520" x2="1190" y2="250" class="connector"/>
     <circle cx="1190" cy="520" r="8" class="nodeNew"/>
     <rect x="1140" y="178" width="176" height="72" rx="18" class="cardNew"/>
-    <text x="1164" y="204" class="cardTitle">New Beat 7</text>
-    <text x="1164" y="227" class="cardText">Mira finds a map</text>
-    <text x="1164" y="247" class="cardText">inside the lens.</text>
+    <text x="1158" y="202" class="cardTitle">New Beat 7</text>
+    <text x="1158" y="220" class="cardText">Mira finds a map</text>
+    <text x="1158" y="236" class="cardText">inside the lens.</text>
   </g>
 
   <g class="new8 hidden">
     <line x1="1310" y1="520" x2="1310" y2="414" class="connector"/>
     <circle cx="1310" cy="520" r="8" class="nodeNew"/>
     <rect x="1204" y="342" width="176" height="72" rx="18" class="cardNew"/>
-    <text x="1228" y="368" class="cardTitle">New Beat 8</text>
-    <text x="1228" y="391" class="cardText">She sails at dawn</text>
-    <text x="1228" y="411" class="cardText">toward the hidden cove.</text>
+    <text x="1222" y="366" class="cardTitle">New Beat 8</text>
+    <text x="1222" y="384" class="cardText">She sails at dawn</text>
+    <text x="1222" y="400" class="cardText">toward the hidden cove.</text>
   </g>
 
   <line x1="90" y1="690" x2="1310" y2="690" stroke="rgba(255,255,255,0.06)" stroke-width="1"/>
