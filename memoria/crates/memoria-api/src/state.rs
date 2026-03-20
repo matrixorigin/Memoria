@@ -1,4 +1,5 @@
 use crate::auth::{LastUsedBatcher, spawn_last_used_flusher};
+use crate::rate_limit::RateLimiter;
 use memoria_git::GitForDataService;
 use memoria_service::{AsyncTaskStore, MemoryService};
 use moka::future::Cache;
@@ -22,6 +23,8 @@ pub struct AppState {
     pub auth_pool: Option<sqlx::MySqlPool>,
     /// Batched last_used_at updater
     pub last_used_batcher: Arc<LastUsedBatcher>,
+    /// Per-API-key rate limiter
+    pub rate_limiter: RateLimiter,
 }
 
 impl AppState {
@@ -49,6 +52,7 @@ impl AppState {
                 .build(),
             auth_pool: None,
             last_used_batcher: Arc::new(LastUsedBatcher::new()),
+            rate_limiter: crate::rate_limit::from_env(),
         }
     }
 
