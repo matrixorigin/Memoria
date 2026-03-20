@@ -1113,10 +1113,21 @@ fn configure_codex(project_dir: &Path, entry: &serde_json::Value, force: bool) -
         .collect::<Vec<_>>()
         .join(", ");
 
-    let new_section = format!(
-        "\n[mcp_servers.memoria]\ncommand = \"{}\"\nargs = [{}]\nenabled = true\n",
-        command, args_toml
-    );
+    let new_section = if let Some(env) = entry["env"].as_object().filter(|e| !e.is_empty()) {
+        let env_lines: String = env
+            .iter()
+            .map(|(k, v)| format!("\n{} = \"{}\"", k, v.as_str().unwrap_or("")))
+            .collect();
+        format!(
+            "\n[mcp_servers.memoria]\ncommand = \"{}\"\nargs = [{}]\nenabled = true\n\n[mcp_servers.memoria.env]{}",
+            command, args_toml, env_lines
+        )
+    } else {
+        format!(
+            "\n[mcp_servers.memoria]\ncommand = \"{}\"\nargs = [{}]\nenabled = true\n",
+            command, args_toml
+        )
+    };
 
     if let Some(parent) = config_path.parent() {
         std::fs::create_dir_all(parent).ok();
@@ -1263,6 +1274,27 @@ fn load_existing_config(project_dir: &Path) -> ExistingConfig {
                     if found_entry.is_none() {
                         found_entry = Some(json["mcpServers"][MCP_KEY].clone());
                     }
+                }
+            }
+        }
+    }
+    // Check codex ~/.codex/config.toml
+    let codex_config = std::env::var("HOME").ok().map(std::path::PathBuf::from)
+        .map(|h| h.join(".codex/config.toml"))
+        .unwrap_or_default();
+    if let Ok(toml_content) = std::fs::read_to_string(&codex_config) {
+        if toml_content.contains("[mcp_servers.memoria]") {
+            cfg.tools.push(ToolName::Codex);
+            // Parse db_url from args line if found_entry not yet set
+            if found_entry.is_none() {
+                if let Some(args_line) = toml_content.lines().find(|l| l.trim_start().starts_with("args = [")) {
+                    let args_str = args_line.trim_start().trim_start_matches("args = [").trim_end_matches(']');
+                    let args: Vec<String> = args_str.split(',')
+                        .map(|s| s.trim().trim_matches('"').to_string())
+                        .collect();
+                    // Reconstruct a minimal entry so the existing parser below can reuse it
+                    let args_json: Vec<serde_json::Value> = args.iter().map(|a| serde_json::Value::String(a.clone())).collect();
+                    found_entry = Some(serde_json::json!({"args": args_json}));
                 }
             }
         }
