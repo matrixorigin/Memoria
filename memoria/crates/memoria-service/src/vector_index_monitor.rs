@@ -27,14 +27,17 @@ pub fn init_coarse_clock() {
         COARSE_CLOCK_SECS.store(now, Ordering::Relaxed);
         
         // 后台线程每秒更新
-        std::thread::spawn(|| loop {
-            std::thread::sleep(std::time::Duration::from_secs(1));
-            let t = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs() as i64;
-            COARSE_CLOCK_SECS.store(t, Ordering::Relaxed);
-        });
+        std::thread::Builder::new()
+            .name("coarse-clock".into())
+            .spawn(|| loop {
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                let t = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs() as i64;
+                COARSE_CLOCK_SECS.store(t, Ordering::Relaxed);
+            })
+            .expect("failed to spawn coarse-clock thread");
     });
 }
 

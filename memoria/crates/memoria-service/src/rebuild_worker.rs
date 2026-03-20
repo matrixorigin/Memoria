@@ -55,9 +55,10 @@ impl RebuildWorker {
 
         // 2. 获取分布式锁（防止多节点同时重建）
         let lock_key = format!("vector_index_rebuild:{}", table);
+        let lock_ttl_secs: u64 = 600; // 10分钟
         let lock_acquired = self
             .store
-            .try_acquire_lock(&lock_key, 600) // 10分钟锁
+            .try_acquire_lock(&lock_key, lock_ttl_secs as i64)
             .await?;
 
         if !lock_acquired {
@@ -65,15 +66,22 @@ impl RebuildWorker {
             return Ok(());
         }
 
-        // 3. 执行重建
+        // 3. 执行重建（超时略短于锁TTL，确保锁过期前能释放）
+        let rebuild_timeout = std::time::Duration::from_secs(lock_ttl_secs - 30);
         info!(
-            "Starting vector index rebuild for {}: {} rows, reason: {:?}",
-            table, current_rows, signal.reason
+            "Starting vector index rebuild for {}: {} rows, reason: {:?}, timeout: {:?}",
+            table, current_rows, signal.reason, rebuild_timeout
         );
 
         let start = std::time::Instant::now();
-        match self.store.rebuild_vector_index(table).await {
-            Ok(rebuilt_rows) => {
+        let rebuild_result = tokio::time::timeout(
+            rebuild_timeout,
+            self.store.rebuild_vector_index(table),
+        )
+        .await;
+
+        match rebuild_result {
+            Ok(Ok(rebuilt_rows)) => {
                 let elapsed = start.elapsed();
                 info!(
                     "Vector index rebuilt for {}: {} rows in {:?}",
@@ -92,7 +100,7 @@ impl RebuildWorker {
                     cooldown_secs / 3600
                 );
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 warn!("Vector index rebuild failed for {}: {}", table, e);
                 // 记录失败，使用指数退避
                 match self.store.record_vector_index_rebuild_failure(table).await {
@@ -101,6 +109,20 @@ impl RebuildWorker {
                     }
                     Err(record_err) => {
                         warn!("Failed to record rebuild failure: {}", record_err);
+                    }
+                }
+            }
+            Err(_) => {
+                warn!(
+                    "Vector index rebuild for {} timed out after {:?}",
+                    table, rebuild_timeout
+                );
+                match self.store.record_vector_index_rebuild_failure(table).await {
+                    Ok(cooldown) => {
+                        info!("Rebuild timeout recorded, next retry in {}s", cooldown);
+                    }
+                    Err(record_err) => {
+                        warn!("Failed to record rebuild timeout: {}", record_err);
                     }
                 }
             }
