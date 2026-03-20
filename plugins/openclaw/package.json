@@ -4,11 +4,11 @@
   "description": "OpenClaw memory plugin that uses the Rust Memoria CLI/API for embedded and remote backends.",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/matrixorigin/openclaw-memoria.git"
+    "url": "git+https://github.com/matrixorigin/Memoria.git"
   },
-  "homepage": "https://github.com/matrixorigin/openclaw-memoria",
+  "homepage": "https://github.com/matrixorigin/Memoria/tree/main/plugins/openclaw",
   "bugs": {
-    "url": "https://github.com/matrixorigin/openclaw-memoria/issues"
+    "url": "https://github.com/matrixorigin/Memoria/issues"
   },
   "keywords": [
     "openclaw",

@@ -18,78 +18,150 @@ In practice that means:
 
 ## Quick Start
 
-### Preflight
-
-Verify prerequisites before installing:
-
-```bash
-openclaw --version
-# -> OpenClaw vX.Y.Z (CLI is installed and in PATH)
-
-memoria --version 2>/dev/null || echo "not installed (installer can install it)"
-# -> memoria X.Y.Z or fallback message
-
-openclaw plugins list
-# -> command succeeds and prints plugin table
-```
-
 Assume OpenClaw is already installed and healthy.
 
-If you want the shortest OpenClaw-native path:
+### Usage Paths
 
-- run MatrixOne locally, or use MatrixOne Cloud
-- use an OpenAI-compatible embedding API
-- install the plugin with `openclaw plugins install`
-- let the plugin install or validate the Rust `memoria` runtime through `openclaw memoria install`
+1. GitHub README (this file): cloud-first setup plus local setup.
+2. OpenClaw chat/agent: user asks agent to install, agent runs commands and returns raw outputs.
 
-For ordinary users and AI agents, prefer npm install first:
+### 1) Cloud (Recommended)
+
+Cloud is the default path for new users.
+
+#### Developer Flow
 
 ```bash
+# A1. Install plugin from npm
 openclaw plugins install @matrixorigin/memory-memoria
 openclaw plugins enable memory-memoria
-
-MEMORIA_DB_URL='mysql://root:111@127.0.0.1:6001/memoria' \
-MEMORIA_EMBEDDING_PROVIDER='openai' \
-MEMORIA_EMBEDDING_MODEL='text-embedding-3-small' \
-MEMORIA_EMBEDDING_API_KEY='sk-...' \
-MEMORIA_EMBEDDING_DIM='1536' \
-openclaw memoria install
 ```
-
-If you are installing from a local checkout (development/contributor workflow), use:
 
 ```bash
-openclaw plugins install --link /path/to/Memoria/plugins/openclaw
+# A2. If npm package is unavailable, use source-link instead
+git clone https://github.com/matrixorigin/Memoria.git
+openclaw plugins install --link ./Memoria/plugins/openclaw
 openclaw plugins enable memory-memoria
-openclaw memoria install
 ```
 
-The installer will:
+```bash
+# B. Connect to Memoria Cloud
+openclaw memoria connect \
+  --mode cloud \
+  --api-url <MEMORIA_API_URL> \
+  --api-key <MEMORIA_API_KEY>
+```
 
-- reuse the current plugin checkout or installed package
-- install the Rust `memoria` binary if it is missing
-- enable `memory-memoria` in OpenClaw
-- write the plugin config into `~/.openclaw/openclaw.json`
-- add the Memoria tool surface to global and existing agent tool policy
-- install the managed skills in `~/.openclaw/skills`
+Success standard:
 
-### Agent-Driven Install
+```bash
+openclaw memoria health
+# must include: "status": "ok"
+```
 
-If you are operating from an OpenClaw chat/channel and want the agent to install for you, send:
+#### Agent Prompt (Cloud)
 
 ```text
-Install Memoria plugin for OpenClaw.
-Use: openclaw plugins install @matrixorigin/memory-memoria, then enable memory-memoria.
-Then run openclaw memoria install with:
-MEMORIA_DB_URL=mysql://root:111@127.0.0.1:6001/memoria
-MEMORIA_EMBEDDING_PROVIDER=openai
-MEMORIA_EMBEDDING_MODEL=text-embedding-3-small
-MEMORIA_EMBEDDING_DIM=1536
-MEMORIA_EMBEDDING_API_KEY from my shell env.
-Finally run openclaw memoria verify and report pass/fail.
+Install Memoria plugin for my OpenClaw in cloud mode.
+Use:
+- apiUrl: <MEMORIA_API_URL>
+- apiKey: <MEMORIA_API_KEY>
+
+Execute exactly:
+1) Try npm install first:
+   openclaw plugins install @matrixorigin/memory-memoria
+2) If step 1 fails, fallback:
+   git clone https://github.com/matrixorigin/Memoria.git
+   openclaw plugins install --link ./Memoria/plugins/openclaw
+3) Enable plugin:
+   openclaw plugins enable memory-memoria
+4) Connect cloud:
+   openclaw memoria connect --mode cloud --api-url <MEMORIA_API_URL> --api-key <MEMORIA_API_KEY>
+5) Verify:
+   openclaw memoria health
+
+Output requirements:
+- Return all executed commands and raw outputs
+- If failed, classify as network/auth/config and provide exact fix commands
+- Do not hide or summarize errors
 ```
 
-## Installer Inputs
+### 2) Local (Embedded)
+
+Use local mode when you explicitly want self-hosted storage/runtime.
+
+#### Developer Flow
+
+```bash
+# A. Install memoria CLI (if missing)
+curl -sSL https://raw.githubusercontent.com/matrixorigin/Memoria/main/scripts/install.sh | sh -s -- -y -d ~/.local/bin
+
+# B1. Install + enable plugin from npm
+openclaw plugins install @matrixorigin/memory-memoria
+openclaw plugins enable memory-memoria
+```
+
+```bash
+# B2. If npm package is unavailable, use source-link instead
+git clone https://github.com/matrixorigin/Memoria.git
+openclaw plugins install --link ./Memoria/plugins/openclaw
+openclaw plugins enable memory-memoria
+```
+
+```bash
+# C. Connect local backend
+openclaw memoria connect \
+  --mode local \
+  --db-url <MATRIXONE_DSN> \
+  --embedding-provider <provider> \
+  --embedding-model <model> \
+  --embedding-api-key <embedding_key> \
+  --embedding-dim <dim> \
+  --memoria-bin ~/.local/bin/memoria
+```
+
+Success standard:
+
+```bash
+openclaw memoria health
+# must include: "status": "ok"
+```
+
+#### Agent Prompt (Local)
+
+```text
+Install Memoria plugin for my OpenClaw in local mode.
+Use:
+- dbUrl: <MATRIXONE_DSN>
+- embeddingProvider: <provider>
+- embeddingModel: <model>
+- embeddingApiKey: <embedding_key>
+- embeddingDim: <dim>
+
+Execute exactly:
+1) Ensure memoria CLI exists (install if missing):
+   curl -sSL https://raw.githubusercontent.com/matrixorigin/Memoria/main/scripts/install.sh | sh -s -- -y -d ~/.local/bin
+2) Try npm install first:
+   openclaw plugins install @matrixorigin/memory-memoria
+3) If step 2 fails, fallback:
+   git clone https://github.com/matrixorigin/Memoria.git
+   openclaw plugins install --link ./Memoria/plugins/openclaw
+4) Enable plugin:
+   openclaw plugins enable memory-memoria
+5) Connect local:
+   openclaw memoria connect --mode local --db-url <MATRIXONE_DSN> --embedding-provider <provider> --embedding-model <model> --embedding-api-key <embedding_key> --embedding-dim <dim> --memoria-bin ~/.local/bin/memoria
+6) Verify:
+   openclaw memoria health
+
+Output requirements:
+- Return all executed commands and raw outputs
+- If failed, report the missing dependency/permission/config exactly
+- Do not hide or summarize errors
+```
+
+## Local Installer Inputs (Optional)
+
+Use this section when you choose `openclaw memoria install` for local bootstrap/repair.
 
 Important environment variables:
 
@@ -181,7 +253,7 @@ That removes the plugin entry, tool policy additions, managed skills, and the de
 | Level | Check | Command | Pass |
 |---|---|---|---|
 | 1. Plugin loaded | OpenClaw recognizes plugin | `openclaw plugins list` | `memory-memoria` is listed and enabled |
-| 2. Backend reachable | Memoria can reach configured backend | `openclaw memoria verify` | exits successfully |
+| 2. Backend reachable | Memoria can reach configured backend | `openclaw memoria health` | returns `status: ok` |
 | 3. Memory persisted | Store -> retrieve round-trip works | `openclaw memoria stats` + `openclaw ltm list --limit 10` | non-zero memory appears after a write |
 
 Before the smoke check, confirm the CLIs you are about to use are the ones you expect:
@@ -204,8 +276,9 @@ Notes:
 - `openclaw memoria capabilities` is a config/plugin check and does not require a live Memoria backend
 - `openclaw memoria stats` and `openclaw ltm list` require the configured backend to be reachable; in embedded mode that means MatrixOne must be up and the embedding config must be valid
 - OpenClaw reserves `openclaw memory` for its built-in file memory, so this plugin uses `openclaw memoria` and the compatibility alias `openclaw ltm`
-- `openclaw memoria install` is the preferred onboarding entrypoint once the plugin has been installed through OpenClaw
-- `openclaw memoria verify` runs OpenClaw config validation plus deeper `stats` / `ltm list` checks when the embedded database is reachable
+- `openclaw memoria connect` is the preferred config entrypoint for cloud/local mode switching
+- `openclaw memoria install` is optional local bootstrap/repair (runtime + config rewrite)
+- `openclaw memoria verify` is an optional deeper diagnostic; `openclaw memoria health` is the primary quick connectivity check
 
 Low-level fallback:
 

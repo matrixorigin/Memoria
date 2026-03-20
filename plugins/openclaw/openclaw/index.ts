@@ -46,6 +46,7 @@ const MEMORIA_AGENT_GUIDANCE = [
 const PLUGIN_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const INSTALLER_SCRIPT = path.join(PLUGIN_ROOT, "scripts", "install-openclaw-memoria.sh");
 const VERIFY_SCRIPT = path.join(PLUGIN_ROOT, "scripts", "verify_plugin_install.mjs");
+const CONNECT_SCRIPT = path.join(PLUGIN_ROOT, "scripts", "connect_openclaw_memoria.mjs");
 
 function resolveOpenClawBinFromProcess(): string {
   return typeof process.argv[1] === "string" && process.argv[1].trim()
@@ -54,6 +55,24 @@ function resolveOpenClawBinFromProcess(): string {
 }
 
 function resolveOpenClawConfigFile(): string {
+  const explicitConfigPath =
+    typeof process.env.OPENCLAW_CONFIG_PATH === "string" ? process.env.OPENCLAW_CONFIG_PATH.trim() : "";
+  if (explicitConfigPath) {
+    return explicitConfigPath.replace(/^~(?=$|\/|\\)/, process.env.HOME ?? "~");
+  }
+
+  const openclawBin = resolveOpenClawBinFromProcess();
+  const fromCli = spawnSync(openclawBin, ["config", "file"], {
+    cwd: PLUGIN_ROOT,
+    env: process.env,
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  const candidate = typeof fromCli.stdout === "string" ? fromCli.stdout.trim() : "";
+  if (fromCli.status === 0 && candidate) {
+    return candidate.replace(/^~(?=$|\/|\\)/, process.env.HOME ?? "~");
+  }
+
   const openclawHome = typeof process.env.OPENCLAW_HOME === "string" ? process.env.OPENCLAW_HOME : "";
   return openclawHome
     ? path.join(openclawHome, ".openclaw", "openclaw.json")
@@ -1548,6 +1567,61 @@ const plugin = {
           runLocalCommand("node", args);
         };
 
+        const runMemoriaConnector = (opts: {
+          mode: "cloud" | "local";
+          apiUrl?: string;
+          apiKey?: string;
+          dbUrl?: string;
+          memoriaBin?: string;
+          userId?: string;
+          embeddingProvider?: string;
+          embeddingModel?: string;
+          embeddingApiKey?: string;
+          embeddingBaseUrl?: string;
+          embeddingDim?: number;
+        }) => {
+          const args = [
+            CONNECT_SCRIPT,
+            "--config-file",
+            resolveOpenClawConfigFile(),
+            "--mode",
+            opts.mode,
+          ];
+
+          if (opts.apiUrl) {
+            args.push("--api-url", opts.apiUrl);
+          }
+          if (opts.apiKey) {
+            args.push("--api-key", opts.apiKey);
+          }
+          if (opts.dbUrl) {
+            args.push("--db-url", opts.dbUrl);
+          }
+          if (opts.memoriaBin) {
+            args.push("--memoria-executable", opts.memoriaBin);
+          }
+          if (opts.userId) {
+            args.push("--default-user-id", opts.userId);
+          }
+          if (opts.embeddingProvider) {
+            args.push("--embedding-provider", opts.embeddingProvider);
+          }
+          if (opts.embeddingModel) {
+            args.push("--embedding-model", opts.embeddingModel);
+          }
+          if (opts.embeddingApiKey) {
+            args.push("--embedding-api-key", opts.embeddingApiKey);
+          }
+          if (opts.embeddingBaseUrl) {
+            args.push("--embedding-base-url", opts.embeddingBaseUrl);
+          }
+          if (typeof opts.embeddingDim === "number" && Number.isFinite(opts.embeddingDim)) {
+            args.push("--embedding-dim", String(Math.trunc(opts.embeddingDim)));
+          }
+
+          runLocalCommand("node", args);
+        };
+
         memoria
           .command("health")
           .description("Check Memoria connectivity")
@@ -1687,6 +1761,113 @@ const plugin = {
                 typeof opts.memoriaBin === "string" && opts.memoriaBin.trim()
                   ? opts.memoriaBin.trim()
                   : undefined,
+            });
+          }));
+
+        memoria
+          .command("connect")
+          .description("Configure cloud/local Memoria backend in OpenClaw config")
+          .option("--mode <cloud|local>", "Backend mode to configure", "cloud")
+          .option("--api-url <url>", "Memoria API URL (required for mode=cloud)")
+          .option("--api-key <token>", "Memoria API token (required for mode=cloud)")
+          .option("--db-url <dsn>", "MatrixOne DSN (required for mode=local)")
+          .option("--memoria-bin <path>", "Path to memoria executable to pin in plugin config")
+          .option("--user-id <user>", "Default Memoria user id")
+          .option("--embedding-provider <provider>", "Embedding provider for mode=local")
+          .option("--embedding-model <model>", "Embedding model for mode=local")
+          .option("--embedding-api-key <key>", "Embedding API key for mode=local")
+          .option("--embedding-base-url <url>", "Embedding API base URL for mode=local")
+          .option("--embedding-dim <n>", "Embedding dimensions for mode=local")
+          .option("--skip-validate", "Skip `openclaw config validate`", false)
+          .option("--skip-health-check", "Skip `openclaw memoria health`", false)
+          .action(withCliClient(async (opts) => {
+            const modeRaw =
+              typeof opts.mode === "string" && opts.mode.trim()
+                ? opts.mode.trim().toLowerCase()
+                : "cloud";
+            if (modeRaw !== "cloud" && modeRaw !== "local") {
+              throw new Error("mode must be one of: cloud, local");
+            }
+            const mode = modeRaw as "cloud" | "local";
+
+            const normalizedApiUrl =
+              typeof opts.apiUrl === "string" && opts.apiUrl.trim()
+                ? opts.apiUrl.trim().replace(/\/+$/, "")
+                : undefined;
+            const normalizedApiKey =
+              typeof opts.apiKey === "string" && opts.apiKey.trim() ? opts.apiKey.trim() : undefined;
+            const normalizedDbUrl =
+              typeof opts.dbUrl === "string" && opts.dbUrl.trim() ? opts.dbUrl.trim() : undefined;
+            const normalizedMemoriaBin =
+              typeof opts.memoriaBin === "string" && opts.memoriaBin.trim()
+                ? opts.memoriaBin.trim()
+                : undefined;
+            const normalizedUserId =
+              typeof opts.userId === "string" && opts.userId.trim() ? opts.userId.trim() : undefined;
+            const normalizedEmbeddingProvider =
+              typeof opts.embeddingProvider === "string" && opts.embeddingProvider.trim()
+                ? opts.embeddingProvider.trim()
+                : undefined;
+            const normalizedEmbeddingModel =
+              typeof opts.embeddingModel === "string" && opts.embeddingModel.trim()
+                ? opts.embeddingModel.trim()
+                : undefined;
+            const normalizedEmbeddingApiKey =
+              typeof opts.embeddingApiKey === "string" && opts.embeddingApiKey.trim()
+                ? opts.embeddingApiKey.trim()
+                : undefined;
+            const normalizedEmbeddingBaseUrl =
+              typeof opts.embeddingBaseUrl === "string" && opts.embeddingBaseUrl.trim()
+                ? opts.embeddingBaseUrl.trim().replace(/\/+$/, "")
+                : undefined;
+            const parsedEmbeddingDim = Number.parseInt(String(opts.embeddingDim ?? ""), 10);
+            if (
+              opts.embeddingDim != null &&
+              String(opts.embeddingDim).trim() &&
+              !Number.isFinite(parsedEmbeddingDim)
+            ) {
+              throw new Error("--embedding-dim must be a valid positive integer");
+            }
+
+            runMemoriaConnector({
+              mode,
+              apiUrl: normalizedApiUrl,
+              apiKey: normalizedApiKey,
+              dbUrl: normalizedDbUrl,
+              memoriaBin: normalizedMemoriaBin,
+              userId: normalizedUserId,
+              embeddingProvider: normalizedEmbeddingProvider,
+              embeddingModel: normalizedEmbeddingModel,
+              embeddingApiKey: normalizedEmbeddingApiKey,
+              embeddingBaseUrl: normalizedEmbeddingBaseUrl,
+              embeddingDim: Number.isFinite(parsedEmbeddingDim) ? parsedEmbeddingDim : undefined,
+            });
+
+            const openclawBin = resolveOpenClawBinFromProcess();
+            const configValidateEnabled = opts.skipValidate !== true;
+            const healthCheckEnabled = opts.skipHealthCheck !== true;
+
+            if (configValidateEnabled) {
+              runLocalCommand(openclawBin, ["config", "validate"]);
+            }
+
+            if (healthCheckEnabled) {
+              const healthArgs = ["memoria", "health"];
+              if (normalizedUserId) {
+                healthArgs.push("--user-id", normalizedUserId);
+              }
+              runLocalCommand(openclawBin, healthArgs);
+            }
+
+            printJson({
+              ok: true,
+              mode,
+              configFile: resolveOpenClawConfigFile(),
+              validated: configValidateEnabled,
+              healthChecked: healthCheckEnabled,
+              next: healthCheckEnabled
+                ? "Connected and health-checked."
+                : "Config updated. Run `openclaw memoria health` to verify.",
             });
           }));
 
