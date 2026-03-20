@@ -2604,7 +2604,7 @@ impl SqlMemoryStore {
             .await
             .map_err(db_err)?;
         
-        rows.iter().map(|r| row_to_memory(r)).collect()
+        rows.iter().map(row_to_memory).collect()
     }
 
     /// Hybrid search: vector + fulltext, merged with 4-dimension weighted scoring.
