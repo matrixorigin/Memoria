@@ -10,7 +10,7 @@
   [![Git for Data](https://img.shields.io/badge/Git%20for%20Data-Enabled-00A3CC?style=flat-square)](https://github.com/matrixorigin/matrixone)
   [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg?style=flat-square)](LICENSE)
   
-  [Quick Start](#quick-start) · [Steering Rules](#steering-rules) · [API Reference](#api-reference) · [For AI Agents](#for-ai-agents)
+  [See It in Action](#see-git-for-data-in-action) · [Quick Start](#quick-start) · [Steering Rules](#steering-rules) · [API Reference](#api-reference) · [For AI Agents](#for-ai-agents)
   
 </div>
 
@@ -32,6 +32,22 @@ Every memory change is tracked, auditable, and reversible — snapshots, branche
 **Supported Agents:** [Kiro](https://kiro.dev) · [Cursor](https://cursor.sh) · [Claude Code](https://docs.anthropic.com/en/docs/claude-code) · [Codex](https://openai.com/index/introducing-codex/) · [OpenClaw](plugins/openclaw/README.md) · Any MCP-compatible agent
 
 **Storage Backend:** [MatrixOne](https://github.com/matrixorigin/matrixone) — Distributed database with native vector indexing
+
+---
+
+## See Git for Data in Action
+
+<p align="center">
+  <img src="assets/git4data-story-writing-demo.svg" alt="Animated Memoria Git-for-Data demo showing an author branching a story draft, merging a better plot direction into the main storyline, and rolling back the last two unsatisfying beats." width="100%"/>
+</p>
+
+A story-writing scenario makes the core idea visible faster: an author already has a few accepted story-memory nodes, then opens an experimental branch to try a different plot direction. When the branch feels better, it is merged into the main storyline. Later, if the newest beats do not work, the author rolls back to an earlier snapshot and keeps writing from there.
+
+**What the demo shows:**
+- **Main storyline** — accepted story beats live on `main`
+- **Experimental branch** — the author tries a new plot turn without rewriting canon
+- **Merge** — the stronger draft is promoted back into the main storyline
+- **Rollback** — the last two bad turns are discarded, and writing resumes from a safe snapshot
 
 ---
 
