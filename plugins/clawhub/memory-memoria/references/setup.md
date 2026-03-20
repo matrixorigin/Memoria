@@ -1,91 +1,55 @@
-# Setup
+# OpenClaw Setup
 
-Use this when installing Memoria or wiring it into Kiro, Cursor, Claude Code, Codex, or another MCP client.
+Use this when Memoria needs to be installed, enabled, or verified as OpenClaw's memory plugin.
 
-## Decision Tree
+## Install
 
-1. Decide between embedded mode and remote mode.
-2. Identify the AI tool that needs MCP config.
-3. Confirm MatrixOne access.
-4. Choose the embedding provider and dimension before first startup.
-
-## Binary Install
+Preferred package install:
 
 ```bash
-# Linux x86_64
-curl -LO https://github.com/matrixorigin/Memoria/releases/latest/download/memoria-x86_64-unknown-linux-musl.tar.gz
-tar xzf memoria-x86_64-unknown-linux-musl.tar.gz
-sudo mv memoria /usr/local/bin/
+openclaw plugins install @matrixorigin/memory-memoria
+openclaw plugins enable memory-memoria
 
-# macOS Apple Silicon
-curl -LO https://github.com/matrixorigin/Memoria/releases/latest/download/memoria-aarch64-apple-darwin.tar.gz
-tar xzf memoria-aarch64-apple-darwin.tar.gz
-sudo mv memoria /usr/local/bin/
+MEMORIA_DB_URL='mysql://root:111@127.0.0.1:6001/memoria' \
+MEMORIA_EMBEDDING_PROVIDER='openai' \
+MEMORIA_EMBEDDING_MODEL='text-embedding-3-small' \
+MEMORIA_EMBEDDING_API_KEY='sk-...' \
+MEMORIA_EMBEDDING_DIM='1536' \
+openclaw memoria install
 ```
 
-Build from source when local embedding is required:
+Local checkout install:
 
 ```bash
-cd Memoria/memoria
-cargo build --release -p memoria-cli --features local-embedding
-sudo cp target/release/memoria /usr/local/bin/
+openclaw plugins install --link /path/to/Memoria/plugins/openclaw
+openclaw plugins enable memory-memoria
+openclaw memoria install
 ```
 
-Verify:
+## Backend Modes
 
-```bash
-memoria --version
-```
-
-## Embedded Mode
-
-Use embedded mode when the user runs their own Memoria and MatrixOne.
-
-```bash
-docker compose up -d
-cd <project>
-memoria init --tool <tool>
-```
-
-For OpenAI-compatible embeddings:
-
-```bash
-memoria init --tool <tool> \
-  --embedding-provider openai \
-  --embedding-base-url https://api.openai.com/v1 \
-  --embedding-api-key sk-... \
-  --embedding-model text-embedding-3-small \
-  --embedding-dim 1536
-```
-
-## Remote Mode
-
-Use remote mode when the user already has a running Memoria API.
-
-```bash
-cd <project>
-memoria init --tool <tool> --api-url 'https://host:8100' --token 'sk-...'
-```
-
-## Tool Outputs
-
-`memoria init --tool <tool>` writes the right config for:
-
-- Kiro: `.kiro/settings/mcp.json` and `.kiro/steering/memory.md`
-- Cursor: `.cursor/mcp.json` and `.cursor/rules/memory.mdc`
-- Claude Code: `.mcp.json` and `CLAUDE.md`
-- Codex: `~/.codex/config.toml` and `AGENTS.md`
+- `embedded`: run local `memoria mcp` against MatrixOne
+- `http`: connect to an existing Memoria API
 
 ## Verify
 
 ```bash
-memoria status
+openclaw plugins list
+openclaw memoria capabilities
+openclaw memoria verify
+openclaw memoria stats
+openclaw ltm list --limit 10
 ```
 
-Restart the AI tool after install, then verify memory tools are visible.
+Success means:
 
-## Important Rules
+- `memory-memoria` is enabled
+- `openclaw memoria verify` passes
+- a store and retrieve round-trip works
 
-- If the user has no Docker and no existing DB, use MatrixOne Cloud.
-- Local embedding requires a source build with `local-embedding`.
-- The embedding dimension is effectively locked in when the schema is first created.
+## Important Notes
+
+- OpenClaw reserves `openclaw memory` for built-in file memory, so this plugin uses `openclaw memoria` and `openclaw ltm`.
+- The plugin defaults to explicit memory writes rather than silent auto-capture.
+- Choose embedding model and dimensions before first startup.
+- If upgrading from an old stack, use a fresh DB name to avoid schema drift.
