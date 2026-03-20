@@ -36,7 +36,7 @@ jobs:
           shared-key: memoria-check
           save-if: false
       - name: Check & Clippy
-        run: cd memoria && cargo check && cargo clippy -- -D warnings
+        run: cd memoria && cargo clippy -- -D warnings
       - name: Unit tests
         run: cd memoria && cargo test --lib -p memoria-core -p memoria-service -p memoria-mcp
       - name: Wait for MatrixOne

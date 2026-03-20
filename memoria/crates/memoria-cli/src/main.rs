@@ -82,6 +82,9 @@ enum Commands {
     },
     /// Start MCP server (embedded or remote mode)
     Mcp {
+        /// AI tool that launched this MCP server (sent as X-Memoria-Tool header)
+        #[arg(long, env = "MEMORIA_TOOL")]
+        tool: Option<ToolName>,
         /// Remote Memoria API URL (remote mode)
         #[arg(long, env = "MEMORIA_API_URL")]
         api_url: Option<String>,
@@ -396,6 +399,7 @@ async fn cmd_serve(db_url: Option<String>, port: u16, master_key: String) -> Res
 
 #[allow(clippy::too_many_arguments)]
 async fn cmd_mcp(
+    tool: Option<String>,
     api_url: Option<String>,
     token: Option<String>,
     db_url: Option<String>,
@@ -425,7 +429,7 @@ async fn cmd_mcp(
         let user = user.clone().unwrap_or_else(|| "default".to_string());
         tracing::info!(api_url = %api_url, user = %user, "Starting Memoria MCP (remote mode)");
         let remote =
-            memoria_mcp::remote::RemoteClient::new(api_url, token.as_deref(), user.clone());
+            memoria_mcp::remote::RemoteClient::new(api_url, token.as_deref(), user.clone(), tool.as_deref());
         return memoria_mcp::run_stdio_remote(remote, user).await;
     }
 
@@ -869,6 +873,7 @@ fn mcp_entry(
     api_url: Option<&str>,
     token: Option<&str>,
     user: &str,
+    tool_name: &str,
     embedding_provider: Option<&str>,
     embedding_model: Option<&str>,
     embedding_dim: Option<&str>,
@@ -921,6 +926,8 @@ fn mcp_entry(
 
     // Use subcommand: memoria mcp [args]
     let mut full_args = vec!["mcp".to_string()];
+    full_args.push("--tool".to_string());
+    full_args.push(tool_name.to_string());
     full_args.extend(args);
 
     let mut entry = serde_json::json!({
@@ -1106,10 +1113,22 @@ fn configure_codex(project_dir: &Path, entry: &serde_json::Value, force: bool) -
         .collect::<Vec<_>>()
         .join(", ");
 
-    let new_section = format!(
-        "\n[mcp_servers.memoria]\ncommand = \"{}\"\nargs = [{}]\nenabled = true\n",
-        command, args_toml
-    );
+    let new_section = if let Some(env) = entry["env"].as_object().filter(|e| !e.is_empty()) {
+        let env_lines: String = env.iter().fold(String::new(), |mut s, (k, v)| {
+            use std::fmt::Write;
+            let _ = write!(s, "\n{} = \"{}\"", k, v.as_str().unwrap_or(""));
+            s
+        });
+        format!(
+            "\n[mcp_servers.memoria]\ncommand = \"{}\"\nargs = [{}]\nenabled = true\n\n[mcp_servers.memoria.env]{}",
+            command, args_toml, env_lines
+        )
+    } else {
+        format!(
+            "\n[mcp_servers.memoria]\ncommand = \"{}\"\nargs = [{}]\nenabled = true\n",
+            command, args_toml
+        )
+    };
 
     if let Some(parent) = config_path.parent() {
         std::fs::create_dir_all(parent).ok();
@@ -1256,6 +1275,27 @@ fn load_existing_config(project_dir: &Path) -> ExistingConfig {
                     if found_entry.is_none() {
                         found_entry = Some(json["mcpServers"][MCP_KEY].clone());
                     }
+                }
+            }
+        }
+    }
+    // Check codex ~/.codex/config.toml
+    let codex_config = std::env::var("HOME").ok().map(std::path::PathBuf::from)
+        .map(|h| h.join(".codex/config.toml"))
+        .unwrap_or_default();
+    if let Ok(toml_content) = std::fs::read_to_string(&codex_config) {
+        if toml_content.contains("[mcp_servers.memoria]") {
+            cfg.tools.push(ToolName::Codex);
+            // Parse db_url from args line if found_entry not yet set
+            if found_entry.is_none() {
+                if let Some(args_line) = toml_content.lines().find(|l| l.trim_start().starts_with("args = [")) {
+                    let args_str = args_line.trim_start().trim_start_matches("args = [").trim_end_matches(']');
+                    let args: Vec<String> = args_str.split(',')
+                        .map(|s| s.trim().trim_matches('"').to_string())
+                        .collect();
+                    // Reconstruct a minimal entry so the existing parser below can reuse it
+                    let args_json: Vec<serde_json::Value> = args.iter().map(|a| serde_json::Value::String(a.clone())).collect();
+                    found_entry = Some(serde_json::json!({"args": args_json}));
                 }
             }
         }
@@ -1784,20 +1824,20 @@ fn cmd_init(
     embedding_api_key: Option<String>,
     embedding_base_url: Option<String>,
 ) {
-    let entry = mcp_entry(
-        db_url.as_deref(),
-        api_url.as_deref(),
-        token.as_deref(),
-        &user,
-        embedding_provider.as_deref(),
-        embedding_model.as_deref(),
-        embedding_dim.as_deref(),
-        embedding_api_key.as_deref(),
-        embedding_base_url.as_deref(),
-    );
-
     for tool in &tools {
         println!("\n[{}]", tool);
+        let entry = mcp_entry(
+            db_url.as_deref(),
+            api_url.as_deref(),
+            token.as_deref(),
+            &user,
+            &tool.to_string(),
+            embedding_provider.as_deref(),
+            embedding_model.as_deref(),
+            embedding_dim.as_deref(),
+            embedding_api_key.as_deref(),
+            embedding_base_url.as_deref(),
+        );
         let results = match tool {
             ToolName::Kiro => configure_kiro(project_dir, &entry, force),
             ToolName::Cursor => configure_cursor(project_dir, &entry, force),
@@ -2357,6 +2397,7 @@ fn main() -> Result<()> {
                 .block_on(cmd_serve(db_url, port, master_key))?;
         }
         Commands::Mcp {
+            tool,
             api_url,
             token,
             db_url,
@@ -2376,6 +2417,7 @@ fn main() -> Result<()> {
                 .enable_all()
                 .build()?
                 .block_on(cmd_mcp(
+                    tool.map(|t| t.to_string()),
                     api_url,
                     token,
                     db_url,
