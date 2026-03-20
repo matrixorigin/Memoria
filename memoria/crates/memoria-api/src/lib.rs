@@ -1,5 +1,6 @@
 pub mod auth;
 pub mod models;
+pub mod otel;
 pub mod routes;
 pub mod state;
 

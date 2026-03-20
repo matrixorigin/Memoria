@@ -158,6 +158,23 @@ async fn collect_metrics(state: &AppState) -> Result<String, String> {
         env!("CARGO_PKG_VERSION")
     ));
 
+    // ── Connection pool ───────────────────────────────────────────────────
+    out.push_str("# HELP memoria_pool_size Total connections in main pool.\n");
+    out.push_str("# TYPE memoria_pool_size gauge\n");
+    out.push_str(&format!("memoria_pool_size {}\n", pool.size()));
+    out.push_str("# HELP memoria_pool_idle Idle connections in main pool.\n");
+    out.push_str("# TYPE memoria_pool_idle gauge\n");
+    out.push_str(&format!("memoria_pool_idle {}\n", pool.num_idle()));
+
+    if let Some(auth_pool) = &state.auth_pool {
+        out.push_str("# HELP memoria_auth_pool_size Total connections in auth pool.\n");
+        out.push_str("# TYPE memoria_auth_pool_size gauge\n");
+        out.push_str(&format!("memoria_auth_pool_size {}\n", auth_pool.size()));
+        out.push_str("# HELP memoria_auth_pool_idle Idle connections in auth pool.\n");
+        out.push_str("# TYPE memoria_auth_pool_idle gauge\n");
+        out.push_str(&format!("memoria_auth_pool_idle {}\n", auth_pool.num_idle()));
+    }
+
     // ── Security counters ─────────────────────────────────────────────────
     let auth_failures = AUTH_FAILURES.load(Ordering::Relaxed);
     out.push_str("# HELP memoria_auth_failures_total Authentication failures (401/403).\n");

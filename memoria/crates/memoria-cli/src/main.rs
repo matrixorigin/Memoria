@@ -350,11 +350,8 @@ async fn cmd_serve(db_url: Option<String>, port: u16, master_key: String) -> Res
     use memoria_storage::SqlMemoryStore;
     use sqlx::mysql::MySqlPool;
     use tower_http::trace::TraceLayer;
-    use tracing_subscriber::EnvFilter;
 
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
-        .init();
+    memoria_api::otel::init_tracing();
 
     let mut cfg = Config::from_env();
     if let Some(v) = db_url {

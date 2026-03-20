@@ -1,0 +1,105 @@
+{
+  "__inputs": [
+    { "name": "DS_PROMETHEUS", "type": "datasource", "pluginId": "prometheus" }
+  ],
+  "title": "Memoria Overview",
+  "uid": "memoria-overview",
+  "tags": ["memoria"],
+  "timezone": "browser",
+  "refresh": "30s",
+  "time": { "from": "now-1h", "to": "now" },
+  "panels": [
+    {
+      "title": "Active Memories",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
+      "targets": [{ "expr": "memoria_memories_total{type=\"all\"}", "legendFormat": "total" }]
+    },
+    {
+      "title": "Active Users",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
+      "targets": [{ "expr": "memoria_users_total", "legendFormat": "users" }]
+    },
+    {
+      "title": "Graph Nodes / Edges",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 0 },
+      "targets": [
+        { "expr": "memoria_graph_nodes_total", "legendFormat": "nodes" },
+        { "expr": "memoria_graph_edges_total", "legendFormat": "edges" }
+      ]
+    },
+    {
+      "title": "Snapshots / Branches",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 0 },
+      "targets": [
+        { "expr": "memoria_snapshots_total", "legendFormat": "snapshots" },
+        { "expr": "memoria_branches_total", "legendFormat": "branches" }
+      ]
+    },
+    {
+      "title": "Memories by Type",
+      "type": "piechart",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
+      "targets": [{ "expr": "memoria_memories_total{type!=\"all\"}", "legendFormat": "{{type}}" }]
+    },
+    {
+      "title": "Feedback Signals",
+      "type": "piechart",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
+      "targets": [{ "expr": "memoria_feedback_total", "legendFormat": "{{signal}}" }]
+    },
+    {
+      "title": "Main Pool Connections",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
+      "targets": [
+        { "expr": "memoria_pool_size", "legendFormat": "{{instance}} total" },
+        { "expr": "memoria_pool_idle", "legendFormat": "{{instance}} idle" }
+      ]
+    },
+    {
+      "title": "Auth Pool Connections",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
+      "targets": [
+        { "expr": "memoria_auth_pool_size", "legendFormat": "{{instance}} total" },
+        { "expr": "memoria_auth_pool_idle", "legendFormat": "{{instance}} idle" }
+      ]
+    },
+    {
+      "title": "Auth Failures (rate)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 20 },
+      "targets": [{ "expr": "rate(memoria_auth_failures_total[5m])", "legendFormat": "{{instance}}" }]
+    },
+    {
+      "title": "Sensitivity Blocks (rate)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 20 },
+      "targets": [{ "expr": "rate(memoria_sensitivity_blocks_total[5m])", "legendFormat": "{{instance}}" }]
+    },
+    {
+      "title": "Async Tasks by Status",
+      "type": "bargauge",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 28 },
+      "targets": [{ "expr": "memoria_async_tasks", "legendFormat": "{{status}}" }]
+    },
+    {
+      "title": "Last Governance Run",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 12, "x": 12, "y": 28 },
+      "fieldConfig": { "defaults": { "unit": "dateTimeFromNow" } },
+      "targets": [{ "expr": "memoria_governance_last_run_timestamp * 1000", "legendFormat": "last run" }]
+    },
+    {
+      "title": "Instances",
+      "type": "table",
+      "gridPos": { "h": 4, "w": 12, "x": 12, "y": 32 },
+      "targets": [{ "expr": "memoria_info", "format": "table", "instant": true }]
+    }
+  ],
+  "schemaVersion": 39
+}
