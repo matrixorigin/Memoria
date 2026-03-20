@@ -1,0 +1,578 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="820" viewBox="0 0 1400 820" role="img" aria-labelledby="title desc">
+  <title id="title">Memoria Git-for-Data story timeline demo</title>
+  <desc id="desc">A smooth story-writing timeline: the first three beats grow on the main line, a detached branch appears from an idea bulb, two branch beats are explored, the branch glides upward and merges into main, later beats are rolled back to beat six, and new beats continue from there.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#050b13"/>
+      <stop offset="58%" stop-color="#0b1622"/>
+      <stop offset="100%" stop-color="#130f1f"/>
+    </linearGradient>
+    <linearGradient id="panel" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#101a28"/>
+      <stop offset="100%" stop-color="#0a1119"/>
+    </linearGradient>
+    <linearGradient id="mainGradient" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#8fd0ff"/>
+      <stop offset="100%" stop-color="#8b6cff"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="14" stdDeviation="18" flood-color="#020c15" flood-opacity="0.34"/>
+    </filter>
+    <style>
+      svg {
+        font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      }
+
+      .panel {
+        fill: url(#panel);
+        stroke: rgba(255,255,255,0.07);
+        stroke-width: 1.2;
+        filter: url(#shadow);
+      }
+
+      .label {
+        fill: #9db1c6;
+        font-size: 12px;
+        font-weight: 700;
+        letter-spacing: 2.2px;
+        text-transform: uppercase;
+      }
+
+      .title {
+        fill: #f8fbff;
+        font-size: 36px;
+        font-weight: 680;
+      }
+
+      .subtitle {
+        fill: #c2cfdb;
+        font-size: 17px;
+      }
+
+      .productPill {
+        fill: rgba(255,255,255,0.05);
+        stroke: rgba(255,255,255,0.08);
+        stroke-width: 1;
+      }
+
+      .productPillText {
+        fill: #edf4fb;
+        font-size: 12px;
+        font-weight: 700;
+      }
+
+      .capPill {
+        fill: rgba(255,255,255,0.045);
+        stroke: rgba(255,255,255,0.08);
+        stroke-width: 1;
+      }
+
+      .capPillText {
+        fill: #e7eef7;
+        font-size: 12px;
+        font-weight: 700;
+      }
+
+      .timeline {
+        stroke: url(#mainGradient);
+        stroke-width: 5;
+        stroke-linecap: round;
+        fill: none;
+      }
+
+      .timelineBase {
+        stroke: rgba(220,232,245,0.12);
+        stroke-width: 2.3;
+        stroke-linecap: round;
+        fill: none;
+      }
+
+      .branchLine {
+        stroke: rgba(155,118,255,0.82);
+        stroke-width: 3.6;
+        stroke-linecap: round;
+        fill: none;
+      }
+
+      .connector {
+        stroke: rgba(255,255,255,0.13);
+        stroke-width: 1.4;
+      }
+
+      .node { fill: #dce8f5; }
+      .nodeMerged { fill: #00a3cc; }
+      .nodeNew { fill: #10b981; }
+      .nodeGhost { fill: rgba(220,232,245,0.42); }
+
+      .card {
+        fill: rgba(255,255,255,0.045);
+        stroke: rgba(255,255,255,0.075);
+        stroke-width: 1;
+        filter: url(#shadow);
+      }
+
+      .cardBranch {
+        fill: rgba(139,108,255,0.1);
+        stroke: rgba(139,108,255,0.26);
+        stroke-width: 1;
+        filter: url(#shadow);
+      }
+
+      .cardMerged {
+        fill: rgba(143,208,255,0.08);
+        stroke: rgba(143,208,255,0.24);
+        stroke-width: 1;
+        filter: url(#shadow);
+      }
+
+      .cardNew {
+        fill: rgba(118,215,181,0.1);
+        stroke: rgba(118,215,181,0.24);
+        stroke-width: 1;
+        filter: url(#shadow);
+      }
+
+      .cardTitle {
+        fill: #f7fbff;
+        font-size: 14px;
+        font-weight: 700;
+      }
+
+      .cardText {
+        fill: #d8e4ef;
+        font-size: 13px;
+      }
+
+      .caption {
+        fill: #d5e1ee;
+        font-size: 14px;
+      }
+
+      .noteGreen {
+        fill: rgba(118,215,181,0.11);
+        stroke: rgba(118,215,181,0.24);
+        stroke-width: 1;
+      }
+
+      .noteRed {
+        fill: rgba(255,138,138,0.09);
+        stroke: rgba(255,138,138,0.2);
+        stroke-width: 1;
+      }
+
+      .hidden { opacity: 0; }
+
+      .seg {
+        stroke-dasharray: 100;
+        stroke-dashoffset: 100;
+      }
+
+      .seg1 { animation: seg1 28s cubic-bezier(.22,.61,.36,1) infinite; }
+      .seg2 { animation: seg2 28s cubic-bezier(.22,.61,.36,1) infinite; }
+      .seg3 { animation: seg3 28s cubic-bezier(.22,.61,.36,1) infinite; }
+      .seg4 { animation: seg4 28s cubic-bezier(.22,.61,.36,1) infinite; }
+      .seg5 { animation: seg5 28s cubic-bezier(.22,.61,.36,1) infinite; }
+      .seg6 { animation: seg6 28s cubic-bezier(.22,.61,.36,1) infinite; }
+      .seg7draft { animation: seg7draft 28s cubic-bezier(.22,.61,.36,1) infinite; }
+      .seg8draft { animation: seg8draft 28s cubic-bezier(.22,.61,.36,1) infinite; }
+      .seg7new { animation: seg7new 28s cubic-bezier(.22,.61,.36,1) infinite; }
+      .seg8new { animation: seg8new 28s cubic-bezier(.22,.61,.36,1) infinite; }
+      .base1 { animation: base1 28s ease-in-out infinite; }
+      .base2 { animation: base2 28s ease-in-out infinite; }
+      .base3 { animation: base3 28s ease-in-out infinite; }
+      .base4 { animation: base4 28s ease-in-out infinite; }
+      .base5 { animation: base5 28s ease-in-out infinite; }
+      .base6 { animation: base6 28s ease-in-out infinite; }
+      .base7draft { animation: base7draft 28s ease-in-out infinite; }
+      .base8draft { animation: base8draft 28s ease-in-out infinite; }
+      .base7new { animation: base7new 28s ease-in-out infinite; }
+      .base8new { animation: base8new 28s ease-in-out infinite; }
+
+      .beat1 { animation: beat1 28s ease-in-out infinite; }
+      .beat2 { animation: beat2 28s ease-in-out infinite; }
+      .beat3 { animation: beat3 28s ease-in-out infinite; }
+      .idea { animation: idea 28s ease-in-out infinite; }
+      .branchGroup {
+        animation: branchGroup 28s cubic-bezier(.22,.61,.36,1) infinite;
+        transform-box: fill-box;
+        transform-origin: center;
+      }
+      .branchPath {
+        stroke-dasharray: 100;
+        stroke-dashoffset: 100;
+        animation: branchPath 28s cubic-bezier(.22,.61,.36,1) infinite;
+      }
+      .branchA { animation: branchA 28s ease-in-out infinite; }
+      .branchB { animation: branchB 28s ease-in-out infinite; }
+      .mergeTag { animation: mergeTag 28s ease-in-out infinite; }
+      .beat4 { animation: beat4 28s ease-in-out infinite; }
+      .beat5 { animation: beat5 28s ease-in-out infinite; }
+      .beat6 { animation: beat6 28s ease-in-out infinite; }
+      .draft7 { animation: draft7 28s ease-in-out infinite; }
+      .draft8 { animation: draft8 28s ease-in-out infinite; }
+      .rollback { animation: rollback 28s ease-in-out infinite; }
+      .new7 { animation: new7 28s ease-in-out infinite; }
+      .new8 { animation: new8 28s ease-in-out infinite; }
+
+      .caption-main { animation: captionMain 28s ease-in-out infinite; }
+      .caption-idea { animation: captionIdea 28s ease-in-out infinite; }
+      .caption-branch { animation: captionBranch 28s ease-in-out infinite; }
+      .caption-merge { animation: captionMerge 28s ease-in-out infinite; }
+      .caption-continue { animation: captionContinue 28s ease-in-out infinite; }
+      .caption-rollback { animation: captionRollback 28s ease-in-out infinite; }
+      .caption-renew { animation: captionRenew 28s ease-in-out infinite; }
+
+      @keyframes seg1 {
+        0% { opacity: 1; stroke-dashoffset: 100; }
+        8% { opacity: 1; stroke-dashoffset: 0; }
+        100% { opacity: 1; stroke-dashoffset: 0; }
+      }
+      @keyframes seg2 {
+        0%, 8% { opacity: 0; stroke-dashoffset: 100; }
+        9% { opacity: 1; stroke-dashoffset: 100; }
+        17% { opacity: 1; stroke-dashoffset: 0; }
+        100% { opacity: 1; stroke-dashoffset: 0; }
+      }
+      @keyframes seg3 {
+        0%, 17% { opacity: 0; stroke-dashoffset: 100; }
+        18% { opacity: 1; stroke-dashoffset: 100; }
+        26% { opacity: 1; stroke-dashoffset: 0; }
+        100% { opacity: 1; stroke-dashoffset: 0; }
+      }
+      @keyframes seg4 {
+        0%, 57% { opacity: 0; stroke-dashoffset: 100; }
+        58% { opacity: 1; stroke-dashoffset: 100; }
+        64% { opacity: 1; stroke-dashoffset: 0; }
+        100% { opacity: 1; stroke-dashoffset: 0; }
+      }
+      @keyframes seg5 {
+        0%, 61% { opacity: 0; stroke-dashoffset: 100; }
+        62% { opacity: 1; stroke-dashoffset: 100; }
+        68% { opacity: 1; stroke-dashoffset: 0; }
+        100% { opacity: 1; stroke-dashoffset: 0; }
+      }
+      @keyframes seg6 {
+        0%, 65% { opacity: 0; stroke-dashoffset: 100; }
+        66% { opacity: 1; stroke-dashoffset: 100; }
+        72% { opacity: 1; stroke-dashoffset: 0; }
+        100% { opacity: 1; stroke-dashoffset: 0; }
+      }
+      @keyframes seg7draft {
+        0%, 71% { opacity: 0; stroke-dashoffset: 100; }
+        72% { opacity: 1; stroke-dashoffset: 100; }
+        78% { opacity: 1; stroke-dashoffset: 0; }
+        84% { opacity: 1; stroke-dashoffset: 0; }
+        90%, 100% { opacity: 0; stroke-dashoffset: 0; }
+      }
+      @keyframes seg8draft {
+        0%, 76% { opacity: 0; stroke-dashoffset: 100; }
+        77% { opacity: 1; stroke-dashoffset: 100; }
+        83% { opacity: 1; stroke-dashoffset: 0; }
+        84% { opacity: 1; stroke-dashoffset: 0; }
+        90%, 100% { opacity: 0; stroke-dashoffset: 0; }
+      }
+      @keyframes seg7new {
+        0%, 91% { opacity: 0; stroke-dashoffset: 100; }
+        92% { opacity: 1; stroke-dashoffset: 100; }
+        97% { opacity: 1; stroke-dashoffset: 0; }
+        100% { opacity: 1; stroke-dashoffset: 0; }
+      }
+      @keyframes seg8new {
+        0%, 95% { opacity: 0; stroke-dashoffset: 100; }
+        96% { opacity: 1; stroke-dashoffset: 100; }
+        100% { opacity: 1; stroke-dashoffset: 0; }
+        100% { opacity: 1; stroke-dashoffset: 0; }
+      }
+
+      @keyframes base1 { 0% { opacity: 0; } 6%, 100% { opacity: 1; } }
+      @keyframes base2 { 0%, 10% { opacity: 0; } 16%, 100% { opacity: 1; } }
+      @keyframes base3 { 0%, 18% { opacity: 0; } 24%, 100% { opacity: 1; } }
+      @keyframes base4 { 0%, 57% { opacity: 0; } 63%, 100% { opacity: 1; } }
+      @keyframes base5 { 0%, 61% { opacity: 0; } 67%, 100% { opacity: 1; } }
+      @keyframes base6 { 0%, 65% { opacity: 0; } 71%, 100% { opacity: 1; } }
+      @keyframes base7draft { 0%, 71% { opacity: 0; } 77%, 84% { opacity: 1; } 90%, 100% { opacity: 0; } }
+      @keyframes base8draft { 0%, 76% { opacity: 0; } 82%, 84% { opacity: 1; } 90%, 100% { opacity: 0; } }
+      @keyframes base7new { 0%, 91% { opacity: 0; } 97%, 100% { opacity: 1; } }
+      @keyframes base8new { 0%, 95% { opacity: 0; } 100% { opacity: 1; } }
+
+      @keyframes beat1 {
+        0% { opacity: 0; transform: translateY(14px); }
+        6%, 100% { opacity: 1; transform: translateY(0); }
+      }
+      @keyframes beat2 {
+        0%, 10% { opacity: 0; transform: translateY(14px); }
+        16%, 100% { opacity: 1; transform: translateY(0); }
+      }
+      @keyframes beat3 {
+        0%, 18% { opacity: 0; transform: translateY(14px); }
+        24%, 100% { opacity: 1; transform: translateY(0); }
+      }
+      @keyframes idea {
+        0%, 24% { opacity: 0; transform: scale(.8); }
+        28%, 34% { opacity: 1; transform: scale(1); }
+        35%, 100% { opacity: 0; transform: scale(1); }
+      }
+      @keyframes branchGroup {
+        0%, 29% { opacity: 0; transform: translate(0px, 0px); }
+        30%, 46% { opacity: 1; transform: translate(0px, 0px); }
+        52% { opacity: 1; transform: translate(-4px, -10px); }
+        58% { opacity: 0.18; transform: translate(-10px, -70px); }
+        59%, 100% { opacity: 0; transform: translate(-10px, -70px); }
+      }
+      @keyframes branchPath {
+        0%, 29% { stroke-dashoffset: 100; }
+        30% { stroke-dashoffset: 100; }
+        46%, 100% { stroke-dashoffset: 0; }
+      }
+      @keyframes branchA {
+        0%, 33% { opacity: 0; transform: translateY(14px); }
+        38%, 58% { opacity: 1; transform: translateY(0); }
+        59%, 100% { opacity: 0; transform: translateY(0); }
+      }
+      @keyframes branchB {
+        0%, 38% { opacity: 0; transform: translateY(14px); }
+        44%, 58% { opacity: 1; transform: translateY(0); }
+        59%, 100% { opacity: 0; transform: translateY(0); }
+      }
+      @keyframes mergeTag {
+        0%, 46% { opacity: 0; transform: translateY(10px); }
+        50%, 62% { opacity: 1; transform: translateY(0); }
+        63%, 100% { opacity: 0; transform: translateY(-4px); }
+      }
+      @keyframes beat4 {
+        0%, 61% { opacity: 0; transform: translateY(14px); }
+        67%, 100% { opacity: 1; transform: translateY(0); }
+      }
+      @keyframes beat5 {
+        0%, 65% { opacity: 0; transform: translateY(14px); }
+        71%, 100% { opacity: 1; transform: translateY(0); }
+      }
+      @keyframes beat6 {
+        0%, 69% { opacity: 0; transform: translateY(14px); }
+        75%, 100% { opacity: 1; transform: translateY(0); }
+      }
+      @keyframes draft7 {
+        0%, 75% { opacity: 0; transform: translateY(14px); }
+        80%, 86% { opacity: 1; transform: translateY(0); }
+        91%, 100% { opacity: 0; transform: translateY(8px); }
+      }
+      @keyframes draft8 {
+        0%, 79% { opacity: 0; transform: translateY(14px); }
+        84%, 86% { opacity: 1; transform: translateY(0); }
+        91%, 100% { opacity: 0; transform: translateY(8px); }
+      }
+      @keyframes rollback {
+        0%, 86% { opacity: 0; transform: translateY(10px); }
+        88%, 96% { opacity: 1; transform: translateY(0); }
+        97%, 100% { opacity: 0; transform: translateY(-2px); }
+      }
+      @keyframes new7 {
+        0%, 93% { opacity: 0; transform: translateY(14px); }
+        97%, 100% { opacity: 1; transform: translateY(0); }
+      }
+      @keyframes new8 {
+        0%, 96% { opacity: 0; transform: translateY(14px); }
+        100% { opacity: 1; transform: translateY(0); }
+      }
+
+      @keyframes captionMain { 0%, 24% { opacity: 1; } 25%, 100% { opacity: 0; } }
+      @keyframes captionIdea { 0%, 24% { opacity: 0; } 25%, 31% { opacity: 1; } 32%, 100% { opacity: 0; } }
+      @keyframes captionBranch { 0%, 31% { opacity: 0; } 32%, 45% { opacity: 1; } 46%, 100% { opacity: 0; } }
+      @keyframes captionMerge { 0%, 47% { opacity: 0; } 48%, 76% { opacity: 1; } 77%, 100% { opacity: 0; } }
+      @keyframes captionContinue { 0%, 76% { opacity: 0; } 77%, 88% { opacity: 1; } 89%, 100% { opacity: 0; } }
+      @keyframes captionRollback { 0%, 88% { opacity: 0; } 89%, 96% { opacity: 1; } 97%, 100% { opacity: 0; } }
+      @keyframes captionRenew { 0%, 96% { opacity: 0; } 97%, 100% { opacity: 1; } }
+    </style>
+  </defs>
+
+  <rect width="1400" height="820" fill="url(#bg)"/>
+  <circle cx="1220" cy="120" r="170" fill="#00a3cc" opacity="0.08"/>
+  <circle cx="190" cy="760" r="210" fill="#7c3aed" opacity="0.07"/>
+
+  <g>
+    <rect x="72" y="52" width="106" height="30" rx="15" class="productPill"/>
+    <text x="125" y="71" text-anchor="middle" class="productPillText">Memoria</text>
+    <rect x="188" y="52" width="118" height="30" rx="15" class="productPill"/>
+    <text x="247" y="71" text-anchor="middle" class="productPillText">Git for Data</text>
+  </g>
+
+  <text x="72" y="112" class="label">Secure · Auditable · Programmable Memory for AI Agents</text>
+  <text x="72" y="156" class="title">Memoria lets AI branch, merge, and roll back memory safely</text>
+  <text x="72" y="188" class="subtitle">This writing loop visualizes Memoria's Git-for-Data model: branch an alternate story arc, merge it into canon when it works, then roll back a weak ending and continue from a stronger state.</text>
+
+  <g>
+    <rect x="1014" y="128" width="88" height="28" rx="14" class="capPill"/>
+    <text x="1058" y="146" text-anchor="middle" class="capPillText">Branch</text>
+    <rect x="1114" y="128" width="86" height="28" rx="14" class="capPill"/>
+    <text x="1157" y="146" text-anchor="middle" class="capPillText">Merge</text>
+    <rect x="1212" y="128" width="102" height="28" rx="14" class="capPill"/>
+    <text x="1263" y="146" text-anchor="middle" class="capPillText">Rollback</text>
+  </g>
+
+  <rect x="60" y="216" width="1280" height="534" rx="30" class="panel"/>
+
+  <path d="M120 520 L260 520" class="timelineBase base1 hidden"/>
+  <path d="M260 520 L410 520" class="timelineBase base2 hidden"/>
+  <path d="M410 520 L560 520" class="timelineBase base3 hidden"/>
+  <path d="M560 520 L720 520" class="timelineBase base4 hidden"/>
+  <path d="M720 520 L880 520" class="timelineBase base5 hidden"/>
+  <path d="M880 520 L1040 520" class="timelineBase base6 hidden"/>
+  <path d="M1040 520 L1190 520" class="timelineBase base7draft hidden"/>
+  <path d="M1190 520 L1310 520" class="timelineBase base8draft hidden"/>
+  <path d="M1040 520 L1190 520" class="timelineBase base7new hidden"/>
+  <path d="M1190 520 L1310 520" class="timelineBase base8new hidden"/>
+
+  <path d="M120 520 L260 520" pathLength="100" class="timeline seg seg1"/>
+  <path d="M260 520 L410 520" pathLength="100" class="timeline seg seg2"/>
+  <path d="M410 520 L560 520" pathLength="100" class="timeline seg seg3"/>
+  <path d="M560 520 L720 520" pathLength="100" class="timeline seg seg4"/>
+  <path d="M720 520 L880 520" pathLength="100" class="timeline seg seg5"/>
+  <path d="M880 520 L1040 520" pathLength="100" class="timeline seg seg6"/>
+  <path d="M1040 520 L1190 520" pathLength="100" class="timeline seg seg7draft"/>
+  <path d="M1190 520 L1310 520" pathLength="100" class="timeline seg seg8draft"/>
+  <path d="M1040 520 L1190 520" pathLength="100" class="timeline seg seg7new"/>
+  <path d="M1190 520 L1310 520" pathLength="100" class="timeline seg seg8new"/>
+
+  <g class="beat1 hidden">
+    <line x1="260" y1="520" x2="260" y2="396" class="connector"/>
+    <circle cx="260" cy="520" r="8" class="node"/>
+    <rect x="178" y="324" width="168" height="72" rx="18" class="card"/>
+    <text x="202" y="350" class="cardTitle">Beat 1</text>
+    <text x="202" y="373" class="cardText">Mira inherits</text>
+    <text x="202" y="393" class="cardText">the lighthouse.</text>
+  </g>
+
+  <g class="beat2 hidden">
+    <line x1="410" y1="520" x2="410" y2="306" class="connector"/>
+    <circle cx="410" cy="520" r="8" class="node"/>
+    <rect x="326" y="234" width="172" height="72" rx="18" class="card"/>
+    <text x="350" y="260" class="cardTitle">Beat 2</text>
+    <text x="350" y="283" class="cardText">A storm traps the</text>
+    <text x="350" y="303" class="cardText">harbor overnight.</text>
+  </g>
+
+  <g class="beat3 hidden">
+    <line x1="560" y1="520" x2="560" y2="376" class="connector"/>
+    <circle cx="560" cy="520" r="8" class="node"/>
+    <rect x="474" y="304" width="172" height="72" rx="18" class="card"/>
+    <text x="498" y="330" class="cardTitle">Beat 3</text>
+    <text x="498" y="353" class="cardText">She plans to leave</text>
+    <text x="498" y="373" class="cardText">before dawn.</text>
+  </g>
+
+  <g class="idea hidden">
+    <line x1="624" y1="424" x2="624" y2="414" stroke="#fbbf24" stroke-width="2.4" stroke-linecap="round"/>
+    <line x1="605" y1="431" x2="598" y2="423" stroke="#fbbf24" stroke-width="2.4" stroke-linecap="round"/>
+    <line x1="643" y1="431" x2="650" y2="423" stroke="#fbbf24" stroke-width="2.4" stroke-linecap="round"/>
+    <line x1="597" y1="452" x2="587" y2="452" stroke="#fbbf24" stroke-width="2.4" stroke-linecap="round"/>
+    <line x1="651" y1="452" x2="661" y2="452" stroke="#fbbf24" stroke-width="2.4" stroke-linecap="round"/>
+    <line x1="605" y1="473" x2="598" y2="481" stroke="#fbbf24" stroke-width="2.4" stroke-linecap="round"/>
+    <line x1="643" y1="473" x2="650" y2="481" stroke="#fbbf24" stroke-width="2.4" stroke-linecap="round"/>
+    <circle cx="624" cy="452" r="18" fill="rgba(245,158,11,0.18)" stroke="rgba(245,158,11,0.54)" stroke-width="1.6"/>
+    <path d="M617 445 C617 438, 622 433, 629 433 C636 433, 641 438, 641 445 C641 450, 638 453, 634 457 C632 459, 631 462, 631 466 L627 466 C627 462, 626 459, 624 457 C620 453, 617 450, 617 445 Z" fill="#fbbf24"/>
+    <rect x="624" y="467" width="10" height="6" rx="3" fill="#fbbf24"/>
+  </g>
+
+  <g class="branchGroup hidden">
+    <path d="M560 520 C618 586, 700 632, 804 626 C894 620, 952 596, 990 560" pathLength="100" class="branchLine branchPath"/>
+
+    <g class="branchA hidden">
+      <line x1="732" y1="620" x2="732" y2="562" class="connector"/>
+      <circle cx="732" cy="620" r="7" class="node"/>
+      <rect x="638" y="558" width="180" height="46" rx="16" class="cardBranch"/>
+      <text x="660" y="586" class="caption">Beat A - she stays</text>
+    </g>
+
+    <g class="branchB hidden">
+      <line x1="862" y1="606" x2="862" y2="548" class="connector"/>
+      <circle cx="862" cy="606" r="7" class="node"/>
+      <rect x="760" y="500" width="198" height="46" rx="16" class="cardBranch"/>
+      <text x="782" y="528" class="caption">Beat B - lights the tower</text>
+    </g>
+  </g>
+
+  <g class="mergeTag hidden">
+    <rect x="748" y="446" width="168" height="36" rx="18" class="noteGreen"/>
+    <text x="832" y="469" text-anchor="middle" class="caption">looks nice - merge</text>
+  </g>
+
+  <g class="beat4 hidden">
+    <line x1="720" y1="520" x2="720" y2="286" class="connector"/>
+    <circle cx="720" cy="520" r="8" class="nodeMerged"/>
+    <rect x="634" y="214" width="176" height="72" rx="18" class="cardMerged"/>
+    <text x="658" y="240" class="cardTitle">Beat 4</text>
+    <text x="658" y="263" class="cardText">The branch wins:</text>
+    <text x="658" y="283" class="cardText">she stays instead.</text>
+  </g>
+
+  <g class="beat5 hidden">
+    <line x1="880" y1="520" x2="880" y2="376" class="connector"/>
+    <circle cx="880" cy="520" r="8" class="nodeMerged"/>
+    <rect x="794" y="304" width="176" height="72" rx="18" class="cardMerged"/>
+    <text x="818" y="330" class="cardTitle">Beat 5</text>
+    <text x="818" y="353" class="cardText">She lights the tower</text>
+    <text x="818" y="373" class="cardText">and saves the harbor.</text>
+  </g>
+
+  <g class="beat6 hidden">
+    <line x1="1040" y1="520" x2="1040" y2="306" class="connector"/>
+    <circle cx="1040" cy="520" r="8" class="nodeMerged"/>
+    <rect x="952" y="234" width="180" height="72" rx="18" class="cardMerged"/>
+    <text x="976" y="260" class="cardTitle">Beat 6</text>
+    <text x="976" y="283" class="cardText">The town asks Mira</text>
+    <text x="976" y="303" class="cardText">to remain as keeper.</text>
+  </g>
+
+  <g class="draft7 hidden">
+    <line x1="1190" y1="520" x2="1190" y2="396" class="connector"/>
+    <circle cx="1190" cy="520" r="8" class="nodeGhost"/>
+    <rect x="1102" y="324" width="176" height="72" rx="18" class="card"/>
+    <text x="1126" y="350" class="cardTitle">Beat 7</text>
+    <text x="1126" y="373" class="cardText">A romance subplot</text>
+    <text x="1126" y="393" class="cardText">takes over.</text>
+  </g>
+
+  <g class="draft8 hidden">
+    <line x1="1310" y1="520" x2="1310" y2="306" class="connector"/>
+    <circle cx="1310" cy="520" r="8" class="nodeGhost"/>
+    <rect x="1212" y="214" width="176" height="72" rx="18" class="card"/>
+    <text x="1236" y="240" class="cardTitle">Beat 8</text>
+    <text x="1236" y="263" class="cardText">An unrelated</text>
+    <text x="1236" y="283" class="cardText">courtroom twist.</text>
+  </g>
+
+  <g class="rollback hidden">
+    <circle cx="1040" cy="520" r="26" fill="rgba(239,68,68,0.08)" stroke="rgba(239,68,68,0.32)" stroke-width="2"/>
+    <rect x="1064" y="560" width="268" height="38" rx="19" class="noteRed"/>
+    <text x="1198" y="584" text-anchor="middle" class="caption">not good - return to Beat 6</text>
+  </g>
+
+  <g class="new7 hidden">
+    <line x1="1190" y1="520" x2="1190" y2="250" class="connector"/>
+    <circle cx="1190" cy="520" r="8" class="nodeNew"/>
+    <rect x="1140" y="178" width="176" height="72" rx="18" class="cardNew"/>
+    <text x="1164" y="204" class="cardTitle">New Beat 7</text>
+    <text x="1164" y="227" class="cardText">Mira finds a map</text>
+    <text x="1164" y="247" class="cardText">inside the lens.</text>
+  </g>
+
+  <g class="new8 hidden">
+    <line x1="1310" y1="520" x2="1310" y2="414" class="connector"/>
+    <circle cx="1310" cy="520" r="8" class="nodeNew"/>
+    <rect x="1204" y="342" width="176" height="72" rx="18" class="cardNew"/>
+    <text x="1228" y="368" class="cardTitle">New Beat 8</text>
+    <text x="1228" y="391" class="cardText">She sails at dawn</text>
+    <text x="1228" y="411" class="cardText">toward the hidden cove.</text>
+  </g>
+
+  <g class="caption-main hidden"><text x="94" y="708" class="caption">The main storyline grows beat by beat.</text></g>
+  <g class="caption-idea hidden"><text x="94" y="708" class="caption">A new idea appears: what if Mira stays instead of leaving?</text></g>
+  <g class="caption-branch hidden"><text x="94" y="708" class="caption">A detached branch explores two alternate beats without touching the main plot.</text></g>
+  <g class="caption-merge hidden"><text x="94" y="708" class="caption">The branch glides back in and merges because the new direction works better.</text></g>
+  <g class="caption-continue hidden"><text x="94" y="708" class="caption">Writing continues on main through Beat 6, then two more beats are tried.</text></g>
+  <g class="caption-rollback hidden"><text x="94" y="708" class="caption">Those two turns feel wrong, so the story calmly returns to Beat 6.</text></g>
+  <g class="caption-renew hidden"><text x="94" y="708" class="caption">From Beat 6, a better new ending begins to grow.</text></g>
+
+  <rect x="60" y="770" width="90" height="28" rx="14" fill="rgba(255,255,255,0.07)"/>
+  <text x="105" y="789" text-anchor="middle" class="caption">28s loop</text>
+</svg>
