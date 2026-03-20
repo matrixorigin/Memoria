@@ -204,4 +204,77 @@ mod tests {
         let fb_extreme_neg = MemoryFeedback { wrong: 100, ..Default::default() };
         assert!((plugin.adjust_score(1.0, &fb_extreme_neg, &params) - 0.5).abs() < 0.001);
     }
+
+    #[tokio::test]
+    async fn test_tune_params_negative_feedback_decreases_weight() {
+        use std::collections::HashMap;
+
+        // Mock ScoringStore with mostly negative feedback (negative_ratio > 0.5)
+        struct MockStore {
+            totals: FeedbackTotals,
+            params: std::sync::Mutex<UserRetrievalParams>,
+        }
+        #[async_trait::async_trait]
+        impl ScoringStore for MockStore {
+            async fn get_user_params(&self, _: &str) -> Result<UserRetrievalParams, MemoriaError> {
+                Ok(self.params.lock().unwrap().clone())
+            }
+            async fn set_user_params(&self, p: &UserRetrievalParams) -> Result<(), MemoriaError> {
+                *self.params.lock().unwrap() = p.clone();
+                Ok(())
+            }
+            async fn get_feedback_history(&self, _: &str, _: i64) -> Result<Vec<(String, String, i64)>, MemoriaError> {
+                Ok(vec![])
+            }
+            async fn get_feedback_totals(&self, _: &str) -> Result<FeedbackTotals, MemoriaError> {
+                Ok(self.totals.clone())
+            }
+        }
+
+        let plugin = DefaultScoringPlugin;
+
+        // Case 1: negative_ratio > 0.5 → weight decreases
+        let store = MockStore {
+            totals: FeedbackTotals { useful: 2, irrelevant: 5, outdated: 0, wrong: 5 },
+            params: std::sync::Mutex::new(UserRetrievalParams::default()),
+        };
+        let result = plugin.tune_params(&store, "u1").await.unwrap().unwrap();
+        assert!(
+            (result.feedback_weight - 0.09).abs() < 0.001,
+            "negative feedback should decrease weight: got {:.4}", result.feedback_weight
+        );
+
+        // Case 2: neutral zone (neither branch) → weight unchanged
+        let store2 = MockStore {
+            totals: FeedbackTotals { useful: 5, irrelevant: 3, outdated: 2, wrong: 2 },
+            params: std::sync::Mutex::new(UserRetrievalParams::default()),
+        };
+        let result2 = plugin.tune_params(&store2, "u2").await.unwrap().unwrap();
+        assert!(
+            (result2.feedback_weight - 0.1).abs() < 0.001,
+            "neutral feedback should not change weight: got {:.4}", result2.feedback_weight
+        );
+
+        // Case 3: weight clamped at max 0.2
+        let store3 = MockStore {
+            totals: FeedbackTotals { useful: 10, irrelevant: 0, outdated: 0, wrong: 0 },
+            params: std::sync::Mutex::new(UserRetrievalParams { feedback_weight: 0.19, ..Default::default() }),
+        };
+        let result3 = plugin.tune_params(&store3, "u3").await.unwrap().unwrap();
+        assert!(
+            (result3.feedback_weight - 0.2).abs() < 0.001,
+            "weight should be clamped at 0.2: got {:.4}", result3.feedback_weight
+        );
+
+        // Case 4: weight clamped at min 0.05
+        let store4 = MockStore {
+            totals: FeedbackTotals { useful: 0, irrelevant: 6, outdated: 0, wrong: 6 },
+            params: std::sync::Mutex::new(UserRetrievalParams { feedback_weight: 0.051, ..Default::default() }),
+        };
+        let result4 = plugin.tune_params(&store4, "u4").await.unwrap().unwrap();
+        assert!(
+            (result4.feedback_weight - 0.05).abs() < 0.001,
+            "weight should be clamped at 0.05: got {:.4}", result4.feedback_weight
+        );
+    }
 }
