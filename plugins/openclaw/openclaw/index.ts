@@ -54,6 +54,32 @@ function resolveOpenClawBinFromProcess(): string {
     : "openclaw";
 }
 
+function stripAnsi(value: string): string {
+  return value.replace(/\x1B\[[0-?]*[ -/]*[@-~]/g, "");
+}
+
+function extractConfigPathFromCliOutput(rawOutput: string): string | undefined {
+  const cleanedLines = stripAnsi(rawOutput)
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  for (let index = cleanedLines.length - 1; index >= 0; index -= 1) {
+    const line = cleanedLines[index];
+    const directPathMatch = line.match(/(~?\/[^\s]*openclaw\.json)$/);
+    if (directPathMatch?.[1]) {
+      return directPathMatch[1];
+    }
+
+    const embeddedPathMatch = line.match(/((?:~|\/)[^\s]*openclaw\.json)/);
+    if (embeddedPathMatch?.[1]) {
+      return embeddedPathMatch[1];
+    }
+  }
+
+  return undefined;
+}
+
 function resolveOpenClawConfigFile(): string {
   const explicitConfigPath =
     typeof process.env.OPENCLAW_CONFIG_PATH === "string" ? process.env.OPENCLAW_CONFIG_PATH.trim() : "";
@@ -68,7 +94,9 @@ function resolveOpenClawConfigFile(): string {
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"],
   });
-  const candidate = typeof fromCli.stdout === "string" ? fromCli.stdout.trim() : "";
+  const candidate = extractConfigPathFromCliOutput(
+    typeof fromCli.stdout === "string" ? fromCli.stdout : "",
+  );
   if (fromCli.status === 0 && candidate) {
     return candidate.replace(/^~(?=$|\/|\\)/, process.env.HOME ?? "~");
   }
@@ -79,10 +107,15 @@ function resolveOpenClawConfigFile(): string {
     : path.join(process.env.HOME ?? "", ".openclaw", "openclaw.json");
 }
 
-function runLocalCommand(command: string, args: string[]) {
+function runLocalCommand(
+  command: string,
+  args: string[],
+  options: { env?: NodeJS.ProcessEnv } = {},
+) {
+  const env = options.env ? { ...process.env, ...options.env } : process.env;
   const result = spawnSync(command, args, {
     cwd: PLUGIN_ROOT,
-    env: process.env,
+    env,
     stdio: "inherit",
   });
 
@@ -1592,6 +1625,7 @@ const plugin = {
         };
 
         const runMemoriaConnector = (opts: {
+          configFile: string;
           mode: "cloud" | "local";
           apiUrl?: string;
           apiKey?: string;
@@ -1607,7 +1641,7 @@ const plugin = {
           const args = [
             CONNECT_SCRIPT,
             "--config-file",
-            resolveOpenClawConfigFile(),
+            opts.configFile,
             "--mode",
             opts.mode,
           ];
@@ -1774,7 +1808,9 @@ const plugin = {
         };
 
         const applyConnectOptions = (normalized: NormalizedConnectOptions) => {
+          const resolvedConfigFile = resolveOpenClawConfigFile();
           runMemoriaConnector({
+            configFile: resolvedConfigFile,
             mode: normalized.mode,
             apiUrl: normalized.apiUrl,
             apiKey: normalized.apiKey,
@@ -1790,9 +1826,10 @@ const plugin = {
 
           const openclawBin = resolveOpenClawBinFromProcess();
           const effectiveMemoriaExecutable = normalized.memoriaBin ?? config.memoriaExecutable;
+          const openclawEnv = { OPENCLAW_CONFIG_PATH: resolvedConfigFile };
 
           if (normalized.validateConfig) {
-            runLocalCommand(openclawBin, ["config", "validate"]);
+            runLocalCommand(openclawBin, ["config", "validate"], { env: openclawEnv });
           }
 
           if (normalized.healthCheck) {
@@ -1801,13 +1838,13 @@ const plugin = {
             if (normalized.userId) {
               healthArgs.push("--user-id", normalized.userId);
             }
-            runLocalCommand(openclawBin, healthArgs);
+            runLocalCommand(openclawBin, healthArgs, { env: openclawEnv });
           }
 
           printJson({
             ok: true,
             mode: normalized.mode,
-            configFile: resolveOpenClawConfigFile(),
+            configFile: resolvedConfigFile,
             validated: normalized.validateConfig,
             healthChecked: normalized.healthCheck,
             next: normalized.healthCheck
