@@ -166,7 +166,7 @@ pub async fn call(
                 .transpose()
                 .ok()
                 .flatten();
-            let mt = MemoryType::from_str(memory_type).unwrap_or(MemoryType::Semantic);
+            let mt = memory_type.parse::<MemoryType>().unwrap();
             let m = match service
                 .store_memory(
                     user_id,
@@ -641,7 +641,7 @@ pub async fn call(
                         continue;
                     }
                     let mt_str = item["type"].as_str().unwrap_or("semantic");
-                    let mt = MemoryType::from_str(mt_str).unwrap_or(MemoryType::Semantic);
+                    let mt = mt_str.parse::<MemoryType>().unwrap();
                     let confidence = item["confidence"].as_f64().unwrap_or(0.5) as f32;
                     // Store as T4 (unverified insight from reflection)
                     let _ = service

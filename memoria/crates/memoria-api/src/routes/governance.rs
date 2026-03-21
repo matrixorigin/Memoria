@@ -184,8 +184,7 @@ pub async fn reflect(
                 continue;
             }
             let mt_str = item["type"].as_str().unwrap_or("semantic");
-            let mt = memoria_core::MemoryType::from_str(mt_str)
-                .unwrap_or(memoria_core::MemoryType::Semantic);
+            let mt = mt_str.parse::<memoria_core::MemoryType>().unwrap();
             let _ = state
                 .service
                 .store_memory(
@@ -370,5 +369,3 @@ pub async fn get_entities(
         "entities": entities.iter().map(|(n, t)| json!({"name": n, "entity_type": t})).collect::<Vec<_>>()
     })))
 }
-
-use std::str::FromStr;
