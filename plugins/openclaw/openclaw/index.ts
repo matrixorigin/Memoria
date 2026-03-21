@@ -554,6 +554,17 @@ function shouldShowOnboardingHint(rawPluginConfig: unknown): boolean {
   return !(backend === "http" || hasCloudConfig || hasLocalConfig);
 }
 
+const ONBOARDING_HINT_ONCE_KEY = "__memory_memoria_onboarding_hint_logged__";
+
+function shouldLogOnboardingHintOnce(): boolean {
+  const state = globalThis as Record<string, unknown>;
+  if (state[ONBOARDING_HINT_ONCE_KEY] === true) {
+    return false;
+  }
+  state[ONBOARDING_HINT_ONCE_KEY] = true;
+  return true;
+}
+
 const plugin = {
   id: "memory-memoria",
   name: "Memory (Memoria)",
@@ -566,9 +577,12 @@ const plugin = {
     const client = new MemoriaClient(config);
 
     api.logger.info(`memory-memoria: registered (${config.backend})`);
-    if (shouldShowOnboardingHint(api.pluginConfig)) {
+    if (shouldShowOnboardingHint(api.pluginConfig) && shouldLogOnboardingHintOnce()) {
       api.logger.info(
-        "memory-memoria: next step -> openclaw memoria setup --mode cloud --api-url <MEMORIA_API_URL> --api-key <MEMORIA_API_KEY> --install-memoria --memoria-bin ~/.local/bin/memoria",
+        "🧠 Memoria next step: openclaw memoria setup --mode cloud --api-url <MEMORIA_API_URL> --api-key <MEMORIA_API_KEY> --install-memoria",
+      );
+      api.logger.info(
+        "🧪 Verify with: openclaw memoria health",
       );
     }
 
