@@ -134,7 +134,15 @@ openclaw plugins enable memory-memoria
 ```
 
 ```bash
-# C. Setup local backend
+# C0. Local quick start (use plugin defaults for db/provider/model)
+openclaw memoria setup \
+  --mode local \
+  --install-memoria \
+  --embedding-api-key <EMBEDDING_API_KEY>
+```
+
+```bash
+# C. Setup local backend (advanced/custom values)
 openclaw memoria setup \
   --mode local \
   --db-url <MATRIXONE_DSN> \
@@ -175,8 +183,10 @@ Execute exactly:
    openclaw plugins install --link ~/.openclaw/plugins-src/Memoria/plugins/openclaw
 4) Enable plugin:
    openclaw plugins enable memory-memoria
-5) Setup local:
-   openclaw memoria setup --mode local --db-url <MATRIXONE_DSN> --embedding-provider <provider> --embedding-model <model> --embedding-api-key <embedding_key> --embedding-dim <dim> --install-memoria --memoria-bin ~/.local/bin/memoria
+5) Setup local (quick start):
+   openclaw memoria setup --mode local --install-memoria --embedding-api-key <EMBEDDING_API_KEY>
+   If custom MatrixOne/provider/model is required, append:
+   --db-url <MATRIXONE_DSN> --embedding-provider <provider> --embedding-model <model> --embedding-dim <dim>
 6) Verify:
    openclaw memoria health
 

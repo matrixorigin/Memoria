@@ -582,7 +582,7 @@ const plugin = {
         "🧠 Memoria next step (Cloud, recommended): openclaw memoria setup --mode cloud --api-url <MEMORIA_API_URL> --api-key <MEMORIA_API_KEY> --install-memoria",
       );
       api.logger.info(
-        "🧩 Local option: openclaw memoria setup --mode local --db-url <MATRIXONE_DSN> --embedding-provider <provider> --embedding-model <model> --embedding-api-key <embedding_key> --embedding-dim <dim> --install-memoria",
+        "🧩 Local quick start: openclaw memoria setup --mode local --install-memoria --embedding-api-key <EMBEDDING_API_KEY>",
       );
       api.logger.info(
         "📘 More options: openclaw memoria setup --help",
@@ -1805,7 +1805,9 @@ const plugin = {
           const apiKey =
             readOptionalCliString(raw.apiKey) ?? readOptionalEnvString("MEMORIA_API_KEY");
           const dbUrl =
-            readOptionalCliString(raw.dbUrl) ?? readOptionalEnvString("MEMORIA_DB_URL");
+            readOptionalCliString(raw.dbUrl) ??
+            readOptionalEnvString("MEMORIA_DB_URL") ??
+            config.dbUrl;
           const memoriaBin =
             readOptionalCliString(raw.memoriaBin) ?? readOptionalEnvString("MEMORIA_EXECUTABLE");
           const memoriaVersion =
@@ -1818,23 +1820,29 @@ const plugin = {
             readOptionalCliString(raw.userId) ?? readOptionalEnvString("MEMORIA_DEFAULT_USER_ID");
           const embeddingProvider =
             readOptionalCliString(raw.embeddingProvider) ??
-            readOptionalEnvString("MEMORIA_EMBEDDING_PROVIDER");
+            readOptionalEnvString("MEMORIA_EMBEDDING_PROVIDER") ??
+            config.embeddingProvider;
           const embeddingModel =
             readOptionalCliString(raw.embeddingModel) ??
-            readOptionalEnvString("MEMORIA_EMBEDDING_MODEL");
+            readOptionalEnvString("MEMORIA_EMBEDDING_MODEL") ??
+            config.embeddingModel;
           const embeddingApiKey =
             readOptionalCliString(raw.embeddingApiKey) ??
-            readOptionalEnvString("MEMORIA_EMBEDDING_API_KEY");
+            readOptionalEnvString("MEMORIA_EMBEDDING_API_KEY") ??
+            config.embeddingApiKey;
           const embeddingBaseUrl =
             readOptionalCliString(raw.embeddingBaseUrl, { trimTrailingSlashes: true }) ??
-            readOptionalEnvString("MEMORIA_EMBEDDING_BASE_URL", { trimTrailingSlashes: true });
+            readOptionalEnvString("MEMORIA_EMBEDDING_BASE_URL", { trimTrailingSlashes: true }) ??
+            config.embeddingBaseUrl;
 
           const embeddingDimRaw = String(raw.embeddingDim ?? "").trim();
           const parsedEmbeddingDim = Number.parseInt(embeddingDimRaw, 10);
           if (embeddingDimRaw && !Number.isFinite(parsedEmbeddingDim)) {
             throw new Error("--embedding-dim must be a valid positive integer");
           }
-          const embeddingDim = Number.isFinite(parsedEmbeddingDim) ? parsedEmbeddingDim : undefined;
+          const embeddingDim = Number.isFinite(parsedEmbeddingDim)
+            ? parsedEmbeddingDim
+            : config.embeddingDim;
 
           if (mode === "cloud") {
             if (!apiUrl || !apiKey) {
@@ -1845,6 +1853,10 @@ const plugin = {
           } else if (!dbUrl) {
             throw new Error(
               "local mode requires db-url. Example: openclaw memoria setup --mode local --db-url <MATRIXONE_DSN>",
+            );
+          } else if (embeddingProvider !== "local" && !embeddingApiKey) {
+            throw new Error(
+              "local mode requires embedding API key when embedding-provider is not 'local'. Quick start: openclaw memoria setup --mode local --install-memoria --embedding-api-key <EMBEDDING_API_KEY>",
             );
           }
 
