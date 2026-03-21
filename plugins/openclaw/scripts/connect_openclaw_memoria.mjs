@@ -69,6 +69,9 @@ const root = asObject(data);
 const plugins = asObject(root.plugins);
 const entries = asObject(plugins.entries);
 const slots = asObject(plugins.slots);
+const allow = Array.isArray(plugins.allow)
+  ? plugins.allow.filter((entry) => typeof entry === "string" && entry.trim())
+  : [];
 const pluginEntry = asObject(entries[pluginId]);
 const pluginConfig = asObject(pluginEntry.config);
 
@@ -131,6 +134,10 @@ pluginEntry.enabled = true;
 pluginEntry.config = pluginConfig;
 entries[pluginId] = pluginEntry;
 slots.memory = pluginId;
+if (!allow.includes(pluginId)) {
+  allow.push(pluginId);
+}
+plugins.allow = allow;
 plugins.entries = entries;
 plugins.slots = slots;
 root.plugins = plugins;
