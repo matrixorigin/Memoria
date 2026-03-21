@@ -14,7 +14,7 @@ const STRESS_VERSIONS: i64 = 32;
 
 fn db_url() -> String {
     std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "mysql://root:111@localhost:6001/memoria".to_string())
+        .unwrap_or_else(|_| "mysql://root:111@localhost:6001/memoria_test".to_string())
 }
 
 fn tbl(prefix: &str) -> String {
