@@ -15,6 +15,7 @@ In practice that means:
 - durable memory still lives in MatrixOne
 - snapshots, rollback, branches, merge, diff, governance, reflect, and entity extraction are handled by Rust Memoria
 - the plugin shells out to the `memoria` binary instead of importing bundled backend code
+- the `memoria` binary is required even in cloud mode — it serves as the local MCP stdio bridge between OpenClaw and the Memoria backend
 
 ## Quick Start
 
@@ -46,6 +47,8 @@ command -v memoria >/dev/null || \
 # A1. Install plugin from npm
 openclaw plugins install @matrixorigin/memory-memoria
 openclaw plugins enable memory-memoria
+# Note: OpenClaw may print "Restart the gateway to apply."
+# This is unnecessary for CLI commands like `setup` below, but harmless if you do restart.
 ```
 
 ```bash
@@ -200,12 +203,14 @@ Output requirements:
 
 Use this section when you choose `openclaw memoria install` for local bootstrap/repair.
 
-Important environment variables:
+> **Cloud users:** skip all embedding and LLM environment variables below. These are only used in local/embedded mode. Cloud mode only needs `--api-url` and `--api-key` via `openclaw memoria setup`.
+
+Important environment variables (local/embedded mode only):
 
 - `MEMORIA_DB_URL`: embedded MatrixOne DSN. Default: `mysql://root:111@127.0.0.1:6001/memoria`
 - `MEMORIA_EMBEDDING_PROVIDER`: usually `openai`; `local` only works if your `memoria` binary was built with the `local-embedding` feature
 - `MEMORIA_EMBEDDING_MODEL`: for example `text-embedding-3-small` or `BAAI/bge-m3`
-- `MEMORIA_EMBEDDING_API_KEY`: required unless you intentionally use `local`
+- `MEMORIA_EMBEDDING_API_KEY`: required for local/embedded mode unless embedding provider is `local`. Not needed for cloud mode.
 - `MEMORIA_EMBEDDING_BASE_URL`: optional for official OpenAI, required for compatible gateways
 - `MEMORIA_EMBEDDING_DIM`: must match the embedding model before first startup
 - `MEMORIA_LLM_API_KEY`, `MEMORIA_LLM_BASE_URL`, `MEMORIA_LLM_MODEL`: optional, only needed for `autoObserve` and internal LLM-backed Memoria tools
@@ -315,9 +320,10 @@ Notes:
 - `openclaw memoria stats` and `openclaw ltm list` require the configured backend to be reachable; in embedded mode that means MatrixOne must be up and the embedding config must be valid
 - OpenClaw reserves `openclaw memory` for its built-in file memory, so this plugin uses `openclaw memoria` and the compatibility alias `openclaw ltm`
 - `openclaw memoria setup` is the recommended onboarding command for cloud/local setup
-- `openclaw memoria connect` remains available as the lower-level config entrypoint
+- `openclaw memoria connect` remains available as the lower-level config-only entrypoint (no `--install-memoria` support)
 - `setup/connect` will merge `memory-memoria` into `plugins.allow` to satisfy OpenClaw allow-list policy
-- on fresh install without explicit backend config, plugin load logs a one-time hint with cloud (recommended), local (optional), and `openclaw memoria setup --help`
+- on fresh install without explicit backend config, `openclaw plugins enable` logs a one-time hint with cloud (recommended), local (optional), and `openclaw memoria setup --help`
+- OpenClaw may print "Restart the gateway" after `plugins install` or `plugins enable` — this is unnecessary for CLI commands like `setup` and `health`, but harmless if you do restart
 - `openclaw memoria install` is optional local bootstrap/repair (runtime + config rewrite)
 - `openclaw memoria verify` is an optional deeper diagnostic; `openclaw memoria health` is the primary quick connectivity check
 

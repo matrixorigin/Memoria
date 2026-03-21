@@ -576,8 +576,17 @@ const plugin = {
     const config = parseMemoriaPluginConfig(api.pluginConfig);
     const client = new MemoriaClient(config);
 
-    api.logger.info(`memory-memoria: registered (${config.backend})`);
-    if (shouldShowOnboardingHint(api.pluginConfig) && shouldLogOnboardingHintOnce()) {
+    const needsSetup = shouldShowOnboardingHint(api.pluginConfig);
+    if (shouldLogOnboardingHintOnce()) {
+      api.logger.info(
+        `memory-memoria: registered (${needsSetup ? "pending setup" : config.backend})`,
+      );
+    }
+
+    const isEnableCommand =
+      process.argv.some((arg) => arg === "enable") &&
+      process.argv.some((arg) => arg === "plugins");
+    if (needsSetup && isEnableCommand) {
       api.logger.info(
         "🧠 Memoria next step (Cloud, recommended): openclaw memoria setup --mode cloud --api-url <MEMORIA_API_URL> --api-key <MEMORIA_API_KEY> --install-memoria",
       );
