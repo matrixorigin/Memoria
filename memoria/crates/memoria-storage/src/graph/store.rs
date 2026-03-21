@@ -616,7 +616,7 @@ impl GraphStore {
              WHERE user_id = ? AND is_active = 1 \
                AND embedding IS NOT NULL AND vector_dims(embedding) > 0 \
              ORDER BY l2_dist ASC \
-             LIMIT ? by rank with option 'mode=pre'"
+             LIMIT ? by rank with option 'mode=post'"
         );
         let rows = sqlx::query(&sql)
             .bind(user_id)
