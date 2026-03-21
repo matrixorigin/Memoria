@@ -2265,7 +2265,7 @@ impl SqlMemoryStore {
              WHERE user_id = ? AND is_active = 1 {type_filter}\
                AND embedding IS NOT NULL AND vector_dims(embedding) > 0 \
                AND memory_id != ? \
-             ORDER BY l2_dist ASC LIMIT 1 by rank with option 'mode=pre'"
+             ORDER BY l2_dist ASC LIMIT 1 by rank with option 'mode=post'"
         );
         let mut q = sqlx::query(&sql).bind(user_id);
         if let Some(mt) = memory_type {
@@ -2538,12 +2538,23 @@ impl SqlMemoryStore {
                AND MATCH(content) AGAINST('{safe}' IN BOOLEAN MODE) \
              ORDER BY ft_score DESC LIMIT ?"
         );
-        let rows = sqlx::query(&sql)
+        let rows = match sqlx::query(&sql)
             .bind(user_id)
             .bind(limit)
             .fetch_all(&self.pool)
             .await
-            .map_err(db_err)?;
+        {
+            Ok(rows) => rows,
+            Err(e) => {
+                // MatrixOne returns 20101 when the search string tokenizes to an empty pattern
+                // (e.g. all stopwords, single chars, or unsupported Unicode). Treat as no results.
+                let msg = e.to_string();
+                if msg.contains("20101") && msg.contains("empty pattern") {
+                    return Ok(vec![]);
+                }
+                return Err(db_err(e));
+            }
+        };
         rows.iter()
             .map(|r| {
                 let mut m = row_to_memory(r)?;
@@ -2594,7 +2605,7 @@ impl SqlMemoryStore {
              FROM {table} \
              WHERE user_id = '{}' AND is_active = 1 AND embedding IS NOT NULL{type_clause} \
              ORDER BY l2_distance(embedding, '{vec_literal}') ASC \
-             LIMIT {} by rank with option 'mode=pre'",
+             LIMIT {} by rank with option 'mode=post'",
             sanitize_sql_literal(user_id),
             limit
         );

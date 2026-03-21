@@ -5,7 +5,7 @@ use uuid::Uuid;
 
 async fn connect() -> MySqlPool {
     let url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "mysql://root:111@localhost:6001/memoria".to_string());
+        .unwrap_or_else(|_| "mysql://root:111@localhost:6001/memoria_test".to_string());
     MySqlPool::connect(&url)
         .await
         .expect("connect to MatrixOne")

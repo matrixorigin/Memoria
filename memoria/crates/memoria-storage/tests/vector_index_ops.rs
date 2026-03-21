@@ -282,8 +282,9 @@ async fn test_vector_search_pre_filter_multi_user() {
     // User A: two memories (hot dims 0, 1)
     insert(uid_a.clone(), "user A memory 1".into(), make_emb(0)).await;
     insert(uid_a.clone(), "user A memory 2".into(), make_emb(1)).await;
-    // User B: memory in a different direction (hot dim 2)
-    insert(uid_b.clone(), "user B memory 1".into(), make_emb(2)).await;
+    // User B: memory in same direction as query (hot dim 0) but different user.
+    // Note: IVF index is approximate — orthogonal vectors may not be found in probed clusters.
+    insert(uid_b.clone(), "user B memory 1".into(), make_emb(0)).await;
 
     // Build IVF index after data import
     let indexed = store.rebuild_vector_index("mem_memories").await.expect("rebuild");

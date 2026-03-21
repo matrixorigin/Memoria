@@ -1,7 +1,7 @@
 /// CRUD integration tests for SqlMemoryStore against real MatrixOne.
 /// Each test uses a unique user_id — safe to run in parallel (default cargo test behavior).
 ///
-/// Run: DATABASE_URL=mysql://root:111@localhost:6001/memoria \
+/// Run: DATABASE_URL=mysql://root:111@localhost:6001/memoria_test \
 ///      SQLX_OFFLINE=true cargo test -p memoria-storage --test store_crud -- --nocapture
 use chrono::Utc;
 use memoria_core::{interfaces::MemoryStore, Memory, MemoryType, TrustTier};
@@ -24,7 +24,7 @@ fn dim_vec(idx: usize, val: f32) -> Vec<f32> {
 
 async fn setup() -> (SqlMemoryStore, String) {
     let url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "mysql://root:111@localhost:6001/memoria".to_string());
+        .unwrap_or_else(|_| "mysql://root:111@localhost:6001/memoria_test".to_string());
     let instance_id = uuid::Uuid::new_v4().to_string();
     let store = SqlMemoryStore::connect(&url, test_dim(), instance_id)
         .await
