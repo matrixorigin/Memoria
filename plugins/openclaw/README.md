@@ -307,7 +307,7 @@ Notes:
 - `openclaw memoria setup` is the recommended onboarding command for cloud/local setup
 - `openclaw memoria connect` remains available as the lower-level config entrypoint
 - `setup/connect` will merge `memory-memoria` into `plugins.allow` to satisfy OpenClaw allow-list policy
-- on fresh install without explicit backend config, plugin load logs a one-time next-step hint for `openclaw memoria setup ...`
+- on fresh install without explicit backend config, plugin load logs a one-time hint with cloud (recommended), local (optional), and `openclaw memoria setup --help`
 - `openclaw memoria install` is optional local bootstrap/repair (runtime + config rewrite)
 - `openclaw memoria verify` is an optional deeper diagnostic; `openclaw memoria health` is the primary quick connectivity check
 

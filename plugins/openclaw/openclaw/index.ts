@@ -579,7 +579,13 @@ const plugin = {
     api.logger.info(`memory-memoria: registered (${config.backend})`);
     if (shouldShowOnboardingHint(api.pluginConfig) && shouldLogOnboardingHintOnce()) {
       api.logger.info(
-        "🧠 Memoria next step: openclaw memoria setup --mode cloud --api-url <MEMORIA_API_URL> --api-key <MEMORIA_API_KEY> --install-memoria",
+        "🧠 Memoria next step (Cloud, recommended): openclaw memoria setup --mode cloud --api-url <MEMORIA_API_URL> --api-key <MEMORIA_API_KEY> --install-memoria",
+      );
+      api.logger.info(
+        "🧩 Local option: openclaw memoria setup --mode local --db-url <MATRIXONE_DSN> --embedding-provider <provider> --embedding-model <model> --embedding-api-key <embedding_key> --embedding-dim <dim> --install-memoria",
+      );
+      api.logger.info(
+        "📘 More options: openclaw memoria setup --help",
       );
       api.logger.info(
         "🧪 Verify with: openclaw memoria health",
