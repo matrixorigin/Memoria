@@ -61,8 +61,8 @@ openclaw plugins enable memory-memoria
 ```
 
 ```bash
-# B. Connect to Memoria Cloud
-openclaw memoria connect \
+# B. Setup Memoria Cloud
+openclaw memoria setup \
   --mode cloud \
   --api-url <MEMORIA_API_URL> \
   --api-key <MEMORIA_API_KEY>
@@ -94,8 +94,8 @@ Execute exactly:
    openclaw plugins install --link ~/.openclaw/plugins-src/Memoria/plugins/openclaw
 4) Enable plugin:
    openclaw plugins enable memory-memoria
-5) Connect cloud:
-   openclaw memoria connect --mode cloud --api-url <MEMORIA_API_URL> --api-key <MEMORIA_API_KEY>
+5) Setup cloud:
+   openclaw memoria setup --mode cloud --api-url <MEMORIA_API_URL> --api-key <MEMORIA_API_KEY>
 6) Verify:
    openclaw memoria health
 
@@ -133,8 +133,8 @@ openclaw plugins enable memory-memoria
 ```
 
 ```bash
-# C. Connect local backend
-openclaw memoria connect \
+# C. Setup local backend
+openclaw memoria setup \
   --mode local \
   --db-url <MATRIXONE_DSN> \
   --embedding-provider <provider> \
@@ -173,8 +173,8 @@ Execute exactly:
    openclaw plugins install --link ~/.openclaw/plugins-src/Memoria/plugins/openclaw
 4) Enable plugin:
    openclaw plugins enable memory-memoria
-5) Connect local:
-   openclaw memoria connect --mode local --db-url <MATRIXONE_DSN> --embedding-provider <provider> --embedding-model <model> --embedding-api-key <embedding_key> --embedding-dim <dim> --memoria-bin ~/.local/bin/memoria
+5) Setup local:
+   openclaw memoria setup --mode local --db-url <MATRIXONE_DSN> --embedding-provider <provider> --embedding-model <model> --embedding-api-key <embedding_key> --embedding-dim <dim> --memoria-bin ~/.local/bin/memoria
 6) Verify:
    openclaw memoria health
 
@@ -301,11 +301,12 @@ Notes:
 - `openclaw memoria capabilities` is a config/plugin check and does not require a live Memoria backend
 - `openclaw memoria stats` and `openclaw ltm list` require the configured backend to be reachable; in embedded mode that means MatrixOne must be up and the embedding config must be valid
 - OpenClaw reserves `openclaw memory` for its built-in file memory, so this plugin uses `openclaw memoria` and the compatibility alias `openclaw ltm`
-- `openclaw memoria connect` is the preferred config entrypoint for cloud/local mode switching
+- `openclaw memoria setup` is the recommended onboarding command for cloud/local setup
+- `openclaw memoria connect` remains available as the lower-level config entrypoint
 - `openclaw memoria install` is optional local bootstrap/repair (runtime + config rewrite)
 - `openclaw memoria verify` is an optional deeper diagnostic; `openclaw memoria health` is the primary quick connectivity check
 
-If `openclaw memoria connect` is missing:
+If `openclaw memoria setup` (or `connect`) is missing:
 
 ```bash
 openclaw plugins update memory-memoria

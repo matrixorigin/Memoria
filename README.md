@@ -186,8 +186,8 @@ if [ ! -d ~/.openclaw/plugins-src/Memoria/.git ]; then git clone https://github.
 openclaw plugins install --link ~/.openclaw/plugins-src/Memoria/plugins/openclaw
 openclaw plugins enable memory-memoria
 
-# cloud-first connect flow
-openclaw memoria connect --mode cloud --api-url <MEMORIA_API_URL> --api-key <MEMORIA_API_KEY>
+# cloud-first setup flow
+openclaw memoria setup --mode cloud --api-url <MEMORIA_API_URL> --api-key <MEMORIA_API_KEY>
 openclaw memoria health
 ```
 

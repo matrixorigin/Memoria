@@ -1646,6 +1646,176 @@ const plugin = {
           runLocalCommand("node", args);
         };
 
+        type RawConnectCliOptions = {
+          mode?: unknown;
+          apiUrl?: unknown;
+          apiKey?: unknown;
+          dbUrl?: unknown;
+          memoriaBin?: unknown;
+          userId?: unknown;
+          embeddingProvider?: unknown;
+          embeddingModel?: unknown;
+          embeddingApiKey?: unknown;
+          embeddingBaseUrl?: unknown;
+          embeddingDim?: unknown;
+          skipValidate?: unknown;
+          skipHealthCheck?: unknown;
+        };
+
+        type NormalizedConnectOptions = {
+          mode: "cloud" | "local";
+          apiUrl?: string;
+          apiKey?: string;
+          dbUrl?: string;
+          memoriaBin?: string;
+          userId?: string;
+          embeddingProvider?: string;
+          embeddingModel?: string;
+          embeddingApiKey?: string;
+          embeddingBaseUrl?: string;
+          embeddingDim?: number;
+          validateConfig: boolean;
+          healthCheck: boolean;
+        };
+
+        const readOptionalCliString = (
+          raw: unknown,
+          opts: { trimTrailingSlashes?: boolean } = {},
+        ): string | undefined => {
+          if (typeof raw !== "string") {
+            return undefined;
+          }
+          const normalized = raw.trim();
+          if (!normalized) {
+            return undefined;
+          }
+          return opts.trimTrailingSlashes ? normalized.replace(/\/+$/, "") : normalized;
+        };
+
+        const readOptionalEnvString = (
+          envName: string,
+          opts: { trimTrailingSlashes?: boolean } = {},
+        ): string | undefined => {
+          const value = readOptionalCliString(process.env[envName], opts);
+          return value;
+        };
+
+        const normalizeConnectOptions = (
+          raw: RawConnectCliOptions,
+          defaultMode: "cloud" | "local" = "cloud",
+        ): NormalizedConnectOptions => {
+          const modeRaw =
+            typeof raw.mode === "string" && raw.mode.trim()
+              ? raw.mode.trim().toLowerCase()
+              : defaultMode;
+          if (modeRaw !== "cloud" && modeRaw !== "local") {
+            throw new Error("mode must be one of: cloud, local");
+          }
+          const mode = modeRaw as "cloud" | "local";
+
+          const apiUrl =
+            readOptionalCliString(raw.apiUrl, { trimTrailingSlashes: true }) ??
+            readOptionalEnvString("MEMORIA_API_URL", { trimTrailingSlashes: true });
+          const apiKey =
+            readOptionalCliString(raw.apiKey) ?? readOptionalEnvString("MEMORIA_API_KEY");
+          const dbUrl =
+            readOptionalCliString(raw.dbUrl) ?? readOptionalEnvString("MEMORIA_DB_URL");
+          const memoriaBin =
+            readOptionalCliString(raw.memoriaBin) ?? readOptionalEnvString("MEMORIA_EXECUTABLE");
+          const userId =
+            readOptionalCliString(raw.userId) ?? readOptionalEnvString("MEMORIA_DEFAULT_USER_ID");
+          const embeddingProvider =
+            readOptionalCliString(raw.embeddingProvider) ??
+            readOptionalEnvString("MEMORIA_EMBEDDING_PROVIDER");
+          const embeddingModel =
+            readOptionalCliString(raw.embeddingModel) ??
+            readOptionalEnvString("MEMORIA_EMBEDDING_MODEL");
+          const embeddingApiKey =
+            readOptionalCliString(raw.embeddingApiKey) ??
+            readOptionalEnvString("MEMORIA_EMBEDDING_API_KEY");
+          const embeddingBaseUrl =
+            readOptionalCliString(raw.embeddingBaseUrl, { trimTrailingSlashes: true }) ??
+            readOptionalEnvString("MEMORIA_EMBEDDING_BASE_URL", { trimTrailingSlashes: true });
+
+          const embeddingDimRaw = String(raw.embeddingDim ?? "").trim();
+          const parsedEmbeddingDim = Number.parseInt(embeddingDimRaw, 10);
+          if (embeddingDimRaw && !Number.isFinite(parsedEmbeddingDim)) {
+            throw new Error("--embedding-dim must be a valid positive integer");
+          }
+          const embeddingDim = Number.isFinite(parsedEmbeddingDim) ? parsedEmbeddingDim : undefined;
+
+          if (mode === "cloud") {
+            if (!apiUrl || !apiKey) {
+              throw new Error(
+                "cloud mode requires api-url and api-key. Example: openclaw memoria setup --mode cloud --api-url <MEMORIA_API_URL> --api-key <MEMORIA_API_KEY>",
+              );
+            }
+          } else if (!dbUrl) {
+            throw new Error(
+              "local mode requires db-url. Example: openclaw memoria setup --mode local --db-url <MATRIXONE_DSN>",
+            );
+          }
+
+          return {
+            mode,
+            apiUrl,
+            apiKey,
+            dbUrl,
+            memoriaBin,
+            userId,
+            embeddingProvider,
+            embeddingModel,
+            embeddingApiKey,
+            embeddingBaseUrl,
+            embeddingDim,
+            validateConfig: raw.skipValidate !== true,
+            healthCheck: raw.skipHealthCheck !== true,
+          };
+        };
+
+        const applyConnectOptions = (normalized: NormalizedConnectOptions) => {
+          runMemoriaConnector({
+            mode: normalized.mode,
+            apiUrl: normalized.apiUrl,
+            apiKey: normalized.apiKey,
+            dbUrl: normalized.dbUrl,
+            memoriaBin: normalized.memoriaBin,
+            userId: normalized.userId,
+            embeddingProvider: normalized.embeddingProvider,
+            embeddingModel: normalized.embeddingModel,
+            embeddingApiKey: normalized.embeddingApiKey,
+            embeddingBaseUrl: normalized.embeddingBaseUrl,
+            embeddingDim: normalized.embeddingDim,
+          });
+
+          const openclawBin = resolveOpenClawBinFromProcess();
+          const effectiveMemoriaExecutable = normalized.memoriaBin ?? config.memoriaExecutable;
+
+          if (normalized.validateConfig) {
+            runLocalCommand(openclawBin, ["config", "validate"]);
+          }
+
+          if (normalized.healthCheck) {
+            assertMemoriaExecutableAvailable(effectiveMemoriaExecutable, normalized.mode);
+            const healthArgs = ["memoria", "health"];
+            if (normalized.userId) {
+              healthArgs.push("--user-id", normalized.userId);
+            }
+            runLocalCommand(openclawBin, healthArgs);
+          }
+
+          printJson({
+            ok: true,
+            mode: normalized.mode,
+            configFile: resolveOpenClawConfigFile(),
+            validated: normalized.validateConfig,
+            healthChecked: normalized.healthCheck,
+            next: normalized.healthCheck
+              ? "Connected and health-checked."
+              : "Config updated. Run `openclaw memoria health` to verify.",
+          });
+        };
+
         memoria
           .command("health")
           .description("Check Memoria connectivity")
@@ -1789,6 +1959,27 @@ const plugin = {
           }));
 
         memoria
+          .command("setup")
+          .description("Recommended onboarding entrypoint: configure cloud/local backend then validate")
+          .option("--mode <cloud|local>", "Backend mode to configure", "cloud")
+          .option("--api-url <url>", "Memoria API URL (required for mode=cloud)")
+          .option("--api-key <token>", "Memoria API token (required for mode=cloud)")
+          .option("--db-url <dsn>", "MatrixOne DSN (required for mode=local)")
+          .option("--memoria-bin <path>", "Path to memoria executable to pin in plugin config")
+          .option("--user-id <user>", "Default Memoria user id")
+          .option("--embedding-provider <provider>", "Embedding provider for mode=local")
+          .option("--embedding-model <model>", "Embedding model for mode=local")
+          .option("--embedding-api-key <key>", "Embedding API key for mode=local")
+          .option("--embedding-base-url <url>", "Embedding API base URL for mode=local")
+          .option("--embedding-dim <n>", "Embedding dimensions for mode=local")
+          .option("--skip-validate", "Skip `openclaw config validate`", false)
+          .option("--skip-health-check", "Skip `openclaw memoria health`", false)
+          .action(withCliClient(async (opts) => {
+            const normalized = normalizeConnectOptions(opts as RawConnectCliOptions, "cloud");
+            applyConnectOptions(normalized);
+          }));
+
+        memoria
           .command("connect")
           .description("Configure cloud/local Memoria backend in OpenClaw config")
           .option("--mode <cloud|local>", "Backend mode to configure", "cloud")
@@ -1805,96 +1996,8 @@ const plugin = {
           .option("--skip-validate", "Skip `openclaw config validate`", false)
           .option("--skip-health-check", "Skip `openclaw memoria health`", false)
           .action(withCliClient(async (opts) => {
-            const modeRaw =
-              typeof opts.mode === "string" && opts.mode.trim()
-                ? opts.mode.trim().toLowerCase()
-                : "cloud";
-            if (modeRaw !== "cloud" && modeRaw !== "local") {
-              throw new Error("mode must be one of: cloud, local");
-            }
-            const mode = modeRaw as "cloud" | "local";
-
-            const normalizedApiUrl =
-              typeof opts.apiUrl === "string" && opts.apiUrl.trim()
-                ? opts.apiUrl.trim().replace(/\/+$/, "")
-                : undefined;
-            const normalizedApiKey =
-              typeof opts.apiKey === "string" && opts.apiKey.trim() ? opts.apiKey.trim() : undefined;
-            const normalizedDbUrl =
-              typeof opts.dbUrl === "string" && opts.dbUrl.trim() ? opts.dbUrl.trim() : undefined;
-            const normalizedMemoriaBin =
-              typeof opts.memoriaBin === "string" && opts.memoriaBin.trim()
-                ? opts.memoriaBin.trim()
-                : undefined;
-            const normalizedUserId =
-              typeof opts.userId === "string" && opts.userId.trim() ? opts.userId.trim() : undefined;
-            const normalizedEmbeddingProvider =
-              typeof opts.embeddingProvider === "string" && opts.embeddingProvider.trim()
-                ? opts.embeddingProvider.trim()
-                : undefined;
-            const normalizedEmbeddingModel =
-              typeof opts.embeddingModel === "string" && opts.embeddingModel.trim()
-                ? opts.embeddingModel.trim()
-                : undefined;
-            const normalizedEmbeddingApiKey =
-              typeof opts.embeddingApiKey === "string" && opts.embeddingApiKey.trim()
-                ? opts.embeddingApiKey.trim()
-                : undefined;
-            const normalizedEmbeddingBaseUrl =
-              typeof opts.embeddingBaseUrl === "string" && opts.embeddingBaseUrl.trim()
-                ? opts.embeddingBaseUrl.trim().replace(/\/+$/, "")
-                : undefined;
-            const parsedEmbeddingDim = Number.parseInt(String(opts.embeddingDim ?? ""), 10);
-            if (
-              opts.embeddingDim != null &&
-              String(opts.embeddingDim).trim() &&
-              !Number.isFinite(parsedEmbeddingDim)
-            ) {
-              throw new Error("--embedding-dim must be a valid positive integer");
-            }
-
-            runMemoriaConnector({
-              mode,
-              apiUrl: normalizedApiUrl,
-              apiKey: normalizedApiKey,
-              dbUrl: normalizedDbUrl,
-              memoriaBin: normalizedMemoriaBin,
-              userId: normalizedUserId,
-              embeddingProvider: normalizedEmbeddingProvider,
-              embeddingModel: normalizedEmbeddingModel,
-              embeddingApiKey: normalizedEmbeddingApiKey,
-              embeddingBaseUrl: normalizedEmbeddingBaseUrl,
-              embeddingDim: Number.isFinite(parsedEmbeddingDim) ? parsedEmbeddingDim : undefined,
-            });
-
-            const openclawBin = resolveOpenClawBinFromProcess();
-            const configValidateEnabled = opts.skipValidate !== true;
-            const healthCheckEnabled = opts.skipHealthCheck !== true;
-            const effectiveMemoriaExecutable = normalizedMemoriaBin ?? config.memoriaExecutable;
-
-            if (configValidateEnabled) {
-              runLocalCommand(openclawBin, ["config", "validate"]);
-            }
-
-            if (healthCheckEnabled) {
-              assertMemoriaExecutableAvailable(effectiveMemoriaExecutable, mode);
-              const healthArgs = ["memoria", "health"];
-              if (normalizedUserId) {
-                healthArgs.push("--user-id", normalizedUserId);
-              }
-              runLocalCommand(openclawBin, healthArgs);
-            }
-
-            printJson({
-              ok: true,
-              mode,
-              configFile: resolveOpenClawConfigFile(),
-              validated: configValidateEnabled,
-              healthChecked: healthCheckEnabled,
-              next: healthCheckEnabled
-                ? "Connected and health-checked."
-                : "Config updated. Run `openclaw memoria health` to verify.",
-            });
+            const normalized = normalizeConnectOptions(opts as RawConnectCliOptions, "cloud");
+            applyConnectOptions(normalized);
           }));
 
         ltm
