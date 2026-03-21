@@ -187,7 +187,7 @@ openclaw plugins install --link ~/.openclaw/plugins-src/Memoria/plugins/openclaw
 openclaw plugins enable memory-memoria
 
 # cloud-first setup flow
-openclaw memoria setup --mode cloud --api-url <MEMORIA_API_URL> --api-key <MEMORIA_API_KEY>
+openclaw memoria setup --mode cloud --api-url <MEMORIA_API_URL> --api-key <MEMORIA_API_KEY> --install-memoria
 openclaw memoria health
 ```
 

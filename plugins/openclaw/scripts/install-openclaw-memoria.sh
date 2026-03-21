@@ -114,6 +114,7 @@ Options:
   --memoria-bin <path|command>  Use an existing memoria executable.
   --memoria-version <tag>       Rust Memoria release tag. Default: v0.1.0.
   --memoria-install-dir <path>  Where to install memoria if it is missing.
+  --binary-only                 Only install/validate the memoria binary, then exit.
   --skip-memoria-install        Require an existing memoria executable.
   --skip-plugin-install         Assume the plugin is already installed/enabled in OpenClaw.
   --verify                      Run verify_plugin_install.mjs after installation.
@@ -337,6 +338,7 @@ MEMORIA_RELEASE_TAG="${MEMORIA_RELEASE_TAG:-$DEFAULT_MEMORIA_VERSION}"
 MEMORIA_BINARY_INSTALL_DIR="${MEMORIA_BINARY_INSTALL_DIR:-$HOME/.local/bin}"
 SKIP_MEMORIA_INSTALL=false
 SKIP_PLUGIN_INSTALL=false
+BINARY_ONLY=false
 RUN_VERIFY=false
 
 while [[ $# -gt 0 ]]; do
@@ -375,6 +377,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --skip-memoria-install)
       SKIP_MEMORIA_INSTALL=true
+      shift
+      ;;
+    --binary-only)
+      BINARY_ONLY=true
       shift
       ;;
     --skip-plugin-install)
@@ -454,6 +460,16 @@ else
   log "Installed memoria executable: ${MEMORIA_EXECUTABLE_VALUE}"
 fi
 log "Memoria version: $("${MEMORIA_EXECUTABLE_VALUE}" --version 2>/dev/null | head -n 1)"
+
+if [[ "${BINARY_ONLY}" == true ]]; then
+  cat <<EOF
+
+Binary install complete.
+
+Memoria executable: ${MEMORIA_EXECUTABLE_VALUE}
+EOF
+  exit 0
+fi
 
 MEMORIA_DB_URL="$(normalize_db_url "${MEMORIA_DB_URL:-mysql://root:111@127.0.0.1:6001/memoria}")"
 MEMORIA_DEFAULT_USER_ID="${MEMORIA_DEFAULT_USER_ID:-openclaw-user}"

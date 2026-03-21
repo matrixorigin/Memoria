@@ -2,7 +2,7 @@
 
 This package turns [MatrixOrigin Memoria](https://github.com/matrixorigin/Memoria) into an installable OpenClaw `memory` plugin.
 
-The plugin targets the current Rust Memoria CLI and API release line. The default installer target is [`v0.1.0`](https://github.com/matrixorigin/Memoria/releases/tag/v0.1.0). There is no bundled Python runtime, no virtualenv, and no `pip install` step.
+The plugin targets the current Rust Memoria CLI and API release line. Installer release tag is configurable via `--memoria-version` / `MEMORIA_RELEASE_TAG`. There is no bundled Python runtime, no virtualenv, and no `pip install` step.
 
 ## Architecture
 
@@ -65,7 +65,8 @@ openclaw plugins enable memory-memoria
 openclaw memoria setup \
   --mode cloud \
   --api-url <MEMORIA_API_URL> \
-  --api-key <MEMORIA_API_KEY>
+  --api-key <MEMORIA_API_KEY> \
+  --install-memoria
 ```
 
 Success standard:
@@ -95,7 +96,7 @@ Execute exactly:
 4) Enable plugin:
    openclaw plugins enable memory-memoria
 5) Setup cloud:
-   openclaw memoria setup --mode cloud --api-url <MEMORIA_API_URL> --api-key <MEMORIA_API_KEY>
+   openclaw memoria setup --mode cloud --api-url <MEMORIA_API_URL> --api-key <MEMORIA_API_KEY> --install-memoria
 6) Verify:
    openclaw memoria health
 
@@ -141,6 +142,7 @@ openclaw memoria setup \
   --embedding-model <model> \
   --embedding-api-key <embedding_key> \
   --embedding-dim <dim> \
+  --install-memoria \
   --memoria-bin ~/.local/bin/memoria
 ```
 
@@ -174,7 +176,7 @@ Execute exactly:
 4) Enable plugin:
    openclaw plugins enable memory-memoria
 5) Setup local:
-   openclaw memoria setup --mode local --db-url <MATRIXONE_DSN> --embedding-provider <provider> --embedding-model <model> --embedding-api-key <embedding_key> --embedding-dim <dim> --memoria-bin ~/.local/bin/memoria
+   openclaw memoria setup --mode local --db-url <MATRIXONE_DSN> --embedding-provider <provider> --embedding-model <model> --embedding-api-key <embedding_key> --embedding-dim <dim> --install-memoria --memoria-bin ~/.local/bin/memoria
 6) Verify:
    openclaw memoria health
 
@@ -198,7 +200,7 @@ Important environment variables:
 - `MEMORIA_EMBEDDING_DIM`: must match the embedding model before first startup
 - `MEMORIA_LLM_API_KEY`, `MEMORIA_LLM_BASE_URL`, `MEMORIA_LLM_MODEL`: optional, only needed for `autoObserve` and internal LLM-backed Memoria tools
 - `MEMORIA_EXECUTABLE`: optional explicit path to an existing `memoria` binary
-- `MEMORIA_RELEASE_TAG`: Rust Memoria release tag to install. Default: `v0.1.0`
+- `MEMORIA_RELEASE_TAG`: Rust Memoria release tag to install. Default: installer-defined release tag
 
 Installer flags:
 
@@ -206,6 +208,7 @@ Installer flags:
 - `--memoria-bin <path|command>`: use an existing `memoria` executable
 - `--memoria-version <tag>`: override the Rust Memoria release tag
 - `--memoria-install-dir <path>`: where to install `memoria` if it is missing
+- `--binary-only`: install/validate `memoria` binary only, skip plugin config rewrite
 - `--skip-memoria-install`: require an existing `memoria` executable
 - `--skip-plugin-install`: only rewrite plugin config; assume OpenClaw already installed and the plugin already loaded
 - `--verify`: run a post-install smoke check

@@ -150,7 +150,7 @@ function assertMemoriaExecutableAvailable(command: string, mode: "cloud" | "loca
   const installHint =
     "curl -sSL https://raw.githubusercontent.com/matrixorigin/Memoria/main/scripts/install.sh | bash -s -- -y -d ~/.local/bin";
   throw new Error(
-    `Memoria executable '${command}' was not found. Install Memoria CLI first (${installHint}), or rerun with --memoria-bin <path>. This plugin uses local memoria CLI as the MCP bridge even in mode=${mode}.`,
+    `Memoria executable '${command}' was not found. Install Memoria CLI first (${installHint}), rerun setup with --install-memoria, or rerun with --memoria-bin <path>. This plugin uses local memoria CLI as the MCP bridge even in mode=${mode}.`,
   );
 }
 
@@ -568,7 +568,7 @@ const plugin = {
     api.logger.info(`memory-memoria: registered (${config.backend})`);
     if (shouldShowOnboardingHint(api.pluginConfig)) {
       api.logger.info(
-        "memory-memoria: next step -> openclaw memoria setup --mode cloud --api-url <MEMORIA_API_URL> --api-key <MEMORIA_API_KEY> --memoria-bin ~/.local/bin/memoria",
+        "memory-memoria: next step -> openclaw memoria setup --mode cloud --api-url <MEMORIA_API_URL> --api-key <MEMORIA_API_KEY> --install-memoria --memoria-bin ~/.local/bin/memoria",
       );
     }
 
@@ -1604,6 +1604,7 @@ const plugin = {
           memoriaVersion?: string;
           memoriaInstallDir?: string;
           skipMemoriaInstall?: boolean;
+          binaryOnly?: boolean;
           verify?: boolean;
         }) => {
           const args = [
@@ -1625,6 +1626,9 @@ const plugin = {
           }
           if (opts.skipMemoriaInstall) {
             args.push("--skip-memoria-install");
+          }
+          if (opts.binaryOnly) {
+            args.push("--binary-only");
           }
           if (opts.verify !== false) {
             args.push("--verify");
@@ -1708,6 +1712,9 @@ const plugin = {
           apiKey?: unknown;
           dbUrl?: unknown;
           memoriaBin?: unknown;
+          memoriaVersion?: unknown;
+          memoriaInstallDir?: unknown;
+          installMemoria?: unknown;
           userId?: unknown;
           embeddingProvider?: unknown;
           embeddingModel?: unknown;
@@ -1724,6 +1731,9 @@ const plugin = {
           apiKey?: string;
           dbUrl?: string;
           memoriaBin?: string;
+          memoriaVersion?: string;
+          memoriaInstallDir?: string;
+          installMemoria: boolean;
           userId?: string;
           embeddingProvider?: string;
           embeddingModel?: string;
@@ -1778,6 +1788,12 @@ const plugin = {
             readOptionalCliString(raw.dbUrl) ?? readOptionalEnvString("MEMORIA_DB_URL");
           const memoriaBin =
             readOptionalCliString(raw.memoriaBin) ?? readOptionalEnvString("MEMORIA_EXECUTABLE");
+          const memoriaVersion =
+            readOptionalCliString(raw.memoriaVersion) ?? readOptionalEnvString("MEMORIA_RELEASE_TAG");
+          const memoriaInstallDir =
+            readOptionalCliString(raw.memoriaInstallDir) ??
+            readOptionalEnvString("MEMORIA_BINARY_INSTALL_DIR");
+          const installMemoria = raw.installMemoria === true;
           const userId =
             readOptionalCliString(raw.userId) ?? readOptionalEnvString("MEMORIA_DEFAULT_USER_ID");
           const embeddingProvider =
@@ -1818,6 +1834,9 @@ const plugin = {
             apiKey,
             dbUrl,
             memoriaBin,
+            memoriaVersion,
+            memoriaInstallDir,
+            installMemoria,
             userId,
             embeddingProvider,
             embeddingModel,
@@ -1831,13 +1850,38 @@ const plugin = {
 
         const applyConnectOptions = (normalized: NormalizedConnectOptions) => {
           const resolvedConfigFile = resolveOpenClawConfigFile();
+          let memoriaBinForConfig = normalized.memoriaBin;
+          const installDirFallback =
+            normalized.memoriaInstallDir ??
+            (memoriaBinForConfig && memoriaBinForConfig.includes("/")
+              ? path.dirname(memoriaBinForConfig)
+              : path.join(process.env.HOME ?? "", ".local", "bin"));
+          let effectiveMemoriaExecutable = memoriaBinForConfig ?? config.memoriaExecutable;
+
+          if (normalized.installMemoria && !isExecutableAvailable(effectiveMemoriaExecutable)) {
+            runMemoriaInstaller({
+              memoriaVersion: normalized.memoriaVersion,
+              memoriaInstallDir: installDirFallback,
+              binaryOnly: true,
+              verify: false,
+            });
+            const installedPath =
+              memoriaBinForConfig && memoriaBinForConfig.includes("/")
+                ? memoriaBinForConfig
+                : path.join(installDirFallback, "memoria");
+            if (isExecutableAvailable(installedPath)) {
+              memoriaBinForConfig = installedPath;
+              effectiveMemoriaExecutable = installedPath;
+            }
+          }
+
           runMemoriaConnector({
             configFile: resolvedConfigFile,
             mode: normalized.mode,
             apiUrl: normalized.apiUrl,
             apiKey: normalized.apiKey,
             dbUrl: normalized.dbUrl,
-            memoriaBin: normalized.memoriaBin,
+            memoriaBin: memoriaBinForConfig,
             userId: normalized.userId,
             embeddingProvider: normalized.embeddingProvider,
             embeddingModel: normalized.embeddingModel,
@@ -1847,7 +1891,6 @@ const plugin = {
           });
 
           const openclawBin = resolveOpenClawBinFromProcess();
-          const effectiveMemoriaExecutable = normalized.memoriaBin ?? config.memoriaExecutable;
           const openclawEnv = { OPENCLAW_CONFIG_PATH: resolvedConfigFile };
 
           if (normalized.validateConfig) {
@@ -2025,6 +2068,9 @@ const plugin = {
           .option("--api-key <token>", "Memoria API token (required for mode=cloud)")
           .option("--db-url <dsn>", "MatrixOne DSN (required for mode=local)")
           .option("--memoria-bin <path>", "Path to memoria executable to pin in plugin config")
+          .option("--install-memoria", "Install memoria binary automatically if it is missing", false)
+          .option("--memoria-version <tag>", "Rust Memoria release tag to install when --install-memoria")
+          .option("--memoria-install-dir <path>", "Install directory for memoria when --install-memoria")
           .option("--user-id <user>", "Default Memoria user id")
           .option("--embedding-provider <provider>", "Embedding provider for mode=local")
           .option("--embedding-model <model>", "Embedding model for mode=local")
