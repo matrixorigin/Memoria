@@ -666,12 +666,21 @@ impl GraphStore {
              AND MATCH(content) AGAINST('{safe}' IN BOOLEAN MODE) \
              ORDER BY ft_score DESC LIMIT ?"
         );
-        let rows = sqlx::query(&sql)
+        let rows = match sqlx::query(&sql)
             .bind(user_id)
             .bind(top_k)
             .fetch_all(&self.pool)
             .await
-            .map_err(db_err)?;
+        {
+            Ok(rows) => rows,
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("20101") && msg.contains("empty pattern") {
+                    return Ok(vec![]);
+                }
+                return Err(db_err(e));
+            }
+        };
         Ok(rows
             .iter()
             .map(|r| {

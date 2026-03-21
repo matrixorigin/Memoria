@@ -95,7 +95,7 @@ impl AppState {
             let raw: u32 = std::env::var("MEMORIA_AUTH_POOL_MAX_CONNECTIONS")
                 .ok()
                 .and_then(|s| s.parse().ok())
-                .unwrap_or(8);
+                .unwrap_or(16);
             let clamped = raw.clamp(1, AUTH_POOL_MAX_CONNECTIONS_UPPER);
             if clamped != raw {
                 warn!(
