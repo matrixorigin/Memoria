@@ -537,6 +537,23 @@ function hasMessageError(value: unknown): value is Record<string, unknown> & { m
   return Boolean(record && "error" in record && typeof record.message === "string");
 }
 
+function hasNonEmptyString(value: unknown): boolean {
+  return typeof value === "string" && value.trim().length > 0;
+}
+
+function shouldShowOnboardingHint(rawPluginConfig: unknown): boolean {
+  const raw = asRecord(rawPluginConfig);
+  if (!raw) {
+    return true;
+  }
+
+  const backend = hasNonEmptyString(raw.backend) ? String(raw.backend).trim().toLowerCase() : "";
+  const hasCloudConfig = hasNonEmptyString(raw.apiUrl) || hasNonEmptyString(raw.apiKey);
+  const hasLocalConfig = hasNonEmptyString(raw.dbUrl);
+
+  return !(backend === "http" || hasCloudConfig || hasLocalConfig);
+}
+
 const plugin = {
   id: "memory-memoria",
   name: "Memory (Memoria)",
@@ -549,6 +566,11 @@ const plugin = {
     const client = new MemoriaClient(config);
 
     api.logger.info(`memory-memoria: registered (${config.backend})`);
+    if (shouldShowOnboardingHint(api.pluginConfig)) {
+      api.logger.info(
+        "memory-memoria: next step -> openclaw memoria setup --mode cloud --api-url <MEMORIA_API_URL> --api-key <MEMORIA_API_KEY> --memoria-bin ~/.local/bin/memoria",
+      );
+    }
 
     api.on("before_prompt_build", async () => ({
       appendSystemContext: MEMORIA_AGENT_GUIDANCE,
