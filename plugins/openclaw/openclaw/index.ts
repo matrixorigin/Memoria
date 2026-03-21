@@ -577,28 +577,30 @@ const plugin = {
     const client = new MemoriaClient(config);
 
     const needsSetup = shouldShowOnboardingHint(api.pluginConfig);
-    if (shouldLogOnboardingHintOnce()) {
+    const isFirstRegister = shouldLogOnboardingHintOnce();
+
+    if (isFirstRegister) {
       api.logger.info(
         `memory-memoria: registered (${needsSetup ? "pending setup" : config.backend})`,
       );
-    }
 
-    const isEnableCommand =
-      process.argv.some((arg) => arg === "enable") &&
-      process.argv.some((arg) => arg === "plugins");
-    if (needsSetup && isEnableCommand) {
-      api.logger.info(
-        "🧠 Memoria next step (Cloud, recommended): openclaw memoria setup --mode cloud --api-url <MEMORIA_API_URL> --api-key <MEMORIA_API_KEY> --install-memoria",
-      );
-      api.logger.info(
-        "🧩 Local quick start: openclaw memoria setup --mode local --install-memoria --embedding-api-key <EMBEDDING_API_KEY>",
-      );
-      api.logger.info(
-        "📘 More options: openclaw memoria setup --help",
-      );
-      api.logger.info(
-        "🧪 Verify with: openclaw memoria health",
-      );
+      const isEnableCommand =
+        process.argv.some((arg) => arg === "enable") &&
+        process.argv.some((arg) => arg === "plugins");
+      if (needsSetup && isEnableCommand) {
+        api.logger.info(
+          "🧠 Memoria next step (Cloud, recommended): openclaw memoria setup --mode cloud --api-url <MEMORIA_API_URL> --api-key <MEMORIA_API_KEY> --install-memoria",
+        );
+        api.logger.info(
+          "🧩 Local quick start: openclaw memoria setup --mode local --install-memoria --embedding-api-key <EMBEDDING_API_KEY>",
+        );
+        api.logger.info(
+          "📘 More options: openclaw memoria setup --help",
+        );
+        api.logger.info(
+          "🧪 Verify with: openclaw memoria health",
+        );
+      }
     }
 
     api.on("before_prompt_build", async () => ({
