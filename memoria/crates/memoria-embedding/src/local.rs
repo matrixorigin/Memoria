@@ -20,15 +20,11 @@ mod inner {
                 "all-MiniLM-L6-v2" | "sentence-transformers/all-MiniLM-L6-v2" => {
                     (EmbeddingModel::AllMiniLML6V2, 384)
                 }
-                "BAAI/bge-m3" | "bge-m3" => {
-                    (EmbeddingModel::BGEM3, 1024)
-                }
+                "BAAI/bge-m3" | "bge-m3" => (EmbeddingModel::BGEM3, 1024),
                 "BAAI/bge-small-en-v1.5" | "bge-small-en-v1.5" => {
                     (EmbeddingModel::BGESmallENV15, 384)
                 }
-                "BAAI/bge-base-en-v1.5" | "bge-base-en-v1.5" => {
-                    (EmbeddingModel::BGEBaseENV15, 384)
-                }
+                "BAAI/bge-base-en-v1.5" | "bge-base-en-v1.5" => (EmbeddingModel::BGEBaseENV15, 384),
                 "BAAI/bge-large-en-v1.5" | "bge-large-en-v1.5" => {
                     (EmbeddingModel::BGELargeENV15, 1024)
                 }
@@ -46,18 +42,26 @@ mod inner {
             let model = TextEmbedding::try_new(opts)
                 .map_err(|e| MemoriaError::Embedding(format!("Failed to load local model: {e}")))?;
 
-            Ok(Self { model: Mutex::new(model), dimension: dim })
+            Ok(Self {
+                model: Mutex::new(model),
+                dimension: dim,
+            })
         }
     }
 
     #[async_trait]
     impl EmbeddingProvider for LocalEmbedder {
         async fn embed(&self, text: &str) -> Result<Vec<f32>, MemoriaError> {
-            let model = self.model.lock()
+            let model = self
+                .model
+                .lock()
                 .map_err(|e| MemoriaError::Embedding(format!("Lock poisoned: {e}")))?;
-            let results = model.embed(vec![text], None)
+            let results = model
+                .embed(vec![text], None)
                 .map_err(|e| MemoriaError::Embedding(e.to_string()))?;
-            results.into_iter().next()
+            results
+                .into_iter()
+                .next()
                 .ok_or_else(|| MemoriaError::Embedding("Empty embedding result".into()))
         }
 
@@ -65,10 +69,13 @@ mod inner {
             if texts.is_empty() {
                 return Ok(vec![]);
             }
-            let model = self.model.lock()
+            let model = self
+                .model
+                .lock()
                 .map_err(|e| MemoriaError::Embedding(format!("Lock poisoned: {e}")))?;
             let refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
-            model.embed(refs, None)
+            model
+                .embed(refs, None)
                 .map_err(|e| MemoriaError::Embedding(e.to_string()))
         }
 

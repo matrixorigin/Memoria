@@ -10,10 +10,13 @@ use memoria_service::{ConsolidationInput, ConsolidationStrategy, DefaultConsolid
 use serde::{Deserialize, Serialize};
 use sqlx::{MySqlPool, Row};
 
-use crate::{auth::AuthUser, state::AppState, routes::memory::api_err};
+use crate::{auth::AuthUser, routes::memory::api_err, state::AppState};
 
 fn get_pool(state: &AppState) -> Result<&MySqlPool, (StatusCode, String)> {
-    state.service.sql_store.as_ref()
+    state
+        .service
+        .sql_store
+        .as_ref()
         .map(|s| s.pool())
         .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "No SQL store".into()))
 }
@@ -64,30 +67,40 @@ pub struct TriggerParams {
 
 /// GET /admin/stats
 pub async fn system_stats(
-    _auth: AuthUser,
+    auth: AuthUser,
     State(state): State<AppState>,
 ) -> Result<Json<SystemStats>, (StatusCode, String)> {
+    auth.require_master()?;
     let pool = get_pool(&state)?;
 
-    let (total_users,): (i64,) = sqlx::query_as(
-        "SELECT COUNT(DISTINCT user_id) FROM mem_memories WHERE is_active > 0"
-    ).fetch_one(pool).await.map_err(db_err)?;
+    let (total_users,): (i64,) =
+        sqlx::query_as("SELECT COUNT(DISTINCT user_id) FROM mem_memories WHERE is_active > 0")
+            .fetch_one(pool)
+            .await
+            .map_err(db_err)?;
 
-    let (total_memories,): (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM mem_memories WHERE is_active > 0"
-    ).fetch_one(pool).await.map_err(db_err)?;
+    let (total_memories,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM mem_memories WHERE is_active > 0")
+            .fetch_one(pool)
+            .await
+            .map_err(db_err)?;
 
     let snapshots = state.git.list_snapshots().await.map_err(db_err)?;
 
-    Ok(Json(SystemStats { total_users, total_memories, total_snapshots: snapshots.len() as i64 }))
+    Ok(Json(SystemStats {
+        total_users,
+        total_memories,
+        total_snapshots: snapshots.len() as i64,
+    }))
 }
 
 /// GET /admin/users
 pub async fn list_users(
-    _auth: AuthUser,
+    auth: AuthUser,
     State(state): State<AppState>,
     Query(params): Query<CursorParams>,
 ) -> Result<Json<UserListResponse>, (StatusCode, String)> {
+    auth.require_master()?;
     let pool = get_pool(&state)?;
     let limit = params.limit.unwrap_or(100);
 
@@ -101,75 +114,116 @@ pub async fn list_users(
         ).bind(limit).fetch_all(pool).await
     }.map_err(db_err)?;
 
-    let next_cursor = if rows.len() as i64 == limit { rows.last().map(|r| r.0.clone()) } else { None };
+    let next_cursor = if rows.len() as i64 == limit {
+        rows.last().map(|r| r.0.clone())
+    } else {
+        None
+    };
 
     Ok(Json(UserListResponse {
-        users: rows.into_iter().map(|r| UserEntry { user_id: r.0 }).collect(),
+        users: rows
+            .into_iter()
+            .map(|r| UserEntry { user_id: r.0 })
+            .collect(),
         next_cursor,
     }))
 }
 
 /// GET /admin/users/:user_id/stats
 pub async fn user_stats(
-    _auth: AuthUser,
+    auth: AuthUser,
     State(state): State<AppState>,
     Path(user_id): Path<String>,
 ) -> Result<Json<UserStats>, (StatusCode, String)> {
+    auth.require_master()?;
     let pool = get_pool(&state)?;
 
-    let (memory_count,): (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM mem_memories WHERE user_id = ? AND is_active > 0"
-    ).bind(&user_id).fetch_one(pool).await.map_err(db_err)?;
+    let (memory_count,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM mem_memories WHERE user_id = ? AND is_active > 0")
+            .bind(&user_id)
+            .fetch_one(pool)
+            .await
+            .map_err(db_err)?;
 
     let snapshots = state.git.list_snapshots().await.map_err(db_err)?;
 
-    Ok(Json(UserStats { user_id, memory_count, snapshot_count: snapshots.len() as i64 }))
+    Ok(Json(UserStats {
+        user_id,
+        memory_count,
+        snapshot_count: snapshots.len() as i64,
+    }))
 }
 
 /// DELETE /admin/users/:user_id
 pub async fn delete_user(
-    _auth: AuthUser,
+    auth: AuthUser,
     State(state): State<AppState>,
     Path(user_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    auth.require_master()?;
     let pool = get_pool(&state)?;
     sqlx::query("UPDATE mem_memories SET is_active = 0 WHERE user_id = ?")
-        .bind(&user_id).execute(pool).await.map_err(db_err)?;
-    Ok(Json(serde_json::json!({"status": "ok", "user_id": user_id})))
+        .bind(&user_id)
+        .execute(pool)
+        .await
+        .map_err(db_err)?;
+    Ok(Json(
+        serde_json::json!({"status": "ok", "user_id": user_id}),
+    ))
 }
 
 /// POST /admin/users/:user_id/reset-access-counts
 pub async fn reset_access_counts(
     State(state): State<AppState>,
-    _auth: AuthUser,
+    auth: AuthUser,
     Path(user_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let sql = state.service.sql_store.as_ref()
-        .ok_or_else(|| (StatusCode::SERVICE_UNAVAILABLE, "SQL store required".to_string()))?;
+    auth.require_master()?;
+    let sql = state.service.sql_store.as_ref().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "SQL store required".to_string(),
+        )
+    })?;
     let reset = sql.reset_access_counts(&user_id).await.map_err(api_err)?;
-    Ok(Json(serde_json::json!({"user_id": user_id, "reset": reset})))
+    Ok(Json(
+        serde_json::json!({"user_id": user_id, "reset": reset}),
+    ))
 }
 
 /// POST /admin/governance/:user_id/trigger?op=governance|consolidate
 /// Skips cooldown checks (admin override).
 pub async fn trigger_governance(
-    _auth: AuthUser,
+    auth: AuthUser,
     State(state): State<AppState>,
     Path(user_id): Path<String>,
     Query(params): Query<TriggerParams>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    auth.require_master()?;
     let op = params.op.as_deref().unwrap_or("governance");
-    let sql = state.service.sql_store.as_ref()
+    let sql = state
+        .service
+        .sql_store
+        .as_ref()
         .ok_or((StatusCode::SERVICE_UNAVAILABLE, "SQL store required".into()))?;
 
     match op {
         "governance" => {
-            let quarantined = sql.quarantine_low_confidence(&user_id).await.map_err(db_err)?;
+            let quarantined = sql
+                .quarantine_low_confidence(&user_id)
+                .await
+                .map_err(db_err)?;
             let cleaned_stale = sql.cleanup_stale(&user_id).await.map_err(db_err)?;
             let cleaned_tool_results = sql.cleanup_tool_results(72).await.map_err(db_err)?;
             let archived_working = sql.archive_stale_working(24).await.map_err(db_err)?;
-            let compressed = sql.compress_redundant(&user_id, 0.95, 30, 10_000).await.map_err(db_err)?;
-            let cleaned_incrementals = sql.cleanup_orphaned_incrementals(&user_id, 24).await.map_err(db_err)?;
+            let compressed = sql
+                .compress_redundant(&user_id, 0.95, 30, 10_000)
+                .await
+                .map_err(db_err)?;
+            let cleaned_incrementals = sql
+                .cleanup_orphaned_incrementals(&user_id, 24)
+                .await
+                .map_err(db_err)?;
             let pollution_detected = sql.detect_pollution(&user_id, 24).await.map_err(db_err)?;
             Ok(Json(serde_json::json!({
                 "op": op, "user_id": user_id,
@@ -200,7 +254,9 @@ pub async fn trigger_governance(
             })))
         }
         "extract_entities" => {
-            let r = memoria_storage::graph::backfill::backfill_graph(sql, &user_id).await.map_err(db_err)?;
+            let r = memoria_storage::graph::backfill::backfill_graph(sql, &user_id)
+                .await
+                .map_err(db_err)?;
             Ok(Json(serde_json::json!({
                 "op": op, "user_id": user_id,
                 "processed": r.processed, "skipped": r.skipped,
@@ -211,9 +267,14 @@ pub async fn trigger_governance(
             let cleaned_snapshots = sql.cleanup_snapshots(5).await.map_err(db_err)?;
             let cleaned_branches = sql.cleanup_orphan_branches().await.map_err(db_err)?;
             let _ = sql.rebuild_vector_index("mem_memories").await;
-            Ok(Json(serde_json::json!({"op": op, "user_id": user_id, "cleaned_snapshots": cleaned_snapshots, "cleaned_branches": cleaned_branches})))
+            Ok(Json(
+                serde_json::json!({"op": op, "user_id": user_id, "cleaned_snapshots": cleaned_snapshots, "cleaned_branches": cleaned_branches}),
+            ))
         }
-        _ => Err((StatusCode::BAD_REQUEST, format!("Invalid op: {op}. Must be governance|consolidate|extract_entities|weekly"))),
+        _ => Err((
+            StatusCode::BAD_REQUEST,
+            format!("Invalid op: {op}. Must be governance|consolidate|extract_entities|weekly"),
+        )),
     }
 }
 
@@ -221,10 +282,13 @@ pub async fn trigger_governance(
 
 /// GET /v1/health/analyze — per-type stats
 pub async fn health_analyze(
-    AuthUser(user_id): AuthUser,
+    AuthUser { user_id, .. }: AuthUser,
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let sql = state.service.sql_store.as_ref()
+    let sql = state
+        .service
+        .sql_store
+        .as_ref()
         .ok_or((StatusCode::SERVICE_UNAVAILABLE, "SQL store required".into()))?;
     let result = sql.health_analyze(&user_id).await.map_err(db_err)?;
     Ok(Json(result))
@@ -232,10 +296,13 @@ pub async fn health_analyze(
 
 /// GET /v1/health/storage — storage stats
 pub async fn health_storage(
-    AuthUser(user_id): AuthUser,
+    AuthUser { user_id, .. }: AuthUser,
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let sql = state.service.sql_store.as_ref()
+    let sql = state
+        .service
+        .sql_store
+        .as_ref()
         .ok_or((StatusCode::SERVICE_UNAVAILABLE, "SQL store required".into()))?;
     let result = sql.health_storage_stats(&user_id).await.map_err(db_err)?;
     Ok(Json(result))
@@ -243,10 +310,13 @@ pub async fn health_storage(
 
 /// GET /v1/health/capacity — IVF capacity estimate
 pub async fn health_capacity(
-    AuthUser(user_id): AuthUser,
+    AuthUser { user_id, .. }: AuthUser,
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let sql = state.service.sql_store.as_ref()
+    let sql = state
+        .service
+        .sql_store
+        .as_ref()
         .ok_or((StatusCode::SERVICE_UNAVAILABLE, "SQL store required".into()))?;
     let result = sql.health_capacity(&user_id).await.map_err(db_err)?;
     Ok(Json(result))
@@ -254,30 +324,40 @@ pub async fn health_capacity(
 
 /// POST /admin/users/:id/strategy?strategy=... — set retrieval strategy (no-op stub for benchmark compat)
 pub async fn set_user_strategy(
+    State(_state): State<AppState>,
+    auth: AuthUser,
     Path(user_id): Path<String>,
     Query(params): Query<std::collections::HashMap<String, String>>,
-    _state: State<AppState>,
-) -> Json<serde_json::Value> {
-    let strategy = params.get("strategy").cloned().unwrap_or_else(|| "vector:v1".to_string());
-    Json(serde_json::json!({
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    auth.require_master()?;
+    let strategy = params
+        .get("strategy")
+        .cloned()
+        .unwrap_or_else(|| "vector:v1".to_string());
+    Ok(Json(serde_json::json!({
         "user_id": user_id,
         "strategy": strategy,
         "previous": "vector:v1",
         "status": "ok",
-    }))
+    })))
 }
 
 /// GET /admin/users/:user_id/keys — list all active API keys for a user (admin only)
 pub async fn list_user_keys(
-    _auth: AuthUser,
+    auth: AuthUser,
     State(state): State<AppState>,
     Path(user_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    auth.require_master()?;
     let pool = get_pool(&state)?;
     let rows = sqlx::query(
         "SELECT key_id, name, key_prefix, created_at, expires_at, last_used_at \
-         FROM mem_api_keys WHERE user_id = ? AND is_active = 1 ORDER BY created_at DESC"
-    ).bind(&user_id).fetch_all(pool).await.map_err(db_err)?;
+         FROM mem_api_keys WHERE user_id = ? AND is_active = 1 ORDER BY created_at DESC",
+    )
+    .bind(&user_id)
+    .fetch_all(pool)
+    .await
+    .map_err(db_err)?;
 
     let keys: Vec<serde_json::Value> = rows.iter().map(|r| {
         serde_json::json!({
@@ -295,27 +375,81 @@ pub async fn list_user_keys(
 
 /// DELETE /admin/users/:user_id/keys — revoke all active API keys for a user (admin only)
 pub async fn revoke_all_user_keys(
-    _auth: AuthUser,
+    auth: AuthUser,
     State(state): State<AppState>,
     Path(user_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    auth.require_master()?;
     let pool = get_pool(&state)?;
-    let result = sqlx::query("UPDATE mem_api_keys SET is_active = 0 WHERE user_id = ? AND is_active = 1")
-        .bind(&user_id).execute(pool).await.map_err(db_err)?;
-    Ok(Json(serde_json::json!({"user_id": user_id, "revoked": result.rows_affected()})))
+    let result =
+        sqlx::query("UPDATE mem_api_keys SET is_active = 0 WHERE user_id = ? AND is_active = 1")
+            .bind(&user_id)
+            .execute(pool)
+            .await
+            .map_err(db_err)?;
+    Ok(Json(
+        serde_json::json!({"user_id": user_id, "revoked": result.rows_affected()}),
+    ))
 }
 
 /// POST /admin/users/:user_id/params — set per-user activation param overrides
 pub async fn set_user_params(
-    _auth: AuthUser,
+    auth: AuthUser,
     State(state): State<AppState>,
     Path(user_id): Path<String>,
     Json(params): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    auth.require_master()?;
     let pool = get_pool(&state)?;
     let pj = serde_json::to_string(&params).map_err(db_err)?;
     sqlx::query(
-        "UPDATE mem_user_memory_config SET params_json = ?, updated_at = NOW() WHERE user_id = ?"
-    ).bind(&pj).bind(&user_id).execute(pool).await.map_err(db_err)?;
-    Ok(Json(serde_json::json!({"user_id": user_id, "params": params})))
+        "UPDATE mem_user_memory_config SET params_json = ?, updated_at = NOW() WHERE user_id = ?",
+    )
+    .bind(&pj)
+    .bind(&user_id)
+    .execute(pool)
+    .await
+    .map_err(db_err)?;
+    Ok(Json(
+        serde_json::json!({"user_id": user_id, "params": params}),
+    ))
+}
+
+/// GET /admin/config — view current runtime configuration (redacted secrets).
+pub async fn get_config(
+    auth: AuthUser,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    auth.require_master()?;
+    let cfg = memoria_service::Config::from_env();
+    Ok(Json(serde_json::json!({
+        "db_url": redact_url(&cfg.db_url),
+        "db_name": cfg.db_name,
+        "embedding_provider": cfg.embedding_provider,
+        "embedding_model": cfg.embedding_model,
+        "embedding_dim": cfg.embedding_dim,
+        "embedding_base_url": cfg.embedding_base_url,
+        "has_embedding": cfg.has_embedding(),
+        "has_llm": cfg.has_llm(),
+        "llm_model": cfg.llm_model,
+        "llm_base_url": cfg.llm_base_url,
+        "user": cfg.user,
+        "governance_plugin_binding": cfg.governance_plugin_binding,
+        "governance_plugin_subject": cfg.governance_plugin_subject,
+        "governance_plugin_dir": cfg.governance_plugin_dir,
+        "instance_id": cfg.instance_id,
+        "lock_ttl_secs": cfg.lock_ttl_secs,
+        "governance_enabled": std::env::var("MEMORIA_GOVERNANCE_ENABLED")
+            .unwrap_or_else(|_| "false".into()),
+    })))
+}
+
+/// Redact password from database URL for safe display.
+fn redact_url(url: &str) -> String {
+    // mysql://user:pass@host:port/db → mysql://user:***@host:port/db
+    if let Some(at) = url.find('@') {
+        if let Some(colon) = url[..at].rfind(':') {
+            return format!("{}:***{}", &url[..colon], &url[at..]);
+        }
+    }
+    url.to_string()
 }

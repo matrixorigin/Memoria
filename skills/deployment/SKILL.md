@@ -140,6 +140,8 @@ spec:
               value: "1024"
             - name: MEMORIA_GOVERNANCE_ENABLED
               value: "true"
+            - name: MEMORIA_LOCK_TTL_SECS
+              value: "120"
           livenessProbe:
             httpGet:
               path: /health

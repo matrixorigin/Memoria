@@ -112,16 +112,6 @@ pub fn list() -> Value {
             }
         },
         {
-            "name": "memory_rebuild_index",
-            "description": "Rebuild IVF vector index for a memory table. Only call when governance reports needs_rebuild=True.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "table": {"type": "string", "default": "mem_memories"}
-                }
-            }
-        },
-        {
             "name": "memory_consolidate",
             "description": "Run graph consolidation: detect contradicting memories, fix orphaned nodes, manage trust tiers. 30-minute cooldown.",
             "inputSchema": {
@@ -143,40 +133,16 @@ pub fn list() -> Value {
             }
         },
         {
-            "name": "memory_extract_entities",
-            "description": "Extract named entities from memories and build entity graph.",
+            "name": "memory_feedback",
+            "description": "Record explicit relevance feedback for a memory. Helps improve retrieval over time.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "mode": {"type": "string", "default": "auto"}
-                }
-            }
-        },
-        {
-            "name": "memory_link_entities",
-            "description": "Write entity links from user-LLM extraction results.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "entities": {"type": "string"}
+                    "memory_id": {"type": "string", "description": "ID of the memory to provide feedback on"},
+                    "signal": {"type": "string", "enum": ["useful", "irrelevant", "outdated", "wrong"], "description": "Feedback signal"},
+                    "context": {"type": "string", "description": "Optional context about why this feedback was given"}
                 },
-                "required": ["entities"]
-            }
-        },
-        {
-            "name": "memory_observe",
-            "description": "Observe a conversation turn and extract memories from messages. Stores assistant/user messages as semantic memories.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "messages": {
-                        "type": "array",
-                        "items": {"type": "object"},
-                        "description": "Array of {role, content} message objects"
-                    },
-                    "session_id": {"type": "string"}
-                },
-                "required": ["messages"]
+                "required": ["memory_id", "signal"]
             }
         }
     ])
@@ -194,11 +160,25 @@ pub async fn call(
             let content = args["content"].as_str().unwrap_or("").to_string();
             let memory_type = args["memory_type"].as_str().unwrap_or("semantic");
             let session_id = args["session_id"].as_str().map(String::from);
-            let trust_tier = args["trust_tier"].as_str()
-                .map(TrustTier::from_str).transpose().ok().flatten();
-            let mt = MemoryType::from_str(memory_type)
-                .unwrap_or(MemoryType::Semantic);
-            let m = match service.store_memory(user_id, &content, mt, session_id.clone(), trust_tier, None, None).await {
+            let trust_tier = args["trust_tier"]
+                .as_str()
+                .map(TrustTier::from_str)
+                .transpose()
+                .ok()
+                .flatten();
+            let mt = MemoryType::from_str(memory_type).unwrap_or(MemoryType::Semantic);
+            let m = match service
+                .store_memory(
+                    user_id,
+                    &content,
+                    mt,
+                    session_id.clone(),
+                    trust_tier,
+                    None,
+                    None,
+                )
+                .await
+            {
                 Ok(m) => m,
                 Err(memoria_core::MemoriaError::Blocked(reason)) => {
                     return Ok(json!({"result": format!("⚠️ Memory blocked: {reason}")}));
@@ -234,18 +214,30 @@ pub async fn call(
 
                 // Auto entity extraction (regex, lightweight)
                 let entities = memoria_storage::extract_entities(&m.content);
+                let mut links: Vec<(String, String, &str)> = Vec::new();
                 for ent in &entities {
-                    if let Ok((entity_id, _)) = graph.upsert_entity(
-                        user_id, &ent.name, &ent.display, &ent.entity_type
-                    ).await {
-                        let _ = graph.upsert_memory_entity_link(
-                            &m.memory_id, &entity_id, user_id, "regex"
-                        ).await;
+                    if let Ok((entity_id, _)) = graph
+                        .upsert_entity(user_id, &ent.name, &ent.display, &ent.entity_type)
+                        .await
+                    {
+                        links.push((m.memory_id.clone(), entity_id, "regex"));
                     }
+                }
+                if !links.is_empty() {
+                    let refs: Vec<(&str, &str, &str)> = links
+                        .iter()
+                        .map(|(m, e, s)| (m.as_str(), e.as_str(), *s))
+                        .collect();
+                    let _ = graph
+                        .batch_upsert_memory_entity_links(user_id, &refs)
+                        .await;
                 }
             }
 
-            Ok(mcp_text(&format!("Stored memory {}: {}", m.memory_id, m.content)))
+            Ok(mcp_text(&format!(
+                "Stored memory {}: {}",
+                m.memory_id, m.content
+            )))
         }
 
         "memory_retrieve" | "memory_search" => {
@@ -260,24 +252,34 @@ pub async fn call(
             let level = memoria_service::ExplainLevel::from_str_or_bool(explain_str);
 
             if level != memoria_service::ExplainLevel::None {
-                let (results, stats) = service.retrieve_explain_level(user_id, &query, top_k, level).await?;
+                let (results, stats) = service
+                    .retrieve_explain_level(user_id, &query, top_k, level)
+                    .await?;
                 if results.is_empty() {
                     let explain_json = serde_json::to_string_pretty(&stats).unwrap_or_default();
-                    return Ok(mcp_text(&format!("No relevant memories found.\n\n--- explain ---\n{explain_json}")));
+                    return Ok(mcp_text(&format!(
+                        "No relevant memories found.\n\n--- explain ---\n{explain_json}"
+                    )));
                 }
-                let text = results.iter().map(|m| {
-                    format!("[{}] ({}) {}", m.memory_id, m.memory_type, m.content)
-                }).collect::<Vec<_>>().join("\n");
+                let text = results
+                    .iter()
+                    .map(|m| format!("[{}] ({}) {}", m.memory_id, m.memory_type, m.content))
+                    .collect::<Vec<_>>()
+                    .join("\n");
                 let explain_json = serde_json::to_string_pretty(&stats).unwrap_or_default();
-                Ok(mcp_text(&format!("{text}\n\n--- explain ---\n{explain_json}")))
+                Ok(mcp_text(&format!(
+                    "{text}\n\n--- explain ---\n{explain_json}"
+                )))
             } else {
                 let results = service.retrieve(user_id, &query, top_k).await?;
                 if results.is_empty() {
                     return Ok(mcp_text("No relevant memories found."));
                 }
-                let text = results.iter().map(|m| {
-                    format!("[{}] ({}) {}", m.memory_id, m.memory_type, m.content)
-                }).collect::<Vec<_>>().join("\n");
+                let text = results
+                    .iter()
+                    .map(|m| format!("[{}] ({}) {}", m.memory_id, m.memory_type, m.content))
+                    .collect::<Vec<_>>()
+                    .join("\n");
                 Ok(mcp_text(&text))
             }
         }
@@ -309,9 +311,14 @@ pub async fn call(
             if let Some(sql) = &service.sql_store {
                 let graph = sql.graph_store();
                 let _ = graph.deactivate_by_memory_id(&old_mid).await;
-                let _ = graph.update_content_by_memory_id(&m.memory_id, &m.content).await;
+                let _ = graph
+                    .update_content_by_memory_id(&m.memory_id, &m.content)
+                    .await;
             }
-            Ok(mcp_text(&format!("Corrected memory {}: {}", m.memory_id, m.content)))
+            Ok(mcp_text(&format!(
+                "Corrected memory {}: {}",
+                m.memory_id, m.content
+            )))
         }
 
         "memory_purge" => {
@@ -319,7 +326,11 @@ pub async fn call(
             let topic = args["topic"].as_str().unwrap_or("");
             if !memory_id.is_empty() {
                 // Batch: comma-separated IDs
-                let ids: Vec<&str> = memory_id.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
+                let ids: Vec<&str> = memory_id
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .collect();
                 let result = service.purge_batch(user_id, &ids).await?;
                 for id in &ids {
                     // Graph sync: deactivate graph node (best-effort)
@@ -327,11 +338,17 @@ pub async fn call(
                         let _ = sql.graph_store().deactivate_by_memory_id(id).await;
                     }
                 }
-                Ok(mcp_text(&format_purge_msg(&format!("Purged {} memory(s)", result.purged), &result)))
+                Ok(mcp_text(&format_purge_msg(
+                    &format!("Purged {} memory(s)", result.purged),
+                    &result,
+                )))
             } else if !topic.is_empty() {
                 // Bulk by keyword: exact text match then purge
                 let result = service.purge_by_topic(user_id, topic).await?;
-                Ok(mcp_text(&format_purge_msg(&format!("Purged {} memory(s) matching '{topic}'", result.purged), &result)))
+                Ok(mcp_text(&format_purge_msg(
+                    &format!("Purged {} memory(s) matching '{topic}'", result.purged),
+                    &result,
+                )))
             } else {
                 Ok(mcp_text("Provide memory_id or topic"))
             }
@@ -339,15 +356,18 @@ pub async fn call(
 
         "memory_profile" => {
             let memories = service.list_active(user_id, 50).await?;
-            let profile_mems: Vec<_> = memories.iter()
+            let profile_mems: Vec<_> = memories
+                .iter()
                 .filter(|m| m.memory_type == MemoryType::Profile)
                 .collect();
             if profile_mems.is_empty() {
                 return Ok(mcp_text("No profile memories found."));
             }
-            let text = profile_mems.iter()
+            let text = profile_mems
+                .iter()
                 .map(|m| m.content.as_str())
-                .collect::<Vec<_>>().join("\n");
+                .collect::<Vec<_>>()
+                .join("\n");
             Ok(mcp_text(&text))
         }
 
@@ -357,18 +377,19 @@ pub async fn call(
             if memories.is_empty() {
                 return Ok(mcp_text("No memories found."));
             }
-            let text = memories.iter().map(|m| {
-                format!("[{}] ({}) {}", m.memory_id, m.memory_type, m.content)
-            }).collect::<Vec<_>>().join("\n");
+            let text = memories
+                .iter()
+                .map(|m| format!("[{}] ({}) {}", m.memory_id, m.memory_type, m.content))
+                .collect::<Vec<_>>()
+                .join("\n");
             Ok(mcp_text(&text))
         }
 
         "memory_capabilities" => Ok(mcp_text(
             "Available tools: memory_store, memory_retrieve, memory_search, \
              memory_correct, memory_purge, memory_profile, memory_list, \
-             memory_capabilities, memory_governance, memory_rebuild_index, \
-             memory_consolidate, memory_reflect, memory_extract_entities, \
-             memory_link_entities, memory_observe"
+             memory_capabilities, memory_governance, memory_consolidate, \
+             memory_reflect, memory_feedback",
         )),
 
         "memory_governance" => {
@@ -379,7 +400,10 @@ pub async fn call(
             };
             const COOLDOWN_SECS: i64 = 3600; // 1 hour
             if !force {
-                if let Some(remaining) = sql.check_cooldown(user_id, "governance", COOLDOWN_SECS).await? {
+                if let Some(remaining) = sql
+                    .check_cooldown(user_id, "governance", COOLDOWN_SECS)
+                    .await?
+                {
                     return Ok(mcp_text(&format!(
                         "Governance skipped (cooldown: {remaining}s remaining). Use force=true to override."
                     )));
@@ -389,17 +413,55 @@ pub async fn call(
             let cleaned = sql.cleanup_stale(user_id).await?;
             sql.set_cooldown(user_id, "governance").await?;
 
+            // Audit log for quarantine/cleanup
+            if quarantined > 0 {
+                let payload = serde_json::json!({"quarantined": quarantined}).to_string();
+                sql.log_edit(
+                    user_id,
+                    "governance:quarantine",
+                    None,
+                    Some(&payload),
+                    &format!("quarantined {quarantined}"),
+                    None,
+                )
+                .await;
+            }
+            if cleaned > 0 {
+                let payload = serde_json::json!({"cleaned_stale": cleaned}).to_string();
+                sql.log_edit(
+                    user_id,
+                    "governance:cleanup",
+                    None,
+                    Some(&payload),
+                    &format!("cleaned_stale {cleaned}"),
+                    None,
+                )
+                .await;
+            }
+
             // Snapshot health
             let snap_health = {
                 let snaps = sqlx::query("SHOW SNAPSHOTS")
-                    .fetch_all(sql.pool()).await.unwrap_or_default();
+                    .fetch_all(sql.pool())
+                    .await
+                    .unwrap_or_default();
                 let total = snaps.len();
-                let auto = snaps.iter().filter(|r| {
-                    let name: String = r.try_get("SNAPSHOT_NAME").unwrap_or_default();
-                    name.starts_with("mem_milestone_") || name.starts_with("mem_snap_pre_")
-                }).count();
-                let ratio = if total > 0 { auto as f64 / total as f64 } else { 0.0 };
-                format!("snapshots: {total} total, {:.0}% auto-generated", ratio * 100.0)
+                let auto = snaps
+                    .iter()
+                    .filter(|r| {
+                        let name: String = r.try_get("SNAPSHOT_NAME").unwrap_or_default();
+                        name.starts_with("mem_milestone_") || name.starts_with("mem_snap_pre_")
+                    })
+                    .count();
+                let ratio = if total > 0 {
+                    auto as f64 / total as f64
+                } else {
+                    0.0
+                };
+                format!(
+                    "snapshots: {total} total, {:.0}% auto-generated",
+                    ratio * 100.0
+                )
             };
 
             Ok(mcp_text(&format!(
@@ -410,13 +472,17 @@ pub async fn call(
         "memory_rebuild_index" => {
             let table = args["table"].as_str().unwrap_or("mem_memories");
             if !["mem_memories", "memory_graph_nodes"].contains(&table) {
-                return Ok(mcp_text(&format!("Invalid table '{table}'. Use mem_memories or memory_graph_nodes")));
+                return Ok(mcp_text(&format!(
+                    "Invalid table '{table}'. Use mem_memories or memory_graph_nodes"
+                )));
             }
             let sql = match &service.sql_store {
                 Some(s) => s.clone(),
                 None => return Ok(mcp_text("Rebuild index requires SQL store")),
             };
-            let total_rows = sql.rebuild_vector_index(table).await
+            let total_rows = sql
+                .rebuild_vector_index(table)
+                .await
                 .map_err(|e| anyhow::anyhow!("rebuild index failed: {e}"))?;
             Ok(mcp_text(&format!(
                 "Rebuilt IVF index for {table}: rows={total_rows}"
@@ -431,7 +497,10 @@ pub async fn call(
             };
             const COOLDOWN_SECS: i64 = 1800; // 30 minutes
             if !force {
-                if let Some(remaining) = sql.check_cooldown(user_id, "consolidate", COOLDOWN_SECS).await? {
+                if let Some(remaining) = sql
+                    .check_cooldown(user_id, "consolidate", COOLDOWN_SECS)
+                    .await?
+                {
                     return Ok(mcp_text(&format!(
                         "Consolidation skipped (cooldown: {remaining}s remaining). Use force=true to override."
                     )));
@@ -469,13 +538,16 @@ pub async fn call(
 
             if mode == "internal" && service.llm.is_none() {
                 return Ok(mcp_text(
-                    "Reflection with internal LLM requires LLM_API_KEY to be set."
+                    "Reflection with internal LLM requires LLM_API_KEY to be set.",
                 ));
             }
 
             const COOLDOWN_SECS: i64 = 7200; // 2 hours
             if mode != "candidates" && !force {
-                if let Some(remaining) = sql.check_cooldown(user_id, "reflect", COOLDOWN_SECS).await? {
+                if let Some(remaining) = sql
+                    .check_cooldown(user_id, "reflect", COOLDOWN_SECS)
+                    .await?
+                {
                     return Ok(mcp_text(&format!(
                         "Reflection skipped (cooldown: {remaining}s remaining). Use force=true to override."
                     )));
@@ -488,7 +560,7 @@ pub async fn call(
             if clusters.is_empty() {
                 return Ok(mcp_text(
                     "No memory clusters found for reflection. \
-                     Store more memories across multiple sessions first."
+                     Store more memories across multiple sessions first.",
                 ));
             }
 
@@ -496,12 +568,14 @@ pub async fn call(
             if mode == "candidates" || service.llm.is_none() {
                 let mut parts = Vec::new();
                 for (i, (signal, importance, mems)) in clusters.iter().enumerate() {
-                    let mem_lines: Vec<String> = mems.iter()
+                    let mem_lines: Vec<String> = mems
+                        .iter()
                         .map(|(_, c, _)| format!("  - [semantic] {c}"))
                         .collect();
                     parts.push(format!(
                         "Cluster {} ({signal}, importance={importance:.3}):\n{}",
-                        i + 1, mem_lines.join("\n")
+                        i + 1,
+                        mem_lines.join("\n")
                     ));
                 }
                 return Ok(mcp_text(&format!(
@@ -518,23 +592,30 @@ pub async fn call(
             // Get existing high-confidence memories as "existing knowledge"
             let existing_rows = sqlx::query(
                 "SELECT content FROM mem_memories WHERE user_id = ? AND is_active = 1 \
-                 AND trust_tier IN ('T1','T2') ORDER BY created_at DESC LIMIT 10"
+                 AND trust_tier IN ('T1','T2') ORDER BY created_at DESC LIMIT 10",
             )
             .bind(user_id)
-            .fetch_all(sql.pool()).await.map_err(|e| anyhow::anyhow!("{e}"))?;
-            let existing_knowledge = existing_rows.iter()
+            .fetch_all(sql.pool())
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let existing_knowledge = existing_rows
+                .iter()
                 .filter_map(|r| r.try_get::<String, _>("content").ok())
-                .collect::<Vec<_>>().join("\n");
+                .collect::<Vec<_>>()
+                .join("\n");
 
             for (_, _, mems) in &clusters {
-                let experiences = mems.iter()
+                let experiences = mems
+                    .iter()
                     .map(|(_, c, _)| format!("- {c}"))
-                    .collect::<Vec<_>>().join("\n");
+                    .collect::<Vec<_>>()
+                    .join("\n");
 
                 let prompt = reflection_prompt(&experiences, &existing_knowledge);
-                let msgs = vec![
-                    memoria_embedding::ChatMessage { role: "user".to_string(), content: prompt }
-                ];
+                let msgs = vec![memoria_embedding::ChatMessage {
+                    role: "user".to_string(),
+                    content: prompt,
+                }];
                 let raw = match llm.chat(&msgs, 0.3, Some(400)).await {
                     Ok(r) => r,
                     Err(e) => {
@@ -546,7 +627,9 @@ pub async fn call(
                 // Parse JSON array from response
                 let start = raw.find('[').unwrap_or(raw.len());
                 let end = raw.rfind(']').map(|i| i + 1).unwrap_or(raw.len());
-                if start >= end { continue; }
+                if start >= end {
+                    continue;
+                }
                 let items: Vec<serde_json::Value> = match serde_json::from_str(&raw[start..end]) {
                     Ok(v) => v,
                     Err(_) => continue,
@@ -554,16 +637,24 @@ pub async fn call(
 
                 for item in &items {
                     let content = item["content"].as_str().unwrap_or("").trim().to_string();
-                    if content.is_empty() { continue; }
+                    if content.is_empty() {
+                        continue;
+                    }
                     let mt_str = item["type"].as_str().unwrap_or("semantic");
                     let mt = MemoryType::from_str(mt_str).unwrap_or(MemoryType::Semantic);
                     let confidence = item["confidence"].as_f64().unwrap_or(0.5) as f32;
                     // Store as T4 (unverified insight from reflection)
-                    let _ = service.store_memory(
-                        user_id, &content, mt, None,
-                        Some(TrustTier::from_str("T4").unwrap_or(TrustTier::T4Unverified)),
-                        None, None,
-                    ).await;
+                    let _ = service
+                        .store_memory(
+                            user_id,
+                            &content,
+                            mt,
+                            None,
+                            Some(TrustTier::from_str("T4").unwrap_or(TrustTier::T4Unverified)),
+                            None,
+                            None,
+                        )
+                        .await;
                     scenes_created += 1;
                     let _ = confidence; // used in future for graph node confidence
                 }
@@ -585,7 +676,7 @@ pub async fn call(
 
             if mode == "internal" && service.llm.is_none() {
                 return Ok(mcp_text(
-                    "LLM entity extraction requires LLM_API_KEY to be set."
+                    "LLM entity extraction requires LLM_API_KEY to be set.",
                 ));
             }
 
@@ -602,53 +693,76 @@ pub async fn call(
 
             // auto with LLM: extract via LLM and write directly
             if mode != "candidates" {
-              if let Some(llm) = service.llm.as_ref() {
-                let mut total_created = 0usize;
-                let mut total_edges = 0usize;
+                if let Some(llm) = service.llm.as_ref() {
+                    let mut total_created = 0usize;
+                    let mut total_edges = 0usize;
 
-                for (memory_id, content) in &unlinked {
-                    let prompt = entity_extract_prompt(content);
-                    let msgs = vec![
-                        memoria_embedding::ChatMessage { role: "user".to_string(), content: prompt }
-                    ];
-                    let raw = match llm.chat(&msgs, 0.0, Some(300)).await {
-                        Ok(r) => r,
-                        Err(_) => continue,
-                    };
-                    let start = raw.find('[').unwrap_or(raw.len());
-                    let end = raw.rfind(']').map(|i| i + 1).unwrap_or(raw.len());
-                    if start >= end { continue; }
-                    let items: Vec<serde_json::Value> = match serde_json::from_str(&raw[start..end]) {
-                        Ok(v) => v,
-                        Err(_) => continue,
-                    };
-                    for item in &items {
-                        let name = item["name"].as_str().unwrap_or("").trim().to_lowercase();
-                        if name.is_empty() { continue; }
-                        let display = item["name"].as_str().unwrap_or("").trim().to_string();
-                        let etype = item["type"].as_str().unwrap_or("concept").to_string();
-                        if let Ok((entity_id, is_new)) = graph.upsert_entity(user_id, &name, &display, &etype).await {
-                            let _ = graph.upsert_memory_entity_link(memory_id, &entity_id, user_id, "llm").await;
-                            if is_new { total_created += 1; total_edges += 1; }
+                    for (memory_id, content) in &unlinked {
+                        let prompt = entity_extract_prompt(content);
+                        let msgs = vec![memoria_embedding::ChatMessage {
+                            role: "user".to_string(),
+                            content: prompt,
+                        }];
+                        let raw = match llm.chat(&msgs, 0.0, Some(300)).await {
+                            Ok(r) => r,
+                            Err(_) => continue,
+                        };
+                        let start = raw.find('[').unwrap_or(raw.len());
+                        let end = raw.rfind(']').map(|i| i + 1).unwrap_or(raw.len());
+                        if start >= end {
+                            continue;
+                        }
+                        let items: Vec<serde_json::Value> =
+                            match serde_json::from_str(&raw[start..end]) {
+                                Ok(v) => v,
+                                Err(_) => continue,
+                            };
+                        let mut links: Vec<(String, String, &str)> = Vec::new();
+                        for item in &items {
+                            let name = item["name"].as_str().unwrap_or("").trim().to_lowercase();
+                            if name.is_empty() {
+                                continue;
+                            }
+                            let display = item["name"].as_str().unwrap_or("").trim().to_string();
+                            let etype = item["type"].as_str().unwrap_or("concept").to_string();
+                            if let Ok((entity_id, is_new)) =
+                                graph.upsert_entity(user_id, &name, &display, &etype).await
+                            {
+                                links.push((memory_id.to_string(), entity_id, "llm"));
+                                if is_new {
+                                    total_created += 1;
+                                    total_edges += 1;
+                                }
+                            }
+                        }
+                        if !links.is_empty() {
+                            let refs: Vec<(&str, &str, &str)> = links
+                                .iter()
+                                .map(|(m, e, s)| (m.as_str(), e.as_str(), *s))
+                                .collect();
+                            let _ = graph
+                                .batch_upsert_memory_entity_links(user_id, &refs)
+                                .await;
                         }
                     }
-                }
 
-                return Ok(mcp_text(&serde_json::to_string(&json!({
-                    "status": "done",
-                    "total_memories": unlinked.len(),
-                    "entities_found": total_created,
-                    "edges_created": total_edges
-                }))?));
-              }
+                    return Ok(mcp_text(&serde_json::to_string(&json!({
+                        "status": "done",
+                        "total_memories": unlinked.len(),
+                        "entities_found": total_created,
+                        "edges_created": total_edges
+                    }))?));
+                }
             }
 
             // candidates mode (or auto without LLM): return for agent to process
             let existing = graph.get_user_entities(user_id).await?;
-            let existing_json: Vec<serde_json::Value> = existing.iter()
+            let existing_json: Vec<serde_json::Value> = existing
+                .iter()
                 .map(|(name, etype)| json!({"name": name, "entity_type": etype}))
                 .collect();
-            let memories_json: Vec<serde_json::Value> = unlinked.iter()
+            let memories_json: Vec<serde_json::Value> = unlinked
+                .iter()
                 .map(|(mid, content)| json!({"memory_id": mid, "content": content}))
                 .collect();
 
@@ -670,11 +784,13 @@ pub async fn call(
 
             let parsed: Vec<serde_json::Value> = match serde_json::from_str(entities_str) {
                 Ok(v) => v,
-                Err(_) => return Ok(mcp_text(&serde_json::to_string(&json!({
-                    "status": "error",
-                    "error": "Invalid JSON",
-                    "expected_format": [{"memory_id": "...", "entities": [{"name": "...", "type": "..."}]}]
-                }))?)),
+                Err(_) => {
+                    return Ok(mcp_text(&serde_json::to_string(&json!({
+                        "status": "error",
+                        "error": "Invalid JSON",
+                        "expected_format": [{"memory_id": "...", "entities": [{"name": "...", "type": "..."}]}]
+                    }))?))
+                }
             };
 
             let graph = sql.graph_store();
@@ -687,23 +803,44 @@ pub async fn call(
                     Some(id) => id,
                     None => continue,
                 };
-                let ents: Vec<(String, String, String)> = item["entities"].as_array()
+                let ents: Vec<(String, String, String)> = item["entities"]
+                    .as_array()
                     .unwrap_or(&vec![])
                     .iter()
                     .filter_map(|e| {
                         let name = e["name"].as_str()?.trim().to_lowercase();
-                        if name.is_empty() { return None; }
+                        if name.is_empty() {
+                            return None;
+                        }
                         let display = e["name"].as_str().unwrap_or("").trim().to_string();
                         let etype = e["type"].as_str().unwrap_or("concept").to_string();
                         Some((name, display, etype))
                     })
                     .collect();
 
-                if ents.is_empty() { continue; }
+                if ents.is_empty() {
+                    continue;
+                }
+                let mut links: Vec<(String, String, &str)> = Vec::new();
                 for (name, display, etype) in &ents {
-                    let (entity_id, is_new) = graph.upsert_entity(user_id, name, display, etype).await?;
-                    graph.upsert_memory_entity_link(memory_id, &entity_id, user_id, "manual").await?;
-                    if is_new { total_created += 1; total_edges += 1; } else { total_reused += 1; }
+                    let (entity_id, is_new) =
+                        graph.upsert_entity(user_id, name, display, etype).await?;
+                    links.push((memory_id.to_string(), entity_id, "manual"));
+                    if is_new {
+                        total_created += 1;
+                        total_edges += 1;
+                    } else {
+                        total_reused += 1;
+                    }
+                }
+                if !links.is_empty() {
+                    let refs: Vec<(&str, &str, &str)> = links
+                        .iter()
+                        .map(|(m, e, s)| (m.as_str(), e.as_str(), *s))
+                        .collect();
+                    graph
+                        .batch_upsert_memory_entity_links(user_id, &refs)
+                        .await?;
                 }
             }
 
@@ -715,11 +852,64 @@ pub async fn call(
             }))?))
         }
 
+        "memory_feedback" => {
+            let memory_id = args["memory_id"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("memory_id is required"))?;
+            let signal = args["signal"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("signal is required"))?;
+            let context = args["context"].as_str();
+
+            let feedback_id = service
+                .record_feedback(user_id, memory_id, signal, context)
+                .await?;
+
+            Ok(mcp_text(&format!(
+                "Recorded feedback: memory={}, signal={}, feedback_id={}",
+                memory_id, signal, feedback_id
+            )))
+        }
+
+        "memory_get_retrieval_params" => {
+            let sql = service
+                .sql_store
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("SQL store not available"))?;
+            let params = sql.get_user_retrieval_params(user_id).await?;
+            Ok(mcp_text(&serde_json::to_string_pretty(&params)?))
+        }
+
+        "memory_tune_params" => {
+            use memoria_service::scoring::{DefaultScoringPlugin, ScoringPlugin};
+
+            let sql = service
+                .sql_store
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("SQL store not available"))?;
+
+            let old_params = sql.get_user_retrieval_params(user_id).await?;
+            let plugin = DefaultScoringPlugin;
+            match plugin.tune_params(sql.as_ref(), user_id).await? {
+                Some(new_params) => Ok(mcp_text(&format!(
+                    "Parameters tuned:\n  feedback_weight: {:.3} → {:.3}\n  temporal_decay_hours: {:.1} → {:.1}\n  confidence_weight: {:.3} → {:.3}",
+                    old_params.feedback_weight, new_params.feedback_weight,
+                    old_params.temporal_decay_hours, new_params.temporal_decay_hours,
+                    old_params.confidence_weight, new_params.confidence_weight
+                ))),
+                None => Ok(mcp_text(
+                    "Not enough feedback to tune parameters (minimum 10 feedback signals required)"
+                )),
+            }
+        }
+
         "memory_observe" => {
             let messages = args["messages"].as_array().cloned().unwrap_or_default();
             let session_id = args["session_id"].as_str().map(String::from);
 
-            let (memories, has_llm) = service.observe_turn(user_id, &messages, session_id.clone()).await?;
+            let (memories, has_llm) = service
+                .observe_turn(user_id, &messages, session_id.clone())
+                .await?;
 
             // Graph sync (best-effort) for each stored memory
             for m in &memories {
@@ -748,27 +938,42 @@ pub async fn call(
                     };
                     let _ = graph.create_node(&node).await;
                     let entities = memoria_storage::extract_entities(&m.content);
+                    let mut links: Vec<(String, String, &str)> = Vec::new();
                     for ent in &entities {
-                        if let Ok((entity_id, _)) = graph.upsert_entity(
-                            user_id, &ent.name, &ent.display, &ent.entity_type
-                        ).await {
-                            let _ = graph.upsert_memory_entity_link(
-                                &m.memory_id, &entity_id, user_id, "regex"
-                            ).await;
+                        if let Ok((entity_id, _)) = graph
+                            .upsert_entity(user_id, &ent.name, &ent.display, &ent.entity_type)
+                            .await
+                        {
+                            links.push((m.memory_id.clone(), entity_id, "regex"));
                         }
+                    }
+                    if !links.is_empty() {
+                        let refs: Vec<(&str, &str, &str)> = links
+                            .iter()
+                            .map(|(m, e, s)| (m.as_str(), e.as_str(), *s))
+                            .collect();
+                        let _ = graph
+                            .batch_upsert_memory_entity_links(user_id, &refs)
+                            .await;
                     }
                 }
             }
 
-            let stored: Vec<_> = memories.iter().map(|m| json!({
-                "memory_id": m.memory_id,
-                "content": m.content,
-                "memory_type": m.memory_type.to_string(),
-            })).collect();
+            let stored: Vec<_> = memories
+                .iter()
+                .map(|m| {
+                    json!({
+                        "memory_id": m.memory_id,
+                        "content": m.content,
+                        "memory_type": m.memory_type.to_string(),
+                    })
+                })
+                .collect();
 
             let mut result = json!({ "memories": stored });
             if !has_llm {
-                result["warning"] = json!("LLM not configured — storing messages as-is without extraction");
+                result["warning"] =
+                    json!("LLM not configured — storing messages as-is without extraction");
             }
             Ok(mcp_text(&serde_json::to_string_pretty(&result)?))
         }
@@ -784,7 +989,9 @@ fn mcp_text(text: &str) -> Value {
 fn format_purge_msg(base: &str, result: &memoria_service::PurgeResult) -> String {
     let mut msg = base.to_string();
     if let Some(snap) = &result.snapshot_name {
-        msg.push_str(&format!("\nSafety snapshot: {snap} (use memory_rollback to undo)"));
+        msg.push_str(&format!(
+            "\nSafety snapshot: {snap} (use memory_rollback to undo)"
+        ));
     }
     if let Some(warning) = &result.warning {
         msg.push_str(&format!("\n{warning}"));
@@ -809,7 +1016,9 @@ pub async fn build_reflect_clusters(
     }
 
     // Get recent semantic nodes as candidates
-    let semantic_nodes = graph.get_user_nodes(user_id, &memoria_storage::NodeType::Semantic, true).await?;
+    let semantic_nodes = graph
+        .get_user_nodes(user_id, &memoria_storage::NodeType::Semantic, true)
+        .await?;
     if semantic_nodes.len() < MIN_CLUSTER_SIZE {
         return Ok(vec![]);
     }
@@ -827,8 +1036,14 @@ pub async fn build_reflect_clusters(
     let mut adjacency: std::collections::HashMap<&str, Vec<&str>> = Default::default();
     for (src, tgt) in &edges {
         if node_set.contains(src.as_str()) && node_set.contains(tgt.as_str()) {
-            adjacency.entry(src.as_str()).or_default().push(tgt.as_str());
-            adjacency.entry(tgt.as_str()).or_default().push(src.as_str());
+            adjacency
+                .entry(src.as_str())
+                .or_default()
+                .push(tgt.as_str());
+            adjacency
+                .entry(tgt.as_str())
+                .or_default()
+                .push(src.as_str());
         }
     }
 
@@ -839,11 +1054,15 @@ pub async fn build_reflect_clusters(
     let mut visited = std::collections::HashSet::new();
     let mut clusters = Vec::new();
     for nid in &node_ids {
-        if visited.contains(nid.as_str()) { continue; }
+        if visited.contains(nid.as_str()) {
+            continue;
+        }
         let mut component = Vec::new();
         let mut queue = vec![nid.as_str()];
         while let Some(cur) = queue.pop() {
-            if !visited.insert(cur) { continue; }
+            if !visited.insert(cur) {
+                continue;
+            }
             if let Some(node) = node_map.get(cur) {
                 component.push(*node);
             }
@@ -854,19 +1073,27 @@ pub async fn build_reflect_clusters(
             }
         }
         if component.len() >= MIN_CLUSTER_SIZE {
-            let sessions: std::collections::HashSet<&str> = component.iter()
+            let sessions: std::collections::HashSet<&str> = component
+                .iter()
                 .filter_map(|n| n.session_id.as_deref())
                 .collect();
             if sessions.len() >= MIN_SESSIONS {
                 let has_conflict = component.iter().any(|n| n.conflicts_with.is_some());
-                let signal = if has_conflict { "contradiction" } else { "semantic_cluster" };
+                let signal = if has_conflict {
+                    "contradiction"
+                } else {
+                    "semantic_cluster"
+                };
                 let importance = 0.5 + (component.len() as f32 * 0.05).min(0.3);
-                let mems: Vec<(String, String, Option<String>)> = component.iter()
-                    .map(|n| (
-                        n.memory_id.clone().unwrap_or_else(|| n.node_id.clone()),
-                        n.content.clone(),
-                        n.session_id.clone(),
-                    ))
+                let mems: Vec<(String, String, Option<String>)> = component
+                    .iter()
+                    .map(|n| {
+                        (
+                            n.memory_id.clone().unwrap_or_else(|| n.node_id.clone()),
+                            n.content.clone(),
+                            n.session_id.clone(),
+                        )
+                    })
                     .collect();
                 clusters.push((signal.to_string(), importance, mems));
             }
@@ -875,11 +1102,19 @@ pub async fn build_reflect_clusters(
 
     // If no graph clusters (no edges yet), fall back to session-based grouping
     if clusters.is_empty() {
-        let mut by_session: std::collections::HashMap<String, Vec<(String, String, Option<String>)>> = Default::default();
+        let mut by_session: std::collections::HashMap<
+            String,
+            Vec<(String, String, Option<String>)>,
+        > = Default::default();
         for node in &nodes {
-            let sid = node.session_id.clone().unwrap_or_else(|| "default".to_string());
+            let sid = node
+                .session_id
+                .clone()
+                .unwrap_or_else(|| "default".to_string());
             by_session.entry(sid.clone()).or_default().push((
-                node.memory_id.clone().unwrap_or_else(|| node.node_id.clone()),
+                node.memory_id
+                    .clone()
+                    .unwrap_or_else(|| node.node_id.clone()),
                 node.content.clone(),
                 node.session_id.clone(),
             ));

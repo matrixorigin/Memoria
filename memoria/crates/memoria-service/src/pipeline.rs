@@ -66,7 +66,13 @@ impl MemoryPipeline {
                 result.memories_redacted += 1;
             }
 
-            let embedding = self.service.embed(&content).await;
+            let embedding = match self.service.embed(&content).await {
+                Ok(e) => e,
+                Err(e) => {
+                    result.errors.push(format!("embedding: {e}"));
+                    continue;
+                }
+            };
             validated.push(Memory {
                 memory_id: Uuid::new_v4().simple().to_string(),
                 user_id: user_id.to_string(),

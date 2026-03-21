@@ -1,6 +1,6 @@
 use thiserror::Error;
 
-#[derive(Debug, Error)]
+#[derive(Debug, Error, Clone)]
 pub enum MemoriaError {
     #[error("Invalid memory type: {0}")]
     InvalidMemoryType(String),
@@ -15,7 +15,7 @@ pub enum MemoriaError {
     Database(String),
 
     #[error("Serialization error: {0}")]
-    Serialization(#[from] serde_json::Error),
+    Serialization(String),
 
     #[error("Embedding error: {0}")]
     Embedding(String),
@@ -23,6 +23,15 @@ pub enum MemoriaError {
     #[error("Internal error: {0}")]
     Internal(String),
 
+    #[error("Validation error: {0}")]
+    Validation(String),
+
     #[error("Blocked: {0}")]
     Blocked(String),
+}
+
+impl From<serde_json::Error> for MemoriaError {
+    fn from(e: serde_json::Error) -> Self {
+        MemoriaError::Serialization(e.to_string())
+    }
 }

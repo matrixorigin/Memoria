@@ -1,7 +1,7 @@
 pub mod config;
 pub mod git_tools;
 pub mod remote;
-pub mod tools;
 mod server;
+pub mod tools;
 
-pub use server::{run_stdio, run_stdio_remote, run_sse};
+pub use server::{run_sse, run_stdio, run_stdio_remote};

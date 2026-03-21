@@ -148,7 +148,15 @@ impl GovernanceScheduler {
             }
         }
 
-        Ok(Self::from_parts(service, delegate.clone(), delegate, None, lock, instance_id, lock_ttl))
+        Ok(Self::from_parts(
+            service,
+            delegate.clone(),
+            delegate,
+            None,
+            lock,
+            instance_id,
+            lock_ttl,
+        ))
     }
 
     pub fn new_with_registry(
@@ -308,7 +316,11 @@ impl GovernanceScheduler {
         loop {
             ticker.tick().await;
             // Distributed leader election: only one instance runs each task
-            match self.lock.try_acquire(&lock_key, &self.instance_id, self.lock_ttl).await {
+            match self
+                .lock
+                .try_acquire(&lock_key, &self.instance_id, self.lock_ttl)
+                .await
+            {
                 Ok(true) => {}
                 Ok(false) => {
                     info!(
@@ -601,10 +613,15 @@ mod tests {
         async fn cleanup_orphan_branches(&self) -> Result<i64, crate::MemoriaError> {
             Ok(0)
         }
+        async fn cleanup_orphan_stats(&self) -> Result<i64, crate::MemoriaError> {
+            Ok(0)
+        }
+        async fn cleanup_edit_log(&self, _: i64) -> Result<i64, crate::MemoriaError> { Ok(0) }
+        async fn cleanup_feedback(&self, _: i64) -> Result<i64, crate::MemoriaError> { Ok(0) }
         async fn create_safety_snapshot(&self, _: &str) -> (Option<String>, Option<String>) {
             (Some("mem_snap_pre_daily_test".into()), None)
         }
-        async fn log_edit(&self, _: &str, _: &str, _: &[&str], _: &str, _: Option<&str>) {}
+        async fn log_edit(&self, _: &str, _: &str, _: Option<&str>, _: Option<&str>, _: &str, _: Option<&str>) {}
     }
 
     struct FallbackStore;
@@ -657,10 +674,15 @@ mod tests {
         async fn cleanup_orphan_branches(&self) -> Result<i64, crate::MemoriaError> {
             Ok(0)
         }
+        async fn cleanup_orphan_stats(&self) -> Result<i64, crate::MemoriaError> {
+            Ok(0)
+        }
+        async fn cleanup_edit_log(&self, _: i64) -> Result<i64, crate::MemoriaError> { Ok(0) }
+        async fn cleanup_feedback(&self, _: i64) -> Result<i64, crate::MemoriaError> { Ok(0) }
         async fn create_safety_snapshot(&self, _: &str) -> (Option<String>, Option<String>) {
             (Some("mem_snap_pre_daily_fallback".into()), None)
         }
-        async fn log_edit(&self, _: &str, _: &str, _: &[&str], _: &str, _: Option<&str>) {}
+        async fn log_edit(&self, _: &str, _: &str, _: Option<&str>, _: Option<&str>, _: &str, _: Option<&str>) {}
     }
 
     #[derive(Default)]
@@ -722,10 +744,15 @@ mod tests {
         async fn cleanup_orphan_branches(&self) -> Result<i64, crate::MemoriaError> {
             Ok(0)
         }
+        async fn cleanup_orphan_stats(&self) -> Result<i64, crate::MemoriaError> {
+            Ok(0)
+        }
+        async fn cleanup_edit_log(&self, _: i64) -> Result<i64, crate::MemoriaError> { Ok(0) }
+        async fn cleanup_feedback(&self, _: i64) -> Result<i64, crate::MemoriaError> { Ok(0) }
         async fn create_safety_snapshot(&self, _: &str) -> (Option<String>, Option<String>) {
             (None, None)
         }
-        async fn log_edit(&self, _: &str, _: &str, _: &[&str], _: &str, _: Option<&str>) {}
+        async fn log_edit(&self, _: &str, _: &str, _: Option<&str>, _: Option<&str>, _: &str, _: Option<&str>) {}
 
         async fn check_shared_breaker(
             &self,
@@ -1278,7 +1305,10 @@ mod tests {
             .unwrap();
 
         assert_eq!(scheduler.strategy.strategy_key(), "governance:default:v1");
-        assert_eq!(scheduler.fallback_strategy.strategy_key(), "governance:default:v1");
+        assert_eq!(
+            scheduler.fallback_strategy.strategy_key(),
+            "governance:default:v1"
+        );
     }
 
     /// In-memory distributed lock for testing leader election.
@@ -1288,13 +1318,20 @@ mod tests {
 
     impl InMemoryLock {
         fn new() -> Self {
-            Self { locks: Mutex::new(std::collections::HashMap::new()) }
+            Self {
+                locks: Mutex::new(std::collections::HashMap::new()),
+            }
         }
     }
 
     #[async_trait]
     impl crate::distributed::DistributedLock for InMemoryLock {
-        async fn try_acquire(&self, key: &str, holder: &str, _ttl: Duration) -> Result<bool, crate::MemoriaError> {
+        async fn try_acquire(
+            &self,
+            key: &str,
+            holder: &str,
+            _ttl: Duration,
+        ) -> Result<bool, crate::MemoriaError> {
             let mut locks = self.locks.lock().unwrap();
             if let Some(existing) = locks.get(key) {
                 return Ok(existing == holder);
@@ -1302,7 +1339,12 @@ mod tests {
             locks.insert(key.to_string(), holder.to_string());
             Ok(true)
         }
-        async fn renew(&self, key: &str, holder: &str, _ttl: Duration) -> Result<bool, crate::MemoriaError> {
+        async fn renew(
+            &self,
+            key: &str,
+            holder: &str,
+            _ttl: Duration,
+        ) -> Result<bool, crate::MemoriaError> {
             let locks = self.locks.lock().unwrap();
             Ok(locks.get(key).map_or(false, |h| h == holder))
         }
@@ -1347,16 +1389,28 @@ mod tests {
 
         // Simulate run_loop lock acquisition: A acquires first
         let lock_key = "governance:daily";
-        let acquired_a = shared_lock.try_acquire(lock_key, "instance_a", Duration::from_secs(120)).await.unwrap();
+        let acquired_a = shared_lock
+            .try_acquire(lock_key, "instance_a", Duration::from_secs(120))
+            .await
+            .unwrap();
         assert!(acquired_a, "instance_a should acquire the lock");
 
         // B tries to acquire — should fail
-        let acquired_b = shared_lock.try_acquire(lock_key, "instance_b", Duration::from_secs(120)).await.unwrap();
-        assert!(!acquired_b, "instance_b should NOT acquire while instance_a holds it");
+        let acquired_b = shared_lock
+            .try_acquire(lock_key, "instance_b", Duration::from_secs(120))
+            .await
+            .unwrap();
+        assert!(
+            !acquired_b,
+            "instance_b should NOT acquire while instance_a holds it"
+        );
 
         // Only A runs the task
         let exec_a = scheduler_a.run_task(GovernanceTask::Daily).await.unwrap();
-        assert_eq!(*strategy_a.tasks.lock().unwrap(), vec![GovernanceTask::Daily]);
+        assert_eq!(
+            *strategy_a.tasks.lock().unwrap(),
+            vec![GovernanceTask::Daily]
+        );
         assert_eq!(exec_a.report.status, StrategyStatus::Success);
 
         // B's strategy was never called
@@ -1364,13 +1418,140 @@ mod tests {
 
         // A releases, now B can acquire and run
         shared_lock.release(lock_key, "instance_a").await.unwrap();
-        let acquired_b = shared_lock.try_acquire(lock_key, "instance_b", Duration::from_secs(120)).await.unwrap();
+        let acquired_b = shared_lock
+            .try_acquire(lock_key, "instance_b", Duration::from_secs(120))
+            .await
+            .unwrap();
         assert!(acquired_b);
 
         let exec_b = scheduler_b.run_task(GovernanceTask::Daily).await.unwrap();
-        assert_eq!(*strategy_b.tasks.lock().unwrap(), vec![GovernanceTask::Daily]);
+        assert_eq!(
+            *strategy_b.tasks.lock().unwrap(),
+            vec![GovernanceTask::Daily]
+        );
         assert_eq!(exec_b.report.status, StrategyStatus::Success);
 
         shared_lock.release(lock_key, "instance_b").await.unwrap();
+    }
+
+    /// Gap: breaker state persists across scheduler instances sharing the same store.
+    /// Simulates process restart: scheduler_a opens the breaker, scheduler_b (new process)
+    /// sees the open breaker and uses fallback without calling primary.
+    #[tokio::test]
+    async fn scheduler_breaker_state_survives_across_instances() {
+        let shared_breaker = Arc::new(SharedBreakerStore::default());
+
+        // Instance A: fail twice to open the breaker (threshold=2)
+        let primary_a = Arc::new(CountingFailingStrategy::default());
+        let scheduler_a = GovernanceScheduler::new_with_components_and_breaker(
+            Some(shared_breaker.clone()),
+            None,
+            primary_a.clone(),
+            Arc::new(DefaultGovernanceStrategy),
+            true,
+            2,
+            Duration::from_secs(300),
+            None,
+            Arc::new(crate::distributed::NoopDistributedLock),
+            "instance_a".into(),
+            Duration::from_secs(120),
+        );
+
+        // Two failures → breaker opens
+        let _ = scheduler_a.run_task(GovernanceTask::Daily).await.unwrap();
+        let _ = scheduler_a.run_task(GovernanceTask::Daily).await.unwrap();
+        assert_eq!(*primary_a.calls.lock().unwrap(), 2);
+
+        // Drop scheduler_a, simulating process restart.
+        drop(scheduler_a);
+
+        // Instance B: new scheduler, same shared breaker store, fresh primary strategy
+        let primary_b = Arc::new(RecordingStrategy::default());
+        let scheduler_b = GovernanceScheduler::new_with_components_and_breaker(
+            Some(shared_breaker.clone()),
+            None,
+            primary_b.clone(),
+            Arc::new(DefaultGovernanceStrategy),
+            true,
+            2,
+            Duration::from_secs(300),
+            None,
+            Arc::new(crate::distributed::NoopDistributedLock),
+            "instance_b".into(),
+            Duration::from_secs(120),
+        );
+
+        let exec = scheduler_b.run_task(GovernanceTask::Daily).await.unwrap();
+
+        // Primary should NOT have been called — breaker is still open
+        assert!(
+            primary_b.tasks.lock().unwrap().is_empty(),
+            "primary_b should not be called while breaker is open"
+        );
+        assert_eq!(exec.report.status, StrategyStatus::Degraded);
+        assert!(exec.report.warnings.iter().any(|w| w.contains("circuit breaker is open")));
+    }
+
+    /// Gap: two scheduler instances competing for the same task — only one executes,
+    /// and both strategies produce correct results.
+    #[tokio::test]
+    async fn scheduler_two_instances_compete_only_winner_executes() {
+        let strategy_a = Arc::new(RecordingStrategy::default());
+        let strategy_b = Arc::new(RecordingStrategy::default());
+        let shared_lock = Arc::new(InMemoryLock::new());
+
+        let scheduler_a = Arc::new(GovernanceScheduler::new_with_components(
+            Some(Arc::new(FallbackStore)),
+            None,
+            strategy_a.clone(),
+            Arc::new(DefaultGovernanceStrategy),
+            true,
+            None,
+            shared_lock.clone(),
+            "instance_a".into(),
+            Duration::from_secs(120),
+        ));
+
+        let scheduler_b = Arc::new(GovernanceScheduler::new_with_components(
+            Some(Arc::new(FallbackStore)),
+            None,
+            strategy_b.clone(),
+            Arc::new(DefaultGovernanceStrategy),
+            true,
+            None,
+            shared_lock.clone(),
+            "instance_b".into(),
+            Duration::from_secs(120),
+        ));
+
+        // Both try to run hourly concurrently
+        let lock_key = "governance:hourly";
+        let a_got = shared_lock.try_acquire(lock_key, "instance_a", Duration::from_secs(120)).await.unwrap();
+        let b_got = shared_lock.try_acquire(lock_key, "instance_b", Duration::from_secs(120)).await.unwrap();
+
+        assert!(a_got ^ b_got, "exactly one should acquire the lock");
+
+        let (winner, loser_strategy) = if a_got {
+            (scheduler_a.clone(), strategy_b.clone())
+        } else {
+            (scheduler_b.clone(), strategy_a.clone())
+        };
+
+        let exec = winner.run_task(GovernanceTask::Hourly).await.unwrap();
+        assert_eq!(exec.report.status, StrategyStatus::Success);
+        assert!(loser_strategy.tasks.lock().unwrap().is_empty(), "loser should not have run");
+
+        // Release and let loser run
+        let holder = if a_got { "instance_a" } else { "instance_b" };
+        shared_lock.release(lock_key, holder).await.unwrap();
+
+        let loser = if a_got { scheduler_b.clone() } else { scheduler_a.clone() };
+        let loser_holder = if a_got { "instance_b" } else { "instance_a" };
+        let got = shared_lock.try_acquire(lock_key, loser_holder, Duration::from_secs(120)).await.unwrap();
+        assert!(got);
+
+        let exec2 = loser.run_task(GovernanceTask::Hourly).await.unwrap();
+        assert_eq!(exec2.report.status, StrategyStatus::Success);
+        shared_lock.release(lock_key, loser_holder).await.unwrap();
     }
 }

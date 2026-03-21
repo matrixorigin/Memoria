@@ -19,6 +19,21 @@ In practice that means:
 
 ## Quick Start
 
+### Preflight
+
+Verify prerequisites before installing:
+
+```bash
+openclaw --version
+# -> OpenClaw vX.Y.Z (CLI is installed and in PATH)
+
+memoria --version 2>/dev/null || echo "not installed (installer can install it)"
+# -> memoria X.Y.Z or fallback message
+
+openclaw plugins list
+# -> command succeeds and prints plugin table
+```
+
 Assume OpenClaw is already installed and healthy.
 
 ### Usage Paths

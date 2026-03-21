@@ -94,10 +94,15 @@ impl Config {
             governance_plugin_dir: std::env::var("MEMORIA_GOVERNANCE_PLUGIN_DIR")
                 .ok()
                 .filter(|s| !s.trim().is_empty()),
-            instance_id: std::env::var("MEMORIA_INSTANCE_ID")
-                .ok()
-                .filter(|s| !s.trim().is_empty())
-                .unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string()),
+            instance_id: {
+                let base = std::env::var("MEMORIA_INSTANCE_ID")
+                    .ok()
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string());
+                // Append PID so two processes with the same MEMORIA_INSTANCE_ID
+                // still get distinct holder IDs and cannot bypass the distributed lock.
+                format!("{}-{}", base, std::process::id())
+            },
             lock_ttl_secs: std::env::var("MEMORIA_LOCK_TTL_SECS")
                 .ok()
                 .and_then(|s| s.parse().ok())

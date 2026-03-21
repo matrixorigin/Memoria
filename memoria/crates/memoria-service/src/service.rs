@@ -7,7 +7,11 @@ use memoria_core::{
 use memoria_embedding::llm::ChatMessage;
 use memoria_embedding::LlmClient;
 use memoria_storage::SqlMemoryStore;
+use memoria_storage::EditLogEntry;
+use moka::future::Cache;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -86,6 +90,58 @@ pub struct PurgeResult {
     pub warning: Option<String>,
 }
 
+/// In-memory access counter that batches DB writes to avoid row-lock contention.
+/// Accumulates counts in a DashMap and flushes every `FLUSH_INTERVAL`.
+struct AccessCounter {
+    pending: Arc<dashmap::DashMap<String, AtomicU64>>,
+}
+
+const ACCESS_FLUSH_INTERVAL: Duration = Duration::from_secs(5);
+
+impl AccessCounter {
+    fn new(store: Arc<SqlMemoryStore>) -> Self {
+        let pending: Arc<dashmap::DashMap<String, AtomicU64>> = Arc::new(dashmap::DashMap::new());
+        let p = pending.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(ACCESS_FLUSH_INTERVAL).await;
+                Self::flush(&p, &store).await;
+            }
+        });
+        Self { pending }
+    }
+
+    fn bump(&self, ids: &[String]) {
+        for id in ids {
+            self.pending
+                .entry(id.clone())
+                .or_insert_with(|| AtomicU64::new(0))
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    async fn flush(
+        pending: &dashmap::DashMap<String, AtomicU64>,
+        store: &SqlMemoryStore,
+    ) {
+        // Drain all entries
+        let batch: Vec<(String, u64)> = pending
+            .iter()
+            .map(|e| (e.key().clone(), e.value().swap(0, Ordering::Relaxed)))
+            .filter(|(_, n)| *n > 0)
+            .collect();
+        // Remove zeroed entries to avoid unbounded growth
+        pending.retain(|_, v| v.load(Ordering::Relaxed) > 0);
+
+        if batch.is_empty() {
+            return;
+        }
+        if let Err(e) = store.bump_access_counts_batch(&batch).await {
+            tracing::warn!("access counter flush failed: {e}");
+        }
+    }
+}
+
 pub struct MemoryService {
     /// Trait-based store for generic ops (used by tests with MockStore)
     pub store: Arc<dyn MemoryStore>,
@@ -96,6 +152,12 @@ pub struct MemoryService {
     pub llm: Option<Arc<LlmClient>>,
     /// Async entity extraction queue (None when sql_store is absent)
     entity_tx: Option<tokio::sync::mpsc::UnboundedSender<EntityJob>>,
+    /// Batched access counter (None in tests)
+    access_counter: Option<AccessCounter>,
+    /// Per-user feedback_weight cache (TTL 5 min)
+    feedback_weight_cache: Cache<String, f64>,
+    /// Vector index monitor (None in tests)
+    vector_monitor: Option<Arc<crate::vector_index_monitor::VectorIndexMonitor>>,
 }
 
 /// A pending entity-extraction job pushed from the write path.
@@ -112,16 +174,7 @@ impl MemoryService {
         embedder: Option<Arc<dyn EmbeddingProvider>>,
     ) -> Self {
         let llm = LlmClient::from_env().map(Arc::new);
-        let (entity_tx, entity_rx) = tokio::sync::mpsc::unbounded_channel();
-        let svc = Self {
-            store: store.clone(),
-            sql_store: Some(store.clone()),
-            embedder,
-            llm: llm.clone(),
-            entity_tx: Some(entity_tx),
-        };
-        Self::spawn_entity_worker(entity_rx, store, llm);
-        svc
+        Self::new_sql_with_llm(store, embedder, llm)
     }
 
     /// Production constructor with explicit LLM client.
@@ -131,12 +184,29 @@ impl MemoryService {
         llm: Option<Arc<LlmClient>>,
     ) -> Self {
         let (entity_tx, entity_rx) = tokio::sync::mpsc::unbounded_channel();
+        
+        // 启动 vector index monitor + rebuild worker
+        let (rebuild_tx, rebuild_rx) = tokio::sync::mpsc::unbounded_channel();
+        crate::vector_index_monitor::init_coarse_clock();
+        let vector_monitor = Arc::new(crate::vector_index_monitor::VectorIndexMonitor::new(
+            "mem_memories".to_string(),
+            rebuild_tx,
+        ));
+        let worker = crate::rebuild_worker::RebuildWorker::new(store.clone(), rebuild_rx);
+        tokio::spawn(async move { worker.run().await });
+        
         let svc = Self {
             store: store.clone(),
             sql_store: Some(store.clone()),
             embedder,
             llm: llm.clone(),
             entity_tx: Some(entity_tx),
+            access_counter: Some(AccessCounter::new(store.clone())),
+            feedback_weight_cache: Cache::builder()
+                .max_capacity(10_000)
+                .time_to_live(Duration::from_secs(300))
+                .build(),
+            vector_monitor: Some(vector_monitor),
         };
         Self::spawn_entity_worker(entity_rx, store, llm);
         svc
@@ -150,6 +220,12 @@ impl MemoryService {
             embedder,
             llm: None,
             entity_tx: None,
+            access_counter: None,
+            feedback_weight_cache: Cache::builder()
+                .max_capacity(10_000)
+                .time_to_live(Duration::from_secs(300))
+                .build(),
+            vector_monitor: None,
         }
     }
 
@@ -180,22 +256,37 @@ impl MemoryService {
                 let graph = store.graph_store();
                 // 1. Regex extraction
                 let entities = memoria_storage::extract_entities(&job.content);
+                let mut links: Vec<(String, String, &str)> = Vec::new();
                 for ent in &entities {
                     if let Ok((eid, _)) = graph
                         .upsert_entity(&job.user_id, &ent.name, &ent.display, &ent.entity_type)
                         .await
                     {
-                        let _ = graph
-                            .upsert_memory_entity_link(&job.memory_id, &eid, &job.user_id, "regex")
-                            .await;
+                        links.push((job.memory_id.clone(), eid, "regex"));
                     }
+                }
+                if !links.is_empty() {
+                    let refs: Vec<(&str, &str, &str)> = links
+                        .iter()
+                        .map(|(m, e, s)| (m.as_str(), e.as_str(), *s))
+                        .collect();
+                    let _ = graph
+                        .batch_upsert_memory_entity_links(&job.user_id, &refs)
+                        .await;
                 }
                 // 2. Hybrid: if regex found few entities and content is long, try LLM
                 if entities.len() < Self::ENTITY_LLM_THRESHOLD
                     && job.content.len() >= Self::ENTITY_LLM_MIN_CONTENT_LEN
                 {
                     if let Some(ref llm) = llm {
-                        Self::llm_extract_entities(llm, &graph, &job.user_id, &job.memory_id, &job.content).await;
+                        Self::llm_extract_entities(
+                            llm,
+                            &graph,
+                            &job.user_id,
+                            &job.memory_id,
+                            &job.content,
+                        )
+                        .await;
                     }
                 }
             }
@@ -216,26 +307,46 @@ impl MemoryService {
              Rules: only specific named entities, max 10, deduplicate.\n\nText:\n{}\n\nJSON array:",
             memoria_core::truncate_utf8(content, 2000)
         );
-        let msgs = vec![ChatMessage { role: "user".into(), content: prompt }];
+        let msgs = vec![ChatMessage {
+            role: "user".into(),
+            content: prompt,
+        }];
         let raw = match llm.chat(&msgs, 0.0, Some(300)).await {
             Ok(r) => r,
-            Err(e) => { warn!(error = %e, "entity worker LLM extraction failed"); return; }
+            Err(e) => {
+                warn!(error = %e, "entity worker LLM extraction failed");
+                return;
+            }
         };
         let start = raw.find('[').unwrap_or(raw.len());
         let end = raw.rfind(']').map(|i| i + 1).unwrap_or(raw.len());
-        if start >= end { return; }
+        if start >= end {
+            return;
+        }
         let items: Vec<serde_json::Value> = match serde_json::from_str(&raw[start..end]) {
             Ok(v) => v,
             Err(_) => return,
         };
+        let mut links: Vec<(String, String, &str)> = Vec::new();
         for item in &items {
             let name = item["name"].as_str().unwrap_or("").trim().to_lowercase();
-            if name.is_empty() { continue; }
+            if name.is_empty() {
+                continue;
+            }
             let display = item["name"].as_str().unwrap_or("").trim().to_string();
             let etype = item["type"].as_str().unwrap_or("concept").to_string();
             if let Ok((eid, _)) = graph.upsert_entity(user_id, &name, &display, &etype).await {
-                let _ = graph.upsert_memory_entity_link(memory_id, &eid, user_id, "llm").await;
+                links.push((memory_id.to_string(), eid, "llm"));
             }
+        }
+        if !links.is_empty() {
+            let refs: Vec<(&str, &str, &str)> = links
+                .iter()
+                .map(|(m, e, s)| (m.as_str(), e.as_str(), *s))
+                .collect();
+            let _ = graph
+                .batch_upsert_memory_entity_links(user_id, &refs)
+                .await;
         }
     }
 
@@ -262,6 +373,7 @@ impl MemoryService {
         observed_at: Option<DateTime<Utc>>,
         initial_confidence: Option<f64>,
     ) -> Result<Memory, MemoriaError> {
+        let t0 = std::time::Instant::now();
         // Sensitivity check — block HIGH tier, redact MEDIUM tier
         let sensitivity = check_sensitivity(content);
         if sensitivity.blocked {
@@ -273,7 +385,8 @@ impl MemoryService {
         let content = sensitivity.redacted_content.as_deref().unwrap_or(content);
 
         let effective_tier = trust_tier.unwrap_or(TrustTier::T1Verified);
-        let embedding = self.embed(content).await;
+        let embedding = self.embed(content).await?;
+        let t_embed = t0.elapsed();
         let memory = Memory {
             memory_id: Uuid::new_v4().simple().to_string(),
             user_id: user_id.to_string(),
@@ -303,6 +416,7 @@ impl MemoryService {
                 // Assumes normalized embeddings (bge-m3, text-embedding-3-* all output unit vectors).
                 let l2_threshold = 0.3162;
                 let mtype = memory.memory_type.to_string();
+                let t1 = std::time::Instant::now();
                 if let Ok(Some((old_id, old_content, _dist))) = sql
                     .find_near_duplicate(
                         &table,
@@ -314,35 +428,38 @@ impl MemoryService {
                     )
                     .await
                 {
+                    let t_dedup = t1.elapsed();
                     if old_content.trim() != memory.content.trim() {
+                        let t2 = std::time::Instant::now();
                         sql.insert_into(&table, &memory).await?;
+                        let t_insert = t2.elapsed();
                         sql.supersede_memory(&table, &old_id, &memory.memory_id)
                             .await?;
-                        sql.log_edit(
-                            user_id,
-                            "inject",
-                            &[memory.memory_id.as_str()],
-                            "store_memory:supersede",
-                            None,
-                        )
-                        .await;
+                        let payload = serde_json::json!({"content": &memory.content, "type": memory.memory_type.to_string()}).to_string();
+                        sql.log_edit(user_id, "inject", Some(&memory.memory_id), Some(&payload), "store_memory:supersede", None).await;
                         self.enqueue_entity_extraction(user_id, &memory.memory_id, &memory.content);
+                        if t0.elapsed().as_secs() >= 1 { tracing::warn!(embed_ms = t_embed.as_millis() as u64, dedup_ms = t_dedup.as_millis() as u64, insert_ms = t_insert.as_millis() as u64, total_ms = t0.elapsed().as_millis() as u64, "store_memory slow (supersede)"); };
                         return Ok(memory);
                     }
                     // Same content — skip storing duplicate
+                    if t0.elapsed().as_secs() >= 1 { tracing::warn!(embed_ms = t_embed.as_millis() as u64, dedup_ms = t_dedup.as_millis() as u64, total_ms = t0.elapsed().as_millis() as u64, "store_memory slow (skip dup)"); };
                     return Ok(memory);
                 }
+                let t_dedup = t1.elapsed();
+                let t2 = std::time::Instant::now();
+                sql.insert_into(&table, &memory).await?;
+                let t_insert = t2.elapsed();
+                let payload = serde_json::json!({"content": &memory.content, "type": memory.memory_type.to_string()}).to_string();
+                sql.log_edit(user_id, "inject", Some(&memory.memory_id), Some(&payload), "store_memory", None).await;
+                self.enqueue_entity_extraction(user_id, &memory.memory_id, &memory.content);
+                if t0.elapsed().as_secs() >= 1 { tracing::warn!(embed_ms = t_embed.as_millis() as u64, dedup_ms = t_dedup.as_millis() as u64, insert_ms = t_insert.as_millis() as u64, total_ms = t0.elapsed().as_millis() as u64, "store_memory slow"); };
+            } else {
+                sql.insert_into(&table, &memory).await?;
+                let payload = serde_json::json!({"content": &memory.content, "type": memory.memory_type.to_string()}).to_string();
+                sql.log_edit(user_id, "inject", Some(&memory.memory_id), Some(&payload), "store_memory", None).await;
+                self.enqueue_entity_extraction(user_id, &memory.memory_id, &memory.content);
+                if t0.elapsed().as_secs() >= 1 { tracing::warn!(embed_ms = t_embed.as_millis() as u64, total_ms = t0.elapsed().as_millis() as u64, "store_memory slow (no embedding)"); };
             }
-            sql.insert_into(&table, &memory).await?;
-            sql.log_edit(
-                user_id,
-                "inject",
-                &[memory.memory_id.as_str()],
-                "store_memory",
-                None,
-            )
-            .await;
-            self.enqueue_entity_extraction(user_id, &memory.memory_id, &memory.content);
         } else {
             self.store.insert(&memory).await?;
         }
@@ -417,7 +534,7 @@ impl MemoryService {
         let (mems, _) = self
             .retrieve_inner(user_id, query, top_k, ExplainLevel::None)
             .await?;
-        self.bump_access_counts(&mems).await;
+        self.bump_access_counts(&mems);
         Ok(mems)
     }
 
@@ -431,7 +548,7 @@ impl MemoryService {
         let (mems, explain) = self
             .retrieve_inner(user_id, query, top_k, ExplainLevel::Basic)
             .await?;
-        self.bump_access_counts(&mems).await;
+        self.bump_access_counts(&mems);
         Ok((mems, explain))
     }
 
@@ -443,16 +560,24 @@ impl MemoryService {
         top_k: i64,
         level: ExplainLevel,
     ) -> Result<(Vec<Memory>, RetrievalExplain), MemoriaError> {
+        let start = std::time::Instant::now();
         let (mems, explain) = self.retrieve_inner(user_id, query, top_k, level).await?;
-        self.bump_access_counts(&mems).await;
+        self.bump_access_counts(&mems);
+        
+        // 记录查询到 vector monitor（轻量级，无阻塞）
+        if let Some(monitor) = &self.vector_monitor {
+            let elapsed_ms = start.elapsed().as_millis() as u64;
+            monitor.record_query(elapsed_ms, mems.len());
+        }
+        
         Ok((mems, explain))
     }
 
     /// Fire-and-forget bump of access counts for retrieved memories.
-    async fn bump_access_counts(&self, mems: &[Memory]) {
-        if let Some(sql) = &self.sql_store {
+    fn bump_access_counts(&self, mems: &[Memory]) {
+        if let Some(counter) = &self.access_counter {
             let ids: Vec<String> = mems.iter().map(|m| m.memory_id.clone()).collect();
-            let _ = sql.bump_access_counts(&ids).await;
+            counter.bump(&ids);
         }
     }
 
@@ -472,10 +597,12 @@ impl MemoryService {
 
         if let Some(sql) = &self.sql_store {
             let table = sql.active_table(user_id).await?;
+            // Load per-user feedback_weight lazily — only when needed for scoring
+            // (avoids extra DB query when fulltext fallback has no feedback to apply)
 
             // Phase 0: embed query
             let p0_start = std::time::Instant::now();
-            let emb = self.embed(query).await;
+            let emb = self.embed(query).await.unwrap_or(None);
             explain.embedding_ms = p0_start.elapsed().as_secs_f64() * 1000.0;
 
             // Phase 1: graph retrieval (activation-based)
@@ -529,7 +656,8 @@ impl MemoryService {
                         explain.vector_attempted = true;
                         let vs_start = std::time::Instant::now();
                         let (vec_results, scores) = if level.at_least(ExplainLevel::Verbose) {
-                            sql.search_hybrid_from_scored(&table, user_id, embedding, query, top_k)
+                            let fw = self.get_feedback_weight(user_id).await;
+                            sql.search_hybrid_from_scored(&table, user_id, embedding, query, top_k, fw)
                                 .await?
                         } else {
                             (
@@ -600,7 +728,8 @@ impl MemoryService {
                 explain.vector_attempted = true;
                 let vs_start = std::time::Instant::now();
                 let (results, scores) = if level.at_least(ExplainLevel::Verbose) {
-                    sql.search_hybrid_from_scored(&table, user_id, embedding, query, top_k)
+                    let fw = self.get_feedback_weight(user_id).await;
+                    sql.search_hybrid_from_scored(&table, user_id, embedding, query, top_k, fw)
                         .await?
                 } else {
                     (
@@ -637,11 +766,38 @@ impl MemoryService {
             // Phase 3: fulltext fallback
             explain.fulltext_attempted = true;
             let ft_start = std::time::Instant::now();
-            let results = sql
+            let mut results = sql
                 .search_fulltext_from(&table, user_id, query, top_k)
                 .await?;
             explain.fulltext_ms = ft_start.elapsed().as_secs_f64() * 1000.0;
             explain.fulltext_hit = !results.is_empty();
+
+            // Apply feedback adjustment to fulltext results
+            if !results.is_empty() {
+                let ids: Vec<String> = results.iter().map(|m| m.memory_id.clone()).collect();
+                if let Ok(fb_map) = sql.get_feedback_batch(&ids).await {
+                    let feedback_weight = self.get_feedback_weight(user_id).await;
+                    for m in &mut results {
+                        if let Some(fb) = fb_map.get(&m.memory_id) {
+                            let positive = fb.useful as f64;
+                            let negative = (fb.irrelevant + fb.outdated + fb.wrong) as f64;
+                            let feedback_delta = positive - 0.5 * negative;
+                            if feedback_delta.abs() > 0.01 {
+                                if let Some(score) = m.retrieval_score.as_mut() {
+                                    *score *= (1.0 + feedback_weight * feedback_delta).clamp(0.5, 2.0);
+                                }
+                            }
+                        }
+                    }
+                    // Re-sort after feedback adjustment
+                    results.sort_by(|a, b| {
+                        b.retrieval_score
+                            .partial_cmp(&a.retrieval_score)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                }
+            }
+
             explain.path = if explain.fulltext_hit {
                 "fulltext"
             } else {
@@ -671,7 +827,7 @@ impl MemoryService {
         }
 
         // Fallback for tests (no sql_store)
-        if let Some(emb) = self.embed(query).await {
+        if let Some(emb) = self.embed(query).await.unwrap_or(None) {
             explain.vector_attempted = true;
             let results = self.store.search_vector(user_id, &emb, top_k).await?;
             if !results.is_empty() {
@@ -744,7 +900,7 @@ impl MemoryService {
             memory_type: old.memory_type.clone(),
             trust_tier: TrustTier::T2Curated,
             initial_confidence: old.initial_confidence,
-            embedding: self.embed(new_content).await,
+            embedding: self.embed(new_content).await?,
             session_id: old.session_id.clone(),
             source_event_ids: vec![format!("correct:{}", memory_id)],
             extra_metadata: None,
@@ -760,22 +916,31 @@ impl MemoryService {
         // Store new memory
         self.store.insert(&new_mem).await?;
 
-        // Deactivate old and link to new via superseded_by
-        self.store.soft_delete(memory_id).await?;
         let user_id = old.user_id.clone();
-        let mut old_updated = old;
-        old_updated.superseded_by = Some(new_mem.memory_id.clone());
-        self.store.update(&old_updated).await?;
+        // Deactivate old and link to new via superseded_by
+        // Only update superseded_by — avoid touching content to skip fulltext index rebuild
+        self.store.soft_delete(memory_id).await?;
+        if let Some(sql) = &self.sql_store {
+            sqlx::query(
+                "UPDATE mem_memories SET superseded_by = ?, updated_at = NOW() WHERE memory_id = ?"
+            )
+            .bind(&new_mem.memory_id)
+            .bind(memory_id)
+            .execute(sql.pool())
+            .await
+            .map_err(|e| MemoriaError::Database(e.to_string()))?;
+        } else {
+            let mut old_updated = old;
+            old_updated.superseded_by = Some(new_mem.memory_id.clone());
+            self.store.update(&old_updated).await?;
+        }
 
         if let Some(sql) = &self.sql_store {
-            sql.log_edit(
-                &user_id,
-                "correct",
-                &[memory_id, new_mem.memory_id.as_str()],
-                "",
-                None,
-            )
-            .await;
+            let payload = serde_json::json!({
+                "new_content": new_content,
+                "new_memory_id": &new_mem.memory_id,
+            }).to_string();
+            sql.log_edit(&user_id, "correct", Some(memory_id), Some(&payload), "", None).await;
         }
 
         Ok(new_mem)
@@ -784,8 +949,7 @@ impl MemoryService {
     pub async fn purge(&self, user_id: &str, memory_id: &str) -> Result<PurgeResult, MemoriaError> {
         let (snap, warning) = if let Some(sql) = &self.sql_store {
             let (s, w) = sql.create_safety_snapshot("purge").await;
-            sql.log_edit(user_id, "purge", &[memory_id], "", s.as_deref())
-                .await;
+            sql.log_edit(user_id, "purge", Some(memory_id), None, "", s.as_deref()).await;
             (s, w)
         } else {
             (None, None)
@@ -813,8 +977,11 @@ impl MemoryService {
             self.store.soft_delete(id).await?;
         }
         if let Some(sql) = &self.sql_store {
-            sql.log_edit(user_id, "purge", ids, "", snap.as_deref())
-                .await;
+            let entries: Vec<EditLogEntry<'_>> = ids
+                .iter()
+                .map(|id| (user_id, "purge", Some(*id), None, "", snap.as_deref()))
+                .collect();
+            sql.batch_log_edit(&entries).await;
         }
         Ok(PurgeResult {
             purged: ids.len(),
@@ -837,15 +1004,12 @@ impl MemoryService {
                 self.store.soft_delete(id).await?;
                 let _ = sql.graph_store().deactivate_by_memory_id(id).await;
             }
-            let id_refs: Vec<&str> = ids.iter().map(|s| s.as_str()).collect();
-            sql.log_edit(
-                user_id,
-                "purge",
-                &id_refs,
-                &format!("topic:{topic}"),
-                snap.as_deref(),
-            )
-            .await;
+            let reason = format!("topic:{topic}");
+            let entries: Vec<EditLogEntry<'_>> = ids
+                .iter()
+                .map(|id| (user_id, "purge", Some(id.as_str()), None, reason.as_str(), snap.as_deref()))
+                .collect();
+            sql.batch_log_edit(&entries).await;
             Ok(PurgeResult {
                 purged: ids.len(),
                 snapshot_name: snap,
@@ -876,12 +1040,46 @@ impl MemoryService {
         self.store.list_active(user_id, limit).await
     }
 
-    pub async fn embed(&self, text: &str) -> Option<Vec<f32>> {
-        self.embedder.as_ref()?.embed(text).await.ok()
+    pub async fn embed(&self, text: &str) -> Result<Option<Vec<f32>>, MemoriaError> {
+        match self.embedder.as_ref() {
+            None => Ok(None),
+            Some(e) => match e.embed(text).await {
+                Ok(v) => Ok(Some(v)),
+                Err(err) => {
+                    tracing::warn!(error = %err, "embedding failed");
+                    Err(MemoriaError::Embedding(err.to_string()))
+                }
+            },
+        }
     }
 
-    pub async fn embed_batch(&self, texts: &[String]) -> Option<Vec<Vec<f32>>> {
-        self.embedder.as_ref()?.embed_batch(texts).await.ok()
+    pub async fn embed_batch(&self, texts: &[String]) -> Result<Option<Vec<Vec<f32>>>, MemoriaError> {
+        match self.embedder.as_ref() {
+            None => Ok(None),
+            Some(e) => match e.embed_batch(texts).await {
+                Ok(v) => Ok(Some(v)),
+                Err(err) => {
+                    tracing::warn!(error = %err, "batch embedding failed");
+                    Err(MemoriaError::Embedding(err.to_string()))
+                }
+            },
+        }
+    }
+
+    /// Get per-user feedback_weight with caching (TTL 5 min).
+    pub async fn get_feedback_weight(&self, user_id: &str) -> f64 {
+        if let Some(fw) = self.feedback_weight_cache.get(user_id).await {
+            return fw;
+        }
+        let fw = if let Some(sql) = &self.sql_store {
+            sql.get_user_retrieval_params(user_id).await
+                .map(|p| p.feedback_weight)
+                .unwrap_or(0.1)
+        } else {
+            0.1
+        };
+        self.feedback_weight_cache.insert(user_id.to_string(), fw).await;
+        fw
     }
 
     /// Batch store with single embedding API call for all memories.
@@ -911,7 +1109,7 @@ impl MemoryService {
         }
 
         // Batch embed
-        let embeddings = self.embed_batch(&contents).await;
+        let embeddings = self.embed_batch(&contents).await?;
 
         let mut results = Vec::with_capacity(checked_items.len());
         for (i, (content, mt, session_id, tier)) in checked_items.into_iter().enumerate() {
@@ -936,18 +1134,27 @@ impl MemoryService {
                 trust_tier: effective_tier,
                 retrieval_score: None,
             };
-            if let Some(sql) = &self.sql_store {
-                let table = sql.active_table(user_id).await?;
-                sql.insert_into(&table, &memory).await?;
-            } else {
-                self.store.insert(&memory).await?;
-            }
             results.push(memory);
         }
         if let Some(sql) = &self.sql_store {
-            let ids: Vec<&str> = results.iter().map(|m| m.memory_id.as_str()).collect();
-            sql.log_edit(user_id, "inject", &ids, "store_batch", None)
-                .await;
+            let table = sql.active_table(user_id).await?;
+            let refs: Vec<&Memory> = results.iter().collect();
+            sql.batch_insert_into(&table, &refs).await?;
+            let payloads: Vec<String> = results
+                .iter()
+                .map(|m| serde_json::json!({"content": &m.content, "type": m.memory_type.to_string()}).to_string())
+                .collect();
+            let log_entries: Vec<EditLogEntry<'_>> =
+                results
+                    .iter()
+                    .zip(payloads.iter())
+                    .map(|(m, p)| (user_id, "inject", Some(m.memory_id.as_str()), Some(p.as_str()), "store_batch", None))
+                    .collect();
+            sql.batch_log_edit(&log_entries).await;
+        } else {
+            for m in &results {
+                self.store.insert(m).await?;
+            }
         }
         Ok(results)
     }
@@ -1036,7 +1243,10 @@ impl MemoryService {
                 memory_type: mtype,
                 content: content.to_string(),
                 initial_confidence: confidence,
-                embedding: self.embed(content).await,
+                embedding: match self.embed(content).await {
+                    Ok(e) => e,
+                    Err(_) => continue,
+                },
                 source_event_ids: vec![],
                 superseded_by: None,
                 is_active: true,
@@ -1109,7 +1319,7 @@ impl MemoryService {
             mem.content = redacted.clone();
         }
         if mem.embedding.is_none() {
-            mem.embedding = self.embed(&mem.content).await;
+            mem.embedding = self.embed(&mem.content).await?;
         }
 
         if let Some(sql) = &self.sql_store {
@@ -1226,3 +1436,48 @@ Confidence guide:
 Do NOT extract: greetings, pure meta-conversation.
 If nothing worth remembering, return [].
 "#;
+
+// ── Feedback methods ──────────────────────────────────────────────────────────
+
+impl MemoryService {
+    /// Record explicit relevance feedback for a memory.
+    /// signal: "useful" | "irrelevant" | "outdated" | "wrong"
+    pub async fn record_feedback(
+        &self,
+        user_id: &str,
+        memory_id: &str,
+        signal: &str,
+        context: Option<&str>,
+    ) -> Result<String, MemoriaError> {
+        let sql = self
+            .sql_store
+            .as_ref()
+            .ok_or_else(|| MemoriaError::Internal("Feedback requires SQL store".into()))?;
+        sql.record_feedback(user_id, memory_id, signal, context)
+            .await
+    }
+
+    /// Get feedback statistics for a user.
+    pub async fn get_feedback_stats(
+        &self,
+        user_id: &str,
+    ) -> Result<memoria_storage::FeedbackStats, MemoriaError> {
+        let sql = self
+            .sql_store
+            .as_ref()
+            .ok_or_else(|| MemoriaError::Internal("Feedback requires SQL store".into()))?;
+        sql.get_feedback_stats(user_id).await
+    }
+
+    /// Get feedback breakdown by trust tier.
+    pub async fn get_feedback_by_tier(
+        &self,
+        user_id: &str,
+    ) -> Result<Vec<memoria_storage::TierFeedback>, MemoriaError> {
+        let sql = self
+            .sql_store
+            .as_ref()
+            .ok_or_else(|| MemoriaError::Internal("Feedback requires SQL store".into()))?;
+        sql.get_feedback_by_tier(user_id).await
+    }
+}

@@ -1,8 +1,8 @@
 //! Build graph nodes + association edges + entity links from existing memories.
 //! Equivalent to Python's ActivationIndexManager.backfill().
 
-use crate::graph::types::{GraphNode, NodeType};
 use crate::graph::ner;
+use crate::graph::types::{GraphNode, NodeType};
 use crate::store::SqlMemoryStore;
 use memoria_core::MemoriaError;
 use uuid::Uuid;
@@ -32,7 +32,11 @@ pub async fn backfill_graph(
             result.skipped += 1;
             continue;
         }
-        let importance = if mem.initial_confidence >= 0.85 { 0.6 } else { 0.5 };
+        let importance = if mem.initial_confidence >= 0.85 {
+            0.6
+        } else {
+            0.5
+        };
         let node = GraphNode {
             node_id: Uuid::new_v4().simple().to_string(),
             user_id: user_id.to_string(),
@@ -59,10 +63,14 @@ pub async fn backfill_graph(
 
         // Entity linking via NER + graph edges for spreading activation
         let entities = ner::extract_entities(&mem.content);
+        let mut links: Vec<(String, String, &str)> = Vec::new();
         for ent in &entities {
             let name = ent.name.to_lowercase();
-            if let Ok((entity_id, _created)) = graph.upsert_entity(user_id, &name, &ent.name, &ent.entity_type).await {
-                let _ = graph.upsert_memory_entity_link(&mem.memory_id, &entity_id, user_id, "ner").await;
+            if let Ok((entity_id, _created)) = graph
+                .upsert_entity(user_id, &name, &ent.name, &ent.entity_type)
+                .await
+            {
+                links.push((mem.memory_id.clone(), entity_id, "ner"));
                 result.entities_linked += 1;
 
                 // Create entity graph node if new (so spreading activation can reach it)
@@ -75,6 +83,15 @@ pub async fn backfill_graph(
                 //     ...
                 // }
             }
+        }
+        if !links.is_empty() {
+            let refs: Vec<(&str, &str, &str)> = links
+                .iter()
+                .map(|(m, e, s)| (m.as_str(), e.as_str(), *s))
+                .collect();
+            let _ = graph
+                .batch_upsert_memory_entity_links(user_id, &refs)
+                .await;
         }
     }
 

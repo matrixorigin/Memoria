@@ -56,7 +56,9 @@ pub struct GraphNode {
 
 impl GraphNode {
     pub fn age_days(&self) -> i64 {
-        let Some(created) = self.created_at else { return 0 };
+        let Some(created) = self.created_at else {
+            return 0;
+        };
         let now = chrono::Utc::now().naive_utc();
         (now - created).num_days().max(0)
     }

@@ -138,18 +138,22 @@ pub struct RulesQuery {
 
 pub async fn list_signers(
     State(state): State<AppState>,
-    _user: AuthUser,
+    auth: AuthUser,
 ) -> Result<Json<SignerResponse>, (StatusCode, String)> {
+    auth.require_master()?;
     let store = get_store(&state)?;
-    let signers = plugin::list_trusted_plugin_signers(store).await.map_err(api_err)?;
+    let signers = plugin::list_trusted_plugin_signers(store)
+        .await
+        .map_err(api_err)?;
     Ok(Json(SignerResponse { signers }))
 }
 
 pub async fn upsert_signer(
     State(state): State<AppState>,
-    _user: AuthUser,
+    auth: AuthUser,
     Json(req): Json<SignerRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    auth.require_master()?;
     let store = get_store(&state)?;
     plugin::upsert_trusted_plugin_signer(store, &req.signer, &req.public_key, &req.actor)
         .await
@@ -159,19 +163,29 @@ pub async fn upsert_signer(
 
 pub async fn publish_package(
     State(state): State<AppState>,
-    _user: AuthUser,
+    auth: AuthUser,
     Json(req): Json<PublishRequest>,
 ) -> Result<Json<plugin::PluginRepositoryEntry>, (StatusCode, String)> {
+    auth.require_master()?;
     if !req.files.contains_key("manifest.json") {
-        return Err((StatusCode::BAD_REQUEST, "files must include manifest.json".into()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "files must include manifest.json".into(),
+        ));
     }
-    let dir = tempfile::tempdir().map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let dir =
+        tempfile::tempdir().map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     for (name, b64) in &req.files {
         // Reject path traversal
         if name.contains("..") || name.starts_with('/') {
             return Err((StatusCode::BAD_REQUEST, format!("invalid filename: {name}")));
         }
-        let bytes = BASE64.decode(b64).map_err(|e| (StatusCode::BAD_REQUEST, format!("base64 decode {name}: {e}")))?;
+        let bytes = BASE64.decode(b64).map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("base64 decode {name}: {e}"),
+            )
+        })?;
         std::fs::write(dir.path().join(name), bytes)
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     }
@@ -184,9 +198,10 @@ pub async fn publish_package(
 
 pub async fn list_packages(
     State(state): State<AppState>,
-    _user: AuthUser,
+    auth: AuthUser,
     Query(q): Query<ListQuery>,
 ) -> Result<Json<Vec<plugin::PluginRepositoryEntry>>, (StatusCode, String)> {
+    auth.require_master()?;
     let store = get_store(&state)?;
     let entries = plugin::list_plugin_repository_entries(store, q.domain.as_deref())
         .await
@@ -196,10 +211,11 @@ pub async fn list_packages(
 
 pub async fn review_package(
     State(state): State<AppState>,
-    _user: AuthUser,
+    auth: AuthUser,
     Path((plugin_key, version)): Path<(String, String)>,
     Json(req): Json<ReviewRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    auth.require_master()?;
     let store = get_store(&state)?;
     plugin::review_plugin_package(
         store,
@@ -216,10 +232,11 @@ pub async fn review_package(
 
 pub async fn score_package(
     State(state): State<AppState>,
-    _user: AuthUser,
+    auth: AuthUser,
     Path((plugin_key, version)): Path<(String, String)>,
     Json(req): Json<ScoreRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    auth.require_master()?;
     let store = get_store(&state)?;
     plugin::score_plugin_package(
         store,
@@ -236,10 +253,11 @@ pub async fn score_package(
 
 pub async fn upsert_binding_rule(
     State(state): State<AppState>,
-    _user: AuthUser,
+    auth: AuthUser,
     Path(domain): Path<String>,
     Json(req): Json<BindingRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    auth.require_master()?;
     let store = get_store(&state)?;
     plugin::upsert_plugin_binding_rule(
         store,
@@ -263,10 +281,11 @@ pub async fn upsert_binding_rule(
 
 pub async fn activate_binding(
     State(state): State<AppState>,
-    _user: AuthUser,
+    auth: AuthUser,
     Path(domain): Path<String>,
     Json(req): Json<ActivateRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    auth.require_master()?;
     let store = get_store(&state)?;
     plugin::activate_plugin_binding(
         store,
@@ -283,10 +302,11 @@ pub async fn activate_binding(
 
 pub async fn list_binding_rules(
     State(state): State<AppState>,
-    _user: AuthUser,
+    auth: AuthUser,
     Path(domain): Path<String>,
     Query(q): Query<RulesQuery>,
 ) -> Result<Json<Vec<plugin::PluginBindingRule>>, (StatusCode, String)> {
+    auth.require_master()?;
     let store = get_store(&state)?;
     let rules = plugin::list_binding_rules(store, &domain, &q.binding)
         .await
@@ -296,9 +316,10 @@ pub async fn list_binding_rules(
 
 pub async fn list_compatibility_matrix(
     State(state): State<AppState>,
-    _user: AuthUser,
+    auth: AuthUser,
     Query(q): Query<ListQuery>,
 ) -> Result<Json<Vec<plugin::PluginCompatibilityEntry>>, (StatusCode, String)> {
+    auth.require_master()?;
     let store = get_store(&state)?;
     let entries = plugin::list_plugin_compatibility_matrix(store, q.domain.as_deref())
         .await
@@ -308,9 +329,10 @@ pub async fn list_compatibility_matrix(
 
 pub async fn list_audit_events(
     State(state): State<AppState>,
-    _user: AuthUser,
+    auth: AuthUser,
     Query(q): Query<EventsQuery>,
 ) -> Result<Json<Vec<plugin::PluginAuditEvent>>, (StatusCode, String)> {
+    auth.require_master()?;
     let store = get_store(&state)?;
     let events = plugin::get_plugin_audit_events(
         store,
