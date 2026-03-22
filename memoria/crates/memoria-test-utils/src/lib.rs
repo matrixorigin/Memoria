@@ -60,37 +60,35 @@ pub async fn spawn_fake_llm(
 
     let app = axum::Router::new().route(
         "/chat/completions",
-        axum::routing::post(
-            move |axum::Json(payload): axum::Json<serde_json::Value>| {
-                let rules = Arc::clone(&rules_c);
-                let fallback = Arc::clone(&fallback_c);
-                async move {
-                    let prompt = payload["messages"]
-                        .as_array()
-                        .and_then(|msgs| msgs.last())
-                        .and_then(|m| m["content"].as_str())
-                        .unwrap_or("");
-                    let content = rules
-                        .iter()
-                        .find(|(needle, _)| prompt.contains(needle.as_str()))
-                        .map(|(_, resp)| resp.clone())
-                        .unwrap_or_else(|| fallback.as_str().to_string());
-                    axum::Json(serde_json::json!({
-                        "choices": [{"message": {"content": content}}]
-                    }))
-                }
-            },
-        ),
+        axum::routing::post(move |axum::Json(payload): axum::Json<serde_json::Value>| {
+            let rules = Arc::clone(&rules_c);
+            let fallback = Arc::clone(&fallback_c);
+            async move {
+                let prompt = payload["messages"]
+                    .as_array()
+                    .and_then(|msgs| msgs.last())
+                    .and_then(|m| m["content"].as_str())
+                    .unwrap_or("");
+                let content = rules
+                    .iter()
+                    .find(|(needle, _)| prompt.contains(needle.as_str()))
+                    .map(|(_, resp)| resp.clone())
+                    .unwrap_or_else(|| fallback.as_str().to_string());
+                axum::Json(serde_json::json!({
+                    "choices": [{"message": {"content": content}}]
+                }))
+            }
+        }),
     );
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     tokio::spawn(async move {
         axum::serve(listener, app)
-            .with_graceful_shutdown(async { let _ = shutdown_rx.await; })
+            .with_graceful_shutdown(async {
+                let _ = shutdown_rx.await;
+            })
             .await
             .unwrap();
     });

@@ -55,7 +55,10 @@ pub fn build_router(state: AppState) -> Router {
             "/v1/memories/:id/feedback",
             post(routes::memory::record_feedback),
         )
-        .route("/v1/feedback/stats", get(routes::memory::get_feedback_stats))
+        .route(
+            "/v1/feedback/stats",
+            get(routes::memory::get_feedback_stats),
+        )
         .route(
             "/v1/feedback/by-tier",
             get(routes::memory::get_feedback_by_tier),
@@ -210,27 +213,36 @@ pub fn build_router(state: AppState) -> Router {
         )
         .with_state(state)
         .layer(DefaultBodyLimit::max(2 * 1024 * 1024)) // 2 MB
-        .layer(tower_http::trace::TraceLayer::new_for_http()
-            .make_span_with(|req: &axum::http::Request<_>| {
-                tracing::info_span!(
-                    "http",
-                    method = %req.method(),
-                    path = %req.uri().path(),
-                )
-            })
-            .on_response(|res: &axum::http::Response<_>, latency: std::time::Duration, _span: &tracing::Span| {
-                let status = res.status().as_u16();
-                if status >= 500 {
-                    tracing::error!(status, latency_ms = latency.as_millis(), "response");
-                } else if status == 429 {
-                    // rate-limit hits are operationally important
-                    tracing::warn!(status, latency_ms = latency.as_millis(), "response");
-                } else if latency.as_secs() >= 2 {
-                    tracing::warn!(status, latency_ms = latency.as_millis(), "slow response");
-                } else {
-                    tracing::debug!(status, latency_ms = latency.as_millis(), "response");
-                }
-            })
+        .layer(
+            tower_http::trace::TraceLayer::new_for_http()
+                .make_span_with(|req: &axum::http::Request<_>| {
+                    tracing::info_span!(
+                        "http",
+                        method = %req.method(),
+                        path = %req.uri().path(),
+                    )
+                })
+                .on_response(
+                    |res: &axum::http::Response<_>,
+                     latency: std::time::Duration,
+                     _span: &tracing::Span| {
+                        let status = res.status().as_u16();
+                        if status >= 500 {
+                            tracing::error!(status, latency_ms = latency.as_millis(), "response");
+                        } else if status == 429 {
+                            // rate-limit hits are operationally important
+                            tracing::warn!(status, latency_ms = latency.as_millis(), "response");
+                        } else if latency.as_secs() >= 2 {
+                            tracing::warn!(
+                                status,
+                                latency_ms = latency.as_millis(),
+                                "slow response"
+                            );
+                        } else {
+                            tracing::debug!(status, latency_ms = latency.as_millis(), "response");
+                        }
+                    },
+                ),
         )
         .layer(CatchPanicLayer::custom(
             |err: Box<dyn std::any::Any + Send>| {

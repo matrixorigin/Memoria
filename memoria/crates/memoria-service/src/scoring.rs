@@ -169,15 +169,25 @@ mod tests {
         assert!((plugin.adjust_score(1.0, &fb_none, &params) - 1.0).abs() < 0.001);
 
         // 2 useful → 1.2x boost (0.1 * 2 = 0.2)
-        let fb_useful = MemoryFeedback { useful: 2, ..Default::default() };
+        let fb_useful = MemoryFeedback {
+            useful: 2,
+            ..Default::default()
+        };
         assert!((plugin.adjust_score(1.0, &fb_useful, &params) - 1.2).abs() < 0.001);
 
         // 2 wrong → 0.9x penalty (0.1 * -1 = -0.1)
-        let fb_wrong = MemoryFeedback { wrong: 2, ..Default::default() };
+        let fb_wrong = MemoryFeedback {
+            wrong: 2,
+            ..Default::default()
+        };
         assert!((plugin.adjust_score(1.0, &fb_wrong, &params) - 0.9).abs() < 0.001);
 
         // 2 useful, 3 wrong → 1.05x (2 - 1.5 = 0.5, 0.1 * 0.5 = 0.05)
-        let fb_mixed = MemoryFeedback { useful: 2, wrong: 3, ..Default::default() };
+        let fb_mixed = MemoryFeedback {
+            useful: 2,
+            wrong: 3,
+            ..Default::default()
+        };
         assert!((plugin.adjust_score(1.0, &fb_mixed, &params) - 1.05).abs() < 0.001);
     }
 
@@ -187,11 +197,17 @@ mod tests {
         let params = UserRetrievalParams::default();
 
         // Extreme positive → clamped to 2.0
-        let fb_extreme = MemoryFeedback { useful: 100, ..Default::default() };
+        let fb_extreme = MemoryFeedback {
+            useful: 100,
+            ..Default::default()
+        };
         assert!((plugin.adjust_score(1.0, &fb_extreme, &params) - 2.0).abs() < 0.001);
 
         // Extreme negative → clamped to 0.5
-        let fb_extreme_neg = MemoryFeedback { wrong: 100, ..Default::default() };
+        let fb_extreme_neg = MemoryFeedback {
+            wrong: 100,
+            ..Default::default()
+        };
         assert!((plugin.adjust_score(1.0, &fb_extreme_neg, &params) - 0.5).abs() < 0.001);
     }
 
@@ -220,46 +236,76 @@ mod tests {
 
         // Case 1: negative_ratio > 0.5 → weight decreases
         let store = MockStore {
-            totals: FeedbackTotals { useful: 2, irrelevant: 5, outdated: 0, wrong: 5 },
+            totals: FeedbackTotals {
+                useful: 2,
+                irrelevant: 5,
+                outdated: 0,
+                wrong: 5,
+            },
             params: std::sync::Mutex::new(UserRetrievalParams::default()),
         };
         let result = plugin.tune_params(&store, "u1").await.unwrap().unwrap();
         assert!(
             (result.feedback_weight - 0.09).abs() < 0.001,
-            "negative feedback should decrease weight: got {:.4}", result.feedback_weight
+            "negative feedback should decrease weight: got {:.4}",
+            result.feedback_weight
         );
 
         // Case 2: neutral zone (neither branch) → weight unchanged
         let store2 = MockStore {
-            totals: FeedbackTotals { useful: 5, irrelevant: 3, outdated: 2, wrong: 2 },
+            totals: FeedbackTotals {
+                useful: 5,
+                irrelevant: 3,
+                outdated: 2,
+                wrong: 2,
+            },
             params: std::sync::Mutex::new(UserRetrievalParams::default()),
         };
         let result2 = plugin.tune_params(&store2, "u2").await.unwrap().unwrap();
         assert!(
             (result2.feedback_weight - 0.1).abs() < 0.001,
-            "neutral feedback should not change weight: got {:.4}", result2.feedback_weight
+            "neutral feedback should not change weight: got {:.4}",
+            result2.feedback_weight
         );
 
         // Case 3: weight clamped at max 0.2
         let store3 = MockStore {
-            totals: FeedbackTotals { useful: 10, irrelevant: 0, outdated: 0, wrong: 0 },
-            params: std::sync::Mutex::new(UserRetrievalParams { feedback_weight: 0.19, ..Default::default() }),
+            totals: FeedbackTotals {
+                useful: 10,
+                irrelevant: 0,
+                outdated: 0,
+                wrong: 0,
+            },
+            params: std::sync::Mutex::new(UserRetrievalParams {
+                feedback_weight: 0.19,
+                ..Default::default()
+            }),
         };
         let result3 = plugin.tune_params(&store3, "u3").await.unwrap().unwrap();
         assert!(
             (result3.feedback_weight - 0.2).abs() < 0.001,
-            "weight should be clamped at 0.2: got {:.4}", result3.feedback_weight
+            "weight should be clamped at 0.2: got {:.4}",
+            result3.feedback_weight
         );
 
         // Case 4: weight clamped at min 0.05
         let store4 = MockStore {
-            totals: FeedbackTotals { useful: 0, irrelevant: 6, outdated: 0, wrong: 6 },
-            params: std::sync::Mutex::new(UserRetrievalParams { feedback_weight: 0.051, ..Default::default() }),
+            totals: FeedbackTotals {
+                useful: 0,
+                irrelevant: 6,
+                outdated: 0,
+                wrong: 6,
+            },
+            params: std::sync::Mutex::new(UserRetrievalParams {
+                feedback_weight: 0.051,
+                ..Default::default()
+            }),
         };
         let result4 = plugin.tune_params(&store4, "u4").await.unwrap().unwrap();
         assert!(
             (result4.feedback_weight - 0.05).abs() < 0.001,
-            "weight should be clamped at 0.05: got {:.4}", result4.feedback_weight
+            "weight should be clamped at 0.05: got {:.4}",
+            result4.feedback_weight
         );
     }
 
@@ -268,14 +314,21 @@ mod tests {
     #[test]
     fn test_feedback_weight_affects_ranking_spread() {
         let plugin = DefaultScoringPlugin;
-        let fb = MemoryFeedback { useful: 3, wrong: 1, ..Default::default() };
+        let fb = MemoryFeedback {
+            useful: 3,
+            wrong: 1,
+            ..Default::default()
+        };
         // net delta = 3 - 0.5*1 = 2.5
 
         let weights = [0.05, 0.1, 0.15, 0.2];
         let scores: Vec<f64> = weights
             .iter()
             .map(|&w| {
-                let p = UserRetrievalParams { feedback_weight: w, ..Default::default() };
+                let p = UserRetrievalParams {
+                    feedback_weight: w,
+                    ..Default::default()
+                };
                 plugin.adjust_score(1.0, &fb, &p)
             })
             .collect();
@@ -285,7 +338,10 @@ mod tests {
             assert!(
                 scores[i] > scores[i - 1],
                 "weight {:.2} score {:.4} should > weight {:.2} score {:.4}",
-                weights[i], scores[i], weights[i - 1], scores[i - 1]
+                weights[i],
+                scores[i],
+                weights[i - 1],
+                scores[i - 1]
             );
         }
 
@@ -304,9 +360,16 @@ mod tests {
         let params = UserRetrievalParams::default(); // weight=0.1
 
         let base = 0.85;
-        let fb_positive = MemoryFeedback { useful: 4, ..Default::default() };
+        let fb_positive = MemoryFeedback {
+            useful: 4,
+            ..Default::default()
+        };
         let fb_neutral = MemoryFeedback::default();
-        let fb_negative = MemoryFeedback { irrelevant: 2, wrong: 2, ..Default::default() };
+        let fb_negative = MemoryFeedback {
+            irrelevant: 2,
+            wrong: 2,
+            ..Default::default()
+        };
 
         let s_pos = plugin.adjust_score(base, &fb_positive, &params);
         let s_neu = plugin.adjust_score(base, &fb_neutral, &params);

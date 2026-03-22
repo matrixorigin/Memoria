@@ -88,24 +88,26 @@ async fn collect_metrics(state: &AppState) -> Result<Arc<String>, String> {
     out.push_str(&format!("memoria_users_total {users}\n"));
 
     // ── Feedback counts ───────────────────────────────────────────────────
-    let fb_rows: Vec<(String, i64)> = sqlx::query_as(
-        "SELECT signal, COUNT(*) FROM mem_retrieval_feedback GROUP BY signal",
-    )
-    .fetch_all(pool)
-    .await
-    .unwrap_or_default();
+    let fb_rows: Vec<(String, i64)> =
+        sqlx::query_as("SELECT signal, COUNT(*) FROM mem_retrieval_feedback GROUP BY signal")
+            .fetch_all(pool)
+            .await
+            .unwrap_or_default();
 
     out.push_str("# HELP memoria_feedback_total Feedback signals by type.\n");
     out.push_str("# TYPE memoria_feedback_total counter\n");
     for (signal, cnt) in &fb_rows {
-        out.push_str(&format!("memoria_feedback_total{{signal=\"{signal}\"}} {cnt}\n"));
+        out.push_str(&format!(
+            "memoria_feedback_total{{signal=\"{signal}\"}} {cnt}\n"
+        ));
     }
 
     // ── Entity graph ──────────────────────────────────────────────────────
-    let (nodes,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM memory_graph_nodes WHERE is_active = 1")
-        .fetch_one(pool)
-        .await
-        .unwrap_or((0,));
+    let (nodes,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM memory_graph_nodes WHERE is_active = 1")
+            .fetch_one(pool)
+            .await
+            .unwrap_or((0,));
     let (edges,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM memory_graph_edges")
         .fetch_one(pool)
         .await
@@ -134,17 +136,18 @@ async fn collect_metrics(state: &AppState) -> Result<Arc<String>, String> {
     out.push_str(&format!("memoria_branches_total {}\n", branches.len()));
 
     // ── Async tasks ───────────────────────────────────────────────────────
-    let task_rows: Vec<(String, i64)> = sqlx::query_as(
-        "SELECT status, COUNT(*) FROM mem_async_tasks GROUP BY status",
-    )
-    .fetch_all(pool)
-    .await
-    .unwrap_or_default();
+    let task_rows: Vec<(String, i64)> =
+        sqlx::query_as("SELECT status, COUNT(*) FROM mem_async_tasks GROUP BY status")
+            .fetch_all(pool)
+            .await
+            .unwrap_or_default();
 
     out.push_str("# HELP memoria_async_tasks Async tasks by status.\n");
     out.push_str("# TYPE memoria_async_tasks gauge\n");
     for (status, cnt) in &task_rows {
-        out.push_str(&format!("memoria_async_tasks{{status=\"{status}\"}} {cnt}\n"));
+        out.push_str(&format!(
+            "memoria_async_tasks{{status=\"{status}\"}} {cnt}\n"
+        ));
     }
 
     // ── Governance last run ───────────────────────────────────────────────
@@ -160,7 +163,9 @@ async fn collect_metrics(state: &AppState) -> Result<Arc<String>, String> {
         // Parse and convert to unix timestamp
         if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(&ts, "%Y-%m-%d %H:%M:%S%.f") {
             let unix = dt.and_utc().timestamp();
-            out.push_str("# HELP memoria_governance_last_run_timestamp Last governance run (unix).\n");
+            out.push_str(
+                "# HELP memoria_governance_last_run_timestamp Last governance run (unix).\n",
+            );
             out.push_str("# TYPE memoria_governance_last_run_timestamp gauge\n");
             out.push_str(&format!("memoria_governance_last_run_timestamp {unix}\n"));
         }
@@ -189,7 +194,10 @@ async fn collect_metrics(state: &AppState) -> Result<Arc<String>, String> {
         out.push_str(&format!("memoria_auth_pool_size {}\n", auth_pool.size()));
         out.push_str("# HELP memoria_auth_pool_idle Idle connections in auth pool.\n");
         out.push_str("# TYPE memoria_auth_pool_idle gauge\n");
-        out.push_str(&format!("memoria_auth_pool_idle {}\n", auth_pool.num_idle()));
+        out.push_str(&format!(
+            "memoria_auth_pool_idle {}\n",
+            auth_pool.num_idle()
+        ));
     }
 
     // ── Security counters ─────────────────────────────────────────────────
@@ -199,20 +207,30 @@ async fn collect_metrics(state: &AppState) -> Result<Arc<String>, String> {
     out.push_str(&format!("memoria_auth_failures_total {auth_failures}\n"));
 
     let sensitivity_blocks = SENSITIVITY_BLOCKS.load(Ordering::Relaxed);
-    out.push_str("# HELP memoria_sensitivity_blocks_total Requests blocked by sensitivity filter.\n");
+    out.push_str(
+        "# HELP memoria_sensitivity_blocks_total Requests blocked by sensitivity filter.\n",
+    );
     out.push_str("# TYPE memoria_sensitivity_blocks_total counter\n");
-    out.push_str(&format!("memoria_sensitivity_blocks_total {sensitivity_blocks}\n"));
+    out.push_str(&format!(
+        "memoria_sensitivity_blocks_total {sensitivity_blocks}\n"
+    ));
 
     // ── Entity extraction health ──────────────────────────────────────────
     let entity_bp = memoria_service::ENTITY_EXTRACTION_BACKPRESSURE.load(Ordering::Relaxed);
-    out.push_str("# HELP memoria_entity_extraction_backpressure_total Times entity queue was full.\n");
+    out.push_str(
+        "# HELP memoria_entity_extraction_backpressure_total Times entity queue was full.\n",
+    );
     out.push_str("# TYPE memoria_entity_extraction_backpressure_total counter\n");
-    out.push_str(&format!("memoria_entity_extraction_backpressure_total {entity_bp}\n"));
+    out.push_str(&format!(
+        "memoria_entity_extraction_backpressure_total {entity_bp}\n"
+    ));
 
     let entity_drops = memoria_service::ENTITY_EXTRACTION_DROPS.load(Ordering::Relaxed);
     out.push_str("# HELP memoria_entity_extraction_drops_total Entity extraction jobs dropped.\n");
     out.push_str("# TYPE memoria_entity_extraction_drops_total counter\n");
-    out.push_str(&format!("memoria_entity_extraction_drops_total {entity_drops}\n"));
+    out.push_str(&format!(
+        "memoria_entity_extraction_drops_total {entity_drops}\n"
+    ));
 
     let body = Arc::new(out);
     *cache = Some(CachedMetrics {

@@ -17,7 +17,8 @@ const NODE_COLS_NO_EMB: &str = "node_id, user_id, node_type, content, entity_typ
     conflict_resolution, access_count, cross_session_count, is_active, superseded_by, created_at";
 
 /// Columns for GraphNode (including embedding)
-const NODE_COLS_WITH_EMB: &str = "node_id, user_id, node_type, content, entity_type, embedding, memory_id, \
+const NODE_COLS_WITH_EMB: &str =
+    "node_id, user_id, node_type, content, entity_type, embedding, memory_id, \
     session_id, confidence, trust_tier, importance, source_nodes, conflicts_with, \
     conflict_resolution, access_count, cross_session_count, is_active, superseded_by, created_at";
 
@@ -138,11 +139,13 @@ impl GraphStore {
     // ── Node reads ───────────────────────────────────────────────────────────
 
     pub async fn get_node(&self, node_id: &str) -> Result<Option<GraphNode>, MemoriaError> {
-        let row = sqlx::query(&format!("SELECT {NODE_COLS_WITH_EMB} FROM memory_graph_nodes WHERE node_id = ?"))
-            .bind(node_id)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(db_err)?;
+        let row = sqlx::query(&format!(
+            "SELECT {NODE_COLS_WITH_EMB} FROM memory_graph_nodes WHERE node_id = ?"
+        ))
+        .bind(node_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
         Ok(row.map(|r| row_to_node(&r)))
     }
 
@@ -151,7 +154,9 @@ impl GraphStore {
             return Ok(vec![]);
         }
         let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-        let sql = format!("SELECT {NODE_COLS_NO_EMB} FROM memory_graph_nodes WHERE node_id IN ({placeholders})");
+        let sql = format!(
+            "SELECT {NODE_COLS_NO_EMB} FROM memory_graph_nodes WHERE node_id IN ({placeholders})"
+        );
         let mut q = sqlx::query(&sql);
         for id in ids {
             q = q.bind(id);
@@ -453,13 +458,16 @@ impl GraphStore {
 
         match res {
             Ok(_) => Ok((entity_id, true)),
-            Err(sqlx::Error::Database(e))
-                if e.message().contains("Duplicate entry") =>
-            {
+            Err(sqlx::Error::Database(e)) if e.message().contains("Duplicate entry") => {
                 // Duplicate on unique key — fetch existing
-                let row = sqlx::query("SELECT entity_id FROM mem_entities WHERE user_id = ? AND name = ?")
-                    .bind(user_id).bind(name)
-                    .fetch_one(&self.pool).await.map_err(db_err)?;
+                let row = sqlx::query(
+                    "SELECT entity_id FROM mem_entities WHERE user_id = ? AND name = ?",
+                )
+                .bind(user_id)
+                .bind(name)
+                .fetch_one(&self.pool)
+                .await
+                .map_err(db_err)?;
                 let id: String = row.try_get("entity_id").map_err(db_err)?;
                 Ok((id, false))
             }

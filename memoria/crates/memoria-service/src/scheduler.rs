@@ -616,12 +616,25 @@ mod tests {
         async fn cleanup_orphan_stats(&self) -> Result<i64, crate::MemoriaError> {
             Ok(0)
         }
-        async fn cleanup_edit_log(&self, _: i64) -> Result<i64, crate::MemoriaError> { Ok(0) }
-        async fn cleanup_feedback(&self, _: i64) -> Result<i64, crate::MemoriaError> { Ok(0) }
+        async fn cleanup_edit_log(&self, _: i64) -> Result<i64, crate::MemoriaError> {
+            Ok(0)
+        }
+        async fn cleanup_feedback(&self, _: i64) -> Result<i64, crate::MemoriaError> {
+            Ok(0)
+        }
         async fn create_safety_snapshot(&self, _: &str) -> (Option<String>, Option<String>) {
             (Some("mem_snap_pre_daily_test".into()), None)
         }
-        async fn log_edit(&self, _: &str, _: &str, _: Option<&str>, _: Option<&str>, _: &str, _: Option<&str>) {}
+        async fn log_edit(
+            &self,
+            _: &str,
+            _: &str,
+            _: Option<&str>,
+            _: Option<&str>,
+            _: &str,
+            _: Option<&str>,
+        ) {
+        }
     }
 
     struct FallbackStore;
@@ -677,12 +690,25 @@ mod tests {
         async fn cleanup_orphan_stats(&self) -> Result<i64, crate::MemoriaError> {
             Ok(0)
         }
-        async fn cleanup_edit_log(&self, _: i64) -> Result<i64, crate::MemoriaError> { Ok(0) }
-        async fn cleanup_feedback(&self, _: i64) -> Result<i64, crate::MemoriaError> { Ok(0) }
+        async fn cleanup_edit_log(&self, _: i64) -> Result<i64, crate::MemoriaError> {
+            Ok(0)
+        }
+        async fn cleanup_feedback(&self, _: i64) -> Result<i64, crate::MemoriaError> {
+            Ok(0)
+        }
         async fn create_safety_snapshot(&self, _: &str) -> (Option<String>, Option<String>) {
             (Some("mem_snap_pre_daily_fallback".into()), None)
         }
-        async fn log_edit(&self, _: &str, _: &str, _: Option<&str>, _: Option<&str>, _: &str, _: Option<&str>) {}
+        async fn log_edit(
+            &self,
+            _: &str,
+            _: &str,
+            _: Option<&str>,
+            _: Option<&str>,
+            _: &str,
+            _: Option<&str>,
+        ) {
+        }
     }
 
     #[derive(Default)]
@@ -747,12 +773,25 @@ mod tests {
         async fn cleanup_orphan_stats(&self) -> Result<i64, crate::MemoriaError> {
             Ok(0)
         }
-        async fn cleanup_edit_log(&self, _: i64) -> Result<i64, crate::MemoriaError> { Ok(0) }
-        async fn cleanup_feedback(&self, _: i64) -> Result<i64, crate::MemoriaError> { Ok(0) }
+        async fn cleanup_edit_log(&self, _: i64) -> Result<i64, crate::MemoriaError> {
+            Ok(0)
+        }
+        async fn cleanup_feedback(&self, _: i64) -> Result<i64, crate::MemoriaError> {
+            Ok(0)
+        }
         async fn create_safety_snapshot(&self, _: &str) -> (Option<String>, Option<String>) {
             (None, None)
         }
-        async fn log_edit(&self, _: &str, _: &str, _: Option<&str>, _: Option<&str>, _: &str, _: Option<&str>) {}
+        async fn log_edit(
+            &self,
+            _: &str,
+            _: &str,
+            _: Option<&str>,
+            _: Option<&str>,
+            _: &str,
+            _: Option<&str>,
+        ) {
+        }
 
         async fn check_shared_breaker(
             &self,
@@ -1489,7 +1528,11 @@ mod tests {
             "primary_b should not be called while breaker is open"
         );
         assert_eq!(exec.report.status, StrategyStatus::Degraded);
-        assert!(exec.report.warnings.iter().any(|w| w.contains("circuit breaker is open")));
+        assert!(exec
+            .report
+            .warnings
+            .iter()
+            .any(|w| w.contains("circuit breaker is open")));
     }
 
     /// Gap: two scheduler instances competing for the same task — only one executes,
@@ -1526,8 +1569,14 @@ mod tests {
 
         // Both try to run hourly concurrently
         let lock_key = "governance:hourly";
-        let a_got = shared_lock.try_acquire(lock_key, "instance_a", Duration::from_secs(120)).await.unwrap();
-        let b_got = shared_lock.try_acquire(lock_key, "instance_b", Duration::from_secs(120)).await.unwrap();
+        let a_got = shared_lock
+            .try_acquire(lock_key, "instance_a", Duration::from_secs(120))
+            .await
+            .unwrap();
+        let b_got = shared_lock
+            .try_acquire(lock_key, "instance_b", Duration::from_secs(120))
+            .await
+            .unwrap();
 
         assert!(a_got ^ b_got, "exactly one should acquire the lock");
 
@@ -1539,15 +1588,25 @@ mod tests {
 
         let exec = winner.run_task(GovernanceTask::Hourly).await.unwrap();
         assert_eq!(exec.report.status, StrategyStatus::Success);
-        assert!(loser_strategy.tasks.lock().unwrap().is_empty(), "loser should not have run");
+        assert!(
+            loser_strategy.tasks.lock().unwrap().is_empty(),
+            "loser should not have run"
+        );
 
         // Release and let loser run
         let holder = if a_got { "instance_a" } else { "instance_b" };
         shared_lock.release(lock_key, holder).await.unwrap();
 
-        let loser = if a_got { scheduler_b.clone() } else { scheduler_a.clone() };
+        let loser = if a_got {
+            scheduler_b.clone()
+        } else {
+            scheduler_a.clone()
+        };
         let loser_holder = if a_got { "instance_b" } else { "instance_a" };
-        let got = shared_lock.try_acquire(lock_key, loser_holder, Duration::from_secs(120)).await.unwrap();
+        let got = shared_lock
+            .try_acquire(lock_key, loser_holder, Duration::from_secs(120))
+            .await
+            .unwrap();
         assert!(got);
 
         let exec2 = loser.run_task(GovernanceTask::Hourly).await.unwrap();

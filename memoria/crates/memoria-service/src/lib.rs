@@ -43,7 +43,9 @@ pub use scheduler::GovernanceScheduler;
 pub use scoring::{
     DefaultScoringPlugin, FeedbackTotals, ScoringPlugin, ScoringStore, TuningResult,
 };
-pub use service::{CandidateScore, ExplainLevel, MemoryService, PurgeResult, RetrievalExplain,
-    ENTITY_EXTRACTION_BACKPRESSURE, ENTITY_EXTRACTION_DROPS};
+pub use service::{
+    CandidateScore, ExplainLevel, MemoryService, PurgeResult, RetrievalExplain,
+    ENTITY_EXTRACTION_BACKPRESSURE, ENTITY_EXTRACTION_DROPS,
+};
 pub use strategy::{RetrievalStrategy, StrategyRegistry};
 pub use strategy_domain::{StrategyDecision, StrategyEvidence, StrategyReport, StrategyStatus};

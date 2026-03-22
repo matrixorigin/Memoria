@@ -52,7 +52,10 @@ async fn spawn_tiny_pool_server() -> (String, reqwest::Client, sqlx::MySqlPool) 
     tokio::spawn(async move { axum::serve(listener, app).await });
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-    let client = reqwest::Client::builder().no_proxy().build().expect("client");
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("client");
     let base = format!("http://127.0.0.1:{port}");
     (base, client, pool)
 }
@@ -73,7 +76,11 @@ async fn test_api_survives_main_pool_saturation() {
         .send()
         .await
         .expect("request");
-    assert!(res.status().is_success(), "store should succeed with healthy pool, got {}", res.status());
+    assert!(
+        res.status().is_success(),
+        "store should succeed with healthy pool, got {}",
+        res.status()
+    );
 
     // 2. Saturate the main pool: hold all 2 connections with SLEEP queries
     let mut blockers = Vec::new();
@@ -106,7 +113,9 @@ async fn test_api_survives_main_pool_saturation() {
     );
     let body = res.text().await.unwrap_or_default();
     assert!(
-        body.contains("pool timed out") || body.contains("PoolTimedOut") || body.contains("timed out"),
+        body.contains("pool timed out")
+            || body.contains("PoolTimedOut")
+            || body.contains("timed out"),
         "error should mention pool timeout, got: {body}"
     );
 

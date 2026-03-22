@@ -46,22 +46,28 @@ pub async fn health() -> &'static str {
     "ok"
 }
 
-pub async fn health_instance(State(state): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
+pub async fn health_instance(
+    State(state): State<AppState>,
+) -> (StatusCode, Json<serde_json::Value>) {
     let db_ok = if let Some(sql) = &state.service.sql_store {
-        sqlx::query("SELECT 1")
-            .execute(sql.pool())
-            .await
-            .is_ok()
+        sqlx::query("SELECT 1").execute(sql.pool()).await.is_ok()
     } else {
         false
     };
     let status = if db_ok { "ok" } else { "degraded" };
-    let code = if db_ok { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE };
-    (code, Json(serde_json::json!({
-        "status": status,
-        "instance_id": state.instance_id,
-        "db": db_ok,
-    })))
+    let code = if db_ok {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (
+        code,
+        Json(serde_json::json!({
+            "status": status,
+            "instance_id": state.instance_id,
+            "db": db_ok,
+        })),
+    )
 }
 
 pub async fn list_memories(
@@ -101,10 +107,16 @@ pub async fn store_memory(
     Json(req): Json<StoreRequest>,
 ) -> Result<(StatusCode, Json<MemoryResponse>), (StatusCode, String)> {
     if req.content.is_empty() {
-        return Err((StatusCode::UNPROCESSABLE_ENTITY, "content must not be empty".into()));
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "content must not be empty".into(),
+        ));
     }
     if req.content.len() > 32_768 {
-        return Err((StatusCode::UNPROCESSABLE_ENTITY, "content exceeds 32 KiB limit".into()));
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "content exceeds 32 KiB limit".into(),
+        ));
     }
     let mt =
         parse_memory_type(&req.memory_type).map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e))?;
@@ -134,7 +146,8 @@ pub async fn store_memory(
         .await
         .map_err(|e| {
             if matches!(e, memoria_core::MemoriaError::Blocked(_)) {
-                crate::routes::metrics::SENSITIVITY_BLOCKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                crate::routes::metrics::SENSITIVITY_BLOCKS
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             api_err_typed(e)
         })?;
@@ -147,11 +160,17 @@ pub async fn batch_store(
     Json(req): Json<BatchStoreRequest>,
 ) -> Result<(StatusCode, Json<Vec<MemoryResponse>>), (StatusCode, String)> {
     if req.memories.len() > 100 {
-        return Err((StatusCode::UNPROCESSABLE_ENTITY, "batch exceeds 100 items".into()));
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "batch exceeds 100 items".into(),
+        ));
     }
     for m in &req.memories {
         if m.content.len() > 32_768 {
-            return Err((StatusCode::UNPROCESSABLE_ENTITY, "content exceeds 32 KiB limit".into()));
+            return Err((
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "content exceeds 32 KiB limit".into(),
+            ));
         }
     }
     let items: Vec<_> = req
@@ -330,7 +349,11 @@ pub async fn delete_memory(
     Path(id): Path<String>,
 ) -> Result<StatusCode, (StatusCode, String)> {
     if !is_master {
-        let existing = state.service.get(&id).await.map_err(api_err)?
+        let existing = state
+            .service
+            .get(&id)
+            .await
+            .map_err(api_err)?
             .ok_or_else(|| (StatusCode::NOT_FOUND, "Memory not found".to_string()))?;
         if existing.user_id != user_id {
             return Err((StatusCode::FORBIDDEN, "Not your memory".to_string()));
@@ -348,7 +371,11 @@ pub async fn purge_memories(
     let result = if let Some(ids) = &req.memory_ids {
         if !is_master {
             for id in ids {
-                let mem = state.service.get(id).await.map_err(api_err)?
+                let mem = state
+                    .service
+                    .get(id)
+                    .await
+                    .map_err(api_err)?
                     .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Memory not found: {id}")))?;
                 if mem.user_id != user_id {
                     return Err((StatusCode::FORBIDDEN, format!("Not your memory: {id}")));
@@ -716,11 +743,12 @@ pub async fn get_retrieval_params(
     State(state): State<AppState>,
     AuthUser { user_id, .. }: AuthUser,
 ) -> ApiResult<serde_json::Value> {
-    let sql = state
-        .service
-        .sql_store
-        .as_ref()
-        .ok_or_else(|| (StatusCode::SERVICE_UNAVAILABLE, "SQL store not available".to_string()))?;
+    let sql = state.service.sql_store.as_ref().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "SQL store not available".to_string(),
+        )
+    })?;
     let params = sql
         .get_user_retrieval_params(&user_id)
         .await
@@ -741,11 +769,12 @@ pub async fn set_retrieval_params(
     AuthUser { user_id, .. }: AuthUser,
     Json(req): Json<SetRetrievalParamsRequest>,
 ) -> ApiResult<serde_json::Value> {
-    let sql = state
-        .service
-        .sql_store
-        .as_ref()
-        .ok_or_else(|| (StatusCode::SERVICE_UNAVAILABLE, "SQL store not available".to_string()))?;
+    let sql = state.service.sql_store.as_ref().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "SQL store not available".to_string(),
+        )
+    })?;
 
     let mut params = sql
         .get_user_retrieval_params(&user_id)
@@ -762,7 +791,9 @@ pub async fn set_retrieval_params(
         params.confidence_weight = v.clamp(0.0, 0.5);
     }
 
-    sql.set_user_retrieval_params(&params).await.map_err(api_err)?;
+    sql.set_user_retrieval_params(&params)
+        .await
+        .map_err(api_err)?;
     Ok(Json(serde_json::to_value(params).unwrap()))
 }
 
@@ -773,11 +804,12 @@ pub async fn tune_retrieval_params(
 ) -> ApiResult<serde_json::Value> {
     use memoria_service::scoring::{DefaultScoringPlugin, ScoringPlugin};
 
-    let sql = state
-        .service
-        .sql_store
-        .as_ref()
-        .ok_or_else(|| (StatusCode::SERVICE_UNAVAILABLE, "SQL store not available".to_string()))?;
+    let sql = state.service.sql_store.as_ref().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "SQL store not available".to_string(),
+        )
+    })?;
 
     let old_params = sql
         .get_user_retrieval_params(&user_id)
@@ -785,7 +817,11 @@ pub async fn tune_retrieval_params(
         .map_err(api_err)?;
 
     let plugin = DefaultScoringPlugin;
-    match plugin.tune_params(sql.as_ref(), &user_id).await.map_err(api_err)? {
+    match plugin
+        .tune_params(sql.as_ref(), &user_id)
+        .await
+        .map_err(api_err)?
+    {
         Some(new_params) => Ok(Json(serde_json::json!({
             "tuned": true,
             "old_params": old_params,

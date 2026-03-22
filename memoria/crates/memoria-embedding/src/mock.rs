@@ -23,7 +23,9 @@ impl EmbeddingProvider for MockEmbedder {
         // Generate deterministic pseudo-random unit vector from seed
         let mut v: Vec<f32> = (0..self.dim)
             .map(|i| {
-                let x = ((seed.wrapping_mul(6364136223846793005).wrapping_add(i as u64)) as f32)
+                let x = ((seed
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(i as u64)) as f32)
                     / u64::MAX as f32;
                 x * 2.0 - 1.0
             })

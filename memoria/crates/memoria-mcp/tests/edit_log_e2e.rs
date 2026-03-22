@@ -79,7 +79,13 @@ async fn get_edit_logs_by_op(pool: &MySqlPool, user_id: &str, op: &str) -> Vec<E
 }
 
 // (operation, memory_id, payload, reason, snapshot_before)
-type EditLogRow = (String, Option<String>, Option<String>, String, Option<String>);
+type EditLogRow = (
+    String,
+    Option<String>,
+    Option<String>,
+    String,
+    Option<String>,
+);
 
 /// Check if a snapshot exists by name.
 async fn snapshot_exists(pool: &MySqlPool, name: &str) -> bool {
@@ -148,8 +154,14 @@ async fn test_inject_writes_edit_log() {
     let (op, memory_id, payload, reason, _snap) = &logs[0];
     assert_eq!(op, "inject");
     assert_eq!(memory_id.as_deref(), Some(mid), "memory_id should match");
-    assert!(payload.as_ref().map_or(false, |p| p.contains("test fact")), "payload should contain content");
-    assert!(reason.contains("store_memory"), "reason should mention store_memory: {reason}");
+    assert!(
+        payload.as_ref().map_or(false, |p| p.contains("test fact")),
+        "payload should contain content"
+    );
+    assert!(
+        reason.contains("store_memory"),
+        "reason should mention store_memory: {reason}"
+    );
 
     cleanup(&pool, &uid).await;
     println!("✅ inject writes edit log with memory_id");
@@ -187,9 +199,23 @@ async fn test_correct_writes_edit_log() {
     assert!(!logs.is_empty(), "correct should write edit log");
     let (op, memory_id, payload, _reason, _snap) = &logs[0];
     assert_eq!(op, "correct");
-    assert_eq!(memory_id.as_deref(), Some(old_mid.as_str()), "memory_id should be old_id");
-    assert!(payload.as_ref().map_or(false, |p| p.contains("corrected fact")), "payload should contain new_content");
-    assert!(payload.as_ref().map_or(false, |p| p.contains("new_memory_id")), "payload should contain new_memory_id");
+    assert_eq!(
+        memory_id.as_deref(),
+        Some(old_mid.as_str()),
+        "memory_id should be old_id"
+    );
+    assert!(
+        payload
+            .as_ref()
+            .map_or(false, |p| p.contains("corrected fact")),
+        "payload should contain new_content"
+    );
+    assert!(
+        payload
+            .as_ref()
+            .map_or(false, |p| p.contains("new_memory_id")),
+        "payload should contain new_memory_id"
+    );
 
     cleanup(&pool, &uid).await;
     println!("✅ correct writes edit log with memory_id and payload");
@@ -227,7 +253,11 @@ async fn test_purge_single_creates_snapshot_and_edit_log() {
     assert!(!logs.is_empty(), "purge should write edit log");
     let (op, memory_id, _payload, _reason, snap_before) = &logs[0];
     assert_eq!(op, "purge");
-    assert_eq!(memory_id.as_deref(), Some(mid.as_str()), "memory_id should match purged id");
+    assert_eq!(
+        memory_id.as_deref(),
+        Some(mid.as_str()),
+        "memory_id should match purged id"
+    );
 
     // Verify safety snapshot was created and recorded
     assert!(snap_before.is_some(), "snapshot_before should be set");
@@ -286,8 +316,16 @@ async fn test_purge_batch_single_edit_log() {
 
     // Should be 3 purge edit log entries (one per memory)
     let logs = get_edit_logs_by_op(&pool, &uid, "purge").await;
-    assert_eq!(logs.len(), 3, "batch purge should produce 3 edit logs (one per memory), got {}", logs.len());
-    let purged_ids: Vec<_> = logs.iter().filter_map(|(_, mid, _, _, _)| mid.clone()).collect();
+    assert_eq!(
+        logs.len(),
+        3,
+        "batch purge should produce 3 edit logs (one per memory), got {}",
+        logs.len()
+    );
+    let purged_ids: Vec<_> = logs
+        .iter()
+        .filter_map(|(_, mid, _, _, _)| mid.clone())
+        .collect();
     for id in &ids {
         assert!(purged_ids.contains(id), "purged_ids should contain {id}");
     }
@@ -336,9 +374,16 @@ async fn test_purge_topic_edit_log() {
 
     // Topic purge produces one log per purged memory
     let logs = get_edit_logs_by_op(&pool, &uid, "purge").await;
-    assert_eq!(logs.len(), 2, "topic purge should produce 2 edit logs (one per rust memory)");
+    assert_eq!(
+        logs.len(),
+        2,
+        "topic purge should produce 2 edit logs (one per rust memory)"
+    );
     let (_, _memory_id, _payload, reason, snap_before) = &logs[0];
-    assert!(reason.contains("topic:rust"), "reason should contain topic: {reason}");
+    assert!(
+        reason.contains("topic:rust"),
+        "reason should contain topic: {reason}"
+    );
     assert!(snap_before.is_some(), "snapshot_before should be set");
 
     cleanup(&pool, &uid).await;
@@ -497,12 +542,24 @@ async fn test_store_batch_writes_single_edit_log() {
     // Should be exactly 1 inject log for the batch
     // Batch store now produces one log per memory
     let logs = get_edit_logs_by_op(&pool, &uid, "inject").await;
-    assert_eq!(logs.len(), 3, "batch store should produce 3 edit logs, got {}", logs.len());
+    assert_eq!(
+        logs.len(),
+        3,
+        "batch store should produce 3 edit logs, got {}",
+        logs.len()
+    );
     let (_, _, _, reason, _) = &logs[0];
     assert!(reason.contains("store_batch"), "reason: {reason}");
-    let logged_ids: Vec<_> = logs.iter().filter_map(|(_, mid, _, _, _)| mid.clone()).collect();
+    let logged_ids: Vec<_> = logs
+        .iter()
+        .filter_map(|(_, mid, _, _, _)| mid.clone())
+        .collect();
     for m in &results {
-        assert!(logged_ids.contains(&m.memory_id), "logged_ids should contain {}", m.memory_id);
+        assert!(
+            logged_ids.contains(&m.memory_id),
+            "logged_ids should contain {}",
+            m.memory_id
+        );
     }
 
     cleanup(&pool, &uid).await;
@@ -743,7 +800,11 @@ async fn test_api_purge_topic_returns_snapshot() {
     // Topic purge produces one log per purged memory
     let logs = get_edit_logs_by_op(&pool, &uid, "purge").await;
     assert_eq!(logs.len(), 2, "topic purge should produce 2 edit logs");
-    assert!(logs[0].3.contains("topic:topicX"), "reason: {:?}", logs[0].3);
+    assert!(
+        logs[0].3.contains("topic:topicX"),
+        "reason: {:?}",
+        logs[0].3
+    );
 
     cleanup(&pool, &uid).await;
     println!("✅ API purge by topic: snapshot + edit log");

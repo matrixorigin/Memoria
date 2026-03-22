@@ -95,7 +95,9 @@ fn milestone_internal(name: &str) -> Option<String> {
     }
 }
 
-fn snapshot_store(svc: &Arc<MemoryService>) -> Result<&memoria_storage::SqlMemoryStore, MemoriaError> {
+fn snapshot_store(
+    svc: &Arc<MemoryService>,
+) -> Result<&memoria_storage::SqlMemoryStore, MemoriaError> {
     svc.sql_store
         .as_deref()
         .ok_or_else(|| MemoriaError::Internal("Snapshot ops require SQL store".into()))
@@ -156,10 +158,18 @@ async fn resolve_snapshot_for_user(
     name: &str,
 ) -> Result<Option<String>, MemoriaError> {
     if let Some(internal) = milestone_internal(name) {
-        return Ok(git.get_snapshot(&internal).await.map_err(git_err)?.map(|_| internal));
+        return Ok(git
+            .get_snapshot(&internal)
+            .await
+            .map_err(git_err)?
+            .map(|_| internal));
     }
     if name.starts_with(SAFETY_PREFIX) {
-        return Ok(git.get_snapshot(name).await.map_err(git_err)?.map(|_| name.to_string()));
+        return Ok(git
+            .get_snapshot(name)
+            .await
+            .map_err(git_err)?
+            .map(|_| name.to_string()));
     }
 
     let sql = snapshot_store(svc)?;
@@ -372,7 +382,9 @@ pub async fn call(
                     "%Y-%m-%d %H:%M:%S",
                 )
                 .or_else(|_| NaiveDateTime::parse_from_str(older_than, "%Y-%m-%dT%H:%M:%S"))
-                .map_err(|_| MemoriaError::Validation("older_than must be ISO date e.g. '2026-03-01'".into()))?;
+                .map_err(|_| {
+                    MemoriaError::Validation("older_than must be ISO date e.g. '2026-03-01'".into())
+                })?;
                 snaps
                     .iter()
                     .filter(|s| s.timestamp.map(|t| t < cutoff).unwrap_or(false))
@@ -384,7 +396,9 @@ pub async fn call(
 
             let count = to_delete.len();
             for snapshot in &to_delete {
-                git.drop_snapshot(&snapshot.internal_name).await.map_err(git_err)?;
+                git.drop_snapshot(&snapshot.internal_name)
+                    .await
+                    .map_err(git_err)?;
                 if snapshot.registered {
                     sql.deregister_snapshot_by_internal(user_id, &snapshot.internal_name)
                         .await?;
@@ -425,8 +439,12 @@ pub async fn call(
 
             // from_timestamp validation: must be within last 30 minutes, not future
             if let Some(ts_str) = from_timestamp {
-                let ts = NaiveDateTime::parse_from_str(ts_str, "%Y-%m-%d %H:%M:%S")
-                    .map_err(|_| MemoriaError::Validation("from_timestamp must be 'YYYY-MM-DD HH:MM:SS'".into()))?;
+                let ts =
+                    NaiveDateTime::parse_from_str(ts_str, "%Y-%m-%d %H:%M:%S").map_err(|_| {
+                        MemoriaError::Validation(
+                            "from_timestamp must be 'YYYY-MM-DD HH:MM:SS'".into(),
+                        )
+                    })?;
                 let now = chrono::Utc::now().naive_utc();
                 if ts > now {
                     return Ok(mcp_text("from_timestamp cannot be in the future"));
@@ -475,7 +493,9 @@ pub async fn call(
                     .await
                     .map_err(git_err)?;
             } else {
-                git.create_branch(&table_name, "mem_memories").await.map_err(git_err)?;
+                git.create_branch(&table_name, "mem_memories")
+                    .await
+                    .map_err(git_err)?;
             }
             sql.register_branch(user_id, branch_name, &table_name)
                 .await?;

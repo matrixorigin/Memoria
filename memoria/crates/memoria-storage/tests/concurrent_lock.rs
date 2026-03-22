@@ -5,10 +5,10 @@ use std::sync::Arc;
 async fn test_concurrent_lock_acquisition() {
     let database_url = std::env::var("TEST_DATABASE_URL")
         .unwrap_or_else(|_| "mysql://root:111@localhost:6001/memoria_test".to_string());
-    
+
     let instance_a = uuid::Uuid::new_v4().to_string();
     let instance_b = uuid::Uuid::new_v4().to_string();
-    
+
     let store_a = Arc::new(
         SqlMemoryStore::connect(&database_url, 1536, instance_a.clone())
             .await
@@ -19,7 +19,7 @@ async fn test_concurrent_lock_acquisition() {
             .await
             .expect("Failed to connect B"),
     );
-    
+
     store_a.migrate().await.expect("Failed to migrate");
 
     let lock_key = format!("concurrent_test_{}", uuid::Uuid::new_v4());
@@ -29,14 +29,10 @@ async fn test_concurrent_lock_acquisition() {
     let store_b_clone = store_b.clone();
     let key_a = lock_key.clone();
     let key_b = lock_key.clone();
-    
-    let handle_a = tokio::spawn(async move {
-        store_a_clone.try_acquire_lock(&key_a, 10).await
-    });
-    
-    let handle_b = tokio::spawn(async move {
-        store_b_clone.try_acquire_lock(&key_b, 10).await
-    });
+
+    let handle_a = tokio::spawn(async move { store_a_clone.try_acquire_lock(&key_a, 10).await });
+
+    let handle_b = tokio::spawn(async move { store_b_clone.try_acquire_lock(&key_b, 10).await });
 
     let result_a = handle_a.await.unwrap().unwrap();
     let result_b = handle_b.await.unwrap().unwrap();
@@ -59,14 +55,10 @@ async fn test_concurrent_lock_acquisition() {
     let store_b_clone = store_b.clone();
     let key_a = lock_key.clone();
     let key_b = lock_key.clone();
-    
-    let handle_a = tokio::spawn(async move {
-        store_a_clone.try_acquire_lock(&key_a, 10).await
-    });
-    
-    let handle_b = tokio::spawn(async move {
-        store_b_clone.try_acquire_lock(&key_b, 10).await
-    });
+
+    let handle_a = tokio::spawn(async move { store_a_clone.try_acquire_lock(&key_a, 10).await });
+
+    let handle_b = tokio::spawn(async move { store_b_clone.try_acquire_lock(&key_b, 10).await });
 
     let result_a2 = handle_a.await.unwrap().unwrap();
     let result_b2 = handle_b.await.unwrap().unwrap();

@@ -115,7 +115,10 @@ async fn test_should_rebuild_vector_index() {
 
     assert!(!should2, "Should not rebuild during cooldown");
     assert!(cooldown2.is_some(), "Should have cooldown");
-    assert!(cooldown2.unwrap() > 0 && cooldown2.unwrap() <= 3600, "Cooldown should be within range");
+    assert!(
+        cooldown2.unwrap() > 0 && cooldown2.unwrap() <= 3600,
+        "Cooldown should be within range"
+    );
 }
 
 #[tokio::test]
@@ -175,7 +178,11 @@ async fn test_rebuild_vector_index_adaptive_cooldown() {
             .await
             .expect("Check cooldown");
 
-        assert!(cooldown.is_some(), "Should have cooldown for {} rows", row_count);
+        assert!(
+            cooldown.is_some(),
+            "Should have cooldown for {} rows",
+            row_count
+        );
         let remaining = cooldown.unwrap();
         // 允许一些误差（因为时间流逝）
         assert!(
@@ -187,7 +194,6 @@ async fn test_rebuild_vector_index_adaptive_cooldown() {
         );
     }
 }
-
 
 #[tokio::test]
 async fn test_rebuild_failure_exponential_backoff() {
@@ -261,7 +267,13 @@ async fn test_vector_search_pre_filter_multi_user() {
     let insert = |uid: String, content: String, emb: Vec<f32>| {
         let pool = store.pool().clone();
         let mid = uuid::Uuid::new_v4().simple().to_string();
-        let vec_lit = format!("[{}]", emb.iter().map(|f| f.to_string()).collect::<Vec<_>>().join(","));
+        let vec_lit = format!(
+            "[{}]",
+            emb.iter()
+                .map(|f| f.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        );
         async move {
             sqlx::query(&format!(
                 "INSERT INTO mem_memories \
@@ -287,8 +299,14 @@ async fn test_vector_search_pre_filter_multi_user() {
     insert(uid_b.clone(), "user B memory 1".into(), make_emb(0)).await;
 
     // Build IVF index after data import
-    let indexed = store.rebuild_vector_index("mem_memories").await.expect("rebuild");
-    assert!(indexed > 0, "expected at least 1 indexed row, got {indexed}");
+    let indexed = store
+        .rebuild_vector_index("mem_memories")
+        .await
+        .expect("rebuild");
+    assert!(
+        indexed > 0,
+        "expected at least 1 indexed row, got {indexed}"
+    );
 
     // Query close to user A's memories
     let query = make_emb(0);
@@ -317,7 +335,10 @@ async fn test_vector_search_pre_filter_multi_user() {
 
     let a_ids: std::collections::HashSet<_> = results_a.iter().map(|m| &m.memory_id).collect();
     let b_ids: std::collections::HashSet<_> = results_b.iter().map(|m| &m.memory_id).collect();
-    assert!(a_ids.is_disjoint(&b_ids), "results must not overlap between users");
+    assert!(
+        a_ids.is_disjoint(&b_ids),
+        "results must not overlap between users"
+    );
 
     // Cleanup
     sqlx::query("DELETE FROM mem_memories WHERE user_id = ? OR user_id = ?")

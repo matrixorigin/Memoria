@@ -416,9 +416,7 @@ pub async fn set_user_params(
 }
 
 /// GET /admin/config — view current runtime configuration (redacted secrets).
-pub async fn get_config(
-    auth: AuthUser,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+pub async fn get_config(auth: AuthUser) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     auth.require_master()?;
     let cfg = memoria_service::Config::from_env();
     Ok(Json(serde_json::json!({

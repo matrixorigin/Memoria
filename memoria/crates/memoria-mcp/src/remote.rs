@@ -66,7 +66,11 @@ impl RemoteClient {
             return Ok(r.json().await?);
         }
         let body = r.text().await.unwrap_or_default();
-        let msg = if body.is_empty() { status.to_string() } else { body };
+        let msg = if body.is_empty() {
+            status.to_string()
+        } else {
+            body
+        };
         anyhow::bail!("API error {status}: {msg}")
     }
 
@@ -241,7 +245,11 @@ impl RemoteClient {
             )),
 
             "memory_get_retrieval_params" => {
-                let r = self.client.get(self.url("/v1/retrieval-params")).send().await?;
+                let r = self
+                    .client
+                    .get(self.url("/v1/retrieval-params"))
+                    .send()
+                    .await?;
                 let body = Self::parse_response(r).await?;
                 Ok(Self::mcp_text(&serde_json::to_string_pretty(&body)?))
             }
@@ -267,7 +275,9 @@ impl RemoteClient {
                     )))
                 } else {
                     Ok(Self::mcp_text(
-                        body["message"].as_str().unwrap_or("Not enough feedback to tune parameters")
+                        body["message"]
+                            .as_str()
+                            .unwrap_or("Not enough feedback to tune parameters"),
                     ))
                 }
             }

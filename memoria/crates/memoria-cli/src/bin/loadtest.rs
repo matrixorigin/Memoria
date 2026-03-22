@@ -82,7 +82,9 @@ impl Stats {
         let ok = self.ok.load(Relaxed);
         let err = self.err.load(Relaxed);
         let total = ok + err;
-        if total == 0 { return; }
+        if total == 0 {
+            return;
+        }
         let mut lat = self.latencies.lock().await.clone();
         lat.sort_by(|a, b| a.partial_cmp(b).unwrap());
         let p50 = lat[lat.len() / 2];
@@ -107,10 +109,16 @@ async fn merge_stats(merged: &mut BTreeMap<String, Arc<Stats>>, incoming: Vec<Ar
         if let Some(existing) = merged.get(&s.name) {
             existing.ok.fetch_add(s.ok.load(Relaxed), Relaxed);
             existing.err.fetch_add(s.err.load(Relaxed), Relaxed);
-            existing.latencies.lock().await.extend(s.latencies.lock().await.iter());
+            existing
+                .latencies
+                .lock()
+                .await
+                .extend(s.latencies.lock().await.iter());
             let mut dst = existing.errors.lock().await;
             for e in s.errors.lock().await.iter() {
-                if dst.len() < 5 { dst.push(e.clone()); }
+                if dst.len() < 5 {
+                    dst.push(e.clone());
+                }
             }
         } else {
             merged.insert(s.name.clone(), s);
@@ -143,10 +151,18 @@ const CONTENTS: &[&str] = &[
 ];
 
 const QUERIES: &[&str] = &[
-    "deployment command", "database configuration", "testing framework",
-    "user preferences", "API conventions", "formatting tools",
-    "authentication", "embedding setup", "CI pipeline",
-    "retry policy", "connection pool", "feature flags",
+    "deployment command",
+    "database configuration",
+    "testing framework",
+    "user preferences",
+    "API conventions",
+    "formatting tools",
+    "authentication",
+    "embedding setup",
+    "CI pipeline",
+    "retry policy",
+    "connection pool",
+    "feature flags",
 ];
 
 const MEMORY_TYPES: &[&str] = &["semantic", "profile", "procedural", "working", "episodic"];
@@ -168,13 +184,22 @@ impl ApiClient {
         }
     }
 
-    async fn post(&self, path: &str, body: serde_json::Value, stats: &Stats,
-                  expected: &[u16]) -> (u16, Option<serde_json::Value>) {
+    async fn post(
+        &self,
+        path: &str,
+        body: serde_json::Value,
+        stats: &Stats,
+        expected: &[u16],
+    ) -> (u16, Option<serde_json::Value>) {
         let t0 = Instant::now();
-        let res = self.client.post(format!("{}{path}", self.base))
+        let res = self
+            .client
+            .post(format!("{}{path}", self.base))
             .bearer_auth(&self.token)
             .header("X-Impersonate-User", &self.user_id)
-            .json(&body).send().await;
+            .json(&body)
+            .send()
+            .await;
         let ms = t0.elapsed().as_secs_f64() * 1000.0;
         match res {
             Ok(r) => {
@@ -186,19 +211,28 @@ impl ApiClient {
             Err(e) => {
                 stats.record(ms, 0, expected).await;
                 let mut errs = stats.errors.lock().await;
-                if errs.len() < 5 { errs.push(format!("{e}")); }
+                if errs.len() < 5 {
+                    errs.push(format!("{e}"));
+                }
                 (0, None)
             }
         }
     }
 
-    async fn get(&self, path: &str, stats: &Stats,
-                 expected: &[u16]) -> (u16, Option<serde_json::Value>) {
+    async fn get(
+        &self,
+        path: &str,
+        stats: &Stats,
+        expected: &[u16],
+    ) -> (u16, Option<serde_json::Value>) {
         let t0 = Instant::now();
-        let res = self.client.get(format!("{}{path}", self.base))
+        let res = self
+            .client
+            .get(format!("{}{path}", self.base))
             .bearer_auth(&self.token)
             .header("X-Impersonate-User", &self.user_id)
-            .send().await;
+            .send()
+            .await;
         let ms = t0.elapsed().as_secs_f64() * 1000.0;
         match res {
             Ok(r) => {
@@ -210,7 +244,9 @@ impl ApiClient {
             Err(e) => {
                 stats.record(ms, 0, expected).await;
                 let mut errs = stats.errors.lock().await;
-                if errs.len() < 5 { errs.push(format!("{e}")); }
+                if errs.len() < 5 {
+                    errs.push(format!("{e}"));
+                }
                 (0, None)
             }
         }
@@ -218,17 +254,26 @@ impl ApiClient {
 
     async fn delete(&self, path: &str, stats: &Stats, expected: &[u16]) -> u16 {
         let t0 = Instant::now();
-        let res = self.client.delete(format!("{}{path}", self.base))
+        let res = self
+            .client
+            .delete(format!("{}{path}", self.base))
             .bearer_auth(&self.token)
             .header("X-Impersonate-User", &self.user_id)
-            .send().await;
+            .send()
+            .await;
         let ms = t0.elapsed().as_secs_f64() * 1000.0;
         match res {
-            Ok(r) => { let s = r.status().as_u16(); stats.record(ms, s, expected).await; s }
+            Ok(r) => {
+                let s = r.status().as_u16();
+                stats.record(ms, s, expected).await;
+                s
+            }
             Err(e) => {
                 stats.record(ms, 0, expected).await;
                 let mut errs = stats.errors.lock().await;
-                if errs.len() < 5 { errs.push(format!("{e}")); }
+                if errs.len() < 5 {
+                    errs.push(format!("{e}"));
+                }
                 0
             }
         }
@@ -251,47 +296,75 @@ async fn session_loop(c: &ApiClient, duration: Duration) -> Vec<Arc<Stats>> {
     let deadline = Instant::now() + duration;
     while Instant::now() < deadline {
         // Phase 1: bootstrap — retrieve context (agent always does this first)
-        c.post("/v1/memories/retrieve",
+        c.post(
+            "/v1/memories/retrieve",
             serde_json::json!({"query": rand_pick(QUERIES), "top_k": 5}),
-            &retrieve, &[200]).await;
+            &retrieve,
+            &[200],
+        )
+        .await;
 
         // small think pause
         tokio::time::sleep(Duration::from_millis(fastrand::u64(100..500))).await;
-        if Instant::now() >= deadline { break; }
+        if Instant::now() >= deadline {
+            break;
+        }
 
         // Phase 2: mid-session — 3-8 operations (store, search, correct, list)
         let mid_ops = fastrand::usize(3..=8);
         for _ in 0..mid_ops {
-            if Instant::now() >= deadline { break; }
+            if Instant::now() >= deadline {
+                break;
+            }
             match fastrand::u32(0..10) {
                 0..=3 => {
                     // store a working or semantic memory
-                    let mtype = if fastrand::bool() { "working" } else { "semantic" };
-                    c.post("/v1/memories",
+                    let mtype = if fastrand::bool() {
+                        "working"
+                    } else {
+                        "semantic"
+                    };
+                    c.post(
+                        "/v1/memories",
                         serde_json::json!({
                             "content": rand_pick(CONTENTS),
                             "memory_type": mtype,
                         }),
-                        &store, &[201]).await;
+                        &store,
+                        &[201],
+                    )
+                    .await;
                 }
                 4..=5 => {
-                    c.post("/v1/memories/search",
+                    c.post(
+                        "/v1/memories/search",
                         serde_json::json!({"query": rand_pick(QUERIES), "top_k": 10}),
-                        &search, &[200]).await;
+                        &search,
+                        &[200],
+                    )
+                    .await;
                 }
                 6..=7 => {
-                    c.post("/v1/memories/retrieve",
+                    c.post(
+                        "/v1/memories/retrieve",
                         serde_json::json!({"query": rand_pick(QUERIES), "top_k": 5}),
-                        &retrieve, &[200]).await;
+                        &retrieve,
+                        &[200],
+                    )
+                    .await;
                 }
                 8 => {
-                    c.post("/v1/memories/correct",
+                    c.post(
+                        "/v1/memories/correct",
                         serde_json::json!({
                             "query": rand_pick(QUERIES),
                             "new_content": format!("{} [updated]", rand_pick(CONTENTS)),
                             "reason": "session-correction",
                         }),
-                        &correct, &[200]).await;
+                        &correct,
+                        &[200],
+                    )
+                    .await;
                 }
                 _ => {
                     c.get("/v1/memories", &list, &[200]).await;
@@ -306,16 +379,24 @@ async fn session_loop(c: &ApiClient, duration: Duration) -> Vec<Arc<Stats>> {
         }
 
         // Phase 3: wrap-up — purge working memories, store episodic summary
-        c.post("/v1/memories/purge",
+        c.post(
+            "/v1/memories/purge",
             serde_json::json!({"topic": "load-test working", "reason": "session end"}),
-            &purge, &[200]).await;
+            &purge,
+            &[200],
+        )
+        .await;
 
-        c.post("/v1/memories",
+        c.post(
+            "/v1/memories",
             serde_json::json!({
                 "content": "Session Summary: load test session completed",
                 "memory_type": "episodic",
             }),
-            &store, &[201]).await;
+            &store,
+            &[201],
+        )
+        .await;
 
         // gap between sessions
         tokio::time::sleep(Duration::from_millis(fastrand::u64(500..2000))).await;
@@ -347,64 +428,110 @@ async fn git_loop(c: &ApiClient, duration: Duration) -> Vec<Arc<Stats>> {
         let snap_name = format!("lt-s-{}-{iter}-{tag}", c.user_id);
 
         // create safety snapshot
-        c.post("/v1/snapshots",
+        c.post(
+            "/v1/snapshots",
             serde_json::json!({"name": snap_name, "description": "pre-experiment"}),
-            &snapshot, &[200, 201]).await;
+            &snapshot,
+            &[200, 201],
+        )
+        .await;
 
         // create branch
-        c.post("/v1/branches",
+        c.post(
+            "/v1/branches",
             serde_json::json!({"name": branch_name}),
-            &branch, &[200, 201]).await;
+            &branch,
+            &[200, 201],
+        )
+        .await;
 
         // checkout branch
-        c.post(&format!("/v1/branches/{branch_name}/checkout"),
+        c.post(
+            &format!("/v1/branches/{branch_name}/checkout"),
             serde_json::json!({}),
-            &checkout, &[200]).await;
+            &checkout,
+            &[200],
+        )
+        .await;
 
         // store a few memories on branch
         for _ in 0..fastrand::usize(2..=5) {
-            if Instant::now() >= deadline { break; }
-            c.post("/v1/memories",
+            if Instant::now() >= deadline {
+                break;
+            }
+            c.post(
+                "/v1/memories",
                 serde_json::json!({
                     "content": format!("Branch experiment: {}", rand_pick(CONTENTS)),
                     "memory_type": "semantic",
                 }),
-                &store, &[201]).await;
+                &store,
+                &[201],
+            )
+            .await;
             tokio::time::sleep(Duration::from_millis(fastrand::u64(50..200))).await;
         }
 
         // diff (GET)
-        c.get(&format!("/v1/branches/{branch_name}/diff"),
-            &diff, &[200]).await;
+        c.get(&format!("/v1/branches/{branch_name}/diff"), &diff, &[200])
+            .await;
 
         // checkout main
-        c.post("/v1/branches/main/checkout",
+        c.post(
+            "/v1/branches/main/checkout",
             serde_json::json!({}),
-            &checkout, &[200]).await;
+            &checkout,
+            &[200],
+        )
+        .await;
 
         // 70% merge, 30% abandon
         if fastrand::u32(0..10) < 7 {
-            c.post(&format!("/v1/branches/{branch_name}/merge"),
+            c.post(
+                &format!("/v1/branches/{branch_name}/merge"),
                 serde_json::json!({}),
-                &merge, &[200]).await;
+                &merge,
+                &[200],
+            )
+            .await;
         }
 
         // cleanup branch
-        c.delete(&format!("/v1/branches/{branch_name}"), &branch_delete, &[200, 204]).await;
+        c.delete(
+            &format!("/v1/branches/{branch_name}"),
+            &branch_delete,
+            &[200, 204],
+        )
+        .await;
 
         // occasionally rollback to snapshot (10%)
         if fastrand::u32(0..10) == 0 {
-            c.post(&format!("/v1/snapshots/{snap_name}/rollback"),
+            c.post(
+                &format!("/v1/snapshots/{snap_name}/rollback"),
                 serde_json::json!({}),
-                &rollback, &[200, 404]).await;
+                &rollback,
+                &[200, 404],
+            )
+            .await;
         }
 
         // list snapshots
-        c.get("/v1/snapshots?limit=10", &snapshots_list, &[200]).await;
+        c.get("/v1/snapshots?limit=10", &snapshots_list, &[200])
+            .await;
 
         tokio::time::sleep(Duration::from_millis(fastrand::u64(300..1000))).await;
     }
-    vec![snapshot, branch, checkout, diff, merge, rollback, store, snapshots_list, branch_delete]
+    vec![
+        snapshot,
+        branch,
+        checkout,
+        diff,
+        merge,
+        rollback,
+        store,
+        snapshots_list,
+        branch_delete,
+    ]
 }
 
 // ── Scenario 3: Maintenance (governance/consolidate/reflect + metrics) ──────
@@ -422,22 +549,28 @@ async fn maintenance_loop(c: &ApiClient, duration: Duration) -> Vec<Arc<Stats>> 
     while Instant::now() < deadline {
         match fastrand::u32(0..10) {
             0..=2 => {
-                c.post("/v1/governance", serde_json::json!({}),
-                    &governance, &[200]).await;
+                c.post("/v1/governance", serde_json::json!({}), &governance, &[200])
+                    .await;
             }
             3..=4 => {
-                c.post("/v1/consolidate", serde_json::json!({}),
-                    &consolidate, &[200]).await;
+                c.post(
+                    "/v1/consolidate",
+                    serde_json::json!({}),
+                    &consolidate,
+                    &[200],
+                )
+                .await;
             }
             5 => {
-                c.post("/v1/reflect", serde_json::json!({}),
-                    &reflect, &[200]).await;
+                c.post("/v1/reflect", serde_json::json!({}), &reflect, &[200])
+                    .await;
             }
             6..=8 => {
                 c.get("/metrics", &metrics, &[200]).await;
             }
             _ => {
-                c.get(&format!("/v1/profiles/{}", c.user_id), &profile, &[200]).await;
+                c.get(&format!("/v1/profiles/{}", c.user_id), &profile, &[200])
+                    .await;
             }
         }
         // these are heavy — longer pauses
@@ -465,28 +598,41 @@ async fn burst_loop(c: &ApiClient, duration: Duration) -> Vec<Arc<Stats>> {
                 0 => {
                     let r = &retrieve;
                     futs.push(Box::pin(async move {
-                        c.post("/v1/memories/retrieve",
+                        c.post(
+                            "/v1/memories/retrieve",
                             serde_json::json!({"query": rand_pick(QUERIES), "top_k": 5}),
-                            r, &[200]).await;
-                    }) as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>);
+                            r,
+                            &[200],
+                        )
+                        .await;
+                    })
+                        as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>);
                 }
                 1 => {
                     let s = &store;
                     futs.push(Box::pin(async move {
-                        c.post("/v1/memories",
+                        c.post(
+                            "/v1/memories",
                             serde_json::json!({
                                 "content": rand_pick(CONTENTS),
                                 "memory_type": rand_pick(MEMORY_TYPES),
                             }),
-                            s, &[201]).await;
+                            s,
+                            &[201],
+                        )
+                        .await;
                     }));
                 }
                 _ => {
                     let s = &search;
                     futs.push(Box::pin(async move {
-                        c.post("/v1/memories/search",
+                        c.post(
+                            "/v1/memories/search",
                             serde_json::json!({"query": rand_pick(QUERIES), "top_k": 10}),
-                            s, &[200]).await;
+                            s,
+                            &[200],
+                        )
+                        .await;
                     }));
                 }
             }
@@ -505,12 +651,16 @@ async fn seed_user(c: &ApiClient, count: usize) {
     let dummy = Stats::new("_seed");
     for i in 0..count {
         let mtype = MEMORY_TYPES[i % MEMORY_TYPES.len()];
-        c.post("/v1/memories",
+        c.post(
+            "/v1/memories",
             serde_json::json!({
                 "content": format!("{} (seed #{})", CONTENTS[i % CONTENTS.len()], i),
                 "memory_type": mtype,
             }),
-            &dummy, &[201]).await;
+            &dummy,
+            &[201],
+        )
+        .await;
     }
 }
 
@@ -519,22 +669,31 @@ async fn seed_user(c: &ApiClient, count: usize) {
 fn print_header(label: &str, users: usize, duration: Duration) {
     println!(
         "\n{}\n[{label}] — {users} users × {:.0}s\n{}",
-        "=".repeat(70), duration.as_secs_f64(), "=".repeat(70),
+        "=".repeat(70),
+        duration.as_secs_f64(),
+        "=".repeat(70),
     );
 }
 
 fn shared_client() -> Arc<Client> {
-    Arc::new(Client::builder()
-        .pool_max_idle_per_host(32)
-        .timeout(Duration::from_secs(30))
-        .no_proxy()
-        .build()
-        .unwrap())
+    Arc::new(
+        Client::builder()
+            .pool_max_idle_per_host(32)
+            .timeout(Duration::from_secs(30))
+            .no_proxy()
+            .build()
+            .unwrap(),
+    )
 }
 
 async fn run_scenario<F, Fut>(
-    label: &str, user_ids: Vec<String>, duration: Duration,
-    base: &str, token: &str, seed: usize, user_fn: F,
+    label: &str,
+    user_ids: Vec<String>,
+    duration: Duration,
+    base: &str,
+    token: &str,
+    seed: usize,
+    user_fn: F,
 ) where
     F: Fn(Arc<ApiClient>, Duration) -> Fut + Send + Sync + Clone + 'static,
     Fut: std::future::Future<Output = Vec<Arc<Stats>>> + Send,
@@ -551,7 +710,9 @@ async fn run_scenario<F, Fut>(
             let n = seed;
             seed_handles.push(tokio::spawn(async move { seed_user(&c, n).await }));
         }
-        for h in seed_handles { let _ = h.await; }
+        for h in seed_handles {
+            let _ = h.await;
+        }
         println!(" done");
     }
 
@@ -569,7 +730,9 @@ async fn run_scenario<F, Fut>(
             merge_stats(&mut merged, stats_vec).await;
         }
     }
-    for s in merged.values() { s.report().await; }
+    for s in merged.values() {
+        s.report().await;
+    }
 }
 
 // ── Preflight ────────────────────────────────────────────────────────────────
@@ -583,20 +746,88 @@ async fn preflight(base: &str, token: &str) -> bool {
 
     match client.get(format!("{base}/health")).send().await {
         Ok(r) if r.status().as_u16() == 200 => println!("  ✓ health: 200"),
-        Ok(r) => { println!("  ✗ health: {}", r.status()); return false; }
-        Err(e) => { println!("  ✗ health: {e}"); return false; }
+        Ok(r) => {
+            println!("  ✗ health: {}", r.status());
+            return false;
+        }
+        Err(e) => {
+            println!("  ✗ health: {e}");
+            return false;
+        }
     }
 
     let checks: Vec<(&str, u16)> = vec![
-        ("store",      { let (s,_) = c.post("/v1/memories", serde_json::json!({"content":"preflight","memory_type":"semantic"}), &d, &[201]).await; s }),
-        ("retrieve",   { let (s,_) = c.post("/v1/memories/retrieve", serde_json::json!({"query":"preflight","top_k":5}), &d, &[200]).await; s }),
-        ("search",     { let (s,_) = c.post("/v1/memories/search", serde_json::json!({"query":"preflight","top_k":5}), &d, &[200]).await; s }),
-        ("correct",    { let (s,_) = c.post("/v1/memories/correct", serde_json::json!({"query":"preflight","new_content":"updated","reason":"preflight"}), &d, &[200]).await; s }),
-        ("list",       { let (s,_) = c.get("/v1/memories", &d, &[200]).await; s }),
-        ("purge",      { let (s,_) = c.post("/v1/memories/purge", serde_json::json!({"topic":"preflight","reason":"cleanup"}), &d, &[200]).await; s }),
-        ("create_key", { let (s,_) = c.post("/auth/keys", serde_json::json!({"user_id":"lt-preflight","name":"preflight-key"}), &d, &[201]).await; s }),
-        ("list_keys",  { let (s,_) = c.get("/auth/keys", &d, &[200]).await; s }),
-        ("metrics",    { let (s,_) = c.get("/metrics", &d, &[200]).await; s }),
+        ("store", {
+            let (s, _) = c
+                .post(
+                    "/v1/memories",
+                    serde_json::json!({"content":"preflight","memory_type":"semantic"}),
+                    &d,
+                    &[201],
+                )
+                .await;
+            s
+        }),
+        ("retrieve", {
+            let (s, _) = c
+                .post(
+                    "/v1/memories/retrieve",
+                    serde_json::json!({"query":"preflight","top_k":5}),
+                    &d,
+                    &[200],
+                )
+                .await;
+            s
+        }),
+        ("search", {
+            let (s, _) = c
+                .post(
+                    "/v1/memories/search",
+                    serde_json::json!({"query":"preflight","top_k":5}),
+                    &d,
+                    &[200],
+                )
+                .await;
+            s
+        }),
+        ("correct", {
+            let (s,_) = c.post("/v1/memories/correct", serde_json::json!({"query":"preflight","new_content":"updated","reason":"preflight"}), &d, &[200]).await;
+            s
+        }),
+        ("list", {
+            let (s, _) = c.get("/v1/memories", &d, &[200]).await;
+            s
+        }),
+        ("purge", {
+            let (s, _) = c
+                .post(
+                    "/v1/memories/purge",
+                    serde_json::json!({"topic":"preflight","reason":"cleanup"}),
+                    &d,
+                    &[200],
+                )
+                .await;
+            s
+        }),
+        ("create_key", {
+            let (s, _) = c
+                .post(
+                    "/auth/keys",
+                    serde_json::json!({"user_id":"lt-preflight","name":"preflight-key"}),
+                    &d,
+                    &[201],
+                )
+                .await;
+            s
+        }),
+        ("list_keys", {
+            let (s, _) = c.get("/auth/keys", &d, &[200]).await;
+            s
+        }),
+        ("metrics", {
+            let (s, _) = c.get("/metrics", &d, &[200]).await;
+            s
+        }),
     ];
 
     for (name, status) in &checks {
@@ -607,8 +838,11 @@ async fn preflight(base: &str, token: &str) -> bool {
             ok = false;
         }
     }
-    if ok { println!("\nAll preflight checks passed."); }
-    else  { println!("\nPreflight FAILED — fix errors above."); }
+    if ok {
+        println!("\nAll preflight checks passed.");
+    } else {
+        println!("\nPreflight FAILED — fix errors above.");
+    }
     ok
 }
 
@@ -629,28 +863,60 @@ async fn run(args: &Args) -> anyhow::Result<()> {
 
     if s == "session" || s == "all" {
         let ids: Vec<String> = (0..n).map(|i| format!("lt-sess-{i}")).collect();
-        run_scenario("session (MCP agent conversation)", ids, dur, base, token, seed,
-            |c, d| async move { session_loop(&c, d).await }).await;
+        run_scenario(
+            "session (MCP agent conversation)",
+            ids,
+            dur,
+            base,
+            token,
+            seed,
+            |c, d| async move { session_loop(&c, d).await },
+        )
+        .await;
     }
 
     if s == "git" || s == "all" {
         let git_n = (n / 3).max(1);
         let ids: Vec<String> = (0..git_n).map(|i| format!("lt-git-{i}")).collect();
-        run_scenario("git-for-data (snapshot/branch/merge)", ids, dur, base, token, seed,
-            |c, d| async move { git_loop(&c, d).await }).await;
+        run_scenario(
+            "git-for-data (snapshot/branch/merge)",
+            ids,
+            dur,
+            base,
+            token,
+            seed,
+            |c, d| async move { git_loop(&c, d).await },
+        )
+        .await;
     }
 
     if s == "maintenance" || s == "all" {
         let maint_n = (n / 5).max(1);
         let ids: Vec<String> = (0..maint_n).map(|i| format!("lt-maint-{i}")).collect();
-        run_scenario("maintenance (governance/consolidate/reflect)", ids, dur, base, token, 0,
-            |c, d| async move { maintenance_loop(&c, d).await }).await;
+        run_scenario(
+            "maintenance (governance/consolidate/reflect)",
+            ids,
+            dur,
+            base,
+            token,
+            0,
+            |c, d| async move { maintenance_loop(&c, d).await },
+        )
+        .await;
     }
 
     if s == "burst" || s == "all" {
         let ids: Vec<String> = (0..n).map(|i| format!("lt-burst-{i}")).collect();
-        run_scenario("burst (concurrent spike)", ids, dur, base, token, seed,
-            |c, d| async move { burst_loop(&c, d).await }).await;
+        run_scenario(
+            "burst (concurrent spike)",
+            ids,
+            dur,
+            base,
+            token,
+            seed,
+            |c, d| async move { burst_loop(&c, d).await },
+        )
+        .await;
     }
 
     Ok(())

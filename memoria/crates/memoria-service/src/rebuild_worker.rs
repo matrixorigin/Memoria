@@ -16,10 +16,7 @@ pub struct RebuildWorker {
 }
 
 impl RebuildWorker {
-    pub fn new(
-        store: Arc<SqlMemoryStore>,
-        rx: mpsc::Receiver<RebuildSignal>,
-    ) -> Self {
+    pub fn new(store: Arc<SqlMemoryStore>, rx: mpsc::Receiver<RebuildSignal>) -> Self {
         Self { store, rx }
     }
 
@@ -74,11 +71,8 @@ impl RebuildWorker {
         );
 
         let start = std::time::Instant::now();
-        let rebuild_result = tokio::time::timeout(
-            rebuild_timeout,
-            self.store.rebuild_vector_index(table),
-        )
-        .await;
+        let rebuild_result =
+            tokio::time::timeout(rebuild_timeout, self.store.rebuild_vector_index(table)).await;
 
         match rebuild_result {
             Ok(Ok(rebuilt_rows)) => {
@@ -138,11 +132,11 @@ impl RebuildWorker {
 /// 自适应冷却时间计算
 fn calculate_cooldown(row_count: i64) -> i64 {
     match row_count {
-        0..=500 => 0,            // 不需要索引
-        501..=5_000 => 3600,     // 1小时
-        5_001..=20_000 => 10800,  // 3小时
-        20_001..=50_000 => 21600, // 6小时
+        0..=500 => 0,              // 不需要索引
+        501..=5_000 => 3600,       // 1小时
+        5_001..=20_000 => 10800,   // 3小时
+        20_001..=50_000 => 21600,  // 6小时
         50_001..=100_000 => 43200, // 12小时
-        _ => 86400,              // 24小时
+        _ => 86400,                // 24小时
     }
 }

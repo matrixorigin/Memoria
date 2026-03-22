@@ -367,7 +367,8 @@ async fn cmd_serve(db_url: Option<String>, port: u16, master_key: String) -> Res
         "Starting Memoria API server"
     );
 
-    let store = SqlMemoryStore::connect(&cfg.db_url, cfg.embedding_dim, cfg.instance_id.clone()).await?;
+    let store =
+        SqlMemoryStore::connect(&cfg.db_url, cfg.embedding_dim, cfg.instance_id.clone()).await?;
     store.migrate().await?;
 
     let pool = MySqlPool::connect(&cfg.db_url).await?;
@@ -376,15 +377,13 @@ async fn cmd_serve(db_url: Option<String>, port: u16, master_key: String) -> Res
     let embedder = build_embedder(&cfg);
     let llm = build_llm(&cfg);
 
-    let service = Arc::new(
-        MemoryService::new_sql_with_llm(Arc::new(store), embedder, llm).await,
-    );
+    let service = Arc::new(MemoryService::new_sql_with_llm(Arc::new(store), embedder, llm).await);
     Arc::new(memoria_service::GovernanceScheduler::from_config(service.clone(), &cfg).await?)
         .start();
     let state = AppState::new(service, git, master_key)
         .with_instance_id(cfg.instance_id.clone())
         .init_auth_pool(&cfg.db_url)
-        .await;
+        .await?;
 
     let app = build_router(state).layer(TraceLayer::new_for_http());
     let addr = format!("0.0.0.0:{}", port);
@@ -427,8 +426,12 @@ async fn cmd_mcp(
     if let Some(api_url) = &api_url {
         let user = user.clone().unwrap_or_else(|| "default".to_string());
         tracing::info!(api_url = %api_url, user = %user, "Starting Memoria MCP (remote mode)");
-        let remote =
-            memoria_mcp::remote::RemoteClient::new(api_url, token.as_deref(), user.clone(), tool.as_deref());
+        let remote = memoria_mcp::remote::RemoteClient::new(
+            api_url,
+            token.as_deref(),
+            user.clone(),
+            tool.as_deref(),
+        );
         return memoria_mcp::run_stdio_remote(remote, user).await;
     }
 
@@ -474,7 +477,8 @@ async fn cmd_mcp(
         "Starting Memoria MCP (embedded mode)"
     );
 
-    let store = SqlMemoryStore::connect(&cfg.db_url, cfg.embedding_dim, cfg.instance_id.clone()).await?;
+    let store =
+        SqlMemoryStore::connect(&cfg.db_url, cfg.embedding_dim, cfg.instance_id.clone()).await?;
     store.migrate().await?;
 
     let pool = MySqlPool::connect(&cfg.db_url).await?;
@@ -483,9 +487,7 @@ async fn cmd_mcp(
     let embedder = build_embedder(&cfg);
     let llm = build_llm(&cfg);
 
-    let service = Arc::new(
-        MemoryService::new_sql_with_llm(Arc::new(store), embedder, llm).await,
-    );
+    let service = Arc::new(MemoryService::new_sql_with_llm(Arc::new(store), embedder, llm).await);
     Arc::new(memoria_service::GovernanceScheduler::from_config(service.clone(), &cfg).await?)
         .start();
 
@@ -539,7 +541,8 @@ async fn cmd_plugin(command: PluginCommands) -> Result<()> {
     if let Some(db_url) = cfg_db_url {
         cfg.db_url = db_url;
     }
-    let store = SqlMemoryStore::connect(&cfg.db_url, cfg.embedding_dim, cfg.instance_id.clone()).await?;
+    let store =
+        SqlMemoryStore::connect(&cfg.db_url, cfg.embedding_dim, cfg.instance_id.clone()).await?;
     store.migrate().await?;
 
     match command {
@@ -827,8 +830,10 @@ fn build_embedder(
 
     if cfg.embedding_provider == "mock" {
         tracing::info!(dim = cfg.embedding_dim, "using mock embedder");
-        return Some(Arc::new(memoria_embedding::MockEmbedder::new(cfg.embedding_dim))
-            as Arc<dyn memoria_core::interfaces::EmbeddingProvider>);
+        return Some(
+            Arc::new(memoria_embedding::MockEmbedder::new(cfg.embedding_dim))
+                as Arc<dyn memoria_core::interfaces::EmbeddingProvider>,
+        );
     }
 
     if cfg.has_embedding() {
@@ -961,10 +966,17 @@ fn detect_tools(project_dir: &Path) -> Vec<String> {
     if project_dir.join(".cursor").exists() || which_cmd("cursor").is_some() {
         tools.push("cursor".to_string());
     }
-    if project_dir.join(".mcp.json").exists() || project_dir.join(".claude").exists() || which_cmd("claude").is_some() {
+    if project_dir.join(".mcp.json").exists()
+        || project_dir.join(".claude").exists()
+        || which_cmd("claude").is_some()
+    {
         tools.push("claude".to_string());
     }
-    let codex_config = std::env::var("HOME").ok().map(std::path::PathBuf::from).map(|h| h.join(".codex/config.toml")).unwrap_or_default();
+    let codex_config = std::env::var("HOME")
+        .ok()
+        .map(std::path::PathBuf::from)
+        .map(|h| h.join(".codex/config.toml"))
+        .unwrap_or_default();
     if codex_config.exists() || which_cmd("codex").is_some() {
         tools.push("codex".to_string());
     }
@@ -1052,11 +1064,36 @@ fn configure_kiro(project_dir: &Path, entry: &serde_json::Value, force: bool) ->
             entry,
             project_dir,
         ),
-        write_rule(&steering.join("memory.md"), KIRO_STEERING, force, project_dir),
-        write_rule(&steering.join("session-lifecycle.md"), KIRO_SESSION_LIFECYCLE, force, project_dir),
-        write_rule(&steering.join("memory-hygiene.md"), KIRO_MEMORY_HYGIENE, force, project_dir),
-        write_rule(&steering.join("memory-branching-patterns.md"), KIRO_MEMORY_BRANCHING, force, project_dir),
-        write_rule(&steering.join("goal-driven-evolution.md"), KIRO_GOAL_EVOLUTION, force, project_dir),
+        write_rule(
+            &steering.join("memory.md"),
+            KIRO_STEERING,
+            force,
+            project_dir,
+        ),
+        write_rule(
+            &steering.join("session-lifecycle.md"),
+            KIRO_SESSION_LIFECYCLE,
+            force,
+            project_dir,
+        ),
+        write_rule(
+            &steering.join("memory-hygiene.md"),
+            KIRO_MEMORY_HYGIENE,
+            force,
+            project_dir,
+        ),
+        write_rule(
+            &steering.join("memory-branching-patterns.md"),
+            KIRO_MEMORY_BRANCHING,
+            force,
+            project_dir,
+        ),
+        write_rule(
+            &steering.join("goal-driven-evolution.md"),
+            KIRO_GOAL_EVOLUTION,
+            force,
+            project_dir,
+        ),
     ]
 }
 
@@ -1065,10 +1102,30 @@ fn configure_cursor(project_dir: &Path, entry: &serde_json::Value, force: bool) 
     vec![
         write_mcp_json(&project_dir.join(".cursor/mcp.json"), entry, project_dir),
         write_rule(&rules.join("memory.mdc"), CURSOR_RULE, force, project_dir),
-        write_rule(&rules.join("session-lifecycle.mdc"), CURSOR_SESSION_LIFECYCLE, force, project_dir),
-        write_rule(&rules.join("memory-hygiene.mdc"), CURSOR_MEMORY_HYGIENE, force, project_dir),
-        write_rule(&rules.join("memory-branching-patterns.mdc"), CURSOR_MEMORY_BRANCHING, force, project_dir),
-        write_rule(&rules.join("goal-driven-evolution.mdc"), CURSOR_GOAL_EVOLUTION, force, project_dir),
+        write_rule(
+            &rules.join("session-lifecycle.mdc"),
+            CURSOR_SESSION_LIFECYCLE,
+            force,
+            project_dir,
+        ),
+        write_rule(
+            &rules.join("memory-hygiene.mdc"),
+            CURSOR_MEMORY_HYGIENE,
+            force,
+            project_dir,
+        ),
+        write_rule(
+            &rules.join("memory-branching-patterns.mdc"),
+            CURSOR_MEMORY_BRANCHING,
+            force,
+            project_dir,
+        ),
+        write_rule(
+            &rules.join("goal-driven-evolution.mdc"),
+            CURSOR_GOAL_EVOLUTION,
+            force,
+            project_dir,
+        ),
     ]
 }
 
@@ -1079,11 +1136,36 @@ fn configure_claude(project_dir: &Path, entry: &serde_json::Value, force: bool) 
         entry,
         project_dir,
     )];
-    results.push(write_rule(&rules.join("memory.md"), CLAUDE_RULE, force, project_dir));
-    results.push(write_rule(&rules.join("session-lifecycle.md"), CLAUDE_SESSION_LIFECYCLE, force, project_dir));
-    results.push(write_rule(&rules.join("memory-hygiene.md"), CLAUDE_MEMORY_HYGIENE, force, project_dir));
-    results.push(write_rule(&rules.join("memory-branching-patterns.md"), CLAUDE_MEMORY_BRANCHING, force, project_dir));
-    results.push(write_rule(&rules.join("goal-driven-evolution.md"), CLAUDE_GOAL_EVOLUTION, force, project_dir));
+    results.push(write_rule(
+        &rules.join("memory.md"),
+        CLAUDE_RULE,
+        force,
+        project_dir,
+    ));
+    results.push(write_rule(
+        &rules.join("session-lifecycle.md"),
+        CLAUDE_SESSION_LIFECYCLE,
+        force,
+        project_dir,
+    ));
+    results.push(write_rule(
+        &rules.join("memory-hygiene.md"),
+        CLAUDE_MEMORY_HYGIENE,
+        force,
+        project_dir,
+    ));
+    results.push(write_rule(
+        &rules.join("memory-branching-patterns.md"),
+        CLAUDE_MEMORY_BRANCHING,
+        force,
+        project_dir,
+    ));
+    results.push(write_rule(
+        &rules.join("goal-driven-evolution.md"),
+        CLAUDE_GOAL_EVOLUTION,
+        force,
+        project_dir,
+    ));
     // Warn if legacy CLAUDE.md contains memoria rules
     let claude_md = project_dir.join("CLAUDE.md");
     if claude_md.exists() {
@@ -1100,14 +1182,20 @@ fn configure_codex(project_dir: &Path, entry: &serde_json::Value, force: bool) -
     let mut results = vec![];
 
     // MCP: write to ~/.codex/config.toml (global, TOML format)
-    let config_path = std::env::var("HOME").ok().map(std::path::PathBuf::from)
+    let config_path = std::env::var("HOME")
+        .ok()
+        .map(std::path::PathBuf::from)
         .map(|h| h.join(".codex/config.toml"))
         .unwrap_or_else(|| std::path::PathBuf::from("~/.codex/config.toml"));
 
     let command = entry["command"].as_str().unwrap_or("memoria");
     let args: Vec<String> = entry["args"]
         .as_array()
-        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default();
 
     let args_toml = args
@@ -1145,7 +1233,12 @@ fn configure_codex(project_dir: &Path, entry: &serde_json::Value, force: bool) -
             .find("\n[")
             .map(|i| re_start + 1 + i)
             .unwrap_or(existing_toml.len());
-        format!("{}{}{}", &existing_toml[..re_start], new_section.trim_start(), &existing_toml[re_end..])
+        format!(
+            "{}{}{}",
+            &existing_toml[..re_start],
+            new_section.trim_start(),
+            &existing_toml[re_end..]
+        )
     } else {
         format!("{}{}", existing_toml.trim_end(), new_section)
     };
@@ -1197,20 +1290,28 @@ fn configure_codex(project_dir: &Path, entry: &serde_json::Value, force: bool) -
                 .rfind("\n---\n")
                 .map(|i| i + 1) // keep the \n before ---
                 .unwrap_or(0);
-            format!("{}\n\n---\n\n{}", &existing[..section_start].trim_end(), content)
+            format!(
+                "{}\n\n---\n\n{}",
+                &existing[..section_start].trim_end(),
+                content
+            )
         } else {
             format!("{}\n\n---\n\n{}", existing.trim_end(), content)
         };
         std::fs::write(&agents_md, updated).ok();
         results.push(format!(
             "  ✓ AGENTS.md (updated memoria section{})",
-            regex_version(&content).map(|v| format!(", v{}", v)).unwrap_or_default()
+            regex_version(&content)
+                .map(|v| format!(", v{}", v))
+                .unwrap_or_default()
         ));
     } else {
         std::fs::write(&agents_md, &content).ok();
         results.push(format!(
             "  ✓ AGENTS.md{}",
-            regex_version(&content).map(|v| format!(" (v{})", v)).unwrap_or_default()
+            regex_version(&content)
+                .map(|v| format!(" (v{})", v))
+                .unwrap_or_default()
         ));
     }
 
@@ -1283,7 +1384,9 @@ fn load_existing_config(project_dir: &Path) -> ExistingConfig {
         }
     }
     // Check codex ~/.codex/config.toml
-    let codex_config = std::env::var("HOME").ok().map(std::path::PathBuf::from)
+    let codex_config = std::env::var("HOME")
+        .ok()
+        .map(std::path::PathBuf::from)
         .map(|h| h.join(".codex/config.toml"))
         .unwrap_or_default();
     if let Ok(toml_content) = std::fs::read_to_string(&codex_config) {
@@ -1291,13 +1394,23 @@ fn load_existing_config(project_dir: &Path) -> ExistingConfig {
             cfg.tools.push(ToolName::Codex);
             // Parse db_url from args line if found_entry not yet set
             if found_entry.is_none() {
-                if let Some(args_line) = toml_content.lines().find(|l| l.trim_start().starts_with("args = [")) {
-                    let args_str = args_line.trim_start().trim_start_matches("args = [").trim_end_matches(']');
-                    let args: Vec<String> = args_str.split(',')
+                if let Some(args_line) = toml_content
+                    .lines()
+                    .find(|l| l.trim_start().starts_with("args = ["))
+                {
+                    let args_str = args_line
+                        .trim_start()
+                        .trim_start_matches("args = [")
+                        .trim_end_matches(']');
+                    let args: Vec<String> = args_str
+                        .split(',')
                         .map(|s| s.trim().trim_matches('"').to_string())
                         .collect();
                     // Reconstruct a minimal entry so the existing parser below can reuse it
-                    let args_json: Vec<serde_json::Value> = args.iter().map(|a| serde_json::Value::String(a.clone())).collect();
+                    let args_json: Vec<serde_json::Value> = args
+                        .iter()
+                        .map(|a| serde_json::Value::String(a.clone()))
+                        .collect();
                     found_entry = Some(serde_json::json!({"args": args_json}));
                 }
             }
@@ -1510,12 +1623,15 @@ fn cmd_init_interactive(
 
     // ── Step 1: AI Tool ─────────────────────────────────────────────
     let tools: Vec<ToolName> = if let Some(pre) = prefill_tools {
-        let names: Vec<&str> = pre.iter().map(|t| match t {
-            ToolName::Kiro => "Kiro",
-            ToolName::Cursor => "Cursor",
-            ToolName::Claude => "Claude Code",
-            ToolName::Codex => "Codex",
-        }).collect();
+        let names: Vec<&str> = pre
+            .iter()
+            .map(|t| match t {
+                ToolName::Kiro => "Kiro",
+                ToolName::Cursor => "Cursor",
+                ToolName::Claude => "Claude Code",
+                ToolName::Codex => "Codex",
+            })
+            .collect();
         cliclack::note("AI Tool", names.join(", ")).ok();
         pre
     } else {
@@ -1541,7 +1657,11 @@ fn cmd_init_interactive(
             .item(0, "Kiro", "")
             .item(1, "Cursor", "")
             .item(2, "Claude Code", "")
-            .item(3, "Codex", "MCP in ~/.codex/config.toml, rules in AGENTS.md")
+            .item(
+                3,
+                "Codex",
+                "MCP in ~/.codex/config.toml, rules in AGENTS.md",
+            )
             .initial_values(tool_defaults)
             .interact()
         {
@@ -1575,120 +1695,176 @@ fn cmd_init_interactive(
     // If --api-url + --token are pre-filled, skip DB and Embedding steps entirely
     let use_api_mode = prefill_api_url.is_some() && prefill_token.is_some();
 
-    let (final_db_url, final_api_url, final_token, emb_provider, emb_model, emb_dim, emb_api_key, emb_base_url, emb_label) =
-        if use_api_mode {
-            let api_url = prefill_api_url.clone().unwrap();
-            let token = prefill_token.clone().unwrap();
-            cliclack::note(
-                "Database (MatrixOne)",
-                format!("API URL:  {}\nToken:    {}", api_url, mask_key(&token)),
-            )
-            .ok();
-            (None, Some(api_url), Some(token), None, String::new(), String::new(), String::new(), String::new(), "N/A")
+    let (
+        final_db_url,
+        final_api_url,
+        final_token,
+        emb_provider,
+        emb_model,
+        emb_dim,
+        emb_api_key,
+        emb_base_url,
+        emb_label,
+    ) = if use_api_mode {
+        let api_url = prefill_api_url.clone().unwrap();
+        let token = prefill_token.clone().unwrap();
+        cliclack::note(
+            "Database (MatrixOne)",
+            format!("API URL:  {}\nToken:    {}", api_url, mask_key(&token)),
+        )
+        .ok();
+        (
+            None,
+            Some(api_url),
+            Some(token),
+            None,
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            "N/A",
+        )
+    } else {
+        cliclack::note(
+            "Database (MatrixOne)",
+            "Configure your MatrixOne connection",
+        )
+        .ok();
+
+        let db_host: String = cliclack::input("Host")
+            .default_input(&existing.db_host)
+            .interact()
+            .unwrap_or_else(|_| existing.db_host.clone());
+        let db_port: String = cliclack::input("Port")
+            .default_input(&existing.db_port)
+            .interact()
+            .unwrap_or_else(|_| existing.db_port.clone());
+        let db_user: String = cliclack::input("User")
+            .default_input(&existing.db_user)
+            .interact()
+            .unwrap_or_else(|_| existing.db_user.clone());
+        let db_pass: String = if existing.db_pass.is_empty() {
+            cliclack::input("Password")
+                .default_input("111")
+                .interact()
+                .unwrap_or_else(|_| "111".into())
         } else {
-            cliclack::note(
-                "Database (MatrixOne)",
-                "Configure your MatrixOne connection",
-            )
-            .ok();
-
-            let db_host: String = cliclack::input("Host")
-                .default_input(&existing.db_host)
+            cliclack::input("Password")
+                .default_input(&existing.db_pass)
                 .interact()
-                .unwrap_or_else(|_| existing.db_host.clone());
-            let db_port: String = cliclack::input("Port")
-                .default_input(&existing.db_port)
-                .interact()
-                .unwrap_or_else(|_| existing.db_port.clone());
-            let db_user: String = cliclack::input("User")
-                .default_input(&existing.db_user)
-                .interact()
-                .unwrap_or_else(|_| existing.db_user.clone());
-            let db_pass: String = if existing.db_pass.is_empty() {
-                cliclack::input("Password")
-                    .default_input("111")
-                    .interact()
-                    .unwrap_or_else(|_| "111".into())
-            } else {
-                cliclack::input("Password")
-                    .default_input(&existing.db_pass)
-                    .interact()
-                    .unwrap_or_else(|_| existing.db_pass.clone())
-            };
-            let db_name: String = cliclack::input("Database")
-                .default_input(&existing.db_name)
-                .interact()
-                .unwrap_or_else(|_| existing.db_name.clone());
-            let db_url = format!(
-                "mysql://{}:{}@{}:{}/{}",
-                db_user, db_pass, db_host, db_port, db_name
-            );
-
-            // ── Step 3: Embedding ───────────────────────────────────────────
-            cliclack::note(
-                "Embedding Service",
-                "⚠ Dimension is locked on first startup. Choose a preset, then adjust any field.",
-            )
-            .ok();
-
-            let emb_default: usize = match existing.emb_provider.as_str() {
-                "openai" if existing.emb_base_url.contains("siliconflow") => 0,
-                "openai" if existing.emb_base_url.contains("localhost:11434") => 2,
-                "openai" if existing.emb_base_url.is_empty() => 1,
-                "openai" => 3,
-                _ => 0,
-            };
-            let emb_choice: usize = cliclack::select("Preset")
-                .item(0, "SiliconFlow", "BAAI/bge-m3, 1024d — recommended, free tier")
-                .item(1, "OpenAI", "text-embedding-3-small, 1536d")
-                .item(2, "Ollama", "nomic-embed-text, 768d — local")
-                .item(3, "Custom", "enter all fields manually")
-                .initial_value(emb_default)
-                .interact()
-                .unwrap_or(emb_default);
-
-            let (pre_url, pre_model, pre_dim) = match emb_choice {
-                0 => ("https://api.siliconflow.cn/v1", "BAAI/bge-m3", "1024"),
-                1 => ("https://api.openai.com/v1", "text-embedding-3-small", "1536"),
-                2 => ("http://localhost:11434/v1", "nomic-embed-text", "768"),
-                _ => ("", "", ""),
-            };
-            let def_url = if !existing.emb_base_url.is_empty() { &existing.emb_base_url } else { pre_url };
-            let def_key = &existing.emb_api_key;
-            let def_model = if !existing.emb_model.is_empty() { &existing.emb_model } else { pre_model };
-            let def_dim = if !existing.emb_dim.is_empty() { &existing.emb_dim } else { pre_dim };
-
-            let mut url_input = cliclack::input("Base URL").default_input(def_url);
-            if def_url.is_empty() {
-                url_input = url_input.placeholder("https://api.openai.com/v1");
-            }
-            let emb_base_url: String = url_input.interact().unwrap_or_else(|_| def_url.to_string());
-            let emb_api_key: String = if def_key.is_empty() {
-                cliclack::password("API Key").mask('▪').interact().unwrap_or_default()
-            } else {
-                let v: String = cliclack::password(format!("API Key [{}]", mask_key(def_key)))
-                    .mask('▪')
-                    .allow_empty()
-                    .interact()
-                    .unwrap_or_default();
-                if v.is_empty() { def_key.clone() } else { v }
-            };
-            let emb_model: String = cliclack::input("Model")
-                .default_input(def_model)
-                .interact()
-                .unwrap_or_else(|_| def_model.to_string());
-            let emb_dim: String = cliclack::input("Dimension")
-                .default_input(def_dim)
-                .interact()
-                .unwrap_or_else(|_| def_dim.to_string());
-            let emb_label = match emb_choice {
-                0 => "SiliconFlow",
-                1 => "OpenAI",
-                2 => "Ollama",
-                _ => "Custom",
-            };
-            (Some(db_url), None, None, Some("openai".to_string()), emb_model, emb_dim, emb_api_key, emb_base_url, emb_label)
+                .unwrap_or_else(|_| existing.db_pass.clone())
         };
+        let db_name: String = cliclack::input("Database")
+            .default_input(&existing.db_name)
+            .interact()
+            .unwrap_or_else(|_| existing.db_name.clone());
+        let db_url = format!(
+            "mysql://{}:{}@{}:{}/{}",
+            db_user, db_pass, db_host, db_port, db_name
+        );
+
+        // ── Step 3: Embedding ───────────────────────────────────────────
+        cliclack::note(
+            "Embedding Service",
+            "⚠ Dimension is locked on first startup. Choose a preset, then adjust any field.",
+        )
+        .ok();
+
+        let emb_default: usize = match existing.emb_provider.as_str() {
+            "openai" if existing.emb_base_url.contains("siliconflow") => 0,
+            "openai" if existing.emb_base_url.contains("localhost:11434") => 2,
+            "openai" if existing.emb_base_url.is_empty() => 1,
+            "openai" => 3,
+            _ => 0,
+        };
+        let emb_choice: usize = cliclack::select("Preset")
+            .item(
+                0,
+                "SiliconFlow",
+                "BAAI/bge-m3, 1024d — recommended, free tier",
+            )
+            .item(1, "OpenAI", "text-embedding-3-small, 1536d")
+            .item(2, "Ollama", "nomic-embed-text, 768d — local")
+            .item(3, "Custom", "enter all fields manually")
+            .initial_value(emb_default)
+            .interact()
+            .unwrap_or(emb_default);
+
+        let (pre_url, pre_model, pre_dim) = match emb_choice {
+            0 => ("https://api.siliconflow.cn/v1", "BAAI/bge-m3", "1024"),
+            1 => (
+                "https://api.openai.com/v1",
+                "text-embedding-3-small",
+                "1536",
+            ),
+            2 => ("http://localhost:11434/v1", "nomic-embed-text", "768"),
+            _ => ("", "", ""),
+        };
+        let def_url = if !existing.emb_base_url.is_empty() {
+            &existing.emb_base_url
+        } else {
+            pre_url
+        };
+        let def_key = &existing.emb_api_key;
+        let def_model = if !existing.emb_model.is_empty() {
+            &existing.emb_model
+        } else {
+            pre_model
+        };
+        let def_dim = if !existing.emb_dim.is_empty() {
+            &existing.emb_dim
+        } else {
+            pre_dim
+        };
+
+        let mut url_input = cliclack::input("Base URL").default_input(def_url);
+        if def_url.is_empty() {
+            url_input = url_input.placeholder("https://api.openai.com/v1");
+        }
+        let emb_base_url: String = url_input.interact().unwrap_or_else(|_| def_url.to_string());
+        let emb_api_key: String = if def_key.is_empty() {
+            cliclack::password("API Key")
+                .mask('▪')
+                .interact()
+                .unwrap_or_default()
+        } else {
+            let v: String = cliclack::password(format!("API Key [{}]", mask_key(def_key)))
+                .mask('▪')
+                .allow_empty()
+                .interact()
+                .unwrap_or_default();
+            if v.is_empty() {
+                def_key.clone()
+            } else {
+                v
+            }
+        };
+        let emb_model: String = cliclack::input("Model")
+            .default_input(def_model)
+            .interact()
+            .unwrap_or_else(|_| def_model.to_string());
+        let emb_dim: String = cliclack::input("Dimension")
+            .default_input(def_dim)
+            .interact()
+            .unwrap_or_else(|_| def_dim.to_string());
+        let emb_label = match emb_choice {
+            0 => "SiliconFlow",
+            1 => "OpenAI",
+            2 => "Ollama",
+            _ => "Custom",
+        };
+        (
+            Some(db_url),
+            None,
+            None,
+            Some("openai".to_string()),
+            emb_model,
+            emb_dim,
+            emb_api_key,
+            emb_base_url,
+            emb_label,
+        )
+    };
 
     // ── Summary ─────────────────────────────────────────────────────
     let tool_names: Vec<&str> = tools
@@ -1702,7 +1878,11 @@ fn cmd_init_interactive(
         .collect();
 
     let db_line = if use_api_mode {
-        format!("API URL:   {}\nToken:     {}", final_api_url.as_deref().unwrap_or(""), mask_key(final_token.as_deref().unwrap_or("")))
+        format!(
+            "API URL:   {}\nToken:     {}",
+            final_api_url.as_deref().unwrap_or(""),
+            mask_key(final_token.as_deref().unwrap_or(""))
+        )
     } else {
         format!("Database:  {}", final_db_url.as_deref().unwrap_or(""))
     };
@@ -1803,10 +1983,26 @@ fn cmd_init_interactive(
         "default".into(),
         force,
         emb_provider,
-        if emb_model.is_empty() { None } else { Some(emb_model) },
-        if emb_dim.is_empty() { None } else { Some(emb_dim) },
-        if emb_api_key.is_empty() { None } else { Some(emb_api_key) },
-        if emb_base_url.is_empty() { None } else { Some(emb_base_url) },
+        if emb_model.is_empty() {
+            None
+        } else {
+            Some(emb_model)
+        },
+        if emb_dim.is_empty() {
+            None
+        } else {
+            Some(emb_dim)
+        },
+        if emb_api_key.is_empty() {
+            None
+        } else {
+            Some(emb_api_key)
+        },
+        if emb_base_url.is_empty() {
+            None
+        } else {
+            Some(emb_base_url)
+        },
     );
 
     cliclack::outro("You're all set! Restart your AI tool to activate Memoria.").ok();
@@ -1959,7 +2155,11 @@ fn cmd_status(project_dir: &Path) {
                 }
             }
             "codex" => {
-                let config = std::env::var("HOME").ok().map(std::path::PathBuf::from).map(|h| h.join(".codex/config.toml")).unwrap_or_default();
+                let config = std::env::var("HOME")
+                    .ok()
+                    .map(std::path::PathBuf::from)
+                    .map(|h| h.join(".codex/config.toml"))
+                    .unwrap_or_default();
                 if config.exists() {
                     let has_memoria = std::fs::read_to_string(&config)
                         .map(|c| c.contains("[mcp_servers.memoria]"))
@@ -2001,7 +2201,10 @@ fn write_rules_for_tool(project_dir: &Path, tool: &str, force: bool) {
                 ("goal-driven-evolution.md", KIRO_GOAL_EVOLUTION),
             ];
             for (name, content) in pairs {
-                println!("{}", write_rule(&steering.join(name), content, force, project_dir));
+                println!(
+                    "{}",
+                    write_rule(&steering.join(name), content, force, project_dir)
+                );
             }
         }
         "cursor" => {
@@ -2014,7 +2217,10 @@ fn write_rules_for_tool(project_dir: &Path, tool: &str, force: bool) {
                 ("goal-driven-evolution.mdc", CURSOR_GOAL_EVOLUTION),
             ];
             for (name, content) in pairs {
-                println!("{}", write_rule(&rules.join(name), content, force, project_dir));
+                println!(
+                    "{}",
+                    write_rule(&rules.join(name), content, force, project_dir)
+                );
             }
         }
         "claude" => {
@@ -2027,12 +2233,18 @@ fn write_rules_for_tool(project_dir: &Path, tool: &str, force: bool) {
                 ("goal-driven-evolution.md", CLAUDE_GOAL_EVOLUTION),
             ];
             for (name, content) in pairs {
-                println!("{}", write_rule(&rules.join(name), content, force, project_dir));
+                println!(
+                    "{}",
+                    write_rule(&rules.join(name), content, force, project_dir)
+                );
             }
         }
         "codex" => {
             let agents_md = project_dir.join("AGENTS.md");
-            println!("{}", write_rule(&agents_md, CODEX_AGENTS, force, project_dir));
+            println!(
+                "{}",
+                write_rule(&agents_md, CODEX_AGENTS, force, project_dir)
+            );
         }
         _ => {}
     }
@@ -2050,14 +2262,22 @@ fn cmd_rules(project_dir: &Path, tools: Vec<ToolName>, interactive: bool, force:
             .interact()
         {
             Ok(v) => v,
-            Err(_) => { cliclack::outro_cancel("Cancelled").ok(); return; }
+            Err(_) => {
+                cliclack::outro_cancel("Cancelled").ok();
+                return;
+            }
         };
         match sel {
             0 => vec!["kiro".to_string()],
             1 => vec!["cursor".to_string()],
             2 => vec!["claude".to_string()],
             3 => vec!["codex".to_string()],
-            _ => vec!["kiro".to_string(), "cursor".to_string(), "claude".to_string(), "codex".to_string()],
+            _ => vec![
+                "kiro".to_string(),
+                "cursor".to_string(),
+                "claude".to_string(),
+                "codex".to_string(),
+            ],
         }
     } else if tools.is_empty() {
         let detected = detect_tools(project_dir);
@@ -2099,7 +2319,12 @@ fn cmd_update(ghproxy: Option<&str>) {
             .get(&api)
             .header("User-Agent", "memoria-cli")
             .send()
-            .or_else(|_| client.get(&api_proxy).header("User-Agent", "memoria-cli").send());
+            .or_else(|_| {
+                client
+                    .get(&api_proxy)
+                    .header("User-Agent", "memoria-cli")
+                    .send()
+            });
         match resp {
             Ok(r) if r.status().is_success() => {
                 let json: serde_json::Value = r.json().unwrap_or_default();
@@ -2122,16 +2347,28 @@ fn cmd_update(ghproxy: Option<&str>) {
     println!("Updating v{} → v{}", current, latest);
 
     // ── Build URLs ──────────────────────────────────────────────────
-    let gh_url = format!("https://github.com/{}/releases/download/{}/{}", repo, resolved_tag, asset);
-    let gh_sum_url = format!("https://github.com/{}/releases/download/{}/SHA256SUMS.txt", repo, resolved_tag);
+    let gh_url = format!(
+        "https://github.com/{}/releases/download/{}/{}",
+        repo, resolved_tag, asset
+    );
+    let gh_sum_url = format!(
+        "https://github.com/{}/releases/download/{}/SHA256SUMS.txt",
+        repo, resolved_tag
+    );
 
     // ── Download with progress ──────────────────────────────────────
     println!("Downloading {}", gh_url);
     let (dl_url, sum_url) = match client.get(&gh_url).send() {
         Ok(r) if !r.status().is_server_error() => (gh_url.clone(), gh_sum_url.clone()),
         _ => {
-            println!("Direct download failed, retrying via proxy: {}", ghproxy_base);
-            (format!("{}/{}", ghproxy_base, gh_url), format!("{}/{}", ghproxy_base, gh_sum_url))
+            println!(
+                "Direct download failed, retrying via proxy: {}",
+                ghproxy_base
+            );
+            (
+                format!("{}/{}", ghproxy_base, gh_url),
+                format!("{}/{}", ghproxy_base, gh_sum_url),
+            )
         }
     };
 
@@ -2139,7 +2376,10 @@ fn cmd_update(ghproxy: Option<&str>) {
         .get(&dl_url)
         .timeout(std::time::Duration::from_secs(120))
         .send()
-        .unwrap_or_else(|e| { eprintln!("error: {}", e); std::process::exit(1); });
+        .unwrap_or_else(|e| {
+            eprintln!("error: {}", e);
+            std::process::exit(1);
+        });
 
     if !resp.status().is_success() {
         eprintln!("error: download failed: HTTP {}", resp.status());
@@ -2159,14 +2399,19 @@ fn cmd_update(ghproxy: Option<&str>) {
                 downloaded += n as u64;
                 if total > 0 {
                     let pct = downloaded * 100 / total;
-                    print!("\r  {:.1} MB / {:.1} MB  ({}%)",
+                    print!(
+                        "\r  {:.1} MB / {:.1} MB  ({}%)",
                         downloaded as f64 / 1_048_576.0,
                         total as f64 / 1_048_576.0,
-                        pct);
+                        pct
+                    );
                     let _ = std::io::Write::flush(&mut std::io::stdout());
                 }
             }
-            Err(e) => { eprintln!("\nerror: read failed: {}", e); std::process::exit(1); }
+            Err(e) => {
+                eprintln!("\nerror: read failed: {}", e);
+                std::process::exit(1);
+            }
         }
     }
     println!();
@@ -2185,7 +2430,10 @@ fn cmd_update(ghproxy: Option<&str>) {
     let new_bin = tmp.path().join("memoria");
     if let Err(e) = self_replace::self_replace(&new_bin) {
         if e.kind() == std::io::ErrorKind::PermissionDenied {
-            eprintln!("error: permission denied replacing {}", current_exe.display());
+            eprintln!(
+                "error: permission denied replacing {}",
+                current_exe.display()
+            );
             eprintln!("hint:  try: sudo memoria update");
         } else {
             eprintln!("error: failed to replace binary: {}", e);
@@ -2218,11 +2466,14 @@ fn detect_install_target() -> String {
     let os = std::env::consts::OS;
     let arch = std::env::consts::ARCH;
     match (os, arch) {
-        ("linux", "x86_64")  => "x86_64-unknown-linux-musl".into(),
+        ("linux", "x86_64") => "x86_64-unknown-linux-musl".into(),
         ("linux", "aarch64") => "aarch64-unknown-linux-musl".into(),
-        ("macos", "x86_64")  => "x86_64-apple-darwin".into(),
+        ("macos", "x86_64") => "x86_64-apple-darwin".into(),
         ("macos", "aarch64") => "aarch64-apple-darwin".into(),
-        _ => { eprintln!("error: unsupported platform: {} {}", os, arch); std::process::exit(1); }
+        _ => {
+            eprintln!("error: unsupported platform: {} {}", os, arch);
+            std::process::exit(1);
+        }
     }
 }
 
@@ -2230,7 +2481,9 @@ fn sha256_hex(data: &[u8]) -> String {
     use std::fmt::Write;
     // simple SHA-256 via sha2 if available, else skip
     let mut s = String::new();
-    for b in data.iter().take(0) { write!(s, "{:02x}", b).ok(); }
+    for b in data.iter().take(0) {
+        write!(s, "{:02x}", b).ok();
+    }
     s
 }
 
@@ -2481,7 +2734,11 @@ fn main() -> Result<()> {
             }
         }
         Commands::Status => cmd_status(&project_dir),
-        Commands::Rules { tool, interactive, force } => cmd_rules(&project_dir, tool, interactive, force),
+        Commands::Rules {
+            tool,
+            interactive,
+            force,
+        } => cmd_rules(&project_dir, tool, interactive, force),
         Commands::Update { ghproxy } => cmd_update(ghproxy.as_deref()),
         Commands::Benchmark {
             api_url,

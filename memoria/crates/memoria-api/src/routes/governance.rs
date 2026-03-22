@@ -36,11 +36,27 @@ pub async fn governance(
     let cleaned = sql.cleanup_stale(&user_id).await.map_err(api_err)?;
     if quarantined > 0 {
         let payload = serde_json::json!({"quarantined": quarantined}).to_string();
-        sql.log_edit(&user_id, "governance:quarantine", None, Some(&payload), &format!("quarantined {quarantined}"), None).await;
+        sql.log_edit(
+            &user_id,
+            "governance:quarantine",
+            None,
+            Some(&payload),
+            &format!("quarantined {quarantined}"),
+            None,
+        )
+        .await;
     }
     if cleaned > 0 {
         let payload = serde_json::json!({"cleaned_stale": cleaned}).to_string();
-        sql.log_edit(&user_id, "governance:cleanup_stale", None, Some(&payload), &format!("cleaned {cleaned}"), None).await;
+        sql.log_edit(
+            &user_id,
+            "governance:cleanup_stale",
+            None,
+            Some(&payload),
+            &format!("cleaned {cleaned}"),
+            None,
+        )
+        .await;
     }
     sql.set_cooldown(&user_id, "governance")
         .await

@@ -505,9 +505,7 @@ async fn test_store_creates_graph_node() {
         .expect("connect");
     sql.migrate().await.expect("migrate");
     let uid = format!("gsync_{}", uuid::Uuid::new_v4().simple());
-    let svc = Arc::new(MemoryService::new_sql_with_llm(Arc::new(sql.clone()),
-    None,
-    None,).await);
+    let svc = Arc::new(MemoryService::new_sql_with_llm(Arc::new(sql.clone()), None, None).await);
 
     // Call memory_store via tools
     let r = memoria_mcp::tools::call(
@@ -565,9 +563,7 @@ async fn test_correct_updates_graph_node() {
         .expect("connect");
     sql.migrate().await.expect("migrate");
     let uid = format!("gcorr_{}", uuid::Uuid::new_v4().simple());
-    let svc = Arc::new(MemoryService::new_sql_with_llm(Arc::new(sql.clone()),
-    None,
-    None,).await);
+    let svc = Arc::new(MemoryService::new_sql_with_llm(Arc::new(sql.clone()), None, None).await);
 
     // Store
     let r = memoria_mcp::tools::call(
@@ -628,9 +624,7 @@ async fn test_purge_deactivates_graph_node() {
         .expect("connect");
     sql.migrate().await.expect("migrate");
     let uid = format!("gpurge_{}", uuid::Uuid::new_v4().simple());
-    let svc = Arc::new(MemoryService::new_sql_with_llm(Arc::new(sql.clone()),
-    None,
-    None,).await);
+    let svc = Arc::new(MemoryService::new_sql_with_llm(Arc::new(sql.clone()), None, None).await);
 
     // Store
     let r = memoria_mcp::tools::call(
@@ -793,14 +787,14 @@ async fn test_batch_upsert_entity_links_empty() {
 #[tokio::test]
 async fn test_batch_upsert_entity_links_basic() {
     let (store, uid) = setup_graph().await;
-    let (eid1, _) = store.upsert_entity(&uid, "rust", "Rust", "tech").await.unwrap();
+    let (eid1, _) = store
+        .upsert_entity(&uid, "rust", "Rust", "tech")
+        .await
+        .unwrap();
     let (eid2, _) = store.upsert_entity(&uid, "go", "Go", "tech").await.unwrap();
     let mid = format!("mem_{}", uuid::Uuid::new_v4().simple());
 
-    let links: Vec<(&str, &str, &str)> = vec![
-        (&mid, &eid1, "regex"),
-        (&mid, &eid2, "llm"),
-    ];
+    let links: Vec<(&str, &str, &str)> = vec![(&mid, &eid1, "regex"), (&mid, &eid2, "llm")];
     store
         .batch_upsert_memory_entity_links(&uid, &links)
         .await
@@ -825,13 +819,22 @@ async fn test_batch_upsert_entity_links_basic() {
 #[tokio::test]
 async fn test_batch_upsert_entity_links_idempotent() {
     let (store, uid) = setup_graph().await;
-    let (eid, _) = store.upsert_entity(&uid, "matrixone", "MatrixOne", "tech").await.unwrap();
+    let (eid, _) = store
+        .upsert_entity(&uid, "matrixone", "MatrixOne", "tech")
+        .await
+        .unwrap();
     let mid = format!("mem_{}", uuid::Uuid::new_v4().simple());
 
     let links: Vec<(&str, &str, &str)> = vec![(&mid, &eid, "regex")];
-    store.batch_upsert_memory_entity_links(&uid, &links).await.unwrap();
+    store
+        .batch_upsert_memory_entity_links(&uid, &links)
+        .await
+        .unwrap();
     // Upsert again — should not fail (ON DUPLICATE KEY UPDATE)
-    store.batch_upsert_memory_entity_links(&uid, &links).await.unwrap();
+    store
+        .batch_upsert_memory_entity_links(&uid, &links)
+        .await
+        .unwrap();
 
     let rows = sqlx::query(
         "SELECT COUNT(*) as cnt FROM mem_memory_entity_links WHERE user_id = ? AND memory_id = ? AND entity_id = ?"
@@ -847,27 +850,42 @@ async fn test_batch_upsert_entity_links_idempotent() {
 #[tokio::test]
 async fn test_batch_upsert_entity_links_source_upgrade() {
     let (store, uid) = setup_graph().await;
-    let (eid, _) = store.upsert_entity(&uid, "tokio", "Tokio", "tech").await.unwrap();
+    let (eid, _) = store
+        .upsert_entity(&uid, "tokio", "Tokio", "tech")
+        .await
+        .unwrap();
     let mid = format!("mem_{}", uuid::Uuid::new_v4().simple());
 
     // First insert with regex (weight 0.8)
     let links: Vec<(&str, &str, &str)> = vec![(&mid, &eid, "regex")];
-    store.batch_upsert_memory_entity_links(&uid, &links).await.unwrap();
+    store
+        .batch_upsert_memory_entity_links(&uid, &links)
+        .await
+        .unwrap();
 
     // Upsert with manual (weight 1.0) — should update
     let links2: Vec<(&str, &str, &str)> = vec![(&mid, &eid, "manual")];
-    store.batch_upsert_memory_entity_links(&uid, &links2).await.unwrap();
+    store
+        .batch_upsert_memory_entity_links(&uid, &links2)
+        .await
+        .unwrap();
 
     use sqlx::Row;
     let row = sqlx::query(
-        "SELECT source, weight FROM mem_memory_entity_links WHERE memory_id = ? AND entity_id = ?"
+        "SELECT source, weight FROM mem_memory_entity_links WHERE memory_id = ? AND entity_id = ?",
     )
-    .bind(&mid).bind(&eid)
-    .fetch_one(store.pool()).await.unwrap();
+    .bind(&mid)
+    .bind(&eid)
+    .fetch_one(store.pool())
+    .await
+    .unwrap();
     let source: String = row.get("source");
     let weight: f32 = row.get("weight");
     assert_eq!(source, "manual");
-    assert!((weight - 1.0).abs() < 0.01, "weight should be updated to 1.0");
+    assert!(
+        (weight - 1.0).abs() < 0.01,
+        "weight should be updated to 1.0"
+    );
     println!("✅ batch_upsert_memory_entity_links: source/weight updated on conflict");
 }
 
@@ -895,10 +913,13 @@ async fn test_batch_upsert_entity_links_large_batch() {
 
     use sqlx::Row;
     let row = sqlx::query(
-        "SELECT COUNT(*) as cnt FROM mem_memory_entity_links WHERE user_id = ? AND memory_id = ?"
+        "SELECT COUNT(*) as cnt FROM mem_memory_entity_links WHERE user_id = ? AND memory_id = ?",
     )
-    .bind(&uid).bind(&mid)
-    .fetch_one(store.pool()).await.unwrap();
+    .bind(&uid)
+    .bind(&mid)
+    .fetch_one(store.pool())
+    .await
+    .unwrap();
     let cnt: i64 = row.get("cnt");
     assert_eq!(cnt, 80);
     println!("✅ batch_upsert_memory_entity_links: 80 links chunked correctly");
@@ -917,7 +938,10 @@ async fn test_batch_upsert_entity_links_mixed_sources() {
         (&mid, &eid2, "llm"),
         (&mid, &eid3, "manual"),
     ];
-    store.batch_upsert_memory_entity_links(&uid, &links).await.unwrap();
+    store
+        .batch_upsert_memory_entity_links(&uid, &links)
+        .await
+        .unwrap();
 
     use sqlx::Row;
     let rows = sqlx::query(
@@ -934,16 +958,19 @@ async fn test_batch_upsert_entity_links_mixed_sources() {
 #[tokio::test]
 async fn test_batch_upsert_entity_links_multiple_memories() {
     let (store, uid) = setup_graph().await;
-    let (eid, _) = store.upsert_entity(&uid, "shared_entity", "SharedEntity", "concept").await.unwrap();
+    let (eid, _) = store
+        .upsert_entity(&uid, "shared_entity", "SharedEntity", "concept")
+        .await
+        .unwrap();
     let mid1 = format!("mem1_{}", uuid::Uuid::new_v4().simple());
     let mid2 = format!("mem2_{}", uuid::Uuid::new_v4().simple());
 
     // Same entity linked to two different memories in one batch
-    let links: Vec<(&str, &str, &str)> = vec![
-        (&mid1, &eid, "regex"),
-        (&mid2, &eid, "llm"),
-    ];
-    store.batch_upsert_memory_entity_links(&uid, &links).await.unwrap();
+    let links: Vec<(&str, &str, &str)> = vec![(&mid1, &eid, "regex"), (&mid2, &eid, "llm")];
+    store
+        .batch_upsert_memory_entity_links(&uid, &links)
+        .await
+        .unwrap();
 
     let rows = sqlx::query(
         "SELECT memory_id, source FROM mem_memory_entity_links WHERE user_id = ? AND entity_id = ? ORDER BY memory_id"

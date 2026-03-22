@@ -7,7 +7,12 @@ use serde::Deserialize;
 use serde_json::json;
 use sqlx::Row;
 
-use crate::{auth::AuthUser, models::*, routes::memory::{api_err, api_err_typed}, state::AppState};
+use crate::{
+    auth::AuthUser,
+    models::*,
+    routes::memory::{api_err, api_err_typed},
+    state::AppState,
+};
 
 #[derive(Deserialize, Default)]
 pub struct ListSnapshotsQuery {

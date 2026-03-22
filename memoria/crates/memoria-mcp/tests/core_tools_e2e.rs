@@ -399,7 +399,10 @@ async fn test_purge_short_topic() {
     let result = memoria_mcp::tools::call("memory_purge", json!({"topic": "ab"}), &svc, &uid).await;
     assert!(result.is_err(), "Should return error for short topic");
     let err_msg = format!("{:?}", result.unwrap_err());
-    assert!(err_msg.contains("at least 3 characters"), "expected validation error, got: {err_msg}");
+    assert!(
+        err_msg.contains("at least 3 characters"),
+        "expected validation error, got: {err_msg}"
+    );
     println!("✅ purge short topic rejected");
 }
 
@@ -504,7 +507,10 @@ async fn test_capabilities() {
         "memory_tune_params",
         "memory_observe",
     ] {
-        assert!(!t.contains(hidden), "hidden tool {hidden} should not be in capabilities: {t}");
+        assert!(
+            !t.contains(hidden),
+            "hidden tool {hidden} should not be in capabilities: {t}"
+        );
     }
     println!("✅ capabilities: {t}");
 }
@@ -988,29 +994,33 @@ async fn test_reflect_with_llm_if_configured() {
     .into_iter()
     .enumerate()
     {
-        graph.create_node(&memoria_storage::GraphNode {
-            node_id: format!("reflect_node_{idx}_{}", &Uuid::new_v4().simple().to_string()[..8]),
-            user_id: uid.clone(),
-            node_type: memoria_storage::NodeType::Semantic,
-            content: content.to_string(),
-            entity_type: None,
-            embedding: None,
-            memory_id: None,
-            session_id: Some("llm_cluster".to_string()),
-            confidence: 0.8,
-            trust_tier: "T3".to_string(),
-            importance: 0.5,
-            source_nodes: vec![],
-            conflicts_with: None,
-            conflict_resolution: None,
-            access_count: 0,
-            cross_session_count: 0,
-            is_active: true,
-            superseded_by: None,
-            created_at: Some(chrono::Utc::now().naive_utc()),
-        })
-        .await
-        .unwrap();
+        graph
+            .create_node(&memoria_storage::GraphNode {
+                node_id: format!(
+                    "reflect_node_{idx}_{}",
+                    &Uuid::new_v4().simple().to_string()[..8]
+                ),
+                user_id: uid.clone(),
+                node_type: memoria_storage::NodeType::Semantic,
+                content: content.to_string(),
+                entity_type: None,
+                embedding: None,
+                memory_id: None,
+                session_id: Some("llm_cluster".to_string()),
+                confidence: 0.8,
+                trust_tier: "T3".to_string(),
+                importance: 0.5,
+                source_nodes: vec![],
+                conflicts_with: None,
+                conflict_resolution: None,
+                access_count: 0,
+                cross_session_count: 0,
+                is_active: true,
+                superseded_by: None,
+                created_at: Some(chrono::Utc::now().naive_utc()),
+            })
+            .await
+            .unwrap();
     }
 
     let r = call(
@@ -1068,7 +1078,10 @@ async fn test_extract_entities_with_llm_if_configured() {
     .await;
     let t = text(&r);
     let parsed: serde_json::Value = serde_json::from_str(&t).unwrap_or(serde_json::Value::Null);
-    assert_eq!(parsed["status"], "done", "with LLM should return done, got: {t}");
+    assert_eq!(
+        parsed["status"], "done",
+        "with LLM should return done, got: {t}"
+    );
     assert!(
         parsed["entities_found"].as_u64().unwrap_or(0) >= 2,
         "fake LLM should create entities: {t}"

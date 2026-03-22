@@ -1,5 +1,6 @@
-use crate::auth::{LastUsedBatcher, spawn_last_used_flusher};
+use crate::auth::{spawn_last_used_flusher, LastUsedBatcher};
 use crate::rate_limit::RateLimiter;
+use memoria_core::MemoriaError;
 use memoria_git::GitForDataService;
 use memoria_service::{AsyncTaskStore, MemoryService};
 use moka::future::Cache;
@@ -90,7 +91,10 @@ impl AppState {
 
     /// Create a dedicated auth pool and start the batched last_used_at flusher.
     /// Call after construction, before serving requests.
-    pub async fn init_auth_pool(mut self, database_url: &str) -> Self {
+    ///
+    /// This is strict on purpose: if the auth pool cannot be created, startup fails
+    /// rather than letting auth traffic spill into the main business pool.
+    pub async fn init_auth_pool(mut self, database_url: &str) -> Result<Self, MemoriaError> {
         let auth_max_connections = {
             let raw: u32 = std::env::var("MEMORIA_AUTH_POOL_MAX_CONNECTIONS")
                 .ok()
@@ -99,7 +103,9 @@ impl AppState {
             let clamped = raw.clamp(1, AUTH_POOL_MAX_CONNECTIONS_UPPER);
             if clamped != raw {
                 warn!(
-                    raw = raw, clamped = clamped, max = AUTH_POOL_MAX_CONNECTIONS_UPPER,
+                    raw = raw,
+                    clamped = clamped,
+                    max = AUTH_POOL_MAX_CONNECTIONS_UPPER,
                     "MEMORIA_AUTH_POOL_MAX_CONNECTIONS clamped to bounds"
                 );
             }
@@ -113,40 +119,34 @@ impl AppState {
             let clamped = raw.clamp(1, AUTH_POOL_ACQUIRE_TIMEOUT_MAX_SECS);
             if clamped != raw {
                 warn!(
-                    raw_secs = raw, clamped_secs = clamped, max = AUTH_POOL_ACQUIRE_TIMEOUT_MAX_SECS,
+                    raw_secs = raw,
+                    clamped_secs = clamped,
+                    max = AUTH_POOL_ACQUIRE_TIMEOUT_MAX_SECS,
                     "MEMORIA_AUTH_POOL_ACQUIRE_TIMEOUT_SECS clamped to bounds"
                 );
             }
             Duration::from_secs(clamped)
         };
 
-        match sqlx::mysql::MySqlPoolOptions::new()
+        let pool = sqlx::mysql::MySqlPoolOptions::new()
             .max_connections(auth_max_connections)
             .max_lifetime(Duration::from_secs(3600))
             .acquire_timeout(auth_acquire_timeout)
             .idle_timeout(Duration::from_secs(300))
             .connect(database_url)
             .await
-        {
-            Ok(pool) => {
-                info!(
-                    max_connections = auth_max_connections,
-                    acquire_timeout_secs = auth_acquire_timeout.as_secs(),
-                    "Dedicated auth connection pool initialized"
-                );
-                // Start the batched last_used_at flusher using the auth pool
-                spawn_last_used_flusher(self.last_used_batcher.clone(), pool.clone());
-                self.auth_pool = Some(pool);
-            }
-            Err(e) => {
-                warn!("Failed to create auth pool, falling back to main pool: {e}");
-                // Still start the flusher using the main pool if available
-                if let Some(sql) = &self.service.sql_store {
-                    spawn_last_used_flusher(self.last_used_batcher.clone(), sql.pool().clone());
-                }
-            }
-        }
-        self
+            .map_err(|e| {
+                MemoriaError::Database(format!("failed to create dedicated auth pool: {e}"))
+            })?;
+        info!(
+            max_connections = auth_max_connections,
+            acquire_timeout_secs = auth_acquire_timeout.as_secs(),
+            "Dedicated auth connection pool initialized"
+        );
+        // Start the batched last_used_at flusher using the auth pool
+        spawn_last_used_flusher(self.last_used_batcher.clone(), pool.clone());
+        self.auth_pool = Some(pool);
+        Ok(self)
     }
 
     pub fn with_instance_id(mut self, instance_id: String) -> Self {
@@ -197,7 +197,10 @@ mod tests {
 
         let r = cache.read().await;
         let snapshot = r.as_ref().unwrap();
-        assert!(snapshot.generated_at.elapsed() >= ttl, "cache should be expired");
+        assert!(
+            snapshot.generated_at.elapsed() >= ttl,
+            "cache should be expired"
+        );
     }
 
     #[tokio::test]
@@ -238,17 +241,26 @@ mod tests {
     fn test_connection_pool_config() {
         // metrics_cache_ttl clamping
         assert_eq!(0u64.clamp(1, METRICS_CACHE_TTL_MAX_SECS), 1);
-        assert_eq!(999u64.clamp(1, METRICS_CACHE_TTL_MAX_SECS), METRICS_CACHE_TTL_MAX_SECS);
+        assert_eq!(
+            999u64.clamp(1, METRICS_CACHE_TTL_MAX_SECS),
+            METRICS_CACHE_TTL_MAX_SECS
+        );
         assert_eq!(5u64.clamp(1, METRICS_CACHE_TTL_MAX_SECS), 5);
 
         // auth pool max_connections clamping
         assert_eq!(0u32.clamp(1, AUTH_POOL_MAX_CONNECTIONS_UPPER), 1);
-        assert_eq!(200u32.clamp(1, AUTH_POOL_MAX_CONNECTIONS_UPPER), AUTH_POOL_MAX_CONNECTIONS_UPPER);
+        assert_eq!(
+            200u32.clamp(1, AUTH_POOL_MAX_CONNECTIONS_UPPER),
+            AUTH_POOL_MAX_CONNECTIONS_UPPER
+        );
         assert_eq!(8u32.clamp(1, AUTH_POOL_MAX_CONNECTIONS_UPPER), 8);
 
         // auth pool acquire_timeout clamping
         assert_eq!(0u64.clamp(1, AUTH_POOL_ACQUIRE_TIMEOUT_MAX_SECS), 1);
-        assert_eq!(100u64.clamp(1, AUTH_POOL_ACQUIRE_TIMEOUT_MAX_SECS), AUTH_POOL_ACQUIRE_TIMEOUT_MAX_SECS);
+        assert_eq!(
+            100u64.clamp(1, AUTH_POOL_ACQUIRE_TIMEOUT_MAX_SECS),
+            AUTH_POOL_ACQUIRE_TIMEOUT_MAX_SECS
+        );
         assert_eq!(5u64.clamp(1, AUTH_POOL_ACQUIRE_TIMEOUT_MAX_SECS), 5);
     }
 
@@ -264,7 +276,10 @@ mod tests {
         let body = Arc::new("# metrics\nmemoria_memories_total{type=\"all\"} 0\n".to_string());
         {
             let mut w = cache.write().await;
-            *w = Some(CachedMetrics { body: body.clone(), generated_at: Instant::now() });
+            *w = Some(CachedMetrics {
+                body: body.clone(),
+                generated_at: Instant::now(),
+            });
         }
 
         // Hit: within TTL, same Arc pointer (no copy)

@@ -369,7 +369,10 @@ async fn spawn_server_with_master_key(master_key: &str) -> (String, reqwest::Cli
     let pool = MySqlPool::connect(&db).await.expect("pool");
     let git = Arc::new(GitForDataService::new(pool, &cfg.db_name));
     let service = Arc::new(MemoryService::new_sql_with_llm(Arc::new(store), None, None).await);
-    let state = memoria_api::AppState::new(service, git, master_key.to_string());
+    let state = memoria_api::AppState::new(service, git, master_key.to_string())
+        .init_auth_pool(&db)
+        .await
+        .expect("init auth pool");
     let app = memoria_api::build_router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -1680,9 +1683,13 @@ async fn test_reflect_with_llm() {
     let (base, client) = spawn_server_with_llm(llm).await;
     let uid = uid();
 
-    let store = memoria_storage::SqlMemoryStore::connect(&db_url(), test_dim(), uuid::Uuid::new_v4().to_string())
-        .await
-        .expect("connect");
+    let store = memoria_storage::SqlMemoryStore::connect(
+        &db_url(),
+        test_dim(),
+        uuid::Uuid::new_v4().to_string(),
+    )
+    .await
+    .expect("connect");
     store.migrate().await.expect("migrate");
     let graph = store.graph_store();
     for (idx, content) in [
@@ -1693,29 +1700,33 @@ async fn test_reflect_with_llm() {
     .into_iter()
     .enumerate()
     {
-        graph.create_node(&memoria_storage::GraphNode {
-            node_id: format!("reflect_node_{idx}_{}", &uuid::Uuid::new_v4().simple().to_string()[..8]),
-            user_id: uid.clone(),
-            node_type: memoria_storage::NodeType::Semantic,
-            content: content.to_string(),
-            entity_type: None,
-            embedding: None,
-            memory_id: None,
-            session_id: Some("llm_cluster".to_string()),
-            confidence: 0.8,
-            trust_tier: "T3".to_string(),
-            importance: 0.5,
-            source_nodes: vec![],
-            conflicts_with: None,
-            conflict_resolution: None,
-            access_count: 0,
-            cross_session_count: 0,
-            is_active: true,
-            superseded_by: None,
-            created_at: Some(chrono::Utc::now().naive_utc()),
-        })
-        .await
-        .expect("create graph node");
+        graph
+            .create_node(&memoria_storage::GraphNode {
+                node_id: format!(
+                    "reflect_node_{idx}_{}",
+                    &uuid::Uuid::new_v4().simple().to_string()[..8]
+                ),
+                user_id: uid.clone(),
+                node_type: memoria_storage::NodeType::Semantic,
+                content: content.to_string(),
+                entity_type: None,
+                embedding: None,
+                memory_id: None,
+                session_id: Some("llm_cluster".to_string()),
+                confidence: 0.8,
+                trust_tier: "T3".to_string(),
+                importance: 0.5,
+                source_nodes: vec![],
+                conflicts_with: None,
+                conflict_resolution: None,
+                access_count: 0,
+                cross_session_count: 0,
+                is_active: true,
+                superseded_by: None,
+                created_at: Some(chrono::Utc::now().naive_utc()),
+            })
+            .await
+            .expect("create graph node");
     }
 
     let r = client
@@ -1944,9 +1955,7 @@ async fn spawn_server_with_llm(
     store.migrate().await.expect("migrate");
     let pool = MySqlPool::connect(&db).await.expect("pool");
     let git = Arc::new(GitForDataService::new(pool, &cfg.db_name));
-    let service = Arc::new(MemoryService::new_sql_with_llm(Arc::new(store),
-    None,
-    Some(llm),).await);
+    let service = Arc::new(MemoryService::new_sql_with_llm(Arc::new(store), None, Some(llm)).await);
     let state = memoria_api::AppState::new(service, git, String::new());
     let app = memoria_api::build_router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1970,14 +1979,15 @@ async fn spawn_server_with_embedding(
 
     let cfg = Config::from_env();
     let db = db_url();
-    let store = SqlMemoryStore::connect(&db, 1024, uuid::Uuid::new_v4().to_string()).await.expect("connect");
+    let store = SqlMemoryStore::connect(&db, 1024, uuid::Uuid::new_v4().to_string())
+        .await
+        .expect("connect");
     store.migrate().await.expect("migrate");
     let pool = MySqlPool::connect(&db).await.expect("pool");
     let git = Arc::new(GitForDataService::new(pool, &cfg.db_name));
     let embedder = Arc::new(HttpEmbedder::new(base_url, emb_key, model, 1024));
-    let service = Arc::new(MemoryService::new_sql_with_llm(Arc::new(store),
-    Some(embedder),
-    None,).await);
+    let service =
+        Arc::new(MemoryService::new_sql_with_llm(Arc::new(store), Some(embedder), None).await);
     let state = memoria_api::AppState::new(service, git, String::new());
     let app = memoria_api::build_router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2091,7 +2101,10 @@ async fn test_episodic_with_llm_async() {
     let (llm, _shutdown) = spawn_fake_llm().await;
     let (base, client) = spawn_server_with_llm(llm).await;
     let uid = uid();
-    let session_id = format!("ep_async_{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
+    let session_id = format!(
+        "ep_async_{}",
+        &uuid::Uuid::new_v4().simple().to_string()[..8]
+    );
 
     for content in [
         "Validated scheduler fallback behavior",
@@ -4279,7 +4292,6 @@ async fn test_distributed_async_task_fail() {
     println!("✅ async task failure recorded correctly");
 }
 
-
 // ── Feedback API tests ────────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -4449,7 +4461,6 @@ async fn test_api_feedback_by_tier() {
     println!("✅ GET /v1/feedback/by-tier: {} entries", breakdown.len());
 }
 
-
 // ── Retrieval Params API Tests ────────────────────────────────────────────────
 
 #[tokio::test]
@@ -4571,9 +4582,15 @@ async fn test_api_tune_with_feedback() {
 
     let old_weight = body["old_params"]["feedback_weight"].as_f64().unwrap();
     let new_weight = body["new_params"]["feedback_weight"].as_f64().unwrap();
-    assert!(new_weight >= old_weight, "feedback_weight should increase with positive feedback");
+    assert!(
+        new_weight >= old_weight,
+        "feedback_weight should increase with positive feedback"
+    );
 
-    println!("✅ POST /v1/retrieval-params/tune: {:.3} → {:.3}", old_weight, new_weight);
+    println!(
+        "✅ POST /v1/retrieval-params/tune: {:.3} → {:.3}",
+        old_weight, new_weight
+    );
 }
 
 // ── Prometheus metrics ────────────────────────────────────────────────────────
@@ -4584,9 +4601,18 @@ async fn test_api_metrics() {
     let r = client.get(format!("{base}/metrics")).send().await.unwrap();
     assert_eq!(r.status(), 200);
     let body = r.text().await.unwrap();
-    assert!(body.contains("memoria_memories_total"), "missing memoria_memories_total");
-    assert!(body.contains("memoria_users_total"), "missing memoria_users_total");
-    assert!(body.contains("memoria_auth_failures_total"), "missing auth_failures counter");
+    assert!(
+        body.contains("memoria_memories_total"),
+        "missing memoria_memories_total"
+    );
+    assert!(
+        body.contains("memoria_users_total"),
+        "missing memoria_users_total"
+    );
+    assert!(
+        body.contains("memoria_auth_failures_total"),
+        "missing auth_failures counter"
+    );
     println!("✅ GET /metrics: {} bytes", body.len());
 }
 
@@ -4638,7 +4664,11 @@ async fn test_api_snapshot_rollback() {
     assert_eq!(r.status(), 200);
     let body: Value = r.json().await.unwrap();
     assert!(
-        body["result"].as_str().unwrap_or("").to_lowercase().contains("roll"),
+        body["result"]
+            .as_str()
+            .unwrap_or("")
+            .to_lowercase()
+            .contains("roll"),
         "rollback response: {body}"
     );
     println!("✅ POST /v1/snapshots/:name/rollback: {}", body["result"]);
@@ -4670,7 +4700,10 @@ async fn test_api_entities() {
     assert_eq!(r.status(), 200);
     let body: Value = r.json().await.unwrap();
     assert!(body["entities"].is_array(), "entities should be an array");
-    println!("✅ GET /v1/entities: {} entities", body["entities"].as_array().unwrap().len());
+    println!(
+        "✅ GET /v1/entities: {} entities",
+        body["entities"].as_array().unwrap().len()
+    );
 }
 
 // ── Admin config ──────────────────────────────────────────────────────────────
@@ -4681,7 +4714,11 @@ async fn test_api_admin_config() {
     let (base, client) = spawn_server_with_master_key(&mk).await;
 
     // Without master key → 401
-    let r = client.get(format!("{base}/admin/config")).send().await.unwrap();
+    let r = client
+        .get(format!("{base}/admin/config"))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(r.status(), 401);
 
     // With master key → 200
@@ -4697,7 +4734,10 @@ async fn test_api_admin_config() {
     assert!(body["embedding_dim"].is_number(), "missing embedding_dim");
     // Password should be redacted
     let db_url = body["db_url"].as_str().unwrap_or("");
-    assert!(db_url.contains("***") || !db_url.contains("@"), "db password not redacted: {db_url}");
+    assert!(
+        db_url.contains("***") || !db_url.contains("@"),
+        "db password not redacted: {db_url}"
+    );
     println!("✅ GET /admin/config: db_name={}", body["db_name"]);
 }
 
@@ -4749,7 +4789,9 @@ async fn test_concurrent_stores() {
         handles.push(tokio::spawn(async move {
             c.post(format!("{b}/v1/memories"))
                 .header("X-User-Id", &u)
-                .json(&json!({"content": format!("concurrent fact #{i}"), "memory_type": "semantic"}))
+                .json(
+                    &json!({"content": format!("concurrent fact #{i}"), "memory_type": "semantic"}),
+                )
                 .send()
                 .await
                 .unwrap()
@@ -4894,7 +4936,11 @@ async fn test_concurrent_feedback() {
     }
     for h in handles {
         let r = h.await.unwrap();
-        assert!(r.status() == 200 || r.status() == 201, "concurrent feedback should succeed, got {}", r.status());
+        assert!(
+            r.status() == 200 || r.status() == 201,
+            "concurrent feedback should succeed, got {}",
+            r.status()
+        );
     }
 
     // Verify stats reflect all signals
@@ -5021,15 +5067,18 @@ async fn test_last_used_batcher_coalesces_and_flushes() {
 
     // Verify last_used_at was updated for all 3 keys
     for hash in &hashes {
-        let row: Option<(Option<chrono::NaiveDateTime>,)> = sqlx::query_as(
-            "SELECT last_used_at FROM mem_api_keys WHERE key_hash = ?",
-        )
-        .bind(hash)
-        .fetch_optional(store.pool())
-        .await
-        .expect("query");
+        let row: Option<(Option<chrono::NaiveDateTime>,)> =
+            sqlx::query_as("SELECT last_used_at FROM mem_api_keys WHERE key_hash = ?")
+                .bind(hash)
+                .fetch_optional(store.pool())
+                .await
+                .expect("query");
         let (last_used,) = row.expect("key should exist");
-        assert!(last_used.is_some(), "last_used_at should be set after flush for hash {}", &hash[..8]);
+        assert!(
+            last_used.is_some(),
+            "last_used_at should be set after flush for hash {}",
+            &hash[..8]
+        );
     }
 
     // Flush again — should be a no-op (pending set is drained)
@@ -5065,7 +5114,8 @@ async fn test_api_key_auth_uses_batcher_not_fire_and_forget() {
     let service = Arc::new(MemoryService::new_sql_with_llm(Arc::new(store), None, None).await);
     let state = memoria_api::AppState::new(service, git, mk.to_string())
         .init_auth_pool(&db)
-        .await;
+        .await
+        .expect("auth pool");
 
     let batcher = state.last_used_batcher.clone();
     let app = memoria_api::build_router(state);
@@ -5078,7 +5128,8 @@ async fn test_api_key_auth_uses_batcher_not_fire_and_forget() {
     let auth = format!("Bearer {mk}");
 
     // Create an API key
-    let raw_key = create_api_key_for_user(&client, &base, &auth, "batcher_e2e_user", "e2e_key").await;
+    let raw_key =
+        create_api_key_for_user(&client, &base, &auth, "batcher_e2e_user", "e2e_key").await;
 
     // Use the API key to make a request (cache miss → DB lookup → batcher.mark_used)
     let r = client
@@ -5104,16 +5155,21 @@ async fn test_api_key_auth_uses_batcher_not_fire_and_forget() {
         .expect("connect");
     batcher.flush(verify_store.pool()).await;
 
-    let key_hash = format!("{:x}", <sha2::Sha256 as sha2::Digest>::digest(raw_key.as_bytes()));
-    let row: Option<(Option<chrono::NaiveDateTime>,)> = sqlx::query_as(
-        "SELECT last_used_at FROM mem_api_keys WHERE key_hash = ?",
-    )
-    .bind(&key_hash)
-    .fetch_optional(verify_store.pool())
-    .await
-    .expect("query");
+    let key_hash = format!(
+        "{:x}",
+        <sha2::Sha256 as sha2::Digest>::digest(raw_key.as_bytes())
+    );
+    let row: Option<(Option<chrono::NaiveDateTime>,)> =
+        sqlx::query_as("SELECT last_used_at FROM mem_api_keys WHERE key_hash = ?")
+            .bind(&key_hash)
+            .fetch_optional(verify_store.pool())
+            .await
+            .expect("query");
     let (last_used,) = row.expect("key should exist");
-    assert!(last_used.is_some(), "last_used_at should be set after batcher flush");
+    assert!(
+        last_used.is_some(),
+        "last_used_at should be set after batcher flush"
+    );
 
     println!("✅ test_api_key_auth_uses_batcher_not_fire_and_forget: auth pool + batcher works");
 }

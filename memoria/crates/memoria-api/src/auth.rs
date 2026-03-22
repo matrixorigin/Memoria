@@ -11,7 +11,7 @@ use axum::{
     http::{request::Parts, StatusCode},
 };
 use serde::Deserialize;
-use sha2::{Sha256, Digest};
+use sha2::{Digest, Sha256};
 use sqlx::Row;
 use std::collections::HashSet;
 use std::sync::Mutex;
@@ -92,17 +92,17 @@ impl LastUsedBatcher {
                 query = query.bind(h);
             }
             if let Err(e) = query.execute(pool).await {
-                warn!("last_used_at batch flush failed ({} keys): {e}", chunk.len());
+                warn!(
+                    "last_used_at batch flush failed ({} keys): {e}",
+                    chunk.len()
+                );
             }
         }
     }
 }
 
 /// Spawn the background flush loop. Call once at server startup.
-pub fn spawn_last_used_flusher(
-    batcher: std::sync::Arc<LastUsedBatcher>,
-    pool: sqlx::MySqlPool,
-) {
+pub fn spawn_last_used_flusher(batcher: std::sync::Arc<LastUsedBatcher>, pool: sqlx::MySqlPool) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
         interval.tick().await; // skip immediate
@@ -138,9 +138,13 @@ impl FromRequestParts<AppState> for AuthUser {
             }
             // 2) API key — user_id resolved from DB, never master
             else if let Some(uid) = validate_api_key(token, state).await {
-                return Ok(AuthUser { user_id: uid, is_master: false });
+                return Ok(AuthUser {
+                    user_id: uid,
+                    is_master: false,
+                });
             } else {
-                crate::routes::metrics::AUTH_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                crate::routes::metrics::AUTH_FAILURES
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 warn!(
                     token_prefix = &token[..token.len().min(8)],
                     "auth: invalid token"
@@ -149,7 +153,8 @@ impl FromRequestParts<AppState> for AuthUser {
             }
         } else if !state.master_key.is_empty() {
             // master_key is configured but caller sent no Bearer token
-            crate::routes::metrics::AUTH_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            crate::routes::metrics::AUTH_FAILURES
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             warn!("auth: missing Bearer token");
             return Err((StatusCode::UNAUTHORIZED, "Missing Bearer token".to_string()));
         }
@@ -169,18 +174,21 @@ impl FromRequestParts<AppState> for AuthUser {
             })
             .unwrap_or_else(|| "default".to_string());
 
-        Ok(AuthUser { user_id, is_master: true })
+        Ok(AuthUser {
+            user_id,
+            is_master: true,
+        })
     }
 }
 
 /// Hash the raw API key and look it up in mem_api_keys.
 /// Returns Some(user_id) if valid, None otherwise.
 ///
-/// Uses a dedicated auth connection pool (2 connections, 2s timeout) so that
-/// auth validation is never blocked by slow business queries on the main pool.
+/// Uses a dedicated auth connection pool so that auth validation is never
+/// blocked by slow business queries on the main pool.
 /// `last_used_at` is updated via batched writes (see [`LastUsedBatcher`]).
 async fn validate_api_key(token: &str, state: &AppState) -> Option<String> {
-    let sql = state.service.sql_store.as_ref()?;
+    state.service.sql_store.as_ref()?;
     let key_hash = format!("{:x}", Sha256::digest(token.as_bytes()));
 
     // Rate limit check (before cache, to count all attempts)
@@ -196,13 +204,15 @@ async fn validate_api_key(token: &str, state: &AppState) -> Option<String> {
         return Some(user_id);
     }
 
-    // Use dedicated auth pool if available, fall back to main pool
-    let pool = state.auth_pool.as_ref().unwrap_or(sql.pool());
+    let Some(pool) = state.auth_pool.as_ref() else {
+        warn!("validate_api_key: dedicated auth pool unavailable");
+        return None;
+    };
 
     let row = sqlx::query(
         "SELECT user_id FROM mem_api_keys \
          WHERE key_hash = ? AND is_active = 1 \
-         AND (expires_at IS NULL OR expires_at > NOW(6))"
+         AND (expires_at IS NULL OR expires_at > NOW(6))",
     )
     .bind(&key_hash)
     .fetch_optional(pool)
@@ -213,7 +223,10 @@ async fn validate_api_key(token: &str, state: &AppState) -> Option<String> {
     let user_id: String = row.try_get("user_id").ok()?;
 
     // Cache the result (TTL 5 min)
-    state.api_key_cache.insert(key_hash.clone(), user_id.clone()).await;
+    state
+        .api_key_cache
+        .insert(key_hash.clone(), user_id.clone())
+        .await;
 
     // Enqueue batched last_used_at update — zero DB pressure on hot path
     state.last_used_batcher.mark_used(key_hash);

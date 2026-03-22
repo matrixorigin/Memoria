@@ -267,7 +267,16 @@ impl GovernanceStore for SqlMemoryStore {
         reason: &str,
         snapshot_before: Option<&str>,
     ) {
-        SqlMemoryStore::log_edit(self, user_id, operation, memory_id, payload, reason, snapshot_before).await;
+        SqlMemoryStore::log_edit(
+            self,
+            user_id,
+            operation,
+            memory_id,
+            payload,
+            reason,
+            snapshot_before,
+        )
+        .await;
     }
 
     async fn check_shared_breaker(
@@ -453,7 +462,10 @@ impl DefaultGovernanceStrategy {
                                 &user_id,
                                 "governance:archive_working",
                                 None,
-                                Some(&format!("{{\"archived\":{count},\"threshold_hours\":{}}}", Self::STALE_WORKING_HOURS)),
+                                Some(&format!(
+                                    "{{\"archived\":{count},\"threshold_hours\":{}}}",
+                                    Self::STALE_WORKING_HOURS
+                                )),
                                 &format!(
                                     "archived {count} stale working memories (>{}h)",
                                     Self::STALE_WORKING_HOURS
@@ -896,7 +908,10 @@ impl DefaultGovernanceStrategy {
                 state.decisions.push(governance_decision(
                     GovernanceTask::Weekly,
                     "cleanup_edit_log",
-                    format!("Deleted {deleted} audit-log rows older than {} days", Self::EDIT_LOG_RETAIN_DAYS),
+                    format!(
+                        "Deleted {deleted} audit-log rows older than {} days",
+                        Self::EDIT_LOG_RETAIN_DAYS
+                    ),
                     Some(if deleted > 0 { 1.0 } else { 0.0 }),
                     vec![],
                     state.snapshot_before.as_deref(),
@@ -922,7 +937,10 @@ impl DefaultGovernanceStrategy {
                 state.decisions.push(governance_decision(
                     GovernanceTask::Weekly,
                     "cleanup_feedback",
-                    format!("Deleted {deleted} feedback rows older than {} days", Self::FEEDBACK_RETAIN_DAYS),
+                    format!(
+                        "Deleted {deleted} feedback rows older than {} days",
+                        Self::FEEDBACK_RETAIN_DAYS
+                    ),
                     Some(if deleted > 0 { 1.0 } else { 0.0 }),
                     vec![],
                     state.snapshot_before.as_deref(),
@@ -1442,8 +1460,12 @@ mod tests {
             Ok(0)
         }
 
-        async fn cleanup_edit_log(&self, _: i64) -> Result<i64, MemoriaError> { Ok(0) }
-        async fn cleanup_feedback(&self, _: i64) -> Result<i64, MemoriaError> { Ok(0) }
+        async fn cleanup_edit_log(&self, _: i64) -> Result<i64, MemoriaError> {
+            Ok(0)
+        }
+        async fn cleanup_feedback(&self, _: i64) -> Result<i64, MemoriaError> {
+            Ok(0)
+        }
 
         async fn create_safety_snapshot(
             &self,
@@ -1702,23 +1724,76 @@ mod tests {
             async fn list_active_users(&self) -> Result<Vec<String>, MemoriaError> {
                 Ok(self.users.clone())
             }
-            async fn cleanup_tool_results(&self, _: i64) -> Result<i64, MemoriaError> { Ok(0) }
-            async fn cleanup_async_tasks(&self, _: i64) -> Result<i64, MemoriaError> { Ok(0) }
-            async fn archive_stale_working(&self, _: i64) -> Result<Vec<(String, i64)>, MemoriaError> { Ok(vec![]) }
-            async fn cleanup_stale(&self, _: &str) -> Result<i64, MemoriaError> { Ok(0) }
-            async fn quarantine_low_confidence(&self, _: &str) -> Result<i64, MemoriaError> { Ok(0) }
-            async fn compress_redundant(&self, _: &str, _: f64, _: i64, _: usize) -> Result<i64, MemoriaError> { Ok(0) }
-            async fn cleanup_orphaned_incrementals(&self, _: &str, _: i64) -> Result<i64, MemoriaError> { Ok(0) }
-            async fn rebuild_vector_index(&self, _: &str) -> Result<i64, MemoriaError> { Ok(0) }
-            async fn cleanup_snapshots(&self, _: usize) -> Result<i64, MemoriaError> { Ok(0) }
-            async fn cleanup_orphan_branches(&self) -> Result<i64, MemoriaError> { Ok(0) }
-            async fn cleanup_orphan_stats(&self) -> Result<i64, MemoriaError> { Ok(0) }
-            async fn cleanup_edit_log(&self, _: i64) -> Result<i64, MemoriaError> { Ok(0) }
-        async fn cleanup_feedback(&self, _: i64) -> Result<i64, MemoriaError> { Ok(0) }
-            async fn create_safety_snapshot(&self, _: &str) -> (Option<String>, Option<String>) { (None, None) }
-            async fn log_edit(&self, _: &str, _: &str, _: Option<&str>, _: Option<&str>, _: &str, _: Option<&str>) {}
+            async fn cleanup_tool_results(&self, _: i64) -> Result<i64, MemoriaError> {
+                Ok(0)
+            }
+            async fn cleanup_async_tasks(&self, _: i64) -> Result<i64, MemoriaError> {
+                Ok(0)
+            }
+            async fn archive_stale_working(
+                &self,
+                _: i64,
+            ) -> Result<Vec<(String, i64)>, MemoriaError> {
+                Ok(vec![])
+            }
+            async fn cleanup_stale(&self, _: &str) -> Result<i64, MemoriaError> {
+                Ok(0)
+            }
+            async fn quarantine_low_confidence(&self, _: &str) -> Result<i64, MemoriaError> {
+                Ok(0)
+            }
+            async fn compress_redundant(
+                &self,
+                _: &str,
+                _: f64,
+                _: i64,
+                _: usize,
+            ) -> Result<i64, MemoriaError> {
+                Ok(0)
+            }
+            async fn cleanup_orphaned_incrementals(
+                &self,
+                _: &str,
+                _: i64,
+            ) -> Result<i64, MemoriaError> {
+                Ok(0)
+            }
+            async fn rebuild_vector_index(&self, _: &str) -> Result<i64, MemoriaError> {
+                Ok(0)
+            }
+            async fn cleanup_snapshots(&self, _: usize) -> Result<i64, MemoriaError> {
+                Ok(0)
+            }
+            async fn cleanup_orphan_branches(&self) -> Result<i64, MemoriaError> {
+                Ok(0)
+            }
+            async fn cleanup_orphan_stats(&self) -> Result<i64, MemoriaError> {
+                Ok(0)
+            }
+            async fn cleanup_edit_log(&self, _: i64) -> Result<i64, MemoriaError> {
+                Ok(0)
+            }
+            async fn cleanup_feedback(&self, _: i64) -> Result<i64, MemoriaError> {
+                Ok(0)
+            }
+            async fn create_safety_snapshot(&self, _: &str) -> (Option<String>, Option<String>) {
+                (None, None)
+            }
+            async fn log_edit(
+                &self,
+                _: &str,
+                _: &str,
+                _: Option<&str>,
+                _: Option<&str>,
+                _: &str,
+                _: Option<&str>,
+            ) {
+            }
 
-            async fn tune_user_retrieval_params(&self, user_id: &str) -> Result<bool, MemoriaError> {
+            async fn tune_user_retrieval_params(
+                &self,
+                user_id: &str,
+            ) -> Result<bool, MemoriaError> {
                 if user_id == self.failing_user {
                     return Err(MemoriaError::Database("tune exploded".into()));
                 }
@@ -1747,6 +1822,10 @@ mod tests {
 
         // Report should be degraded with a warning about u2
         assert_eq!(execution.report.status, StrategyStatus::Degraded);
-        assert!(execution.report.warnings.iter().any(|w| w.contains("tune_retrieval_params") && w.contains("u2")));
+        assert!(execution
+            .report
+            .warnings
+            .iter()
+            .any(|w| w.contains("tune_retrieval_params") && w.contains("u2")));
     }
 }

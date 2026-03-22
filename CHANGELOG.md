@@ -14,6 +14,8 @@ All notable changes to this project will be documented in this file.
 - **pool exhaustion**: Add `max_lifetime` (default 1h via `DB_MAX_LIFETIME_SECS`) to prevent stale connections behind proxies.
 - **pool exhaustion**: Increase default pool size and isolate background workers (rebuild, entity extraction) into separate pools.
 - **entity extraction**: Use bounded queue (default 512, configurable via `ENTITY_QUEUE_SIZE`) with 30s backpressure instead of silent drop.
+- **strict isolation**: Dedicated auth pool no longer falls back to the main pool; startup now fails if auth isolation cannot be created.
+- **strict isolation**: Rebuild/entity workers are disabled if their isolated pools cannot be created, instead of sharing the main pool.
 
 ### 📊 Observability
 
@@ -151,4 +153,3 @@ All notable changes to this project will be documented in this file.
 - Optimize MCP server startup and database configuration loading (#16) ([e908548](https://github.com/matrixorigin/Memoria/commit/e90854805ddcde4a1326d2560f6b3d7f582f75a0))
 - Enable offline mode for local embedding by default (#3) ([d446a13](https://github.com/matrixorigin/Memoria/commit/d446a1309f44de5b8b9d50a245876baefd88bee1))
 - L0/L1 tiered memory retrieval + redundancy compression + governance improvements (#2) ([9d99085](https://github.com/matrixorigin/Memoria/commit/9d9908572cf6d758dafff6d92a8cb8373b97d499))
-
