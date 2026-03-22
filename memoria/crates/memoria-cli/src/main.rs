@@ -948,7 +948,6 @@ fn mcp_entry(
     let mut entry = serde_json::json!({
         "command": "memoria",
         "args": full_args,
-        "_version": VERSION,
     });
     if !env.is_empty() {
         entry["env"] = serde_json::Value::Object(env);
