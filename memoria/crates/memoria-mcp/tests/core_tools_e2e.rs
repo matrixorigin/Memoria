@@ -38,7 +38,7 @@ async fn setup() -> (Arc<MemoryService>, String) {
         .await
         .expect("connect");
     store.migrate().await.expect("migrate");
-    let svc = Arc::new(MemoryService::new_sql_with_llm(Arc::new(store), None, None));
+    let svc = Arc::new(MemoryService::new_sql_with_llm(Arc::new(store), None, None).await);
     (svc, uid())
 }
 
@@ -805,7 +805,7 @@ async fn setup_with_llm(
         .await
         .expect("connect");
     store.migrate().await.expect("migrate");
-    let svc = Arc::new(MemoryService::new_sql_with_llm(Arc::new(store), None, llm));
+    let svc = Arc::new(MemoryService::new_sql_with_llm(Arc::new(store), None, llm).await);
     (svc, uid())
 }
 

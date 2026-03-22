@@ -376,11 +376,9 @@ async fn cmd_serve(db_url: Option<String>, port: u16, master_key: String) -> Res
     let embedder = build_embedder(&cfg);
     let llm = build_llm(&cfg);
 
-    let service = Arc::new(MemoryService::new_sql_with_llm(
-        Arc::new(store),
-        embedder,
-        llm,
-    ));
+    let service = Arc::new(
+        MemoryService::new_sql_with_llm(Arc::new(store), embedder, llm).await,
+    );
     Arc::new(memoria_service::GovernanceScheduler::from_config(service.clone(), &cfg).await?)
         .start();
     let state = AppState::new(service, git, master_key)
@@ -485,11 +483,9 @@ async fn cmd_mcp(
     let embedder = build_embedder(&cfg);
     let llm = build_llm(&cfg);
 
-    let service = Arc::new(MemoryService::new_sql_with_llm(
-        Arc::new(store),
-        embedder,
-        llm,
-    ));
+    let service = Arc::new(
+        MemoryService::new_sql_with_llm(Arc::new(store), embedder, llm).await,
+    );
     Arc::new(memoria_service::GovernanceScheduler::from_config(service.clone(), &cfg).await?)
         .start();
 

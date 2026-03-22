@@ -75,7 +75,7 @@ async fn spawn_server() -> (String, reqwest::Client) {
     store.migrate().await.expect("migrate");
     let pool = MySqlPool::connect(&db).await.expect("pool");
     let git = Arc::new(GitForDataService::new(pool, &cfg.db_name));
-    let service = Arc::new(MemoryService::new_sql_with_llm(Arc::new(store), None, None));
+    let service = Arc::new(MemoryService::new_sql_with_llm(Arc::new(store), None, None).await);
     let state = memoria_api::AppState::new(service, git, String::new());
 
     let app = memoria_api::build_router(state);
@@ -368,7 +368,7 @@ async fn spawn_server_with_master_key(master_key: &str) -> (String, reqwest::Cli
     store.migrate().await.expect("migrate");
     let pool = MySqlPool::connect(&db).await.expect("pool");
     let git = Arc::new(GitForDataService::new(pool, &cfg.db_name));
-    let service = Arc::new(MemoryService::new_sql_with_llm(Arc::new(store), None, None));
+    let service = Arc::new(MemoryService::new_sql_with_llm(Arc::new(store), None, None).await);
     let state = memoria_api::AppState::new(service, git, master_key.to_string());
     let app = memoria_api::build_router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1944,11 +1944,9 @@ async fn spawn_server_with_llm(
     store.migrate().await.expect("migrate");
     let pool = MySqlPool::connect(&db).await.expect("pool");
     let git = Arc::new(GitForDataService::new(pool, &cfg.db_name));
-    let service = Arc::new(MemoryService::new_sql_with_llm(
-        Arc::new(store),
-        None,
-        Some(llm),
-    ));
+    let service = Arc::new(MemoryService::new_sql_with_llm(Arc::new(store),
+    None,
+    Some(llm),).await);
     let state = memoria_api::AppState::new(service, git, String::new());
     let app = memoria_api::build_router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1977,11 +1975,9 @@ async fn spawn_server_with_embedding(
     let pool = MySqlPool::connect(&db).await.expect("pool");
     let git = Arc::new(GitForDataService::new(pool, &cfg.db_name));
     let embedder = Arc::new(HttpEmbedder::new(base_url, emb_key, model, 1024));
-    let service = Arc::new(MemoryService::new_sql_with_llm(
-        Arc::new(store),
-        Some(embedder),
-        None,
-    ));
+    let service = Arc::new(MemoryService::new_sql_with_llm(Arc::new(store),
+    Some(embedder),
+    None,).await);
     let state = memoria_api::AppState::new(service, git, String::new());
     let app = memoria_api::build_router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3963,7 +3959,7 @@ async fn spawn_server_with_instance(instance_id: &str) -> (String, reqwest::Clie
     store.migrate().await.expect("migrate");
     let pool = MySqlPool::connect(&db).await.expect("pool");
     let git = Arc::new(GitForDataService::new(pool, &cfg.db_name));
-    let service = Arc::new(MemoryService::new_sql_with_llm(Arc::new(store), None, None));
+    let service = Arc::new(MemoryService::new_sql_with_llm(Arc::new(store), None, None).await);
     let state = memoria_api::AppState::new(service, git, String::new())
         .with_instance_id(instance_id.to_string());
 
@@ -5066,7 +5062,7 @@ async fn test_api_key_auth_uses_batcher_not_fire_and_forget() {
     store.migrate().await.expect("migrate");
     let pool = MySqlPool::connect(&db).await.expect("pool");
     let git = Arc::new(GitForDataService::new(pool, &cfg.db_name));
-    let service = Arc::new(MemoryService::new_sql_with_llm(Arc::new(store), None, None));
+    let service = Arc::new(MemoryService::new_sql_with_llm(Arc::new(store), None, None).await);
     let state = memoria_api::AppState::new(service, git, mk.to_string())
         .init_auth_pool(&db)
         .await;

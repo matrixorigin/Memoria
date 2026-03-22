@@ -56,7 +56,7 @@ pub struct VectorIndexMonitor {
     /// 上次检查时间戳
     pub last_check_ts: Arc<AtomicI64>,
     /// 发送重建信号的channel
-    tx: tokio::sync::mpsc::UnboundedSender<RebuildSignal>,
+    tx: tokio::sync::mpsc::Sender<RebuildSignal>,
 }
 
 pub struct RebuildSignal {
@@ -72,7 +72,7 @@ pub enum SignalReason {
 impl VectorIndexMonitor {
     pub fn new(
         table_name: String,
-        tx: tokio::sync::mpsc::UnboundedSender<RebuildSignal>,
+        tx: tokio::sync::mpsc::Sender<RebuildSignal>,
     ) -> Self {
         Self {
             table_name,
@@ -118,7 +118,7 @@ impl VectorIndexMonitor {
 
         // 触发条件：p95 > 200ms 或 慢查询比例 > 20%
         if p95 > 200 || slow_count > 20 {
-            let _ = self.tx.send(RebuildSignal {
+            let _ = self.tx.try_send(RebuildSignal {
                 table_name: self.table_name.clone(),
                 reason: SignalReason::HighLatency {
                     p95_ms: p95,

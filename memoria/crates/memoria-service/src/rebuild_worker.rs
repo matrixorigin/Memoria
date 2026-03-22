@@ -8,17 +8,17 @@ use memoria_core::MemoriaError;
 use memoria_storage::SqlMemoryStore;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 pub struct RebuildWorker {
     store: Arc<SqlMemoryStore>,
-    rx: mpsc::UnboundedReceiver<RebuildSignal>,
+    rx: mpsc::Receiver<RebuildSignal>,
 }
 
 impl RebuildWorker {
     pub fn new(
         store: Arc<SqlMemoryStore>,
-        rx: mpsc::UnboundedReceiver<RebuildSignal>,
+        rx: mpsc::Receiver<RebuildSignal>,
     ) -> Self {
         Self { store, rx }
     }
@@ -34,14 +34,14 @@ impl RebuildWorker {
 
     async fn handle_signal(&self, signal: RebuildSignal) -> Result<(), MemoriaError> {
         let table = &signal.table_name;
-        debug!("Received rebuild signal for {}: {:?}", table, signal.reason);
+        info!("Received rebuild signal for {}: {:?}", table, signal.reason);
 
         // 1. 检查分布式冷却状态
         let (should_rebuild, current_rows, cooldown_remaining) =
             self.store.should_rebuild_vector_index(table).await?;
 
         if let Some(remaining) = cooldown_remaining {
-            debug!(
+            info!(
                 "Vector index rebuild for {} in cooldown: {}s remaining",
                 table, remaining
             );
@@ -49,7 +49,7 @@ impl RebuildWorker {
         }
 
         if !should_rebuild {
-            debug!("Vector index rebuild for {} not needed", table);
+            info!("Vector index rebuild for {} not needed", table);
             return Ok(());
         }
 
@@ -62,7 +62,7 @@ impl RebuildWorker {
             .await?;
 
         if !lock_acquired {
-            debug!("Another node is rebuilding vector index for {}", table);
+            info!("Another node is rebuilding vector index for {}", table);
             return Ok(());
         }
 

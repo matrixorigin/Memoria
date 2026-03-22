@@ -122,6 +122,7 @@ impl AppState {
 
         match sqlx::mysql::MySqlPoolOptions::new()
             .max_connections(auth_max_connections)
+            .max_lifetime(Duration::from_secs(3600))
             .acquire_timeout(auth_acquire_timeout)
             .idle_timeout(Duration::from_secs(300))
             .connect(database_url)

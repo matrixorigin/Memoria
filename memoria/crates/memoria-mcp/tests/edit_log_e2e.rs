@@ -40,7 +40,7 @@ async fn setup() -> (
         .expect("store");
     store.migrate().await.expect("migrate");
     let git = Arc::new(GitForDataService::new(pool.clone(), &db_name));
-    let svc = Arc::new(MemoryService::new_sql_with_llm(Arc::new(store), None, None));
+    let svc = Arc::new(MemoryService::new_sql_with_llm(Arc::new(store), None, None).await);
     (svc, git, pool, uid())
 }
 
@@ -630,7 +630,7 @@ async fn spawn_server() -> (String, reqwest::Client, MySqlPool) {
     store.migrate().await.expect("migrate");
     let pool = MySqlPool::connect(&db).await.expect("pool");
     let git = Arc::new(GitForDataService::new(pool.clone(), &cfg.db_name));
-    let service = Arc::new(MemoryService::new_sql_with_llm(Arc::new(store), None, None));
+    let service = Arc::new(MemoryService::new_sql_with_llm(Arc::new(store), None, None).await);
     let state = memoria_api::AppState::new(service, git, String::new());
     let app = memoria_api::build_router(state);
 

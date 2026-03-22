@@ -211,11 +211,9 @@ async fn make_git_service() -> (
         .expect("pool");
     let db_name = db_url.rsplit('/').next().unwrap_or("memoria");
     let git = Arc::new(memoria_git::GitForDataService::new(pool, db_name));
-    let svc = Arc::new(MemoryService::new_sql_with_llm(
-        Arc::new(store),
-        embedder,
-        None,
-    ));
+    let svc = Arc::new(MemoryService::new_sql_with_llm(Arc::new(store),
+    embedder,
+    None,).await);
     let uid = format!("e2e_{}", Uuid::new_v4().simple());
     (svc, git, uid)
 }

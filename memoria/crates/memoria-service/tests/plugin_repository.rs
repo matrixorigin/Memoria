@@ -412,7 +412,7 @@ async fn repository_requires_review_before_activation_and_startup_load() {
         .any(|event| event.event_type == "binding.loaded"));
 
     let sql_store = Arc::new(store);
-    let service = Arc::new(MemoryService::new_sql_with_llm(sql_store, None, None));
+    let service = Arc::new(MemoryService::new_sql_with_llm(sql_store, None, None).await);
     let config = Config {
         db_url: db_url(),
         db_name: "memoria_test".into(),

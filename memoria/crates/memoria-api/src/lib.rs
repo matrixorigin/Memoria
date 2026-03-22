@@ -225,6 +225,8 @@ pub fn build_router(state: AppState) -> Router {
                 } else if status == 429 {
                     // rate-limit hits are operationally important
                     tracing::warn!(status, latency_ms = latency.as_millis(), "response");
+                } else if latency.as_secs() >= 2 {
+                    tracing::warn!(status, latency_ms = latency.as_millis(), "slow response");
                 } else {
                     tracing::debug!(status, latency_ms = latency.as_millis(), "response");
                 }

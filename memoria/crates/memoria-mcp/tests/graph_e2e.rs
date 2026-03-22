@@ -505,11 +505,9 @@ async fn test_store_creates_graph_node() {
         .expect("connect");
     sql.migrate().await.expect("migrate");
     let uid = format!("gsync_{}", uuid::Uuid::new_v4().simple());
-    let svc = Arc::new(MemoryService::new_sql_with_llm(
-        Arc::new(sql.clone()),
-        None,
-        None,
-    ));
+    let svc = Arc::new(MemoryService::new_sql_with_llm(Arc::new(sql.clone()),
+    None,
+    None,).await);
 
     // Call memory_store via tools
     let r = memoria_mcp::tools::call(
@@ -567,11 +565,9 @@ async fn test_correct_updates_graph_node() {
         .expect("connect");
     sql.migrate().await.expect("migrate");
     let uid = format!("gcorr_{}", uuid::Uuid::new_v4().simple());
-    let svc = Arc::new(MemoryService::new_sql_with_llm(
-        Arc::new(sql.clone()),
-        None,
-        None,
-    ));
+    let svc = Arc::new(MemoryService::new_sql_with_llm(Arc::new(sql.clone()),
+    None,
+    None,).await);
 
     // Store
     let r = memoria_mcp::tools::call(
@@ -632,11 +628,9 @@ async fn test_purge_deactivates_graph_node() {
         .expect("connect");
     sql.migrate().await.expect("migrate");
     let uid = format!("gpurge_{}", uuid::Uuid::new_v4().simple());
-    let svc = Arc::new(MemoryService::new_sql_with_llm(
-        Arc::new(sql.clone()),
-        None,
-        None,
-    ));
+    let svc = Arc::new(MemoryService::new_sql_with_llm(Arc::new(sql.clone()),
+    None,
+    None,).await);
 
     // Store
     let r = memoria_mcp::tools::call(

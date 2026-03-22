@@ -41,7 +41,7 @@ async fn setup() -> (Arc<MemoryService>, Arc<GitForDataService>, String) {
         .expect("store");
     store.migrate().await.expect("migrate");
     let git = Arc::new(GitForDataService::new(pool, &db_name));
-    let svc = Arc::new(MemoryService::new_sql_with_llm(Arc::new(store), None, None));
+    let svc = Arc::new(MemoryService::new_sql_with_llm(Arc::new(store), None, None).await);
     (svc, git, uid())
 }
 

@@ -29,7 +29,7 @@ async fn setup() -> (Arc<MemoryService>, Arc<SqlMemoryStore>, String) {
         .expect("connect");
     store.migrate().await.expect("migrate");
     let store = Arc::new(store);
-    let svc = Arc::new(MemoryService::new_sql_with_llm(store.clone(), None, None));
+    let svc = Arc::new(MemoryService::new_sql_with_llm(store.clone(), None, None).await);
     (svc, store, uid())
 }
 

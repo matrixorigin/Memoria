@@ -15,6 +15,11 @@ use std::time::Duration;
 use tracing::{info, warn};
 use uuid::Uuid;
 
+/// Incremented when entity extraction queue applies backpressure (queue full).
+pub static ENTITY_EXTRACTION_BACKPRESSURE: AtomicU64 = AtomicU64::new(0);
+/// Incremented when entity extraction jobs are dropped (timeout or channel closed).
+pub static ENTITY_EXTRACTION_DROPS: AtomicU64 = AtomicU64::new(0);
+
 #[inline]
 fn round4(v: f64) -> f64 {
     (v * 10000.0).round() / 10000.0
@@ -151,7 +156,7 @@ pub struct MemoryService {
     /// LLM client for reflect/extract (None if LLM_API_KEY not set)
     pub llm: Option<Arc<LlmClient>>,
     /// Async entity extraction queue (None when sql_store is absent)
-    entity_tx: Option<tokio::sync::mpsc::UnboundedSender<EntityJob>>,
+    entity_tx: Option<tokio::sync::mpsc::Sender<EntityJob>>,
     /// Batched access counter (None in tests)
     access_counter: Option<AccessCounter>,
     /// Per-user feedback_weight cache (TTL 5 min)
@@ -169,31 +174,54 @@ struct EntityJob {
 
 impl MemoryService {
     /// Production constructor — uses SqlMemoryStore for branch support
-    pub fn new_sql(
+    pub async fn new_sql(
         store: Arc<SqlMemoryStore>,
         embedder: Option<Arc<dyn EmbeddingProvider>>,
     ) -> Self {
         let llm = LlmClient::from_env().map(Arc::new);
-        Self::new_sql_with_llm(store, embedder, llm)
+        Self::new_sql_with_llm(store, embedder, llm).await
     }
 
     /// Production constructor with explicit LLM client.
-    pub fn new_sql_with_llm(
+    pub async fn new_sql_with_llm(
         store: Arc<SqlMemoryStore>,
         embedder: Option<Arc<dyn EmbeddingProvider>>,
         llm: Option<Arc<LlmClient>>,
     ) -> Self {
-        let (entity_tx, entity_rx) = tokio::sync::mpsc::unbounded_channel();
+        let entity_queue_size: usize = std::env::var("ENTITY_QUEUE_SIZE")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(512)
+            .clamp(64, 8192);
+        let (entity_tx, entity_rx) = tokio::sync::mpsc::channel(entity_queue_size);
         
         // 启动 vector index monitor + rebuild worker
-        let (rebuild_tx, rebuild_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (rebuild_tx, rebuild_rx) = tokio::sync::mpsc::channel(4);
         crate::vector_index_monitor::init_coarse_clock();
         let vector_monitor = Arc::new(crate::vector_index_monitor::VectorIndexMonitor::new(
             "mem_memories".to_string(),
             rebuild_tx,
         ));
-        let worker = crate::rebuild_worker::RebuildWorker::new(store.clone(), rebuild_rx);
+        // Use isolated pool for rebuild worker to avoid starving the main pool with DDL
+        let rebuild_store = match store.spawn_background_store(2).await {
+            Some(s) => s,
+            None => {
+                tracing::warn!("rebuild worker will share main pool");
+                store.clone()
+            }
+        };
+        let worker = crate::rebuild_worker::RebuildWorker::new(rebuild_store, rebuild_rx);
         tokio::spawn(async move { worker.run().await });
+        
+        // Use isolated pool for entity worker to avoid starving the main pool with N+1 writes
+        let entity_store = match store.spawn_background_store(4).await {
+            Some(s) => s,
+            None => {
+                tracing::warn!("entity worker will share main pool");
+                store.clone()
+            }
+        };
+        Self::spawn_entity_worker(entity_rx, entity_store, llm.clone());
         
         let svc = Self {
             store: store.clone(),
@@ -208,7 +236,6 @@ impl MemoryService {
                 .build(),
             vector_monitor: Some(vector_monitor),
         };
-        Self::spawn_entity_worker(entity_rx, store, llm);
         svc
     }
 
@@ -229,14 +256,43 @@ impl MemoryService {
         }
     }
 
-    /// Enqueue a memory for async entity extraction (non-blocking).
-    fn enqueue_entity_extraction(&self, user_id: &str, memory_id: &str, content: &str) {
+    /// Enqueue a memory for async entity extraction.
+    /// Uses backpressure: waits up to 30s for queue capacity before dropping.
+    async fn enqueue_entity_extraction(&self, user_id: &str, memory_id: &str, content: &str) {
         if let Some(tx) = &self.entity_tx {
-            let _ = tx.send(EntityJob {
+            let job = EntityJob {
                 user_id: user_id.to_string(),
                 memory_id: memory_id.to_string(),
                 content: content.to_string(),
-            });
+            };
+            match tx.try_send(job) {
+                Ok(()) => {}
+                Err(tokio::sync::mpsc::error::TrySendError::Full(job)) => {
+                    tracing::warn!(
+                        memory_id, queue_len = tx.max_capacity(),
+                        "entity extraction queue full, applying backpressure"
+                    );
+                    ENTITY_EXTRACTION_BACKPRESSURE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    match tokio::time::timeout(
+                        Duration::from_secs(30),
+                        tx.send(job),
+                    ).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(_)) => {
+                            ENTITY_EXTRACTION_DROPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            tracing::error!(memory_id, "entity extraction channel closed — entities will be missing");
+                        }
+                        Err(_) => {
+                            ENTITY_EXTRACTION_DROPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            tracing::error!(memory_id, "entity extraction job dropped after 30s timeout — entities may be missing");
+                        }
+                    }
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_job)) => {
+                    ENTITY_EXTRACTION_DROPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    tracing::error!(memory_id, "entity extraction channel closed — entities will be missing");
+                }
+            }
         }
     }
 
@@ -247,7 +303,7 @@ impl MemoryService {
 
     /// Spawn background task that drains the entity extraction queue.
     fn spawn_entity_worker(
-        mut rx: tokio::sync::mpsc::UnboundedReceiver<EntityJob>,
+        mut rx: tokio::sync::mpsc::Receiver<EntityJob>,
         store: Arc<SqlMemoryStore>,
         llm: Option<Arc<LlmClient>>,
     ) {
@@ -437,7 +493,7 @@ impl MemoryService {
                             .await?;
                         let payload = serde_json::json!({"content": &memory.content, "type": memory.memory_type.to_string()}).to_string();
                         sql.log_edit(user_id, "inject", Some(&memory.memory_id), Some(&payload), "store_memory:supersede", None).await;
-                        self.enqueue_entity_extraction(user_id, &memory.memory_id, &memory.content);
+                        self.enqueue_entity_extraction(user_id, &memory.memory_id, &memory.content).await;
                         if t0.elapsed().as_secs() >= 1 { tracing::warn!(embed_ms = t_embed.as_millis() as u64, dedup_ms = t_dedup.as_millis() as u64, insert_ms = t_insert.as_millis() as u64, total_ms = t0.elapsed().as_millis() as u64, "store_memory slow (supersede)"); };
                         return Ok(memory);
                     }
@@ -451,13 +507,13 @@ impl MemoryService {
                 let t_insert = t2.elapsed();
                 let payload = serde_json::json!({"content": &memory.content, "type": memory.memory_type.to_string()}).to_string();
                 sql.log_edit(user_id, "inject", Some(&memory.memory_id), Some(&payload), "store_memory", None).await;
-                self.enqueue_entity_extraction(user_id, &memory.memory_id, &memory.content);
+                self.enqueue_entity_extraction(user_id, &memory.memory_id, &memory.content).await;
                 if t0.elapsed().as_secs() >= 1 { tracing::warn!(embed_ms = t_embed.as_millis() as u64, dedup_ms = t_dedup.as_millis() as u64, insert_ms = t_insert.as_millis() as u64, total_ms = t0.elapsed().as_millis() as u64, "store_memory slow"); };
             } else {
                 sql.insert_into(&table, &memory).await?;
                 let payload = serde_json::json!({"content": &memory.content, "type": memory.memory_type.to_string()}).to_string();
                 sql.log_edit(user_id, "inject", Some(&memory.memory_id), Some(&payload), "store_memory", None).await;
-                self.enqueue_entity_extraction(user_id, &memory.memory_id, &memory.content);
+                self.enqueue_entity_extraction(user_id, &memory.memory_id, &memory.content).await;
                 if t0.elapsed().as_secs() >= 1 { tracing::warn!(embed_ms = t_embed.as_millis() as u64, total_ms = t0.elapsed().as_millis() as u64, "store_memory slow (no embedding)"); };
             }
         } else {
@@ -1336,14 +1392,14 @@ impl MemoryService {
                         sql.supersede_memory(&table, &old_id, &mem.memory_id)
                             .await?;
                         info!(old_id, new_id = %mem.memory_id, "superseded near-duplicate");
-                        self.enqueue_entity_extraction(user_id, &mem.memory_id, &mem.content);
+                        self.enqueue_entity_extraction(user_id, &mem.memory_id, &mem.content).await;
                         return Ok(mem);
                     }
                     return Ok(mem); // exact dup — skip
                 }
             }
             sql.insert_into(&table, &mem).await?;
-            self.enqueue_entity_extraction(user_id, &mem.memory_id, &mem.content);
+            self.enqueue_entity_extraction(user_id, &mem.memory_id, &mem.content).await;
         } else {
             self.store.insert(&mem).await?;
         }

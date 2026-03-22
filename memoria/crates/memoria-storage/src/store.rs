@@ -5,7 +5,41 @@ use sqlx::{mysql::MySqlPool, Row};
 use std::str::FromStr;
 
 pub(crate) fn db_err(e: sqlx::Error) -> MemoriaError {
+    if matches!(&e, sqlx::Error::PoolTimedOut) {
+        tracing::error!("pool timed out while waiting for an open connection");
+    }
     MemoriaError::Database(e.to_string())
+}
+
+/// Spawn a background task that periodically logs pool utilization.
+/// Warns when idle connections drop below 10% of pool size.
+/// Stops automatically when the pool is closed.
+pub fn spawn_pool_monitor(pool: MySqlPool) {
+    ::tokio::spawn(async move {
+        let mut interval = ::tokio::time::interval(std::time::Duration::from_secs(30));
+        interval.tick().await; // skip immediate
+        loop {
+            interval.tick().await;
+            if pool.is_closed() {
+                tracing::debug!("pool monitor stopping — pool closed");
+                break;
+            }
+            let size = pool.size();
+            let idle = pool.num_idle();
+            let active = size - idle as u32;
+            if idle == 0 {
+                tracing::warn!(
+                    pool_size = size, pool_active = active, pool_idle = idle,
+                    "connection pool saturated — 0 idle connections"
+                );
+            } else if (idle as u32) < size / 10 + 1 {
+                tracing::warn!(
+                    pool_size = size, pool_active = active, pool_idle = idle,
+                    "connection pool high utilization"
+                );
+            }
+        }
+    });
 }
 
 /// One entry for [`SqlMemoryStore::batch_log_edit`].
@@ -88,6 +122,7 @@ pub struct SqlMemoryStore {
     pool: MySqlPool,
     embedding_dim: usize,
     instance_id: String,
+    database_url: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -150,6 +185,7 @@ impl SqlMemoryStore {
             pool,
             embedding_dim,
             instance_id,
+            database_url: None,
         }
     }
 
@@ -184,16 +220,61 @@ impl SqlMemoryStore {
         let max_conns: u32 = std::env::var("DB_MAX_CONNECTIONS")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(32)
+            .unwrap_or(64)
             .clamp(1, DB_MAX_CONNECTIONS_UPPER);
+        let max_lifetime_secs: u64 = std::env::var("DB_MAX_LIFETIME_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(3600);
         let pool = sqlx::mysql::MySqlPoolOptions::new()
             .max_connections(max_conns)
+            .max_lifetime(std::time::Duration::from_secs(max_lifetime_secs))
             .idle_timeout(std::time::Duration::from_secs(300))
             .acquire_timeout(std::time::Duration::from_secs(10))
             .connect(database_url)
             .await
             .map_err(db_err)?;
-        Ok(Self::new(pool, embedding_dim, instance_id))
+        tracing::info!(
+            max_connections = max_conns,
+            max_lifetime_secs = max_lifetime_secs,
+            "Main connection pool initialized"
+        );
+        spawn_pool_monitor(pool.clone());
+        let mut store = Self::new(pool, embedding_dim, instance_id);
+        store.database_url = Some(database_url.to_string());
+        Ok(store)
+    }
+
+    /// Create a small isolated pool for background tasks (DDL, maintenance).
+    /// Returns `None` if no database_url was stored (e.g. test-constructed stores)
+    /// or if the connection fails — callers should fall back to the main pool.
+    pub async fn spawn_background_store(&self, max_connections: u32) -> Option<std::sync::Arc<Self>> {
+        let url = self.database_url.as_deref()?;
+        match sqlx::mysql::MySqlPoolOptions::new()
+            .max_connections(max_connections)
+            .max_lifetime(std::time::Duration::from_secs(3600))
+            .idle_timeout(std::time::Duration::from_secs(300))
+            .acquire_timeout(std::time::Duration::from_secs(30))
+            .connect(url)
+            .await
+        {
+            Ok(pool) => {
+                tracing::info!(
+                    max_connections = max_connections,
+                    "Background connection pool initialized"
+                );
+                let mut s = Self::new(pool, self.embedding_dim, self.instance_id.clone());
+                s.database_url = self.database_url.clone();
+                Some(std::sync::Arc::new(s))
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e, max_connections = max_connections,
+                    "Failed to create background pool, falling back to main pool"
+                );
+                None
+            }
+        }
     }
 
     pub async fn migrate(&self) -> Result<(), MemoriaError> {
@@ -1770,7 +1851,41 @@ impl SqlMemoryStore {
                 // 检查是否是主键冲突（锁已存在且未过期）
                 let err_str = e.to_string();
                 if err_str.contains("Duplicate") || err_str.contains("1062") {
-                    Ok(false)
+                    // MatrixOne SI: the row may have been deleted by another
+                    // connection but our snapshot still sees the old key.
+                    // A fresh SELECT forces a snapshot refresh.
+                    let exists: (i64,) = sqlx::query_as(
+                        "SELECT COUNT(*) FROM mem_distributed_locks \
+                         WHERE lock_key = ? AND expires_at >= NOW()",
+                    )
+                    .bind(key)
+                    .fetch_one(&self.pool)
+                    .await
+                    .map_err(db_err)?;
+                    if exists.0 > 0 {
+                        return Ok(false); // lock genuinely held
+                    }
+                    // Row was deleted — retry INSERT with refreshed snapshot
+                    let retry = sqlx::query(
+                        "INSERT INTO mem_distributed_locks (lock_key, holder_id, acquired_at, expires_at) \
+                         VALUES (?, ?, NOW(), ?)",
+                    )
+                    .bind(key)
+                    .bind(&self.instance_id)
+                    .bind(expires_at)
+                    .execute(&self.pool)
+                    .await;
+                    match retry {
+                        Ok(_) => Ok(true),
+                        Err(e2) => {
+                            let s = e2.to_string();
+                            if s.contains("Duplicate") || s.contains("1062") {
+                                Ok(false)
+                            } else {
+                                Err(db_err(e2))
+                            }
+                        }
+                    }
                 } else {
                     Err(db_err(e))
                 }

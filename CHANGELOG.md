@@ -2,6 +2,25 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### ⚠️ Breaking Changes
+
+- `MemoryService::new_sql()` and `new_sql_with_llm()` are now `async fn` — callers must `.await` the result.
+- Default `DB_MAX_CONNECTIONS` changed from 32 → 64. Set the env var explicitly if your database has a low connection limit.
+
+### 🐛 Bug Fixes
+
+- **pool exhaustion**: Add `max_lifetime` (default 1h via `DB_MAX_LIFETIME_SECS`) to prevent stale connections behind proxies.
+- **pool exhaustion**: Increase default pool size and isolate background workers (rebuild, entity extraction) into separate pools.
+- **entity extraction**: Use bounded queue (default 512, configurable via `ENTITY_QUEUE_SIZE`) with 30s backpressure instead of silent drop.
+
+### 📊 Observability
+
+- New `/metrics` counters: `memoria_entity_extraction_backpressure_total`, `memoria_entity_extraction_drops_total`.
+- Pool monitor logs warning when idle connections reach 0 or fall below 10% of pool size.
+- Slow responses (≥ 2s) now logged at `warn` level.
+
 ## [0.2.3] - 2026-03-21
 
 ### ⚡ Performance
