@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import net from "node:net";
 import path from "node:path";
@@ -23,6 +23,27 @@ function run(command, args) {
   }).trim();
 }
 
+function runResult(command, args) {
+  const result = spawnSync(command, args, {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+
+  return {
+    status: typeof result.status === "number" ? result.status : null,
+    signal: result.signal ?? null,
+    stdout: typeof result.stdout === "string" ? result.stdout.trim() : "",
+    stderr: typeof result.stderr === "string" ? result.stderr.trim() : "",
+    error: result.error ? String(result.error) : null,
+  };
+}
+
+function stripAnsi(value) {
+  return typeof value === "string"
+    ? value.replace(/\x1B\[[0-?]*[ -/]*[@-~]/g, "")
+    : "";
+}
+
 function tryParseJson(raw) {
   try {
     return JSON.parse(raw);
@@ -32,16 +53,17 @@ function tryParseJson(raw) {
 }
 
 function parseCommandJson(raw) {
-  const direct = tryParseJson(raw);
+  const cleaned = stripAnsi(raw).trim();
+  const direct = tryParseJson(cleaned);
   if (direct) {
     return direct;
   }
-  const start = raw.indexOf("{");
-  const end = raw.lastIndexOf("}");
+  const start = cleaned.indexOf("{");
+  const end = cleaned.lastIndexOf("}");
   if (start >= 0 && end > start) {
-    return tryParseJson(raw.slice(start, end + 1)) ?? raw;
+    return tryParseJson(cleaned.slice(start, end + 1)) ?? cleaned;
   }
-  return raw;
+  return cleaned;
 }
 
 function parsePort(rawProtocol, rawPort) {
@@ -89,6 +111,11 @@ if (pluginConfig.memoriaExecutable == null) {
 }
 
 const resolvedMemoriaBin = pluginConfig.memoriaExecutable || memoriaBin;
+const backend = pluginConfig.backend ?? "embedded";
+const userId =
+  typeof pluginConfig.defaultUserId === "string" && pluginConfig.defaultUserId.trim()
+    ? pluginConfig.defaultUserId.trim()
+    : "openclaw-user";
 const openclawVersion = run(openclawBin, ["--version"]);
 const configValidation = tryParseJson(run(openclawBin, ["config", "validate", "--json"]));
 const memoriaVersion = run(resolvedMemoriaBin, ["--version"]);
@@ -105,14 +132,51 @@ const result = {
   memoriaVersion,
   memoriaExecutable: pluginConfig.memoriaExecutable,
   configValidation,
+  healthCheck: {
+    performed: true,
+    ok: false,
+    backend,
+    userId,
+  },
   deepChecks: {
-    backend: pluginConfig.backend ?? "embedded",
+    backend,
     performed: false,
     skipped: null,
   },
 };
 
-if ((pluginConfig.backend ?? "embedded") === "embedded" && typeof pluginConfig.dbUrl === "string") {
+const healthResult = runResult(openclawBin, ["memoria", "health", "--user-id", userId]);
+result.healthCheck.exitStatus = healthResult.status;
+result.healthCheck.stdout = parseCommandJson(healthResult.stdout);
+if (healthResult.stderr) {
+  result.healthCheck.stderr = healthResult.stderr;
+}
+if (healthResult.error) {
+  result.healthCheck.error = healthResult.error;
+}
+if (healthResult.status === 0) {
+  result.healthCheck.ok = true;
+} else {
+  const hints = [];
+  if (backend === "embedded" && typeof pluginConfig.dbUrl === "string") {
+    hints.push(`Verify MatrixOne is reachable at ${pluginConfig.dbUrl}.`);
+  }
+  if (backend === "embedded" && pluginConfig.embeddingProvider === "local") {
+    hints.push(
+      "embeddingProvider=local requires a memoria binary built with local-embedding support; otherwise setup may validate but health/search will fail at runtime.",
+    );
+  }
+  if (backend === "http" && typeof pluginConfig.apiUrl === "string") {
+    hints.push(`Verify the remote Memoria API is healthy and reachable at ${pluginConfig.apiUrl}.`);
+  }
+
+  result.ok = false;
+  result.healthCheck.hints = hints;
+  console.log(JSON.stringify(result, null, 2));
+  process.exit(1);
+}
+
+if (backend === "embedded" && typeof pluginConfig.dbUrl === "string") {
   const dbUrl = new URL(pluginConfig.dbUrl);
   const dbReachable = await checkTcp(
     dbUrl.hostname || "127.0.0.1",
@@ -123,10 +187,6 @@ if ((pluginConfig.backend ?? "embedded") === "embedded" && typeof pluginConfig.d
   result.deepChecks.dbReachable = dbReachable;
 
   if (dbReachable) {
-    const userId =
-      typeof pluginConfig.defaultUserId === "string" && pluginConfig.defaultUserId.trim()
-        ? pluginConfig.defaultUserId.trim()
-        : "openclaw-user";
     const statsRaw = run(openclawBin, ["memoria", "stats", "--user-id", userId]);
     const listRaw = run(openclawBin, ["ltm", "list", "--limit", "1", "--user-id", userId]);
     result.deepChecks.performed = true;
@@ -134,16 +194,17 @@ if ((pluginConfig.backend ?? "embedded") === "embedded" && typeof pluginConfig.d
     result.deepChecks.stats = parseCommandJson(statsRaw);
     result.deepChecks.list = parseCommandJson(listRaw);
   } else {
+    result.ok = false;
     result.deepChecks.skipped = "Embedded database is not reachable; skipped stats/list verification.";
   }
 } else {
-  result.deepChecks.skipped = "Deep verification is only automatic for embedded mode.";
+  const listRaw = run(openclawBin, ["ltm", "list", "--limit", "1", "--user-id", userId]);
+  result.deepChecks.performed = true;
+  result.deepChecks.userId = userId;
+  result.deepChecks.list = parseCommandJson(listRaw);
 }
 
-console.log(
-  JSON.stringify(
-    result,
-    null,
-    2,
-  ),
-);
+console.log(JSON.stringify(result, null, 2));
+if (!result.ok) {
+  process.exit(1);
+}

@@ -332,6 +332,7 @@ openclaw ltm list --limit 10
 Notes:
 
 - `openclaw memoria capabilities` is a config/plugin check and does not require a live Memoria backend
+- `openclaw memoria verify` now includes `openclaw memoria health`, so it fails if the configured backend is unreachable even when plugin/config wiring looks correct
 - `openclaw memoria stats` and `openclaw ltm list` require the configured backend to be reachable; in embedded mode that means MatrixOne must be up and the embedding config must be valid
 - OpenClaw reserves `openclaw memory` for its built-in file memory, so this plugin uses `openclaw memoria` and the compatibility alias `openclaw ltm`
 - `openclaw memoria setup` is the recommended onboarding command for cloud/local setup
