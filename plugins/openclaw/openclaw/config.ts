@@ -511,9 +511,12 @@ export function parseMemoriaPluginConfig(value: unknown): MemoriaPluginConfig {
   const input = asObject(value ?? {});
   assertNoUnknownKeys(input);
 
-  // Auto-migrate legacy "http" backend to "api"
+  // Reject legacy "http" backend — it was removed in favor of "api"
   if (typeof input.backend === "string" && input.backend.trim().toLowerCase() === "http") {
-    input.backend = "api";
+    fail(
+      "backend 'http' is no longer supported. Use 'api' for cloud mode (direct HTTP to Memoria REST API, no binary needed).",
+      ["backend"],
+    );
   }
 
   const backend = readEnum(input, "backend", MEMORIA_BACKENDS, DEFAULTS.backend);
