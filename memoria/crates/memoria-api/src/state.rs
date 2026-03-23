@@ -1,4 +1,4 @@
-use crate::auth::{spawn_last_used_flusher, LastUsedBatcher};
+use crate::auth::{spawn_last_used_flusher, spawn_tool_usage_flusher, LastUsedBatcher, ToolUsageBatcher};
 use crate::rate_limit::RateLimiter;
 use memoria_core::MemoriaError;
 use memoria_git::GitForDataService;
@@ -35,6 +35,8 @@ pub struct AppState {
     pub auth_pool: Option<sqlx::MySqlPool>,
     /// Batched last_used_at updater
     pub last_used_batcher: Arc<LastUsedBatcher>,
+    /// Batched per-user tool usage tracker (flushed every 10 min)
+    pub tool_usage_batcher: Arc<ToolUsageBatcher>,
     /// Per-API-key rate limiter
     pub rate_limiter: RateLimiter,
     /// Short-lived cache for Prometheus output to avoid repeated full-table scans.
@@ -83,6 +85,7 @@ impl AppState {
                 .build(),
             auth_pool: None,
             last_used_batcher: Arc::new(LastUsedBatcher::new()),
+            tool_usage_batcher: Arc::new(ToolUsageBatcher::new()),
             rate_limiter: crate::rate_limit::from_env(),
             metrics_cache: Arc::new(RwLock::new(None)),
             metrics_cache_ttl,
@@ -145,6 +148,9 @@ impl AppState {
         );
         // Start the batched last_used_at flusher using the auth pool
         spawn_last_used_flusher(self.last_used_batcher.clone(), pool.clone());
+        // Rebuild tool-usage cache from DB, then start the periodic flusher
+        self.tool_usage_batcher.rebuild_from_db(&pool).await;
+        spawn_tool_usage_flusher(self.tool_usage_batcher.clone(), pool.clone());
         self.auth_pool = Some(pool);
         Ok(self)
     }

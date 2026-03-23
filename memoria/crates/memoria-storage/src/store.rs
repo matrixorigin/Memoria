@@ -730,6 +730,19 @@ impl SqlMemoryStore {
         .await
         .map_err(db_err)?;
 
+        // mem_tool_usage — per-user tool access timestamps (batched from API layer)
+        sqlx::query(
+            r#"CREATE TABLE IF NOT EXISTS mem_tool_usage (
+                user_id      VARCHAR(64)  NOT NULL,
+                tool_name    VARCHAR(128) NOT NULL,
+                last_used_at DATETIME(6)  NOT NULL,
+                PRIMARY KEY (user_id, tool_name)
+            )"#,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+
         Ok(())
     }
 
