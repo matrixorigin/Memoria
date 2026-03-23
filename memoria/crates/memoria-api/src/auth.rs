@@ -117,11 +117,13 @@ pub fn spawn_last_used_flusher(batcher: std::sync::Arc<LastUsedBatcher>, pool: s
 
 use chrono::{DateTime, Utc};
 
+type ToolUsageMap = std::collections::HashMap<(String, String), (DateTime<Utc>, bool)>;
+
 /// In-memory cache of per-user tool access times, periodically flushed to DB.
 /// On startup, rebuilt from `mem_tool_usage` so restarts don't lose data.
 pub struct ToolUsageBatcher {
     /// (user_id, tool_name) → (last_used_at, dirty)
-    entries: Mutex<std::collections::HashMap<(String, String), (DateTime<Utc>, bool)>>,
+    entries: Mutex<ToolUsageMap>,
 }
 
 impl Default for ToolUsageBatcher {
