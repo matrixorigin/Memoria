@@ -175,6 +175,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/health/capacity", get(routes::admin::health_capacity))
         // Pipeline
         .route("/v1/pipeline/run", post(routes::memory::run_pipeline))
+        // Tool usage (in-memory cache, no DB hit)
+        .route("/v1/tool-usage", get(routes::memory::get_tool_usage))
         // Plugins
         .route("/admin/plugins/signers", get(routes::plugins::list_signers))
         .route(
