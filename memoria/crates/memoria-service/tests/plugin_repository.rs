@@ -434,6 +434,7 @@ async fn repository_requires_review_before_activation_and_startup_load() {
         embedding_dim: test_dim(),
         embedding_api_key: String::new(),
         embedding_base_url: String::new(),
+        embedding_endpoints: vec![],
         llm_api_key: None,
         llm_base_url: "https://api.openai.com/v1".into(),
         llm_model: "gpt-4o-mini".into(),
