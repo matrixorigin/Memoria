@@ -181,18 +181,14 @@ impl ToolUsageBatcher {
     /// Flush dirty entries to DB.
     pub async fn flush(&self, pool: &sqlx::MySqlPool) {
         let dirty: Vec<(String, String, DateTime<Utc>)> = {
-            let mut map = match self.entries.lock() {
+            let map = match self.entries.lock() {
                 Ok(m) => m,
                 Err(_) => return,
             };
-            let mut out = Vec::new();
-            for ((uid, tool), (ts, dirty)) in map.iter_mut() {
-                if *dirty {
-                    out.push((uid.clone(), tool.clone(), *ts));
-                    *dirty = false;
-                }
-            }
-            out
+            map.iter()
+                .filter(|(_, (_, d))| *d)
+                .map(|((uid, tool), (ts, _))| (uid.clone(), tool.clone(), *ts))
+                .collect()
         };
         if dirty.is_empty() {
             return;
@@ -211,6 +207,16 @@ impl ToolUsageBatcher {
             }
             if let Err(e) = query.execute(pool).await {
                 warn!("tool_usage batch flush failed ({} entries): {e}", chunk.len());
+                return; // keep dirty flags for retry on next cycle
+            }
+        }
+
+        // Only clear dirty flags after all chunks succeed.
+        if let Ok(mut map) = self.entries.lock() {
+            for (uid, tool, _) in &dirty {
+                if let Some((_, d)) = map.get_mut(&(uid.clone(), tool.clone())) {
+                    *d = false;
+                }
             }
         }
     }
