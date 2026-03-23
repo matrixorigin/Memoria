@@ -1,0 +1,393 @@
+/**
+ * MemoriaHttpTransport — direct HTTP client for the Memoria REST API.
+ *
+ * Replaces the MCP stdio bridge (MemoriaMcpSession) when backend === "api".
+ * No Rust binary needed. Uses native fetch().
+ */
+
+import type { MemoriaPluginConfig } from "./config.js";
+
+export class MemoriaHttpTransport {
+  private readonly apiUrl: string;
+  private readonly apiKey: string;
+  private readonly timeoutMs: number;
+
+  constructor(config: MemoriaPluginConfig, private readonly userId: string) {
+    if (!config.apiUrl) {
+      throw new Error("apiUrl is required for api backend mode");
+    }
+    if (!config.apiKey) {
+      throw new Error("apiKey is required for api backend mode");
+    }
+    this.apiUrl = config.apiUrl.replace(/\/+$/, "");
+    this.apiKey = config.apiKey;
+    this.timeoutMs = config.timeoutMs;
+  }
+
+  /** Matches MemoriaMcpSession.isAlive() — HTTP transport is always "alive". */
+  isAlive(): boolean {
+    return true;
+  }
+
+  /** No-op for HTTP transport (no child process to kill). */
+  close(): void {}
+
+  /**
+   * Unified entry point that mirrors MemoriaMcpSession.callTool().
+   * Maps MCP tool names to REST API calls and returns the same
+   * text-content structure the MCP session would return.
+   */
+  async callTool(name: string, args: Record<string, unknown>): Promise<unknown> {
+    const result = await this.dispatch(name, args);
+    // Wrap in MCP-compatible content block so extractToolText() works unchanged
+    return { content: [{ type: "text", text: typeof result === "string" ? result : JSON.stringify(result) }] };
+  }
+
+  // ── REST dispatch ──────────────────────────────────────────────
+
+  private async dispatch(tool: string, args: Record<string, unknown>): Promise<unknown> {
+    switch (tool) {
+      case "memory_store":
+        return this.store(args);
+      case "memory_retrieve":
+        return this.retrieve(args);
+      case "memory_search":
+        return this.search(args);
+      case "memory_list":
+        return this.list(args);
+      case "memory_profile":
+        return this.profile();
+      case "memory_correct":
+        return this.correct(args);
+      case "memory_purge":
+        return this.purge(args);
+      case "memory_observe":
+        return this.observe(args);
+      case "memory_governance":
+        return this.governance(args);
+      case "memory_consolidate":
+        return this.consolidate(args);
+      case "memory_reflect":
+        return this.reflect(args);
+      case "memory_extract_entities":
+        return this.extractEntities(args);
+      case "memory_link_entities":
+        return this.linkEntities(args);
+      case "memory_rebuild_index":
+        return { message: "rebuild_index is managed by the cloud service and not available via API." };
+      case "memory_snapshot":
+        return this.createSnapshot(args);
+      case "memory_snapshots":
+        return this.listSnapshots(args);
+      case "memory_rollback":
+        return this.rollbackSnapshot(args);
+      case "memory_branch":
+        return this.branchCreate(args);
+      case "memory_branches":
+        return this.branchList();
+      case "memory_checkout":
+        return this.branchCheckout(args);
+      case "memory_branch_delete":
+        return this.branchDelete(args);
+      case "memory_merge":
+        return this.branchMerge(args);
+      case "memory_diff":
+        return this.branchDiff(args);
+      default:
+        throw new Error(`Unknown Memoria tool: ${tool}`);
+    }
+  }
+
+  // ── Memory CRUD ────────────────────────────────────────────────
+
+  private async store(args: Record<string, unknown>) {
+    const body: Record<string, unknown> = { content: args.content };
+    if (args.memory_type) body.memory_type = args.memory_type;
+    if (args.session_id) body.session_id = args.session_id;
+    if (args.trust_tier) body.trust_tier = args.trust_tier;
+    const data = await this.post("/v1/memories", body);
+    const rec = this.asRecord(data);
+    const id = rec?.memory_id ?? "";
+    const content = rec?.content ?? args.content ?? "";
+    return `Stored memory ${id}: ${content}`;
+  }
+
+  private async retrieve(args: Record<string, unknown>) {
+    const body: Record<string, unknown> = {
+      query: args.query,
+      top_k: args.top_k ?? 5,
+    };
+    if (args.session_id) body.session_id = args.session_id;
+    const data = await this.post("/v1/memories/retrieve", body);
+    return this.formatMemoryList(data);
+  }
+
+  private async search(args: Record<string, unknown>) {
+    const body: Record<string, unknown> = {
+      query: args.query,
+      top_k: args.top_k ?? 10,
+    };
+    const data = await this.post("/v1/memories/search", body);
+    return this.formatMemoryList(data);
+  }
+
+  private async list(args: Record<string, unknown>) {
+    const limit = typeof args.limit === "number" ? args.limit : 100;
+    const data = await this.get(`/v1/memories?limit=${limit}`);
+    const rec = this.asRecord(data);
+    const items = Array.isArray(rec?.items) ? rec!.items : Array.isArray(data) ? data : [];
+    return this.formatMemoryItems(items);
+  }
+
+  private async profile() {
+    const data = await this.get("/v1/profiles/me");
+    const rec = this.asRecord(data);
+    if (rec?.profile && typeof rec.profile === "string") {
+      return rec.profile;
+    }
+    return "No profile memories found.";
+  }
+
+  private async correct(args: Record<string, unknown>) {
+    // Correct by ID or by query
+    if (args.memory_id && typeof args.memory_id === "string") {
+      const body: Record<string, unknown> = {
+        new_content: args.new_content,
+      };
+      if (args.reason) body.reason = args.reason;
+      const data = await this.put(`/v1/memories/${args.memory_id}/correct`, body);
+      const rec = this.asRecord(data);
+      return `Corrected memory ${rec?.memory_id ?? args.memory_id}: ${rec?.content ?? args.new_content}`;
+    }
+    // Correct by query
+    const body: Record<string, unknown> = {
+      query: args.query,
+      new_content: args.new_content,
+    };
+    if (args.reason) body.reason = args.reason;
+    const data = await this.post("/v1/memories/correct", body);
+    const rec = this.asRecord(data);
+    return `Corrected memory ${rec?.memory_id ?? ""}: ${rec?.content ?? args.new_content}`;
+  }
+
+  private async purge(args: Record<string, unknown>) {
+    const body: Record<string, unknown> = {};
+    if (args.memory_id) body.memory_ids = [args.memory_id];
+    if (args.topic) body.topic = args.topic;
+    if (args.reason) body.reason = args.reason;
+    const data = await this.post("/v1/memories/purge", body);
+    const rec = this.asRecord(data);
+    const count = typeof rec?.purged === "number" ? rec.purged : 0;
+    return `Purged ${count} memory(ies).`;
+  }
+
+  private async observe(args: Record<string, unknown>) {
+    const body: Record<string, unknown> = {
+      messages: args.messages,
+    };
+    if (args.session_id) body.session_id = args.session_id;
+    const data = await this.post("/v1/observe", body);
+    return JSON.stringify(data);
+  }
+
+  // ── Governance / Graph ──────────────────────────────────────────
+
+  private async governance(args: Record<string, unknown>) {
+    return this.post("/v1/governance", { force: args.force ?? false });
+  }
+
+  private async consolidate(args: Record<string, unknown>) {
+    return this.post("/v1/consolidate", { force: args.force ?? false });
+  }
+
+  private async reflect(args: Record<string, unknown>) {
+    return this.post("/v1/reflect", {
+      force: args.force ?? false,
+      mode: args.mode ?? "auto",
+    });
+  }
+
+  private async extractEntities(args: Record<string, unknown>) {
+    return this.post("/v1/extract-entities", { mode: args.mode ?? "auto" });
+  }
+
+  private async linkEntities(args: Record<string, unknown>) {
+    let entities = args.entities;
+    if (typeof entities === "string") {
+      try { entities = JSON.parse(entities); } catch { /* keep as-is */ }
+    }
+    return this.post("/v1/extract-entities/link", { entities });
+  }
+
+  // ── Snapshots ─────────────────────────────────────────────────
+
+  private async createSnapshot(args: Record<string, unknown>) {
+    const body: Record<string, unknown> = { name: args.name };
+    if (args.description) body.description = args.description;
+    const data = await this.post("/v1/snapshots", body);
+    const rec = this.asRecord(data);
+    const name = rec?.name ?? args.name ?? "";
+    const ts = rec?.timestamp ?? rec?.created_at ?? "";
+    return `Snapshot '${name}' created at ${ts}`;
+  }
+
+  private async listSnapshots(args: Record<string, unknown>) {
+    const limit = typeof args.limit === "number" ? args.limit : 20;
+    const offset = typeof args.offset === "number" ? args.offset : 0;
+    const data = await this.get(`/v1/snapshots?limit=${limit}&offset=${offset}`);
+    return JSON.stringify(data);
+  }
+
+  private async rollbackSnapshot(args: Record<string, unknown>) {
+    return this.post(`/v1/snapshots/${encodeURIComponent(String(args.name))}/rollback`, {});
+  }
+
+  // ── Branches ──────────────────────────────────────────────────
+
+  private async branchCreate(args: Record<string, unknown>) {
+    const body: Record<string, unknown> = { name: args.name };
+    if (args.from_snapshot) body.from_snapshot = args.from_snapshot;
+    if (args.from_timestamp) body.from_timestamp = args.from_timestamp;
+    return this.post("/v1/branches", body);
+  }
+
+  private async branchList() {
+    return this.get("/v1/branches");
+  }
+
+  private async branchCheckout(args: Record<string, unknown>) {
+    return this.post(`/v1/branches/${encodeURIComponent(String(args.name))}/checkout`, {});
+  }
+
+  private async branchDelete(args: Record<string, unknown>) {
+    return this.delete(`/v1/branches/${encodeURIComponent(String(args.name))}`);
+  }
+
+  private async branchMerge(args: Record<string, unknown>) {
+    const body: Record<string, unknown> = {};
+    if (args.strategy) body.strategy = args.strategy;
+    return this.post(`/v1/branches/${encodeURIComponent(String(args.source))}/merge`, body);
+  }
+
+  private async branchDiff(args: Record<string, unknown>) {
+    const limit = typeof args.limit === "number" ? args.limit : 50;
+    return this.get(`/v1/branches/${encodeURIComponent(String(args.source))}/diff?limit=${limit}`);
+  }
+
+  // ── Health ──────────────────────────────────────────────────────
+
+  async healthCheck(): Promise<{ status: string; instance_id?: string; db?: boolean }> {
+    const data = await this.get("/health/instance");
+    const rec = this.asRecord(data);
+    return {
+      status: typeof rec?.status === "string" ? rec.status : "ok",
+      instance_id: typeof rec?.instance_id === "string" ? rec.instance_id : undefined,
+      db: typeof rec?.db === "boolean" ? rec.db : undefined,
+    };
+  }
+
+  // ── HTTP primitives ───────────────────────────────────────────
+
+  private headers(): Record<string, string> {
+    return {
+      "Authorization": `Bearer ${this.apiKey}`,
+      "Content-Type": "application/json",
+      "X-User-Id": this.userId,
+    };
+  }
+
+  private async request(method: string, path: string, body?: unknown): Promise<unknown> {
+    const url = `${this.apiUrl}${path}`;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+
+    try {
+      const response = await fetch(url, {
+        method,
+        headers: this.headers(),
+        body: body !== undefined ? JSON.stringify(body) : undefined,
+        signal: controller.signal,
+      });
+
+      const text = await response.text();
+
+      if (!response.ok) {
+        throw new Error(
+          `Memoria API ${method} ${path} returned ${response.status}: ${text.slice(0, 500)}`,
+        );
+      }
+
+      if (!text.trim()) {
+        return { ok: true };
+      }
+
+      try {
+        return JSON.parse(text);
+      } catch {
+        return text;
+      }
+    } catch (error) {
+      if (error instanceof DOMException && error.name === "AbortError") {
+        throw new Error(`Memoria API request timed out after ${this.timeoutMs}ms: ${method} ${path}`);
+      }
+      throw error;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  private get(path: string) {
+    return this.request("GET", path);
+  }
+
+  private post(path: string, body: unknown) {
+    return this.request("POST", path, body);
+  }
+
+  private put(path: string, body: unknown) {
+    return this.request("PUT", path, body);
+  }
+
+  private delete(path: string) {
+    return this.request("DELETE", path);
+  }
+
+  // ── Formatting helpers ────────────────────────────────────────
+  // Produce text output matching the Rust MCP binary's format so that
+  // the existing parsers in client.ts (parseMemoryTextList, etc.) work.
+
+  private formatMemoryList(data: unknown): string {
+    // The retrieve/search endpoints return either an array or { results: [...] }
+    const rec = this.asRecord(data);
+    const items = Array.isArray(data)
+      ? data
+      : Array.isArray(rec?.results)
+        ? rec!.results
+        : Array.isArray(rec?.items)
+          ? rec!.items
+          : [];
+    return this.formatMemoryItems(items);
+  }
+
+  private formatMemoryItems(items: unknown[]): string {
+    if (items.length === 0) {
+      return "No relevant memories found.";
+    }
+    const lines: string[] = [];
+    for (const item of items) {
+      const rec = this.asRecord(item);
+      if (!rec) continue;
+      const id = rec.memory_id ?? "";
+      const type = rec.memory_type ?? "semantic";
+      const content = typeof rec.content === "string" ? rec.content : "";
+      lines.push(`[${id}] (${type}) ${content}`);
+    }
+    return lines.join("\n");
+  }
+
+  private asRecord(value: unknown): Record<string, unknown> | null {
+    return value && typeof value === "object" && !Array.isArray(value)
+      ? (value as Record<string, unknown>)
+      : null;
+  }
+}

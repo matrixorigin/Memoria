@@ -2,12 +2,12 @@
   "id": "memory-memoria",
   "name": "Memory (Memoria)",
   "description": "Memoria-backed long-term memory plugin for OpenClaw powered by the Rust memoria CLI and API.",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "kind": "memory",
   "uiHints": {
     "backend": {
       "label": "Backend Mode",
-      "help": "embedded runs the Rust memoria CLI locally against MatrixOne; http connects to an existing Memoria API.",
+      "help": "embedded runs the Rust memoria CLI locally against MatrixOne; api connects directly to the Memoria REST API over HTTP.",
       "placeholder": "embedded"
     },
     "dbUrl": {
@@ -17,14 +17,14 @@
     },
     "apiUrl": {
       "label": "Memoria API URL",
-      "help": "Only used when backend=http.",
+      "help": "Only used when backend=api.",
       "placeholder": "http://127.0.0.1:8100"
     },
     "apiKey": {
       "label": "Memoria API Token",
-      "help": "Bearer token for backend=http.",
+      "help": "Bearer token for backend=api.",
       "sensitive": true,
-      "placeholder": "mem-..."
+      "placeholder": "sk-..."
     },
     "memoriaExecutable": {
       "label": "Memoria Executable",
@@ -151,7 +151,7 @@
     "properties": {
       "backend": {
         "type": "string",
-        "enum": ["embedded", "http"]
+        "enum": ["embedded", "api"]
       },
       "dbUrl": {
         "type": "string"

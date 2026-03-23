@@ -432,7 +432,7 @@ function buildCapabilitiesPayload(config: MemoriaPluginConfig): Record<string, u
     userIdStrategy: config.userIdStrategy,
     autoRecall: config.autoRecall,
     autoObserve: config.autoObserve,
-    llmConfigured: Boolean(config.llmApiKey || config.backend === "http"),
+    llmConfigured: Boolean(config.llmApiKey || config.backend === "api"),
     tools: supportedToolNames(),
     embeddedOnly: [...EMBEDDED_ONLY_TOOL_NAMES],
     cliCommands: [...CLI_COMMAND_NAMES],
@@ -551,7 +551,7 @@ function shouldShowOnboardingHint(rawPluginConfig: unknown): boolean {
   const hasCloudConfig = hasNonEmptyString(raw.apiUrl) || hasNonEmptyString(raw.apiKey);
   const hasLocalConfig = hasNonEmptyString(raw.dbUrl);
 
-  return !(backend === "http" || hasCloudConfig || hasLocalConfig);
+  return !(backend === "api" || hasCloudConfig || hasLocalConfig);
 }
 
 const ONBOARDING_HINT_ONCE_KEY = "__memory_memoria_onboarding_hint_logged__";
@@ -568,7 +568,7 @@ function shouldLogOnboardingHintOnce(): boolean {
 const plugin = {
   id: "memory-memoria",
   name: "Memory (Memoria)",
-  description: "Memoria-backed long-term memory plugin for OpenClaw powered by the Rust memoria CLI and API.",
+  description: "Memoria-backed long-term memory plugin for OpenClaw. Supports direct HTTP API mode (no binary) and embedded mode (local Rust CLI).",
   kind: "memory" as const,
   configSchema: memoriaPluginConfigSchema,
 
@@ -589,7 +589,7 @@ const plugin = {
         process.argv.some((arg) => arg === "plugins");
       if (needsSetup && isEnableCommand) {
         api.logger.info(
-          "🧠 Memoria next step (Cloud, recommended): openclaw memoria setup --mode cloud --api-url <MEMORIA_API_URL> --api-key <MEMORIA_API_KEY> --install-memoria",
+          "🧠 Memoria next step (Cloud, recommended): openclaw memoria setup --mode cloud --api-url <MEMORIA_API_URL> --api-key <MEMORIA_API_KEY>",
         );
         api.logger.info(
           "🧩 Local quick start: openclaw memoria setup --mode local --install-memoria --embedding-api-key <EMBEDDING_API_KEY>",
@@ -1891,7 +1891,7 @@ const plugin = {
           };
         };
 
-        const applyConnectOptions = (normalized: NormalizedConnectOptions) => {
+        const applyConnectOptions = async (normalized: NormalizedConnectOptions) => {
           const resolvedConfigFile = resolveOpenClawConfigFile();
           let memoriaBinForConfig = normalized.memoriaBin;
           const installDirFallback =
@@ -1901,7 +1901,7 @@ const plugin = {
               : path.join(process.env.HOME ?? "", ".local", "bin"));
           let effectiveMemoriaExecutable = memoriaBinForConfig ?? config.memoriaExecutable;
 
-          if (normalized.installMemoria && !isExecutableAvailable(effectiveMemoriaExecutable)) {
+          if (normalized.mode === "local" && normalized.installMemoria && !isExecutableAvailable(effectiveMemoriaExecutable)) {
             runMemoriaInstaller({
               memoriaVersion: normalized.memoriaVersion,
               memoriaInstallDir: installDirFallback,
@@ -1941,12 +1941,39 @@ const plugin = {
           }
 
           if (normalized.healthCheck) {
-            assertMemoriaExecutableAvailable(effectiveMemoriaExecutable, normalized.mode);
-            const healthArgs = ["memoria", "health"];
-            if (normalized.userId) {
-              healthArgs.push("--user-id", normalized.userId);
+            if (normalized.mode === "cloud") {
+              // API mode: direct HTTP health check, no binary needed
+              const healthUrl = `${normalized.apiUrl}/health/instance`;
+              const controller = new AbortController();
+              const timer = setTimeout(() => controller.abort(), 10_000);
+              try {
+                const resp = await fetch(healthUrl, {
+                  headers: {
+                    "Authorization": `Bearer ${normalized.apiKey}`,
+                    "Content-Type": "application/json",
+                  },
+                  signal: controller.signal,
+                });
+                if (!resp.ok) {
+                  throw new Error(`Health check returned ${resp.status}: ${await resp.text()}`);
+                }
+                const data = await resp.json();
+                printJson({ healthCheck: "ok", ...data });
+              } catch (error) {
+                throw new Error(
+                  `Health check failed against ${healthUrl}: ${error instanceof Error ? error.message : String(error)}`,
+                );
+              } finally {
+                clearTimeout(timer);
+              }
+            } else {
+              assertMemoriaExecutableAvailable(effectiveMemoriaExecutable, normalized.mode);
+              const healthArgs = ["memoria", "health"];
+              if (normalized.userId) {
+                healthArgs.push("--user-id", normalized.userId);
+              }
+              runLocalCommand(openclawBin, healthArgs, { env: openclawEnv });
             }
-            runLocalCommand(openclawBin, healthArgs, { env: openclawEnv });
           }
 
           printJson({

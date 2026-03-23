@@ -9,7 +9,7 @@ export const MEMORIA_MEMORY_TYPES = [
 ] as const;
 
 export const MEMORIA_TRUST_TIERS = ["T1", "T2", "T3", "T4"] as const;
-export const MEMORIA_BACKENDS = ["embedded", "http"] as const;
+export const MEMORIA_BACKENDS = ["embedded", "api"] as const;
 export const MEMORIA_USER_ID_STRATEGIES = ["config", "agentId", "sessionKey"] as const;
 
 export type MemoriaMemoryType = (typeof MEMORIA_MEMORY_TYPES)[number];
@@ -84,7 +84,7 @@ const UI_HINTS: Record<
 > = {
   backend: {
     label: "Backend Mode",
-    help: "embedded runs the Rust memoria CLI locally against MatrixOne; http connects to an existing Memoria API.",
+    help: "embedded runs the Rust memoria CLI locally against MatrixOne; api connects directly to the Memoria REST API over HTTP.",
     placeholder: DEFAULTS.backend,
   },
   dbUrl: {
@@ -94,14 +94,14 @@ const UI_HINTS: Record<
   },
   apiUrl: {
     label: "Memoria API URL",
-    help: "Only used when backend=http.",
+    help: "Only used when backend=api.",
     placeholder: DEFAULTS.apiUrl,
   },
   apiKey: {
     label: "Memoria API Token",
-    help: "Bearer token for backend=http.",
+    help: "Bearer token for backend=api.",
     sensitive: true,
-    placeholder: "mem-...",
+    placeholder: "sk-...",
   },
   memoriaExecutable: {
     label: "Memoria Executable",
@@ -511,18 +511,23 @@ export function parseMemoriaPluginConfig(value: unknown): MemoriaPluginConfig {
   const input = asObject(value ?? {});
   assertNoUnknownKeys(input);
 
+  // Auto-migrate legacy "http" backend to "api"
+  if (typeof input.backend === "string" && input.backend.trim().toLowerCase() === "http") {
+    input.backend = "api";
+  }
+
   const backend = readEnum(input, "backend", MEMORIA_BACKENDS, DEFAULTS.backend);
   const apiUrl = optional(readString(input, "apiUrl", { defaultValue: DEFAULTS.apiUrl }))?.replace(
     /\/+$/,
     "",
   );
   const apiKey = optional(readString(input, "apiKey"));
-  if (backend === "http") {
+  if (backend === "api") {
     if (!apiUrl) {
-      fail("apiUrl required when backend=http", ["apiUrl"]);
+      fail("apiUrl required when backend=api", ["apiUrl"]);
     }
     if (!apiKey) {
-      fail("apiKey required when backend=http", ["apiKey"]);
+      fail("apiKey required when backend=api", ["apiKey"]);
     }
   }
 

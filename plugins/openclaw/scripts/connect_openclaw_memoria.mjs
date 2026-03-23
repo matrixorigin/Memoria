@@ -82,7 +82,7 @@ if (mode === "cloud") {
   if (!apiKey) {
     fail("--api-key required when mode=cloud");
   }
-  pluginConfig.backend = "http";
+  pluginConfig.backend = "api";
   pluginConfig.apiUrl = normalizeUrl(apiUrl);
   pluginConfig.apiKey = apiKey;
   delete pluginConfig.dbUrl;
@@ -153,11 +153,11 @@ console.log(
       pluginId,
       backend: pluginConfig.backend,
       apiUrl:
-        pluginConfig.backend === "http" && typeof pluginConfig.apiUrl === "string"
+        pluginConfig.backend === "api" && typeof pluginConfig.apiUrl === "string"
           ? pluginConfig.apiUrl
           : undefined,
       apiKeySet:
-        pluginConfig.backend === "http" &&
+        pluginConfig.backend === "api" &&
         typeof pluginConfig.apiKey === "string" &&
         pluginConfig.apiKey.length > 0,
       dbUrl: typeof pluginConfig.dbUrl === "string" ? pluginConfig.dbUrl : undefined,

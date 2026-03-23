@@ -7,15 +7,16 @@ The plugin targets the current Rust Memoria CLI and API release line. Installer 
 ## Architecture
 
 - `backend: "embedded"` runs the Rust `memoria` CLI locally via `memoria mcp --db-url ... --user ...`
-- `backend: "http"` connects to an existing Rust Memoria API server
+- `backend: "api"` connects directly to the Memoria REST API over HTTP — no binary needed
 - OpenClaw keeps its own tool and hook surface, but the storage and retrieval backend is Memoria
 
 In practice that means:
 
 - durable memory still lives in MatrixOne
 - snapshots, rollback, branches, merge, diff, governance, reflect, and entity extraction are handled by Rust Memoria
-- the plugin shells out to the `memoria` binary instead of importing bundled backend code
-- the `memoria` binary is required even in cloud mode — it serves as the local MCP stdio bridge between OpenClaw and the Memoria backend
+- in embedded mode, the plugin shells out to the `memoria` binary as an MCP stdio bridge
+- in api mode, the plugin makes direct HTTP `fetch()` calls to the Memoria REST API — no binary required
+- legacy `backend: "http"` configs are auto-migrated to `"api"` on load
 
 ## Quick Start
 
@@ -43,19 +44,13 @@ Assume OpenClaw is already installed and healthy.
 
 ### 1) Cloud (Recommended)
 
-Cloud is the default path for new users.
+Cloud is the default path for new users. No binary installation needed.
 
 #### Developer Flow
 
 ```bash
 # A0. Optional cleanup (if you installed an older/source-linked memory-memoria before)
 openclaw plugins uninstall memory-memoria
-```
-
-```bash
-# A0.5. Ensure memoria CLI exists (required even for cloud mode)
-command -v memoria >/dev/null || \
-  curl -sSL https://raw.githubusercontent.com/matrixorigin/Memoria/main/scripts/install.sh | bash -s -- -y -d ~/.local/bin
 ```
 
 ```bash
@@ -79,12 +74,11 @@ openclaw plugins enable memory-memoria
 ```
 
 ```bash
-# B. Setup Memoria Cloud
+# B. Setup Memoria Cloud (no --install-memoria needed)
 openclaw memoria setup \
   --mode cloud \
   --api-url <MEMORIA_API_URL> \
-  --api-key <MEMORIA_API_KEY> \
-  --install-memoria
+  --api-key <MEMORIA_API_KEY>
 ```
 
 Success standard:
@@ -103,19 +97,17 @@ Use:
 - apiKey: <MEMORIA_API_KEY>
 
 Execute exactly:
-1) Ensure memoria CLI exists:
-   command -v memoria >/dev/null || curl -sSL https://raw.githubusercontent.com/matrixorigin/Memoria/main/scripts/install.sh | bash -s -- -y -d ~/.local/bin
-2) Try npm install first:
+1) Try npm install first:
    openclaw plugins install @matrixorigin/memory-memoria
-3) If step 2 fails, fallback:
+2) If step 1 fails, fallback:
    mkdir -p ~/.openclaw/plugins-src
    if [ ! -d ~/.openclaw/plugins-src/Memoria/.git ]; then git clone https://github.com/matrixorigin/Memoria.git ~/.openclaw/plugins-src/Memoria; else git -C ~/.openclaw/plugins-src/Memoria pull --ff-only; fi
    openclaw plugins install --link ~/.openclaw/plugins-src/Memoria/plugins/openclaw
-4) Enable plugin:
+3) Enable plugin:
    openclaw plugins enable memory-memoria
-5) Setup cloud:
-   openclaw memoria setup --mode cloud --api-url <MEMORIA_API_URL> --api-key <MEMORIA_API_KEY> --install-memoria
-6) Verify:
+4) Setup cloud:
+   openclaw memoria setup --mode cloud --api-url <MEMORIA_API_URL> --api-key <MEMORIA_API_KEY>
+5) Verify:
    openclaw memoria health
 
 Output requirements:
@@ -362,7 +354,9 @@ node scripts/verify_plugin_install.mjs \
 
 What changed in this repo:
 
-- `openclaw/client.ts` now talks to Rust Memoria over MCP stdio
-- the plugin manifest and config surface now use `memoriaExecutable`
+- `openclaw/client.ts` now talks to Rust Memoria over MCP stdio (embedded mode) or direct HTTP fetch (api mode)
+- `openclaw/http-client.ts` is the new direct HTTP transport for api mode — no binary dependency
+- the plugin manifest and config surface now use `memoriaExecutable` (embedded mode only)
 - the installer/uninstaller are pure shell + Node, with no Python dependency
 - the package no longer publishes the old bundled Python runtime
+- `backend: "http"` (binary-proxied cloud) has been removed; legacy configs auto-migrate to `"api"`
