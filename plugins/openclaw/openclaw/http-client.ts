@@ -235,7 +235,8 @@ export class MemoriaHttpTransport {
     const limit = typeof args.limit === "number" ? args.limit : 20;
     const offset = typeof args.offset === "number" ? args.offset : 0;
     const data = await this.get(`/v1/snapshots?limit=${limit}&offset=${offset}`);
-    return JSON.stringify(data);
+    // Format as MCP-compatible text so parseSnapshotList() in client.ts works
+    return this.formatSnapshotList(data);
   }
 
   private async rollbackSnapshot(args: Record<string, unknown>) {
@@ -252,7 +253,9 @@ export class MemoriaHttpTransport {
   }
 
   private async branchList() {
-    return this.get("/v1/branches");
+    const data = await this.get("/v1/branches");
+    // Format as MCP-compatible text so parseBranches() in client.ts works
+    return this.formatBranchList(data);
   }
 
   private async branchCheckout(args: Record<string, unknown>) {
@@ -381,6 +384,61 @@ export class MemoriaHttpTransport {
       const type = rec.memory_type ?? "semantic";
       const content = typeof rec.content === "string" ? rec.content : "";
       lines.push(`[${id}] (${type}) ${content}`);
+    }
+    return lines.join("\n");
+  }
+
+  private formatSnapshotList(data: unknown): string {
+    // Produce text matching Rust MCP format: "Snapshots (N):\n  name (timestamp)\n  ..."
+    const rec = this.asRecord(data);
+    const items = rec?.result ? this.asRecord(rec.result) : rec;
+    // The API may return an array or an object with items/snapshots
+    let snapshots: unknown[] = [];
+    if (Array.isArray(data)) {
+      snapshots = data;
+    } else if (items && Array.isArray(items)) {
+      snapshots = items;
+    } else if (rec) {
+      // Try common response shapes
+      if (Array.isArray(rec.snapshots)) snapshots = rec.snapshots;
+      else if (Array.isArray(rec.items)) snapshots = rec.items;
+      else if (typeof rec.result === "string") return rec.result as string;
+    }
+    if (snapshots.length === 0) {
+      return "Snapshots (0):";
+    }
+    const lines = [`Snapshots (${snapshots.length}):`];
+    for (const snap of snapshots) {
+      const s = this.asRecord(snap);
+      if (!s) continue;
+      const name = s.name ?? s.snapshot_name ?? "";
+      const ts = s.timestamp ?? s.created_at ?? "";
+      lines.push(`  ${name} (${ts})`);
+    }
+    return lines.join("\n");
+  }
+
+  private formatBranchList(data: unknown): string {
+    // Produce text matching Rust MCP format: "Branches:\n  name\n  name ← active"
+    const rec = this.asRecord(data);
+    let branches: unknown[] = [];
+    if (Array.isArray(data)) {
+      branches = data;
+    } else if (rec) {
+      if (Array.isArray(rec.branches)) branches = rec.branches;
+      else if (Array.isArray(rec.items)) branches = rec.items;
+      else if (typeof rec.result === "string") return rec.result as string;
+    }
+    if (branches.length === 0) {
+      return "Branches:\n  main ← active";
+    }
+    const lines = ["Branches:"];
+    for (const branch of branches) {
+      const b = this.asRecord(branch);
+      if (!b) continue;
+      const name = typeof b.name === "string" ? b.name : "";
+      const active = b.active === true;
+      lines.push(`  ${name}${active ? " ← active" : ""}`);
     }
     return lines.join("\n");
   }

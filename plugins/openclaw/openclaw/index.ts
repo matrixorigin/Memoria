@@ -2151,7 +2151,7 @@ const plugin = {
           .option("--skip-health-check", "Skip `openclaw memoria health`", false)
           .action(withCliClient(async (opts) => {
             const normalized = normalizeConnectOptions(opts as RawConnectCliOptions, "cloud");
-            applyConnectOptions(normalized);
+            await applyConnectOptions(normalized);
           }));
 
         memoria
@@ -2172,7 +2172,7 @@ const plugin = {
           .option("--skip-health-check", "Skip `openclaw memoria health`", false)
           .action(withCliClient(async (opts) => {
             const normalized = normalizeConnectOptions(opts as RawConnectCliOptions, "cloud");
-            applyConnectOptions(normalized);
+            await applyConnectOptions(normalized);
           }));
 
         ltm
