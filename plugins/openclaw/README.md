@@ -223,7 +223,7 @@ Use this section when you choose `openclaw memoria install` for local bootstrap/
 Important environment variables (local/embedded mode only):
 
 - `MEMORIA_DB_URL`: embedded MatrixOne DSN. Default: `mysql://root:111@127.0.0.1:6001/memoria`
-- `MEMORIA_EMBEDDING_PROVIDER`: usually `openai`; `local` only works if your `memoria` binary was built with the `local-embedding` feature
+- `MEMORIA_EMBEDDING_PROVIDER`: usually `openai`; `local` only works if your `memoria` binary was built with the `local-embedding` feature, and the installer/setup flow now fails fast when the selected binary lacks that capability
 - `MEMORIA_EMBEDDING_MODEL`: for example `text-embedding-3-small` or `BAAI/bge-m3`
 - `MEMORIA_EMBEDDING_API_KEY`: required for local/embedded mode unless embedding provider is `local`. Not needed for cloud mode.
 - `MEMORIA_EMBEDDING_BASE_URL`: optional for official OpenAI, required for compatible gateways
