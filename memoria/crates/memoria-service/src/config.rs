@@ -1,25 +1,25 @@
-/// Unified configuration for Memoria MCP server.
-/// All settings read from environment variables (matching Python's config.py).
-///
-/// Environment variables (no prefix, matching README):
-///   DATABASE_URL              — full MySQL URL
-///   EMBEDDING_PROVIDER        — "openai" | "local" | "mock" (default: "mock")
-///   EMBEDDING_MODEL           — e.g. "BAAI/bge-m3"
-///   EMBEDDING_DIM             — integer, e.g. 1024
-///   EMBEDDING_API_KEY         — API key for embedding service (single-backend)
-///   EMBEDDING_BASE_URL        — base URL for embedding service (single-backend)
-///   EMBEDDING_ENDPOINTS       — JSON array for multi-backend round-robin, e.g.
-///                               `[{"url":"https://api1.example.com/v1","api_key":"sk-1"},
-///                                 {"url":"https://api2.example.com/v1","api_key":"sk-2"}]`
-///                               When set, supersedes EMBEDDING_BASE_URL/EMBEDDING_API_KEY.
-///                               All entries must serve the same EMBEDDING_MODEL.
-///   LLM_API_KEY               — OpenAI-compatible API key (optional)
-///   LLM_BASE_URL              — LLM base URL (default: https://api.openai.com/v1)
-///   LLM_MODEL                 — LLM model name (default: gpt-4o-mini)
-///   MEMORIA_USER              — default user ID (default: "default")
-///   MEMORIA_DB_NAME           — database name for git-for-data (default: "memoria")
-///   MEMORIA_GOVERNANCE_PLUGIN_BINDING — shared governance plugin binding (default: "default")
-///   MEMORIA_GOVERNANCE_PLUGIN_SUBJECT — deterministic subject key for shared binding selection
+//! Unified configuration for Memoria MCP server.
+//! All settings read from environment variables (matching Python's config.py).
+//!
+//! Environment variables (no prefix, matching README):
+//!   DATABASE_URL              — full MySQL URL
+//!   EMBEDDING_PROVIDER        — "openai" | "local" | "mock" (default: "mock")
+//!   EMBEDDING_MODEL           — e.g. "BAAI/bge-m3"
+//!   EMBEDDING_DIM             — integer, e.g. 1024
+//!   EMBEDDING_API_KEY         — API key for embedding service (single-backend)
+//!   EMBEDDING_BASE_URL        — base URL for embedding service (single-backend)
+//!   EMBEDDING_ENDPOINTS       — JSON array for multi-backend round-robin, e.g.
+//!                               `[{"url":"https://api1.example.com/v1","api_key":"sk-1"},
+//!                                 {"url":"https://api2.example.com/v1","api_key":"sk-2"}]`
+//!                               When set, supersedes EMBEDDING_BASE_URL/EMBEDDING_API_KEY.
+//!                               All entries must serve the same EMBEDDING_MODEL.
+//!   LLM_API_KEY               — OpenAI-compatible API key (optional)
+//!   LLM_BASE_URL              — LLM base URL (default: https://api.openai.com/v1)
+//!   LLM_MODEL                 — LLM model name (default: gpt-4o-mini)
+//!   MEMORIA_USER              — default user ID (default: "default")
+//!   MEMORIA_DB_NAME           — database name for git-for-data (default: "memoria")
+//!   MEMORIA_GOVERNANCE_PLUGIN_BINDING — shared governance plugin binding (default: "default")
+//!   MEMORIA_GOVERNANCE_PLUGIN_SUBJECT — deterministic subject key for shared binding selection
 
 /// A single embedding backend endpoint used for multi-backend round-robin.
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]

@@ -70,6 +70,18 @@ impl RoundRobinEmbedder {
     fn next_start(&self) -> usize {
         self.counter.fetch_add(1, Ordering::Relaxed) % self.backends.len()
     }
+
+    /// Returns `true` for HTTP client errors (4xx except 429) that will fail
+    /// on every backend — retrying is pointless (e.g. 401 bad key, 403 forbidden).
+    /// `HttpEmbedder` formats these as `"HTTP 4xx: …"`.
+    fn is_non_retryable(err: &MemoriaError) -> bool {
+        match err {
+            MemoriaError::Embedding(msg) => {
+                msg.starts_with("HTTP 4") && !msg.starts_with("HTTP 429")
+            }
+            _ => false,
+        }
+    }
 }
 
 #[async_trait]
@@ -83,6 +95,14 @@ impl EmbeddingProvider for RoundRobinEmbedder {
             match self.backends[idx].embed(text).await {
                 Ok(v) => return Ok(v),
                 Err(e) => {
+                    if Self::is_non_retryable(&e) {
+                        tracing::warn!(
+                            backend = idx,
+                            error = %e,
+                            "embedding backend returned non-retryable error, aborting failover"
+                        );
+                        return Err(e);
+                    }
                     if i < n - 1 {
                         tracing::warn!(
                             backend = idx,
@@ -109,6 +129,14 @@ impl EmbeddingProvider for RoundRobinEmbedder {
             match self.backends[idx].embed_batch(texts).await {
                 Ok(v) => return Ok(v),
                 Err(e) => {
+                    if Self::is_non_retryable(&e) {
+                        tracing::warn!(
+                            backend = idx,
+                            error = %e,
+                            "embedding backend returned non-retryable error on batch, aborting failover"
+                        );
+                        return Err(e);
+                    }
                     if i < n - 1 {
                         tracing::warn!(
                             backend = idx,
@@ -145,16 +173,30 @@ mod tests {
     struct MockProvider {
         id: usize,
         call_log: Arc<Mutex<Vec<usize>>>,
-        should_fail: bool,
+        fail_msg: Option<String>,
     }
 
     impl MockProvider {
         fn ok(id: usize, call_log: Arc<Mutex<Vec<usize>>>) -> Arc<Self> {
-            Arc::new(Self { id, call_log, should_fail: false })
+            Arc::new(Self { id, call_log, fail_msg: None })
         }
 
+        /// Retryable failure (e.g. rate-limit, server error).
         fn fail(id: usize, call_log: Arc<Mutex<Vec<usize>>>) -> Arc<Self> {
-            Arc::new(Self { id, call_log, should_fail: true })
+            Arc::new(Self {
+                id,
+                call_log,
+                fail_msg: Some(format!("backend {} simulated rate limit", id)),
+            })
+        }
+
+        /// Non-retryable failure (e.g. 401 auth error) — should abort failover.
+        fn fail_auth(id: usize, call_log: Arc<Mutex<Vec<usize>>>) -> Arc<Self> {
+            Arc::new(Self {
+                id,
+                call_log,
+                fail_msg: Some(format!("HTTP 401: invalid api key on backend {}", id)),
+            })
         }
     }
 
@@ -162,22 +204,16 @@ mod tests {
     impl EmbeddingProvider for MockProvider {
         async fn embed(&self, _text: &str) -> Result<Vec<f32>, MemoriaError> {
             self.call_log.lock().unwrap().push(self.id);
-            if self.should_fail {
-                return Err(MemoriaError::Embedding(format!(
-                    "backend {} simulated rate limit",
-                    self.id
-                )));
+            if let Some(msg) = &self.fail_msg {
+                return Err(MemoriaError::Embedding(msg.clone()));
             }
             Ok(vec![self.id as f32; DIM])
         }
 
         async fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, MemoriaError> {
             self.call_log.lock().unwrap().push(self.id);
-            if self.should_fail {
-                return Err(MemoriaError::Embedding(format!(
-                    "backend {} simulated rate limit",
-                    self.id
-                )));
+            if let Some(msg) = &self.fail_msg {
+                return Err(MemoriaError::Embedding(msg.clone()));
             }
             Ok(texts.iter().map(|_| vec![self.id as f32; DIM]).collect())
         }
@@ -395,5 +431,79 @@ mod tests {
         for v in &results {
             assert_eq!(v.len(), DIM, "each batch embedding must be length DIM");
         }
+    }
+
+    // ── non-retryable error tests ─────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn auth_error_aborts_failover_immediately() {
+        let log = new_log();
+        // Backend 0 returns 401; backend 1 is healthy but should never be tried.
+        let rr = RoundRobinEmbedder::from_providers(vec![
+            MockProvider::fail_auth(0, log.clone()),
+            MockProvider::ok(1, log.clone()),
+        ]);
+
+        let err = rr.embed("text").await.unwrap_err();
+        assert!(matches!(err, MemoriaError::Embedding(ref m) if m.contains("401")));
+        // Only backend 0 was called — failover was aborted.
+        assert_eq!(*log.lock().unwrap(), vec![0]);
+    }
+
+    #[tokio::test]
+    async fn auth_error_aborts_batch_failover_immediately() {
+        let log = new_log();
+        let rr = RoundRobinEmbedder::from_providers(vec![
+            MockProvider::fail_auth(0, log.clone()),
+            MockProvider::ok(1, log.clone()),
+        ]);
+
+        let err = rr.embed_batch(&["x".to_string()]).await.unwrap_err();
+        assert!(matches!(err, MemoriaError::Embedding(ref m) if m.contains("401")));
+        assert_eq!(*log.lock().unwrap(), vec![0]);
+    }
+
+    #[tokio::test]
+    async fn retryable_error_still_fails_over_past_auth_ok_backend() {
+        let log = new_log();
+        // Backend 0 has retryable error (rate limit), backend 1 is ok.
+        // Should still failover normally.
+        let rr = RoundRobinEmbedder::from_providers(vec![
+            MockProvider::fail(0, log.clone()),
+            MockProvider::ok(1, log.clone()),
+        ]);
+
+        let result = rr.embed("text").await.unwrap();
+        assert_eq!(result, vec![1.0_f32; DIM]);
+        assert_eq!(*log.lock().unwrap(), vec![0, 1]);
+    }
+
+    #[tokio::test]
+    async fn is_non_retryable_classification() {
+        // 401, 403, 400 → non-retryable
+        assert!(RoundRobinEmbedder::is_non_retryable(
+            &MemoriaError::Embedding("HTTP 401: bad key".into())
+        ));
+        assert!(RoundRobinEmbedder::is_non_retryable(
+            &MemoriaError::Embedding("HTTP 403: forbidden".into())
+        ));
+        assert!(RoundRobinEmbedder::is_non_retryable(
+            &MemoriaError::Embedding("HTTP 400: bad request".into())
+        ));
+        // 429 → retryable (rate limit)
+        assert!(!RoundRobinEmbedder::is_non_retryable(
+            &MemoriaError::Embedding("HTTP 429: too many requests".into())
+        ));
+        // 500, generic → retryable
+        assert!(!RoundRobinEmbedder::is_non_retryable(
+            &MemoriaError::Embedding("HTTP 500: server error".into())
+        ));
+        assert!(!RoundRobinEmbedder::is_non_retryable(
+            &MemoriaError::Embedding("connection timeout".into())
+        ));
+        // Non-Embedding variant → retryable
+        assert!(!RoundRobinEmbedder::is_non_retryable(
+            &MemoriaError::Internal("something".into())
+        ));
     }
 }
