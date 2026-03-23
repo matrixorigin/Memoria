@@ -1,4 +1,4 @@
-use crate::{git_tools, remote::RemoteClient, tools};
+use crate::{git_tools, remote::RemoteClient, tools, v2};
 use anyhow::Result;
 use memoria_git::GitForDataService;
 use memoria_service::MemoryService;
@@ -199,6 +199,7 @@ async fn dispatch(
         })),
         "tools/list" => {
             let mut all_tools = tools::list().as_array().unwrap().clone();
+            all_tools.extend(v2::dispatch::list());
             all_tools.extend(git_tools::list().as_array().unwrap().clone());
             Ok(json!({"tools": all_tools}))
         }
@@ -224,6 +225,10 @@ async fn dispatch(
                         git_tools::call(&name, args, git, service, user_id)
                             .await
                             .map_err(|e| anyhow::anyhow!("{e}"))
+                    } else if v2::dispatch::handles_tool(&name) {
+                        v2::dispatch::call_embedded(&name, args, service, user_id)
+                            .await?
+                            .ok_or_else(|| anyhow::anyhow!("Unknown V2 MCP tool: {name}"))
                     } else {
                         tools::call(&name, args, service, user_id).await
                     }

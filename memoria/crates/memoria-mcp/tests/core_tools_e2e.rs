@@ -47,6 +47,7 @@ async fn call(name: &str, args: Value, svc: &Arc<MemoryService>, uid: &str) -> V
         .await
         .expect(name)
 }
+
 fn text(v: &Value) -> &str {
     v["content"][0]["text"].as_str().unwrap_or("")
 }

@@ -5,6 +5,8 @@ use anyhow::Result;
 use reqwest::Client;
 use serde_json::{json, Value};
 
+use crate::v2;
+
 pub struct RemoteClient {
     client: Client,
     base_url: String,
@@ -43,15 +45,19 @@ impl RemoteClient {
         }
     }
 
-    fn url(&self, path: &str) -> String {
+    pub(crate) fn http_client(&self) -> &Client {
+        &self.client
+    }
+
+    pub(crate) fn url(&self, path: &str) -> String {
         format!("{}{}", self.base_url, path)
     }
 
-    fn mcp_text(text: &str) -> Value {
+    pub(crate) fn mcp_text(text: &str) -> Value {
         json!({"content": [{"type": "text", "text": text}]})
     }
 
-    fn mcp_json(v: &Value) -> Value {
+    pub(crate) fn mcp_json(v: &Value) -> Value {
         Self::mcp_text(&serde_json::to_string_pretty(v).unwrap_or_default())
     }
 
@@ -60,7 +66,7 @@ impl RemoteClient {
         Self::mcp_text(&format!("Error: {e}"))
     }
 
-    async fn parse_response(r: reqwest::Response) -> Result<Value> {
+    pub(crate) async fn parse_response(r: reqwest::Response) -> Result<Value> {
         let status = r.status();
         if status.is_success() {
             return Ok(r.json().await?);
@@ -74,7 +80,25 @@ impl RemoteClient {
         anyhow::bail!("API error {status}: {msg}")
     }
 
+    pub(crate) fn query_pairs(args: &Value, keys: &[&str]) -> Vec<(String, String)> {
+        keys.iter()
+            .filter_map(|key| {
+                let value = args.get(*key)?;
+                match value {
+                    Value::Null => None,
+                    Value::String(value) => Some(((*key).to_string(), value.clone())),
+                    Value::Number(value) => Some(((*key).to_string(), value.to_string())),
+                    Value::Bool(value) => Some(((*key).to_string(), value.to_string())),
+                    _ => None,
+                }
+            })
+            .collect()
+    }
+
     pub async fn call(&self, name: &str, args: Value) -> Result<Value> {
+        if let Some(result) = v2::remote::call(self, name, args.clone()).await? {
+            return Ok(result);
+        }
         match name {
             "memory_store" => {
                 let r = self
@@ -236,13 +260,14 @@ impl RemoteClient {
                 Ok(Self::mcp_text(&text))
             }
 
-            "memory_capabilities" => Ok(Self::mcp_text(
+            "memory_capabilities" => Ok(Self::mcp_text(&format!(
                 "Available tools: memory_store, memory_retrieve, memory_search, \
                  memory_correct, memory_purge, memory_profile, memory_list, \
                  memory_capabilities, memory_governance, memory_consolidate, \
-                 memory_reflect, memory_feedback \
+                 memory_reflect, memory_feedback, {} \
                  [remote mode — connected to Memoria API server]",
-            )),
+                v2::dispatch::TOOL_NAMES_TEXT
+            ))),
 
             "memory_get_retrieval_params" => {
                 let r = self

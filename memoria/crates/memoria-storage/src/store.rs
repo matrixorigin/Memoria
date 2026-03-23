@@ -65,7 +65,7 @@ fn uuid7_id() -> String {
 /// Sanitize a string for safe interpolation inside a SQL single-quoted literal.
 /// Escapes `'`, `\`, and strips NUL bytes.
 #[allow(dead_code)]
-fn sanitize_sql_literal(s: &str) -> String {
+pub(crate) fn sanitize_sql_literal(s: &str) -> String {
     s.chars()
         .filter(|c| *c != '\0')
         .map(|c| match c {
@@ -78,7 +78,7 @@ fn sanitize_sql_literal(s: &str) -> String {
 
 /// Sanitize a string for use inside MATCH ... AGAINST('...' IN BOOLEAN MODE).
 /// Strips boolean-mode operators and SQL-injection characters.
-fn sanitize_fulltext_query(s: &str) -> String {
+pub(crate) fn sanitize_fulltext_query(s: &str) -> String {
     s.chars()
         .filter(|c| *c != '\0')
         .map(|c| match c {
@@ -92,7 +92,7 @@ fn sanitize_fulltext_query(s: &str) -> String {
 }
 
 /// Sanitize a string for use in a LIKE pattern (escapes `%`).
-fn sanitize_like_pattern(s: &str) -> String {
+pub(crate) fn sanitize_like_pattern(s: &str) -> String {
     s.chars()
         .filter(|c| *c != '\0')
         .map(|c| match c {
@@ -103,7 +103,7 @@ fn sanitize_like_pattern(s: &str) -> String {
         .collect()
 }
 
-fn vec_to_mo(v: &[f32]) -> String {
+pub(crate) fn vec_to_mo(v: &[f32]) -> String {
     format!(
         "[{}]",
         v.iter()
@@ -113,7 +113,7 @@ fn vec_to_mo(v: &[f32]) -> String {
     )
 }
 
-fn mo_to_vec(s: &str) -> Result<Vec<f32>, MemoriaError> {
+pub(crate) fn mo_to_vec(s: &str) -> Result<Vec<f32>, MemoriaError> {
     let inner = s.trim_matches(|c| c == '[' || c == ']');
     if inner.is_empty() {
         return Ok(vec![]);
@@ -202,6 +202,14 @@ impl SqlMemoryStore {
 
     pub fn pool(&self) -> &MySqlPool {
         &self.pool
+    }
+
+    pub fn embedding_dim(&self) -> usize {
+        self.embedding_dim
+    }
+
+    pub fn v2_store(&self) -> crate::v2::store::MemoryV2Store {
+        crate::v2::store::MemoryV2Store::new(self.pool.clone(), self.embedding_dim)
     }
 
     pub fn graph_store(&self) -> crate::graph::GraphStore {
@@ -1691,7 +1699,7 @@ impl SqlMemoryStore {
     }
 
     /// Validate table name to prevent SQL injection
-    fn validate_table_name(table: &str) -> Result<(), MemoriaError> {
+    pub(crate) fn validate_table_name(table: &str) -> Result<(), MemoriaError> {
         // 只允许字母、数字、下划线
         if !table.chars().all(|c| c.is_alphanumeric() || c == '_') {
             return Err(MemoriaError::Validation(format!(
@@ -1933,12 +1941,16 @@ impl SqlMemoryStore {
 
     /// Release a distributed lock.
     pub async fn release_lock(&self, key: &str) -> Result<(), MemoriaError> {
-        sqlx::query("DELETE FROM mem_distributed_locks WHERE lock_key = ? AND holder_id = ?")
-            .bind(key)
-            .bind(&self.instance_id)
-            .execute(&self.pool)
-            .await
-            .map_err(db_err)?;
+        sqlx::query(
+            "UPDATE mem_distributed_locks \
+             SET expires_at = DATE_SUB(NOW(), INTERVAL 1 SECOND) \
+             WHERE lock_key = ? AND holder_id = ?",
+        )
+        .bind(key)
+        .bind(&self.instance_id)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
         Ok(())
     }
 

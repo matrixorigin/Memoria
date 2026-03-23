@@ -1,7 +1,7 @@
 .PHONY: help check-env up down status logs logs-db \
         up-db down-db up-api down-api rebuild-api health \
-        dev build build-local check \
-        test test-unit test-integration test-e2e bench bench-rollup dev-bench \
+        dev dev-build build build-local check \
+        test test-unit test-integration test-e2e test-v2 test-v2-isolation test-v2-all bench bench-rollup dev-bench \
         new-key list-keys revoke-keys \
         clean reset
 
@@ -47,9 +47,12 @@ help:
 	@echo "  make test               All tests (needs DB)"
 	@echo "  make test-unit          Unit tests (no DB)"
 	@echo "  make test-e2e           E2E API tests (needs DB)"
-	@echo "  make bench              Run benchmark (needs: make up)"
+	@echo "  make test-v2            Focused pure V2 validation"
+	@echo "  make test-v2-isolation  Focused V1/V2 coexistence + isolation validation"
+	@echo "  make test-v2-all        Full V2 surface + isolation validation"
+	@echo "  make bench              Run V1+V2 benchmark datasets (needs: make up)"
 	@echo "  make bench-rollup REPORT=path/to/report.json"
-	@echo "  make dev-bench          Load test API (DURATION=60 USERS=10 SCENARIO=all)"
+	@echo "  make dev-bench          Load test API (API_VERSION=v1|v2 DURATION=60 USERS=10 SCENARIO=all)"
 	@echo ""
 	@echo "API Keys:"
 	@echo "  make new-key USER=alice NAME=dev-key"
@@ -117,6 +120,11 @@ dev: check-env
 		LLM_MODEL=$${MEMORIA_LLM_MODEL:-} \
 		MASTER_KEY=$${MEMORIA_MASTER_KEY:-} \
 		cargo run -p memoria-cli -- serve
+
+dev-build: check-env
+	@echo "Building dev binary..."
+	@cd memoria && SQLX_OFFLINE=true cargo build -p memoria-cli
+	@echo "Binary: memoria/target/debug/memoria"
 
 build:
 	@echo "Building release binary..."
@@ -204,10 +212,44 @@ test-e2e:
 		LLM_MODEL=$${MEMORIA_LLM_MODEL:-} \
 		cargo test -p memoria-api --test api_e2e
 
+test-v2:
+	@cd memoria && DATABASE_URL=$(TEST_DB_URL) SQLX_OFFLINE=true \
+		EMBEDDING_API_KEY=$${MEMORIA_EMBEDDING_API_KEY:-} \
+		EMBEDDING_BASE_URL=$${MEMORIA_EMBEDDING_BASE_URL:-} \
+		EMBEDDING_MODEL=$${MEMORIA_EMBEDDING_MODEL:-BAAI/bge-m3} \
+		EMBEDDING_DIM=$${MEMORIA_EMBEDDING_DIM:-1024} \
+		LLM_API_KEY=$${MEMORIA_LLM_API_KEY:-} \
+		LLM_BASE_URL=$${MEMORIA_LLM_BASE_URL:-} \
+		LLM_MODEL=$${MEMORIA_LLM_MODEL:-} \
+		cargo test -p memoria-storage --test v2_store -- --nocapture && \
+		cargo test -p memoria-api --test v2_api_e2e -- --nocapture && \
+		cargo test -p memoria-mcp --test v2_tools_unit -- --nocapture && \
+		cargo test -p memoria-mcp --test v2_tools_e2e -- --nocapture && \
+		cargo test -p memoria-mcp --test v2_mcp_remote_capabilities -- --nocapture
+
+test-v2-isolation:
+	@cd memoria && DATABASE_URL=$(TEST_DB_URL) SQLX_OFFLINE=true \
+		EMBEDDING_API_KEY=$${MEMORIA_EMBEDDING_API_KEY:-} \
+		EMBEDDING_BASE_URL=$${MEMORIA_EMBEDDING_BASE_URL:-} \
+		EMBEDDING_MODEL=$${MEMORIA_EMBEDDING_MODEL:-BAAI/bge-m3} \
+		EMBEDDING_DIM=$${MEMORIA_EMBEDDING_DIM:-1024} \
+		LLM_API_KEY=$${MEMORIA_LLM_API_KEY:-} \
+		LLM_BASE_URL=$${MEMORIA_LLM_BASE_URL:-} \
+		LLM_MODEL=$${MEMORIA_LLM_MODEL:-} \
+		cargo test -p memoria-storage --test v2_store_isolation -- --nocapture && \
+		cargo test -p memoria-api --test v2_api_isolation -- --nocapture && \
+		cargo test -p memoria-api --test v2_api_db_isolation -- --nocapture && \
+		cargo test -p memoria-service --test v2_runtime_isolation -- --nocapture && \
+		cargo test -p memoria-mcp --test v2_mcp_remote_isolation -- --nocapture
+
+test-v2-all:
+	@$(MAKE) -j2 test-v2 test-v2-isolation
+
 # ── Benchmark ───────────────────────────────────────────────────────
 
 BENCH_URL   ?= http://localhost:$${API_PORT:-8100}
 BENCH_TOKEN ?= $${MEMORIA_MASTER_KEY:-test-master-key-for-docker-compose}
+API_VERSION ?= v1
 
 bench: check-env
 	@cd memoria && for ds in core-v1 core-v2 forget-v1 graph-entity-v1 graph-entity-v2 large-graph-v1 large-graph-v2; do \
@@ -223,6 +265,7 @@ bench-rollup:
 dev-bench: check-env
 	@cd memoria && SQLX_OFFLINE=true cargo run -p memoria-cli --bin loadtest -- \
 		--api-url "$(BENCH_URL)" --token "$(BENCH_TOKEN)" \
+		--api-version "$(API_VERSION)" \
 		$(if $(DURATION),--duration $(DURATION),) \
 		$(if $(USERS),--users $(USERS),) \
 		$(if $(SCENARIO),--scenario $(SCENARIO),)

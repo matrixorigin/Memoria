@@ -2,11 +2,46 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DatasetApiVersion {
+    V1,
+    V2,
+}
+
+impl DatasetApiVersion {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::V1 => "v1",
+            Self::V2 => "v2",
+        }
+    }
+}
+
 #[derive(Deserialize)]
 pub struct ScenarioDataset {
     pub dataset_id: String,
     pub version: String,
+    #[serde(default)]
+    pub api_version: Option<String>,
     pub scenarios: Vec<Scenario>,
+}
+
+impl ScenarioDataset {
+    pub fn resolved_api_version(&self) -> Result<DatasetApiVersion, String> {
+        if let Some(version) = self.api_version.as_deref() {
+            return match version.trim() {
+                "" | "v1" => Ok(DatasetApiVersion::V1),
+                "v2" => Ok(DatasetApiVersion::V2),
+                other => Err(format!("api_version must be 'v1' or 'v2', got '{other}'")),
+            };
+        }
+
+        if self.dataset_id.to_ascii_lowercase().contains("v2") {
+            Ok(DatasetApiVersion::V2)
+        } else {
+            Ok(DatasetApiVersion::V1)
+        }
+    }
 }
 
 #[derive(Deserialize)]

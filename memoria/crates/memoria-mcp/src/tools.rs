@@ -1,6 +1,7 @@
 //! 8 core MCP tools for Phase 2.
 //! Phase 4 will add 14 more (Git-for-Data, admin, graph).
 
+use crate::v2;
 use anyhow::Result;
 use memoria_core::{MemoryType, TrustTier};
 use memoria_service::{
@@ -383,12 +384,13 @@ pub async fn call(
             Ok(mcp_text(&text))
         }
 
-        "memory_capabilities" => Ok(mcp_text(
+        "memory_capabilities" => Ok(mcp_text(&format!(
             "Available tools: memory_store, memory_retrieve, memory_search, \
              memory_correct, memory_purge, memory_profile, memory_list, \
              memory_capabilities, memory_governance, memory_consolidate, \
-             memory_reflect, memory_feedback",
-        )),
+             memory_reflect, memory_feedback, {}",
+            v2::dispatch::TOOL_NAMES_TEXT
+        ))),
 
         "memory_governance" => {
             let force = args["force"].as_bool().unwrap_or(false);

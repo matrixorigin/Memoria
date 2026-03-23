@@ -9,8 +9,9 @@ use axum::{
 use memoria_service::{ConsolidationInput, ConsolidationStrategy, DefaultConsolidationStrategy};
 use serde::{Deserialize, Serialize};
 use sqlx::{MySqlPool, Row};
+use std::collections::BTreeSet;
 
-use crate::{auth::AuthUser, routes::memory::api_err, state::AppState};
+use crate::{auth::AuthUser, routes::memory::api_err, state::AppState, v2::registry};
 
 fn get_pool(state: &AppState) -> Result<&MySqlPool, (StatusCode, String)> {
     state
@@ -73,23 +74,32 @@ pub async fn system_stats(
     auth.require_master()?;
     let pool = get_pool(&state)?;
 
-    let (total_users,): (i64,) =
-        sqlx::query_as("SELECT COUNT(DISTINCT user_id) FROM mem_memories WHERE is_active > 0")
-            .fetch_one(pool)
+    let v1_users: Vec<(String,)> =
+        sqlx::query_as("SELECT DISTINCT user_id FROM mem_memories WHERE is_active > 0")
+            .fetch_all(pool)
             .await
             .map_err(db_err)?;
+    let mut all_users = v1_users
+        .into_iter()
+        .map(|(user_id,)| user_id)
+        .collect::<BTreeSet<_>>();
 
-    let (total_memories,): (i64,) =
-        sqlx::query_as("SELECT COUNT(*) FROM mem_memories WHERE is_active > 0")
+    let v1_total_memories: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM mem_memories WHERE is_active > 0")
             .fetch_one(pool)
             .await
             .map_err(db_err)?;
+    let v2_users = registry::active_user_counts(pool).await.map_err(db_err)?;
+    let v2_total_memories = v2_users.iter().map(|(_, count)| *count).sum::<i64>();
+    for (user_id, _) in &v2_users {
+        all_users.insert(user_id.clone());
+    }
 
     let snapshots = state.git.list_snapshots().await.map_err(db_err)?;
 
     Ok(Json(SystemStats {
-        total_users,
-        total_memories,
+        total_users: all_users.len() as i64,
+        total_memories: v1_total_memories + v2_total_memories,
         total_snapshots: snapshots.len() as i64,
     }))
 }
@@ -102,28 +112,48 @@ pub async fn list_users(
 ) -> Result<Json<UserListResponse>, (StatusCode, String)> {
     auth.require_master()?;
     let pool = get_pool(&state)?;
-    let limit = params.limit.unwrap_or(100);
+    let limit = params.limit.unwrap_or(100).max(1);
 
-    let rows: Vec<(String,)> = if let Some(ref cursor) = params.cursor {
-        sqlx::query_as(
-            "SELECT DISTINCT user_id FROM mem_memories WHERE is_active > 0 AND user_id > ? ORDER BY user_id LIMIT ?"
-        ).bind(cursor).bind(limit).fetch_all(pool).await
-    } else {
-        sqlx::query_as(
-            "SELECT DISTINCT user_id FROM mem_memories WHERE is_active > 0 ORDER BY user_id LIMIT ?"
-        ).bind(limit).fetch_all(pool).await
-    }.map_err(db_err)?;
+    let v1_users: Vec<(String,)> = sqlx::query_as(
+        "SELECT DISTINCT user_id FROM mem_memories WHERE is_active > 0 ORDER BY user_id",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(db_err)?;
+    let mut users = v1_users
+        .into_iter()
+        .map(|(user_id,)| user_id)
+        .collect::<BTreeSet<_>>();
+    for (user_id, _) in registry::active_user_counts(pool).await.map_err(db_err)? {
+        users.insert(user_id);
+    }
 
-    let next_cursor = if rows.len() as i64 == limit {
-        rows.last().map(|r| r.0.clone())
+    let filtered = users
+        .into_iter()
+        .filter(|user_id| {
+            params
+                .cursor
+                .as_ref()
+                .map(|cursor| user_id > cursor)
+                .unwrap_or(true)
+        })
+        .collect::<Vec<_>>();
+    let page = filtered
+        .iter()
+        .take(limit as usize)
+        .cloned()
+        .collect::<Vec<_>>();
+
+    let next_cursor = if filtered.len() > limit as usize {
+        page.last().cloned()
     } else {
         None
     };
 
     Ok(Json(UserListResponse {
-        users: rows
+        users: page
             .into_iter()
-            .map(|r| UserEntry { user_id: r.0 })
+            .map(|user_id| UserEntry { user_id })
             .collect(),
         next_cursor,
     }))
@@ -138,18 +168,21 @@ pub async fn user_stats(
     auth.require_master()?;
     let pool = get_pool(&state)?;
 
-    let (memory_count,): (i64,) =
-        sqlx::query_as("SELECT COUNT(*) FROM mem_memories WHERE user_id = ? AND is_active > 0")
+    let v1_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM mem_memories WHERE user_id = ? AND is_active > 0")
             .bind(&user_id)
             .fetch_one(pool)
             .await
             .map_err(db_err)?;
+    let v2_count = registry::active_memory_count_for_user(pool, &user_id)
+        .await
+        .map_err(db_err)?;
 
     let snapshots = state.git.list_snapshots().await.map_err(db_err)?;
 
     Ok(Json(UserStats {
         user_id,
-        memory_count,
+        memory_count: v1_count + v2_count,
         snapshot_count: snapshots.len() as i64,
     }))
 }
@@ -165,6 +198,9 @@ pub async fn delete_user(
     sqlx::query("UPDATE mem_memories SET is_active = 0 WHERE user_id = ?")
         .bind(&user_id)
         .execute(pool)
+        .await
+        .map_err(db_err)?;
+    registry::soft_delete_user_memories(pool, &user_id)
         .await
         .map_err(db_err)?;
     Ok(Json(
@@ -185,7 +221,11 @@ pub async fn reset_access_counts(
             "SQL store required".to_string(),
         )
     })?;
-    let reset = sql.reset_access_counts(&user_id).await.map_err(api_err)?;
+    let v1_reset = sql.reset_access_counts(&user_id).await.map_err(api_err)?;
+    let v2_reset = registry::reset_user_access_counts(sql.pool(), &user_id)
+        .await
+        .map_err(db_err)?;
+    let reset = v1_reset + v2_reset;
     Ok(Json(
         serde_json::json!({"user_id": user_id, "reset": reset}),
     ))
@@ -226,7 +266,7 @@ pub async fn trigger_governance(
                 .map_err(db_err)?;
             let pollution_detected = sql.detect_pollution(&user_id, 24).await.map_err(db_err)?;
             Ok(Json(serde_json::json!({
-                "op": op, "user_id": user_id,
+                "op": op, "scope": "v1", "user_id": user_id,
                 "quarantined": quarantined,
                 "cleaned_stale": cleaned_stale,
                 "cleaned_tool_results": cleaned_tool_results,
@@ -244,6 +284,7 @@ pub async fn trigger_governance(
                 .map_err(db_err)?;
             Ok(Json(serde_json::json!({
                 "op": op,
+                "scope": "v1",
                 "user_id": user_id,
                 "status": report.status.as_str(),
                 "conflicts_detected": report.metrics.get("consolidation.conflicts_detected").copied().unwrap_or(0.0) as i64,
@@ -258,7 +299,7 @@ pub async fn trigger_governance(
                 .await
                 .map_err(db_err)?;
             Ok(Json(serde_json::json!({
-                "op": op, "user_id": user_id,
+                "op": op, "scope": "v1", "user_id": user_id,
                 "processed": r.processed, "skipped": r.skipped,
                 "edges_created": r.edges_created, "entities_linked": r.entities_linked,
             })))
@@ -268,7 +309,7 @@ pub async fn trigger_governance(
             let cleaned_branches = sql.cleanup_orphan_branches().await.map_err(db_err)?;
             let _ = sql.rebuild_vector_index("mem_memories").await;
             Ok(Json(
-                serde_json::json!({"op": op, "user_id": user_id, "cleaned_snapshots": cleaned_snapshots, "cleaned_branches": cleaned_branches}),
+                serde_json::json!({"op": op, "scope": "v1", "user_id": user_id, "cleaned_snapshots": cleaned_snapshots, "cleaned_branches": cleaned_branches}),
             ))
         }
         _ => Err((

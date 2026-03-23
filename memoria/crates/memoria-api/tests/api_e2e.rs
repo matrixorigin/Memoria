@@ -796,10 +796,14 @@ async fn test_master_key_can_impersonate_and_access_any_user() {
         .await
         .unwrap();
     assert_eq!(r.status(), 200, "master key should correct any memory");
+    let corrected_memory_id = r.json::<Value>().await.unwrap()["memory_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
 
     // Master key can delete any user's memory
     let r = client
-        .delete(format!("{base}/v1/memories/{memory_id}"))
+        .delete(format!("{base}/v1/memories/{corrected_memory_id}"))
         .header("Authorization", &auth)
         .send()
         .await
@@ -2271,6 +2275,7 @@ async fn test_admin_trigger_governance() {
     assert_eq!(r.status(), 200);
     let body: Value = r.json().await.unwrap();
     assert_eq!(body["op"].as_str().unwrap(), "governance");
+    assert_eq!(body["scope"].as_str().unwrap(), "v1");
     println!("✅ admin trigger governance: {body}");
 
     // Trigger consolidate
@@ -2284,6 +2289,7 @@ async fn test_admin_trigger_governance() {
     assert_eq!(r.status(), 200);
     let body: Value = r.json().await.unwrap();
     assert_eq!(body["op"].as_str().unwrap(), "consolidate");
+    assert_eq!(body["scope"].as_str().unwrap(), "v1");
     println!("✅ admin trigger consolidate: {body}");
 
     // Invalid op

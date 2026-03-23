@@ -227,7 +227,7 @@ impl MemoryService {
             }
         };
 
-        Self {
+        let svc = Self {
             store: store.clone(),
             sql_store: Some(store.clone()),
             embedder,
@@ -239,7 +239,15 @@ impl MemoryService {
                 .time_to_live(Duration::from_secs(300))
                 .build(),
             vector_monitor,
-        }
+        };
+
+        // V2 background runtime
+        crate::v2::bootstrap::start_background_runtime(
+            svc.sql_store.as_ref().expect("sql store").clone(),
+            svc.llm.clone(),
+        );
+
+        svc
     }
 
     /// Test constructor — any MemoryStore, no branch support
@@ -509,8 +517,7 @@ impl MemoryService {
                             None,
                         )
                         .await;
-                        self.enqueue_entity_extraction(user_id, &memory.memory_id, &memory.content)
-                            .await;
+                        self.enqueue_entity_extraction(user_id, &memory.memory_id, &memory.content).await;
                         if t0.elapsed().as_secs() >= 1 {
                             tracing::warn!(
                                 embed_ms = t_embed.as_millis() as u64,
@@ -547,8 +554,7 @@ impl MemoryService {
                     None,
                 )
                 .await;
-                self.enqueue_entity_extraction(user_id, &memory.memory_id, &memory.content)
-                    .await;
+                self.enqueue_entity_extraction(user_id, &memory.memory_id, &memory.content).await;
                 if t0.elapsed().as_secs() >= 1 {
                     tracing::warn!(
                         embed_ms = t_embed.as_millis() as u64,
@@ -570,8 +576,7 @@ impl MemoryService {
                     None,
                 )
                 .await;
-                self.enqueue_entity_extraction(user_id, &memory.memory_id, &memory.content)
-                    .await;
+                self.enqueue_entity_extraction(user_id, &memory.memory_id, &memory.content).await;
                 if t0.elapsed().as_secs() >= 1 {
                     tracing::warn!(
                         embed_ms = t_embed.as_millis() as u64,
@@ -1495,16 +1500,14 @@ impl MemoryService {
                         sql.supersede_memory(&table, &old_id, &mem.memory_id)
                             .await?;
                         info!(old_id, new_id = %mem.memory_id, "superseded near-duplicate");
-                        self.enqueue_entity_extraction(user_id, &mem.memory_id, &mem.content)
-                            .await;
+                        self.enqueue_entity_extraction(user_id, &mem.memory_id, &mem.content).await;
                         return Ok(mem);
                     }
                     return Ok(mem); // exact dup — skip
                 }
             }
             sql.insert_into(&table, &mem).await?;
-            self.enqueue_entity_extraction(user_id, &mem.memory_id, &mem.content)
-                .await;
+            self.enqueue_entity_extraction(user_id, &mem.memory_id, &mem.content).await;
         } else {
             self.store.insert(&mem).await?;
         }

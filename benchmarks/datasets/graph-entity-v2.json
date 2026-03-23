@@ -222,29 +222,24 @@
       "seed_memories": [
         {
           "content": "2024年Q1：评估 GraphQL，性能测试结果良好，决定在新项目中试用。",
-          "memory_type": "semantic",
-          "age_days": 365.0
+          "memory_type": "semantic"
         },
         {
           "content": "2024年Q3：GraphQL 在 user-profile-service 中正式上线，替代 REST。",
-          "memory_type": "semantic",
-          "age_days": 270.0
+          "memory_type": "semantic"
         },
         {
           "content": "2025年Q1：GraphQL 的 N+1 查询问题导致数据库压力过大，开始评估替代方案。",
-          "memory_type": "semantic",
-          "age_days": 90.0
+          "memory_type": "semantic"
         },
         {
           "content": "2025年Q3：决定废弃 GraphQL，迁回 REST+OpenAPI，预计 2026年Q1 完成迁移。",
-          "memory_type": "semantic",
-          "age_days": 30.0
+          "memory_type": "semantic"
         },
         {
           "content": "GraphQL 的 schema 定义语言比 OpenAPI 更简洁。",
           "memory_type": "semantic",
-          "is_noise": true,
-          "age_days": 180.0
+          "is_noise": true
         }
       ],
       "steps": [],
@@ -529,5 +524,6 @@
         "consolidate"
       ]
     }
-  ]
+  ],
+  "api_version": "v2"
 }

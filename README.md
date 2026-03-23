@@ -295,7 +295,13 @@ Full API details: [API Reference Skill](skills/api-reference/SKILL.md)
 | `memoria rules` | Update steering rules (auto-detect, `--tool`, or `-i`) |
 | `memoria mcp` | Start MCP server |
 | `memoria serve` | Start REST API server |
-| `memoria benchmark` | Run benchmark suite |
+| `memoria benchmark` | Run benchmark suite (dataset selects V1/V2 API surface) |
+
+---
+
+`memoria benchmark` now follows dataset metadata, so `core-v1` keeps using `/v1/*` while `core-v2`, `graph-entity-v2`, and `large-graph-v2` execute against `/v2/memory/*`.
+
+For HTTP load tests, use `make dev-bench API_VERSION=v2` or `cargo run -p memoria-cli --bin loadtest -- --api-version v2`.
 
 ---
 

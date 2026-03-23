@@ -26,6 +26,7 @@ clap = { workspace = true }
 reqwest = { workspace = true }
 futures = { workspace = true }
 axum = { workspace = true }
+base64 = "0.22"
 
 [dev-dependencies]
 tokio = { workspace = true }

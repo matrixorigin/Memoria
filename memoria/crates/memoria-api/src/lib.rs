@@ -4,6 +4,7 @@ pub mod otel;
 pub mod rate_limit;
 pub mod routes;
 pub mod state;
+pub mod v2;
 
 pub use state::AppState;
 
@@ -213,6 +214,7 @@ pub fn build_router(state: AppState) -> Router {
             "/admin/plugins/events",
             get(routes::plugins::list_audit_events),
         )
+        .merge(v2::router::router())
         .with_state(state)
         .layer(DefaultBodyLimit::max(2 * 1024 * 1024)) // 2 MB
         .layer(

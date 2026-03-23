@@ -3,6 +3,7 @@
 //! Exposes key operational metrics in Prometheus text exposition format.
 //! No external crate needed — we emit the text format directly.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -10,7 +11,7 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 
-use crate::{state::CachedMetrics, AppState};
+use crate::{state::CachedMetrics, v2::registry, AppState};
 
 // ── Process-lifetime counters (no external crate needed) ─────────────────────
 
@@ -58,34 +59,65 @@ async fn collect_metrics(state: &AppState) -> Result<Arc<String>, String> {
     let mut out = String::with_capacity(2048);
 
     // ── Memory counts by type ─────────────────────────────────────────────
-    let rows: Vec<(String, i64)> = sqlx::query_as(
+    let v1_rows: Vec<(String, i64)> = sqlx::query_as(
         "SELECT memory_type, COUNT(*) FROM mem_memories WHERE is_active > 0 GROUP BY memory_type",
     )
     .fetch_all(pool)
     .await
     .map_err(|e| e.to_string())?;
+    let (v2_rows, v2_active_users) = registry::collect_metrics(pool).await?;
+    let mut counts_by_type = BTreeMap::new();
+    let mut v1_total = 0i64;
+    for (memory_type, count) in &v1_rows {
+        *counts_by_type.entry(memory_type.clone()).or_insert(0) += *count;
+        v1_total += *count;
+    }
+    let v2_total = v2_rows.values().sum::<i64>();
+    for (memory_type, count) in v2_rows {
+        *counts_by_type.entry(memory_type).or_insert(0) += count;
+    }
 
-    out.push_str("# HELP memoria_memories_total Active memories by type.\n");
+    out.push_str("# HELP memoria_memories_total Active memories by type across V1 and V2.\n");
     out.push_str("# TYPE memoria_memories_total gauge\n");
     let mut total = 0i64;
-    for (mt, cnt) in &rows {
+    for (mt, cnt) in &counts_by_type {
         out.push_str(&format!("memoria_memories_total{{type=\"{mt}\"}} {cnt}\n"));
         total += cnt;
     }
     out.push_str(&format!("memoria_memories_total{{type=\"all\"}} {total}\n"));
+    out.push_str("# HELP memoria_memories_by_version_total Active memories by storage version.\n");
+    out.push_str("# TYPE memoria_memories_by_version_total gauge\n");
+    out.push_str(&format!(
+        "memoria_memories_by_version_total{{version=\"v1\"}} {v1_total}\n"
+    ));
+    out.push_str(&format!(
+        "memoria_memories_by_version_total{{version=\"v2\"}} {v2_total}\n"
+    ));
 
     // ── Users ─────────────────────────────────────────────────────────────
-    let (users,): (i64,) =
-        sqlx::query_as("SELECT COUNT(DISTINCT user_id) FROM mem_memories WHERE is_active > 0")
+    let v1_active_users: Vec<(String,)> =
+        sqlx::query_as("SELECT DISTINCT user_id FROM mem_memories WHERE is_active > 0")
             .fetch_all(pool)
             .await
-            .map_err(|e| e.to_string())?
-            .into_iter()
-            .next()
-            .unwrap_or((0,));
+            .map_err(|e| e.to_string())?;
+    let mut users = v1_active_users
+        .into_iter()
+        .map(|(user_id,)| user_id)
+        .collect::<BTreeSet<_>>();
+    let v1_users = users.len() as i64;
+    let v2_users = v2_active_users.len() as i64;
+    users.extend(v2_active_users);
     out.push_str("# HELP memoria_users_total Active users.\n");
     out.push_str("# TYPE memoria_users_total gauge\n");
-    out.push_str(&format!("memoria_users_total {users}\n"));
+    out.push_str(&format!("memoria_users_total {}\n", users.len()));
+    out.push_str("# HELP memoria_users_by_version_total Active users by storage version.\n");
+    out.push_str("# TYPE memoria_users_by_version_total gauge\n");
+    out.push_str(&format!(
+        "memoria_users_by_version_total{{version=\"v1\"}} {v1_users}\n"
+    ));
+    out.push_str(&format!(
+        "memoria_users_by_version_total{{version=\"v2\"}} {v2_users}\n"
+    ));
 
     // ── Feedback counts ───────────────────────────────────────────────────
     let fb_rows: Vec<(String, i64)> =

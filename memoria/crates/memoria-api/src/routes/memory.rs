@@ -31,6 +31,20 @@ pub fn api_err_typed(e: memoria_core::MemoriaError) -> (StatusCode, String) {
     (status, e.to_string())
 }
 
+async fn lookup_memory_owner_any_state(
+    state: &AppState,
+    memory_id: &str,
+) -> Result<Option<String>, (StatusCode, String)> {
+    let Some(sql) = &state.service.sql_store else {
+        return Ok(None);
+    };
+    sqlx::query_scalar::<_, String>("SELECT user_id FROM mem_memories WHERE memory_id = ? LIMIT 1")
+        .bind(memory_id)
+        .fetch_optional(sql.pool())
+        .await
+        .map_err(api_err)
+}
+
 #[derive(Deserialize, Default)]
 pub struct ListQuery {
     pub memory_type: Option<String>,
@@ -315,7 +329,7 @@ pub async fn correct_memory(
         .service
         .correct(&id, &req.new_content)
         .await
-        .map_err(api_err)?;
+        .map_err(api_err_typed)?;
     Ok(Json(m.into()))
 }
 
@@ -339,7 +353,7 @@ pub async fn correct_by_query(
         .service
         .correct(&found.memory_id, &req.new_content)
         .await
-        .map_err(api_err)?;
+        .map_err(api_err_typed)?;
     Ok(Json(m.into()))
 }
 
@@ -348,16 +362,16 @@ pub async fn delete_memory(
     AuthUser { user_id, is_master }: AuthUser,
     Path(id): Path<String>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    if !is_master {
-        let existing = state
-            .service
-            .get(&id)
-            .await
-            .map_err(api_err)?
-            .ok_or_else(|| (StatusCode::NOT_FOUND, "Memory not found".to_string()))?;
-        if existing.user_id != user_id {
+    if let Some(existing) = state.service.get(&id).await.map_err(api_err)? {
+        if !is_master && existing.user_id != user_id {
             return Err((StatusCode::FORBIDDEN, "Not your memory".to_string()));
         }
+    } else if let Some(owner) = lookup_memory_owner_any_state(&state, &id).await? {
+        if !is_master && owner != user_id {
+            return Err((StatusCode::FORBIDDEN, "Not your memory".to_string()));
+        }
+    } else {
+        return Err((StatusCode::NOT_FOUND, "Memory not found".to_string()));
     }
     let _ = state.service.purge(&user_id, &id).await.map_err(api_err)?;
     Ok(StatusCode::NO_CONTENT)
@@ -369,17 +383,17 @@ pub async fn purge_memories(
     Json(req): Json<PurgeRequest>,
 ) -> ApiResult<PurgeResponse> {
     let result = if let Some(ids) = &req.memory_ids {
-        if !is_master {
-            for id in ids {
-                let mem = state
-                    .service
-                    .get(id)
-                    .await
-                    .map_err(api_err)?
-                    .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Memory not found: {id}")))?;
-                if mem.user_id != user_id {
+        for id in ids {
+            if let Some(mem) = state.service.get(id).await.map_err(api_err)? {
+                if !is_master && mem.user_id != user_id {
                     return Err((StatusCode::FORBIDDEN, format!("Not your memory: {id}")));
                 }
+            } else if let Some(owner) = lookup_memory_owner_any_state(&state, id).await? {
+                if !is_master && owner != user_id {
+                    return Err((StatusCode::FORBIDDEN, format!("Not your memory: {id}")));
+                }
+            } else {
+                return Err((StatusCode::NOT_FOUND, format!("Memory not found: {id}")));
             }
         }
         let id_refs: Vec<&str> = ids.iter().map(|s| s.as_str()).collect();

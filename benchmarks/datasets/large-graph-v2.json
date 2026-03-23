@@ -687,5 +687,6 @@
         "consolidate"
       ]
     }
-  ]
+  ],
+  "api_version": "v2"
 }

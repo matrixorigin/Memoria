@@ -9,12 +9,17 @@ mod benchmark_schema;
 mod benchmark_scoring;
 #[path = "benchmark_taxonomy.rs"]
 mod benchmark_taxonomy;
+#[path = "v1/mod.rs"]
+pub mod v1;
+#[path = "v2/mod.rs"]
+pub mod v2;
 
 pub use benchmark_executor::BenchmarkExecutor;
 #[allow(unused_imports)]
 pub use benchmark_schema::{
-    AssertionResult, BenchmarkReport, CategoryBreakdown, MemoryAssertion, Scenario,
-    ScenarioDataset, ScenarioExecution, ScenarioResult, ScenarioStep, SeedMemory, StepResult,
+    AssertionResult, BenchmarkReport, CategoryBreakdown, DatasetApiVersion, MemoryAssertion,
+    Scenario, ScenarioDataset, ScenarioExecution, ScenarioResult, ScenarioStep, SeedMemory,
+    StepResult,
 };
 pub use benchmark_scoring::{score_dataset, score_scenario};
 #[allow(unused_imports)]
@@ -28,6 +33,13 @@ pub fn validate_dataset(content: &str) -> Vec<String> {
         Ok(d) => d,
         Err(e) => {
             errors.push(format!("JSON parse error: {e}"));
+            return errors;
+        }
+    };
+    let api_version = match dataset.resolved_api_version() {
+        Ok(version) => version,
+        Err(err) => {
+            errors.push(err);
             return errors;
         }
     };
@@ -68,6 +80,9 @@ pub fn validate_dataset(content: &str) -> Vec<String> {
                 }
                 _ => {}
             }
+        }
+        if matches!(api_version, DatasetApiVersion::V2) {
+            v2::benchmark_validation::validate_scenario(s, &mut errors);
         }
     }
     errors
@@ -144,6 +159,7 @@ mod tests {
         let dataset = ScenarioDataset {
             dataset_id: "longmemeval-oracle".into(),
             version: "v1".into(),
+            api_version: None,
             scenarios,
         };
         let executions = HashMap::from([
@@ -184,6 +200,7 @@ mod tests {
         let dataset = ScenarioDataset {
             dataset_id: "beam-100k".into(),
             version: "v1".into(),
+            api_version: None,
             scenarios,
         };
         let executions = HashMap::from([
@@ -197,5 +214,62 @@ mod tests {
             report.results[1].official_category_label.as_deref(),
             Some("Instruction Following")
         );
+    }
+
+    #[test]
+    fn infers_dataset_api_version_from_explicit_field_or_name() {
+        let dataset = ScenarioDataset {
+            dataset_id: "memoria-core-v1".into(),
+            version: "v1".into(),
+            api_version: Some("v2".into()),
+            scenarios: vec![],
+        };
+        assert!(matches!(
+            dataset.resolved_api_version().expect("explicit v2"),
+            DatasetApiVersion::V2
+        ));
+
+        let inferred = ScenarioDataset {
+            dataset_id: "memoria-core-v2".into(),
+            version: "v1".into(),
+            api_version: None,
+            scenarios: vec![],
+        };
+        assert!(matches!(
+            inferred.resolved_api_version().expect("inferred v2"),
+            DatasetApiVersion::V2
+        ));
+    }
+
+    #[test]
+    fn rejects_v2_datasets_with_v1_only_temporal_fields() {
+        let content = serde_json::json!({
+            "dataset_id": "memoria-core-v2",
+            "version": "v1.0",
+            "api_version": "v2",
+            "scenarios": [{
+                "scenario_id": "CASE-1",
+                "title": "bad v2 dataset",
+                "difficulty": "L1",
+                "horizon": "short",
+                "tags": [],
+                "seed_memories": [{
+                    "content": "old memory",
+                    "memory_type": "semantic",
+                    "age_days": 30
+                }],
+                "steps": [],
+                "assertions": [{
+                    "query": "old memory",
+                    "expected_contents": ["old memory"]
+                }]
+            }]
+        })
+        .to_string();
+
+        let errors = validate_dataset(&content);
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("age_days") && error.contains("V2 API benchmark")));
     }
 }

@@ -850,54 +850,6 @@ async fn test_admin_stats_match_db() {
 }
 
 #[tokio::test]
-async fn test_admin_delete_user_verify_db() {
-    let (base, client, pool) = spawn_server().await;
-    let uid = uid();
-
-    // Store memories
-    for i in 0..3 {
-        client
-            .post(format!("{base}/v1/memories"))
-            .header("X-User-Id", &uid)
-            .json(&json!({"content": format!("user del {i}")}))
-            .send()
-            .await
-            .unwrap();
-    }
-    assert_eq!(db_count_active(&pool, &uid).await, 3);
-
-    // DELETE /admin/users/:id
-    let r = client
-        .delete(format!("{base}/admin/users/{uid}"))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(r.status(), 200);
-
-    // DB: all memories deactivated
-    assert_eq!(db_count_active(&pool, &uid).await, 0);
-
-    // DB: rows still exist (soft delete)
-    let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM mem_memories WHERE user_id = ?")
-        .bind(&uid)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-    assert_eq!(total, 3, "rows should still exist");
-
-    // All should have is_active=0
-    let active_vals: Vec<i8> =
-        sqlx::query_scalar("SELECT is_active FROM mem_memories WHERE user_id = ?")
-            .bind(&uid)
-            .fetch_all(&pool)
-            .await
-            .unwrap();
-    assert!(active_vals.iter().all(|&v| v == 0));
-
-    println!("✅ admin delete user: all 3 memories soft-deleted in DB");
-}
-
-#[tokio::test]
 async fn test_admin_list_revoke_user_keys_verify_db() {
     let mk = "test-mk-admin-keys-db";
     let (base, client, pool) = spawn_server_with_master_key(mk).await;

@@ -11,6 +11,7 @@ pub mod scoring;
 pub mod service;
 pub mod strategy;
 pub mod strategy_domain;
+mod v2;
 pub mod vector_index_monitor;
 pub use config::Config;
 pub use distributed::{AsyncTask, AsyncTaskStore, DistributedLock, NoopDistributedLock};

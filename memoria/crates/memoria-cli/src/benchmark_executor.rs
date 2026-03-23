@@ -1,18 +1,28 @@
+use crate::benchmark::v1::benchmark_api::V1BenchmarkApi;
+use crate::benchmark::v2::benchmark_api::V2BenchmarkApi;
 use crate::benchmark::{
-    AssertionResult, MemoryAssertion, Scenario, ScenarioExecution, ScenarioStep, StepResult,
+    AssertionResult, DatasetApiVersion, MemoryAssertion, Scenario, ScenarioExecution, ScenarioStep,
+    StepResult,
 };
+use anyhow::Result;
 use reqwest::blocking::Client;
-use serde_json::{json, Value};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+#[derive(Debug, Clone)]
+pub(crate) struct RecallMatch {
+    pub(crate) id: String,
+    pub(crate) text: String,
+}
 
 pub struct BenchmarkExecutor {
     base_url: String,
     token: String,
     run_id: String,
+    api_version: DatasetApiVersion,
 }
 
 impl BenchmarkExecutor {
-    pub fn new(api_url: &str, token: &str) -> Self {
+    pub fn new(api_url: &str, token: &str, api_version: DatasetApiVersion) -> Self {
         let run_id = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs().to_string())
@@ -21,13 +31,14 @@ impl BenchmarkExecutor {
             base_url: api_url.trim_end_matches('/').into(),
             token: token.into(),
             run_id,
+            api_version,
         }
     }
 
     fn client(&self, scenario_suffix: &str) -> Client {
         let user_id = format!("bench-{}-{}", self.run_id, scenario_suffix);
         Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
+            .timeout(Duration::from_secs(30))
             .no_proxy()
             .default_headers({
                 let mut h = reqwest::header::HeaderMap::new();
@@ -42,6 +53,14 @@ impl BenchmarkExecutor {
             .unwrap()
     }
 
+    fn v2_api(&self) -> V2BenchmarkApi<'_> {
+        V2BenchmarkApi::new(&self.base_url, &self.run_id)
+    }
+
+    fn v1_api(&self) -> V1BenchmarkApi<'_> {
+        V1BenchmarkApi::new(&self.base_url)
+    }
+
     pub fn execute(&self, scenario: &Scenario) -> ScenarioExecution {
         let sid = scenario.scenario_id.to_lowercase();
         let client = self.client(&sid);
@@ -53,6 +72,7 @@ impl BenchmarkExecutor {
             assertion_results: vec![],
             error: None,
         };
+        let mut tracked_memory_ids = Vec::new();
 
         for seed in &scenario.seed_memories {
             match self.store(
@@ -65,8 +85,19 @@ impl BenchmarkExecutor {
                 seed.trust_tier.as_deref(),
             ) {
                 Ok(mid) => {
-                    if seed.is_outdated && !mid.is_empty() {
-                        let _ = self.purge_ids(&client, &[mid], "seed is_outdated");
+                    if !mid.is_empty() {
+                        tracked_memory_ids.push(mid.clone());
+                        if seed.is_outdated {
+                            if let Err(err) = self.forget_ids(
+                                &client,
+                                std::slice::from_ref(&mid),
+                                "seed is_outdated",
+                            ) {
+                                exec.error = Some(format!("seed purge failed: {err}"));
+                                return exec;
+                            }
+                            tracked_memory_ids.retain(|tracked| tracked != &mid);
+                        }
                     }
                 }
                 Err(e) => {
@@ -76,19 +107,27 @@ impl BenchmarkExecutor {
             }
         }
 
+        if matches!(self.api_version, DatasetApiVersion::V2) {
+            if let Err(err) = self.v2_api().after_writes(&client, &tracked_memory_ids) {
+                exec.error = Some(format!("seed derivation failed: {err}"));
+                return exec;
+            }
+        }
+
         for op in &scenario.maturation {
-            let _ = client
-                .post(format!(
-                    "{}/admin/governance/{}/trigger",
-                    self.base_url, user_id
-                ))
-                .query(&[("op", op.as_str())])
-                .send();
+            if let Err(err) = self.run_maturation(&client, &user_id, &tracked_memory_ids, op) {
+                exec.error = Some(format!("maturation '{op}' failed: {err}"));
+                return exec;
+            }
         }
 
         for step in &scenario.steps {
-            exec.step_results
-                .push(self.run_step(&client, step, &session_id));
+            exec.step_results.push(self.run_step(
+                &client,
+                step,
+                &session_id,
+                &mut tracked_memory_ids,
+            ));
         }
 
         for assertion in &scenario.assertions {
@@ -96,6 +135,19 @@ impl BenchmarkExecutor {
                 .push(self.run_assertion(&client, assertion, &session_id));
         }
         exec
+    }
+
+    fn run_maturation(
+        &self,
+        client: &Client,
+        user_id: &str,
+        tracked_memory_ids: &[String],
+        op: &str,
+    ) -> Result<()> {
+        match self.api_version {
+            DatasetApiVersion::V1 => self.v1_api().run_maturation(client, user_id, op),
+            DatasetApiVersion::V2 => self.v2_api().run_maturation(client, tracked_memory_ids, op),
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -108,63 +160,53 @@ impl BenchmarkExecutor {
         age_days: Option<f64>,
         confidence: Option<f64>,
         trust_tier: Option<&str>,
-    ) -> anyhow::Result<String> {
-        let mut body = json!({
-            "content": content, "memory_type": memory_type,
-            "session_id": session_id, "source": "benchmark",
-        });
-        if let Some(days) = age_days {
-            let secs = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_secs_f64()
-                - days * 86400.0;
-            body["observed_at"] = json!(chrono_like_iso(secs));
+    ) -> Result<String> {
+        match self.api_version {
+            DatasetApiVersion::V1 => self.v1_api().store(
+                client,
+                content,
+                memory_type,
+                session_id,
+                age_days,
+                confidence,
+                trust_tier,
+            ),
+            DatasetApiVersion::V2 => {
+                self.v2_api()
+                    .store(client, content, memory_type, session_id, trust_tier)
+            }
         }
-        if let Some(c) = confidence {
-            body["initial_confidence"] = json!(c);
-        }
-        if let Some(t) = trust_tier {
-            body["trust_tier"] = json!(t);
-        }
-
-        let resp = client
-            .post(format!("{}/v1/memories", self.base_url))
-            .json(&body)
-            .send()?;
-        let data: Value = resp.json()?;
-        Ok(data["memory_id"].as_str().unwrap_or("").to_string())
     }
 
-    fn retrieve(&self, client: &Client, query: &str, session_id: &str, top_k: i64) -> Vec<String> {
-        let resp = client
-            .post(format!("{}/v1/memories/retrieve", self.base_url))
-            .json(&json!({"query": query, "top_k": top_k, "session_id": session_id}))
-            .send();
-        let data: Value = match resp.and_then(|r| r.json()) {
-            Ok(v) => v,
-            Err(_) => return vec![],
-        };
-        let items = if data.is_array() {
-            data.as_array()
-        } else {
-            data["results"].as_array()
-        };
-        items
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|i| i["content"].as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default()
+    fn retrieve_matches(
+        &self,
+        client: &Client,
+        query: &str,
+        session_id: &str,
+        top_k: i64,
+    ) -> Vec<RecallMatch> {
+        match self.api_version {
+            DatasetApiVersion::V1 => self
+                .v1_api()
+                .retrieve_matches(client, query, session_id, top_k),
+            DatasetApiVersion::V2 => self
+                .v2_api()
+                .retrieve_matches(client, query, session_id, top_k),
+        }
     }
 
-    fn run_step(&self, client: &Client, step: &ScenarioStep, session_id: &str) -> StepResult {
+    fn run_step(
+        &self,
+        client: &Client,
+        step: &ScenarioStep,
+        session_id: &str,
+        tracked_memory_ids: &mut Vec<String>,
+    ) -> StepResult {
         let action = step.action.clone();
-        let result = (|| -> anyhow::Result<()> {
+        let result = (|| -> Result<()> {
             match action.as_str() {
                 "store" => {
-                    self.store(
+                    let mid = self.store(
                         client,
                         step.content.as_deref().unwrap_or(""),
                         step.memory_type.as_deref().unwrap_or("semantic"),
@@ -173,41 +215,37 @@ impl BenchmarkExecutor {
                         step.initial_confidence,
                         step.trust_tier.as_deref(),
                     )?;
+                    if !mid.is_empty() {
+                        tracked_memory_ids.push(mid.clone());
+                        if matches!(self.api_version, DatasetApiVersion::V2) {
+                            self.v2_api().after_writes(client, &[mid])?;
+                        }
+                    }
                 }
-                "retrieve" => {
-                    self.retrieve(
+                "retrieve" | "search" => {
+                    self.retrieve_matches(
                         client,
                         step.query.as_deref().unwrap_or(""),
                         session_id,
                         step.top_k.unwrap_or(5),
                     );
                 }
-                "search" => {
-                    client
-                        .post(format!("{}/v1/memories/search", self.base_url))
-                        .json(&json!({"query": step.query, "top_k": step.top_k.unwrap_or(10)}))
-                        .send()?
-                        .error_for_status()?;
-                }
-                "correct" => {
-                    client
-                        .post(format!("{}/v1/memories/correct", self.base_url))
-                        .json(&json!({"query": step.query, "new_content": step.content,
-                            "reason": step.reason.as_deref().unwrap_or("benchmark")}))
-                        .send()?
-                        .error_for_status()?;
-                }
-                "purge" => {
-                    let mut body = json!({"reason": step.reason.as_deref().unwrap_or("benchmark")});
-                    if let Some(t) = &step.topic {
-                        body["topic"] = json!(t);
+                "correct" => match self.api_version {
+                    DatasetApiVersion::V1 => self.v1_api().correct_step(client, step)?,
+                    DatasetApiVersion::V2 => {
+                        let _ = self.v2_api().correct_step(client, step, session_id)?;
                     }
-                    client
-                        .post(format!("{}/v1/memories/purge", self.base_url))
-                        .json(&body)
-                        .send()?
-                        .error_for_status()?;
-                }
+                },
+                "purge" => match self.api_version {
+                    DatasetApiVersion::V1 => {
+                        let forgotten = self.v1_api().purge_step(client, step)?;
+                        tracked_memory_ids.retain(|id| !forgotten.contains(id));
+                    }
+                    DatasetApiVersion::V2 => {
+                        let forgotten = self.v2_api().purge_step(client, step, session_id)?;
+                        tracked_memory_ids.retain(|id| !forgotten.contains(id));
+                    }
+                },
                 _ => {}
             }
             Ok(())
@@ -232,7 +270,11 @@ impl BenchmarkExecutor {
         assertion: &MemoryAssertion,
         session_id: &str,
     ) -> AssertionResult {
-        let contents = self.retrieve(client, &assertion.query, session_id, assertion.top_k);
+        let contents = self
+            .retrieve_matches(client, &assertion.query, session_id, assertion.top_k)
+            .into_iter()
+            .map(|item| item.text)
+            .collect();
         AssertionResult {
             _query: assertion.query.clone(),
             returned_contents: contents,
@@ -240,31 +282,14 @@ impl BenchmarkExecutor {
         }
     }
 
-    fn purge_ids(&self, client: &Client, ids: &[String], reason: &str) -> anyhow::Result<()> {
-        client
-            .post(format!("{}/v1/memories/purge", self.base_url))
-            .json(&json!({"memory_ids": ids, "reason": reason}))
-            .send()?
-            .error_for_status()?;
+    fn forget_ids(&self, client: &Client, ids: &[String], reason: &str) -> Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        match self.api_version {
+            DatasetApiVersion::V1 => self.v1_api().forget_ids(client, ids, reason)?,
+            DatasetApiVersion::V2 => self.v2_api().forget_ids(client, ids, reason)?,
+        }
         Ok(())
     }
-}
-
-fn chrono_like_iso(epoch_secs: f64) -> String {
-    let secs = epoch_secs as i64;
-    let d = secs / 86400 + 719468;
-    let era = if d >= 0 { d } else { d - 146096 } / 146097;
-    let doe = (d - era * 146097) as u32;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = if month <= 2 { y + 1 } else { y };
-    let rem = secs.rem_euclid(86400);
-    let h = rem / 3600;
-    let m = (rem % 3600) / 60;
-    let s = rem % 60;
-    format!("{year:04}-{month:02}-{day:02}T{h:02}:{m:02}:{s:02}Z")
 }
