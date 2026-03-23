@@ -292,10 +292,12 @@ export class MemoriaHttpTransport {
   // ── HTTP primitives ───────────────────────────────────────────
 
   private headers(): Record<string, string> {
+    // In api mode, the API key (sk-...) already scopes to its owning user.
+    // Sending X-User-Id is unnecessary and can cause cross-user leakage
+    // in open-auth deployments. Let the API key determine identity.
     return {
       "Authorization": `Bearer ${this.apiKey}`,
       "Content-Type": "application/json",
-      "X-User-Id": this.userId,
     };
   }
 

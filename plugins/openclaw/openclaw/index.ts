@@ -2258,7 +2258,7 @@ const plugin = {
     const handleAutoRecall = async (
       prompt: string,
       ctx: PluginIdentityContext,
-    ): Promise<{ prependContext?: string } | void> => {
+    ): Promise<{ appendSystemContext?: string } | void> => {
       const trimmed = prompt.trim();
       if (trimmed.length < config.recallMinPromptLength) {
         return;
@@ -2280,7 +2280,7 @@ const plugin = {
         }
         api.logger.info(`memory-memoria: recalled ${memories.length} memories`);
         return {
-          prependContext: formatRelevantMemoriesContext(memories),
+          appendSystemContext: formatRelevantMemoriesContext(memories),
         };
       } catch (error) {
         api.logger.warn(`memory-memoria: auto-recall failed: ${String(error)}`);
@@ -2289,10 +2289,6 @@ const plugin = {
 
     if (config.autoRecall) {
       api.on("before_prompt_build", async (event, ctx) => {
-        return await handleAutoRecall(event.prompt, ctx);
-      });
-
-      api.on("before_agent_start", async (event, ctx) => {
         return await handleAutoRecall(event.prompt, ctx);
       });
     }
