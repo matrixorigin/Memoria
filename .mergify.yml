@@ -10,7 +10,6 @@ pull_request_rules:
     actions:
       merge:
         method: squash
-
   - name: Auto merge for dependabot
     conditions:
       - author=dependabot[bot]
@@ -20,3 +19,13 @@ pull_request_rules:
     actions:
       merge:
         method: squash
+queue_rules:
+  - name: main
+    merge_method: squash
+    commit_message_template: |-
+      {{ title }} (#{{ number }})
+
+      {{ body }}
+
+      Approved by: @{{ approved_reviews_by | join(', @') }}
+    checks_timeout: 1 h
