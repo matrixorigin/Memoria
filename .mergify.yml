@@ -2,23 +2,11 @@ pull_request_rules:
   - name: Automatic merge on approval
     conditions:
       - "#approved-reviews-by>=1"
-      - check-success=test-fast
-      - check-success=test-slow
-      - check-success=docker
-      - -draft
       - label!=do-not-merge
+      - base=main
     actions:
-      merge:
-        method: squash
-  - name: Auto merge for dependabot
-    conditions:
-      - author=dependabot[bot]
-      - check-success=test-fast
-      - check-success=test-slow
-      - check-success=docker
-    actions:
-      merge:
-        method: squash
+      queue:
+        name: main
 queue_rules:
   - name: main
     merge_method: squash
