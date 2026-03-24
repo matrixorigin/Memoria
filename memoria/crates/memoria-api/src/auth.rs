@@ -240,6 +240,113 @@ pub fn spawn_tool_usage_flusher(
     });
 }
 
+// ── API call log tracking ─────────────────────────────────────────────────────
+
+/// Request-scoped context shared between the call-log middleware and the AuthUser
+/// extractor.  The middleware inserts this into request extensions before calling
+/// `next`; the extractor fills in the resolved `user_id` so the middleware can
+/// record the call after the handler returns.
+#[derive(Clone, Default)]
+pub struct CallLogContext(pub std::sync::Arc<Mutex<Option<String>>>);
+
+/// A single pending call log entry buffered in memory.
+struct CallLogEntry {
+    user_id: String,
+    method: String,
+    path: String,
+    status_code: u16,
+    latency_ms: u32,
+}
+
+/// Accumulates call log entries in memory and flushes them in batches to DB.
+pub struct CallLogBatcher {
+    pending: Mutex<Vec<CallLogEntry>>,
+}
+
+impl Default for CallLogBatcher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CallLogBatcher {
+    pub fn new() -> Self {
+        Self {
+            pending: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Enqueue a single call log entry. Lock-free hot path relative to DB.
+    pub fn record(
+        &self,
+        user_id: String,
+        method: String,
+        path: String,
+        status_code: u16,
+        latency_ms: u32,
+    ) {
+        if let Ok(mut v) = self.pending.lock() {
+            v.push(CallLogEntry { user_id, method, path, status_code, latency_ms });
+        }
+    }
+
+    /// Drain pending entries and write them to `mem_api_call_log` in chunks.
+    pub async fn flush(&self, pool: &sqlx::MySqlPool) {
+        let entries: Vec<CallLogEntry> = {
+            let mut v = match self.pending.lock() {
+                Ok(v) => v,
+                Err(_) => return,
+            };
+            if v.is_empty() {
+                return;
+            }
+            v.drain(..).collect()
+        };
+
+        for chunk in entries.chunks(200) {
+            let placeholders: String = chunk
+                .iter()
+                .map(|_| "(?, ?, ?, ?, ?)")
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "INSERT INTO mem_api_call_log (user_id, method, path, status_code, latency_ms) \
+                 VALUES {placeholders}"
+            );
+            let mut query = sqlx::query(&sql);
+            for e in chunk {
+                query = query
+                    .bind(&e.user_id)
+                    .bind(&e.method)
+                    .bind(&e.path)
+                    .bind(e.status_code as i16)
+                    .bind(e.latency_ms as i32);
+            }
+            if let Err(e) = query.execute(pool).await {
+                warn!(
+                    "call_log batch flush failed ({} entries): {e}",
+                    chunk.len()
+                );
+            }
+        }
+    }
+}
+
+/// Spawn the background call-log flush loop (5-second interval).
+pub fn spawn_call_log_flusher(
+    batcher: std::sync::Arc<CallLogBatcher>,
+    pool: sqlx::MySqlPool,
+) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+        interval.tick().await; // skip immediate first tick
+        loop {
+            interval.tick().await;
+            batcher.flush(&pool).await;
+        }
+    });
+}
+
 #[axum::async_trait]
 impl FromRequestParts<AppState> for AuthUser {
     type Rejection = (StatusCode, String);
@@ -249,8 +356,9 @@ impl FromRequestParts<AppState> for AuthUser {
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
         // Extract optional tool/agent name for usage tracking (skip empty values).
-        // The MCP client sends X-Memoria-Tool with the agent name (cursor/kiro/claude/codex).
+        // Agents send X-Memoria-Tool with their name: cursor / kiro / claude / codex / openclaw.
         // Fall back to X-Tool-Name for backwards compatibility with older clients.
+        // Any non-empty value is accepted — no whitelist, so new agents work automatically.
         let tool_name = parts
             .headers
             .get("X-Memoria-Tool")
@@ -278,6 +386,14 @@ impl FromRequestParts<AppState> for AuthUser {
             else if let Some(uid) = validate_api_key(token, state).await {
                 if let Some(tool) = tool_name {
                     state.tool_usage_batcher.mark_used(uid.clone(), tool);
+                }
+                // Notify call-log middleware (if present) of the resolved user_id.
+                // The middleware inserted CallLogContext into extensions before calling next;
+                // we fill in the user_id so it can record the call after the handler returns.
+                if let Some(ctx) = parts.extensions.get::<CallLogContext>() {
+                    if let Ok(mut guard) = ctx.0.lock() {
+                        *guard = Some(uid.clone());
+                    }
                 }
                 return Ok(AuthUser {
                     user_id: uid,
@@ -317,6 +433,12 @@ impl FromRequestParts<AppState> for AuthUser {
 
         if let Some(tool) = tool_name {
             state.tool_usage_batcher.mark_used(user_id.clone(), tool);
+        }
+
+        if let Some(ctx) = parts.extensions.get::<CallLogContext>() {
+            if let Ok(mut guard) = ctx.0.lock() {
+                *guard = Some(user_id.clone());
+            }
         }
 
         Ok(AuthUser {

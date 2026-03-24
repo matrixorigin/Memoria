@@ -10,11 +10,73 @@ pub use state::AppState;
 use axum::{
     extract::DefaultBodyLimit,
     http::StatusCode,
+    middleware,
     response::IntoResponse,
     routing::{delete, get, post, put},
     Json, Router,
 };
 use tower_http::catch_panic::CatchPanicLayer;
+
+// ── Call-log middleware ───────────────────────────────────────────────────────
+
+/// Wraps every `/v1/*` request to record timing and HTTP status into
+/// `mem_api_call_log` via the batched `CallLogBatcher`.
+///
+/// The `CallLogContext` extension is inserted into the request *before* the
+/// handler runs.  The `AuthUser` extractor fills in the resolved `user_id`
+/// inside that context.  After `next.run()` the middleware reads back the
+/// user_id and enqueues the entry for batched persistence.
+async fn call_log_mw(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    mut req: axum::http::Request<axum::body::Body>,
+    next: middleware::Next,
+) -> axum::response::Response {
+    // Only instrument /v1/* endpoints.
+    if !req.uri().path().starts_with("/v1/") {
+        return next.run(req).await;
+    }
+
+    // ── Dashboard exclusion filter ─────────────────────────────────────────
+    // The website backend tags its own proxy calls with `X-Memoria-Source: dashboard`.
+    // These are dashboard-initiated operations (Memories panel, Playground, etc.)
+    // that should NOT inflate agent call statistics.
+    //
+    // All other callers (MCP agents, CLI, external integrations) are recorded
+    // by default — no special header required from them.
+    let is_dashboard = req
+        .headers()
+        .get("x-memoria-source")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.eq_ignore_ascii_case("dashboard"));
+
+    if is_dashboard {
+        return next.run(req).await;
+    }
+    // ─────────────────────────────────────────────────────────────────────────
+
+    let t = std::time::Instant::now();
+    let method = req.method().as_str().to_string();
+    let path = req.uri().path().to_string();
+
+    // Inject shared context so AuthUser extractor can deposit the resolved user_id.
+    let ctx = auth::CallLogContext::default();
+    req.extensions_mut().insert(ctx.clone());
+
+    let response = next.run(req).await;
+
+    let latency_ms = t.elapsed().as_millis() as u32;
+    let status_code = response.status().as_u16();
+
+    if let Ok(guard) = ctx.0.lock() {
+        if let Some(uid) = guard.as_ref() {
+            state
+                .call_log_batcher
+                .record(uid.clone(), method, path, status_code, latency_ms);
+        }
+    }
+
+    response
+}
 
 /// Build the full API router with all routes.
 pub fn build_router(state: AppState) -> Router {
@@ -144,6 +206,10 @@ pub fn build_router(state: AppState) -> Router {
             "/admin/users/:user_id/stats",
             get(routes::admin::user_stats),
         )
+        .route(
+            "/admin/users/:user_id/call-stats",
+            get(routes::admin::user_call_stats),
+        )
         .route("/admin/users/:user_id", delete(routes::admin::delete_user))
         .route(
             "/admin/users/:user_id/keys",
@@ -213,7 +279,7 @@ pub fn build_router(state: AppState) -> Router {
             "/admin/plugins/events",
             get(routes::plugins::list_audit_events),
         )
-        .with_state(state)
+        .with_state(state.clone())
         .layer(DefaultBodyLimit::max(2 * 1024 * 1024)) // 2 MB
         .layer(
             tower_http::trace::TraceLayer::new_for_http()
@@ -246,6 +312,7 @@ pub fn build_router(state: AppState) -> Router {
                     },
                 ),
         )
+        .layer(middleware::from_fn_with_state(state, call_log_mw))
         .layer(CatchPanicLayer::custom(
             |err: Box<dyn std::any::Any + Send>| {
                 let detail = err

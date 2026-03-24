@@ -743,6 +743,47 @@ impl SqlMemoryStore {
         .await
         .map_err(db_err)?;
 
+        // mem_api_call_log — per-user API call statistics for the Monitor dashboard.
+        // Records every authenticated /v1/* request: method, path, HTTP status,
+        // latency, and timestamp.  Insertions are batched (every 5 s) to avoid
+        // per-request DB pressure.
+        sqlx::query(
+            r#"CREATE TABLE IF NOT EXISTS mem_api_call_log (
+                id           BIGINT       NOT NULL AUTO_INCREMENT,
+                user_id      VARCHAR(64)  NOT NULL,
+                method       VARCHAR(10)  NOT NULL DEFAULT '',
+                path         VARCHAR(256) NOT NULL,
+                status_code  SMALLINT     NOT NULL DEFAULT 0,
+                latency_ms   INT          NOT NULL DEFAULT 0,
+                called_at    DATETIME(6)  NOT NULL DEFAULT NOW(6),
+                PRIMARY KEY (id),
+                INDEX idx_user_called (user_id, called_at)
+            )"#,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+
+        // Migration: add `method` for tables created before this column existed.
+        // MatrixOne / some MySQL forks do not reliably support
+        // `ADD COLUMN IF NOT EXISTS ... AFTER ...`; use information_schema + plain ALTER.
+        let has_method_col: bool = sqlx::query_scalar(
+            "SELECT COUNT(*) > 0 FROM information_schema.columns \
+             WHERE table_schema = DATABASE() AND table_name = 'mem_api_call_log' \
+             AND column_name = 'method'",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .unwrap_or(false);
+        if !has_method_col {
+            // No `AFTER` — better compatibility with MatrixOne; INSERT lists columns explicitly.
+            let _ = sqlx::query(
+                "ALTER TABLE mem_api_call_log ADD COLUMN method VARCHAR(10) NOT NULL DEFAULT ''",
+            )
+            .execute(&self.pool)
+            .await;
+        }
+
         Ok(())
     }
 
