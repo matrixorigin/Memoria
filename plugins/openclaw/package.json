@@ -1,6 +1,6 @@
 {
-  "name": "@matrixorigin/memory-memoria",
-  "version": "0.3.0",
+  "name": "@matrixorigin/thememoria",
+  "version": "0.4.1",
   "description": "OpenClaw memory plugin that uses the Rust Memoria CLI/API for embedded and remote backends.",
   "repository": {
     "type": "git",
@@ -33,6 +33,10 @@
   "engines": {
     "node": ">=22"
   },
+  "scripts": {
+    "test": "vitest --run",
+    "test:watch": "vitest"
+  },
   "peerDependencies": {
     "openclaw": ">=2026.3.0"
   },
@@ -40,6 +44,11 @@
     "openclaw": {
       "optional": true
     }
+  },
+  "devDependencies": {
+    "@types/node": "^25.5.0",
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.0"
   },
   "openclaw": {
     "extensions": [

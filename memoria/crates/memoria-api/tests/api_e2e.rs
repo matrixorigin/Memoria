@@ -5173,3 +5173,102 @@ async fn test_api_key_auth_uses_batcher_not_fire_and_forget() {
 
     println!("✅ test_api_key_auth_uses_batcher_not_fire_and_forget: auth pool + batcher works");
 }
+
+// ── tool usage tracking ───────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_tool_usage_tracking() {
+    let (base, client) = spawn_server().await;
+    let user = format!("tool_test_{}", uuid::Uuid::new_v4().simple());
+
+    // 1. No tool header → usage should be empty
+    let r = client
+        .get(format!("{base}/v1/tool-usage"))
+        .header("X-User-Id", &user)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let body: Value = r.json().await.unwrap();
+    assert_eq!(body.as_array().unwrap().len(), 0);
+    println!("✅ GET /v1/tool-usage: empty for new user");
+
+    // 2. Request with X-Tool-Name → should be recorded
+    client
+        .post(format!("{base}/v1/memories"))
+        .header("X-User-Id", &user)
+        .header("X-Tool-Name", "memory_store")
+        .json(&json!({"content": "test"}))
+        .send()
+        .await
+        .unwrap();
+
+    let r = client
+        .get(format!("{base}/v1/tool-usage"))
+        .header("X-User-Id", &user)
+        .send()
+        .await
+        .unwrap();
+    let body: Value = r.json().await.unwrap();
+    let items = body.as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["tool_name"], "memory_store");
+    assert!(items[0]["last_used_at"].as_str().is_some());
+    println!("✅ GET /v1/tool-usage: recorded memory_store");
+
+    // 3. Empty X-Tool-Name → should NOT add an entry
+    client
+        .post(format!("{base}/v1/memories"))
+        .header("X-User-Id", &user)
+        .header("X-Tool-Name", "")
+        .json(&json!({"content": "test2"}))
+        .send()
+        .await
+        .unwrap();
+
+    let r = client
+        .get(format!("{base}/v1/tool-usage"))
+        .header("X-User-Id", &user)
+        .send()
+        .await
+        .unwrap();
+    let body: Value = r.json().await.unwrap();
+    assert_eq!(body.as_array().unwrap().len(), 1, "empty tool name should not create entry");
+    println!("✅ GET /v1/tool-usage: empty header ignored");
+
+    // 4. Second tool → should have 2 entries
+    client
+        .post(format!("{base}/v1/memories/search"))
+        .header("X-User-Id", &user)
+        .header("X-Tool-Name", "memory_search")
+        .json(&json!({"query": "test"}))
+        .send()
+        .await
+        .unwrap();
+
+    let r = client
+        .get(format!("{base}/v1/tool-usage"))
+        .header("X-User-Id", &user)
+        .send()
+        .await
+        .unwrap();
+    let body: Value = r.json().await.unwrap();
+    let items = body.as_array().unwrap();
+    assert_eq!(items.len(), 2);
+    let tools: Vec<&str> = items.iter().map(|i| i["tool_name"].as_str().unwrap()).collect();
+    assert!(tools.contains(&"memory_store"));
+    assert!(tools.contains(&"memory_search"));
+    println!("✅ GET /v1/tool-usage: 2 tools tracked");
+
+    // 5. Different user should not see user's tools
+    let other = format!("tool_test_{}", uuid::Uuid::new_v4().simple());
+    let r = client
+        .get(format!("{base}/v1/tool-usage"))
+        .header("X-User-Id", &other)
+        .send()
+        .await
+        .unwrap();
+    let body: Value = r.json().await.unwrap();
+    assert_eq!(body.as_array().unwrap().len(), 0);
+    println!("✅ GET /v1/tool-usage: user isolation verified");
+}

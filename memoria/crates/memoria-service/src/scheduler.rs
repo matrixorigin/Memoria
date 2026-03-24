@@ -1326,6 +1326,7 @@ mod tests {
             embedding_dim: 1024,
             embedding_api_key: String::new(),
             embedding_base_url: String::new(),
+            embedding_endpoints: vec![],
             llm_api_key: None,
             llm_base_url: "https://api.openai.com/v1".into(),
             llm_model: "gpt-4o-mini".into(),

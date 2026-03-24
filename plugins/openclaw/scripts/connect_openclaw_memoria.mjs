@@ -1,9 +1,10 @@
 #!/usr/bin/env node
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 
 function fail(message) {
-  console.error(`[memory-memoria] ${message}`);
+  console.error(`[thememoria] ${message}`);
   process.exit(1);
 }
 
@@ -23,13 +24,40 @@ function normalizeUrl(value) {
   return value.trim().replace(/\/+$/, "");
 }
 
+function resolveExecutable(command) {
+  if (!command) {
+    return null;
+  }
+  if (command.includes("/") || command.includes("\\")) {
+    return fs.existsSync(command) ? path.resolve(command) : null;
+  }
+  const result = spawnSync("/usr/bin/env", ["which", command], {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "ignore"],
+  });
+  if (result.status !== 0 || typeof result.stdout !== "string") {
+    return null;
+  }
+  const resolved = result.stdout.trim().split(/\r?\n/).find(Boolean);
+  return resolved ? path.resolve(resolved) : null;
+}
+
+function binaryLacksLocalEmbeddingSupport(executablePath) {
+  try {
+    const content = fs.readFileSync(executablePath);
+    return content.includes(Buffer.from("compiled without local-embedding feature", "utf8"));
+  } catch {
+    return false;
+  }
+}
+
 const modeRaw = readArg("--mode", "cloud").trim().toLowerCase();
 if (modeRaw !== "cloud" && modeRaw !== "local") {
   fail("mode must be one of: cloud, local");
 }
 const mode = modeRaw;
 
-const pluginId = readArg("--plugin-id", "memory-memoria").trim() || "memory-memoria";
+const pluginId = readArg("--plugin-id", "thememoria").trim() || "thememoria";
 const configFile = path.resolve(
   readArg(
     "--config-file",
@@ -82,7 +110,7 @@ if (mode === "cloud") {
   if (!apiKey) {
     fail("--api-key required when mode=cloud");
   }
-  pluginConfig.backend = "http";
+  pluginConfig.backend = "api";
   pluginConfig.apiUrl = normalizeUrl(apiUrl);
   pluginConfig.apiKey = apiKey;
   delete pluginConfig.dbUrl;
@@ -104,6 +132,24 @@ if (mode === "cloud") {
 
   if (embeddingProvider !== "local" && !embeddingApiKey) {
     fail("--embedding-api-key required for mode=local when embedding-provider is not 'local'");
+  }
+
+  const effectiveMemoriaExecutable =
+    memoriaExecutable ||
+    (typeof pluginConfig.memoriaExecutable === "string" ? pluginConfig.memoriaExecutable.trim() : "") ||
+    "memoria";
+  if (embeddingProvider === "local") {
+    const resolvedExecutable = resolveExecutable(effectiveMemoriaExecutable);
+    if (!resolvedExecutable) {
+      fail(
+        `embedding-provider=local requires a usable memoria executable, but '${effectiveMemoriaExecutable}' could not be resolved. Pass --memoria-executable <path> or install memoria first.`,
+      );
+    }
+    if (binaryLacksLocalEmbeddingSupport(resolvedExecutable)) {
+      fail(
+        `embedding-provider=local requires a memoria binary built with local-embedding support. Resolved '${resolvedExecutable}', but this binary was built without that feature. Use a remote embedding provider or install/rebuild a local-embedding-enabled memoria binary.`,
+      );
+    }
   }
 
   pluginConfig.backend = "embedded";
@@ -153,11 +199,11 @@ console.log(
       pluginId,
       backend: pluginConfig.backend,
       apiUrl:
-        pluginConfig.backend === "http" && typeof pluginConfig.apiUrl === "string"
+        pluginConfig.backend === "api" && typeof pluginConfig.apiUrl === "string"
           ? pluginConfig.apiUrl
           : undefined,
       apiKeySet:
-        pluginConfig.backend === "http" &&
+        pluginConfig.backend === "api" &&
         typeof pluginConfig.apiKey === "string" &&
         pluginConfig.apiKey.length > 0,
       dbUrl: typeof pluginConfig.dbUrl === "string" ? pluginConfig.dbUrl : undefined,

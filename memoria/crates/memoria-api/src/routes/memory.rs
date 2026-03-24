@@ -834,3 +834,15 @@ pub async fn tune_retrieval_params(
         }))),
     }
 }
+
+pub async fn get_tool_usage(
+    State(state): State<AppState>,
+    AuthUser { user_id, .. }: AuthUser,
+) -> ApiResult<serde_json::Value> {
+    let usage = state.tool_usage_batcher.get_user_tool_usage(&user_id);
+    let items: Vec<serde_json::Value> = usage
+        .into_iter()
+        .map(|(tool, ts)| serde_json::json!({"tool_name": tool, "last_used_at": ts.to_rfc3339()}))
+        .collect();
+    Ok(Json(serde_json::json!(items)))
+}

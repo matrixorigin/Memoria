@@ -6,6 +6,7 @@ import type {
   MemoriaTrustTier,
 } from "./config.js";
 import { MEMORIA_MEMORY_TYPES } from "./config.js";
+import { MemoriaHttpTransport } from "./http-client.js";
 
 export type MemoriaMemoryRecord = {
   memory_id: string;
@@ -85,7 +86,7 @@ type McpContentBlock = {
 };
 
 const MCP_PROTOCOL_VERSION = "2024-11-05";
-const PLUGIN_VERSION = "0.3.0";
+const PLUGIN_VERSION = "0.4.0";
 const MEMORY_LINE_RE = /^\[([^\]]+)\] \(([^)]+)\) ?([\s\S]*)$/;
 
 function asRecord(value: unknown): Record<string, unknown> | null {
@@ -425,13 +426,8 @@ class MemoriaMcpSession {
 
   private buildArgs(): string[] {
     const args = ["mcp"];
-    if (this.config.backend === "http") {
-      args.push("--api-url", this.config.apiUrl!);
-      args.push("--token", this.config.apiKey!);
-      args.push("--user", this.userId);
-      return args;
-    }
-
+    // MemoriaMcpSession is only used for embedded mode now.
+    // API mode uses MemoriaHttpTransport directly.
     args.push("--db-url", this.config.dbUrl);
     args.push("--user", this.userId);
     return args;
@@ -543,7 +539,7 @@ class MemoriaMcpSession {
 }
 
 export class MemoriaClient {
-  private readonly sessions = new Map<string, MemoriaMcpSession>();
+  private readonly sessions = new Map<string, MemoriaMcpSession | MemoriaHttpTransport>();
   private readonly memoryCache = new Map<string, MemoriaMemoryRecord>();
 
   constructor(private readonly config: MemoriaPluginConfig) {}
@@ -556,6 +552,17 @@ export class MemoriaClient {
   }
 
   async health(userId: string) {
+    if (this.config.backend === "api") {
+      const transport = this.getSession(userId) as MemoriaHttpTransport;
+      const result = await transport.healthCheck();
+      return {
+        status: result.status,
+        mode: this.config.backend,
+        instance_id: result.instance_id,
+        db: result.db,
+        warnings: [],
+      };
+    }
     await this.callToolText(userId, "memory_list", { limit: 1 });
     return {
       status: "ok",
@@ -865,6 +872,9 @@ export class MemoriaClient {
   }
 
   async rebuildIndex(table: string) {
+    if (this.config.backend === "api") {
+      return { message: "rebuild_index is managed by the cloud service and not available via API." };
+    }
     return parseGenericResult(
       await this.callToolText(this.config.defaultUserId, "memory_rebuild_index", {
         table,
@@ -1016,14 +1026,20 @@ export class MemoriaClient {
     throw new Error(`Memoria tool '${name}' returned no text content.`);
   }
 
-  private getSession(userId: string): MemoriaMcpSession {
+  private getSession(userId: string): MemoriaMcpSession | MemoriaHttpTransport {
     const key = `${this.config.backend}:${userId}`;
     const existing = this.sessions.get(key);
     if (existing?.isAlive()) {
       return existing;
     }
     existing?.close();
-    const created = new MemoriaMcpSession(this.config, userId);
+
+    let created: MemoriaMcpSession | MemoriaHttpTransport;
+    if (this.config.backend === "api") {
+      created = new MemoriaHttpTransport(this.config, userId);
+    } else {
+      created = new MemoriaMcpSession(this.config, userId);
+    }
     this.sessions.set(key, created);
     return created;
   }

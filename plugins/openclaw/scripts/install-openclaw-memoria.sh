@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PLUGIN_ID="memory-memoria"
+PLUGIN_ID="thememoria"
 DEFAULT_REPO_URL="https://github.com/matrixorigin/Memoria.git"
 DEFAULT_REPO_REF="main"
 DEFAULT_MEMORIA_VERSION="v0.1.0"
@@ -39,12 +39,18 @@ MEMORIA_TOOL_NAMES=(
 )
 
 log() {
-  printf '[memory-memoria] %s\n' "$*"
+  printf '[thememoria] %s\n' "$*"
 }
 
 fail() {
-  printf '[memory-memoria] error: %s\n' "$*" >&2
+  printf '[thememoria] error: %s\n' "$*" >&2
   exit 1
+}
+
+binary_lacks_local_embedding_support() {
+  local bin_path="$1"
+  [[ -f "${bin_path}" ]] || return 1
+  LC_ALL=C grep -a -q 'compiled without local-embedding feature' "${bin_path}"
 }
 
 need_cmd() {
@@ -508,7 +514,10 @@ if [[ "${MEMORIA_EMBEDDING_PROVIDER}" != "local" && -z "${MEMORIA_EMBEDDING_DIM}
   log "Auto-selected embedding dimension ${MEMORIA_EMBEDDING_DIM} for ${MEMORIA_EMBEDDING_MODEL}"
 fi
 if [[ "${MEMORIA_EMBEDDING_PROVIDER}" == "local" ]]; then
-  log "Embedding provider is local. Make sure your memoria binary was built with local-embedding support."
+  if binary_lacks_local_embedding_support "${MEMORIA_EXECUTABLE_VALUE}"; then
+    fail "MEMORIA_EMBEDDING_PROVIDER=local requires a memoria binary built with local-embedding support. Resolved ${MEMORIA_EXECUTABLE_VALUE}, but that binary was built without the feature. Use a remote embedding provider or install/rebuild a local-embedding-enabled memoria binary."
+  fi
+  log "Embedding provider is local and the selected memoria binary passed the local-embedding capability check."
 fi
 if [[ "${MEMORIA_AUTO_OBSERVE}" == "true" ]]; then
   [[ -n "${MEMORIA_LLM_API_KEY}" ]] || fail "MEMORIA_AUTO_OBSERVE=true requires MEMORIA_LLM_API_KEY"
