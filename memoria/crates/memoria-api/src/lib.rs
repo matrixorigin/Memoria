@@ -47,7 +47,7 @@ async fn call_log_mw(
         .headers()
         .get("x-memoria-source")
         .and_then(|v| v.to_str().ok())
-        .map_or(false, |v| v.eq_ignore_ascii_case("dashboard"));
+        .is_some_and(|v| v.eq_ignore_ascii_case("dashboard"));
 
     if is_dashboard {
         return next.run(req).await;
