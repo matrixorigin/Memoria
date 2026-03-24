@@ -1,6 +1,6 @@
 # Git-for-Data RFC — Rust Implementation Design
 
-## 1. MatrixOne DDL Syntax (from Python implementation)
+## 1. MatrixOne DDL Syntax
 
 ### Snapshots (account-level)
 ```sql
