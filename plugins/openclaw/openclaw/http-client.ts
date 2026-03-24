@@ -298,6 +298,7 @@ export class MemoriaHttpTransport {
     return {
       "Authorization": `Bearer ${this.apiKey}`,
       "Content-Type": "application/json",
+      "X-Memoria-Tool": "openclaw",
     };
   }
 

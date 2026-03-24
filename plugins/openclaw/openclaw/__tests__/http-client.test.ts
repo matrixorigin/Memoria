@@ -75,6 +75,12 @@ describe("Group 3: Cloud API Communication", () => {
       await transport.callTool("memory_retrieve", { query: "test", top_k: 5 });
       expect(fetchMock.lastCall()!.headers["X-User-Id"]).toBeUndefined();
     });
+
+    it("3.8b every request has X-Memoria-Tool: openclaw", async () => {
+      fetchMock.respondWith(200, { results: [] });
+      await transport.callTool("memory_retrieve", { query: "test", top_k: 5 });
+      expect(fetchMock.lastCall()!.headers["X-Memoria-Tool"]).toBe("openclaw");
+    });
   });
 
   // ── Tool → endpoint mapping (table-driven) ──────────────
