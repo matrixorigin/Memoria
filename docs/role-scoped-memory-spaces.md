@@ -4,6 +4,10 @@
 
 This document proposes **role-scoped memory spaces** as a first-class collaboration primitive in Memoria.
 
+User-facing surfaces should prefer the term **role** because it matches how people think about collaborators such as `writer`, `reviewer`, or `github-ops`.
+
+Internally, Memoria can still model this as a more general **scope** abstraction so the system can later support other inherited overlays beyond roles.
+
 Example:
 
 ```text
@@ -88,16 +92,16 @@ where:
 
 ## Desired capabilities
 
-### Scope lifecycle
+### Role lifecycle (user-facing)
 
-- create role based on a parent scope
-- list available role scopes
-- inspect role parent
-- delete role scope
+- create role based on a parent role/scope
+- list available roles
+- inspect role parent / lineage
+- delete role
 
 ### Memory operations
 
-- store memory into a specific scope
+- store memory into a specific role/scope
 - recall from `main` only
 - recall from `main + role`
 - optionally recall from role-only or parent-only
@@ -133,6 +137,8 @@ POST /v1/roles
   "based_on": "main"
 }
 ```
+
+The API may still map this internally onto a generic scope record.
 
 ### List roles
 
@@ -170,6 +176,19 @@ Server-side semantics:
 ## Data model direction
 
 A generic scope abstraction is likely more future-proof than a hard-coded `role` field.
+
+That leads to a two-layer model:
+
+- **user-facing CLI / product language**: `role`
+- **internal storage / execution model**: `scope`
+
+For example, a user may run:
+
+```bash
+memoria role create writer --based-on main
+```
+
+while the backend stores this as a named inherited scope.
 
 ### Option A: scope fields
 
