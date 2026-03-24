@@ -29,7 +29,7 @@ Every memory change is tracked, auditable, and reversible — snapshots, branche
 - **Self-maintaining** — built-in governance detects contradictions, quarantines low-confidence memories
 - **Private by default** — local embedding model option, no data leaves your machine
 
-**Supported Agents:** [Kiro](https://kiro.dev) · [Cursor](https://cursor.sh) · [Claude Code](https://docs.anthropic.com/en/docs/claude-code) · [Codex](https://openai.com/index/introducing-codex/) · [OpenClaw](plugins/openclaw/README.md) · Any MCP-compatible agent
+**Supported Agents:** [Kiro](https://kiro.dev) · [Cursor](https://cursor.sh) · [Claude Code](https://docs.anthropic.com/en/docs/claude-code) · [Codex](https://openai.com/index/introducing-codex/) · [Gemini CLI](https://geminicli.com) · [OpenClaw](plugins/openclaw/README.md) · Any MCP-compatible agent
 
 **Storage Backend:** [MatrixOne](https://github.com/matrixorigin/matrixone) — Distributed database with native vector indexing
 
@@ -90,7 +90,7 @@ cd your-project
 memoria init -i   # Interactive wizard (recommended)
 ```
 
-This creates MCP config + steering rules for your AI tool (Kiro, Cursor, Claude, or Codex).
+This creates MCP config + steering rules for your AI tool (Kiro, Cursor, Claude, Codex, or Gemini CLI).
 
 ### 🦞 OpenClaw Plugin (Already Using OpenClaw?)
 
@@ -219,6 +219,7 @@ AI:  → memory_branch(name="eval_sqlite")
 - Cursor: `.cursor/rules/*.mdc`
 - Claude: `.claude/rules/*.md`
 - Codex: `AGENTS.md`
+- Gemini CLI: `GEMINI.md` + `.gemini/*.md`
 
 ### Update Rules
 
@@ -305,7 +306,7 @@ If you're an AI agent helping a user set up Memoria:
 
 1. **Load the [Setup Skill](skills/setup/SKILL.md)** — it has step-by-step instructions
 2. **Ask before acting**:
-   - Which AI tool? (Kiro / Cursor / Claude / Codex)
+   - Which AI tool? (Kiro / Cursor / Claude / Codex / Gemini CLI)
    - MatrixOne database? (Docker / Cloud / existing)
    - Embedding service? (OpenAI / SiliconFlow / local)
 3. **Run `memoria init -i`** in the user's project directory

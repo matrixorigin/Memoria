@@ -36,6 +36,11 @@ const CLAUDE_MEMORY_HYGIENE: &str = include_str!("../templates/claude_memory_hyg
 const CLAUDE_MEMORY_BRANCHING: &str = include_str!("../templates/claude_memory_branching.md");
 const CLAUDE_GOAL_EVOLUTION: &str = include_str!("../templates/claude_goal_evolution.md");
 const CODEX_AGENTS: &str = include_str!("../templates/codex_agents.md");
+const GEMINI_RULE: &str = include_str!("../templates/gemini_rule.md");
+const GEMINI_SESSION_LIFECYCLE: &str = include_str!("../templates/gemini_session_lifecycle.md");
+const GEMINI_MEMORY_HYGIENE: &str = include_str!("../templates/gemini_memory_hygiene.md");
+const GEMINI_MEMORY_BRANCHING: &str = include_str!("../templates/gemini_memory_branching.md");
+const GEMINI_GOAL_EVOLUTION: &str = include_str!("../templates/gemini_goal_evolution.md");
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
 
@@ -45,6 +50,7 @@ enum ToolName {
     Cursor,
     Claude,
     Codex,
+    Gemini,
 }
 
 impl std::fmt::Display for ToolName {
@@ -54,6 +60,7 @@ impl std::fmt::Display for ToolName {
             ToolName::Cursor => write!(f, "cursor"),
             ToolName::Claude => write!(f, "claude"),
             ToolName::Codex => write!(f, "codex"),
+            ToolName::Gemini => write!(f, "gemini"),
         }
     }
 }
@@ -131,7 +138,7 @@ enum Commands {
     /// Write MCP config + steering rules (-i for interactive wizard)
     Init {
         /// AI tool to configure
-        #[arg(long, value_name = "kiro|cursor|claude")]
+        #[arg(long, value_name = "kiro|cursor|claude|gemini")]
         tool: Vec<ToolName>,
         /// Interactive setup wizard
         #[arg(short = 'i', long)]
@@ -162,7 +169,7 @@ enum Commands {
     /// Write/update steering rules (auto-detect or specify --tool, --force to overwrite)
     Rules {
         /// AI tool to write rules for (auto-detected if omitted)
-        #[arg(long, value_name = "kiro|cursor|claude")]
+        #[arg(long, value_name = "kiro|cursor|claude|gemini")]
         tool: Vec<ToolName>,
         /// Interactive tool selection
         #[arg(short = 'i', long)]
@@ -357,6 +364,8 @@ async fn cmd_serve(db_url: Option<String>, port: u16, master_key: String) -> Res
     if let Some(v) = db_url {
         cfg.db_url = v;
     }
+
+    validate_embedding_config(&cfg)?;
 
     tracing::info!(
         db_url = %cfg.db_url, port = port,
@@ -889,6 +898,19 @@ fn build_embedder(
     }
 }
 
+fn validate_embedding_config(cfg: &memoria_service::Config) -> Result<()> {
+    if cfg.embedding_provider == "local" {
+        #[cfg(not(feature = "local-embedding"))]
+        {
+            anyhow::bail!(
+                "EMBEDDING_PROVIDER=local requires a binary built with `local-embedding` support. \
+Use an HTTP embedding provider instead, or rebuild Memoria with `--features local-embedding`."
+            );
+        }
+    }
+    Ok(())
+}
+
 fn build_llm(cfg: &memoria_service::Config) -> Option<Arc<memoria_embedding::LlmClient>> {
     cfg.llm_api_key.as_ref().map(|key| {
         Arc::new(memoria_embedding::LlmClient::new(
@@ -967,7 +989,6 @@ fn mcp_entry(
     let mut entry = serde_json::json!({
         "command": "memoria",
         "args": full_args,
-        "_version": VERSION,
     });
     if !env.is_empty() {
         entry["env"] = serde_json::Value::Object(env);
@@ -1005,6 +1026,9 @@ fn detect_tools(project_dir: &Path) -> Vec<String> {
         .unwrap_or_default();
     if codex_config.exists() || which_cmd("codex").is_some() {
         tools.push("codex".to_string());
+    }
+    if project_dir.join(".gemini").exists() || which_cmd("gemini").is_some() {
+        tools.push("gemini".to_string());
     }
     tools
 }
@@ -1344,6 +1368,75 @@ fn configure_codex(project_dir: &Path, entry: &serde_json::Value, force: bool) -
     results
 }
 
+fn configure_gemini(project_dir: &Path, entry: &serde_json::Value, force: bool) -> Vec<String> {
+    let mut results = vec![];
+
+    // MCP: write to .gemini/settings.json (project-level)
+    let settings_path = project_dir.join(".gemini/settings.json");
+    let relative = settings_path.strip_prefix(project_dir).unwrap_or(&settings_path);
+
+    if settings_path.exists() {
+        if let Ok(content) = std::fs::read_to_string(&settings_path) {
+            if let Ok(mut existing) = serde_json::from_str::<serde_json::Value>(&content) {
+                existing["mcpServers"][MCP_KEY] = entry.clone();
+                std::fs::write(&settings_path, serde_json::to_string_pretty(&existing).unwrap())
+                    .ok();
+                results.push(format!("  ✓ {} (updated memoria entry)", relative.display()));
+            } else {
+                // File exists but invalid JSON — overwrite
+                let wrapper = serde_json::json!({ "mcpServers": { MCP_KEY: entry } });
+                std::fs::write(&settings_path, serde_json::to_string_pretty(&wrapper).unwrap())
+                    .ok();
+                results.push(format!("  ✓ {} (created)", relative.display()));
+            }
+        }
+    } else {
+        if let Some(parent) = settings_path.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        let wrapper = serde_json::json!({ "mcpServers": { MCP_KEY: entry } });
+        std::fs::write(&settings_path, serde_json::to_string_pretty(&wrapper).unwrap()).ok();
+        results.push(format!("  ✓ {} (created)", relative.display()));
+    }
+
+    // Rules: write GEMINI.md files to project root
+    results.push(write_rule(
+        &project_dir.join("GEMINI.md"),
+        GEMINI_RULE,
+        force,
+        project_dir,
+    ));
+
+    // Additional rule files in .gemini/ directory
+    let rules_dir = project_dir.join(".gemini");
+    results.push(write_rule(
+        &rules_dir.join("session-lifecycle.md"),
+        GEMINI_SESSION_LIFECYCLE,
+        force,
+        project_dir,
+    ));
+    results.push(write_rule(
+        &rules_dir.join("memory-hygiene.md"),
+        GEMINI_MEMORY_HYGIENE,
+        force,
+        project_dir,
+    ));
+    results.push(write_rule(
+        &rules_dir.join("memory-branching-patterns.md"),
+        GEMINI_MEMORY_BRANCHING,
+        force,
+        project_dir,
+    ));
+    results.push(write_rule(
+        &rules_dir.join("goal-driven-evolution.md"),
+        GEMINI_GOAL_EVOLUTION,
+        force,
+        project_dir,
+    ));
+
+    results
+}
+
 // ── Interactive wizard ─────────────────────────────────────────────────────────
 
 /// Existing config parsed from mcp.json for use as defaults.
@@ -1385,6 +1478,7 @@ fn load_existing_config(project_dir: &Path) -> ExistingConfig {
         ("kiro", ".kiro/settings/mcp.json"),
         ("cursor", ".cursor/mcp.json"),
         ("claude", ".mcp.json"),
+        ("gemini", ".gemini/settings.json"),
     ];
     let mut found_entry: Option<serde_json::Value> = None;
     for (tool, path) in &candidates {
@@ -1400,6 +1494,7 @@ fn load_existing_config(project_dir: &Path) -> ExistingConfig {
                         "kiro" => cfg.tools.push(ToolName::Kiro),
                         "cursor" => cfg.tools.push(ToolName::Cursor),
                         "claude" => cfg.tools.push(ToolName::Claude),
+                        "gemini" => cfg.tools.push(ToolName::Gemini),
                         _ => {}
                     }
                     if found_entry.is_none() {
@@ -1656,6 +1751,7 @@ fn cmd_init_interactive(
                 ToolName::Cursor => "Cursor",
                 ToolName::Claude => "Claude Code",
                 ToolName::Codex => "Codex",
+                ToolName::Gemini => "Gemini CLI",
             })
             .collect();
         cliclack::note("AI Tool", names.join(", ")).ok();
@@ -1677,6 +1773,9 @@ fn cmd_init_interactive(
             if existing.tools.iter().any(|t| matches!(t, ToolName::Codex)) {
                 v.push(3);
             }
+            if existing.tools.iter().any(|t| matches!(t, ToolName::Gemini)) {
+                v.push(4);
+            }
             v
         };
         let tool_sel: Vec<usize> = match cliclack::multiselect("Which AI tools?")
@@ -1687,6 +1786,11 @@ fn cmd_init_interactive(
                 3,
                 "Codex",
                 "MCP in ~/.codex/config.toml, rules in AGENTS.md",
+            )
+            .item(
+                4,
+                "Gemini CLI",
+                "MCP in .gemini/settings.json, rules in GEMINI.md",
             )
             .initial_values(tool_defaults)
             .interact()
@@ -1709,6 +1813,9 @@ fn cmd_init_interactive(
         }
         if tool_sel.contains(&3) {
             t.push(ToolName::Codex);
+        }
+        if tool_sel.contains(&4) {
+            t.push(ToolName::Gemini);
         }
         if t.is_empty() {
             cliclack::outro_cancel("No tool selected").ok();
@@ -1900,6 +2007,7 @@ fn cmd_init_interactive(
             ToolName::Cursor => "Cursor",
             ToolName::Claude => "Claude Code",
             ToolName::Codex => "Codex",
+            ToolName::Gemini => "Gemini CLI",
         })
         .collect();
 
@@ -2068,6 +2176,7 @@ fn cmd_init(
             ToolName::Cursor => configure_cursor(project_dir, &entry, force),
             ToolName::Claude => configure_claude(project_dir, &entry, force),
             ToolName::Codex => configure_codex(project_dir, &entry, force),
+            ToolName::Gemini => configure_gemini(project_dir, &entry, force),
         };
         for r in results {
             println!("{}", r);
@@ -2208,6 +2317,50 @@ fn cmd_status(project_dir: &Path) {
                     println!("  ✗ AGENTS.md (missing)");
                 }
             }
+            "gemini" => {
+                let settings = project_dir.join(".gemini/settings.json");
+                if settings.exists() {
+                    let has_memoria = std::fs::read_to_string(&settings)
+                        .ok()
+                        .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
+                        .and_then(|j| j.get("mcpServers")?.get(MCP_KEY).cloned())
+                        .is_some();
+                    if has_memoria {
+                        println!("  ✓ .gemini/settings.json (memoria entry present)");
+                    } else {
+                        println!("  ✗ .gemini/settings.json (no memoria entry)");
+                    }
+                } else {
+                    println!("  ✗ .gemini/settings.json (missing)");
+                }
+                let gemini_md = project_dir.join("GEMINI.md");
+                if gemini_md.exists() {
+                    let ver = installed_version(&gemini_md)
+                        .map(|v| format!(" (v{})", v))
+                        .unwrap_or_default();
+                    println!("  ✓ GEMINI.md{}", ver);
+                } else {
+                    println!("  ✗ GEMINI.md (missing)");
+                }
+                let rules = [
+                    "session-lifecycle.md",
+                    "memory-hygiene.md",
+                    "memory-branching-patterns.md",
+                    "goal-driven-evolution.md",
+                ];
+                for name in &rules {
+                    let path = project_dir.join(".gemini").join(name);
+                    let rel = format!(".gemini/{}", name);
+                    if path.exists() {
+                        let ver = installed_version(&path)
+                            .map(|v| format!(" (v{})", v))
+                            .unwrap_or_default();
+                        println!("  ✓ {}{}", rel, ver);
+                    } else {
+                        println!("  ✗ {} (missing)", rel);
+                    }
+                }
+            }
             _ => continue,
         }
     }
@@ -2272,6 +2425,25 @@ fn write_rules_for_tool(project_dir: &Path, tool: &str, force: bool) {
                 write_rule(&agents_md, CODEX_AGENTS, force, project_dir)
             );
         }
+        "gemini" => {
+            println!(
+                "{}",
+                write_rule(&project_dir.join("GEMINI.md"), GEMINI_RULE, force, project_dir)
+            );
+            let rules_dir = project_dir.join(".gemini");
+            let pairs: &[(&str, &str)] = &[
+                ("session-lifecycle.md", GEMINI_SESSION_LIFECYCLE),
+                ("memory-hygiene.md", GEMINI_MEMORY_HYGIENE),
+                ("memory-branching-patterns.md", GEMINI_MEMORY_BRANCHING),
+                ("goal-driven-evolution.md", GEMINI_GOAL_EVOLUTION),
+            ];
+            for (name, content) in pairs {
+                println!(
+                    "{}",
+                    write_rule(&rules_dir.join(name), content, force, project_dir)
+                );
+            }
+        }
         _ => {}
     }
 }
@@ -2284,7 +2456,8 @@ fn cmd_rules(project_dir: &Path, tools: Vec<ToolName>, interactive: bool, force:
             .item(1, "Cursor", "")
             .item(2, "Claude Code", "")
             .item(3, "Codex", "")
-            .item(4, "All", "")
+            .item(4, "Gemini CLI", "")
+            .item(5, "All", "")
             .interact()
         {
             Ok(v) => v,
@@ -2298,11 +2471,13 @@ fn cmd_rules(project_dir: &Path, tools: Vec<ToolName>, interactive: bool, force:
             1 => vec!["cursor".to_string()],
             2 => vec!["claude".to_string()],
             3 => vec!["codex".to_string()],
+            4 => vec!["gemini".to_string()],
             _ => vec![
                 "kiro".to_string(),
                 "cursor".to_string(),
                 "claude".to_string(),
                 "codex".to_string(),
+                "gemini".to_string(),
             ],
         }
     } else if tools.is_empty() {
@@ -2783,4 +2958,60 @@ fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_embedding_config;
+    use memoria_service::Config;
+
+    fn test_config() -> Config {
+        Config {
+            db_url: "mysql://root:111@localhost:6001/memoria".to_string(),
+            db_name: "memoria".to_string(),
+            embedding_provider: "openai".to_string(),
+            embedding_model: "BAAI/bge-m3".to_string(),
+            embedding_dim: 1024,
+            embedding_api_key: String::new(),
+            embedding_base_url: String::new(),
+            embedding_endpoints: vec![],
+            llm_api_key: None,
+            llm_base_url: "https://api.openai.com/v1".to_string(),
+            llm_model: "gpt-4o-mini".to_string(),
+            user: "default".to_string(),
+            governance_plugin_binding: "default".to_string(),
+            governance_plugin_subject: "system".to_string(),
+            governance_plugin_dir: None,
+            instance_id: "test-instance".to_string(),
+            lock_ttl_secs: 120,
+        }
+    }
+
+    #[test]
+    fn non_local_embedding_config_is_valid() {
+        let cfg = test_config();
+        assert!(validate_embedding_config(&cfg).is_ok());
+    }
+
+    #[cfg(not(feature = "local-embedding"))]
+    #[test]
+    fn local_embedding_without_feature_fails_validation() {
+        let mut cfg = test_config();
+        cfg.embedding_provider = "local".to_string();
+
+        let err = validate_embedding_config(&cfg).expect_err("local embedding should fail");
+        assert!(
+            err.to_string().contains("local-embedding"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[cfg(feature = "local-embedding")]
+    #[test]
+    fn local_embedding_with_feature_passes_validation() {
+        let mut cfg = test_config();
+        cfg.embedding_provider = "local".to_string();
+
+        assert!(validate_embedding_config(&cfg).is_ok());
+    }
 }
