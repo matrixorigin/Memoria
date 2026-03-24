@@ -1,0 +1,62 @@
+name: Release OpenClaw npm Package
+
+# Trigger: push a tag like openclaw-v*.*.* or run manually.
+on:
+  push:
+    tags:
+      - 'openclaw-v*.*.*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to publish (e.g. 0.4.3). Leave empty to publish current package.json version.'
+        required: false
+        type: string
+
+jobs:
+  test:
+    name: Test OpenClaw Plugin
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: plugins/openclaw
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: plugins/openclaw/package-lock.json
+      - run: npm ci
+      - run: npm test
+
+  publish:
+    name: Publish to npm
+    needs: test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: plugins/openclaw
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Set version (if provided)
+        if: inputs.version != ''
+        run: npm version ${{ inputs.version }} --no-git-tag-version
+
+      - name: Publish
+        run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Get published version
+        id: pkg
+        run: echo "version=$(node -p 'require("./package.json").version')" >> "$GITHUB_OUTPUT"
+
+      - name: Summary
+        run: echo "### Published @matrixorigin/thememoria@${{ steps.pkg.outputs.version }} ✅" >> "$GITHUB_STEP_SUMMARY"
