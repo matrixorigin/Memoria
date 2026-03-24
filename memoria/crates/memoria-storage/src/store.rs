@@ -806,8 +806,11 @@ impl SqlMemoryStore {
         }
 
         // Migration: add (user_id, observed_at) index on mem_memories.
-        // Speeds up the monthly-growth-rate count in health_capacity() and the
-        // timestamp predicate in archive_stale_working().
+        // Speeds up the monthly-growth-rate count in health_capacity() which uses
+        // `observed_at >= NOW() - INTERVAL 30 DAY` (direct range comparison).
+        // Note: TIMESTAMPDIFF-wrapped predicates (e.g. archive_stale_working) cannot
+        // use a B-tree range scan regardless of the index; they are covered by the
+        // existing idx_user_active (user_id, is_active, memory_type) instead.
         let has_memories_user_observed_idx: bool = sqlx::query_scalar(
             "SELECT COUNT(*) > 0 FROM information_schema.statistics \
              WHERE table_schema = DATABASE() \
@@ -1728,22 +1731,44 @@ impl SqlMemoryStore {
 
     /// Clean up orphaned stats records (stats without corresponding memory).
     /// Runs in batches of 1,000 to limit lock pressure.
+    ///
+    /// Multi-table DELETE with LIMIT is not valid MySQL/MatrixOne syntax, so we
+    /// first SELECT the orphan IDs and then DELETE them by primary key.
     pub async fn cleanup_orphan_stats(&self) -> Result<i64, MemoriaError> {
-        const BATCH: u64 = 1000;
+        const BATCH: i64 = 1000;
         let mut total = 0i64;
         loop {
-            let result = sqlx::query(
-                "DELETE s FROM mem_memories_stats s \
+            // Step 1: collect up to BATCH orphan IDs.
+            let ids: Vec<(String,)> = sqlx::query_as(
+                "SELECT s.memory_id \
+                 FROM mem_memories_stats s \
                  LEFT JOIN mem_memories m ON s.memory_id = m.memory_id \
                  WHERE m.memory_id IS NULL \
                  LIMIT 1000",
             )
-            .execute(&self.pool)
+            .fetch_all(&self.pool)
             .await
             .map_err(db_err)?;
-            let n = result.rows_affected();
-            total += n as i64;
-            if n < BATCH {
+
+            if ids.is_empty() {
+                break;
+            }
+
+            // Step 2: delete by primary key (single-table, so LIMIT is allowed, though
+            // not needed here since the IN-list is already capped at BATCH).
+            let placeholders: Vec<&str> = ids.iter().map(|_| "?").collect();
+            let sql = format!(
+                "DELETE FROM mem_memories_stats WHERE memory_id IN ({})",
+                placeholders.join(", ")
+            );
+            let mut q = sqlx::query(&sql);
+            for (id,) in &ids {
+                q = q.bind(id);
+            }
+            let n = q.execute(&self.pool).await.map_err(db_err)?.rows_affected() as i64;
+            total += n;
+
+            if (ids.len() as i64) < BATCH {
                 break;
             }
         }
