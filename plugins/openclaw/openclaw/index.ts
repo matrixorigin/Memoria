@@ -566,7 +566,7 @@ function shouldLogOnboardingHintOnce(): boolean {
 }
 
 const plugin = {
-  id: "memory-memoria",
+  id: "thememoria",
   name: "Memory (Memoria)",
   description: "Memoria-backed long-term memory plugin for OpenClaw. Supports direct HTTP API mode (no binary) and embedded mode (local Rust CLI).",
   kind: "memory" as const,
@@ -581,7 +581,7 @@ const plugin = {
 
     if (isFirstRegister) {
       api.logger.info(
-        `memory-memoria: registered (${needsSetup ? "pending setup" : config.backend})`,
+        `thememoria: registered (${needsSetup ? "pending setup" : config.backend})`,
       );
 
       const isEnableCommand =
@@ -2278,12 +2278,12 @@ const plugin = {
         if (memories.length === 0) {
           return;
         }
-        api.logger.info(`memory-memoria: recalled ${memories.length} memories`);
+        api.logger.info(`thememoria: recalled ${memories.length} memories`);
         return {
           appendSystemContext: formatRelevantMemoriesContext(memories),
         };
       } catch (error) {
-        api.logger.warn(`memory-memoria: auto-recall failed: ${String(error)}`);
+        api.logger.warn(`thememoria: auto-recall failed: ${String(error)}`);
       }
     };
 
@@ -2316,10 +2316,10 @@ const plugin = {
             sessionId: ctx.sessionId,
           });
           if (created.length > 0) {
-            api.logger.info(`memory-memoria: observed ${created.length} new memories`);
+            api.logger.info(`thememoria: observed ${created.length} new memories`);
           }
         } catch (error) {
-          api.logger.warn(`memory-memoria: auto-observe failed: ${String(error)}`);
+          api.logger.warn(`thememoria: auto-observe failed: ${String(error)}`);
         }
       });
 
@@ -2347,34 +2347,34 @@ const plugin = {
           });
           if (created.length > 0) {
             api.logger.info(
-              `memory-memoria: observed ${created.length} new memories before reset`,
+              `thememoria: observed ${created.length} new memories before reset`,
             );
           }
         } catch (error) {
-          api.logger.warn(`memory-memoria: before_reset observe failed: ${String(error)}`);
+          api.logger.warn(`thememoria: before_reset observe failed: ${String(error)}`);
         }
       });
     }
 
     api.on("after_compaction", async () => {
       api.logger.info(
-        "memory-memoria: compaction finished; next prompt will use live Memoria recall",
+        "thememoria: compaction finished; next prompt will use live Memoria recall",
       );
     });
 
     api.registerService({
-      id: "memory-memoria",
+      id: "thememoria",
       async start() {
         try {
           const result = await client.health(config.defaultUserId);
-          api.logger.info(`memory-memoria: connected (${String(result.status ?? "ok")})`);
+          api.logger.info(`thememoria: connected (${String(result.status ?? "ok")})`);
         } catch (error) {
-          api.logger.warn(`memory-memoria: health check failed: ${String(error)}`);
+          api.logger.warn(`thememoria: health check failed: ${String(error)}`);
         }
       },
       stop() {
         client.close();
-        api.logger.info("memory-memoria: stopped");
+        api.logger.info("thememoria: stopped");
       },
     });
   },

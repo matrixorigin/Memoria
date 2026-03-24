@@ -3,7 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 
 function fail(message) {
-  console.error(`[memory-memoria] ${message}`);
+  console.error(`[thememoria] ${message}`);
   process.exit(1);
 }
 
@@ -29,7 +29,7 @@ if (modeRaw !== "cloud" && modeRaw !== "local") {
 }
 const mode = modeRaw;
 
-const pluginId = readArg("--plugin-id", "memory-memoria").trim() || "memory-memoria";
+const pluginId = readArg("--plugin-id", "thememoria").trim() || "thememoria";
 const configFile = path.resolve(
   readArg(
     "--config-file",

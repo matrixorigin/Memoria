@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PLUGIN_ID="memory-memoria"
+PLUGIN_ID="thememoria"
 DEFAULT_REPO_URL="https://github.com/matrixorigin/Memoria.git"
 DEFAULT_REPO_REF="main"
 DEFAULT_MEMORIA_VERSION="v0.1.0"
@@ -39,11 +39,11 @@ MEMORIA_TOOL_NAMES=(
 )
 
 log() {
-  printf '[memory-memoria] %s\n' "$*"
+  printf '[thememoria] %s\n' "$*"
 }
 
 fail() {
-  printf '[memory-memoria] error: %s\n' "$*" >&2
+  printf '[thememoria] error: %s\n' "$*" >&2
   exit 1
 }
 
