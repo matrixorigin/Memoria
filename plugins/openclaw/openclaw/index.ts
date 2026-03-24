@@ -556,6 +556,32 @@ function shouldShowOnboardingHint(rawPluginConfig: unknown): boolean {
 
 const ONBOARDING_HINT_ONCE_KEY = "__memory_memoria_onboarding_hint_logged__";
 
+function buildMemoriaTroubleshootingHint(error: unknown): string[] {
+  const message = error instanceof Error ? error.message : String(error);
+  const lower = message.toLowerCase();
+  const hints: string[] = [];
+
+  if (lower.includes("502") || lower.includes("bad gateway") || lower.includes("proxy")) {
+    hints.push(
+      "If you are testing a local API URL (127.0.0.1/localhost), bypass host proxies first: NO_PROXY=127.0.0.1,localhost",
+    );
+  }
+
+  if (lower.includes("401") || lower.includes("unauthorized") || lower.includes("invalid token")) {
+    hints.push("Check the Memoria API key and API URL, then rerun: openclaw memoria setup --mode cloud ...");
+  }
+
+  if (lower.includes("timed out") || lower.includes("econnrefused") || lower.includes("connect")) {
+    hints.push("Verify the backend is reachable, then run: openclaw memoria health");
+  }
+
+  if (hints.length === 0) {
+    hints.push("Run `openclaw memoria health` after verifying your API URL / API key or MatrixOne DSN.");
+  }
+
+  return hints;
+}
+
 function shouldLogOnboardingHintOnce(): boolean {
   const state = globalThis as Record<string, unknown>;
   if (state[ONBOARDING_HINT_ONCE_KEY] === true) {
@@ -589,16 +615,16 @@ const plugin = {
         process.argv.some((arg) => arg === "plugins");
       if (needsSetup && isEnableCommand) {
         api.logger.info(
-          "🧠 Memoria next step (Cloud, recommended): openclaw memoria setup --mode cloud --api-url <MEMORIA_API_URL> --api-key <MEMORIA_API_KEY> --install-memoria",
+          "🧠 Get started (cloud, recommended): openclaw memoria setup --mode cloud --api-url <MEMORIA_API_URL> --api-key <MEMORIA_API_KEY> --install-memoria",
         );
         api.logger.info(
           "🧩 Local quick start: openclaw memoria setup --mode local --install-memoria --embedding-api-key <EMBEDDING_API_KEY>",
         );
         api.logger.info(
-          "📘 More options: openclaw memoria setup --help",
+          "🧪 Then verify connectivity: openclaw memoria health",
         );
         api.logger.info(
-          "🧪 Verify with: openclaw memoria health",
+          "📘 More options and troubleshooting: openclaw memoria setup --help",
         );
       }
     }
@@ -1858,16 +1884,16 @@ const plugin = {
           if (mode === "cloud") {
             if (!apiUrl || !apiKey) {
               throw new Error(
-                "cloud mode requires api-url and api-key. Example: openclaw memoria setup --mode cloud --api-url <MEMORIA_API_URL> --api-key <MEMORIA_API_KEY>",
+                "cloud mode requires both --api-url and --api-key. Next step: openclaw memoria setup --mode cloud --api-url <MEMORIA_API_URL> --api-key <MEMORIA_API_KEY> --install-memoria",
               );
             }
           } else if (!dbUrl) {
             throw new Error(
-              "local mode requires db-url. Example: openclaw memoria setup --mode local --db-url <MATRIXONE_DSN>",
+              "local mode requires --db-url. Next step: openclaw memoria setup --mode local --db-url <MATRIXONE_DSN>",
             );
           } else if (embeddingProvider !== "local" && !embeddingApiKey) {
             throw new Error(
-              "local mode requires embedding API key when embedding-provider is not 'local'. Quick start: openclaw memoria setup --mode local --install-memoria --embedding-api-key <EMBEDDING_API_KEY>",
+              "local mode requires --embedding-api-key when --embedding-provider is not 'local'. Quick start: openclaw memoria setup --mode local --install-memoria --embedding-api-key <EMBEDDING_API_KEY>",
             );
           }
 
@@ -1967,12 +1993,23 @@ const plugin = {
           .option("--user-id <user>", "Explicit Memoria user_id", config.defaultUserId)
           .action(withCliClient(async (opts) => {
             const userId = resolveCliUserId(opts.userId);
-            const result = await client.health(userId);
-            printJson({
-              userId,
-              backend: config.backend,
-              ...(asRecord(result) ?? {}),
-            });
+            try {
+              const result = await client.health(userId);
+              printJson({
+                userId,
+                backend: config.backend,
+                ...(asRecord(result) ?? {}),
+              });
+            } catch (error) {
+              printJson({
+                ok: false,
+                userId,
+                backend: config.backend,
+                error: error instanceof Error ? error.message : String(error),
+                next: buildMemoriaTroubleshootingHint(error),
+              });
+              process.exitCode = 1;
+            }
           }));
 
         memoria
@@ -2217,12 +2254,23 @@ const plugin = {
           .option("--json", "Ignored compatibility flag; output is already JSON", true)
           .action(withCliClient(async (opts) => {
             const userId = resolveCliUserId(opts.userId);
-            const result = await client.health(userId);
-            printJson({
-              userId,
-              backend: config.backend,
-              ...(asRecord(result) ?? {}),
-            });
+            try {
+              const result = await client.health(userId);
+              printJson({
+                userId,
+                backend: config.backend,
+                ...(asRecord(result) ?? {}),
+              });
+            } catch (error) {
+              printJson({
+                ok: false,
+                userId,
+                backend: config.backend,
+                error: error instanceof Error ? error.message : String(error),
+                next: buildMemoriaTroubleshootingHint(error),
+              });
+              process.exitCode = 1;
+            }
           }));
       },
       { commands: [...CLI_COMMAND_NAMES] },

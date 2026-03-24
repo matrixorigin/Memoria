@@ -45,6 +45,8 @@ Assume OpenClaw is already installed and healthy.
 
 Cloud is the default path for new users.
 
+Canonical API health endpoint: `GET /health`.
+
 #### Developer Flow
 
 ```bash
@@ -92,6 +94,13 @@ Success standard:
 ```bash
 openclaw memoria health
 # must include: "status": "ok"
+```
+
+If you are checking a local API URL such as `http://127.0.0.1:8100` or `http://localhost:8100`, bypass host proxies first. A dead local proxy can make a healthy Memoria API look broken.
+
+```bash
+NO_PROXY=127.0.0.1,localhost openclaw memoria health
+# or temporarily unset proxy env vars before testing localhost
 ```
 
 #### Agent Prompt (Cloud)

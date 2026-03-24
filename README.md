@@ -97,19 +97,6 @@ This creates MCP config + steering rules for your AI tool (Kiro, Cursor, Claude,
 Use the native OpenClaw plugin guide: [OpenClaw Plugin Setup](plugins/openclaw/README.md).
 
 ```bash
-openclaw plugins install @matrixorigin/memory-memoria
-openclaw plugins enable memory-memoria
-openclaw memoria install
-```
-
-Design note:
-- [Role-Scoped Memory Spaces with Inheritance](docs/role-scoped-memory-spaces.md)
-
-### 🦞 OpenClaw Plugin (Already Using OpenClaw?)
-
-Use the native OpenClaw plugin guide: [OpenClaw Plugin Setup](plugins/openclaw/README.md).
-
-```bash
 # ensure memoria CLI exists (required as MCP bridge)
 command -v memoria >/dev/null || curl -sSL https://raw.githubusercontent.com/matrixorigin/Memoria/main/scripts/install.sh | bash -s -- -y -d ~/.local/bin
 
@@ -127,6 +114,9 @@ openclaw plugins enable memory-memoria
 openclaw memoria setup --mode cloud --api-url <MEMORIA_API_URL> --api-key <MEMORIA_API_KEY> --install-memoria
 openclaw memoria health
 ```
+
+Design note:
+- [Role-Scoped Memory Spaces with Inheritance](docs/role-scoped-memory-spaces.md)
 
 ### 4. Restart & verify
 
