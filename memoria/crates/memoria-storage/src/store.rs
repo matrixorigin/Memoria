@@ -784,6 +784,48 @@ impl SqlMemoryStore {
             .await;
         }
 
+        // Migration: add composite index (user_id, memory_id) on mem_retrieval_feedback.
+        // The existing idx_feedback_user(user_id, created_at) does not cover the JOIN on
+        // memory_id used by get_feedback_by_tier(), causing a full-table scan on feedback.
+        let has_feedback_memory_user_idx: bool = sqlx::query_scalar(
+            "SELECT COUNT(*) > 0 FROM information_schema.statistics \
+             WHERE table_schema = DATABASE() \
+               AND table_name = 'mem_retrieval_feedback' \
+               AND index_name = 'idx_feedback_memory_user'",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .unwrap_or(false);
+        if !has_feedback_memory_user_idx {
+            let _ = sqlx::query(
+                "ALTER TABLE mem_retrieval_feedback \
+                 ADD INDEX idx_feedback_memory_user (user_id, memory_id)",
+            )
+            .execute(&self.pool)
+            .await;
+        }
+
+        // Migration: add (user_id, observed_at) index on mem_memories.
+        // Speeds up the monthly-growth-rate count in health_capacity() and the
+        // timestamp predicate in archive_stale_working().
+        let has_memories_user_observed_idx: bool = sqlx::query_scalar(
+            "SELECT COUNT(*) > 0 FROM information_schema.statistics \
+             WHERE table_schema = DATABASE() \
+               AND table_name = 'mem_memories' \
+               AND index_name = 'idx_memories_user_observed'",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .unwrap_or(false);
+        if !has_memories_user_observed_idx {
+            let _ = sqlx::query(
+                "ALTER TABLE mem_memories \
+                 ADD INDEX idx_memories_user_observed (user_id, observed_at)",
+            )
+            .execute(&self.pool)
+            .await;
+        }
+
         Ok(())
     }
 
@@ -1376,12 +1418,16 @@ impl SqlMemoryStore {
         window_days: i64,
         max_pairs: usize,
     ) -> Result<i64, MemoriaError> {
+        // Cap the fetch at 5,000 rows to bound memory usage: each embedding can be
+        // several KB, so loading unbounded rows risks exhausting heap for active users.
+        // The max_pairs limit already caps pair-comparison work in the loop below.
         let rows: Vec<(String, String, chrono::NaiveDateTime, String)> = sqlx::query_as(
             "SELECT memory_id, memory_type, observed_at, embedding \
              FROM mem_memories \
              WHERE user_id = ? AND is_active = 1 AND embedding IS NOT NULL \
                AND TIMESTAMPDIFF(DAY, observed_at, NOW()) <= ? \
-             ORDER BY memory_type, observed_at DESC",
+             ORDER BY memory_type, observed_at DESC \
+             LIMIT 5000",
         )
         .bind(user_id)
         .bind(window_days)
@@ -1681,16 +1727,27 @@ impl SqlMemoryStore {
     }
 
     /// Clean up orphaned stats records (stats without corresponding memory).
+    /// Runs in batches of 1,000 to limit lock pressure.
     pub async fn cleanup_orphan_stats(&self) -> Result<i64, MemoriaError> {
-        let result = sqlx::query(
-            "DELETE s FROM mem_memories_stats s \
-             LEFT JOIN mem_memories m ON s.memory_id = m.memory_id \
-             WHERE m.memory_id IS NULL",
-        )
-        .execute(&self.pool)
-        .await
-        .map_err(db_err)?;
-        Ok(result.rows_affected() as i64)
+        const BATCH: u64 = 1000;
+        let mut total = 0i64;
+        loop {
+            let result = sqlx::query(
+                "DELETE s FROM mem_memories_stats s \
+                 LEFT JOIN mem_memories m ON s.memory_id = m.memory_id \
+                 WHERE m.memory_id IS NULL \
+                 LIMIT 1000",
+            )
+            .execute(&self.pool)
+            .await
+            .map_err(db_err)?;
+            let n = result.rows_affected();
+            total += n as i64;
+            if n < BATCH {
+                break;
+            }
+        }
+        Ok(total)
     }
 
     /// Delete old audit-log rows older than `retain_days` days, in batches to avoid lock pressure.
