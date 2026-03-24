@@ -102,6 +102,9 @@ openclaw plugins enable memory-memoria
 openclaw memoria install
 ```
 
+Design note:
+- [Role-Scoped Memory Spaces with Inheritance](docs/role-scoped-memory-spaces.md)
+
 ### 🦞 OpenClaw Plugin (Already Using OpenClaw?)
 
 Use the native OpenClaw plugin guide: [OpenClaw Plugin Setup](plugins/openclaw/README.md).
