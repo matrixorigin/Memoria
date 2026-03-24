@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 
@@ -21,6 +22,33 @@ function asObject(value) {
 
 function normalizeUrl(value) {
   return value.trim().replace(/\/+$/, "");
+}
+
+function resolveExecutable(command) {
+  if (!command) {
+    return null;
+  }
+  if (command.includes("/") || command.includes("\\")) {
+    return fs.existsSync(command) ? path.resolve(command) : null;
+  }
+  const result = spawnSync("/usr/bin/env", ["which", command], {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "ignore"],
+  });
+  if (result.status !== 0 || typeof result.stdout !== "string") {
+    return null;
+  }
+  const resolved = result.stdout.trim().split(/\r?\n/).find(Boolean);
+  return resolved ? path.resolve(resolved) : null;
+}
+
+function binaryLacksLocalEmbeddingSupport(executablePath) {
+  try {
+    const content = fs.readFileSync(executablePath);
+    return content.includes(Buffer.from("compiled without local-embedding feature", "utf8"));
+  } catch {
+    return false;
+  }
 }
 
 const modeRaw = readArg("--mode", "cloud").trim().toLowerCase();
@@ -104,6 +132,24 @@ if (mode === "cloud") {
 
   if (embeddingProvider !== "local" && !embeddingApiKey) {
     fail("--embedding-api-key required for mode=local when embedding-provider is not 'local'");
+  }
+
+  const effectiveMemoriaExecutable =
+    memoriaExecutable ||
+    (typeof pluginConfig.memoriaExecutable === "string" ? pluginConfig.memoriaExecutable.trim() : "") ||
+    "memoria";
+  if (embeddingProvider === "local") {
+    const resolvedExecutable = resolveExecutable(effectiveMemoriaExecutable);
+    if (!resolvedExecutable) {
+      fail(
+        `embedding-provider=local requires a usable memoria executable, but '${effectiveMemoriaExecutable}' could not be resolved. Pass --memoria-executable <path> or install memoria first.`,
+      );
+    }
+    if (binaryLacksLocalEmbeddingSupport(resolvedExecutable)) {
+      fail(
+        `embedding-provider=local requires a memoria binary built with local-embedding support. Resolved '${resolvedExecutable}', but this binary was built without that feature. Use a remote embedding provider or install/rebuild a local-embedding-enabled memoria binary.`,
+      );
+    }
   }
 
   pluginConfig.backend = "embedded";

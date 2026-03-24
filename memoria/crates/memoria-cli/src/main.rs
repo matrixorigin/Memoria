@@ -826,7 +826,7 @@ fn cmd_plugin_dev_keygen(dir: &Path) -> Result<()> {
 fn build_embedder(
     cfg: &memoria_service::Config,
 ) -> Option<Arc<dyn memoria_core::interfaces::EmbeddingProvider>> {
-    use memoria_embedding::HttpEmbedder;
+    use memoria_embedding::{HttpEmbedder, RoundRobinEmbedder};
 
     if cfg.embedding_provider == "mock" {
         tracing::info!(dim = cfg.embedding_dim, "using mock embedder");
@@ -837,13 +837,35 @@ fn build_embedder(
     }
 
     if cfg.has_embedding() {
-        Some(Arc::new(HttpEmbedder::new(
-            &cfg.embedding_base_url,
-            &cfg.embedding_api_key,
-            &cfg.embedding_model,
-            cfg.embedding_dim,
-        ))
-            as Arc<dyn memoria_core::interfaces::EmbeddingProvider>)
+        let endpoints = cfg.resolved_embedding_endpoints();
+        if endpoints.len() > 1 {
+            tracing::info!(
+                count = endpoints.len(),
+                model = %cfg.embedding_model,
+                "using round-robin HTTP embedder"
+            );
+            Some(
+                Arc::new(RoundRobinEmbedder::new(
+                    endpoints.into_iter().map(|e| (e.url, e.api_key)).collect(),
+                    &cfg.embedding_model,
+                    cfg.embedding_dim,
+                )) as Arc<dyn memoria_core::interfaces::EmbeddingProvider>,
+            )
+        } else {
+            let ep = endpoints
+                .into_iter()
+                .next()
+                .expect("has_embedding() guarantees at least one endpoint");
+            tracing::info!(url = %ep.url, model = %cfg.embedding_model, "using single HTTP embedder");
+            Some(
+                Arc::new(HttpEmbedder::new(
+                    ep.url,
+                    ep.api_key,
+                    &cfg.embedding_model,
+                    cfg.embedding_dim,
+                )) as Arc<dyn memoria_core::interfaces::EmbeddingProvider>,
+            )
+        }
     } else if cfg.embedding_provider == "local" {
         #[cfg(feature = "local-embedding")]
         {
@@ -859,6 +881,10 @@ fn build_embedder(
             None
         }
     } else {
+        tracing::warn!(
+            provider = %cfg.embedding_provider,
+            "no embedding backend initialised — check EMBEDDING_BASE_URL / EMBEDDING_ENDPOINTS"
+        );
         None
     }
 }

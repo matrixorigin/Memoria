@@ -1,20 +1,32 @@
-/// Unified configuration for Memoria MCP server.
-/// All settings read from environment variables (matching Python's config.py).
-///
-/// Environment variables (no prefix, matching README):
-///   DATABASE_URL          — full MySQL URL
-///   EMBEDDING_PROVIDER    — "openai" | "local" | "mock" (default: "mock")
-///   EMBEDDING_MODEL       — e.g. "BAAI/bge-m3"
-///   EMBEDDING_DIM         — integer, e.g. 1024
-///   EMBEDDING_API_KEY     — API key for embedding service
-///   EMBEDDING_BASE_URL    — base URL for embedding service
-///   LLM_API_KEY           — OpenAI-compatible API key (optional)
-///   LLM_BASE_URL          — LLM base URL (default: https://api.openai.com/v1)
-///   LLM_MODEL             — LLM model name (default: gpt-4o-mini)
-///   MEMORIA_USER          — default user ID (default: "default")
-///   MEMORIA_DB_NAME       — database name for git-for-data (default: "memoria")
-///   MEMORIA_GOVERNANCE_PLUGIN_BINDING — shared governance plugin binding (default: "default")
-///   MEMORIA_GOVERNANCE_PLUGIN_SUBJECT — deterministic subject key for shared binding selection
+//! Unified configuration for Memoria MCP server.
+//! All settings read from environment variables (matching Python's config.py).
+//!
+//! Environment variables (no prefix, matching README):
+//!   DATABASE_URL              — full MySQL URL
+//!   EMBEDDING_PROVIDER        — "openai" | "local" | "mock" (default: "mock")
+//!   EMBEDDING_MODEL           — e.g. "BAAI/bge-m3"
+//!   EMBEDDING_DIM             — integer, e.g. 1024
+//!   EMBEDDING_API_KEY         — API key for embedding service (single-backend)
+//!   EMBEDDING_BASE_URL        — base URL for embedding service (single-backend)
+//!   EMBEDDING_ENDPOINTS       — JSON array for multi-backend round-robin, e.g.
+//!                               `[{"url":"https://api1.example.com/v1","api_key":"sk-1"},
+//!                                 {"url":"https://api2.example.com/v1","api_key":"sk-2"}]`
+//!                               When set, supersedes EMBEDDING_BASE_URL/EMBEDDING_API_KEY.
+//!                               All entries must serve the same EMBEDDING_MODEL.
+//!   LLM_API_KEY               — OpenAI-compatible API key (optional)
+//!   LLM_BASE_URL              — LLM base URL (default: https://api.openai.com/v1)
+//!   LLM_MODEL                 — LLM model name (default: gpt-4o-mini)
+//!   MEMORIA_USER              — default user ID (default: "default")
+//!   MEMORIA_DB_NAME           — database name for git-for-data (default: "memoria")
+//!   MEMORIA_GOVERNANCE_PLUGIN_BINDING — shared governance plugin binding (default: "default")
+//!   MEMORIA_GOVERNANCE_PLUGIN_SUBJECT — deterministic subject key for shared binding selection
+
+/// A single embedding backend endpoint used for multi-backend round-robin.
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct EmbeddingEndpoint {
+    pub url: String,
+    pub api_key: String,
+}
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -26,8 +38,13 @@ pub struct Config {
     pub embedding_provider: String,
     pub embedding_model: String,
     pub embedding_dim: usize,
+    /// Single-backend API key — used when `embedding_endpoints` is empty.
     pub embedding_api_key: String,
+    /// Single-backend base URL — used when `embedding_endpoints` is empty.
     pub embedding_base_url: String,
+    /// Multi-backend round-robin endpoints (parsed from `EMBEDDING_ENDPOINTS`).
+    /// When non-empty, supersedes `embedding_base_url` / `embedding_api_key`.
+    pub embedding_endpoints: Vec<EmbeddingEndpoint>,
 
     // LLM (optional)
     pub llm_api_key: Option<String>,
@@ -78,6 +95,22 @@ impl Config {
             embedding_dim,
             embedding_api_key: std::env::var("EMBEDDING_API_KEY").unwrap_or_default(),
             embedding_base_url: std::env::var("EMBEDDING_BASE_URL").unwrap_or_default(),
+            embedding_endpoints: std::env::var("EMBEDDING_ENDPOINTS")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .and_then(|s| {
+                    serde_json::from_str::<Vec<EmbeddingEndpoint>>(&s)
+                        .map_err(|e| {
+                            tracing::warn!(
+                                error = %e,
+                                raw = %s,
+                                "EMBEDDING_ENDPOINTS JSON is malformed — ignoring; \
+                                 no HTTP embedder will be initialised"
+                            );
+                        })
+                        .ok()
+                })
+                .unwrap_or_default(),
             llm_api_key,
             llm_base_url: std::env::var("LLM_BASE_URL")
                 .unwrap_or_else(|_| "https://api.openai.com/v1".to_string()),
@@ -120,7 +153,27 @@ impl Config {
         if self.embedding_provider == "local" {
             return false; // local is handled separately, not via HttpEmbedder
         }
-        self.embedding_provider != "mock" && !self.embedding_base_url.is_empty()
+        if self.embedding_provider == "mock" {
+            return false;
+        }
+        !self.embedding_endpoints.is_empty() || !self.embedding_base_url.is_empty()
+    }
+
+    /// Returns the effective list of HTTP embedding endpoints.
+    ///
+    /// `EMBEDDING_ENDPOINTS` (multi-backend) takes precedence over the single
+    /// `EMBEDDING_BASE_URL` / `EMBEDDING_API_KEY` pair for backward compatibility.
+    pub fn resolved_embedding_endpoints(&self) -> Vec<EmbeddingEndpoint> {
+        if !self.embedding_endpoints.is_empty() {
+            return self.embedding_endpoints.clone();
+        }
+        if !self.embedding_base_url.is_empty() {
+            return vec![EmbeddingEndpoint {
+                url: self.embedding_base_url.clone(),
+                api_key: self.embedding_api_key.clone(),
+            }];
+        }
+        vec![]
     }
 
     /// Returns true if a governance plugin binding is configured.
@@ -160,5 +213,206 @@ mod tests {
             Some(value) => std::env::set_var("MEMORIA_GOVERNANCE_PLUGIN_SUBJECT", value),
             None => std::env::remove_var("MEMORIA_GOVERNANCE_PLUGIN_SUBJECT"),
         }
+    }
+
+    // ── EmbeddingEndpoint / resolved_embedding_endpoints tests ───────────────
+
+    fn with_env<F: FnOnce()>(vars: &[(&str, Option<&str>)], f: F) {
+        let _lock = ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()); // recover from a previously poisoned lock
+
+        // RAII guard: restores env vars in Drop, even if the closure panics.
+        struct EnvGuard(Vec<(String, Option<std::ffi::OsString>)>);
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                for (k, old) in &self.0 {
+                    match old {
+                        Some(value) => std::env::set_var(k, value),
+                        None => std::env::remove_var(k),
+                    }
+                }
+            }
+        }
+
+        let _restore = EnvGuard(
+            vars.iter()
+                .map(|(k, v)| {
+                    let old = std::env::var_os(k);
+                    match v {
+                        Some(val) => std::env::set_var(k, val),
+                        None => std::env::remove_var(k),
+                    }
+                    (k.to_string(), old)
+                })
+                .collect(),
+        );
+
+        f();
+    }
+
+    #[test]
+    fn embedding_endpoint_json_roundtrips() {
+        let ep = EmbeddingEndpoint {
+            url: "https://api.example.com/v1".into(),
+            api_key: "sk-test".into(),
+        };
+        let json = serde_json::to_string(&ep).unwrap();
+        let decoded: EmbeddingEndpoint = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.url, ep.url);
+        assert_eq!(decoded.api_key, ep.api_key);
+    }
+
+    #[test]
+    fn resolved_endpoints_parses_multi_json() {
+        with_env(
+            &[
+                ("EMBEDDING_PROVIDER", Some("openai")),
+                ("EMBEDDING_ENDPOINTS", Some(r#"[{"url":"https://a.com/v1","api_key":"key-a"},{"url":"https://b.com/v1","api_key":"key-b"}]"#)),
+                ("EMBEDDING_BASE_URL", None),
+                ("EMBEDDING_API_KEY", None),
+            ],
+            || {
+                let cfg = Config::from_env();
+                let eps = cfg.resolved_embedding_endpoints();
+                assert_eq!(eps.len(), 2);
+                assert_eq!(eps[0].url, "https://a.com/v1");
+                assert_eq!(eps[0].api_key, "key-a");
+                assert_eq!(eps[1].url, "https://b.com/v1");
+                assert_eq!(eps[1].api_key, "key-b");
+            },
+        );
+    }
+
+    #[test]
+    fn resolved_endpoints_multi_supersedes_single() {
+        with_env(
+            &[
+                ("EMBEDDING_PROVIDER", Some("openai")),
+                ("EMBEDDING_ENDPOINTS", Some(r#"[{"url":"https://multi.com/v1","api_key":"mk"}]"#)),
+                ("EMBEDDING_BASE_URL", Some("https://single.com/v1")),
+                ("EMBEDDING_API_KEY", Some("sk-single")),
+            ],
+            || {
+                let cfg = Config::from_env();
+                let eps = cfg.resolved_embedding_endpoints();
+                // EMBEDDING_ENDPOINTS wins
+                assert_eq!(eps.len(), 1);
+                assert_eq!(eps[0].url, "https://multi.com/v1");
+            },
+        );
+    }
+
+    #[test]
+    fn resolved_endpoints_falls_back_to_single_base_url() {
+        with_env(
+            &[
+                ("EMBEDDING_PROVIDER", Some("openai")),
+                ("EMBEDDING_ENDPOINTS", None),
+                ("EMBEDDING_BASE_URL", Some("https://single.com/v1")),
+                ("EMBEDDING_API_KEY", Some("sk-fallback")),
+            ],
+            || {
+                let cfg = Config::from_env();
+                let eps = cfg.resolved_embedding_endpoints();
+                assert_eq!(eps.len(), 1);
+                assert_eq!(eps[0].url, "https://single.com/v1");
+                assert_eq!(eps[0].api_key, "sk-fallback");
+            },
+        );
+    }
+
+    #[test]
+    fn resolved_endpoints_empty_when_nothing_configured() {
+        with_env(
+            &[
+                ("EMBEDDING_PROVIDER", Some("openai")),
+                ("EMBEDDING_ENDPOINTS", None),
+                ("EMBEDDING_BASE_URL", None),
+                ("EMBEDDING_API_KEY", None),
+            ],
+            || {
+                let cfg = Config::from_env();
+                assert!(cfg.resolved_embedding_endpoints().is_empty());
+            },
+        );
+    }
+
+    #[test]
+    fn has_embedding_true_with_multi_endpoints() {
+        with_env(
+            &[
+                ("EMBEDDING_PROVIDER", Some("openai")),
+                ("EMBEDDING_ENDPOINTS", Some(r#"[{"url":"https://a.com/v1","api_key":"k"}]"#)),
+                ("EMBEDDING_BASE_URL", None),
+            ],
+            || {
+                let cfg = Config::from_env();
+                assert!(cfg.has_embedding());
+            },
+        );
+    }
+
+    #[test]
+    fn has_embedding_true_with_base_url_only() {
+        with_env(
+            &[
+                ("EMBEDDING_PROVIDER", Some("openai")),
+                ("EMBEDDING_ENDPOINTS", None),
+                ("EMBEDDING_BASE_URL", Some("https://single.com/v1")),
+            ],
+            || {
+                let cfg = Config::from_env();
+                assert!(cfg.has_embedding());
+            },
+        );
+    }
+
+    #[test]
+    fn has_embedding_false_for_mock_provider() {
+        with_env(
+            &[
+                ("EMBEDDING_PROVIDER", Some("mock")),
+                ("EMBEDDING_ENDPOINTS", Some(r#"[{"url":"https://a.com/v1","api_key":"k"}]"#)),
+                ("EMBEDDING_BASE_URL", Some("https://single.com/v1")),
+            ],
+            || {
+                let cfg = Config::from_env();
+                // mock provider always returns false regardless of endpoints
+                assert!(!cfg.has_embedding());
+            },
+        );
+    }
+
+    #[test]
+    fn has_embedding_false_for_local_provider() {
+        with_env(
+            &[
+                ("EMBEDDING_PROVIDER", Some("local")),
+                ("EMBEDDING_ENDPOINTS", Some(r#"[{"url":"https://a.com/v1","api_key":"k"}]"#)),
+            ],
+            || {
+                let cfg = Config::from_env();
+                // local provider is handled separately, not via HttpEmbedder
+                assert!(!cfg.has_embedding());
+            },
+        );
+    }
+
+    #[test]
+    fn invalid_json_in_endpoints_falls_back_to_empty() {
+        with_env(
+            &[
+                ("EMBEDDING_PROVIDER", Some("openai")),
+                ("EMBEDDING_ENDPOINTS", Some("not-valid-json")),
+                ("EMBEDDING_BASE_URL", None),
+            ],
+            || {
+                let cfg = Config::from_env();
+                // Malformed JSON → silently ignored → empty endpoints
+                assert!(cfg.embedding_endpoints.is_empty());
+            },
+        );
     }
 }

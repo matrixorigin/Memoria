@@ -37,8 +37,9 @@ Services: API on `:8100`, MatrixOne on `:6001`. Verify: `curl http://localhost:8
 |----------|---------|-------------|
 | `MEMORIA_EMBEDDING_PROVIDER` | `local` | `local` or `openai` |
 | `MEMORIA_EMBEDDING_MODEL` | `all-MiniLM-L6-v2` | Model name |
-| `MEMORIA_EMBEDDING_API_KEY` | — | Required if provider is `openai` |
-| `MEMORIA_EMBEDDING_BASE_URL` | — | Custom endpoint (OpenAI-compatible) |
+| `MEMORIA_EMBEDDING_API_KEY` | — | Required if provider is `openai` (single-backend) |
+| `MEMORIA_EMBEDDING_BASE_URL` | — | Custom endpoint, OpenAI-compatible (single-backend) |
+| `MEMORIA_EMBEDDING_ENDPOINTS` | — | JSON array for multi-backend round-robin. When set, supersedes `BASE_URL`/`API_KEY`. Format: `[{"url":"https://api1.example.com/v1","api_key":"sk-1"},{"url":"https://api2.example.com/v1","api_key":"sk-2"}]`. All endpoints must serve the same model. Requests rotate round-robin; failed/rate-limited endpoints are skipped automatically. |
 | `MEMORIA_EMBEDDING_DIM` | `0` (auto) | Embedding dimension |
 
 ### Distributed
@@ -134,6 +135,9 @@ spec:
                 secretKeyRef:
                   name: memoria-secrets
                   key: embedding-api-key
+            # Optional: multi-backend round-robin (supersedes API_KEY + MODEL single-backend)
+            # - name: MEMORIA_EMBEDDING_ENDPOINTS
+            #   value: '[{"url":"https://api1.example.com/v1","api_key":"sk-1"},{"url":"https://api2.example.com/v1","api_key":"sk-2"}]'
             - name: MEMORIA_EMBEDDING_MODEL
               value: "BAAI/bge-m3"
             - name: MEMORIA_EMBEDDING_DIM

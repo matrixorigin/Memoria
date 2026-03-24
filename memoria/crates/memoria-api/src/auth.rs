@@ -248,10 +248,13 @@ impl FromRequestParts<AppState> for AuthUser {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
-        // Extract optional tool name for usage tracking (skip empty values).
+        // Extract optional tool/agent name for usage tracking (skip empty values).
+        // The MCP client sends X-Memoria-Tool with the agent name (cursor/kiro/claude/codex).
+        // Fall back to X-Tool-Name for backwards compatibility with older clients.
         let tool_name = parts
             .headers
-            .get("X-Tool-Name")
+            .get("X-Memoria-Tool")
+            .or_else(|| parts.headers.get("X-Tool-Name"))
             .and_then(|v| v.to_str().ok())
             .filter(|v| !v.is_empty())
             .map(String::from);
