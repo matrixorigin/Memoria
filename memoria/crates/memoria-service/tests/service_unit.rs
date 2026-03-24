@@ -141,7 +141,7 @@ async fn test_correct() {
         )
         .await
         .unwrap();
-    let corrected = svc.correct(&m.memory_id, "new content").await.unwrap();
+    let corrected = svc.correct("u1", &m.memory_id, "new content").await.unwrap();
     assert_eq!(corrected.content, "new content");
     assert!(corrected.embedding.is_some());
     println!("✅ correct");

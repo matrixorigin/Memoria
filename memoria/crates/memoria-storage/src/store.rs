@@ -2492,6 +2492,46 @@ impl SqlMemoryStore {
     }
 
     /// Mark a memory as superseded by another.
+    /// Branch-aware soft-delete: deactivate a memory in the given table.
+    pub async fn soft_delete_from(
+        &self,
+        table: &str,
+        memory_id: &str,
+    ) -> Result<(), MemoriaError> {
+        let now = Utc::now().naive_utc();
+        sqlx::query(&format!(
+            "UPDATE {table} SET is_active = 0, updated_at = ? WHERE memory_id = ?"
+        ))
+        .bind(now)
+        .bind(memory_id)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// Branch-aware get: fetch an active memory from the given table.
+    pub async fn get_from(
+        &self,
+        table: &str,
+        memory_id: &str,
+    ) -> Result<Option<Memory>, MemoriaError> {
+        let row = sqlx::query(&format!(
+            "SELECT memory_id, user_id, memory_type, content, \
+             embedding AS emb_str, session_id, \
+             CAST(source_event_ids AS CHAR) AS src_ids, \
+             CAST(extra_metadata AS CHAR) AS extra_meta, \
+             is_active, superseded_by, trust_tier, initial_confidence, \
+             observed_at, created_at, updated_at \
+             FROM {table} WHERE memory_id = ? AND is_active = 1"
+        ))
+        .bind(memory_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+        row.map(|r| row_to_memory(&r)).transpose()
+    }
+
     pub async fn supersede_memory(
         &self,
         table: &str,

@@ -1,10 +1,14 @@
 use async_trait::async_trait;
 use memoria_core::{interfaces::EmbeddingProvider, MemoriaError};
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Semaphore;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_RETRIES: u32 = 2;
+const DEFAULT_MAX_CONCURRENT: usize = 32;
+const DEFAULT_SEMAPHORE_TIMEOUT_SECS: u64 = 5;
 
 /// HTTP-based embedding client — OpenAI-compatible API.
 pub struct HttpEmbedder {
@@ -13,6 +17,10 @@ pub struct HttpEmbedder {
     api_key: String,
     model: String,
     dimension: usize,
+    /// Semaphore to limit concurrent embedding requests
+    semaphore: Arc<Semaphore>,
+    /// Timeout for acquiring a semaphore permit
+    semaphore_timeout: Duration,
 }
 
 #[derive(Serialize)]
@@ -45,6 +53,18 @@ impl HttpEmbedder {
         model: impl Into<String>,
         dimension: usize,
     ) -> Self {
+        let max_concurrent: usize = std::env::var("EMBED_MAX_CONCURRENT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(DEFAULT_MAX_CONCURRENT)
+            .clamp(1, 256);
+        let semaphore_timeout = Duration::from_secs(
+            std::env::var("EMBED_SEMAPHORE_TIMEOUT_SECS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(DEFAULT_SEMAPHORE_TIMEOUT_SECS)
+                .clamp(1, 120),
+        );
         let client = reqwest::Client::builder()
             .timeout(REQUEST_TIMEOUT)
             .build()
@@ -55,6 +75,8 @@ impl HttpEmbedder {
             api_key: api_key.into(),
             model: model.into(),
             dimension,
+            semaphore: Arc::new(Semaphore::new(max_concurrent)),
+            semaphore_timeout,
         }
     }
 }
@@ -62,6 +84,10 @@ impl HttpEmbedder {
 impl HttpEmbedder {
     /// Send an embedding request with retry on transient errors.
     async fn post_embed(&self, body: &EmbedRequest<'_>) -> Result<EmbedResponse, MemoriaError> {
+        let _permit = tokio::time::timeout(self.semaphore_timeout, self.semaphore.acquire())
+            .await
+            .map_err(|_| MemoriaError::Embedding("embedding concurrency limit timeout".to_string()))?
+            .map_err(|_| MemoriaError::Embedding("embedding semaphore closed".to_string()))?;
         let url = format!("{}/embeddings", self.base_url.trim_end_matches('/'));
         let mut last_err = String::new();
         for attempt in 0..=MAX_RETRIES {

@@ -980,3 +980,162 @@ async fn test_batch_upsert_entity_links_multiple_memories() {
     assert_eq!(rows.len(), 2, "entity should be linked to 2 memories");
     println!("✅ batch_upsert_memory_entity_links: one entity linked to multiple memories");
 }
+
+// ── batch_upsert_entities tests ──────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_batch_upsert_entities_empty() {
+    let (store, uid) = setup_graph().await;
+    let result = store.batch_upsert_entities(&uid, &[]).await.unwrap();
+    assert!(result.is_empty());
+    println!("✅ batch_upsert_entities: empty input OK");
+}
+
+#[tokio::test]
+async fn test_batch_upsert_entities_basic() {
+    let (store, uid) = setup_graph().await;
+    let entities: Vec<(&str, &str, &str)> = vec![
+        ("rust", "Rust", "tech"),
+        ("go", "Go", "tech"),
+        ("matrixone", "MatrixOne", "project"),
+    ];
+    let result = store.batch_upsert_entities(&uid, &entities).await.unwrap();
+    assert_eq!(result.len(), 3, "should resolve all 3 entities");
+
+    let names: Vec<&str> = result.iter().map(|(n, _)| n.as_str()).collect();
+    assert!(names.contains(&"rust"));
+    assert!(names.contains(&"go"));
+    assert!(names.contains(&"matrixone"));
+
+    // All entity_ids should be non-empty and unique
+    let ids: Vec<&str> = result.iter().map(|(_, id)| id.as_str()).collect();
+    assert!(ids.iter().all(|id| !id.is_empty()));
+    let unique: std::collections::HashSet<&&str> = ids.iter().collect();
+    assert_eq!(unique.len(), 3, "entity_ids should be unique");
+    println!("✅ batch_upsert_entities: 3 new entities created");
+}
+
+#[tokio::test]
+async fn test_batch_upsert_entities_idempotent() {
+    let (store, uid) = setup_graph().await;
+    let entities: Vec<(&str, &str, &str)> = vec![("rust", "Rust", "tech"), ("go", "Go", "tech")];
+
+    let first = store.batch_upsert_entities(&uid, &entities).await.unwrap();
+    let second = store.batch_upsert_entities(&uid, &entities).await.unwrap();
+
+    // Same entity_ids returned on second call
+    let id_map1: std::collections::HashMap<&str, &str> =
+        first.iter().map(|(n, id)| (n.as_str(), id.as_str())).collect();
+    let id_map2: std::collections::HashMap<&str, &str> =
+        second.iter().map(|(n, id)| (n.as_str(), id.as_str())).collect();
+    assert_eq!(id_map1["rust"], id_map2["rust"]);
+    assert_eq!(id_map1["go"], id_map2["go"]);
+    println!("✅ batch_upsert_entities: idempotent — same IDs on re-insert");
+}
+
+#[tokio::test]
+async fn test_batch_upsert_entities_mixed_new_and_existing() {
+    let (store, uid) = setup_graph().await;
+
+    // Pre-create one entity via single upsert
+    let (existing_id, _) = store.upsert_entity(&uid, "rust", "Rust", "tech").await.unwrap();
+
+    // Batch with one existing + one new
+    let entities: Vec<(&str, &str, &str)> = vec![("rust", "Rust", "tech"), ("python", "Python", "tech")];
+    let result = store.batch_upsert_entities(&uid, &entities).await.unwrap();
+    assert_eq!(result.len(), 2);
+
+    let id_map: std::collections::HashMap<&str, &str> =
+        result.iter().map(|(n, id)| (n.as_str(), id.as_str())).collect();
+    assert_eq!(id_map["rust"], existing_id, "existing entity should keep its ID");
+    assert!(!id_map["python"].is_empty(), "new entity should get an ID");
+    assert_ne!(id_map["python"], existing_id);
+    println!("✅ batch_upsert_entities: mixed new + existing resolved correctly");
+}
+
+#[tokio::test]
+async fn test_batch_upsert_entities_duplicates_in_input() {
+    let (store, uid) = setup_graph().await;
+
+    // Same entity name appears twice in one batch
+    let entities: Vec<(&str, &str, &str)> = vec![("rust", "Rust", "tech"), ("rust", "Rust", "tech")];
+    let result = store.batch_upsert_entities(&uid, &entities).await.unwrap();
+
+    // SELECT returns deduplicated — one row for "rust"
+    // Both input entries map to the same entity_id
+    assert!(!result.is_empty());
+    let rust_ids: Vec<&str> = result.iter().filter(|(n, _)| n == "rust").map(|(_, id)| id.as_str()).collect();
+    assert_eq!(rust_ids.len(), 1, "deduplicated in SELECT result");
+    println!("✅ batch_upsert_entities: duplicate names in input handled");
+}
+
+#[tokio::test]
+async fn test_batch_upsert_entities_large_batch() {
+    let (store, uid) = setup_graph().await;
+
+    // 120 entities — exceeds chunk size of 50, tests multi-chunk INSERT
+    let names: Vec<String> = (0..120).map(|i| format!("entity_{i}")).collect();
+    let entities: Vec<(&str, &str, &str)> = names
+        .iter()
+        .map(|n| (n.as_str(), n.as_str(), "concept"))
+        .collect();
+
+    let result = store.batch_upsert_entities(&uid, &entities).await.unwrap();
+    assert_eq!(result.len(), 120, "all 120 entities should be resolved");
+
+    let unique_ids: std::collections::HashSet<&str> =
+        result.iter().map(|(_, id)| id.as_str()).collect();
+    assert_eq!(unique_ids.len(), 120, "all entity_ids should be unique");
+    println!("✅ batch_upsert_entities: 120 entities across multiple chunks");
+}
+
+#[tokio::test]
+async fn test_batch_upsert_entities_user_isolation() {
+    let (store, uid1) = setup_graph().await;
+    let uid2 = format!("graph_test_{}", uuid::Uuid::new_v4().simple());
+
+    let entities: Vec<(&str, &str, &str)> = vec![("rust", "Rust", "tech")];
+    let r1 = store.batch_upsert_entities(&uid1, &entities).await.unwrap();
+    let r2 = store.batch_upsert_entities(&uid2, &entities).await.unwrap();
+
+    // Same name, different users → different entity_ids
+    assert_ne!(r1[0].1, r2[0].1, "different users should get different entity_ids");
+    println!("✅ batch_upsert_entities: user isolation — same name, different IDs");
+}
+
+#[tokio::test]
+async fn test_batch_upsert_entities_end_to_end_with_links() {
+    let (store, uid) = setup_graph().await;
+    let mid = format!("mem_{}", uuid::Uuid::new_v4().simple());
+
+    // Simulate the full process_entity_batch flow
+    let entities: Vec<(&str, &str, &str)> = vec![
+        ("rust", "Rust", "tech"),
+        ("tokio", "Tokio", "tech"),
+        ("matrixone", "MatrixOne", "project"),
+    ];
+    let resolved = store.batch_upsert_entities(&uid, &entities).await.unwrap();
+    assert_eq!(resolved.len(), 3);
+
+    // Build links from resolved entities
+    let links: Vec<(&str, &str, &str)> = resolved
+        .iter()
+        .map(|(_, eid)| (mid.as_str(), eid.as_str(), "regex"))
+        .collect();
+    store
+        .batch_upsert_memory_entity_links(&uid, &links)
+        .await
+        .unwrap();
+
+    // Verify links exist
+    let rows = sqlx::query(
+        "SELECT entity_id FROM mem_memory_entity_links WHERE user_id = ? AND memory_id = ?",
+    )
+    .bind(&uid)
+    .bind(&mid)
+    .fetch_all(store.pool())
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), 3, "all 3 entities should be linked to memory");
+    println!("✅ batch_upsert_entities + batch_upsert_memory_entity_links: end-to-end OK");
+}

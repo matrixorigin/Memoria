@@ -102,6 +102,7 @@ async fn generate_and_store(
         .as_ref()
         .ok_or("LLM not configured — set LLM_API_KEY")?;
 
+    // TODO: make branch-aware — currently hardcoded to mem_memories
     let rows = sqlx::query(
         "SELECT memory_id, content, memory_type FROM mem_memories \
          WHERE user_id = ? AND session_id = ? AND is_active = 1 \

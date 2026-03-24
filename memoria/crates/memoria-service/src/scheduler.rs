@@ -77,10 +77,54 @@ impl GovernanceScheduler {
         let lock_ttl = Duration::from_secs(config.lock_ttl_secs);
         let instance_id = config.instance_id.clone();
 
-        // Build distributed lock: real SQL lock if we have a sql_store, noop otherwise
-        let lock: Arc<dyn DistributedLock> = match &service.sql_store {
-            Some(store) => store.clone(),
-            None => Arc::new(crate::distributed::NoopDistributedLock),
+        // Create an isolated pool for governance so long-running operations
+        // (consolidation, cleanup, DDL rebuilds) do not starve request connections.
+        #[allow(clippy::type_complexity)]
+        let (gov_store, gov_sql_store, lock): (
+            Option<Arc<dyn GovernanceStore>>,
+            Option<Arc<SqlMemoryStore>>,
+            Arc<dyn DistributedLock>,
+        ) = match &service.sql_store {
+            Some(store) => match store.spawn_background_store(4).await {
+                Ok(bg) => {
+                    info!("Governance scheduler using isolated pool (4 connections)");
+                    (
+                        Some(bg.clone() as Arc<dyn GovernanceStore>),
+                        Some(bg.clone()),
+                        bg as Arc<dyn DistributedLock>,
+                    )
+                }
+                Err(e) => {
+                    warn!(error = %e, "Governance isolated pool failed, falling back to main pool");
+                    (
+                        Some(store.clone() as Arc<dyn GovernanceStore>),
+                        Some(store.clone()),
+                        store.clone() as Arc<dyn DistributedLock>,
+                    )
+                }
+            },
+            None => (
+                None,
+                None,
+                Arc::new(crate::distributed::NoopDistributedLock) as Arc<dyn DistributedLock>,
+            ),
+        };
+
+        // Helper to build the scheduler with governance-isolated stores
+        let build = |strategy: Arc<dyn GovernanceStrategy>,
+                     fallback: Arc<dyn GovernanceStrategy>,
+                     plugin: Option<ObservedPlugin>| {
+            Self::new_with_components(
+                gov_store.clone(),
+                gov_sql_store.clone(),
+                strategy,
+                fallback,
+                read_enabled_flag(),
+                plugin,
+                lock.clone(),
+                instance_id.clone(),
+                lock_ttl,
+            )
         };
 
         // Dev mode: load plugin directly from local filesystem (hot-reload friendly)
@@ -98,8 +142,7 @@ impl GovernanceScheduler {
                     plugin_version = %version,
                     "Loaded governance plugin from local directory (dev mode)"
                 );
-                return Ok(Self::from_parts(
-                    service,
+                return Ok(build(
                     strategy,
                     delegate,
                     Some(ObservedPlugin {
@@ -108,14 +151,12 @@ impl GovernanceScheduler {
                         plugin_key,
                         version,
                     }),
-                    lock,
-                    instance_id,
-                    lock_ttl,
                 ));
             }
             warn!(plugin_dir = %dir, "MEMORIA_GOVERNANCE_PLUGIN_DIR set but manifest.json not found, falling back");
         }
 
+        // Use the main store for plugin lookup (one-time startup read)
         if let Some(store) = &service.sql_store {
             if let Some(active_plugin) = load_active_governance_plugin(
                 store.as_ref(),
@@ -131,8 +172,7 @@ impl GovernanceScheduler {
                     binding_key = %active_plugin.binding_key,
                     "Loaded governance plugin from shared repository binding"
                 );
-                return Ok(Self::from_parts(
-                    service,
+                return Ok(build(
                     active_plugin.strategy.clone(),
                     delegate,
                     Some(ObservedPlugin {
@@ -141,22 +181,11 @@ impl GovernanceScheduler {
                         plugin_key: active_plugin.plugin_key,
                         version: active_plugin.version,
                     }),
-                    lock,
-                    instance_id,
-                    lock_ttl,
                 ));
             }
         }
 
-        Ok(Self::from_parts(
-            service,
-            delegate.clone(),
-            delegate,
-            None,
-            lock,
-            instance_id,
-            lock_ttl,
-        ))
+        Ok(build(delegate.clone(), delegate, None))
     }
 
     pub fn new_with_registry(

@@ -446,7 +446,7 @@ impl GraphStore {
         entity_type: &str,
     ) -> Result<(String, bool), MemoriaError> {
         // Try INSERT first; on duplicate (user_id, name) catch the error and SELECT.
-        let entity_id = new_id()[..32].to_string();
+        let entity_id = new_id();
         let now = chrono::Utc::now().naive_utc();
         let res = sqlx::query(
             "INSERT INTO mem_entities (entity_id, user_id, name, display_name, entity_type, created_at) \
@@ -473,6 +473,69 @@ impl GraphStore {
             }
             Err(e) => Err(db_err(e)),
         }
+    }
+
+    /// Batch-upsert entities, return vec of (name, entity_id).
+    /// Uses multi-row INSERT IGNORE + single SELECT to resolve IDs in 2 round-trips.
+    /// Duplicate names in the input are handled gracefully: INSERT IGNORE skips the
+    /// second row (wasting only a generated UUID), and the SELECT returns one row per
+    /// unique (user_id, name). Callers use the returned name→id map, so duplicates
+    /// resolve to the same entity_id automatically.
+    const UPSERT_CHUNK_SIZE: usize = 50;
+
+    pub async fn batch_upsert_entities(
+        &self,
+        user_id: &str,
+        entities: &[(&str, &str, &str)], // (name, display_name, entity_type)
+    ) -> Result<Vec<(String, String)>, MemoriaError> {
+        if entities.is_empty() {
+            return Ok(Vec::new());
+        }
+        let now = chrono::Utc::now().naive_utc();
+
+        // 1. Bulk INSERT IGNORE — inserts new, silently skips duplicates
+        for chunk in entities.chunks(Self::UPSERT_CHUNK_SIZE) {
+            let placeholders = chunk.iter().map(|_| "(?,?,?,?,?,?)").collect::<Vec<_>>().join(", ");
+            let sql = format!(
+                "INSERT IGNORE INTO mem_entities \
+                 (entity_id, user_id, name, display_name, entity_type, created_at) \
+                 VALUES {placeholders}"
+            );
+            let mut q = sqlx::query(&sql);
+            for (name, display, etype) in chunk {
+                let eid = new_id();
+                q = q.bind(eid).bind(user_id).bind(*name).bind(*display).bind(*etype).bind(now);
+            }
+            q.execute(&self.pool).await.map_err(db_err)?;
+        }
+
+        // 2. SELECT to resolve all entity_ids (deduplicate names, chunk to avoid
+        //    overly long IN clauses on very large batches)
+        let mut seen = std::collections::HashSet::new();
+        let names: Vec<&str> = entities
+            .iter()
+            .map(|(n, _, _)| *n)
+            .filter(|n| seen.insert(*n))
+            .collect();
+
+        let mut result = Vec::with_capacity(names.len());
+        for chunk in names.chunks(Self::UPSERT_CHUNK_SIZE) {
+            let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+            let sql = format!(
+                "SELECT name, entity_id FROM mem_entities WHERE user_id = ? AND name IN ({placeholders})"
+            );
+            let mut q = sqlx::query(&sql).bind(user_id);
+            for name in chunk {
+                q = q.bind(*name);
+            }
+            let rows = q.fetch_all(&self.pool).await.map_err(db_err)?;
+            for r in rows {
+                let name: String = r.try_get("name").unwrap_or_default();
+                let eid: String = r.try_get("entity_id").unwrap_or_default();
+                result.push((name, eid));
+            }
+        }
+        Ok(result)
     }
 
     pub async fn upsert_memory_entity_link(
@@ -519,7 +582,7 @@ impl GraphStore {
             return Ok(());
         }
         let now = chrono::Utc::now().naive_utc();
-        for chunk in links.chunks(50) {
+        for chunk in links.chunks(Self::UPSERT_CHUNK_SIZE) {
             let placeholders = chunk
                 .iter()
                 .map(|_| "(?,?,?,?,?,?)")

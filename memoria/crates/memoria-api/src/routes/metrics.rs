@@ -216,15 +216,6 @@ async fn collect_metrics(state: &AppState) -> Result<Arc<String>, String> {
     ));
 
     // ── Entity extraction health ──────────────────────────────────────────
-    let entity_bp = memoria_service::ENTITY_EXTRACTION_BACKPRESSURE.load(Ordering::Relaxed);
-    out.push_str(
-        "# HELP memoria_entity_extraction_backpressure_total Times entity queue was full.\n",
-    );
-    out.push_str("# TYPE memoria_entity_extraction_backpressure_total counter\n");
-    out.push_str(&format!(
-        "memoria_entity_extraction_backpressure_total {entity_bp}\n"
-    ));
-
     let entity_drops = memoria_service::ENTITY_EXTRACTION_DROPS.load(Ordering::Relaxed);
     out.push_str("# HELP memoria_entity_extraction_drops_total Entity extraction jobs dropped.\n");
     out.push_str("# TYPE memoria_entity_extraction_drops_total counter\n");

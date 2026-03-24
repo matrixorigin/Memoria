@@ -285,7 +285,7 @@ pub async fn get_memory(
     AuthUser { user_id, is_master }: AuthUser,
     Path(id): Path<String>,
 ) -> ApiResult<Option<MemoryResponse>> {
-    let m = state.service.get(&id).await.map_err(api_err)?;
+    let m = state.service.get_for_user(&user_id, &id).await.map_err(api_err)?;
     if let Some(ref mem) = m {
         if !is_master && mem.user_id != user_id {
             return Err((StatusCode::FORBIDDEN, "Not your memory".to_string()));
@@ -303,7 +303,7 @@ pub async fn correct_memory(
     if !is_master {
         let existing = state
             .service
-            .get(&id)
+            .get_for_user(&user_id, &id)
             .await
             .map_err(api_err)?
             .ok_or_else(|| (StatusCode::NOT_FOUND, "Memory not found".to_string()))?;
@@ -313,7 +313,7 @@ pub async fn correct_memory(
     }
     let m = state
         .service
-        .correct(&id, &req.new_content)
+        .correct(&user_id, &id, &req.new_content)
         .await
         .map_err(api_err)?;
     Ok(Json(m.into()))
@@ -337,7 +337,7 @@ pub async fn correct_by_query(
     })?;
     let m = state
         .service
-        .correct(&found.memory_id, &req.new_content)
+        .correct(&user_id, &found.memory_id, &req.new_content)
         .await
         .map_err(api_err)?;
     Ok(Json(m.into()))
@@ -351,7 +351,7 @@ pub async fn delete_memory(
     if !is_master {
         let existing = state
             .service
-            .get(&id)
+            .get_for_user(&user_id, &id)
             .await
             .map_err(api_err)?
             .ok_or_else(|| (StatusCode::NOT_FOUND, "Memory not found".to_string()))?;
@@ -373,7 +373,7 @@ pub async fn purge_memories(
             for id in ids {
                 let mem = state
                     .service
-                    .get(id)
+                    .get_for_user(&user_id, id)
                     .await
                     .map_err(api_err)?
                     .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Memory not found: {id}")))?;
@@ -440,6 +440,7 @@ pub async fn get_profile(
         .collect();
 
     // Stats enrichment (matches Python)
+    // TODO: make branch-aware — currently hardcoded to mem_memories
     let stats: serde_json::Value = sqlx::query(
         "SELECT memory_type, COUNT(*) as cnt, \
          ROUND(AVG(initial_confidence), 2) as avg_conf, \

@@ -45,7 +45,7 @@ pub use scoring::{
 };
 pub use service::{
     CandidateScore, ExplainLevel, MemoryService, PurgeResult, RetrievalExplain,
-    ENTITY_EXTRACTION_BACKPRESSURE, ENTITY_EXTRACTION_DROPS,
+    ENTITY_EXTRACTION_DROPS,
 };
 pub use strategy::{RetrievalStrategy, StrategyRegistry};
 pub use strategy_domain::{StrategyDecision, StrategyEvidence, StrategyReport, StrategyStatus};

@@ -824,3 +824,432 @@ async fn test_diff_native_count_vs_join_rows() {
     )
     .await;
 }
+
+// ── 22. correct on branch does NOT affect main ───────────────────────────────
+
+#[tokio::test]
+async fn test_correct_on_branch_isolated_from_main() {
+    let (svc, git, uid) = setup().await;
+    let branch = bname("correctiso");
+
+    // Store on main
+    store_mem("original fact", &svc, &uid).await;
+    let main_mems = svc.list_active(&uid, 10).await.unwrap();
+    assert_eq!(main_mems.len(), 1);
+    let original_id = main_mems[0].memory_id.clone();
+
+    // Create branch (inherits the memory)
+    gc("memory_branch", json!({"name": branch}), &git, &svc, &uid).await;
+    gc("memory_checkout", json!({"name": branch}), &git, &svc, &uid).await;
+
+    // Correct on branch
+    let r = memoria_mcp::tools::call(
+        "memory_correct",
+        json!({"memory_id": original_id, "new_content": "corrected on branch"}),
+        &svc,
+        &uid,
+    )
+    .await
+    .expect("correct on branch");
+    let t = text(&r);
+    assert!(t.contains("corrected on branch"), "correct response: {t}");
+
+    // Branch should show corrected content
+    let branch_mems = svc.list_active(&uid, 10).await.unwrap();
+    assert!(
+        branch_mems.iter().any(|m| m.content == "corrected on branch"),
+        "branch should have corrected memory"
+    );
+    assert!(
+        !branch_mems.iter().any(|m| m.content == "original fact" && m.is_active),
+        "original should be deactivated on branch"
+    );
+
+    // Switch to main — original should still be there, untouched
+    gc("memory_checkout", json!({"name": "main"}), &git, &svc, &uid).await;
+    let main_mems = svc.list_active(&uid, 10).await.unwrap();
+    assert!(
+        main_mems.iter().any(|m| m.content == "original fact"),
+        "main should still have original fact, got: {:?}",
+        main_mems.iter().map(|m| &m.content).collect::<Vec<_>>()
+    );
+    assert!(
+        !main_mems.iter().any(|m| m.content == "corrected on branch"),
+        "main should NOT have branch correction"
+    );
+    println!("✅ correct on branch isolated from main");
+
+    gc("memory_checkout", json!({"name": "main"}), &git, &svc, &uid).await;
+    gc(
+        "memory_branch_delete",
+        json!({"name": branch}),
+        &git,
+        &svc,
+        &uid,
+    )
+    .await;
+}
+
+// ── 23. purge on branch does NOT affect main ─────────────────────────────────
+
+#[tokio::test]
+async fn test_purge_on_branch_isolated_from_main() {
+    let (svc, git, uid) = setup().await;
+    let branch = bname("purgeiso");
+
+    // Store on main
+    store_mem("keep this memory", &svc, &uid).await;
+    let main_mems = svc.list_active(&uid, 10).await.unwrap();
+    assert_eq!(main_mems.len(), 1);
+    let mid = main_mems[0].memory_id.clone();
+
+    // Create branch, checkout
+    gc("memory_branch", json!({"name": branch}), &git, &svc, &uid).await;
+    gc("memory_checkout", json!({"name": branch}), &git, &svc, &uid).await;
+
+    // Purge on branch
+    memoria_mcp::tools::call(
+        "memory_purge",
+        json!({"memory_id": mid}),
+        &svc,
+        &uid,
+    )
+    .await
+    .expect("purge on branch");
+
+    // Branch should be empty
+    let branch_mems = svc.list_active(&uid, 10).await.unwrap();
+    assert!(
+        !branch_mems.iter().any(|m| m.content == "keep this memory"),
+        "memory should be purged on branch"
+    );
+
+    // Switch to main — memory should still be there
+    gc("memory_checkout", json!({"name": "main"}), &git, &svc, &uid).await;
+    let main_mems = svc.list_active(&uid, 10).await.unwrap();
+    assert!(
+        main_mems.iter().any(|m| m.content == "keep this memory"),
+        "main should still have the memory, got: {:?}",
+        main_mems.iter().map(|m| &m.content).collect::<Vec<_>>()
+    );
+    println!("✅ purge on branch isolated from main");
+
+    gc(
+        "memory_branch_delete",
+        json!({"name": branch}),
+        &git,
+        &svc,
+        &uid,
+    )
+    .await;
+}
+
+// ── 24. purge_by_topic on branch does NOT affect main ────────────────────────
+
+#[tokio::test]
+async fn test_purge_by_topic_on_branch_isolated_from_main() {
+    let (svc, git, uid) = setup().await;
+    let branch = bname("topiciso");
+
+    // Store on main
+    store_mem("important database config", &svc, &uid).await;
+    store_mem("important cache config", &svc, &uid).await;
+    assert_eq!(svc.list_active(&uid, 10).await.unwrap().len(), 2);
+
+    // Create branch, checkout
+    gc("memory_branch", json!({"name": branch}), &git, &svc, &uid).await;
+    gc("memory_checkout", json!({"name": branch}), &git, &svc, &uid).await;
+
+    // Purge by topic on branch
+    memoria_mcp::tools::call(
+        "memory_purge",
+        json!({"topic": "database config"}),
+        &svc,
+        &uid,
+    )
+    .await
+    .expect("purge by topic on branch");
+
+    // Branch should have only cache config
+    let branch_mems = svc.list_active(&uid, 10).await.unwrap();
+    assert!(
+        !branch_mems.iter().any(|m| m.content.contains("database")),
+        "database config should be purged on branch"
+    );
+
+    // Switch to main — both should still be there
+    gc("memory_checkout", json!({"name": "main"}), &git, &svc, &uid).await;
+    let main_mems = svc.list_active(&uid, 10).await.unwrap();
+    assert_eq!(
+        main_mems.len(),
+        2,
+        "main should still have both memories, got: {:?}",
+        main_mems.iter().map(|m| &m.content).collect::<Vec<_>>()
+    );
+    println!("✅ purge_by_topic on branch isolated from main");
+
+    gc(
+        "memory_branch_delete",
+        json!({"name": branch}),
+        &git,
+        &svc,
+        &uid,
+    )
+    .await;
+}
+
+// ── 25. purge_batch on branch does NOT affect main ───────────────────────────
+
+#[tokio::test]
+async fn test_purge_batch_on_branch_isolated_from_main() {
+    let (svc, git, uid) = setup().await;
+    let branch = bname("batchiso");
+
+    // Store two memories on main
+    store_mem("batch keep alpha", &svc, &uid).await;
+    store_mem("batch keep beta", &svc, &uid).await;
+    let main_mems = svc.list_active(&uid, 10).await.unwrap();
+    assert_eq!(main_mems.len(), 2);
+    let ids: Vec<String> = main_mems.iter().map(|m| m.memory_id.clone()).collect();
+
+    // Create branch, checkout
+    gc("memory_branch", json!({"name": branch}), &git, &svc, &uid).await;
+    gc("memory_checkout", json!({"name": branch}), &git, &svc, &uid).await;
+
+    // Purge batch on branch (comma-separated IDs)
+    let batch = format!("{},{}", ids[0], ids[1]);
+    memoria_mcp::tools::call(
+        "memory_purge",
+        json!({"memory_id": batch}),
+        &svc,
+        &uid,
+    )
+    .await
+    .expect("purge batch on branch");
+
+    // Branch should be empty
+    let branch_mems = svc.list_active(&uid, 10).await.unwrap();
+    assert_eq!(branch_mems.len(), 0, "branch should have 0 memories after batch purge");
+
+    // Switch to main — both should still be there
+    gc("memory_checkout", json!({"name": "main"}), &git, &svc, &uid).await;
+    let main_mems = svc.list_active(&uid, 10).await.unwrap();
+    assert_eq!(
+        main_mems.len(), 2,
+        "main should still have both memories, got: {:?}",
+        main_mems.iter().map(|m| &m.content).collect::<Vec<_>>()
+    );
+    println!("✅ purge_batch on branch isolated from main");
+
+    gc("memory_branch_delete", json!({"name": branch}), &git, &svc, &uid).await;
+}
+
+// ── 26. correct with sensitive content is blocked ────────────────────────────
+
+#[tokio::test]
+async fn test_correct_blocks_sensitive_content() {
+    let (svc, _git, uid) = setup().await;
+
+    // Store a normal memory
+    store_mem("database config info", &svc, &uid).await;
+    let mems = svc.list_active(&uid, 10).await.unwrap();
+    let mid = mems[0].memory_id.clone();
+
+    // Try to correct with sensitive content (password pattern → HIGH tier → blocked)
+    let result = memoria_mcp::tools::call(
+        "memory_correct",
+        json!({"memory_id": mid, "new_content": "password=supersecret123"}),
+        &svc,
+        &uid,
+    )
+    .await;
+
+    // Should fail with Blocked error
+    assert!(result.is_err(), "correct with sensitive content should be blocked");
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("sensitive") || err.contains("Blocked"),
+        "error should mention sensitive/blocked, got: {err}"
+    );
+
+    // Original memory should be untouched
+    let mems = svc.list_active(&uid, 10).await.unwrap();
+    assert_eq!(mems.len(), 1);
+    assert_eq!(mems[0].content, "database config info");
+    println!("✅ correct blocks sensitive content");
+}
+
+// ── 27. correct triggers entity extraction ───────────────────────────────────
+
+#[tokio::test]
+async fn test_correct_triggers_entity_extraction() {
+    let (svc, _git, uid) = setup().await;
+
+    // Store a memory with an entity
+    store_mem("Project uses PostgreSQL database", &svc, &uid).await;
+    // Wait for async entity extraction from store
+    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+
+    let mems = svc.list_active(&uid, 10).await.unwrap();
+    let mid = mems[0].memory_id.clone();
+
+    // Correct it to mention a different entity
+    let r = memoria_mcp::tools::call(
+        "memory_correct",
+        json!({"memory_id": mid, "new_content": "Project uses MatrixOne and Redis"}),
+        &svc,
+        &uid,
+    )
+    .await
+    .expect("correct");
+    let t = text(&r);
+    assert!(t.contains("MatrixOne"), "corrected content: {t}");
+
+    let new_mid = t
+        .split_whitespace()
+        .nth(2)
+        .unwrap_or("")
+        .trim_end_matches(':');
+
+    // Wait for async entity extraction worker to process the corrected memory.
+    // The worker writes to mem_memory_entity_links (graph table).
+    let sql = svc.sql_store.as_ref().expect("sql_store");
+    let graph = sql.graph_store();
+    let mut found = false;
+    for _ in 0..10 {
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        let unlinked = graph.get_unlinked_memories(&uid, 100).await.unwrap_or_default();
+        // If new_mid is NOT in unlinked, it means entity links were created
+        if !unlinked.iter().any(|(m, _)| m == new_mid) {
+            found = true;
+            break;
+        }
+    }
+    assert!(
+        found,
+        "corrected memory {new_mid} should have entity links within 5s"
+    );
+    println!("✅ correct triggers entity extraction: new memory {new_mid} is entity-linked");
+}
+
+// ── 28. REST API get/correct/delete work on branch-only memories ─────────────
+// This tests that the permission check uses get_for_user (branch-aware)
+// rather than get (main-only).
+
+#[tokio::test]
+async fn test_get_for_user_finds_branch_only_memory() {
+    let (svc, git, uid) = setup().await;
+    let branch = bname("getuser");
+
+    // Create branch, checkout, store a branch-only memory
+    gc("memory_branch", json!({"name": branch}), &git, &svc, &uid).await;
+    gc("memory_checkout", json!({"name": branch}), &git, &svc, &uid).await;
+    store_mem("branch-only secret", &svc, &uid).await;
+
+    let branch_mems = svc.list_active(&uid, 10).await.unwrap();
+    let branch_mid = branch_mems
+        .iter()
+        .find(|m| m.content == "branch-only secret")
+        .expect("branch memory should exist")
+        .memory_id
+        .clone();
+
+    // get_for_user should find it (branch-aware)
+    let found = svc.get_for_user(&uid, &branch_mid).await.unwrap();
+    assert!(found.is_some(), "get_for_user should find branch-only memory");
+    assert_eq!(found.unwrap().content, "branch-only secret");
+
+    // plain get() should NOT find it (hardcoded to mem_memories)
+    let not_found = svc.get(&branch_mid).await.unwrap();
+    assert!(
+        not_found.is_none(),
+        "plain get() should not find branch-only memory"
+    );
+
+    println!("✅ get_for_user finds branch-only memory, get() does not");
+
+    gc("memory_checkout", json!({"name": "main"}), &git, &svc, &uid).await;
+    gc("memory_branch_delete", json!({"name": branch}), &git, &svc, &uid).await;
+}
+
+
+// ── 29. Micro-batch entity extraction: burst writes are batched correctly ────
+
+#[tokio::test]
+async fn test_micro_batch_entity_extraction() {
+    let (svc, _git, uid) = setup().await;
+
+    // Burst-write 10 memories with distinct entities — should trigger micro-batching
+    let contents = [
+        "Using Rust for backend",
+        "PostgreSQL is the database",
+        "Redis for caching",
+        "Docker for containers",
+        "Kubernetes orchestration",
+        "GitHub for version control",
+        "Python for scripts",
+        "TypeScript frontend",
+        "MatrixOne analytics",
+        "Tokio async runtime",
+    ];
+    for content in &contents {
+        store_mem(content, &svc, &uid).await;
+    }
+
+    // Wait for async entity extraction (micro-batch should process all)
+    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+
+    // Verify all memories have entity links
+    let sql = svc.sql_store.as_ref().expect("sql_store");
+    let graph = sql.graph_store();
+    let unlinked = graph.get_unlinked_memories(&uid, 100).await.unwrap_or_default();
+
+    // All 10 memories should have at least one entity extracted
+    let mems = svc.list_active(&uid, 20).await.unwrap();
+    assert_eq!(mems.len(), 10, "should have 10 memories");
+
+    let linked_count = mems
+        .iter()
+        .filter(|m| !unlinked.iter().any(|(mid, _)| mid == &m.memory_id))
+        .count();
+    assert!(
+        linked_count >= 8,
+        "at least 8/10 memories should have entity links (got {linked_count})"
+    );
+    println!("✅ micro-batch entity extraction: {linked_count}/10 memories linked");
+}
+
+// ── 30. Batch upsert entities with duplicates across jobs ────────────────────
+
+#[tokio::test]
+async fn test_batch_entity_deduplication_across_memories() {
+    let (svc, _git, uid) = setup().await;
+
+    // Multiple memories mention the same entity — should deduplicate in batch
+    store_mem("Rust is great for systems programming", &svc, &uid).await;
+    store_mem("I love Rust for its safety", &svc, &uid).await;
+    store_mem("Rust and Go are both compiled", &svc, &uid).await;
+
+    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+
+    // Check that "rust" entity exists only once
+    let sql = svc.sql_store.as_ref().expect("sql_store");
+    let graph = sql.graph_store();
+    let entities = graph.get_user_entities(&uid).await.unwrap();
+
+    let rust_count = entities.iter().filter(|(name, _)| name == "rust").count();
+    assert_eq!(rust_count, 1, "rust entity should exist exactly once");
+
+    // All 3 memories should link to the same rust entity
+    let mems = svc.list_active(&uid, 10).await.unwrap();
+    assert_eq!(mems.len(), 3);
+
+    // Verify links exist (not unlinked)
+    let unlinked = graph.get_unlinked_memories(&uid, 100).await.unwrap_or_default();
+    let linked = mems
+        .iter()
+        .filter(|m| !unlinked.iter().any(|(mid, _)| mid == &m.memory_id))
+        .count();
+    assert!(linked >= 2, "at least 2/3 memories should be linked to rust entity");
+    println!("✅ batch entity deduplication: rust entity created once, linked to multiple memories");
+}

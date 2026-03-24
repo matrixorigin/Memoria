@@ -303,7 +303,7 @@ pub async fn call(
                 return Ok(mcp_text("Provide memory_id or query"));
             };
 
-            let m = service.correct(&old_mid, new_content).await?;
+            let m = service.correct(user_id, &old_mid, new_content).await?;
 
             // Graph sync: deactivate old node, create/update new node
             if let Some(sql) = &service.sql_store {
