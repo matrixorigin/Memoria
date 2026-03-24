@@ -358,6 +358,8 @@ async fn cmd_serve(db_url: Option<String>, port: u16, master_key: String) -> Res
         cfg.db_url = v;
     }
 
+    validate_embedding_config(&cfg)?;
+
     tracing::info!(
         db_url = %cfg.db_url, port = port,
         instance_id = %cfg.instance_id,
@@ -887,6 +889,19 @@ fn build_embedder(
         );
         None
     }
+}
+
+fn validate_embedding_config(cfg: &memoria_service::Config) -> Result<()> {
+    if cfg.embedding_provider == "local" {
+        #[cfg(not(feature = "local-embedding"))]
+        {
+            anyhow::bail!(
+                "EMBEDDING_PROVIDER=local requires a binary built with `local-embedding` support. \
+Use an HTTP embedding provider instead, or rebuild Memoria with `--features local-embedding`."
+            );
+        }
+    }
+    Ok(())
 }
 
 fn build_llm(cfg: &memoria_service::Config) -> Option<Arc<memoria_embedding::LlmClient>> {
@@ -2783,4 +2798,60 @@ fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_embedding_config;
+    use memoria_service::Config;
+
+    fn test_config() -> Config {
+        Config {
+            db_url: "mysql://root:111@localhost:6001/memoria".to_string(),
+            db_name: "memoria".to_string(),
+            embedding_provider: "openai".to_string(),
+            embedding_model: "BAAI/bge-m3".to_string(),
+            embedding_dim: 1024,
+            embedding_api_key: String::new(),
+            embedding_base_url: String::new(),
+            embedding_endpoints: vec![],
+            llm_api_key: None,
+            llm_base_url: "https://api.openai.com/v1".to_string(),
+            llm_model: "gpt-4o-mini".to_string(),
+            user: "default".to_string(),
+            governance_plugin_binding: "default".to_string(),
+            governance_plugin_subject: "system".to_string(),
+            governance_plugin_dir: None,
+            instance_id: "test-instance".to_string(),
+            lock_ttl_secs: 120,
+        }
+    }
+
+    #[test]
+    fn non_local_embedding_config_is_valid() {
+        let cfg = test_config();
+        assert!(validate_embedding_config(&cfg).is_ok());
+    }
+
+    #[cfg(not(feature = "local-embedding"))]
+    #[test]
+    fn local_embedding_without_feature_fails_validation() {
+        let mut cfg = test_config();
+        cfg.embedding_provider = "local".to_string();
+
+        let err = validate_embedding_config(&cfg).expect_err("local embedding should fail");
+        assert!(
+            err.to_string().contains("local-embedding"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[cfg(feature = "local-embedding")]
+    #[test]
+    fn local_embedding_with_feature_passes_validation() {
+        let mut cfg = test_config();
+        cfg.embedding_provider = "local".to_string();
+
+        assert!(validate_embedding_config(&cfg).is_ok());
+    }
 }
