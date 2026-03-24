@@ -547,6 +547,50 @@ async fn test_batch_store_verify_db() {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 #[tokio::test]
+async fn test_memory_stats_match_db() {
+    let (base, client, pool) = spawn_server().await;
+    let uid = uid();
+
+    client
+        .post(format!("{base}/v1/memories"))
+        .header("X-User-Id", &uid)
+        .json(&json!({"content": "stats semantic a", "memory_type": "semantic"}))
+        .send()
+        .await
+        .unwrap();
+    client
+        .post(format!("{base}/v1/memories"))
+        .header("X-User-Id", &uid)
+        .json(&json!({"content": "stats semantic b", "memory_type": "semantic"}))
+        .send()
+        .await
+        .unwrap();
+    client
+        .post(format!("{base}/v1/memories"))
+        .header("X-User-Id", &uid)
+        .json(&json!({"content": "stats profile", "memory_type": "profile"}))
+        .send()
+        .await
+        .unwrap();
+
+    let r = client
+        .get(format!("{base}/v1/memories/stats"))
+        .header("X-User-Id", &uid)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let body: Value = r.json().await.unwrap();
+    assert_eq!(body["user_id"], uid);
+    assert_eq!(body["active_memory_count"].as_i64().unwrap(), 3);
+    assert_eq!(body["memory_type_counts"]["semantic"].as_i64().unwrap(), 2);
+    assert_eq!(body["memory_type_counts"]["profile"].as_i64().unwrap(), 1);
+    assert_eq!(db_count_active(&pool, &uid).await, 3);
+
+    println!("✅ memory stats: counts and type breakdown match DB");
+}
+
+#[tokio::test]
 async fn test_list_matches_db() {
     let (base, client, pool) = spawn_server().await;
     let uid = uid();

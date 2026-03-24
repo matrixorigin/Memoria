@@ -122,6 +122,13 @@ pub struct ListResponse {
 }
 
 #[derive(Serialize)]
+pub struct MemoryStatsResponse {
+    pub user_id: String,
+    pub active_memory_count: i64,
+    pub memory_type_counts: std::collections::BTreeMap<String, i64>,
+}
+
+#[derive(Serialize)]
 pub struct PurgeResponse {
     pub purged: usize,
     #[serde(skip_serializing_if = "Option::is_none")]

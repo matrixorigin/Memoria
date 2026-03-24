@@ -27,6 +27,7 @@ pub fn build_router(state: AppState) -> Router {
         // Memory CRUD
         .route("/v1/memories", get(routes::memory::list_memories))
         .route("/v1/memories", post(routes::memory::store_memory))
+        .route("/v1/memories/stats", get(routes::memory::get_memory_stats))
         .route("/v1/memories/batch", post(routes::memory::batch_store))
         .route("/v1/memories/retrieve", post(routes::memory::retrieve))
         .route("/v1/memories/search", post(routes::memory::search))

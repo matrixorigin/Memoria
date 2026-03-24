@@ -101,6 +101,46 @@ pub async fn list_memories(
     Ok(Json(ListResponse { items, next_cursor }))
 }
 
+pub async fn get_memory_stats(
+    State(state): State<AppState>,
+    AuthUser { user_id, .. }: AuthUser,
+) -> ApiResult<MemoryStatsResponse> {
+    let sql = state
+        .service
+        .sql_store
+        .as_ref()
+        .ok_or_else(|| (StatusCode::SERVICE_UNAVAILABLE, "sql store unavailable".to_string()))?;
+
+    let active_memory_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM mem_memories WHERE user_id = ? AND is_active > 0",
+    )
+    .bind(&user_id)
+    .fetch_one(sql.pool())
+    .await
+    .map_err(api_err)?;
+
+    let rows = sqlx::query(
+        "SELECT memory_type, COUNT(*) AS count FROM mem_memories WHERE user_id = ? AND is_active > 0 GROUP BY memory_type ORDER BY memory_type",
+    )
+    .bind(&user_id)
+    .fetch_all(sql.pool())
+    .await
+    .map_err(api_err)?;
+
+    let mut memory_type_counts = std::collections::BTreeMap::new();
+    for row in rows {
+        let memory_type: String = row.try_get("memory_type").map_err(api_err)?;
+        let count: i64 = row.try_get("count").map_err(api_err)?;
+        memory_type_counts.insert(memory_type, count);
+    }
+
+    Ok(Json(MemoryStatsResponse {
+        user_id,
+        active_memory_count,
+        memory_type_counts,
+    }))
+}
+
 pub async fn store_memory(
     State(state): State<AppState>,
     AuthUser { user_id, .. }: AuthUser,
