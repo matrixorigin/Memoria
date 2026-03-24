@@ -37,11 +37,10 @@ openclaw --version
 Cloud mode connects directly to the Memoria REST API. No binary download needed.
 
 ```bash
-# 1. Install + enable plugin
+# 1. Install plugin
 openclaw plugins install @matrixorigin/thememoria
-openclaw plugins enable thememoria
 
-# 2. Setup cloud backend
+# 2. Setup cloud backend (also enables the plugin)
 openclaw memoria setup \
   --mode cloud \
   --api-url <MEMORIA_API_URL> \
@@ -58,7 +57,6 @@ If the npm package is not yet published, install from source:
 mkdir -p ~/.openclaw/plugins-src
 git clone https://github.com/matrixorigin/Memoria.git ~/.openclaw/plugins-src/Memoria
 openclaw plugins install --link ~/.openclaw/plugins-src/Memoria/plugins/openclaw
-openclaw plugins enable thememoria
 ```
 
 Then continue with step 2 above.
@@ -71,11 +69,10 @@ Local mode runs the Rust `memoria` binary against a self-hosted MatrixOne instan
 # 1. Install memoria CLI
 curl -sSL https://raw.githubusercontent.com/matrixorigin/Memoria/main/scripts/install.sh | bash -s -- -y -d ~/.local/bin
 
-# 2. Install + enable plugin
+# 2. Install plugin
 openclaw plugins install @matrixorigin/thememoria
-openclaw plugins enable thememoria
 
-# 3. Setup local backend (quick start with defaults)
+# 3. Setup local backend (also enables the plugin, quick start with defaults)
 openclaw memoria setup \
   --mode local \
   --install-memoria \
@@ -117,13 +114,10 @@ Run these steps in order. Stop and report if any step fails.
 1) Install plugin:
    openclaw plugins install @matrixorigin/thememoria
 
-2) Enable plugin:
-   openclaw plugins enable thememoria
-
-3) Setup cloud backend:
+2) Setup cloud backend (this also enables the plugin):
    openclaw memoria setup --mode cloud --api-url <MEMORIA_API_URL> --api-key <MEMORIA_API_KEY>
 
-4) Verify:
+3) Verify:
    openclaw memoria health
    Expected: "status": "ok"
 
