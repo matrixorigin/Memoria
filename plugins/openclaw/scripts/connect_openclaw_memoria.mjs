@@ -4,7 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 
 function fail(message) {
-  console.error(`[memory-memoria] ${message}`);
+  console.error(`[thememoria] ${message}`);
   process.exit(1);
 }
 
@@ -57,7 +57,7 @@ if (modeRaw !== "cloud" && modeRaw !== "local") {
 }
 const mode = modeRaw;
 
-const pluginId = readArg("--plugin-id", "memory-memoria").trim() || "memory-memoria";
+const pluginId = readArg("--plugin-id", "thememoria").trim() || "thememoria";
 const configFile = path.resolve(
   readArg(
     "--config-file",
@@ -110,7 +110,7 @@ if (mode === "cloud") {
   if (!apiKey) {
     fail("--api-key required when mode=cloud");
   }
-  pluginConfig.backend = "http";
+  pluginConfig.backend = "api";
   pluginConfig.apiUrl = normalizeUrl(apiUrl);
   pluginConfig.apiKey = apiKey;
   delete pluginConfig.dbUrl;
@@ -199,11 +199,11 @@ console.log(
       pluginId,
       backend: pluginConfig.backend,
       apiUrl:
-        pluginConfig.backend === "http" && typeof pluginConfig.apiUrl === "string"
+        pluginConfig.backend === "api" && typeof pluginConfig.apiUrl === "string"
           ? pluginConfig.apiUrl
           : undefined,
       apiKeySet:
-        pluginConfig.backend === "http" &&
+        pluginConfig.backend === "api" &&
         typeof pluginConfig.apiKey === "string" &&
         pluginConfig.apiKey.length > 0,
       dbUrl: typeof pluginConfig.dbUrl === "string" ? pluginConfig.dbUrl : undefined,
