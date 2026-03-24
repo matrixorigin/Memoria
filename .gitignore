@@ -40,3 +40,4 @@ scripts/migrate_embedding_dim.sh
 
 # Plugin dev keys
 dev-signing-key.b64
+.npmrc
