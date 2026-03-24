@@ -1,4 +1,4 @@
-use crate::auth::{spawn_last_used_flusher, spawn_tool_usage_flusher, LastUsedBatcher, ToolUsageBatcher};
+use crate::auth::{spawn_call_log_flusher, spawn_last_used_flusher, spawn_tool_usage_flusher, CallLogBatcher, LastUsedBatcher, ToolUsageBatcher};
 use crate::rate_limit::RateLimiter;
 use memoria_core::MemoriaError;
 use memoria_git::GitForDataService;
@@ -42,6 +42,8 @@ pub struct AppState {
     /// Short-lived cache for Prometheus output to avoid repeated full-table scans.
     pub metrics_cache: Arc<RwLock<Option<CachedMetrics>>>,
     pub metrics_cache_ttl: Duration,
+    /// Batched API call log writer (flushed every 5 s to mem_api_call_log).
+    pub call_log_batcher: Arc<CallLogBatcher>,
 }
 
 impl AppState {
@@ -86,6 +88,7 @@ impl AppState {
             auth_pool: None,
             last_used_batcher: Arc::new(LastUsedBatcher::new()),
             tool_usage_batcher: Arc::new(ToolUsageBatcher::new()),
+            call_log_batcher: Arc::new(CallLogBatcher::new()),
             rate_limiter: crate::rate_limit::from_env(),
             metrics_cache: Arc::new(RwLock::new(None)),
             metrics_cache_ttl,
@@ -151,6 +154,8 @@ impl AppState {
         // Rebuild tool-usage cache from DB, then start the periodic flusher
         self.tool_usage_batcher.rebuild_from_db(&pool).await;
         spawn_tool_usage_flusher(self.tool_usage_batcher.clone(), pool.clone());
+        // Start the call-log flush loop (writes mem_api_call_log every 5 s)
+        spawn_call_log_flusher(self.call_log_batcher.clone(), pool.clone());
         self.auth_pool = Some(pool);
         Ok(self)
     }

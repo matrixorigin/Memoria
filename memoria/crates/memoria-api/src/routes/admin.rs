@@ -441,6 +441,234 @@ pub async fn get_config(auth: AuthUser) -> Result<Json<serde_json::Value>, (Stat
     })))
 }
 
+// ── Per-user API call statistics ─────────────────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct CallStatsQuery {
+    pub days: Option<u32>,
+}
+
+/// GET /admin/users/:user_id/call-stats?days=7
+///
+/// Returns aggregated MCP/API call statistics for the requested user, sourced
+/// from `mem_api_call_log`.  Requires master key.
+///
+/// Response shape (mirrors the `summary` + `by_tool` sections of the Monitor
+/// dashboard endpoint so the website backend can swap in this data directly):
+/// ```json
+/// {
+///   "total_calls": 12345,
+///   "avg_latency_ms": 125,
+///   "error_count": 42,
+///   "error_rate": 0.34,
+///   "days": 7,
+///   "by_path": [
+///     { "path": "/v1/memories/search", "count": 5000, "avg_ms": 110,
+///       "max_ms": 900, "error_count": 10 },
+///     ...
+///   ]
+/// }
+/// ```
+pub async fn user_call_stats(
+    auth: AuthUser,
+    State(state): State<AppState>,
+    Path(user_id): Path<String>,
+    Query(params): Query<CallStatsQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    auth.require_master()?;
+    let pool = get_pool(&state)?;
+
+    let days = params.days.unwrap_or(7).clamp(1, 90) as i64;
+
+    // Aggregate totals for the requested time window.
+    let row = sqlx::query(
+        "SELECT \
+            CAST(COUNT(*) AS SIGNED) AS total, \
+            CAST(COALESCE(AVG(latency_ms), 0) AS DOUBLE) AS avg_ms, \
+            CAST(SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END) AS SIGNED) AS errors \
+         FROM mem_api_call_log \
+         WHERE user_id = ? AND called_at >= DATE_SUB(NOW(6), INTERVAL ? DAY)",
+    )
+    .bind(&user_id)
+    .bind(days)
+    .fetch_one(pool)
+    .await
+    .map_err(db_err)?;
+
+    let total: i64 = row.try_get("total").unwrap_or(0);
+    let avg_ms: f64 = row.try_get("avg_ms").unwrap_or(0.0);
+    let errors: i64 = row.try_get("errors").unwrap_or(0);
+
+    // Per-(method, path) breakdown — used as "by_tool" in the Monitor dashboard.
+    // Grouping by method disambiguates e.g. POST /v1/memories (store) vs
+    // GET /v1/memories (list).
+    let by_path_rows = sqlx::query(
+        "SELECT \
+            method, \
+            path, \
+            CAST(COUNT(*) AS SIGNED) AS cnt, \
+            CAST(COALESCE(AVG(latency_ms), 0) AS DOUBLE) AS avg_ms, \
+            CAST(COALESCE(MAX(latency_ms), 0) AS SIGNED) AS max_ms, \
+            CAST(SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END) AS SIGNED) AS err_cnt \
+         FROM mem_api_call_log \
+         WHERE user_id = ? AND called_at >= DATE_SUB(NOW(6), INTERVAL ? DAY) \
+         GROUP BY method, path \
+         ORDER BY cnt DESC \
+         LIMIT 50",
+    )
+    .bind(&user_id)
+    .bind(days)
+    .fetch_all(pool)
+    .await
+    .map_err(db_err)?;
+
+    let by_path: Vec<serde_json::Value> = by_path_rows
+        .iter()
+        .map(|r| {
+            let method: String = r.try_get("method").unwrap_or_default();
+            let path: String = r.try_get("path").unwrap_or_default();
+            let cnt: i64 = r.try_get("cnt").unwrap_or(0);
+            let p_avg: f64 = r.try_get("avg_ms").unwrap_or(0.0);
+            let max_ms: i64 = r.try_get("max_ms").unwrap_or(0);
+            let err_cnt: i64 = r.try_get("err_cnt").unwrap_or(0);
+            serde_json::json!({
+                "method": method,
+                "path": path,
+                "count": cnt,
+                "avg_ms": p_avg as i64,
+                "max_ms": max_ms,
+                "error_count": err_cnt,
+                "error_rate": if cnt > 0 {
+                    (err_cnt as f64 / cnt as f64 * 100.0).round() / 100.0
+                } else { 0.0 },
+            })
+        })
+        .collect();
+
+    // Most recent 50 calls for the live "Recent Calls" feed.
+    let recent_rows = sqlx::query(
+        "SELECT method, path, status_code, latency_ms, called_at \
+         FROM mem_api_call_log \
+         WHERE user_id = ? \
+         ORDER BY called_at DESC \
+         LIMIT 50",
+    )
+    .bind(&user_id)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+
+    let recent_calls: Vec<serde_json::Value> = recent_rows
+        .iter()
+        .map(|r| {
+            let method: String = r.try_get("method").unwrap_or_default();
+            let path: String = r.try_get("path").unwrap_or_default();
+            let status_code: i16 = r.try_get("status_code").unwrap_or(0);
+            let latency_ms: i32 = r.try_get("latency_ms").unwrap_or(0);
+            let called_at: chrono::DateTime<chrono::Utc> =
+                r.try_get("called_at").unwrap_or_else(|_| chrono::Utc::now());
+            serde_json::json!({
+                "method": method,
+                "path": path,
+                "status_code": status_code,
+                "latency_ms": latency_ms,
+                "called_at": called_at.to_rfc3339(),
+                // Friendly status string for existing dashboard display
+                "status": if status_code < 400 { "ok" } else { "err" },
+            })
+        })
+        .collect();
+
+    // ── All-time per-type aggregates (no days filter) ─────────────────────────
+    // Used by the Usage panel's stats cards: total_writes, total_searches, etc.
+    let at_row = sqlx::query(
+        "SELECT \
+            CAST(COUNT(*) AS SIGNED) AS total, \
+            CAST(SUM(CASE WHEN path = '/v1/memories' AND method = 'POST' \
+                         THEN 1 ELSE 0 END) AS SIGNED) AS writes, \
+            CAST(SUM(CASE WHEN path IN ('/v1/memories/search','/v1/memories/retrieve') \
+                         THEN 1 ELSE 0 END) AS SIGNED) AS retrieves, \
+            CAST(SUM(CASE WHEN method = 'DELETE' AND path LIKE '/v1/memories/%' \
+                         THEN 1 ELSE 0 END) AS SIGNED) AS deletes, \
+            CAST(COALESCE(AVG(CASE WHEN path IN ('/v1/memories/search','/v1/memories/retrieve') \
+                              THEN latency_ms END), 0) AS DOUBLE) AS avg_retrieval_ms \
+         FROM mem_api_call_log \
+         WHERE user_id = ?",
+    )
+    .bind(&user_id)
+    .fetch_one(pool)
+    .await
+    .map_err(db_err)?;
+
+    let at_total: i64     = at_row.try_get("total").unwrap_or(0);
+    let at_writes: i64    = at_row.try_get("writes").unwrap_or(0);
+    let at_retrieves: i64 = at_row.try_get("retrieves").unwrap_or(0);
+    let at_deletes: i64   = at_row.try_get("deletes").unwrap_or(0);
+    let at_avg_ret: f64   = at_row.try_get("avg_retrieval_ms").unwrap_or(0.0);
+
+    // ── Per-day series within the requested window ─────────────────────────────
+    // Used by the Usage panel's API Call Tracking chart.
+    // day_idx = 0 → oldest calendar day,  day_idx = days-1 → today  (DB timezone).
+    let series_rows = sqlx::query(
+        "SELECT \
+            CAST(DATEDIFF(DATE(called_at), \
+                          DATE(DATE_SUB(NOW(6), INTERVAL ? DAY))) AS SIGNED) AS day_idx, \
+            CAST(SUM(CASE WHEN path = '/v1/memories' AND method = 'POST' \
+                         THEN 1 ELSE 0 END) AS SIGNED) AS writes, \
+            CAST(SUM(CASE WHEN method = 'DELETE' AND path LIKE '/v1/memories/%' \
+                         THEN 1 ELSE 0 END) AS SIGNED) AS deletes, \
+            CAST(SUM(CASE WHEN path IN ('/v1/memories/search','/v1/memories/retrieve') \
+                         THEN 1 ELSE 0 END) AS SIGNED) AS retrieves, \
+            CAST(COUNT(*) AS SIGNED) AS total \
+         FROM mem_api_call_log \
+         WHERE user_id = ? \
+           AND DATE(called_at) >= DATE(DATE_SUB(NOW(6), INTERVAL ? DAY)) \
+         GROUP BY DATE(called_at) \
+         ORDER BY DATE(called_at) ASC",
+    )
+    .bind(days - 1)   // offset = days - 1 so day_idx 0 = oldest day
+    .bind(&user_id)
+    .bind(days - 1)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+
+    let series: Vec<serde_json::Value> = series_rows
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "day_idx":   r.try_get::<i64,_>("day_idx").unwrap_or(0),
+                "writes":    r.try_get::<i64,_>("writes").unwrap_or(0),
+                "deletes":   r.try_get::<i64,_>("deletes").unwrap_or(0),
+                "retrieves": r.try_get::<i64,_>("retrieves").unwrap_or(0),
+                "total":     r.try_get::<i64,_>("total").unwrap_or(0),
+            })
+        })
+        .collect();
+
+    Ok(Json(serde_json::json!({
+        // ── Monitor panel fields ───────────────────────────────────────────────
+        "total_calls": total,
+        "avg_latency_ms": avg_ms as i64,
+        "error_count": errors,
+        "error_rate": if total > 0 {
+            (errors as f64 / total as f64 * 100.0).round() / 100.0
+        } else { 0.0 },
+        "days": days,
+        "by_path": by_path,
+        "recent_calls": recent_calls,
+        // ── Usage panel fields ─────────────────────────────────────────────────
+        "all_time": {
+            "total_calls":     at_total,
+            "total_writes":    at_writes,
+            "total_retrieves": at_retrieves,
+            "total_deletes":   at_deletes,
+            "avg_retrieval_ms": at_avg_ret as i64,
+        },
+        "series": series,
+    })))
+}
+
 /// Redact password from database URL for safe display.
 fn redact_url(url: &str) -> String {
     // mysql://user:pass@host:port/db → mysql://user:***@host:port/db
