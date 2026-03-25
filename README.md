@@ -3,7 +3,11 @@
   
   # Memoria
   
-  **Secure · Auditable · Programmable Memory for AI Agents**
+  **The World's First Git for AI Agent Memory**
+  
+  *Snapshot · Branch · Merge · Rollback — for memory, not code.*
+  
+  > Git made code safe to change. Memoria makes memory safe to change.
   
   [![MatrixOne](https://img.shields.io/badge/Powered%20by-MatrixOne-00ADD8?style=flat-square&logo=database)](https://github.com/matrixorigin/matrixone)
   [![MCP](https://img.shields.io/badge/Protocol-MCP-7C3AED?style=flat-square)](https://modelcontextprotocol.io)
@@ -65,42 +69,44 @@ A story-writing scenario makes the core idea visible faster: an author already h
 
 ## Quick Start
 
-### 1. Start MatrixOne
+### Option A: Memoria Cloud (Recommended)
 
-```bash
-git clone https://github.com/matrixorigin/Memoria.git
-cd Memoria
-docker compose up -d
-```
+The fastest way to get started — no Docker, no database setup.
 
-Or use [MatrixOne Cloud](https://cloud.matrixorigin.cn) (free tier, no Docker needed).
+1. **Sign up** at [thememoria.ai](https://thememoria.ai/auth) and get your token
+2. **Install Memoria CLI**
+   ```bash
+   curl -sSL https://raw.githubusercontent.com/matrixorigin/Memoria/main/scripts/install.sh | bash
+   ```
+   Or download from [GitHub Releases](https://github.com/matrixorigin/Memoria/releases).
+3. **Configure your AI tool**
+   ```bash
+   cd your-project
+   memoria init -i   # Interactive wizard — select "Remote" mode, paste your token
+   ```
+   This creates MCP config + steering rules for your AI tool (Kiro, Cursor, Claude, Codex, or Gemini CLI).
+4. **Restart & verify** — restart your AI tool, then ask: *"Do you have memory tools available?"*
 
-### 2. Install Memoria
+### Option B: Self-Hosted (Docker)
 
-```bash
-curl -sSL https://raw.githubusercontent.com/matrixorigin/Memoria/main/scripts/install.sh | bash
-```
+Run your own Memoria stack with full control over data.
 
-Or download from [GitHub Releases](https://github.com/matrixorigin/Memoria/releases).
-
-### 3. Configure your AI tool
-
-```bash
-cd your-project
-memoria init -i   # Interactive wizard (recommended)
-```
-
-This creates MCP config + steering rules for your AI tool (Kiro, Cursor, Claude, Codex, or Gemini CLI).
-
-### 🦞 OpenClaw Plugin (Already Using OpenClaw?)
-
-Use the native OpenClaw plugin guide: [OpenClaw Plugin Setup](plugins/openclaw/README.md).
-
-```bash
-openclaw plugins install @matrixorigin/memory-memoria
-openclaw plugins enable memory-memoria
-openclaw memoria install
-```
+1. **Start MatrixOne + API**
+   ```bash
+   git clone https://github.com/matrixorigin/Memoria.git
+   cd Memoria
+   docker compose up -d
+   ```
+2. **Install Memoria CLI**
+   ```bash
+   curl -sSL https://raw.githubusercontent.com/matrixorigin/Memoria/main/scripts/install.sh | bash
+   ```
+3. **Configure your AI tool**
+   ```bash
+   cd your-project
+   memoria init -i   # Interactive wizard — select "Embedded" mode
+   ```
+4. **Restart & verify** — restart your AI tool, then ask: *"Do you have memory tools available?"*
 
 ### 🦞 OpenClaw Plugin (Already Using OpenClaw?)
 
@@ -114,20 +120,10 @@ command -v memoria >/dev/null || curl -sSL https://raw.githubusercontent.com/mat
 openclaw plugins install @matrixorigin/memory-memoria
 openclaw plugins enable memory-memoria
 
-# if npm package is unavailable, fallback to source-link
-mkdir -p ~/.openclaw/plugins-src
-if [ ! -d ~/.openclaw/plugins-src/Memoria/.git ]; then git clone https://github.com/matrixorigin/Memoria.git ~/.openclaw/plugins-src/Memoria; else git -C ~/.openclaw/plugins-src/Memoria pull --ff-only; fi
-openclaw plugins install --link ~/.openclaw/plugins-src/Memoria/plugins/openclaw
-openclaw plugins enable memory-memoria
-
 # cloud-first setup flow
 openclaw memoria setup --mode cloud --api-url <MEMORIA_API_URL> --api-key <MEMORIA_API_KEY> --install-memoria
 openclaw memoria health
 ```
-
-### 4. Restart & verify
-
-Restart your AI tool, then ask: *"Do you have memory tools available?"*
 
 For detailed setup, see [Setup Skill](skills/setup/SKILL.md).
 
@@ -307,19 +303,28 @@ If you're an AI agent helping a user set up Memoria:
 1. **Load the [Setup Skill](skills/setup/SKILL.md)** — it has step-by-step instructions
 2. **Ask before acting**:
    - Which AI tool? (Kiro / Cursor / Claude / Codex / Gemini CLI)
-   - MatrixOne database? (Docker / Cloud / existing)
-   - Embedding service? (OpenAI / SiliconFlow / local)
+   - Database? ([Memoria Cloud](https://thememoria.ai/auth) / Docker / existing)
+   - Embedding service? (OpenAI / SiliconFlow / local) — *Self-Hosted only, Cloud handles this*
 3. **Run `memoria init -i`** in the user's project directory
 4. **Tell user to restart** their AI tool
 5. **Verify** with `memory_retrieve("test")`
 
-⚠️ **Configure embedding BEFORE first MCP server start** — dimension is locked into schema.
+⚠️ **Self-Hosted only:** Configure embedding BEFORE first MCP server start — dimension is locked into schema.
 
 ---
 
 ## Architecture
 
 ```
+Cloud / Remote Mode:
+
+┌─────────────┐     MCP (stdio)     ┌──────────────────┐     HTTP/REST     ┌──────────────────┐
+│  AI Agent   │ ◄─────────────────► │  Memoria CLI     │ ◄──────────────► │  Memoria Cloud   │
+│             │   store / retrieve  │  (MCP bridge)    │   Bearer token   │  API Server      │
+└─────────────┘                     └──────────────────┘                  └──────────────────┘
+
+Self-Hosted / Embedded Mode:
+
 ┌─────────────┐     MCP (stdio)     ┌──────────────────────────────────────┐     SQL      ┌────────────┐
 │  AI Agent   │ ◄─────────────────► │  Memoria MCP Server                  │ ◄──────────► │ MatrixOne  │
 │             │   store / retrieve  │  ├── Canonical Storage               │  vector +    │  Database  │
