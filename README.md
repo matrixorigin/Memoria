@@ -304,18 +304,27 @@ If you're an AI agent helping a user set up Memoria:
 2. **Ask before acting**:
    - Which AI tool? (Kiro / Cursor / Claude / Codex / Gemini CLI)
    - Database? ([Memoria Cloud](https://thememoria.ai/auth) / Docker / existing)
-   - Embedding service? (OpenAI / SiliconFlow / local)
+   - Embedding service? (OpenAI / SiliconFlow / local) — *Self-Hosted only, Cloud handles this*
 3. **Run `memoria init -i`** in the user's project directory
 4. **Tell user to restart** their AI tool
 5. **Verify** with `memory_retrieve("test")`
 
-⚠️ **Configure embedding BEFORE first MCP server start** — dimension is locked into schema.
+⚠️ **Self-Hosted only:** Configure embedding BEFORE first MCP server start — dimension is locked into schema.
 
 ---
 
 ## Architecture
 
 ```
+Cloud / Remote Mode:
+
+┌─────────────┐     MCP (stdio)     ┌──────────────────┐     HTTP/REST     ┌──────────────────┐
+│  AI Agent   │ ◄─────────────────► │  Memoria CLI     │ ◄──────────────► │  Memoria Cloud   │
+│             │   store / retrieve  │  (MCP bridge)    │   Bearer token   │  API Server      │
+└─────────────┘                     └──────────────────┘                  └──────────────────┘
+
+Self-Hosted / Embedded Mode:
+
 ┌─────────────┐     MCP (stdio)     ┌──────────────────────────────────────┐     SQL      ┌────────────┐
 │  AI Agent   │ ◄─────────────────► │  Memoria MCP Server                  │ ◄──────────► │ MatrixOne  │
 │             │   store / retrieve  │  ├── Canonical Storage               │  vector +    │  Database  │
