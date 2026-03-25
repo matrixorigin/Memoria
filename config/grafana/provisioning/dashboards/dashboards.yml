@@ -1,0 +1,13 @@
+# Auto-load dashboards from the /dashboards mount.
+apiVersion: 1
+
+providers:
+  - name: "Memoria"
+    orgId: 1
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    allowUiUpdates: true
+    options:
+      path: /dashboards
+      foldersFromFilesStructure: false
