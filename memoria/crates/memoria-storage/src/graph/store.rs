@@ -3,7 +3,7 @@
 
 use crate::graph::types::{edge_type, GraphEdge, GraphNode, NodeType};
 use crate::store::db_err;
-use memoria_core::MemoriaError;
+use memoria_core::{nullable_str, nullable_str_from_row, MemoriaError};
 use sqlx::{MySqlPool, Row};
 use uuid::Uuid;
 
@@ -296,19 +296,19 @@ impl GraphStore {
             .bind(&node.user_id)
             .bind(node.node_type.as_str())
             .bind(&node.content)
-            .bind(&node.entity_type)
-            .bind(&node.memory_id)
-            .bind(&node.session_id)
+            .bind(nullable_str(&node.entity_type))
+            .bind(nullable_str(&node.memory_id))
+            .bind(nullable_str(&node.session_id))
             .bind(node.confidence)
             .bind(&node.trust_tier)
             .bind(node.importance)
             .bind(source_nodes_str)
-            .bind(&node.conflicts_with)
-            .bind(&node.conflict_resolution)
+            .bind(nullable_str(&node.conflicts_with))
+            .bind(nullable_str(&node.conflict_resolution))
             .bind(node.access_count)
             .bind(node.cross_session_count)
             .bind(if node.is_active { 1i8 } else { 0i8 })
-            .bind(&node.superseded_by)
+            .bind(nullable_str(&node.superseded_by))
             .bind(now)
             .execute(&self.pool)
             .await
@@ -968,7 +968,7 @@ impl GraphStore {
     }
 
     /// Deactivate entity links in `mem_memory_entity_links` for a memory_id.
-    pub async fn deactivate_memory_entity_links(
+    pub async fn delete_memory_entity_links(
         &self,
         memory_id: &str,
     ) -> Result<i64, MemoriaError> {
@@ -1115,20 +1115,20 @@ fn row_to_node_inner(r: &sqlx::mysql::MySqlRow, embedding: Option<Vec<f32>>) -> 
         user_id: r.try_get("user_id").unwrap_or_default(),
         node_type: node_type_str.parse().unwrap(),
         content: r.try_get("content").unwrap_or_default(),
-        entity_type: r.try_get("entity_type").ok().flatten(),
+        entity_type: nullable_str_from_row(r.try_get::<Option<String>, _>("entity_type").ok().flatten()),
         embedding,
-        memory_id: r.try_get("memory_id").ok().flatten(),
-        session_id: r.try_get("session_id").ok().flatten(),
+        memory_id: nullable_str_from_row(r.try_get::<Option<String>, _>("memory_id").ok().flatten()),
+        session_id: nullable_str_from_row(r.try_get::<Option<String>, _>("session_id").ok().flatten()),
         confidence: r.try_get::<f32, _>("confidence").unwrap_or(0.75),
         trust_tier: r.try_get("trust_tier").unwrap_or_else(|_| "T3".to_string()),
         importance: r.try_get::<f32, _>("importance").unwrap_or(0.0),
         source_nodes,
-        conflicts_with: r.try_get("conflicts_with").ok().flatten(),
-        conflict_resolution: r.try_get("conflict_resolution").ok().flatten(),
+        conflicts_with: nullable_str_from_row(r.try_get::<Option<String>, _>("conflicts_with").ok().flatten()),
+        conflict_resolution: nullable_str_from_row(r.try_get::<Option<String>, _>("conflict_resolution").ok().flatten()),
         access_count: r.try_get::<i32, _>("access_count").unwrap_or(0),
         cross_session_count: r.try_get::<i32, _>("cross_session_count").unwrap_or(0),
         is_active: r.try_get::<i16, _>("is_active").unwrap_or(1) != 0,
-        superseded_by: r.try_get("superseded_by").ok().flatten(),
+        superseded_by: nullable_str_from_row(r.try_get::<Option<String>, _>("superseded_by").ok().flatten()),
         created_at: r.try_get("created_at").ok(),
     }
 }

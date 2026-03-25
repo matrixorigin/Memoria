@@ -8,6 +8,8 @@ use sqlx::Row;
 
 use crate::{auth::AuthUser, models::*, state::AppState};
 
+use memoria_core::nullable_str_from_row;
+
 type ApiResult<T> = Result<Json<T>, (StatusCode, String)>;
 pub fn api_err(e: impl std::fmt::Display) -> (StatusCode, String) {
     tracing::error!(error = %e, "internal server error");
@@ -560,7 +562,7 @@ pub async fn get_memory_history(
         match row {
             Some(r) => {
                 let mid: String = r.try_get("memory_id").unwrap_or_default();
-                let sup: Option<String> = r.try_get("superseded_by").ok().flatten();
+                let sup: Option<String> = nullable_str_from_row(r.try_get("superseded_by").ok().flatten());
                 chain.push(serde_json::json!({
                     "memory_id": mid,
                     "content": r.try_get::<String, _>("content").unwrap_or_default(),

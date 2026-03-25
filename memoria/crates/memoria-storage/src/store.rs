@@ -1,6 +1,9 @@
 use async_trait::async_trait;
 use chrono::Utc;
-use memoria_core::{interfaces::MemoryStore, MemoriaError, Memory, MemoryType, TrustTier};
+use memoria_core::{
+    interfaces::MemoryStore, nullable_str, nullable_str_from_row, Memory, MemoriaError, MemoryType,
+    TrustTier,
+};
 use sqlx::{mysql::MySqlPool, Row};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -63,6 +66,8 @@ pub struct OwnedEditLogEntry {
 fn uuid7_id() -> String {
     uuid::Uuid::now_v7().simple().to_string()
 }
+
+// Workaround: MO#24001 — nullable_str / nullable_str_from_row imported from memoria_core.
 
 /// Sanitize a string for safe interpolation inside a SQL single-quoted literal.
 /// Escapes `'`, `\`, and strips NUL bytes.
@@ -892,6 +897,37 @@ impl SqlMemoryStore {
             )
             .execute(&self.pool)
             .await;
+        }
+
+        // Migration: MO#24001 — normalize empty-string NULLable VARCHAR columns to real NULL.
+        // MatrixOne PREPARE/EXECUTE stores Option<String>::None as '' instead of NULL.
+        // Effectively runs once: after fix, new writes use nullable_str() and never produce ''.
+        let has_empty_superseded: bool = sqlx::query_scalar(
+            "SELECT COUNT(*) > 0 FROM mem_memories WHERE superseded_by = ''",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .unwrap_or(false);
+        if has_empty_superseded {
+            for (tbl, col) in [
+                ("mem_memories", "superseded_by"),
+                ("mem_memories", "session_id"),
+                ("memory_graph_nodes", "superseded_by"),
+                ("memory_graph_nodes", "session_id"),
+                ("memory_graph_nodes", "memory_id"),
+                ("memory_graph_nodes", "entity_type"),
+                ("memory_graph_nodes", "conflicts_with"),
+                ("memory_graph_nodes", "conflict_resolution"),
+            ] {
+                if let Err(e) = sqlx::query(&format!(
+                    "UPDATE {tbl} SET {col} = NULL WHERE {col} = ''"
+                ))
+                .execute(&self.pool)
+                .await
+                {
+                    tracing::warn!(table = tbl, column = col, error = %e, "MO#24001 migration: failed to normalize empty strings");
+                }
+            }
         }
 
         Ok(())
@@ -1759,7 +1795,7 @@ impl SqlMemoryStore {
              WHERE inc.user_id = ? \
                AND inc.is_active = 1 \
                AND LOCATE('[session_summary:incremental]', inc.content) = 1 \
-               AND inc.session_id IS NOT NULL \
+               AND inc.session_id IS NOT NULL AND inc.session_id != '' \
                AND TIMESTAMPDIFF(HOUR, inc.observed_at, NOW()) > ? \
                AND NOT EXISTS ( \
                    SELECT 1 FROM mem_memories AS full_s \
@@ -2604,7 +2640,7 @@ impl SqlMemoryStore {
     ) -> Result<bool, MemoriaError> {
         let row: (i64, i64) = sqlx::query_as(
             "SELECT COUNT(*) as total_changes, \
-             SUM(CASE WHEN superseded_by IS NOT NULL THEN 1 ELSE 0 END) as supersedes \
+             SUM(CASE WHEN superseded_by IS NOT NULL AND superseded_by != '' THEN 1 ELSE 0 END) as supersedes \
              FROM mem_memories \
              WHERE user_id = ? AND updated_at >= DATE_SUB(NOW(), INTERVAL ? HOUR)",
         )
@@ -2624,7 +2660,7 @@ impl SqlMemoryStore {
     pub async fn health_analyze(&self, user_id: &str) -> Result<serde_json::Value, MemoriaError> {
         let rows: Vec<(String, i64, f64, i64, f64)> = sqlx::query_as(
             "SELECT memory_type, COUNT(*) as total, AVG(initial_confidence) as avg_conf, \
-             COUNT(CASE WHEN superseded_by IS NOT NULL THEN 1 END) as superseded, \
+             COUNT(CASE WHEN superseded_by IS NOT NULL AND superseded_by != '' THEN 1 END) as superseded, \
              AVG(TIMESTAMPDIFF(HOUR, observed_at, NOW())) as avg_stale_h \
              FROM mem_memories WHERE user_id = ? GROUP BY memory_type",
         )
@@ -2893,10 +2929,10 @@ impl SqlMemoryStore {
         .bind(memory.memory_type.to_string())
         .bind(&memory.content)
         .bind(embedding)
-        .bind(&memory.session_id)
+        .bind(nullable_str(&memory.session_id))
         .bind(source_event_ids)
         .bind(extra_metadata)
-        .bind(&memory.superseded_by)
+        .bind(nullable_str(&memory.superseded_by))
         .bind(memory.trust_tier.to_string())
         .bind(memory.initial_confidence as f32)
         .bind(observed_at)
@@ -2955,10 +2991,10 @@ impl SqlMemoryStore {
                     .bind(m.memory_type.to_string())
                     .bind(m.content.clone())
                     .bind(embedding)
-                    .bind(m.session_id.clone())
+                    .bind(nullable_str(&m.session_id).map(str::to_string))
                     .bind(source_event_ids)
                     .bind(extra_metadata)
-                    .bind(m.superseded_by.clone())
+                    .bind(nullable_str(&m.superseded_by).map(str::to_string))
                     .bind(m.trust_tier.to_string())
                     .bind(m.initial_confidence as f32)
                     .bind(observed_at)
@@ -3571,7 +3607,7 @@ impl MemoryStore for SqlMemoryStore {
         .bind(memory.trust_tier.to_string())
         .bind(memory.initial_confidence as f32)
         .bind(extra_metadata)
-        .bind(&memory.superseded_by)
+        .bind(nullable_str(&memory.superseded_by))
         .bind(now)
         .bind(&memory.memory_id)
         .execute(&self.pool)
@@ -3666,13 +3702,13 @@ fn row_to_memory(row: &sqlx::mysql::MySqlRow) -> Result<Memory, MemoriaError> {
             .map_err(db_err)? as f64,
         embedding,
         source_event_ids,
-        superseded_by: row.try_get("superseded_by").map_err(db_err)?,
+        superseded_by: nullable_str_from_row(row.try_get("superseded_by").map_err(db_err)?),
         is_active: {
             let v: i8 = row.try_get("is_active").map_err(db_err)?;
             v != 0
         },
         access_count: 0,
-        session_id: row.try_get("session_id").map_err(db_err)?,
+        session_id: nullable_str_from_row(row.try_get("session_id").map_err(db_err)?),
         observed_at,
         created_at,
         updated_at,

@@ -581,6 +581,25 @@ impl MemoryService {
         }
     }
 
+    /// Best-effort cleanup of graph node + entity links for a deactivated memory.
+    /// Used by correct, purge, and dedup-supersede paths.
+    async fn cleanup_entity_data_for_memory(
+        sql: &SqlMemoryStore,
+        memory_id: &str,
+        op: &str,
+    ) {
+        let graph = sql.graph_store();
+        if let Err(e) = graph.deactivate_by_memory_id(memory_id).await {
+            tracing::warn!(memory_id, error = %e, "{op}: failed to deactivate graph node");
+        }
+        if let Err(e) = graph.delete_memory_entity_links(memory_id).await {
+            tracing::warn!(memory_id, error = %e, "{op}: failed to delete entity links");
+        }
+        if let Err(e) = sql.delete_entity_links_by_memory_id(memory_id).await {
+            tracing::warn!(memory_id, error = %e, "{op}: failed to delete legacy entity links");
+        }
+    }
+
     /// Enqueue a memory for async entity extraction.
     /// Non-blocking: drops the job immediately if the queue is full.
     async fn enqueue_entity_extraction(&self, user_id: &str, memory_id: &str, content: &str) {
@@ -921,6 +940,8 @@ impl MemoryService {
                         let t_insert = t2.elapsed();
                         sql.supersede_memory(&table, &old_id, &memory.memory_id)
                             .await?;
+                        // Clean up entity links for superseded memory (matches correct/purge behavior)
+                        Self::cleanup_entity_data_for_memory(sql, &old_id, "supersede").await;
                         let payload = serde_json::json!({"content": &memory.content, "type": memory.memory_type.to_string()}).to_string();
                         self.send_edit_log(
                             user_id,
@@ -1465,10 +1486,7 @@ impl MemoryService {
                 .await?;
 
             // Graph sync: deactivate old node + entity links, new node gets entities via extraction
-            let graph = sql.graph_store();
-            let _ = graph.deactivate_by_memory_id(memory_id).await;
-            let _ = graph.deactivate_memory_entity_links(memory_id).await;
-            let _ = sql.delete_entity_links_by_memory_id(memory_id).await;
+            Self::cleanup_entity_data_for_memory(sql, memory_id, "correct").await;
 
             let payload = serde_json::json!({
                 "new_content": new_content,
@@ -1533,10 +1551,7 @@ impl MemoryService {
             let table = sql.active_table(user_id).await?;
             sql.soft_delete_from(&table, memory_id).await?;
             // Graph + entity link cleanup (best-effort, governance fallback covers crash)
-            let graph = sql.graph_store();
-            let _ = graph.deactivate_by_memory_id(memory_id).await;
-            let _ = graph.deactivate_memory_entity_links(memory_id).await;
-            let _ = sql.delete_entity_links_by_memory_id(memory_id).await;
+            Self::cleanup_entity_data_for_memory(sql, memory_id, "purge").await;
             Ok(PurgeResult {
                 purged: 1,
                 snapshot_name: snap,
@@ -1561,14 +1576,10 @@ impl MemoryService {
         if let Some(sql) = &self.sql_store {
             let (snap, warning) = sql.create_safety_snapshot("purge").await;
             let table = sql.active_table(user_id).await?;
-            let graph = sql.graph_store();
             for id in ids {
                 sql.soft_delete_from(&table, id).await?;
                 self.send_edit_log(user_id, "purge", Some(id), None, "", snap.as_deref());
-                // Graph + entity link cleanup (best-effort)
-                let _ = graph.deactivate_by_memory_id(id).await;
-                let _ = graph.deactivate_memory_entity_links(id).await;
-                let _ = sql.delete_entity_links_by_memory_id(id).await;
+                Self::cleanup_entity_data_for_memory(sql, id, "purge_batch").await;
             }
             Ok(PurgeResult {
                 purged: ids.len(),
@@ -1597,12 +1608,9 @@ impl MemoryService {
             let (snap, warning) = sql.create_safety_snapshot("purge").await;
             let table = sql.active_table(user_id).await?;
             let ids = sql.find_ids_by_topic(&table, user_id, topic).await?;
-            let graph = sql.graph_store();
             for id in &ids {
                 sql.soft_delete_from(&table, id).await?;
-                let _ = graph.deactivate_by_memory_id(id).await;
-                let _ = graph.deactivate_memory_entity_links(id).await;
-                let _ = sql.delete_entity_links_by_memory_id(id).await;
+                Self::cleanup_entity_data_for_memory(sql, id, "purge_topic").await;
             }
             let reason = format!("topic:{topic}");
             for id in &ids {
