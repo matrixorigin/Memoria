@@ -40,11 +40,45 @@ pub async fn mcp_handler(
         }
     };
 
-    // JSON-RPC 2.0: a Notification is a Request without an "id" member.
+    // Per JSON-RPC 2.0 §4, a Request object MUST be a JSON object.
+    // Anything else (array, string, number, …) is Invalid Request.
+    if !req.is_object() {
+        return Json(json!({
+            "jsonrpc": "2.0",
+            "id": null,
+            "error": {"code": -32600, "message": "Invalid Request: payload must be a JSON object"}
+        }))
+        .into_response();
+    }
+
+    // "jsonrpc" MUST equal exactly "2.0".
+    if req.get("jsonrpc").and_then(|v| v.as_str()) != Some("2.0") {
+        return Json(json!({
+            "jsonrpc": "2.0",
+            "id": req.get("id").cloned().unwrap_or(serde_json::Value::Null),
+            "error": {"code": -32600, "message": "Invalid Request: jsonrpc must be \"2.0\""}
+        }))
+        .into_response();
+    }
+
+    // "method" MUST be a non-empty string.
+    let method = match req.get("method").and_then(|v| v.as_str()) {
+        Some(m) if !m.is_empty() => m.to_string(),
+        _ => {
+            return Json(json!({
+                "jsonrpc": "2.0",
+                "id": req.get("id").cloned().unwrap_or(serde_json::Value::Null),
+                "error": {"code": -32600, "message": "Invalid Request: method must be a non-empty string"}
+            }))
+            .into_response();
+        }
+    };
+
+    let params = req.get("params").cloned();
+
+    // JSON-RPC 2.0: a Notification is a *valid* Request without an "id" member.
     // The server MUST NOT reply to Notifications.
     if req.get("id").is_none() {
-        let method = req["method"].as_str().unwrap_or("").to_string();
-        let params = req.get("params").cloned();
         let _ = memoria_mcp::dispatch_http(
             &method,
             params,
@@ -57,13 +91,14 @@ pub async fn mcp_handler(
     }
 
     let id = req["id"].clone();
-    let method = req["method"].as_str().unwrap_or("").to_string();
-    let params = req.get("params").cloned();
 
     match memoria_mcp::dispatch_http(&method, params, &state.service, &state.git, &auth.user_id)
         .await
     {
-        Ok(v) => Json(json!({"jsonrpc": "2.0", "id": id, "result": v})).into_response(),
+        Ok(v) => {
+            let result = if v.is_null() { json!({}) } else { v };
+            Json(json!({"jsonrpc": "2.0", "id": id, "result": result})).into_response()
+        }
         Err(e) => Json(json!({
             "jsonrpc": "2.0",
             "id": id,

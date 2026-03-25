@@ -53,16 +53,11 @@ pub async fn dispatch_http(
     git: &Arc<GitForDataService>,
     user_id: &str,
 ) -> Result<Value, McpRpcError> {
-    dispatch(
-        method,
-        params,
-        &Mode::Embedded {
-            service: service.clone(),
-            git: git.clone(),
-        },
-        user_id,
-    )
-    .await
+    let mode = Mode::Embedded {
+        service: service.clone(),
+        git: git.clone(),
+    };
+    dispatch(method, params, &mode, user_id).await
 }
 
 /// Run in embedded mode (direct DB).

@@ -5754,6 +5754,73 @@ async fn test_mcp_invalid_json_returns_parse_error() {
 }
 
 #[tokio::test]
+async fn test_mcp_invalid_request_non_object() {
+    let (base, client) = spawn_server().await;
+
+    // A JSON array is valid JSON but not a JSON-RPC object → -32600
+    let resp: Value = client
+        .post(format!("{base}/mcp"))
+        .header("Content-Type", "application/json")
+        .header("X-User-Id", "test_user")
+        .body("[1,2,3]")
+        .send()
+        .await
+        .expect("send")
+        .json()
+        .await
+        .expect("parse");
+
+    assert_eq!(resp["jsonrpc"], "2.0");
+    assert!(resp["id"].is_null());
+    assert_eq!(resp["error"]["code"], -32600, "expected invalid request code");
+    println!("✅ POST /mcp array payload → -32600 Invalid Request");
+}
+
+#[tokio::test]
+async fn test_mcp_invalid_request_wrong_version() {
+    let (base, client) = spawn_server().await;
+
+    // jsonrpc != "2.0" → -32600
+    let resp: Value = client
+        .post(format!("{base}/mcp"))
+        .header("Content-Type", "application/json")
+        .header("X-User-Id", "test_user")
+        .body(r#"{"jsonrpc":"1.0","id":1,"method":"initialize"}"#)
+        .send()
+        .await
+        .expect("send")
+        .json()
+        .await
+        .expect("parse");
+
+    assert_eq!(resp["jsonrpc"], "2.0");
+    assert_eq!(resp["error"]["code"], -32600, "expected invalid request code");
+    println!("✅ POST /mcp jsonrpc=1.0 → -32600 Invalid Request");
+}
+
+#[tokio::test]
+async fn test_mcp_invalid_request_missing_method() {
+    let (base, client) = spawn_server().await;
+
+    // No method field → -32600 (not mistaken for a Notification)
+    let resp: Value = client
+        .post(format!("{base}/mcp"))
+        .header("Content-Type", "application/json")
+        .header("X-User-Id", "test_user")
+        .body(r#"{"jsonrpc":"2.0","id":1}"#)
+        .send()
+        .await
+        .expect("send")
+        .json()
+        .await
+        .expect("parse");
+
+    assert_eq!(resp["jsonrpc"], "2.0");
+    assert_eq!(resp["error"]["code"], -32600, "expected invalid request code");
+    println!("✅ POST /mcp missing method → -32600 Invalid Request");
+}
+
+#[tokio::test]
 async fn test_mcp_auth_required_when_master_key_set() {
     let (base, client) = spawn_server_with_key("test-master-secret").await;
 
