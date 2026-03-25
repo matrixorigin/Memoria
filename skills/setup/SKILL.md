@@ -29,7 +29,7 @@ Ask: "Do you have a MatrixOne database running?"
 
 - Already have one → get connection URL
 - No, use Docker → `docker compose up -d` (wait 30-60s first start)
-- No Docker → [MatrixOne Cloud](https://cloud.matrixorigin.cn) (free tier)
+- No Docker → [Memoria Cloud](https://thememoria.ai/auth) (free, no setup needed)
 
 ### Step 4: Embedding provider?
 
@@ -70,7 +70,7 @@ cd <user-project>
 memoria init --tool <tool>              # + embedding flags below
 ```
 
-### MatrixOne Cloud / Existing DB
+### Memoria Cloud / Existing DB
 
 ```bash
 cd <user-project>
@@ -134,7 +134,7 @@ memoria mcp --transport sse
 | Port 6001 in use | Change `MO_PORT` in `.env` |
 | Can't connect | Wait 30-60s on first start |
 | Docker permission denied | `sudo usermod -aG docker $USER && newgrp docker` |
-| Docker not installed | Use MatrixOne Cloud instead |
+| Docker not installed | Use [Memoria Cloud](https://thememoria.ai/auth) instead |
 | First query slow | Normal with local embedding (~3-5s). Use `openai` provider to avoid |
 | `local-embedding` not compiled | Use OpenAI-compatible service, or build from source |
 | AI tool doesn't use memory | 1. `which memoria` 2. Restart tool 3. Test server directly |
