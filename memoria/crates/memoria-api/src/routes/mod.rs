@@ -1,6 +1,7 @@
 pub mod admin;
 pub mod auth;
 pub mod governance;
+pub mod mcp;
 pub mod memory;
 pub mod metrics;
 pub mod plugins;
