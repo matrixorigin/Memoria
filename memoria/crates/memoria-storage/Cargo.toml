@@ -14,8 +14,10 @@ uuid = { workspace = true }
 async-trait = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
+moka = { version = "0.12", features = ["future"] }
 
 [dev-dependencies]
 chrono = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
+tracing-subscriber = { workspace = true }

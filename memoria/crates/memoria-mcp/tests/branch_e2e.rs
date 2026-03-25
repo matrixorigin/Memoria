@@ -857,11 +857,15 @@ async fn test_correct_on_branch_isolated_from_main() {
     // Branch should show corrected content
     let branch_mems = svc.list_active(&uid, 10).await.unwrap();
     assert!(
-        branch_mems.iter().any(|m| m.content == "corrected on branch"),
+        branch_mems
+            .iter()
+            .any(|m| m.content == "corrected on branch"),
         "branch should have corrected memory"
     );
     assert!(
-        !branch_mems.iter().any(|m| m.content == "original fact" && m.is_active),
+        !branch_mems
+            .iter()
+            .any(|m| m.content == "original fact" && m.is_active),
         "original should be deactivated on branch"
     );
 
@@ -908,14 +912,9 @@ async fn test_purge_on_branch_isolated_from_main() {
     gc("memory_checkout", json!({"name": branch}), &git, &svc, &uid).await;
 
     // Purge on branch
-    memoria_mcp::tools::call(
-        "memory_purge",
-        json!({"memory_id": mid}),
-        &svc,
-        &uid,
-    )
-    .await
-    .expect("purge on branch");
+    memoria_mcp::tools::call("memory_purge", json!({"memory_id": mid}), &svc, &uid)
+        .await
+        .expect("purge on branch");
 
     // Branch should be empty
     let branch_mems = svc.list_active(&uid, 10).await.unwrap();
@@ -1018,30 +1017,37 @@ async fn test_purge_batch_on_branch_isolated_from_main() {
 
     // Purge batch on branch (comma-separated IDs)
     let batch = format!("{},{}", ids[0], ids[1]);
-    memoria_mcp::tools::call(
-        "memory_purge",
-        json!({"memory_id": batch}),
-        &svc,
-        &uid,
-    )
-    .await
-    .expect("purge batch on branch");
+    memoria_mcp::tools::call("memory_purge", json!({"memory_id": batch}), &svc, &uid)
+        .await
+        .expect("purge batch on branch");
 
     // Branch should be empty
     let branch_mems = svc.list_active(&uid, 10).await.unwrap();
-    assert_eq!(branch_mems.len(), 0, "branch should have 0 memories after batch purge");
+    assert_eq!(
+        branch_mems.len(),
+        0,
+        "branch should have 0 memories after batch purge"
+    );
 
     // Switch to main — both should still be there
     gc("memory_checkout", json!({"name": "main"}), &git, &svc, &uid).await;
     let main_mems = svc.list_active(&uid, 10).await.unwrap();
     assert_eq!(
-        main_mems.len(), 2,
+        main_mems.len(),
+        2,
         "main should still have both memories, got: {:?}",
         main_mems.iter().map(|m| &m.content).collect::<Vec<_>>()
     );
     println!("✅ purge_batch on branch isolated from main");
 
-    gc("memory_branch_delete", json!({"name": branch}), &git, &svc, &uid).await;
+    gc(
+        "memory_branch_delete",
+        json!({"name": branch}),
+        &git,
+        &svc,
+        &uid,
+    )
+    .await;
 }
 
 // ── 26. correct with sensitive content is blocked ────────────────────────────
@@ -1065,7 +1071,10 @@ async fn test_correct_blocks_sensitive_content() {
     .await;
 
     // Should fail with Blocked error
-    assert!(result.is_err(), "correct with sensitive content should be blocked");
+    assert!(
+        result.is_err(),
+        "correct with sensitive content should be blocked"
+    );
     let err = result.unwrap_err().to_string();
     assert!(
         err.contains("sensitive") || err.contains("Blocked"),
@@ -1118,7 +1127,10 @@ async fn test_correct_triggers_entity_extraction() {
     let mut found = false;
     for _ in 0..10 {
         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-        let unlinked = graph.get_unlinked_memories(&uid, 100).await.unwrap_or_default();
+        let unlinked = graph
+            .get_unlinked_memories(&uid, 100)
+            .await
+            .unwrap_or_default();
         // If new_mid is NOT in unlinked, it means entity links were created
         if !unlinked.iter().any(|(m, _)| m == new_mid) {
             found = true;
@@ -1156,7 +1168,10 @@ async fn test_get_for_user_finds_branch_only_memory() {
 
     // get_for_user should find it (branch-aware)
     let found = svc.get_for_user(&uid, &branch_mid).await.unwrap();
-    assert!(found.is_some(), "get_for_user should find branch-only memory");
+    assert!(
+        found.is_some(),
+        "get_for_user should find branch-only memory"
+    );
     assert_eq!(found.unwrap().content, "branch-only secret");
 
     // plain get() should NOT find it (hardcoded to mem_memories)
@@ -1169,9 +1184,15 @@ async fn test_get_for_user_finds_branch_only_memory() {
     println!("✅ get_for_user finds branch-only memory, get() does not");
 
     gc("memory_checkout", json!({"name": "main"}), &git, &svc, &uid).await;
-    gc("memory_branch_delete", json!({"name": branch}), &git, &svc, &uid).await;
+    gc(
+        "memory_branch_delete",
+        json!({"name": branch}),
+        &git,
+        &svc,
+        &uid,
+    )
+    .await;
 }
-
 
 // ── 29. Micro-batch entity extraction: burst writes are batched correctly ────
 
@@ -1202,7 +1223,10 @@ async fn test_micro_batch_entity_extraction() {
     // Verify all memories have entity links
     let sql = svc.sql_store.as_ref().expect("sql_store");
     let graph = sql.graph_store();
-    let unlinked = graph.get_unlinked_memories(&uid, 100).await.unwrap_or_default();
+    let unlinked = graph
+        .get_unlinked_memories(&uid, 100)
+        .await
+        .unwrap_or_default();
 
     // All 10 memories should have at least one entity extracted
     let mems = svc.list_active(&uid, 20).await.unwrap();
@@ -1245,11 +1269,19 @@ async fn test_batch_entity_deduplication_across_memories() {
     assert_eq!(mems.len(), 3);
 
     // Verify links exist (not unlinked)
-    let unlinked = graph.get_unlinked_memories(&uid, 100).await.unwrap_or_default();
+    let unlinked = graph
+        .get_unlinked_memories(&uid, 100)
+        .await
+        .unwrap_or_default();
     let linked = mems
         .iter()
         .filter(|m| !unlinked.iter().any(|(mid, _)| mid == &m.memory_id))
         .count();
-    assert!(linked >= 2, "at least 2/3 memories should be linked to rust entity");
-    println!("✅ batch entity deduplication: rust entity created once, linked to multiple memories");
+    assert!(
+        linked >= 2,
+        "at least 2/3 memories should be linked to rust entity"
+    );
+    println!(
+        "✅ batch entity deduplication: rust entity created once, linked to multiple memories"
+    );
 }

@@ -6,8 +6,7 @@ use memoria_core::{
 };
 use memoria_embedding::llm::ChatMessage;
 use memoria_embedding::LlmClient;
-use memoria_storage::EditLogEntry;
-use memoria_storage::SqlMemoryStore;
+use memoria_storage::{OwnedEditLogEntry, SqlMemoryStore};
 use moka::future::Cache;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -97,6 +96,7 @@ pub struct PurgeResult {
 /// Accumulates counts in a DashMap and flushes every `FLUSH_INTERVAL`.
 struct AccessCounter {
     pending: Arc<dashmap::DashMap<String, AtomicU64>>,
+    _shutdown: tokio::sync::watch::Sender<()>,
 }
 
 const ACCESS_FLUSH_INTERVAL: Duration = Duration::from_secs(5);
@@ -105,13 +105,22 @@ impl AccessCounter {
     fn new(store: Arc<SqlMemoryStore>) -> Self {
         let pending: Arc<dashmap::DashMap<String, AtomicU64>> = Arc::new(dashmap::DashMap::new());
         let p = pending.clone();
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(());
         tokio::spawn(async move {
             loop {
-                tokio::time::sleep(ACCESS_FLUSH_INTERVAL).await;
+                tokio::select! {
+                    _ = tokio::time::sleep(ACCESS_FLUSH_INTERVAL) => {}
+                    _ = shutdown_rx.changed() => {
+                        // Final flush before exit
+                        Self::flush(&p, &store).await;
+                        break;
+                    }
+                }
                 Self::flush(&p, &store).await;
             }
+            tracing::debug!("access counter flusher exiting");
         });
-        Self { pending }
+        Self { pending, _shutdown: shutdown_tx }
     }
 
     fn bump(&self, ids: &[String]) {
@@ -142,6 +151,176 @@ impl AccessCounter {
     }
 }
 
+// ── Async batched edit-log writer ─────────────────────────────────────────────
+
+/// Trait for edit-log flush target — allows testing the batching logic without a real DB.
+#[async_trait::async_trait]
+trait EditLogFlusher: Send + Sync + 'static {
+    async fn flush_batch(&self, entries: &[OwnedEditLogEntry]) -> Result<(), MemoriaError>;
+}
+
+#[async_trait::async_trait]
+impl EditLogFlusher for SqlMemoryStore {
+    async fn flush_batch(&self, entries: &[OwnedEditLogEntry]) -> Result<(), MemoriaError> {
+        self.flush_edit_log_batch(entries).await
+    }
+}
+
+/// In-memory flusher for tests — collects entries so tests can assert on them.
+#[derive(Default)]
+pub struct InMemoryFlusher {
+    pub entries: Arc<std::sync::Mutex<Vec<OwnedEditLogEntry>>>,
+}
+
+#[async_trait::async_trait]
+impl EditLogFlusher for InMemoryFlusher {
+    async fn flush_batch(&self, entries: &[OwnedEditLogEntry]) -> Result<(), MemoriaError> {
+        self.entries.lock().unwrap().extend(entries.iter().cloned());
+        Ok(())
+    }
+}
+
+/// Async batched edit-log writer. Collects entries via a bounded channel
+/// and flushes as a multi-row batch every 2s or when 64 entries accumulate.
+struct EditLogBuffer {
+    tx: tokio::sync::mpsc::Sender<OwnedEditLogEntry>,
+    flush_tx: tokio::sync::mpsc::Sender<tokio::sync::oneshot::Sender<()>>,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+const EDIT_LOG_FLUSH_INTERVAL: Duration = Duration::from_secs(2);
+const EDIT_LOG_FLUSH_SIZE: usize = 64;
+const EDIT_LOG_CHANNEL_CAP: usize = 4096;
+const EDIT_LOG_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+const EDIT_LOG_RETRY_DELAY: Duration = Duration::from_millis(500);
+
+impl EditLogBuffer {
+    fn new<F: EditLogFlusher>(flusher: Arc<F>) -> Self {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<OwnedEditLogEntry>(EDIT_LOG_CHANNEL_CAP);
+        let (flush_tx, mut flush_rx) =
+            tokio::sync::mpsc::channel::<tokio::sync::oneshot::Sender<()>>(4);
+        let handle = tokio::spawn(async move {
+            let mut buf = Vec::with_capacity(EDIT_LOG_FLUSH_SIZE);
+            loop {
+                let deadline = tokio::time::sleep(EDIT_LOG_FLUSH_INTERVAL);
+                tokio::pin!(deadline);
+                loop {
+                    tokio::select! {
+                        entry = rx.recv() => {
+                            match entry {
+                                Some(e) => {
+                                    buf.push(e);
+                                    if buf.len() >= EDIT_LOG_FLUSH_SIZE {
+                                        break;
+                                    }
+                                }
+                                None => {
+                                    if !buf.is_empty() {
+                                        Self::flush_with_retry(flusher.as_ref(), &mut buf).await;
+                                    }
+                                    return;
+                                }
+                            }
+                        }
+                        ack = flush_rx.recv() => {
+                            while let Ok(e) = rx.try_recv() { buf.push(e); }
+                            if !buf.is_empty() {
+                                Self::flush_with_retry(flusher.as_ref(), &mut buf).await;
+                            }
+                            match ack {
+                                Some(tx) => { let _ = tx.send(()); }
+                                None => continue, // flush_tx dropped; rx.recv() will drive shutdown
+                            }
+                            continue;
+                        }
+                        _ = &mut deadline => break,
+                    }
+                }
+                if !buf.is_empty() {
+                    Self::flush_with_retry(flusher.as_ref(), &mut buf).await;
+                }
+            }
+        });
+        Self {
+            tx,
+            flush_tx,
+            handle,
+        }
+    }
+
+    async fn flush_with_retry(flusher: &dyn EditLogFlusher, buf: &mut Vec<OwnedEditLogEntry>) {
+        if let Err(e) = flusher.flush_batch(buf).await {
+            tracing::warn!(
+                "edit log flush failed, retrying in {:?}: {e}",
+                EDIT_LOG_RETRY_DELAY
+            );
+            tokio::time::sleep(EDIT_LOG_RETRY_DELAY).await;
+            if let Err(e2) = flusher.flush_batch(buf).await {
+                tracing::error!(
+                    "edit log flush retry failed, dropping {} entries: {e2}",
+                    buf.len()
+                );
+            }
+        }
+        buf.clear();
+    }
+
+    fn send(
+        &self,
+        user_id: &str,
+        operation: &str,
+        memory_id: Option<&str>,
+        payload: Option<&str>,
+        reason: &str,
+        snapshot_before: Option<&str>,
+    ) {
+        let entry = OwnedEditLogEntry {
+            edit_id: uuid::Uuid::now_v7().simple().to_string(),
+            user_id: user_id.to_string(),
+            operation: operation.to_string(),
+            memory_id: memory_id.map(String::from),
+            payload: payload.map(String::from),
+            reason: reason.to_string(),
+            snapshot_before: snapshot_before.map(String::from),
+        };
+        match self.tx.try_send(entry) {
+            Ok(()) => {}
+            Err(tokio::sync::mpsc::error::TrySendError::Full(entry)) => {
+                tracing::warn!(
+                    user_id = %entry.user_id,
+                    operation = %entry.operation,
+                    memory_id = ?entry.memory_id,
+                    "edit log channel full, dropping entry"
+                );
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(entry)) => {
+                tracing::warn!(
+                    user_id = %entry.user_id,
+                    operation = %entry.operation,
+                    memory_id = ?entry.memory_id,
+                    "edit log channel closed, dropping entry"
+                );
+            }
+        }
+    }
+
+    /// Drain: drop sender to stop new writes, await background task flush, with timeout.
+    async fn drain(self, timeout: Duration) -> bool {
+        drop(self.tx);
+        drop(self.flush_tx);
+        match tokio::time::timeout(timeout, self.handle).await {
+            Ok(Ok(())) => { tracing::info!("edit log drained"); true }
+            Ok(Err(e)) => { tracing::error!("edit log drain task panicked: {e}"); false }
+            Err(_) => { tracing::error!("edit log drain timed out after {timeout:?}"); false }
+        }
+    }
+
+    /// Get a clone of the entry sender for wiring into SqlMemoryStore.
+    fn entry_sender(&self) -> tokio::sync::mpsc::Sender<OwnedEditLogEntry> {
+        self.tx.clone()
+    }
+}
+
 pub struct MemoryService {
     /// Trait-based store for generic ops (used by tests with MockStore)
     pub store: Arc<dyn MemoryStore>,
@@ -154,6 +333,8 @@ pub struct MemoryService {
     entity_tx: Option<tokio::sync::mpsc::Sender<EntityJob>>,
     /// Batched access counter (None in tests)
     access_counter: Option<AccessCounter>,
+    /// Async batched edit-log writer
+    edit_log: std::sync::Mutex<Option<EditLogBuffer>>,
     /// Per-user feedback_weight cache (TTL 5 min)
     feedback_weight_cache: Cache<String, f64>,
     /// Vector index monitor (None in tests)
@@ -186,6 +367,10 @@ impl MemoryService {
         embedder: Option<Arc<dyn EmbeddingProvider>>,
         llm: Option<Arc<LlmClient>>,
     ) -> Self {
+        // Create edit-log buffer early so background stores inherit the sender
+        let edit_log = EditLogBuffer::new(store.clone());
+        store.set_edit_log_tx(edit_log.entry_sender());
+
         let entity_queue_size: usize = std::env::var("ENTITY_QUEUE_SIZE")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -262,8 +447,12 @@ impl MemoryService {
             entity_tx,
             // Use graph pool for access counter flushes to keep writes off the main pool
             access_counter: Some(AccessCounter::new(
-                graph_pool.as_ref().map(Arc::clone).unwrap_or_else(|| store.clone()),
+                graph_pool
+                    .as_ref()
+                    .map(Arc::clone)
+                    .unwrap_or_else(|| store.clone()),
             )),
+            edit_log: std::sync::Mutex::new(Some(edit_log)),
             feedback_weight_cache: Cache::builder()
                 .max_capacity(10_000)
                 .time_to_live(Duration::from_secs(300))
@@ -273,21 +462,122 @@ impl MemoryService {
         }
     }
 
-    /// Test constructor — any MemoryStore, no branch support
-    pub fn new(store: Arc<dyn MemoryStore>, embedder: Option<Arc<dyn EmbeddingProvider>>) -> Self {
+    /// Lightweight constructor — no background workers.
+    /// If `sql_store` is provided, edit-log writes go to the real DB via async batching.
+    /// If `sql_store` is None, edit-log entries are silently dropped.
+    pub fn new(
+        store: Arc<dyn MemoryStore>,
+        embedder: Option<Arc<dyn EmbeddingProvider>>,
+        sql_store: Option<Arc<SqlMemoryStore>>,
+    ) -> Self {
+        let edit_log = match &sql_store {
+            Some(s) => {
+                let buf = EditLogBuffer::new(Arc::clone(s));
+                s.set_edit_log_tx(buf.entry_sender());
+                buf
+            }
+            None => {
+                let flusher = Arc::new(InMemoryFlusher::default());
+                EditLogBuffer::new(flusher)
+            }
+        };
         Self {
-            store,
-            sql_store: None,
+            store: store.clone(),
+            sql_store,
             embedder,
             llm: None,
             entity_tx: None,
             access_counter: None,
+            edit_log: std::sync::Mutex::new(Some(edit_log)),
             feedback_weight_cache: Cache::builder()
                 .max_capacity(10_000)
                 .time_to_live(Duration::from_secs(300))
                 .build(),
             vector_monitor: None,
             graph_pool: None,
+        }
+    }
+
+    /// Test constructor — like `new()` but returns an in-memory entry collector
+    /// so tests can assert on edit-log writes without a real DB.
+    #[doc(hidden)]
+    pub fn new_with_test_entries(
+        store: Arc<dyn MemoryStore>,
+        embedder: Option<Arc<dyn EmbeddingProvider>>,
+    ) -> (Self, Arc<std::sync::Mutex<Vec<OwnedEditLogEntry>>>) {
+        let flusher = Arc::new(InMemoryFlusher::default());
+        let entries = Arc::clone(&flusher.entries);
+        let edit_log = EditLogBuffer::new(flusher);
+        (
+            Self {
+                store,
+                sql_store: None,
+                embedder,
+                llm: None,
+                entity_tx: None,
+                access_counter: None,
+                edit_log: std::sync::Mutex::new(Some(edit_log)),
+                feedback_weight_cache: Cache::builder()
+                    .max_capacity(10_000)
+                    .time_to_live(Duration::from_secs(300))
+                    .build(),
+                vector_monitor: None,
+                graph_pool: None,
+            },
+            entries,
+        )
+    }
+
+    /// Force-flush all buffered edit-log entries to the store.
+    pub async fn flush_edit_log(&self) {
+        let flush_tx = {
+            let guard = self.edit_log.lock().unwrap();
+            guard.as_ref().map(|buf| buf.flush_tx.clone())
+        };
+        if let Some(tx) = flush_tx {
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            if tx.send(ack_tx).await.is_ok() {
+                let _ = ack_rx.await;
+            }
+        }
+    }
+
+    /// Drain edit-log: stop accepting new writes, flush remaining entries, with timeout.
+    /// After this call, `send_edit_log` becomes a no-op and `SqlMemoryStore::log_edit`
+    /// falls back to direct INSERT. Returns false if drain failed (timeout or panic).
+    pub async fn drain_edit_log(&self) -> bool {
+        // 1. Clear sender in SqlMemoryStore (and all background pool clones sharing the Arc)
+        //    so governance scheduler's log_edit falls back to direct INSERT.
+        if let Some(sql) = &self.sql_store {
+            sql.clear_edit_log_tx();
+        }
+        // 2. Take the buffer (makes send_edit_log a no-op) and drain it.
+        let buf = self.edit_log.lock().unwrap().take();
+        match buf {
+            Some(buf) => buf.drain(EDIT_LOG_DRAIN_TIMEOUT).await,
+            None => true,
+        }
+    }
+
+    /// Non-blocking: enqueue an edit-log entry for async batched write.
+    pub fn send_edit_log(
+        &self,
+        user_id: &str,
+        operation: &str,
+        memory_id: Option<&str>,
+        payload: Option<&str>,
+        reason: &str,
+        snapshot_before: Option<&str>,
+    ) {
+        if let Some(buf) = self.edit_log.lock().unwrap().as_ref() {
+            buf.send(
+                user_id,
+                operation,
+                memory_id,
+                payload,
+                reason,
+                snapshot_before,
+            );
         }
     }
 
@@ -351,7 +641,9 @@ impl MemoryService {
                     // Hold lock across recv + drain to maximize batch size
                     let batch = {
                         let mut guard = rx.lock().await;
-                        let Some(first) = guard.recv().await else { break };
+                        let Some(first) = guard.recv().await else {
+                            break;
+                        };
                         let mut batch = Vec::with_capacity(Self::ENTITY_BATCH_LIMIT);
                         batch.push(first);
                         while batch.len() < Self::ENTITY_BATCH_LIMIT {
@@ -374,7 +666,12 @@ impl MemoryService {
                         Self::process_entity_batch(&store, &llm, user_id, jobs).await;
                     }
                     if batch_len > 1 {
-                        tracing::debug!(worker_id = i, batch_len, users = by_user.len(), "micro-batch processed");
+                        tracing::debug!(
+                            worker_id = i,
+                            batch_len,
+                            users = by_user.len(),
+                            "micro-batch processed"
+                        );
                     }
                 }
                 tracing::debug!(worker_id = i, "entity worker exiting");
@@ -456,7 +753,9 @@ impl MemoryService {
                     })
                     .collect();
                 if !links.is_empty() {
-                    let _ = graph.batch_upsert_memory_entity_links(user_id, &links).await;
+                    let _ = graph
+                        .batch_upsert_memory_entity_links(user_id, &links)
+                        .await;
                 }
             }
         }
@@ -529,7 +828,9 @@ impl MemoryService {
                     .iter()
                     .map(|(_name, eid)| (memory_id, eid.as_str(), "llm"))
                     .collect();
-                let _ = graph.batch_upsert_memory_entity_links(user_id, &links).await;
+                let _ = graph
+                    .batch_upsert_memory_entity_links(user_id, &links)
+                    .await;
             }
         }
     }
@@ -621,15 +922,14 @@ impl MemoryService {
                         sql.supersede_memory(&table, &old_id, &memory.memory_id)
                             .await?;
                         let payload = serde_json::json!({"content": &memory.content, "type": memory.memory_type.to_string()}).to_string();
-                        sql.log_edit(
+                        self.send_edit_log(
                             user_id,
                             "inject",
                             Some(&memory.memory_id),
                             Some(&payload),
                             "store_memory:supersede",
                             None,
-                        )
-                        .await;
+                        );
                         self.enqueue_entity_extraction(user_id, &memory.memory_id, &memory.content)
                             .await;
                         if t0.elapsed().as_secs() >= 1 {
@@ -659,15 +959,14 @@ impl MemoryService {
                 sql.insert_into(&table, &memory).await?;
                 let t_insert = t2.elapsed();
                 let payload = serde_json::json!({"content": &memory.content, "type": memory.memory_type.to_string()}).to_string();
-                sql.log_edit(
+                self.send_edit_log(
                     user_id,
                     "inject",
                     Some(&memory.memory_id),
                     Some(&payload),
                     "store_memory",
                     None,
-                )
-                .await;
+                );
                 self.enqueue_entity_extraction(user_id, &memory.memory_id, &memory.content)
                     .await;
                 if t0.elapsed().as_secs() >= 1 {
@@ -682,15 +981,14 @@ impl MemoryService {
             } else {
                 sql.insert_into(&table, &memory).await?;
                 let payload = serde_json::json!({"content": &memory.content, "type": memory.memory_type.to_string()}).to_string();
-                sql.log_edit(
+                self.send_edit_log(
                     user_id,
                     "inject",
                     Some(&memory.memory_id),
                     Some(&payload),
                     "store_memory",
                     None,
-                )
-                .await;
+                );
                 self.enqueue_entity_extraction(user_id, &memory.memory_id, &memory.content)
                     .await;
                 if t0.elapsed().as_secs() >= 1 {
@@ -902,9 +1200,7 @@ impl MemoryService {
                         // to avoid redundant get_user_retrieval_params query
                         let fw = self.get_feedback_weight(user_id).await;
                         let (vec_results, scores) = sql
-                            .search_hybrid_from_scored(
-                                &table, user_id, embedding, query, top_k, fw,
-                            )
+                            .search_hybrid_from_scored(&table, user_id, embedding, query, top_k, fw)
                             .await?;
                         explain.vector_ms = vs_start.elapsed().as_secs_f64() * 1000.0;
                         explain.vector_hit = !vec_results.is_empty();
@@ -1168,13 +1464,25 @@ impl MemoryService {
             sql.supersede_memory(&table, memory_id, &new_mem.memory_id)
                 .await?;
 
+            // Graph sync: deactivate old node + entity links, new node gets entities via extraction
+            let graph = sql.graph_store();
+            let _ = graph.deactivate_by_memory_id(memory_id).await;
+            let _ = graph.deactivate_memory_entity_links(memory_id).await;
+            let _ = sql.delete_entity_links_by_memory_id(memory_id).await;
+
             let payload = serde_json::json!({
                 "new_content": new_content,
                 "new_memory_id": &new_mem.memory_id,
             })
             .to_string();
-            sql.log_edit(user_id, "correct", Some(memory_id), Some(&payload), "", None)
-                .await;
+            self.send_edit_log(
+                user_id,
+                "correct",
+                Some(memory_id),
+                Some(&payload),
+                "",
+                None,
+            );
 
             self.enqueue_entity_extraction(user_id, &new_mem.memory_id, new_content)
                 .await;
@@ -1221,10 +1529,14 @@ impl MemoryService {
     pub async fn purge(&self, user_id: &str, memory_id: &str) -> Result<PurgeResult, MemoriaError> {
         if let Some(sql) = &self.sql_store {
             let (snap, warning) = sql.create_safety_snapshot("purge").await;
-            sql.log_edit(user_id, "purge", Some(memory_id), None, "", snap.as_deref())
-                .await;
+            self.send_edit_log(user_id, "purge", Some(memory_id), None, "", snap.as_deref());
             let table = sql.active_table(user_id).await?;
             sql.soft_delete_from(&table, memory_id).await?;
+            // Graph + entity link cleanup (best-effort, governance fallback covers crash)
+            let graph = sql.graph_store();
+            let _ = graph.deactivate_by_memory_id(memory_id).await;
+            let _ = graph.deactivate_memory_entity_links(memory_id).await;
+            let _ = sql.delete_entity_links_by_memory_id(memory_id).await;
             Ok(PurgeResult {
                 purged: 1,
                 snapshot_name: snap,
@@ -1249,14 +1561,15 @@ impl MemoryService {
         if let Some(sql) = &self.sql_store {
             let (snap, warning) = sql.create_safety_snapshot("purge").await;
             let table = sql.active_table(user_id).await?;
+            let graph = sql.graph_store();
             for id in ids {
                 sql.soft_delete_from(&table, id).await?;
+                self.send_edit_log(user_id, "purge", Some(id), None, "", snap.as_deref());
+                // Graph + entity link cleanup (best-effort)
+                let _ = graph.deactivate_by_memory_id(id).await;
+                let _ = graph.deactivate_memory_entity_links(id).await;
+                let _ = sql.delete_entity_links_by_memory_id(id).await;
             }
-            let entries: Vec<EditLogEntry<'_>> = ids
-                .iter()
-                .map(|id| (user_id, "purge", Some(*id), None, "", snap.as_deref()))
-                .collect();
-            sql.batch_log_edit(&entries).await;
             Ok(PurgeResult {
                 purged: ids.len(),
                 snapshot_name: snap,
@@ -1284,25 +1597,24 @@ impl MemoryService {
             let (snap, warning) = sql.create_safety_snapshot("purge").await;
             let table = sql.active_table(user_id).await?;
             let ids = sql.find_ids_by_topic(&table, user_id, topic).await?;
+            let graph = sql.graph_store();
             for id in &ids {
                 sql.soft_delete_from(&table, id).await?;
-                let _ = sql.graph_store().deactivate_by_memory_id(id).await;
+                let _ = graph.deactivate_by_memory_id(id).await;
+                let _ = graph.deactivate_memory_entity_links(id).await;
+                let _ = sql.delete_entity_links_by_memory_id(id).await;
             }
             let reason = format!("topic:{topic}");
-            let entries: Vec<EditLogEntry<'_>> = ids
-                .iter()
-                .map(|id| {
-                    (
-                        user_id,
-                        "purge",
-                        Some(id.as_str()),
-                        None,
-                        reason.as_str(),
-                        snap.as_deref(),
-                    )
-                })
-                .collect();
-            sql.batch_log_edit(&entries).await;
+            for id in &ids {
+                self.send_edit_log(
+                    user_id,
+                    "purge",
+                    Some(id.as_str()),
+                    None,
+                    &reason,
+                    snap.as_deref(),
+                );
+            }
             Ok(PurgeResult {
                 purged: ids.len(),
                 snapshot_name: snap,
@@ -1460,21 +1772,16 @@ impl MemoryService {
                         .to_string()
                 })
                 .collect();
-            let log_entries: Vec<EditLogEntry<'_>> = results
-                .iter()
-                .zip(payloads.iter())
-                .map(|(m, p)| {
-                    (
-                        user_id,
-                        "inject",
-                        Some(m.memory_id.as_str()),
-                        Some(p.as_str()),
-                        "store_batch",
-                        None,
-                    )
-                })
-                .collect();
-            sql.batch_log_edit(&log_entries).await;
+            for (m, p) in results.iter().zip(payloads.iter()) {
+                self.send_edit_log(
+                    user_id,
+                    "inject",
+                    Some(&m.memory_id),
+                    Some(p),
+                    "store_batch",
+                    None,
+                );
+            }
         } else {
             for m in &results {
                 self.store.insert(m).await?;

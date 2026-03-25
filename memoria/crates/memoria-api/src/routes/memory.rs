@@ -285,7 +285,11 @@ pub async fn get_memory(
     AuthUser { user_id, is_master }: AuthUser,
     Path(id): Path<String>,
 ) -> ApiResult<Option<MemoryResponse>> {
-    let m = state.service.get_for_user(&user_id, &id).await.map_err(api_err)?;
+    let m = state
+        .service
+        .get_for_user(&user_id, &id)
+        .await
+        .map_err(api_err)?;
     if let Some(ref mem) = m {
         if !is_master && mem.user_id != user_id {
             return Err((StatusCode::FORBIDDEN, "Not your memory".to_string()));

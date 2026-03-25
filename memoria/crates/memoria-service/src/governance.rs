@@ -107,6 +107,10 @@ pub trait GovernanceStore: Send + Sync {
     /// Remove orphaned stats records (stats without corresponding memory).
     async fn cleanup_orphan_stats(&self) -> Result<i64, MemoriaError>;
 
+    /// Remove orphaned entity links (mem_entity_links + mem_memory_entity_links)
+    /// and deactivate orphaned graph nodes whose memory is inactive.
+    async fn cleanup_orphan_graph_data(&self) -> Result<i64, MemoriaError>;
+
     /// Delete old audit-log rows, keeping only the last `retain_days` days.
     async fn cleanup_edit_log(&self, retain_days: i64) -> Result<i64, MemoriaError>;
 
@@ -244,6 +248,36 @@ impl GovernanceStore for SqlMemoryStore {
 
     async fn cleanup_orphan_stats(&self) -> Result<i64, MemoriaError> {
         SqlMemoryStore::cleanup_orphan_stats(self).await
+    }
+
+    async fn cleanup_orphan_graph_data(&self) -> Result<i64, MemoriaError> {
+        let graph = self.graph_store();
+        let mut total = 0i64;
+        let mut errors = Vec::new();
+        // 1. Orphaned mem_entity_links
+        match SqlMemoryStore::cleanup_orphan_entity_links(self).await {
+            Ok(n) => total += n,
+            Err(e) => errors.push(format!("entity_links: {e}")),
+        }
+        // 2. Orphaned mem_memory_entity_links
+        match graph.cleanup_orphan_memory_entity_links().await {
+            Ok(n) => total += n,
+            Err(e) => errors.push(format!("memory_entity_links: {e}")),
+        }
+        // 3. Orphaned graph nodes (memory inactive but node still active)
+        match graph.cleanup_orphan_graph_nodes().await {
+            Ok(n) => total += n,
+            Err(e) => errors.push(format!("graph_nodes: {e}")),
+        }
+        if errors.is_empty() {
+            Ok(total)
+        } else {
+            Err(MemoriaError::Internal(format!(
+                "partial graph cleanup ({total} removed, {} failed): {}",
+                errors.len(),
+                errors.join("; ")
+            )))
+        }
     }
 
     async fn cleanup_edit_log(&self, retain_days: i64) -> Result<i64, MemoriaError> {
@@ -898,6 +932,37 @@ impl DefaultGovernanceStrategy {
         }
     }
 
+    async fn cleanup_orphan_graph_data_operation(
+        &self,
+        plan: &GovernancePlan,
+        store: &dyn GovernanceStore,
+        state: &mut ExecutionState,
+    ) {
+        match store.cleanup_orphan_graph_data().await {
+            Ok(value) => {
+                state.decisions.push(governance_decision(
+                    GovernanceTask::Weekly,
+                    "cleanup_orphan_graph_data",
+                    format!("Removed {value} orphaned graph/entity-link rows"),
+                    Some(if value > 0 { 1.0 } else { 0.0 }),
+                    vec![task_evidence(
+                        GovernanceTask::Weekly,
+                        &plan.users,
+                        "Weekly graph data cleanup completed".to_string(),
+                    )],
+                    state.snapshot_before.as_deref(),
+                ));
+            }
+            Err(err) => record_warning(
+                GovernanceTask::Weekly,
+                None,
+                "cleanup_orphan_graph_data",
+                &err,
+                &mut state.warnings,
+            ),
+        }
+    }
+
     async fn cleanup_edit_log_operation(
         &self,
         store: &dyn GovernanceStore,
@@ -1032,6 +1097,8 @@ impl DefaultGovernanceStrategy {
         self.cleanup_orphan_branches_operation(plan, store, state)
             .await;
         self.cleanup_orphan_stats_operation(plan, store, state)
+            .await;
+        self.cleanup_orphan_graph_data_operation(plan, store, state)
             .await;
         self.cleanup_edit_log_operation(store, state).await;
         self.cleanup_feedback_operation(store, state).await;
@@ -1460,6 +1527,12 @@ mod tests {
             Ok(0)
         }
 
+        async fn cleanup_orphan_graph_data(&self) -> Result<i64, MemoriaError> {
+            self.record("cleanup_orphan_graph_data");
+            self.fail_if_requested("cleanup_orphan_graph_data")?;
+            Ok(0)
+        }
+
         async fn cleanup_edit_log(&self, _: i64) -> Result<i64, MemoriaError> {
             Ok(0)
         }
@@ -1768,6 +1841,9 @@ mod tests {
                 Ok(0)
             }
             async fn cleanup_orphan_stats(&self) -> Result<i64, MemoriaError> {
+                Ok(0)
+            }
+            async fn cleanup_orphan_graph_data(&self) -> Result<i64, MemoriaError> {
                 Ok(0)
             }
             async fn cleanup_edit_log(&self, _: i64) -> Result<i64, MemoriaError> {

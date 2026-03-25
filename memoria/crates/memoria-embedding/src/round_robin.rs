@@ -178,7 +178,11 @@ mod tests {
 
     impl MockProvider {
         fn ok(id: usize, call_log: Arc<Mutex<Vec<usize>>>) -> Arc<Self> {
-            Arc::new(Self { id, call_log, fail_msg: None })
+            Arc::new(Self {
+                id,
+                call_log,
+                fail_msg: None,
+            })
         }
 
         /// Retryable failure (e.g. rate-limit, server error).

@@ -25,6 +25,8 @@ const NODE_COLS_WITH_EMB: &str =
 pub struct GraphStore {
     pool: MySqlPool,
     embedding_dim: usize,
+    /// Cache: user_id → node count (TTL 2 min)
+    node_count_cache: moka::future::Cache<String, i64>,
 }
 
 impl GraphStore {
@@ -32,6 +34,24 @@ impl GraphStore {
         Self {
             pool,
             embedding_dim,
+            node_count_cache: moka::future::Cache::builder()
+                .max_capacity(10_000)
+                .time_to_live(std::time::Duration::from_secs(120))
+                .build(),
+        }
+    }
+
+    /// Create with a shared node-count cache (used by SqlMemoryStore to share
+    /// the cache across multiple GraphStore instances).
+    pub fn with_node_count_cache(
+        pool: MySqlPool,
+        embedding_dim: usize,
+        node_count_cache: moka::future::Cache<String, i64>,
+    ) -> Self {
+        Self {
+            pool,
+            embedding_dim,
+            node_count_cache,
         }
     }
 
@@ -495,7 +515,11 @@ impl GraphStore {
 
         // 1. Bulk INSERT IGNORE — inserts new, silently skips duplicates
         for chunk in entities.chunks(Self::UPSERT_CHUNK_SIZE) {
-            let placeholders = chunk.iter().map(|_| "(?,?,?,?,?,?)").collect::<Vec<_>>().join(", ");
+            let placeholders = chunk
+                .iter()
+                .map(|_| "(?,?,?,?,?,?)")
+                .collect::<Vec<_>>()
+                .join(", ");
             let sql = format!(
                 "INSERT IGNORE INTO mem_entities \
                  (entity_id, user_id, name, display_name, entity_type, created_at) \
@@ -504,7 +528,13 @@ impl GraphStore {
             let mut q = sqlx::query(&sql);
             for (name, display, etype) in chunk {
                 let eid = new_id();
-                q = q.bind(eid).bind(user_id).bind(*name).bind(*display).bind(*etype).bind(now);
+                q = q
+                    .bind(eid)
+                    .bind(user_id)
+                    .bind(*name)
+                    .bind(*display)
+                    .bind(*etype)
+                    .bind(now);
             }
             q.execute(&self.pool).await.map_err(db_err)?;
         }
@@ -776,6 +806,77 @@ impl GraphStore {
         Ok(row.and_then(|r| r.try_get("entity_id").ok()))
     }
 
+    /// Batch find entity_ids by names. Returns name → entity_id map.
+    pub async fn find_entities_by_names(
+        &self,
+        user_id: &str,
+        names: &[&str],
+    ) -> Result<std::collections::HashMap<String, String>, MemoriaError> {
+        let mut map = std::collections::HashMap::new();
+        if names.is_empty() {
+            return Ok(map);
+        }
+        for chunk in names.chunks(100) {
+            let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let sql = format!(
+                "SELECT name, entity_id FROM mem_entities WHERE user_id = ? AND name IN ({placeholders})"
+            );
+            let mut q = sqlx::query(&sql).bind(user_id);
+            for name in chunk {
+                q = q.bind(*name);
+            }
+            let rows = q.fetch_all(&self.pool).await.map_err(db_err)?;
+            for r in &rows {
+                let n: String = r.try_get("name").unwrap_or_default();
+                let eid: String = r.try_get("entity_id").unwrap_or_default();
+                map.insert(n, eid);
+            }
+        }
+        Ok(map)
+    }
+
+    /// Batch reverse lookup: multiple entity_ids → memory_ids with weights.
+    /// `limit_per_entity` caps results per entity; total LIMIT = limit_per_entity × entity count.
+    pub async fn get_memories_by_entities(
+        &self,
+        entity_ids: &[&str],
+        user_id: &str,
+        limit_per_entity: i64,
+    ) -> Result<Vec<(String, f32)>, MemoriaError> {
+        if entity_ids.is_empty() {
+            return Ok(vec![]);
+        }
+        let total_limit = limit_per_entity * entity_ids.len() as i64;
+        let placeholders = entity_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT l.memory_id, l.weight \
+             FROM mem_memory_entity_links l \
+             JOIN mem_memories m ON l.memory_id = m.memory_id \
+             WHERE l.entity_id IN ({placeholders}) AND l.user_id = ? AND m.is_active = 1 \
+             ORDER BY l.weight DESC, m.created_at DESC \
+             LIMIT ?",
+            placeholders = placeholders
+        );
+        let mut q = sqlx::query(&sql);
+        for eid in entity_ids {
+            q = q.bind(*eid);
+        }
+        let rows = q
+            .bind(user_id)
+            .bind(total_limit)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(db_err)?;
+        Ok(rows
+            .iter()
+            .filter_map(|r| {
+                let mid: String = r.try_get("memory_id").ok()?;
+                let w: f32 = r.try_get("weight").ok()?;
+                Some((mid, w))
+            })
+            .collect())
+    }
+
     /// Reverse lookup: entity → memory_ids with weights.
     pub async fn get_memories_by_entity(
         &self,
@@ -866,8 +967,87 @@ impl GraphStore {
         Ok((incoming, outgoing))
     }
 
-    /// Count active nodes for a user.
+    /// Deactivate entity links in `mem_memory_entity_links` for a memory_id.
+    pub async fn deactivate_memory_entity_links(
+        &self,
+        memory_id: &str,
+    ) -> Result<i64, MemoriaError> {
+        let r = sqlx::query(
+            "DELETE FROM mem_memory_entity_links WHERE memory_id = ?",
+        )
+        .bind(memory_id)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(r.rows_affected() as i64)
+    }
+
+    /// Remove orphaned rows from `mem_memory_entity_links` whose memory_id
+    /// no longer exists or is inactive in `mem_memories`. Idempotent, batch-safe.
+    pub async fn cleanup_orphan_memory_entity_links(&self) -> Result<i64, MemoriaError> {
+        // Two-step: find orphan memory_ids, then delete by primary key.
+        let orphans: Vec<(String, String)> = sqlx::query_as(
+            "SELECT l.memory_id, l.entity_id FROM mem_memory_entity_links l \
+             LEFT JOIN mem_memories m ON l.memory_id = m.memory_id AND m.is_active = 1 \
+             WHERE m.memory_id IS NULL LIMIT 5000",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        if orphans.is_empty() {
+            return Ok(0);
+        }
+        let mut total = 0i64;
+        for chunk in orphans.chunks(100) {
+            let conds = chunk
+                .iter()
+                .map(|_| "(memory_id = ? AND entity_id = ?)")
+                .collect::<Vec<_>>()
+                .join(" OR ");
+            let sql = format!("DELETE FROM mem_memory_entity_links WHERE {conds}");
+            let mut q = sqlx::query(&sql);
+            for (mid, eid) in chunk {
+                q = q.bind(mid).bind(eid);
+            }
+            let r = q.execute(&self.pool).await.map_err(db_err)?;
+            total += r.rows_affected() as i64;
+        }
+        Ok(total)
+    }
+
+    /// Deactivate graph nodes whose memory_id is inactive in `mem_memories`.
+    /// Idempotent fallback for crash recovery.
+    pub async fn cleanup_orphan_graph_nodes(&self) -> Result<i64, MemoriaError> {
+        // Two-step: find orphan node_ids, then update by primary key.
+        let orphans: Vec<(String,)> = sqlx::query_as(
+            "SELECT g.node_id FROM memory_graph_nodes g \
+             JOIN mem_memories m ON g.memory_id = m.memory_id \
+             WHERE m.is_active = 0 AND g.is_active = 1 AND g.memory_id IS NOT NULL \
+             LIMIT 5000",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        if orphans.is_empty() {
+            return Ok(0);
+        }
+        let placeholders = orphans.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "UPDATE memory_graph_nodes SET is_active = 0 WHERE node_id IN ({placeholders})"
+        );
+        let mut q = sqlx::query(&sql);
+        for (nid,) in &orphans {
+            q = q.bind(nid);
+        }
+        let r = q.execute(&self.pool).await.map_err(db_err)?;
+        Ok(r.rows_affected() as i64)
+    }
+
+    /// Count active nodes for a user (cached, TTL 2 min).
     pub async fn count_user_nodes(&self, user_id: &str) -> Result<i64, MemoriaError> {
+        if let Some(cached) = self.node_count_cache.get(user_id).await {
+            return Ok(cached);
+        }
         let row = sqlx::query(
             "SELECT COUNT(*) as cnt FROM memory_graph_nodes WHERE user_id = ? AND is_active = 1",
         )
@@ -875,7 +1055,9 @@ impl GraphStore {
         .fetch_one(&self.pool)
         .await
         .map_err(db_err)?;
-        Ok(row.try_get("cnt").unwrap_or(0))
+        let cnt: i64 = row.try_get("cnt").unwrap_or(0);
+        self.node_count_cache.insert(user_id.to_string(), cnt).await;
+        Ok(cnt)
     }
 
     /// Get edges between a set of node IDs (for connected components).

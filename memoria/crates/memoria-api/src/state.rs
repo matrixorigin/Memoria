@@ -1,4 +1,7 @@
-use crate::auth::{spawn_call_log_flusher, spawn_last_used_flusher, spawn_tool_usage_flusher, CallLogBatcher, LastUsedBatcher, ToolUsageBatcher};
+use crate::auth::{
+    spawn_call_log_flusher, spawn_last_used_flusher, spawn_tool_usage_flusher, CallLogBatcher,
+    LastUsedBatcher, ToolUsageBatcher,
+};
 use crate::rate_limit::RateLimiter;
 use memoria_core::MemoriaError;
 use memoria_git::GitForDataService;
@@ -44,6 +47,14 @@ pub struct AppState {
     pub metrics_cache_ttl: Duration,
     /// Batched API call log writer (flushed every 5 s to mem_api_call_log).
     pub call_log_batcher: Arc<CallLogBatcher>,
+    /// Shutdown signal + task handles for background flushers.
+    /// Wrapped together so drain_flushers() can take ownership of the sender.
+    flusher_state: Arc<std::sync::Mutex<FlusherState>>,
+}
+
+struct FlusherState {
+    shutdown: Option<tokio::sync::watch::Sender<()>>,
+    handles: Vec<tokio::task::JoinHandle<()>>,
 }
 
 impl AppState {
@@ -92,6 +103,10 @@ impl AppState {
             rate_limiter: crate::rate_limit::from_env(),
             metrics_cache: Arc::new(RwLock::new(None)),
             metrics_cache_ttl,
+            flusher_state: Arc::new(std::sync::Mutex::new(FlusherState {
+                shutdown: None,
+                handles: Vec::new(),
+            })),
         }
     }
 
@@ -150,19 +165,39 @@ impl AppState {
             "Dedicated auth connection pool initialized"
         );
         // Start the batched last_used_at flusher using the auth pool
-        spawn_last_used_flusher(self.last_used_batcher.clone(), pool.clone());
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
+        let h1 = spawn_last_used_flusher(self.last_used_batcher.clone(), pool.clone(), shutdown_rx.clone());
         // Rebuild tool-usage cache from DB, then start the periodic flusher
         self.tool_usage_batcher.rebuild_from_db(&pool).await;
-        spawn_tool_usage_flusher(self.tool_usage_batcher.clone(), pool.clone());
+        let h2 = spawn_tool_usage_flusher(self.tool_usage_batcher.clone(), pool.clone(), shutdown_rx.clone());
         // Start the call-log flush loop (writes mem_api_call_log every 5 s)
-        spawn_call_log_flusher(self.call_log_batcher.clone(), pool.clone());
+        let h3 = spawn_call_log_flusher(self.call_log_batcher.clone(), pool.clone(), shutdown_rx);
         self.auth_pool = Some(pool);
+        {
+            let mut fs = self.flusher_state.lock().unwrap();
+            fs.shutdown = Some(shutdown_tx);
+            fs.handles = vec![h1, h2, h3];
+        }
         Ok(self)
     }
 
     pub fn with_instance_id(mut self, instance_id: String) -> Self {
         self.instance_id = instance_id;
         self
+    }
+
+    /// Signal all background flushers to stop, wait for final flush to complete.
+    /// Call during graceful shutdown before dropping the runtime.
+    pub async fn drain_flushers(&self) {
+        let handles = {
+            let mut fs = self.flusher_state.lock().unwrap();
+            // Drop sender → tasks receive shutdown signal and do final flush
+            fs.shutdown.take();
+            fs.handles.drain(..).collect::<Vec<_>>()
+        };
+        for h in handles {
+            let _ = tokio::time::timeout(Duration::from_secs(5), h).await;
+        }
     }
 }
 

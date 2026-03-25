@@ -1757,3 +1757,305 @@ async fn test_full_user_workflow() {
         "✅ full workflow: 4 sessions, store→correct→snapshot→branch→merge→purge, all DB verified"
     );
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// REST API: purge/correct graph + entity link cleanup verification
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Helper: store a memory via API, create graph node + entity links manually, return memory_id.
+async fn store_with_entity_links(
+    base: &str,
+    client: &reqwest::Client,
+    pool: &MySqlPool,
+    uid: &str,
+    content: &str,
+) -> String {
+    let r = client
+        .post(format!("{base}/v1/memories"))
+        .header("X-User-Id", uid)
+        .json(&json!({"content": content}))
+        .send()
+        .await
+        .unwrap();
+    let mid = r.json::<Value>().await.unwrap()["memory_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Wait for async entity extraction
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+    // Create graph node (REST API doesn't create these — only MCP stdio does)
+    let node_id = uuid::Uuid::new_v4().simple().to_string()[..32].to_string();
+    sqlx::query(
+        "INSERT INTO memory_graph_nodes \
+         (node_id, user_id, node_type, content, memory_id, confidence, trust_tier, importance, \
+          access_count, cross_session_count, is_active, created_at) \
+         VALUES (?, ?, 'semantic', ?, ?, 0.95, 'T1', 0.5, 0, 0, 1, NOW())",
+    )
+    .bind(&node_id)
+    .bind(uid)
+    .bind(content)
+    .bind(&mid)
+    .execute(pool)
+    .await
+    .unwrap();
+
+    // Insert into legacy mem_entity_links
+    let id = uuid::Uuid::new_v4().to_string().replace('-', "");
+    sqlx::query(
+        "INSERT INTO mem_entity_links (id, user_id, memory_id, entity_name, entity_type, source, created_at) \
+         VALUES (?, ?, ?, 'test_entity', 'concept', 'manual', NOW())",
+    )
+    .bind(&id)
+    .bind(uid)
+    .bind(&mid)
+    .execute(pool)
+    .await
+    .unwrap();
+
+    mid
+}
+
+/// Helper: count rows in a link table for a given memory_id.
+async fn count_by_memory_id(pool: &MySqlPool, table: LinkTable, mid: &str) -> i64 {
+    let sql = match table {
+        LinkTable::EntityLinks => "SELECT COUNT(*) FROM mem_entity_links WHERE memory_id = ?",
+        LinkTable::MemoryEntityLinks => "SELECT COUNT(*) FROM mem_memory_entity_links WHERE memory_id = ?",
+    };
+    sqlx::query_scalar(sql)
+        .bind(mid)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+enum LinkTable {
+    EntityLinks,
+    MemoryEntityLinks,
+}
+
+/// Helper: check if graph node is active for a memory_id.
+async fn graph_node_active(pool: &MySqlPool, mid: &str) -> bool {
+    let cnt: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM memory_graph_nodes WHERE memory_id = ? AND is_active = 1",
+    )
+    .bind(mid)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    cnt > 0
+}
+
+// ── REST API: DELETE /v1/memories/:id cleans graph + entity links ────────────
+
+#[tokio::test]
+async fn test_delete_cleans_graph_and_entity_links() {
+    let (base, client, pool) = spawn_server().await;
+    let uid = uid();
+    let mid = store_with_entity_links(&base, &client, &pool, &uid, "REST delete graph test").await;
+
+    // Verify graph node + entity links exist
+    assert!(graph_node_active(&pool, &mid).await, "graph node should exist");
+    assert!(
+        count_by_memory_id(&pool, LinkTable::EntityLinks, &mid).await > 0,
+        "mem_entity_links should exist"
+    );
+
+    // DELETE
+    let r = client
+        .delete(format!("{base}/v1/memories/{mid}"))
+        .header("X-User-Id", &uid)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 204);
+
+    // Verify all cleaned
+    assert!(
+        !graph_node_active(&pool, &mid).await,
+        "graph node should be deactivated after delete"
+    );
+    assert_eq!(
+        count_by_memory_id(&pool, LinkTable::EntityLinks, &mid).await,
+        0,
+        "mem_entity_links should be cleaned after delete"
+    );
+    assert_eq!(
+        count_by_memory_id(&pool, LinkTable::MemoryEntityLinks, &mid).await,
+        0,
+        "mem_memory_entity_links should be cleaned after delete"
+    );
+    println!("✅ REST DELETE: graph node + entity links cleaned");
+}
+
+// ── REST API: POST /v1/memories/purge (bulk) cleans graph + entity links ────
+
+#[tokio::test]
+async fn test_purge_bulk_cleans_graph_and_entity_links() {
+    let (base, client, pool) = spawn_server().await;
+    let uid = uid();
+    let mid1 =
+        store_with_entity_links(&base, &client, &pool, &uid, "REST bulk purge graph A").await;
+    let mid2 =
+        store_with_entity_links(&base, &client, &pool, &uid, "REST bulk purge graph B").await;
+
+    // Verify graph nodes exist
+    assert!(graph_node_active(&pool, &mid1).await);
+    assert!(graph_node_active(&pool, &mid2).await);
+
+    // Purge bulk
+    let r = client
+        .post(format!("{base}/v1/memories/purge"))
+        .header("X-User-Id", &uid)
+        .json(&json!({"memory_ids": [&mid1, &mid2]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let body: Value = r.json().await.unwrap();
+    assert_eq!(body["purged"], 2);
+
+    // Verify all cleaned
+    for mid in [&mid1, &mid2] {
+        assert!(
+            !graph_node_active(&pool, mid).await,
+            "graph node should be deactivated for {mid}"
+        );
+        assert_eq!(
+            count_by_memory_id(&pool, LinkTable::EntityLinks, mid).await,
+            0,
+            "mem_entity_links should be cleaned for {mid}"
+        );
+    }
+    println!("✅ REST purge bulk: graph + entity links cleaned for both");
+}
+
+// ── REST API: POST /v1/memories/purge (topic) cleans graph + entity links ───
+
+#[tokio::test]
+async fn test_purge_topic_cleans_graph_and_entity_links() {
+    let (base, client, pool) = spawn_server().await;
+    let uid = uid();
+    let mid = store_with_entity_links(
+        &base,
+        &client,
+        &pool,
+        &uid,
+        "REST topic_purge_graph_xyz test",
+    )
+    .await;
+
+    assert!(graph_node_active(&pool, &mid).await);
+
+    // Purge by topic
+    let r = client
+        .post(format!("{base}/v1/memories/purge"))
+        .header("X-User-Id", &uid)
+        .json(&json!({"topic": "topic_purge_graph_xyz"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+
+    // Verify cleaned
+    assert!(
+        !graph_node_active(&pool, &mid).await,
+        "graph node should be deactivated after topic purge"
+    );
+    assert_eq!(
+        count_by_memory_id(&pool, LinkTable::EntityLinks, &mid).await,
+        0,
+        "mem_entity_links should be cleaned after topic purge"
+    );
+    println!("✅ REST purge topic: graph + entity links cleaned");
+}
+
+// ── REST API: PUT /v1/memories/:id/correct cleans old graph + entity links ──
+
+#[tokio::test]
+async fn test_correct_by_id_cleans_graph_and_entity_links() {
+    let (base, client, pool) = spawn_server().await;
+    let uid = uid();
+    let old_mid = store_with_entity_links(
+        &base,
+        &client,
+        &pool,
+        &uid,
+        "REST correct graph old content",
+    )
+    .await;
+
+    assert!(graph_node_active(&pool, &old_mid).await);
+
+    // Correct
+    let r = client
+        .put(format!("{base}/v1/memories/{old_mid}/correct"))
+        .header("X-User-Id", &uid)
+        .json(&json!({"new_content": "REST correct graph new content"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+
+    // Old graph node deactivated
+    assert!(
+        !graph_node_active(&pool, &old_mid).await,
+        "old graph node should be deactivated after correct"
+    );
+    // Old entity links cleaned
+    assert_eq!(
+        count_by_memory_id(&pool, LinkTable::EntityLinks, &old_mid).await,
+        0,
+        "old mem_entity_links should be cleaned after correct"
+    );
+    assert_eq!(
+        count_by_memory_id(&pool, LinkTable::MemoryEntityLinks, &old_mid).await,
+        0,
+        "old mem_memory_entity_links should be cleaned after correct"
+    );
+    println!("✅ REST correct by id: old graph + entity links cleaned");
+}
+
+// ── REST API: POST /v1/memories/correct (by query) cleans old graph ─────────
+
+#[tokio::test]
+async fn test_correct_by_query_cleans_graph_and_entity_links() {
+    let (base, client, pool) = spawn_server().await;
+    let uid = uid();
+    let old_mid = store_with_entity_links(
+        &base,
+        &client,
+        &pool,
+        &uid,
+        "REST correct_query_graph_xyz unique content",
+    )
+    .await;
+
+    assert!(graph_node_active(&pool, &old_mid).await);
+
+    // Correct by query
+    let r = client
+        .post(format!("{base}/v1/memories/correct"))
+        .header("X-User-Id", &uid)
+        .json(&json!({
+            "query": "correct_query_graph_xyz",
+            "new_content": "REST correct by query new content"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+
+    // Old graph node deactivated
+    assert!(
+        !graph_node_active(&pool, &old_mid).await,
+        "old graph node should be deactivated after correct by query"
+    );
+    assert_eq!(
+        count_by_memory_id(&pool, LinkTable::EntityLinks, &old_mid).await,
+        0,
+        "old mem_entity_links should be cleaned after correct by query"
+    );
+    println!("✅ REST correct by query: old graph + entity links cleaned");
+}

@@ -102,15 +102,26 @@ impl LastUsedBatcher {
 }
 
 /// Spawn the background flush loop. Call once at server startup.
-pub fn spawn_last_used_flusher(batcher: std::sync::Arc<LastUsedBatcher>, pool: sqlx::MySqlPool) {
+pub fn spawn_last_used_flusher(
+    batcher: std::sync::Arc<LastUsedBatcher>,
+    pool: sqlx::MySqlPool,
+    mut shutdown: tokio::sync::watch::Receiver<()>,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
         interval.tick().await; // skip immediate
         loop {
-            interval.tick().await;
+            tokio::select! {
+                _ = interval.tick() => {}
+                _ = shutdown.changed() => {
+                    batcher.flush(&pool).await;
+                    break;
+                }
+            }
             batcher.flush(&pool).await;
         }
-    });
+        tracing::debug!("last_used flusher exiting");
+    })
 }
 
 // ── Tool usage tracking ───────────────────────────────────────────────────────
@@ -197,8 +208,11 @@ impl ToolUsageBatcher {
         }
 
         for chunk in dirty.chunks(500) {
-            let placeholders: String =
-                chunk.iter().map(|_| "(?, ?, ?)").collect::<Vec<_>>().join(",");
+            let placeholders: String = chunk
+                .iter()
+                .map(|_| "(?, ?, ?)")
+                .collect::<Vec<_>>()
+                .join(",");
             let sql = format!(
                 "INSERT INTO mem_tool_usage (user_id, tool_name, last_used_at) VALUES {placeholders} \
                  ON DUPLICATE KEY UPDATE last_used_at = VALUES(last_used_at)"
@@ -208,7 +222,10 @@ impl ToolUsageBatcher {
                 query = query.bind(uid).bind(tool).bind(ts);
             }
             if let Err(e) = query.execute(pool).await {
-                warn!("tool_usage batch flush failed ({} entries): {e}", chunk.len());
+                warn!(
+                    "tool_usage batch flush failed ({} entries): {e}",
+                    chunk.len()
+                );
                 return; // keep dirty flags for retry on next cycle
             }
         }
@@ -228,16 +245,23 @@ impl ToolUsageBatcher {
 pub fn spawn_tool_usage_flusher(
     batcher: std::sync::Arc<ToolUsageBatcher>,
     pool: sqlx::MySqlPool,
-) {
+    mut shutdown: tokio::sync::watch::Receiver<()>,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut interval =
-            tokio::time::interval(std::time::Duration::from_secs(10 * 60));
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(10 * 60));
         interval.tick().await; // skip immediate
         loop {
-            interval.tick().await;
+            tokio::select! {
+                _ = interval.tick() => {}
+                _ = shutdown.changed() => {
+                    batcher.flush(&pool).await;
+                    break;
+                }
+            }
             batcher.flush(&pool).await;
         }
-    });
+        tracing::debug!("tool_usage flusher exiting");
+    })
 }
 
 // ── API call log tracking ─────────────────────────────────────────────────────
@@ -286,7 +310,13 @@ impl CallLogBatcher {
         latency_ms: u32,
     ) {
         if let Ok(mut v) = self.pending.lock() {
-            v.push(CallLogEntry { user_id, method, path, status_code, latency_ms });
+            v.push(CallLogEntry {
+                user_id,
+                method,
+                path,
+                status_code,
+                latency_ms,
+            });
         }
     }
 
@@ -323,10 +353,7 @@ impl CallLogBatcher {
                     .bind(e.latency_ms as i32);
             }
             if let Err(e) = query.execute(pool).await {
-                warn!(
-                    "call_log batch flush failed ({} entries): {e}",
-                    chunk.len()
-                );
+                warn!("call_log batch flush failed ({} entries): {e}", chunk.len());
             }
         }
     }
@@ -336,15 +363,23 @@ impl CallLogBatcher {
 pub fn spawn_call_log_flusher(
     batcher: std::sync::Arc<CallLogBatcher>,
     pool: sqlx::MySqlPool,
-) {
+    mut shutdown: tokio::sync::watch::Receiver<()>,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
         interval.tick().await; // skip immediate first tick
         loop {
-            interval.tick().await;
+            tokio::select! {
+                _ = interval.tick() => {}
+                _ = shutdown.changed() => {
+                    batcher.flush(&pool).await;
+                    break;
+                }
+            }
             batcher.flush(&pool).await;
         }
-    });
+        tracing::debug!("call_log flusher exiting");
+    })
 }
 
 #[axum::async_trait]

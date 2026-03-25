@@ -12,6 +12,7 @@ mod benchmark;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
+use std::future::IntoFuture;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -353,7 +354,7 @@ enum PluginCommands {
 async fn cmd_serve(db_url: Option<String>, port: u16, master_key: String) -> Result<()> {
     use memoria_api::{build_router, AppState};
     use memoria_git::GitForDataService;
-    use memoria_service::{Config, MemoryService};
+    use memoria_service::{shutdown_signal, Config, MemoryService};
     use memoria_storage::SqlMemoryStore;
     use sqlx::mysql::MySqlPool;
     use tower_http::trace::TraceLayer;
@@ -389,16 +390,21 @@ async fn cmd_serve(db_url: Option<String>, port: u16, master_key: String) -> Res
     let service = Arc::new(MemoryService::new_sql_with_llm(Arc::new(store), embedder, llm).await);
     Arc::new(memoria_service::GovernanceScheduler::from_config(service.clone(), &cfg).await?)
         .start();
-    let state = AppState::new(service, git, master_key)
+    let state = AppState::new(service.clone(), git, master_key)
         .with_instance_id(cfg.instance_id.clone())
         .init_auth_pool(&cfg.db_url)
         .await?;
 
-    let app = build_router(state).layer(TraceLayer::new_for_http());
+    let app = build_router(state.clone()).layer(TraceLayer::new_for_http());
     let addr = format!("0.0.0.0:{}", port);
     tracing::info!("Listening on {addr}");
     let listener = tokio::net::TcpListener::bind(&addr).await?;
-    axum::serve(listener, app).await?;
+    run_with_edit_log_drain(
+        service,
+        axum::serve(listener, app).with_graceful_shutdown(shutdown_signal()),
+    )
+    .await?;
+    state.drain_flushers().await;
     Ok(())
 }
 
@@ -501,9 +507,17 @@ async fn cmd_mcp(
         .start();
 
     if transport == "sse" {
-        memoria_mcp::run_sse(service, git, cfg.user, mcp_port).await
+        run_with_edit_log_drain(
+            service.clone(),
+            memoria_mcp::run_sse(service, git, cfg.user, mcp_port),
+        )
+        .await
     } else {
-        memoria_mcp::run_stdio(service, git, cfg.user).await
+        run_with_edit_log_drain(
+            service.clone(),
+            memoria_mcp::run_stdio(service, git, cfg.user),
+        )
+        .await
     }
 }
 
@@ -853,27 +867,25 @@ fn build_embedder(
                 model = %cfg.embedding_model,
                 "using round-robin HTTP embedder"
             );
-            Some(
-                Arc::new(RoundRobinEmbedder::new(
-                    endpoints.into_iter().map(|e| (e.url, e.api_key)).collect(),
-                    &cfg.embedding_model,
-                    cfg.embedding_dim,
-                )) as Arc<dyn memoria_core::interfaces::EmbeddingProvider>,
-            )
+            Some(Arc::new(RoundRobinEmbedder::new(
+                endpoints.into_iter().map(|e| (e.url, e.api_key)).collect(),
+                &cfg.embedding_model,
+                cfg.embedding_dim,
+            ))
+                as Arc<dyn memoria_core::interfaces::EmbeddingProvider>)
         } else {
             let ep = endpoints
                 .into_iter()
                 .next()
                 .expect("has_embedding() guarantees at least one endpoint");
             tracing::info!(url = %ep.url, model = %cfg.embedding_model, "using single HTTP embedder");
-            Some(
-                Arc::new(HttpEmbedder::new(
-                    ep.url,
-                    ep.api_key,
-                    &cfg.embedding_model,
-                    cfg.embedding_dim,
-                )) as Arc<dyn memoria_core::interfaces::EmbeddingProvider>,
-            )
+            Some(Arc::new(HttpEmbedder::new(
+                ep.url,
+                ep.api_key,
+                &cfg.embedding_model,
+                cfg.embedding_dim,
+            ))
+                as Arc<dyn memoria_core::interfaces::EmbeddingProvider>)
         }
     } else if cfg.embedding_provider == "local" {
         #[cfg(feature = "local-embedding")]
@@ -919,6 +931,23 @@ fn build_llm(cfg: &memoria_service::Config) -> Option<Arc<memoria_embedding::Llm
             cfg.llm_model.clone(),
         ))
     })
+}
+
+async fn run_with_edit_log_drain<T, E, Fut>(
+    service: Arc<memoria_service::MemoryService>,
+    fut: Fut,
+) -> Result<T>
+where
+    Fut: IntoFuture<Output = std::result::Result<T, E>>,
+    E: Into<anyhow::Error>,
+{
+    let result = fut.into_future().await.map_err(Into::into);
+    if !service.drain_edit_log().await {
+        // Surface drain failure even if the main task succeeded,
+        // so external supervisors see a non-zero exit code.
+        return Err(anyhow::anyhow!("edit-log drain failed; some audit records may be lost"));
+    }
+    result
 }
 
 // ── Init / Status / Rules ─────────────────────────────────────────────────
@@ -1373,20 +1402,31 @@ fn configure_gemini(project_dir: &Path, entry: &serde_json::Value, force: bool) 
 
     // MCP: write to .gemini/settings.json (project-level)
     let settings_path = project_dir.join(".gemini/settings.json");
-    let relative = settings_path.strip_prefix(project_dir).unwrap_or(&settings_path);
+    let relative = settings_path
+        .strip_prefix(project_dir)
+        .unwrap_or(&settings_path);
 
     if settings_path.exists() {
         if let Ok(content) = std::fs::read_to_string(&settings_path) {
             if let Ok(mut existing) = serde_json::from_str::<serde_json::Value>(&content) {
                 existing["mcpServers"][MCP_KEY] = entry.clone();
-                std::fs::write(&settings_path, serde_json::to_string_pretty(&existing).unwrap())
-                    .ok();
-                results.push(format!("  ✓ {} (updated memoria entry)", relative.display()));
+                std::fs::write(
+                    &settings_path,
+                    serde_json::to_string_pretty(&existing).unwrap(),
+                )
+                .ok();
+                results.push(format!(
+                    "  ✓ {} (updated memoria entry)",
+                    relative.display()
+                ));
             } else {
                 // File exists but invalid JSON — overwrite
                 let wrapper = serde_json::json!({ "mcpServers": { MCP_KEY: entry } });
-                std::fs::write(&settings_path, serde_json::to_string_pretty(&wrapper).unwrap())
-                    .ok();
+                std::fs::write(
+                    &settings_path,
+                    serde_json::to_string_pretty(&wrapper).unwrap(),
+                )
+                .ok();
                 results.push(format!("  ✓ {} (created)", relative.display()));
             }
         }
@@ -1395,7 +1435,11 @@ fn configure_gemini(project_dir: &Path, entry: &serde_json::Value, force: bool) 
             std::fs::create_dir_all(parent).ok();
         }
         let wrapper = serde_json::json!({ "mcpServers": { MCP_KEY: entry } });
-        std::fs::write(&settings_path, serde_json::to_string_pretty(&wrapper).unwrap()).ok();
+        std::fs::write(
+            &settings_path,
+            serde_json::to_string_pretty(&wrapper).unwrap(),
+        )
+        .ok();
         results.push(format!("  ✓ {} (created)", relative.display()));
     }
 
@@ -2428,7 +2472,12 @@ fn write_rules_for_tool(project_dir: &Path, tool: &str, force: bool) {
         "gemini" => {
             println!(
                 "{}",
-                write_rule(&project_dir.join("GEMINI.md"), GEMINI_RULE, force, project_dir)
+                write_rule(
+                    &project_dir.join("GEMINI.md"),
+                    GEMINI_RULE,
+                    force,
+                    project_dir
+                )
             );
             let rules_dir = project_dir.join(".gemini");
             let pairs: &[(&str, &str)] = &[
@@ -2962,8 +3011,56 @@ fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::validate_embedding_config;
-    use memoria_service::Config;
+    use super::{run_with_edit_log_drain, validate_embedding_config};
+    use async_trait::async_trait;
+    use memoria_core::{interfaces::MemoryStore, MemoriaError, Memory};
+    use memoria_service::{Config, MemoryService};
+    use memoria_storage::OwnedEditLogEntry;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Default)]
+    struct DummyStore;
+
+    #[async_trait]
+    impl MemoryStore for DummyStore {
+        async fn insert(&self, _: &Memory) -> Result<(), MemoriaError> {
+            Ok(())
+        }
+
+        async fn get(&self, _: &str) -> Result<Option<Memory>, MemoriaError> {
+            Ok(None)
+        }
+
+        async fn update(&self, _: &Memory) -> Result<(), MemoriaError> {
+            Ok(())
+        }
+
+        async fn soft_delete(&self, _: &str) -> Result<(), MemoriaError> {
+            Ok(())
+        }
+
+        async fn list_active(&self, _: &str, _: i64) -> Result<Vec<Memory>, MemoriaError> {
+            Ok(vec![])
+        }
+
+        async fn search_fulltext(
+            &self,
+            _: &str,
+            _: &str,
+            _: i64,
+        ) -> Result<Vec<Memory>, MemoriaError> {
+            Ok(vec![])
+        }
+
+        async fn search_vector(
+            &self,
+            _: &str,
+            _: &[f32],
+            _: i64,
+        ) -> Result<Vec<Memory>, MemoriaError> {
+            Ok(vec![])
+        }
+    }
 
     fn test_config() -> Config {
         Config {
@@ -3013,5 +3110,42 @@ mod tests {
         cfg.embedding_provider = "local".to_string();
 
         assert!(validate_embedding_config(&cfg).is_ok());
+    }
+
+    fn test_service() -> (Arc<MemoryService>, Arc<Mutex<Vec<OwnedEditLogEntry>>>) {
+        let (svc, entries) = MemoryService::new_with_test_entries(Arc::new(DummyStore), None);
+        (Arc::new(svc), entries)
+    }
+
+    #[tokio::test]
+    async fn run_with_edit_log_drain_flushes_after_success() {
+        let (service, entries) = test_service();
+        run_with_edit_log_drain(service.clone(), async {
+            service.send_edit_log("u1", "inject", Some("m1"), Some("{}"), "test", None);
+            Ok::<_, anyhow::Error>(())
+        })
+        .await
+        .expect("helper should succeed");
+
+        let drained = entries.lock().unwrap();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].operation, "inject");
+    }
+
+    #[tokio::test]
+    async fn run_with_edit_log_drain_flushes_after_error() {
+        let (service, entries) = test_service();
+        let err = run_with_edit_log_drain(service.clone(), async {
+            service.send_edit_log("u1", "purge", Some("m1"), None, "test", None);
+            Err::<(), _>(anyhow::anyhow!("boom"))
+        })
+        .await
+        .expect_err("helper should return original error");
+
+        assert!(err.to_string().contains("boom"));
+
+        let drained = entries.lock().unwrap();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].operation, "purge");
     }
 }

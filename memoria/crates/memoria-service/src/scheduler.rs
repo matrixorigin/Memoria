@@ -645,6 +645,9 @@ mod tests {
         async fn cleanup_orphan_stats(&self) -> Result<i64, crate::MemoriaError> {
             Ok(0)
         }
+        async fn cleanup_orphan_graph_data(&self) -> Result<i64, crate::MemoriaError> {
+            Ok(0)
+        }
         async fn cleanup_edit_log(&self, _: i64) -> Result<i64, crate::MemoriaError> {
             Ok(0)
         }
@@ -717,6 +720,9 @@ mod tests {
             Ok(0)
         }
         async fn cleanup_orphan_stats(&self) -> Result<i64, crate::MemoriaError> {
+            Ok(0)
+        }
+        async fn cleanup_orphan_graph_data(&self) -> Result<i64, crate::MemoriaError> {
             Ok(0)
         }
         async fn cleanup_edit_log(&self, _: i64) -> Result<i64, crate::MemoriaError> {
@@ -800,6 +806,9 @@ mod tests {
             Ok(0)
         }
         async fn cleanup_orphan_stats(&self) -> Result<i64, crate::MemoriaError> {
+            Ok(0)
+        }
+        async fn cleanup_orphan_graph_data(&self) -> Result<i64, crate::MemoriaError> {
             Ok(0)
         }
         async fn cleanup_edit_log(&self, _: i64) -> Result<i64, crate::MemoriaError> {
@@ -1366,11 +1375,12 @@ mod tests {
             instance_id: "test-instance".into(),
             lock_ttl_secs: 120,
         };
-        let service = Arc::new(MemoryService::new(Arc::new(NoopMemoryStore), None));
-
         let scheduler = tokio::runtime::Runtime::new()
             .unwrap()
-            .block_on(GovernanceScheduler::from_config(service, &config))
+            .block_on(async {
+                let service = Arc::new(MemoryService::new(Arc::new(NoopMemoryStore), None, None));
+                GovernanceScheduler::from_config(service, &config).await
+            })
             .unwrap();
 
         assert_eq!(scheduler.strategy.strategy_key(), "governance:default:v1");

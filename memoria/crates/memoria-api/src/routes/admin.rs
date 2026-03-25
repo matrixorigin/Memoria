@@ -565,8 +565,9 @@ pub async fn user_call_stats(
             let path: String = r.try_get("path").unwrap_or_default();
             let status_code: i16 = r.try_get("status_code").unwrap_or(0);
             let latency_ms: i32 = r.try_get("latency_ms").unwrap_or(0);
-            let called_at: chrono::DateTime<chrono::Utc> =
-                r.try_get("called_at").unwrap_or_else(|_| chrono::Utc::now());
+            let called_at: chrono::DateTime<chrono::Utc> = r
+                .try_get("called_at")
+                .unwrap_or_else(|_| chrono::Utc::now());
             serde_json::json!({
                 "method": method,
                 "path": path,
@@ -600,11 +601,11 @@ pub async fn user_call_stats(
     .await
     .map_err(db_err)?;
 
-    let at_total: i64     = at_row.try_get("total").unwrap_or(0);
-    let at_writes: i64    = at_row.try_get("writes").unwrap_or(0);
+    let at_total: i64 = at_row.try_get("total").unwrap_or(0);
+    let at_writes: i64 = at_row.try_get("writes").unwrap_or(0);
     let at_retrieves: i64 = at_row.try_get("retrieves").unwrap_or(0);
-    let at_deletes: i64   = at_row.try_get("deletes").unwrap_or(0);
-    let at_avg_ret: f64   = at_row.try_get("avg_retrieval_ms").unwrap_or(0.0);
+    let at_deletes: i64 = at_row.try_get("deletes").unwrap_or(0);
+    let at_avg_ret: f64 = at_row.try_get("avg_retrieval_ms").unwrap_or(0.0);
 
     // ── Per-day series within the requested window ─────────────────────────────
     // Used by the Usage panel's API Call Tracking chart.
@@ -626,7 +627,7 @@ pub async fn user_call_stats(
          GROUP BY DATE(called_at) \
          ORDER BY DATE(called_at) ASC",
     )
-    .bind(days - 1)   // offset = days - 1 so day_idx 0 = oldest day
+    .bind(days - 1) // offset = days - 1 so day_idx 0 = oldest day
     .bind(&user_id)
     .bind(days - 1)
     .fetch_all(pool)

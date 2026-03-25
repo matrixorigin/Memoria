@@ -3,6 +3,7 @@ use chrono::Utc;
 use memoria_core::{interfaces::MemoryStore, MemoriaError, Memory, MemoryType, TrustTier};
 use sqlx::{mysql::MySqlPool, Row};
 use std::str::FromStr;
+use std::sync::Arc;
 
 pub(crate) fn db_err(e: sqlx::Error) -> MemoriaError {
     if matches!(&e, sqlx::Error::PoolTimedOut) {
@@ -46,16 +47,17 @@ pub fn spawn_pool_monitor(pool: MySqlPool) {
     });
 }
 
-/// One entry for [`SqlMemoryStore::batch_log_edit`].
-/// Fields: `(user_id, operation, memory_id, payload, reason, snapshot_before)`.
-pub type EditLogEntry<'a> = (
-    &'a str,
-    &'a str,
-    Option<&'a str>,
-    Option<&'a str>,
-    &'a str,
-    Option<&'a str>,
-);
+/// Owned edit-log entry for async batched writes.
+#[derive(Clone)]
+pub struct OwnedEditLogEntry {
+    pub edit_id: String,
+    pub user_id: String,
+    pub operation: String,
+    pub memory_id: Option<String>,
+    pub payload: Option<String>,
+    pub reason: String,
+    pub snapshot_before: Option<String>,
+}
 
 /// Generate a UUID v7 (time-ordered) as a simple hex string.
 fn uuid7_id() -> String {
@@ -134,6 +136,15 @@ pub struct SqlMemoryStore {
     embedding_dim: usize,
     instance_id: String,
     database_url: Option<String>,
+    /// Cache: user_id → active table name (TTL 5s, invalidated on branch switch)
+    active_table_cache: moka::future::Cache<String, String>,
+    /// Cache: (user_id, operation) → last_run Instant (avoids DB query for cooldown checks)
+    cooldown_cache: moka::future::Cache<String, std::time::Instant>,
+    /// Cache: user_id → graph node count (TTL 2 min, shared across GraphStore instances)
+    node_count_cache: moka::future::Cache<String, i64>,
+    /// Optional: route log_edit through async buffer instead of direct INSERT.
+    /// Shared across main store and background pool clones so a single clear drains all.
+    edit_log_tx: Arc<std::sync::RwLock<Option<tokio::sync::mpsc::Sender<OwnedEditLogEntry>>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -197,7 +208,33 @@ impl SqlMemoryStore {
             embedding_dim,
             instance_id,
             database_url: None,
+            // Short TTL: multi-instance deployments without sticky sessions could
+            // serve stale branch mappings after a branch switch on another instance.
+            // 5s keeps the hot-path benefit while limiting the inconsistency window.
+            active_table_cache: moka::future::Cache::builder()
+                .max_capacity(10_000)
+                .time_to_live(std::time::Duration::from_secs(5))
+                .build(),
+            cooldown_cache: moka::future::Cache::builder()
+                .max_capacity(1_000)
+                .time_to_live(std::time::Duration::from_secs(7200)) // max cooldown is 2h
+                .build(),
+            node_count_cache: moka::future::Cache::builder()
+                .max_capacity(10_000)
+                .time_to_live(std::time::Duration::from_secs(120))
+                .build(),
+            edit_log_tx: Arc::new(std::sync::RwLock::new(None)),
         }
+    }
+
+    /// Set the edit-log channel sender (once, at startup).
+    pub fn set_edit_log_tx(&self, tx: tokio::sync::mpsc::Sender<OwnedEditLogEntry>) {
+        *self.edit_log_tx.write().unwrap() = Some(tx);
+    }
+
+    /// Clear the edit-log sender (shutdown drain). After this, log_edit falls back to direct INSERT.
+    pub fn clear_edit_log_tx(&self) {
+        *self.edit_log_tx.write().unwrap() = None;
     }
 
     pub fn pool(&self) -> &MySqlPool {
@@ -205,7 +242,11 @@ impl SqlMemoryStore {
     }
 
     pub fn graph_store(&self) -> crate::graph::GraphStore {
-        crate::graph::GraphStore::new(self.pool.clone(), self.embedding_dim)
+        crate::graph::GraphStore::with_node_count_cache(
+            self.pool.clone(),
+            self.embedding_dim,
+            self.node_count_cache.clone(),
+        )
     }
 
     pub async fn connect(
@@ -280,6 +321,8 @@ impl SqlMemoryStore {
                 );
                 let mut s = Self::new(pool, self.embedding_dim, self.instance_id.clone());
                 s.database_url = self.database_url.clone();
+                // Share the same edit_log_tx Arc so clear_edit_log_tx drains all stores at once
+                s.edit_log_tx = self.edit_log_tx.clone();
                 Ok(std::sync::Arc::new(s))
             }
             Err(e) => Err(db_err(e)),
@@ -805,6 +848,28 @@ impl SqlMemoryStore {
             .await;
         }
 
+        // Migration: add created_at index for feedback retention cleanup scans.
+        // cleanup_metrics_and_feedback() deletes old feedback rows with
+        // `created_at < DATE_SUB(NOW(), INTERVAL ? DAY)`, which benefits from
+        // a direct time index instead of scanning all rows.
+        let has_feedback_created_at_idx: bool = sqlx::query_scalar(
+            "SELECT COUNT(*) > 0 FROM information_schema.statistics \
+             WHERE table_schema = DATABASE() \
+               AND table_name = 'mem_retrieval_feedback' \
+               AND index_name = 'idx_feedback_created_at'",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .unwrap_or(false);
+        if !has_feedback_created_at_idx {
+            let _ = sqlx::query(
+                "ALTER TABLE mem_retrieval_feedback \
+                 ADD INDEX idx_feedback_created_at (created_at)",
+            )
+            .execute(&self.pool)
+            .await;
+        }
+
         // Migration: add (user_id, observed_at) index on mem_memories.
         // Speeds up the monthly-growth-rate count in health_capacity() which uses
         // `observed_at >= NOW() - INTERVAL 30 DAY` (direct range comparison).
@@ -909,27 +974,106 @@ impl SqlMemoryStore {
         reason: &str,
         snapshot_before: Option<&str>,
     ) {
+        if let Some(tx) = self.edit_log_tx.read().unwrap().clone() {
+            let entry = OwnedEditLogEntry {
+                edit_id: uuid7_id(),
+                user_id: user_id.to_string(),
+                operation: operation.to_string(),
+                memory_id: memory_id.map(String::from),
+                payload: payload.map(String::from),
+                reason: reason.to_string(),
+                snapshot_before: snapshot_before.map(String::from),
+            };
+            match tx.try_send(entry) {
+                Ok(()) => return,
+                Err(tokio::sync::mpsc::error::TrySendError::Full(entry)) => {
+                    tracing::warn!(
+                        user_id = %entry.user_id,
+                        operation = %entry.operation,
+                        memory_id = ?entry.memory_id,
+                        "edit log async buffer full, dropping entry"
+                    );
+                    return;
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    // Channel closed (drain in progress) — fall through to direct INSERT
+                }
+            }
+        }
         let edit_id = uuid7_id();
-        let _ = sqlx::query(
+        // MO workaround (revert when fixed): MatrixOne prepared-statement bind of
+        // Option<String>::None to nullable columns inherits the previous row's value
+        // instead of SQL NULL in multi-row INSERTs. Use SQL NULL literal instead.
+        // TODO: revert to plain `(?, ?, ?, ?, ?, ?, ?, ?)` + direct bind once MO fixes this.
+        let mid_ph = if memory_id.is_some() { "?" } else { "NULL" };
+        let pay_ph = if payload.is_some() { "?" } else { "NULL" };
+        let snap_ph = if snapshot_before.is_some() { "?" } else { "NULL" };
+        let sql = format!(
             "INSERT INTO mem_edit_log (edit_id, user_id, memory_id, operation, payload, reason, snapshot_before, created_by) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
-        )
-        .bind(&edit_id)
-        .bind(user_id)
-        .bind(memory_id)
-        .bind(operation)
-        .bind(payload)
-        .bind(reason)
-        .bind(snapshot_before)
-        .bind(user_id)
-        .execute(&self.pool)
-        .await;
+             VALUES (?, ?, {mid_ph}, ?, {pay_ph}, ?, {snap_ph}, ?)"
+        );
+        let mut q = sqlx::query(&sql)
+            .bind(&edit_id)
+            .bind(user_id);
+        if let Some(v) = memory_id { q = q.bind(v); }
+        q = q.bind(operation);
+        if let Some(v) = payload { q = q.bind(v); }
+        q = q.bind(reason);
+        if let Some(v) = snapshot_before { q = q.bind(v); }
+        let _ = q.bind(user_id).execute(&self.pool).await;
+    }
+
+    /// Batch-insert edit log entries in a single multi-row INSERT.
+    pub async fn flush_edit_log_batch(
+        &self,
+        entries: &[OwnedEditLogEntry],
+    ) -> Result<(), MemoriaError> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        for chunk in entries.chunks(100) {
+            // MO workaround (revert when fixed): MatrixOne prepared-statement bind of
+            // Option<String>::None to nullable columns inherits the previous row's value
+            // instead of SQL NULL in multi-row INSERTs. Use SQL NULL literal instead.
+            // TODO: revert to plain `(?, ?, ?, ?, ?, ?, ?, ?)` + direct bind once MO fixes this.
+            let placeholders: Vec<String> = chunk
+                .iter()
+                .map(|e| {
+                    let mid = if e.memory_id.is_some() { "?" } else { "NULL" };
+                    let pay = if e.payload.is_some() { "?" } else { "NULL" };
+                    let snap = if e.snapshot_before.is_some() { "?" } else { "NULL" };
+                    format!("(?, ?, {mid}, ?, {pay}, ?, {snap}, ?)")
+                })
+                .collect();
+            let sql = format!(
+                "INSERT INTO mem_edit_log (edit_id, user_id, memory_id, operation, payload, reason, snapshot_before, created_by) VALUES {}",
+                placeholders.join(", ")
+            );
+            let mut q = sqlx::query(&sql);
+            for e in chunk {
+                q = q
+                    .bind(&e.edit_id)
+                    .bind(&e.user_id);
+                if let Some(v) = &e.memory_id { q = q.bind(v); }
+                q = q.bind(&e.operation);
+                if let Some(v) = &e.payload { q = q.bind(v); }
+                q = q.bind(&e.reason);
+                if let Some(v) = &e.snapshot_before { q = q.bind(v); }
+                q = q.bind(&e.user_id);
+            }
+            q.execute(&self.pool).await.map_err(db_err)?;
+        }
+        Ok(())
     }
 
     // ── Branch state ──────────────────────────────────────────────────────────
 
     /// Returns the active table name for a user: "mem_memories" or branch table name.
     pub async fn active_table(&self, user_id: &str) -> Result<String, MemoriaError> {
+        if let Some(cached) = self.active_table_cache.get(user_id).await {
+            return Ok(cached);
+        }
+
         let row = sqlx::query("SELECT active_branch FROM mem_user_state WHERE user_id = ?")
             .bind(user_id)
             .fetch_optional(&self.pool)
@@ -941,6 +1085,9 @@ impl SqlMemoryStore {
             .unwrap_or_else(|| "main".to_string());
 
         if branch == "main" {
+            self.active_table_cache
+                .insert(user_id.to_string(), "mem_memories".to_string())
+                .await;
             return Ok("mem_memories".to_string());
         }
 
@@ -951,7 +1098,13 @@ impl SqlMemoryStore {
         .fetch_optional(&self.pool).await.map_err(db_err)?;
 
         match branch_row {
-            Some(r) => Ok(r.try_get::<String, _>("table_name").map_err(db_err)?),
+            Some(r) => {
+                let table = r.try_get::<String, _>("table_name").map_err(db_err)?;
+                self.active_table_cache
+                    .insert(user_id.to_string(), table.clone())
+                    .await;
+                Ok(table)
+            }
             None => {
                 self.set_active_branch(user_id, "main").await?;
                 Ok("mem_memories".to_string())
@@ -974,6 +1127,7 @@ impl SqlMemoryStore {
         .execute(&self.pool)
         .await
         .map_err(db_err)?;
+        self.active_table_cache.invalidate(user_id).await;
         Ok(())
     }
 
@@ -1166,12 +1320,23 @@ impl SqlMemoryStore {
     // ── Governance ────────────────────────────────────────────────────────────
 
     /// Check cooldown. Returns Some(remaining_seconds) if still in cooldown, None if can run.
+    /// Uses in-memory cache as fast path; falls back to DB for cross-instance consistency.
     pub async fn check_cooldown(
         &self,
         user_id: &str,
         operation: &str,
         cooldown_secs: i64,
     ) -> Result<Option<i64>, MemoriaError> {
+        let key = format!("{}:{}", user_id, operation);
+        if let Some(last_run) = self.cooldown_cache.get(&key).await {
+            let elapsed = last_run.elapsed().as_secs() as i64;
+            if elapsed < cooldown_secs {
+                return Ok(Some(cooldown_secs - elapsed));
+            }
+            // Expired in memory — can run
+            return Ok(None);
+        }
+        // Cache miss — check DB (cold start or cross-instance)
         let row = sqlx::query(
             "SELECT TIMESTAMPDIFF(SECOND, last_run_at, NOW()) as elapsed \
              FROM mem_governance_cooldown WHERE user_id = ? AND operation = ?",
@@ -1188,6 +1353,10 @@ impl SqlMemoryStore {
                 if elapsed >= cooldown_secs {
                     Ok(None)
                 } else {
+                    // Backfill cache from DB
+                    let age = std::time::Duration::from_secs(elapsed as u64);
+                    let approx_start = std::time::Instant::now() - age;
+                    self.cooldown_cache.insert(key, approx_start).await;
                     Ok(Some(cooldown_secs - elapsed))
                 }
             }
@@ -1207,6 +1376,10 @@ impl SqlMemoryStore {
         .execute(&self.pool)
         .await
         .map_err(db_err)?;
+        let key = format!("{}:{}", user_id, operation);
+        self.cooldown_cache
+            .insert(key, std::time::Instant::now())
+            .await;
         Ok(())
     }
 
@@ -1813,6 +1986,45 @@ impl SqlMemoryStore {
         Ok(total)
     }
 
+    /// Remove orphaned rows from `mem_entity_links` whose memory_id
+    /// no longer exists or is inactive in `mem_memories`. Idempotent, batch-safe.
+    pub async fn cleanup_orphan_entity_links(&self) -> Result<i64, MemoriaError> {
+        // Two-step: find orphan IDs, then delete by primary key.
+        let orphans: Vec<(String,)> = sqlx::query_as(
+            "SELECT l.id FROM mem_entity_links l \
+             LEFT JOIN mem_memories m ON l.memory_id = m.memory_id AND m.is_active = 1 \
+             WHERE m.memory_id IS NULL \
+             LIMIT 5000",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        if orphans.is_empty() {
+            return Ok(0);
+        }
+        let placeholders = orphans.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!("DELETE FROM mem_entity_links WHERE id IN ({placeholders})");
+        let mut q = sqlx::query(&sql);
+        for (id,) in &orphans {
+            q = q.bind(id);
+        }
+        let r = q.execute(&self.pool).await.map_err(db_err)?;
+        Ok(r.rows_affected() as i64)
+    }
+
+    /// Delete entity links in `mem_entity_links` for a specific memory_id.
+    pub async fn delete_entity_links_by_memory_id(
+        &self,
+        memory_id: &str,
+    ) -> Result<i64, MemoriaError> {
+        let r = sqlx::query("DELETE FROM mem_entity_links WHERE memory_id = ?")
+            .bind(memory_id)
+            .execute(&self.pool)
+            .await
+            .map_err(db_err)?;
+        Ok(r.rows_affected() as i64)
+    }
+
     /// Validate table name to prevent SQL injection
     fn validate_table_name(table: &str) -> Result<(), MemoriaError> {
         // 只允许字母、数字、下划线
@@ -2336,6 +2548,54 @@ impl SqlMemoryStore {
         Ok(map)
     }
 
+    /// Combined fetch of access_count + feedback in a single query (replaces
+    /// separate get_access_counts + get_feedback_batch calls).
+    pub async fn get_stats_batch(
+        &self,
+        memory_ids: &[String],
+    ) -> Result<
+        (
+            std::collections::HashMap<String, i32>,
+            std::collections::HashMap<String, MemoryFeedback>,
+        ),
+        MemoriaError,
+    > {
+        let mut ac_map = std::collections::HashMap::new();
+        let mut fb_map = std::collections::HashMap::new();
+        if memory_ids.is_empty() {
+            return Ok((ac_map, fb_map));
+        }
+        for chunk in memory_ids.chunks(500) {
+            let placeholders: Vec<&str> = chunk.iter().map(|_| "?").collect();
+            let sql = format!(
+                "SELECT memory_id, access_count, \
+                 feedback_useful, feedback_irrelevant, feedback_outdated, feedback_wrong \
+                 FROM mem_memories_stats WHERE memory_id IN ({})",
+                placeholders.join(", ")
+            );
+            let mut q = sqlx::query(&sql);
+            for id in chunk {
+                q = q.bind(id);
+            }
+            let rows = q.fetch_all(&self.pool).await.map_err(db_err)?;
+            for row in &rows {
+                let id: String = row.try_get("memory_id").map_err(db_err)?;
+                let count: i32 = row.try_get("access_count").unwrap_or(0);
+                ac_map.insert(id.clone(), count);
+                fb_map.insert(
+                    id,
+                    MemoryFeedback {
+                        useful: row.try_get("feedback_useful").unwrap_or(0),
+                        irrelevant: row.try_get("feedback_irrelevant").unwrap_or(0),
+                        outdated: row.try_get("feedback_outdated").unwrap_or(0),
+                        wrong: row.try_get("feedback_wrong").unwrap_or(0),
+                    },
+                );
+            }
+        }
+        Ok((ac_map, fb_map))
+    }
+
     /// Detect pollution: high supersede ratio in recent changes (threshold=0.3).
     pub async fn detect_pollution(
         &self,
@@ -2509,77 +2769,52 @@ impl SqlMemoryStore {
         exclude_id: &str,
         l2_threshold: f64,
     ) -> Result<Option<(String, String, f64)>, MemoriaError> {
-        // Same-type first, then cross-type fallback
-        if let Some(hit) = self
-            .find_near_duplicate_inner(
-                table,
-                user_id,
-                embedding,
-                Some(memory_type),
-                exclude_id,
-                l2_threshold,
-            )
-            .await?
-        {
-            return Ok(Some(hit));
-        }
-        self.find_near_duplicate_inner(table, user_id, embedding, None, exclude_id, l2_threshold)
-            .await
-    }
-
-    async fn find_near_duplicate_inner(
-        &self,
-        table: &str,
-        user_id: &str,
-        embedding: &[f32],
-        memory_type: Option<&str>,
-        exclude_id: &str,
-        l2_threshold: f64,
-    ) -> Result<Option<(String, String, f64)>, MemoriaError> {
+        // Single vector search without type filter; prefer same-type match in app layer.
         let vec_literal = vec_to_mo(embedding);
-        let type_filter = match memory_type {
-            Some(_) => "AND memory_type = ? ",
-            None => "",
-        };
         let sql = format!(
-            "SELECT memory_id, content, \
+            "SELECT memory_id, content, memory_type, \
              l2_distance(embedding, '{vec_literal}') AS l2_dist \
              FROM {table} \
-             WHERE user_id = ? AND is_active = 1 {type_filter}\
+             WHERE user_id = ? AND is_active = 1 \
                AND embedding IS NOT NULL AND vector_dims(embedding) > 0 \
                AND memory_id != ? \
-             ORDER BY l2_dist ASC LIMIT 1 by rank with option 'mode=post'"
+             ORDER BY l2_dist ASC LIMIT 2 by rank with option 'mode=post'"
         );
-        let mut q = sqlx::query(&sql).bind(user_id);
-        if let Some(mt) = memory_type {
-            q = q.bind(mt);
-        }
-        let row = q
+        let rows = sqlx::query(&sql)
+            .bind(user_id)
             .bind(exclude_id)
-            .fetch_optional(&self.pool)
+            .fetch_all(&self.pool)
             .await
             .map_err(db_err)?;
-        if let Some(r) = row {
+
+        // Prefer same-type match, fall back to cross-type
+        let mut same_type: Option<(String, String, f64)> = None;
+        let mut any_type: Option<(String, String, f64)> = None;
+        for r in &rows {
             let dist: f64 = r
                 .try_get::<f64, _>("l2_dist")
                 .or_else(|_| r.try_get::<f32, _>("l2_dist").map(|v| v as f64))
                 .unwrap_or(f64::MAX);
-            if dist <= l2_threshold {
-                let mid: String = r.try_get("memory_id").map_err(db_err)?;
-                let content: String = r.try_get("content").map_err(db_err)?;
-                return Ok(Some((mid, content, dist)));
+            if dist > l2_threshold {
+                continue;
+            }
+            let mid: String = r.try_get("memory_id").map_err(db_err)?;
+            let content: String = r.try_get("content").map_err(db_err)?;
+            let mtype: String = r.try_get("memory_type").unwrap_or_default();
+            if same_type.is_none() && mtype == memory_type {
+                same_type = Some((mid, content, dist));
+                break; // same-type is highest priority
+            }
+            if any_type.is_none() {
+                any_type = Some((mid, content, dist));
             }
         }
-        Ok(None)
+        Ok(same_type.or(any_type))
     }
 
     /// Mark a memory as superseded by another.
     /// Branch-aware soft-delete: deactivate a memory in the given table.
-    pub async fn soft_delete_from(
-        &self,
-        table: &str,
-        memory_id: &str,
-    ) -> Result<(), MemoriaError> {
+    pub async fn soft_delete_from(&self, table: &str, memory_id: &str) -> Result<(), MemoriaError> {
         let now = Utc::now().naive_utc();
         sqlx::query(&format!(
             "UPDATE {table} SET is_active = 0, updated_at = ? WHERE memory_id = ?"
@@ -2733,38 +2968,6 @@ impl SqlMemoryStore {
             q.execute(&self.pool).await.map_err(db_err)?;
         }
         Ok(())
-    }
-
-    /// Batch-insert multiple edit log entries in a single statement.
-    pub async fn batch_log_edit(&self, entries: &[EditLogEntry<'_>]) {
-        if entries.is_empty() {
-            return;
-        }
-        for chunk in entries.chunks(50) {
-            let placeholders = chunk
-                .iter()
-                .map(|_| "(?, ?, ?, ?, ?, ?, ?, ?)")
-                .collect::<Vec<_>>()
-                .join(", ");
-            let sql = format!(
-                "INSERT INTO mem_edit_log \
-                 (edit_id, user_id, memory_id, operation, payload, reason, snapshot_before, created_by) \
-                 VALUES {placeholders}"
-            );
-            let mut q = sqlx::query(&sql);
-            for (user_id, operation, memory_id, payload, reason, snapshot_before) in chunk {
-                q = q
-                    .bind(uuid7_id())
-                    .bind(*user_id)
-                    .bind(*memory_id)
-                    .bind(*operation)
-                    .bind(*payload)
-                    .bind(*reason)
-                    .bind(*snapshot_before)
-                    .bind(*user_id);
-            }
-            let _ = q.execute(&self.pool).await;
-        }
     }
 
     pub async fn list_active_from(
@@ -2978,13 +3181,12 @@ impl SqlMemoryStore {
         feedback_weight: f64,
     ) -> Result<(Vec<Memory>, Vec<(String, f64, f64, f64, f64, f64)>), MemoriaError> {
         let fetch_k = (limit * 3).max(20);
-        let vec_results = self
-            .search_vector_from(table, user_id, embedding, fetch_k)
-            .await?;
-        let ft_results = self
-            .search_fulltext_from(table, user_id, query, fetch_k)
-            .await
-            .unwrap_or_default();
+        let (vec_results, ft_results) = tokio::join!(
+            self.search_vector_from(table, user_id, embedding, fetch_k),
+            self.search_fulltext_from(table, user_id, query, fetch_k)
+        );
+        let vec_results = vec_results?;
+        let ft_results = ft_results.unwrap_or_default();
 
         let ft_map: std::collections::HashMap<String, f64> = ft_results
             .iter()
@@ -3014,12 +3216,9 @@ impl SqlMemoryStore {
 
         let mut score_breakdown: Vec<(String, f64, f64, f64, f64, f64)> = Vec::new();
 
-        // Fetch access counts for frequency boost
+        // Fetch access counts + feedback in a single query
         let ac_ids: Vec<String> = candidates.iter().map(|m| m.memory_id.clone()).collect();
-        let ac_map = self.get_access_counts(&ac_ids).await.unwrap_or_default();
-
-        // Fetch feedback for relevance adjustment
-        let fb_map = self.get_feedback_batch(&ac_ids).await.unwrap_or_default();
+        let (ac_map, fb_map) = self.get_stats_batch(&ac_ids).await.unwrap_or_default();
 
         for m in &mut candidates {
             let vec_score = m.retrieval_score.unwrap_or(0.0);
@@ -3206,6 +3405,125 @@ impl SqlMemoryStore {
             q.execute(&self.pool).await.map_err(db_err)?;
         }
         Ok((to_insert.len(), reused))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{OwnedEditLogEntry, SqlMemoryStore};
+    use sqlx::mysql::MySqlPoolOptions;
+    use std::io::{self, Write};
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    static LOG_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    #[derive(Clone)]
+    struct SharedWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for SharedWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn log_edit_warns_when_async_buffer_is_full() {
+        let _guard = LOG_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("log test lock should not be poisoned");
+
+        let pool = MySqlPoolOptions::new()
+            .connect_lazy("mysql://root:111@localhost:6001/memoria")
+            .expect("lazy pool");
+        let store = SqlMemoryStore::new(pool, 4, "test-instance".to_string());
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        tx.try_send(OwnedEditLogEntry {
+            edit_id: "existing".to_string(),
+            user_id: "u1".to_string(),
+            operation: "inject".to_string(),
+            memory_id: Some("m1".to_string()),
+            payload: None,
+            reason: "prefill".to_string(),
+            snapshot_before: None,
+        })
+        .expect("prefill channel");
+        store.set_edit_log_tx(tx);
+
+        let logs = Arc::new(Mutex::new(Vec::new()));
+        let make_writer = {
+            let logs = Arc::clone(&logs);
+            move || SharedWriter(Arc::clone(&logs))
+        };
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(make_writer)
+            .with_ansi(false)
+            .without_time()
+            .finish();
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+
+        store
+            .log_edit("u1", "purge", Some("m2"), None, "test", None)
+            .await;
+
+        let output = String::from_utf8(logs.lock().unwrap().clone()).expect("utf8 logs");
+        assert!(
+            output.contains("edit log async buffer full, dropping entry"),
+            "expected warning in logs, got: {output}"
+        );
+        assert!(
+            output.contains("operation=purge"),
+            "expected operation field in logs: {output}"
+        );
+    }
+
+    /// Verify that log_edit falls back to direct INSERT when the async channel is closed
+    /// (simulates the race between clear_edit_log_tx and a concurrent log_edit call
+    /// that already cloned the sender before it was cleared).
+    #[tokio::test(flavor = "current_thread")]
+    async fn log_edit_falls_back_on_closed_channel() {
+        let _guard = LOG_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("log test lock should not be poisoned");
+
+        let pool = MySqlPoolOptions::new()
+            .connect_lazy("mysql://root:111@localhost:6001/memoria")
+            .expect("lazy pool");
+        let store = SqlMemoryStore::new(pool, 4, "test-instance".to_string());
+        // Create a channel and immediately drop the receiver → sender is closed
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+        drop(_rx);
+        store.set_edit_log_tx(tx);
+
+        // log_edit should NOT warn about "dropping entry" — it should fall through
+        // to direct INSERT (which will fail on lazy pool, but that's fine for this test)
+        let logs = Arc::new(Mutex::new(Vec::new()));
+        let make_writer = {
+            let logs = Arc::clone(&logs);
+            move || SharedWriter(Arc::clone(&logs))
+        };
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(make_writer)
+            .with_ansi(false)
+            .without_time()
+            .finish();
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+
+        store
+            .log_edit("u1", "purge", Some("m1"), None, "closed-test", None)
+            .await;
+
+        let output = String::from_utf8(logs.lock().unwrap().clone()).expect("utf8 logs");
+        assert!(
+            !output.contains("dropping entry"),
+            "closed channel should fall back to direct INSERT, not drop: {output}"
+        );
     }
 }
 

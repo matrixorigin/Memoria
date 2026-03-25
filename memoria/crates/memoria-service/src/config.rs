@@ -269,7 +269,12 @@ mod tests {
         with_env(
             &[
                 ("EMBEDDING_PROVIDER", Some("openai")),
-                ("EMBEDDING_ENDPOINTS", Some(r#"[{"url":"https://a.com/v1","api_key":"key-a"},{"url":"https://b.com/v1","api_key":"key-b"}]"#)),
+                (
+                    "EMBEDDING_ENDPOINTS",
+                    Some(
+                        r#"[{"url":"https://a.com/v1","api_key":"key-a"},{"url":"https://b.com/v1","api_key":"key-b"}]"#,
+                    ),
+                ),
                 ("EMBEDDING_BASE_URL", None),
                 ("EMBEDDING_API_KEY", None),
             ],
@@ -290,7 +295,10 @@ mod tests {
         with_env(
             &[
                 ("EMBEDDING_PROVIDER", Some("openai")),
-                ("EMBEDDING_ENDPOINTS", Some(r#"[{"url":"https://multi.com/v1","api_key":"mk"}]"#)),
+                (
+                    "EMBEDDING_ENDPOINTS",
+                    Some(r#"[{"url":"https://multi.com/v1","api_key":"mk"}]"#),
+                ),
                 ("EMBEDDING_BASE_URL", Some("https://single.com/v1")),
                 ("EMBEDDING_API_KEY", Some("sk-single")),
             ],
@@ -344,7 +352,10 @@ mod tests {
         with_env(
             &[
                 ("EMBEDDING_PROVIDER", Some("openai")),
-                ("EMBEDDING_ENDPOINTS", Some(r#"[{"url":"https://a.com/v1","api_key":"k"}]"#)),
+                (
+                    "EMBEDDING_ENDPOINTS",
+                    Some(r#"[{"url":"https://a.com/v1","api_key":"k"}]"#),
+                ),
                 ("EMBEDDING_BASE_URL", None),
             ],
             || {
@@ -374,7 +385,10 @@ mod tests {
         with_env(
             &[
                 ("EMBEDDING_PROVIDER", Some("mock")),
-                ("EMBEDDING_ENDPOINTS", Some(r#"[{"url":"https://a.com/v1","api_key":"k"}]"#)),
+                (
+                    "EMBEDDING_ENDPOINTS",
+                    Some(r#"[{"url":"https://a.com/v1","api_key":"k"}]"#),
+                ),
                 ("EMBEDDING_BASE_URL", Some("https://single.com/v1")),
             ],
             || {
@@ -390,7 +404,10 @@ mod tests {
         with_env(
             &[
                 ("EMBEDDING_PROVIDER", Some("local")),
-                ("EMBEDDING_ENDPOINTS", Some(r#"[{"url":"https://a.com/v1","api_key":"k"}]"#)),
+                (
+                    "EMBEDDING_ENDPOINTS",
+                    Some(r#"[{"url":"https://a.com/v1","api_key":"k"}]"#),
+                ),
             ],
             || {
                 let cfg = Config::from_env();

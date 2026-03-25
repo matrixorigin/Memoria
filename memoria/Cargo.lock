@@ -2149,6 +2149,7 @@ name = "memoria-cli"
 version = "0.2.3"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
  "base64 0.22.1",
  "clap",
@@ -2290,12 +2291,14 @@ dependencies = [
  "async-trait",
  "chrono",
  "memoria-core",
+ "moka",
  "serde",
  "serde_json",
  "sqlx",
  "thiserror 1.0.69",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 

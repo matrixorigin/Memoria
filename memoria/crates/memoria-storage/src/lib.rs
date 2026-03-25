@@ -7,5 +7,6 @@ pub use graph::{
     GraphStore,
 };
 pub use store::{
-    EditLogEntry, FeedbackStats, MemoryFeedback, SqlMemoryStore, TierFeedback, UserRetrievalParams,
+    FeedbackStats, MemoryFeedback, OwnedEditLogEntry, SqlMemoryStore, TierFeedback,
+    UserRetrievalParams,
 };

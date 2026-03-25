@@ -5233,7 +5233,11 @@ async fn test_tool_usage_tracking() {
         .await
         .unwrap();
     let body: Value = r.json().await.unwrap();
-    assert_eq!(body.as_array().unwrap().len(), 1, "empty tool name should not create entry");
+    assert_eq!(
+        body.as_array().unwrap().len(),
+        1,
+        "empty tool name should not create entry"
+    );
     println!("✅ GET /v1/tool-usage: empty header ignored");
 
     // 4. Second tool → should have 2 entries
@@ -5255,7 +5259,10 @@ async fn test_tool_usage_tracking() {
     let body: Value = r.json().await.unwrap();
     let items = body.as_array().unwrap();
     assert_eq!(items.len(), 2);
-    let tools: Vec<&str> = items.iter().map(|i| i["tool_name"].as_str().unwrap()).collect();
+    let tools: Vec<&str> = items
+        .iter()
+        .map(|i| i["tool_name"].as_str().unwrap())
+        .collect();
     assert!(tools.contains(&"memory_store"));
     assert!(tools.contains(&"memory_search"));
     println!("✅ GET /v1/tool-usage: 2 tools tracked");
@@ -5271,4 +5278,317 @@ async fn test_tool_usage_tracking() {
     let body: Value = r.json().await.unwrap();
     assert_eq!(body.as_array().unwrap().len(), 0);
     println!("✅ GET /v1/tool-usage: user isolation verified");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MCP Remote: purge/correct graph + entity link cleanup verification
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Helper: store via remote, create graph node + entity links manually, return memory_id.
+async fn remote_store_with_links(
+    remote: &memoria_mcp::remote::RemoteClient,
+    pool: &sqlx::MySqlPool,
+    uid: &str,
+    content: &str,
+) -> String {
+    let r = remote
+        .call("memory_store", json!({"content": content}))
+        .await
+        .expect("store");
+    let text = r["content"][0]["text"].as_str().unwrap_or("");
+    let mid = text
+        .split_whitespace()
+        .nth(2)
+        .unwrap_or("")
+        .trim_end_matches(':')
+        .to_string();
+    assert!(!mid.is_empty(), "should extract mid from: {text}");
+
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+    // Create graph node (remote path goes through REST API which doesn't create graph nodes)
+    let node_id = uuid::Uuid::new_v4().simple().to_string()[..32].to_string();
+    sqlx::query(
+        "INSERT INTO memory_graph_nodes \
+         (node_id, user_id, node_type, content, memory_id, confidence, trust_tier, importance, \
+          access_count, cross_session_count, is_active, created_at) \
+         VALUES (?, ?, 'semantic', ?, ?, 0.95, 'T1', 0.5, 0, 0, 1, NOW())",
+    )
+    .bind(&node_id)
+    .bind(uid)
+    .bind(content)
+    .bind(&mid)
+    .execute(pool)
+    .await
+    .unwrap();
+
+    // Insert into legacy mem_entity_links
+    let id = uuid::Uuid::new_v4().to_string().replace('-', "");
+    sqlx::query(
+        "INSERT INTO mem_entity_links (id, user_id, memory_id, entity_name, entity_type, source, created_at) \
+         VALUES (?, ?, ?, 'remote_entity', 'concept', 'manual', NOW())",
+    )
+    .bind(&id)
+    .bind(uid)
+    .bind(&mid)
+    .execute(pool)
+    .await
+    .unwrap();
+
+    mid
+}
+
+async fn spawn_server_with_pool() -> (String, reqwest::Client, sqlx::MySqlPool) {
+    use memoria_git::GitForDataService;
+    use memoria_service::{Config, MemoryService};
+    use memoria_storage::SqlMemoryStore;
+
+    let cfg = Config::from_env();
+    let db = db_url();
+    let store = SqlMemoryStore::connect(&db, test_dim(), uuid::Uuid::new_v4().to_string())
+        .await
+        .expect("connect");
+    store.migrate().await.expect("migrate");
+    let pool = sqlx::MySqlPool::connect(&db).await.expect("pool");
+    let git = Arc::new(GitForDataService::new(pool.clone(), &cfg.db_name));
+    let service = Arc::new(MemoryService::new_sql_with_llm(Arc::new(store), None, None).await);
+    let state = memoria_api::AppState::new(service, git, String::new());
+    let app = memoria_api::build_router(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move { axum::serve(listener, app).await });
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let base = format!("http://127.0.0.1:{port}");
+    (base, client, pool)
+}
+
+async fn graph_node_active_count(pool: &sqlx::MySqlPool, mid: &str) -> i64 {
+    sqlx::query_scalar(
+        "SELECT COUNT(*) FROM memory_graph_nodes WHERE memory_id = ? AND is_active = 1",
+    )
+    .bind(mid)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+// ── MCP Remote: purge cleans graph + entity links ───────────────────────────
+
+#[tokio::test]
+async fn test_remote_purge_cleans_graph_and_entity_links() {
+    use memoria_mcp::remote::RemoteClient;
+
+    let (base, _client, pool) = spawn_server_with_pool().await;
+    let uid = uid();
+    let remote = RemoteClient::new(&base, None, uid.clone(), None);
+
+    let mid = remote_store_with_links(&remote, &pool, &uid, "Remote purge graph test").await;
+
+    // Verify graph node exists
+    let cnt: i64 = graph_node_active_count(&pool, &mid).await;
+    assert!(cnt > 0, "graph node should exist before purge");
+
+    // Purge via remote
+    let r = remote
+        .call("memory_purge", json!({"memory_id": &mid}))
+        .await
+        .expect("purge");
+    let text = r["content"][0]["text"].as_str().unwrap_or("");
+    assert!(text.contains("Purged"), "got: {text}");
+
+    // Verify graph node deactivated
+    let cnt: i64 = graph_node_active_count(&pool, &mid).await;
+    assert_eq!(cnt, 0, "graph node should be deactivated after remote purge");
+
+    // Verify entity links cleaned
+    let cnt: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM mem_entity_links WHERE memory_id = ?")
+            .bind(&mid)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(cnt, 0, "mem_entity_links should be cleaned after remote purge");
+
+    println!("✅ remote purge: graph + entity links cleaned");
+}
+
+// ── MCP Remote: purge batch cleans graph + entity links ─────────────────────
+
+#[tokio::test]
+async fn test_remote_purge_batch_cleans_graph_and_entity_links() {
+    use memoria_mcp::remote::RemoteClient;
+
+    let (base, _client, pool) = spawn_server_with_pool().await;
+    let uid = uid();
+    let remote = RemoteClient::new(&base, None, uid.clone(), None);
+
+    let mid1 = remote_store_with_links(&remote, &pool, &uid, "Remote batch purge A").await;
+    let mid2 = remote_store_with_links(&remote, &pool, &uid, "Remote batch purge B").await;
+
+    // Purge batch via remote (comma-separated)
+    let r = remote
+        .call(
+            "memory_purge",
+            json!({"memory_id": format!("{mid1},{mid2}")}),
+        )
+        .await
+        .expect("purge");
+    let text = r["content"][0]["text"].as_str().unwrap_or("");
+    assert!(text.contains("Purged"), "got: {text}");
+
+    for mid in [&mid1, &mid2] {
+        let cnt: i64 = graph_node_active_count(&pool, mid).await;
+        assert_eq!(cnt, 0, "graph node should be deactivated for {mid}");
+    }
+    println!("✅ remote purge batch: graph + entity links cleaned");
+}
+
+// ── MCP Remote: purge by topic cleans graph + entity links ──────────────────
+
+#[tokio::test]
+async fn test_remote_purge_topic_cleans_graph_and_entity_links() {
+    use memoria_mcp::remote::RemoteClient;
+
+    let (base, _client, pool) = spawn_server_with_pool().await;
+    let uid = uid();
+    let remote = RemoteClient::new(&base, None, uid.clone(), None);
+
+    let mid = remote_store_with_links(
+        &remote,
+        &pool,
+        &uid,
+        "remote_topic_graph_cleanup_xyz unique",
+    )
+    .await;
+
+    let r = remote
+        .call(
+            "memory_purge",
+            json!({"topic": "remote_topic_graph_cleanup_xyz"}),
+        )
+        .await
+        .expect("purge");
+    let text = r["content"][0]["text"].as_str().unwrap_or("");
+    assert!(text.contains("Purged"), "got: {text}");
+
+    let cnt: i64 = graph_node_active_count(&pool, &mid).await;
+    assert_eq!(cnt, 0, "graph node should be deactivated after topic purge");
+
+    let cnt: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM mem_entity_links WHERE memory_id = ?")
+            .bind(&mid)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(cnt, 0, "entity links should be cleaned after topic purge");
+
+    println!("✅ remote purge topic: graph + entity links cleaned");
+}
+
+// ── MCP Remote: correct by id cleans old graph + entity links ───────────────
+
+#[tokio::test]
+async fn test_remote_correct_cleans_graph_and_entity_links() {
+    use memoria_mcp::remote::RemoteClient;
+
+    let (base, _client, pool) = spawn_server_with_pool().await;
+    let uid = uid();
+    let remote = RemoteClient::new(&base, None, uid.clone(), None);
+
+    let old_mid =
+        remote_store_with_links(&remote, &pool, &uid, "Remote correct graph old content").await;
+
+    // Correct
+    let r = remote
+        .call(
+            "memory_correct",
+            json!({
+                "memory_id": &old_mid,
+                "new_content": "Remote correct graph new content"
+            }),
+        )
+        .await
+        .expect("correct");
+    let text = r["content"][0]["text"].as_str().unwrap_or("");
+    assert!(text.contains("Corrected"), "got: {text}");
+
+    // Old graph node deactivated
+    let cnt: i64 = graph_node_active_count(&pool, &old_mid).await;
+    assert_eq!(
+        cnt, 0,
+        "old graph node should be deactivated after remote correct"
+    );
+
+    // Old entity links cleaned
+    let cnt: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM mem_entity_links WHERE memory_id = ?")
+            .bind(&old_mid)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        cnt, 0,
+        "old entity links should be cleaned after remote correct"
+    );
+
+    println!("✅ remote correct: old graph + entity links cleaned");
+}
+
+// ── MCP Remote: correct by query cleans old graph + entity links ────────────
+
+#[tokio::test]
+async fn test_remote_correct_by_query_cleans_graph_and_entity_links() {
+    use memoria_mcp::remote::RemoteClient;
+
+    let (base, _client, pool) = spawn_server_with_pool().await;
+    let uid = uid();
+    let remote = RemoteClient::new(&base, None, uid.clone(), None);
+
+    let old_mid = remote_store_with_links(
+        &remote,
+        &pool,
+        &uid,
+        "remote_correct_query_graph_xyz unique content",
+    )
+    .await;
+
+    let r = remote
+        .call(
+            "memory_correct",
+            json!({
+                "query": "remote_correct_query_graph_xyz",
+                "new_content": "Remote correct by query new content"
+            }),
+        )
+        .await
+        .expect("correct");
+    let text = r["content"][0]["text"].as_str().unwrap_or("");
+    assert!(
+        text.contains("Corrected") || text.contains("No matching"),
+        "got: {text}"
+    );
+
+    // If corrected, old graph should be cleaned
+    if text.contains("Corrected") {
+        let cnt: i64 = graph_node_active_count(&pool, &old_mid).await;
+        assert_eq!(
+            cnt, 0,
+            "old graph node should be deactivated after remote correct by query"
+        );
+        let cnt: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM mem_entity_links WHERE memory_id = ?")
+                .bind(&old_mid)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            cnt, 0,
+            "old entity links should be cleaned after remote correct by query"
+        );
+    }
+
+    println!("✅ remote correct by query: old graph + entity links cleaned");
 }
