@@ -39,7 +39,8 @@ async fn make_service() -> (Arc<MemoryService>, String) {
     };
 
     let user_id = format!("e2e_{}", Uuid::new_v4().simple());
-    let svc = Arc::new(MemoryService::new(Arc::new(store), embedder));
+    let store = Arc::new(store);
+    let svc = Arc::new(MemoryService::new(store.clone(), embedder, Some(store)));
     (svc, user_id)
 }
 

@@ -228,23 +228,40 @@ impl<'a> ActivationRetriever<'a> {
         let mut memory_ids: HashSet<String> = HashSet::new();
 
         let entities = ner::extract_entities(query);
-        for ent in &entities {
-            if ent.entity_type == "time" || ent.entity_type == "person" {
-                continue;
-            }
-            if let Ok(Some(entity_id)) = self.store.find_entity_by_name(user_id, &ent.name).await {
-                entity_anchors.entry(entity_id.clone()).or_insert(1.0);
-                if let Ok(mems) = self
-                    .store
-                    .get_memories_by_entity(&entity_id, user_id, 20)
-                    .await
-                {
-                    for (mid, _) in mems {
-                        memory_ids.insert(mid);
-                    }
-                }
+        let names: Vec<&str> = entities
+            .iter()
+            .filter(|e| e.entity_type != "time" && e.entity_type != "person")
+            .map(|e| e.name.as_str())
+            .collect();
+        if names.is_empty() {
+            return (entity_anchors, memory_ids);
+        }
+
+        // Batch: resolve all entity names → IDs in one query
+        let id_map = match self.store.find_entities_by_names(user_id, &names).await {
+            Ok(m) => m,
+            Err(_) => return (entity_anchors, memory_ids),
+        };
+        if id_map.is_empty() {
+            return (entity_anchors, memory_ids);
+        }
+
+        for eid in id_map.values() {
+            entity_anchors.entry(eid.clone()).or_insert(1.0);
+        }
+
+        // Batch: resolve all entity IDs → memory links in one query
+        let eids: Vec<&str> = id_map.values().map(|s| s.as_str()).collect();
+        if let Ok(mems) = self
+            .store
+            .get_memories_by_entities(&eids, user_id, 20)
+            .await
+        {
+            for (mid, _) in mems {
+                memory_ids.insert(mid);
             }
         }
+
         (entity_anchors, memory_ids)
     }
 }

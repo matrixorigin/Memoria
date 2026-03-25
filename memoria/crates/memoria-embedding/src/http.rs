@@ -86,7 +86,9 @@ impl HttpEmbedder {
     async fn post_embed(&self, body: &EmbedRequest<'_>) -> Result<EmbedResponse, MemoriaError> {
         let _permit = tokio::time::timeout(self.semaphore_timeout, self.semaphore.acquire())
             .await
-            .map_err(|_| MemoriaError::Embedding("embedding concurrency limit timeout".to_string()))?
+            .map_err(|_| {
+                MemoriaError::Embedding("embedding concurrency limit timeout".to_string())
+            })?
             .map_err(|_| MemoriaError::Embedding("embedding semaphore closed".to_string()))?;
         let url = format!("{}/embeddings", self.base_url.trim_end_matches('/'));
         let mut last_err = String::new();

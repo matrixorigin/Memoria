@@ -8,6 +8,8 @@ use sqlx::Row;
 
 use crate::{auth::AuthUser, models::*, state::AppState};
 
+use memoria_core::nullable_str_from_row;
+
 type ApiResult<T> = Result<Json<T>, (StatusCode, String)>;
 pub fn api_err(e: impl std::fmt::Display) -> (StatusCode, String) {
     tracing::error!(error = %e, "internal server error");
@@ -146,8 +148,7 @@ pub async fn store_memory(
         .await
         .map_err(|e| {
             if matches!(e, memoria_core::MemoriaError::Blocked(_)) {
-                crate::routes::metrics::SENSITIVITY_BLOCKS
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                crate::metrics::registry().security.sensitivity_blocks.inc();
             }
             api_err_typed(e)
         })?;
@@ -285,7 +286,11 @@ pub async fn get_memory(
     AuthUser { user_id, is_master }: AuthUser,
     Path(id): Path<String>,
 ) -> ApiResult<Option<MemoryResponse>> {
-    let m = state.service.get_for_user(&user_id, &id).await.map_err(api_err)?;
+    let m = state
+        .service
+        .get_for_user(&user_id, &id)
+        .await
+        .map_err(api_err)?;
     if let Some(ref mem) = m {
         if !is_master && mem.user_id != user_id {
             return Err((StatusCode::FORBIDDEN, "Not your memory".to_string()));
@@ -556,7 +561,7 @@ pub async fn get_memory_history(
         match row {
             Some(r) => {
                 let mid: String = r.try_get("memory_id").unwrap_or_default();
-                let sup: Option<String> = r.try_get("superseded_by").ok().flatten();
+                let sup: Option<String> = nullable_str_from_row(r.try_get("superseded_by").ok().flatten());
                 chain.push(serde_json::json!({
                     "memory_id": mid,
                     "content": r.try_get::<String, _>("content").unwrap_or_default(),

@@ -44,8 +44,27 @@ pub use scoring::{
     DefaultScoringPlugin, FeedbackTotals, ScoringPlugin, ScoringStore, TuningResult,
 };
 pub use service::{
-    CandidateScore, ExplainLevel, MemoryService, PurgeResult, RetrievalExplain,
+    CandidateScore, ExplainLevel, InMemoryFlusher, MemoryService, PurgeResult, RetrievalExplain,
     ENTITY_EXTRACTION_DROPS,
 };
+
+/// Wait for SIGTERM or Ctrl-C. Shared across CLI, MCP, and API servers.
+pub async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("install SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = terminate.recv() => {}
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
 pub use strategy::{RetrievalStrategy, StrategyRegistry};
 pub use strategy_domain::{StrategyDecision, StrategyEvidence, StrategyReport, StrategyStatus};

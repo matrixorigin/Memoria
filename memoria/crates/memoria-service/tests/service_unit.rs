@@ -5,6 +5,7 @@ use memoria_core::{
     MemoriaError, Memory, MemoryType, TrustTier,
 };
 use memoria_service::MemoryService;
+use memoria_storage::OwnedEditLogEntry;
 use std::sync::{Arc, Mutex};
 
 // ── Mock store ────────────────────────────────────────────────────────────────
@@ -95,7 +96,18 @@ impl EmbeddingProvider for MockEmbedder {
 }
 
 fn make_service() -> MemoryService {
-    MemoryService::new(Arc::new(MockStore::default()), Some(Arc::new(MockEmbedder)))
+    MemoryService::new(
+        Arc::new(MockStore::default()),
+        Some(Arc::new(MockEmbedder)),
+        None,
+    )
+}
+
+fn make_service_with_entries() -> (MemoryService, Arc<Mutex<Vec<OwnedEditLogEntry>>>) {
+    MemoryService::new_with_test_entries(
+        Arc::new(MockStore::default()),
+        Some(Arc::new(MockEmbedder)),
+    )
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -141,7 +153,10 @@ async fn test_correct() {
         )
         .await
         .unwrap();
-    let corrected = svc.correct("u1", &m.memory_id, "new content").await.unwrap();
+    let corrected = svc
+        .correct("u1", &m.memory_id, "new content")
+        .await
+        .unwrap();
     assert_eq!(corrected.content, "new content");
     assert!(corrected.embedding.is_some());
     println!("✅ correct");
@@ -250,7 +265,7 @@ async fn test_trust_tiers() {
 
 #[tokio::test]
 async fn test_no_embedder_still_works() {
-    let svc = MemoryService::new(Arc::new(MockStore::default()), None);
+    let svc = MemoryService::new(Arc::new(MockStore::default()), None, None);
     let m = svc
         .store_memory(
             "u1",
@@ -265,4 +280,24 @@ async fn test_no_embedder_still_works() {
         .unwrap();
     assert!(m.embedding.is_none());
     println!("✅ no_embedder_still_works");
+}
+
+#[tokio::test]
+async fn test_flush_edit_log_drains_in_memory_buffer() {
+    let (svc, entries) = make_service_with_entries();
+    svc.send_edit_log("u1", "inject", Some("m1"), Some("{}"), "store_memory", None);
+
+    assert!(
+        entries.lock().unwrap().is_empty(),
+        "entries should remain buffered until an explicit flush in this test"
+    );
+
+    svc.flush_edit_log().await;
+
+    let drained = entries.lock().unwrap();
+    assert_eq!(drained.len(), 1);
+    assert_eq!(drained[0].user_id, "u1");
+    assert_eq!(drained[0].operation, "inject");
+    assert_eq!(drained[0].reason, "store_memory");
+    println!("✅ flush_edit_log_drains_in_memory_buffer");
 }

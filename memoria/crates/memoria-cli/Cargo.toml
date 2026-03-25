@@ -45,3 +45,6 @@ self-replace = "1.5.0"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[dev-dependencies]
+async-trait = { workspace = true }

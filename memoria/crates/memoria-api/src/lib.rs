@@ -1,10 +1,13 @@
 pub mod auth;
+pub mod instrumented_embedder;
+pub mod metrics;
 pub mod models;
 pub mod otel;
 pub mod rate_limit;
 pub mod routes;
 pub mod state;
 
+pub use instrumented_embedder::InstrumentedEmbedder;
 pub use state::AppState;
 
 use axum::{
@@ -281,6 +284,9 @@ pub fn build_router(state: AppState) -> Router {
         )
         .with_state(state.clone())
         .layer(DefaultBodyLimit::max(2 * 1024 * 1024)) // 2 MB
+        .layer(axum::middleware::from_fn(
+            metrics::middleware::http_metrics,
+        ))
         .layer(
             tower_http::trace::TraceLayer::new_for_http()
                 .make_span_with(|req: &axum::http::Request<_>| {

@@ -1,7 +1,7 @@
 use crate::{git_tools, remote::RemoteClient, tools};
 use anyhow::Result;
 use memoria_git::GitForDataService;
-use memoria_service::MemoryService;
+use memoria_service::{shutdown_signal, MemoryService};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -112,7 +112,9 @@ pub async fn run_sse(
     let addr = format!("0.0.0.0:{port}");
     tracing::info!("Memoria MCP SSE transport listening on {addr}");
     let listener = tokio::net::TcpListener::bind(&addr).await?;
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
     Ok(())
 }
 
@@ -129,7 +131,16 @@ async fn run_loop(mode: Mode, user_id: String) -> Result<()> {
     let mut stdout = tokio::io::stdout();
     let mut reader = BufReader::new(stdin).lines();
 
-    while let Some(line) = reader.next_line().await? {
+    loop {
+        let line = tokio::select! {
+            result = reader.next_line() => {
+                match result? {
+                    Some(l) => l,
+                    None => break, // EOF
+                }
+            }
+            _ = shutdown_signal() => break,
+        };
         let line = line.trim().to_string();
         if line.is_empty() {
             continue;

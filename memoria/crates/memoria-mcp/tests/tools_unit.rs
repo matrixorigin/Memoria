@@ -90,6 +90,7 @@ fn make_service() -> Arc<MemoryService> {
     Arc::new(MemoryService::new(
         Arc::new(MockStore::default()),
         Some(Arc::new(MockEmbedder)),
+        None,
     ))
 }
 

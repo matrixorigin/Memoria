@@ -305,14 +305,6 @@ pub async fn call(
 
             let m = service.correct(user_id, &old_mid, new_content).await?;
 
-            // Graph sync: deactivate old node, create/update new node
-            if let Some(sql) = &service.sql_store {
-                let graph = sql.graph_store();
-                let _ = graph.deactivate_by_memory_id(&old_mid).await;
-                let _ = graph
-                    .update_content_by_memory_id(&m.memory_id, &m.content)
-                    .await;
-            }
             Ok(mcp_text(&format!(
                 "Corrected memory {}: {}",
                 m.memory_id, m.content
@@ -330,12 +322,6 @@ pub async fn call(
                     .filter(|s| !s.is_empty())
                     .collect();
                 let result = service.purge_batch(user_id, &ids).await?;
-                for id in &ids {
-                    // Graph sync: deactivate graph node (best-effort)
-                    if let Some(sql) = &service.sql_store {
-                        let _ = sql.graph_store().deactivate_by_memory_id(id).await;
-                    }
-                }
                 Ok(mcp_text(&format_purge_msg(
                     &format!("Purged {} memory(s)", result.purged),
                     &result,
@@ -414,27 +400,25 @@ pub async fn call(
             // Audit log for quarantine/cleanup
             if quarantined > 0 {
                 let payload = serde_json::json!({"quarantined": quarantined}).to_string();
-                sql.log_edit(
+                service.send_edit_log(
                     user_id,
                     "governance:quarantine",
                     None,
                     Some(&payload),
                     &format!("quarantined {quarantined}"),
                     None,
-                )
-                .await;
+                );
             }
             if cleaned > 0 {
                 let payload = serde_json::json!({"cleaned_stale": cleaned}).to_string();
-                sql.log_edit(
+                service.send_edit_log(
                     user_id,
                     "governance:cleanup",
                     None,
                     Some(&payload),
                     &format!("cleaned_stale {cleaned}"),
                     None,
-                )
-                .await;
+                );
             }
 
             // Snapshot health
