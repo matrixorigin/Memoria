@@ -5,12 +5,12 @@ description: Install Memoria and configure MCP for AI tools (Kiro, Cursor, Claud
 
 ## Decision Tree
 
-### Step 1: Embedded or Remote?
+### Step 1: Memoria Cloud or Self-Hosted?
 
-Ask: "Are you setting up your own instance, or connecting to an existing Memoria server?"
+Ask: "Use Memoria Cloud, or run your own instance?"
 
-- **Own instance** → continue to Step 2
-- **Existing server** → skip to [Remote Mode](#remote-mode) (just need URL + token)
+- **Memoria Cloud (recommended)** → sign up at [thememoria.ai](https://thememoria.ai/auth), get token, skip to [Remote Mode](#remote-mode)
+- **Self-hosted** → continue to Step 2
 
 ### Step 2: Which AI tool?
 
@@ -28,8 +28,7 @@ Config files generated:
 Ask: "Do you have a MatrixOne database running?"
 
 - Already have one → get connection URL
-- No, use Docker → `docker compose up -d` (wait 30-60s first start)
-- No Docker → [Memoria Cloud](https://thememoria.ai/auth) (free, no setup needed)
+- No → `docker compose up -d` (wait 30-60s first start)
 
 ### Step 4: Embedding provider?
 
@@ -61,7 +60,14 @@ Verify: `memoria --version`
 
 ## Configure
 
-### Local Docker
+### Remote Mode (Memoria Cloud)
+
+```bash
+cd <user-project>
+memoria init --tool <tool> --api-url 'https://host:8100' --token 'sk-...'
+```
+
+### Local Docker (Self-Hosted)
 
 ```bash
 docker compose up -d                    # Start MatrixOne
@@ -70,21 +76,14 @@ cd <user-project>
 memoria init --tool <tool>              # + embedding flags below
 ```
 
-### Memoria Cloud / Existing DB
+### Existing DB (Self-Hosted)
 
 ```bash
 cd <user-project>
 memoria init --tool <tool> --db-url 'mysql+pymysql://<user>:<pass>@<host>:<port>/<db>'
 ```
 
-### Remote Mode
-
-```bash
-cd <user-project>
-memoria init --tool <tool> --api-url 'https://host:8100' --token 'sk-...'
-```
-
-### Embedding Flags (for own instance)
+### Embedding Flags (for self-hosted only)
 
 ```bash
 # Local (default, no flags)
@@ -134,7 +133,7 @@ memoria mcp --transport sse
 | Port 6001 in use | Change `MO_PORT` in `.env` |
 | Can't connect | Wait 30-60s on first start |
 | Docker permission denied | `sudo usermod -aG docker $USER && newgrp docker` |
-| Docker not installed | Use [Memoria Cloud](https://thememoria.ai/auth) instead |
+| Docker not installed | Use [Memoria Cloud](https://thememoria.ai/auth) (Remote Mode) |
 | First query slow | Normal with local embedding (~3-5s). Use `openai` provider to avoid |
 | `local-embedding` not compiled | Use OpenAI-compatible service, or build from source |
 | AI tool doesn't use memory | 1. `which memoria` 2. Restart tool 3. Test server directly |
