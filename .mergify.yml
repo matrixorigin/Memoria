@@ -17,3 +17,6 @@ queue_rules:
 
       Approved by: @{{ approved_reviews_by | join(', @') }}
     checks_timeout: 1 h
+    autoqueue: true
+merge_queue:
+  max_parallel_checks: 1
