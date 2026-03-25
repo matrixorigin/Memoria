@@ -5,6 +5,8 @@ description: Install Memoria and configure MCP for AI tools (Kiro, Cursor, Claud
 
 ## Decision Tree
 
+Follow these steps in order. Steps marked "Self-Hosted only" can be skipped for Memoria Cloud users.
+
 ### Step 1: Memoria Cloud or Self-Hosted?
 
 Ask: "Use Memoria Cloud, or run your own instance?"
@@ -46,7 +48,19 @@ Ask: "Do you have an OpenAI-compatible embedding endpoint?"
 - Yes → collect: base URL, API key, model, dimension
 - No → suggest SiliconFlow (free tier) or Ollama. Local embedding requires `--features local-embedding` build.
 
-## Install Binary
+### Step 5: Install Memoria CLI
+
+The `memoria` binary is required for all modes — it serves as the MCP bridge between the AI tool and the Memoria server.
+
+One-line install (recommended):
+
+```bash
+curl -sSL https://raw.githubusercontent.com/matrixorigin/Memoria/main/scripts/install.sh | bash
+```
+
+Or download manually from [GitHub Releases](https://github.com/matrixorigin/Memoria/releases).
+
+Platform-specific manual install:
 
 ```bash
 # Linux x86_64
@@ -65,7 +79,7 @@ sudo cp target/release/memoria /usr/local/bin/
 
 Verify: `memoria --version`
 
-## Configure
+### Step 6: Configure
 
 ### Memoria Cloud (Remote Mode)
 
@@ -109,7 +123,7 @@ memoria init --tool <tool> \
   --embedding-dim 1024
 ```
 
-## Verify
+### Step 7: Verify
 
 After running `memoria init`, tell user to:
 
