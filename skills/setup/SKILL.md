@@ -62,9 +62,11 @@ Verify: `memoria --version`
 
 ### Remote Mode (Memoria Cloud)
 
+Sign up at [thememoria.ai](https://thememoria.ai/auth) — after login you will receive the API URL and token for configuration.
+
 ```bash
 cd <user-project>
-memoria init --tool <tool> --api-url 'https://host:8100' --token 'sk-...'
+memoria init --tool <tool> --api-url '<API URL from thememoria.ai>' --token '<your token>'
 ```
 
 ### Local Docker (Self-Hosted)
