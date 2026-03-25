@@ -39,6 +39,7 @@ sqlx = { workspace = true }
 sha2 = "0.10"
 subtle = "2.6"
 base64 = "0.22"
+async-trait = { workspace = true }
 tempfile = "3.14"
 moka = { version = "0.12", features = ["future"] }
 

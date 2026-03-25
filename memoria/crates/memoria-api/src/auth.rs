@@ -435,8 +435,7 @@ impl FromRequestParts<AppState> for AuthUser {
                     is_master: false,
                 });
             } else {
-                crate::routes::metrics::AUTH_FAILURES
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                crate::metrics::registry().security.auth_failures.inc();
                 warn!(
                     token_prefix = &token[..token.len().min(8)],
                     "auth: invalid token"
@@ -445,8 +444,7 @@ impl FromRequestParts<AppState> for AuthUser {
             }
         } else if !state.master_key.is_empty() {
             // master_key is configured but caller sent no Bearer token
-            crate::routes::metrics::AUTH_FAILURES
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            crate::metrics::registry().security.auth_failures.inc();
             warn!("auth: missing Bearer token");
             return Err((StatusCode::UNAUTHORIZED, "Missing Bearer token".to_string()));
         }
@@ -495,7 +493,7 @@ async fn validate_api_key(token: &str, state: &AppState) -> Option<String> {
 
     // Rate limit check (before cache, to count all attempts)
     if !state.rate_limiter.allow(&key_hash).await {
-        crate::routes::metrics::AUTH_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        crate::metrics::registry().security.auth_failures.inc();
         return None;
     }
 

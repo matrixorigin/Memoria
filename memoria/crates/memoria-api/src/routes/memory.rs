@@ -146,8 +146,7 @@ pub async fn store_memory(
         .await
         .map_err(|e| {
             if matches!(e, memoria_core::MemoriaError::Blocked(_)) {
-                crate::routes::metrics::SENSITIVITY_BLOCKS
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                crate::metrics::registry().security.sensitivity_blocks.inc();
             }
             api_err_typed(e)
         })?;
