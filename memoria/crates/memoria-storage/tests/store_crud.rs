@@ -496,3 +496,64 @@ async fn test_insert_entity_links_large_batch_chunking() {
     assert_eq!(cnt, 120);
     println!("✅ insert_entity_links: 120 entities chunked correctly");
 }
+
+#[tokio::test]
+async fn test_list_active_lite() {
+    let (store, uid) = setup().await;
+    // Insert 3 memories with embeddings
+    for i in 0..3 {
+        let m = make_memory(
+            &format!("lite-{i}-{uid}"),
+            &format!("lite memory {i}"),
+            &uid,
+        );
+        store.insert(&m).await.expect("insert");
+    }
+    store
+        .soft_delete(&format!("lite-1-{uid}"))
+        .await
+        .expect("soft_delete");
+
+    let results = store
+        .list_active_lite("mem_memories", &uid, 10)
+        .await
+        .expect("list_active_lite");
+    assert_eq!(results.len(), 2, "should exclude soft-deleted");
+    // lite results must NOT carry embedding or source_event_ids
+    for m in &results {
+        assert!(m.embedding.is_none(), "lite should skip embedding");
+        assert!(m.source_event_ids.is_empty(), "lite should skip source_event_ids");
+        assert!(m.extra_metadata.is_none(), "lite should skip extra_metadata");
+        assert!(!m.content.is_empty(), "content must be present");
+    }
+    // Verify ordering: newest first
+    assert!(results[0].created_at >= results[1].created_at);
+    println!("✅ list_active_lite: {} results, no embedding", results.len());
+}
+
+#[tokio::test]
+async fn test_list_active_lite_limit_cap() {
+    let (store, uid) = setup().await;
+    for i in 0..5 {
+        let m = make_memory(
+            &format!("cap-{i}-{uid}"),
+            &format!("cap memory {i}"),
+            &uid,
+        );
+        store.insert(&m).await.expect("insert");
+    }
+    // Request limit=2, should only get 2
+    let results = store
+        .list_active_lite("mem_memories", &uid, 2)
+        .await
+        .expect("list_active_lite");
+    assert_eq!(results.len(), 2, "should respect limit");
+
+    // Request absurdly large limit — capped at 500 internally
+    let results = store
+        .list_active_lite("mem_memories", &uid, 999999)
+        .await
+        .expect("list_active_lite");
+    assert!(results.len() <= 500, "should cap at 500");
+    println!("✅ list_active_lite_limit_cap");
+}

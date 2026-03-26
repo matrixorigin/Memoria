@@ -153,6 +153,56 @@ async fn test_api_store_and_list() {
     );
 }
 
+// ── 2b. list response is lightweight (no embedding) and respects limit ────────
+
+#[tokio::test]
+async fn test_api_list_no_embedding_and_limit() {
+    let (base, client) = spawn_server().await;
+    let uid = uid();
+
+    // Store 3 memories
+    for i in 0..3 {
+        let r = client
+            .post(format!("{base}/v1/memories"))
+            .header("X-User-Id", &uid)
+            .json(&json!({"content": format!("item {i}"), "memory_type": "semantic"}))
+            .send()
+            .await
+            .expect("post");
+        assert_eq!(r.status(), 201);
+    }
+
+    // List all — verify no embedding field in response
+    let r = client
+        .get(format!("{base}/v1/memories"))
+        .header("X-User-Id", &uid)
+        .send()
+        .await
+        .expect("get");
+    assert_eq!(r.status(), 200);
+    let body: Value = r.json().await.unwrap();
+    let items = body["items"].as_array().unwrap();
+    assert_eq!(items.len(), 3);
+    for item in items {
+        assert!(item.get("embedding").is_none(), "response must not contain embedding");
+        assert!(item.get("source_event_ids").is_none(), "response must not contain source_event_ids");
+        assert!(item["content"].as_str().is_some(), "content must be present");
+    }
+
+    // List with limit=1
+    let r = client
+        .get(format!("{base}/v1/memories?limit=1"))
+        .header("X-User-Id", &uid)
+        .send()
+        .await
+        .expect("get");
+    assert_eq!(r.status(), 200);
+    let body: Value = r.json().await.unwrap();
+    assert_eq!(body["items"].as_array().unwrap().len(), 1);
+    assert!(body["next_cursor"].as_str().is_some(), "should have cursor when truncated");
+    println!("✅ list: no embedding, limit works");
+}
+
 // ── 3. batch store ────────────────────────────────────────────────────────────
 
 #[tokio::test]
