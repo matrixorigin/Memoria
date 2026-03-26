@@ -7,6 +7,22 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
+/// Structured JSON-RPC error returned by [`dispatch`] and [`dispatch_http`].
+/// Carries the standard error code so callers can forward it verbatim.
+#[derive(Debug)]
+pub struct McpRpcError {
+    pub code: i32,
+    pub message: String,
+}
+
+impl std::fmt::Display for McpRpcError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl std::error::Error for McpRpcError {}
+
 #[derive(Deserialize)]
 struct Request {
     #[serde(default)]
@@ -26,6 +42,22 @@ struct Response {
     result: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<Value>,
+}
+
+/// Dispatch a single JSON-RPC method in embedded mode.
+/// Used by the server-side Streamable HTTP MCP endpoint.
+pub async fn dispatch_http(
+    method: &str,
+    params: Option<Value>,
+    service: &Arc<MemoryService>,
+    git: &Arc<GitForDataService>,
+    user_id: &str,
+) -> Result<Value, McpRpcError> {
+    let mode = Mode::Embedded {
+        service: service.clone(),
+        git: git.clone(),
+    };
+    dispatch(method, params, &mode, user_id).await
 }
 
 /// Run in embedded mode (direct DB).
@@ -103,7 +135,7 @@ pub async fn run_sse(
             let result = dispatch(&method, Some(params), &mode, &s.user_id).await;
             let resp = match result {
                 Ok(v) => serde_json::json!({"jsonrpc":"2.0","id":id,"result":if v.is_null(){serde_json::json!({})}else{v}}),
-                Err(e) => serde_json::json!({"jsonrpc":"2.0","id":id,"error":{"code":-32000,"message":e.to_string()}}),
+                Err(e) => serde_json::json!({"jsonrpc":"2.0","id":id,"error":{"code":e.code,"message":e.message}}),
             };
             let _ = s.tx.send(serde_json::to_string(&resp).unwrap_or_default());
         }))
@@ -179,7 +211,7 @@ async fn run_loop(mode: Mode, user_id: String) -> Result<()> {
                 jsonrpc: "2.0",
                 id,
                 result: None,
-                error: Some(json!({"code": -32000, "message": e.to_string()})),
+                error: Some(json!({"code": e.code, "message": e.message})),
             },
         };
         write_line(&mut stdout, &resp).await?;
@@ -200,7 +232,7 @@ async fn dispatch(
     params: Option<Value>,
     mode: &Mode,
     user_id: &str,
-) -> Result<Value> {
+) -> Result<Value, McpRpcError> {
     let p = params.unwrap_or(Value::Null);
     match method {
         "initialize" => Ok(json!({
@@ -216,8 +248,12 @@ async fn dispatch(
         "tools/call" => {
             let name = p["name"].as_str().unwrap_or("").to_string();
             let args = p["arguments"].clone();
+            let internal_err = |e: anyhow::Error| McpRpcError {
+                code: -32000,
+                message: e.to_string(),
+            };
             match mode {
-                Mode::Remote(client) => client.call(&name, args).await,
+                Mode::Remote(client) => client.call(&name, args).await.map_err(internal_err),
                 Mode::Embedded { service, git } => {
                     let git_tool_names = [
                         "memory_snapshot",
@@ -234,14 +270,22 @@ async fn dispatch(
                     if git_tool_names.contains(&name.as_str()) {
                         git_tools::call(&name, args, git, service, user_id)
                             .await
-                            .map_err(|e| anyhow::anyhow!("{e}"))
+                            .map_err(|e| McpRpcError {
+                                code: -32000,
+                                message: e.to_string(),
+                            })
                     } else {
-                        tools::call(&name, args, service, user_id).await
+                        tools::call(&name, args, service, user_id)
+                            .await
+                            .map_err(internal_err)
                     }
                 }
             }
         }
         "notifications/initialized" => Ok(Value::Null),
-        _ => Err(anyhow::anyhow!("Method not found: {method}")),
+        _ => Err(McpRpcError {
+            code: -32601,
+            message: format!("Method not found: {method}"),
+        }),
     }
 }

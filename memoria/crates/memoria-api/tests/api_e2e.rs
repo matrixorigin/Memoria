@@ -5345,6 +5345,7 @@ async fn spawn_server_with_pool() -> (String, reqwest::Client, sqlx::MySqlPool) 
 
     let cfg = Config::from_env();
     let db = db_url();
+
     let store = SqlMemoryStore::connect(&db, test_dim(), uuid::Uuid::new_v4().to_string())
         .await
         .expect("connect");
@@ -5353,13 +5354,14 @@ async fn spawn_server_with_pool() -> (String, reqwest::Client, sqlx::MySqlPool) 
     let git = Arc::new(GitForDataService::new(pool.clone(), &cfg.db_name));
     let service = Arc::new(MemoryService::new_sql_with_llm(Arc::new(store), None, None).await);
     let state = memoria_api::AppState::new(service, git, String::new());
+
     let app = memoria_api::build_router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind");
     let port = listener.local_addr().unwrap().port();
     tokio::spawn(async move { axum::serve(listener, app).await });
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
     let client = reqwest::Client::builder().no_proxy().build().unwrap();
     let base = format!("http://127.0.0.1:{port}");
     (base, client, pool)
@@ -5591,4 +5593,299 @@ async fn test_remote_correct_by_query_cleans_graph_and_entity_links() {
     }
 
     println!("✅ remote correct by query: old graph + entity links cleaned");
+}
+
+// ── Streamable HTTP MCP endpoint (/mcp) ──────────────────────────────────────
+
+/// Spawn a server that requires a Bearer master key (for auth tests).
+async fn spawn_server_with_key(master_key: &str) -> (String, reqwest::Client) {
+    use memoria_git::GitForDataService;
+    use memoria_service::{Config, MemoryService};
+    use memoria_storage::SqlMemoryStore;
+    use sqlx::mysql::MySqlPool;
+
+    let cfg = Config::from_env();
+    let db = db_url();
+
+    let store = SqlMemoryStore::connect(&db, test_dim(), uuid::Uuid::new_v4().to_string())
+        .await
+        .expect("connect");
+    store.migrate().await.expect("migrate");
+    let pool = MySqlPool::connect(&db).await.expect("pool");
+    let git = Arc::new(GitForDataService::new(pool, &cfg.db_name));
+    let service = Arc::new(MemoryService::new_sql_with_llm(Arc::new(store), None, None).await);
+    let state = memoria_api::AppState::new(service, git, master_key.to_string());
+
+    let app = memoria_api::build_router(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move { axum::serve(listener, app).await });
+    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+    let client = reqwest::Client::builder().no_proxy().build().expect("client");
+    (format!("http://127.0.0.1:{port}"), client)
+}
+
+/// POST /mcp helper: sends a JSON-RPC request and returns the parsed response.
+async fn mcp_post(client: &reqwest::Client, base: &str, body: Value) -> Value {
+    mcp_post_with_headers(client, base, body, &[]).await
+}
+
+async fn mcp_post_with_headers(
+    client: &reqwest::Client,
+    base: &str,
+    body: Value,
+    headers: &[(&str, &str)],
+) -> Value {
+    let mut req = client
+        .post(format!("{base}/mcp"))
+        .header("Content-Type", "application/json");
+    for (k, v) in headers {
+        req = req.header(*k, *v);
+    }
+    req.body(serde_json::to_string(&body).unwrap())
+        .send()
+        .await
+        .expect("POST /mcp")
+        .json()
+        .await
+        .expect("parse json")
+}
+
+#[tokio::test]
+async fn test_mcp_initialize() {
+    let (base, client) = spawn_server().await;
+    let uid = uid();
+
+    let resp = mcp_post_with_headers(
+        &client,
+        &base,
+        json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}),
+        &[("X-User-Id", uid.as_str())],
+    )
+    .await;
+
+    assert_eq!(resp["jsonrpc"], "2.0");
+    assert_eq!(resp["id"], 1);
+    assert_eq!(resp["result"]["protocolVersion"], "2024-11-05");
+    assert_eq!(resp["result"]["serverInfo"]["name"], "memoria-mcp-rs");
+    assert!(resp["result"]["capabilities"]["tools"].is_object());
+    assert!(resp["error"].is_null());
+    println!("✅ POST /mcp initialize: {:?}", resp["result"]["serverInfo"]);
+}
+
+#[tokio::test]
+async fn test_mcp_tools_list() {
+    let (base, client) = spawn_server().await;
+    let uid = uid();
+
+    let resp = mcp_post_with_headers(
+        &client,
+        &base,
+        json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}),
+        &[("X-User-Id", uid.as_str())],
+    )
+    .await;
+
+    assert_eq!(resp["jsonrpc"], "2.0");
+    assert_eq!(resp["id"], 2);
+    let tools = resp["result"]["tools"].as_array().expect("tools array");
+    assert!(!tools.is_empty(), "expected at least one tool");
+    let names: Vec<&str> = tools
+        .iter()
+        .map(|t| t["name"].as_str().unwrap_or(""))
+        .collect();
+    assert!(names.contains(&"memory_store"), "missing memory_store");
+    assert!(names.contains(&"memory_retrieve"), "missing memory_retrieve");
+    println!("✅ POST /mcp tools/list: {} tools", tools.len());
+}
+
+#[tokio::test]
+async fn test_mcp_tools_call_memory_store() {
+    let (base, client) = spawn_server().await;
+    let uid = uid();
+
+    let resp = mcp_post_with_headers(
+        &client,
+        &base,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {
+                "name": "memory_store",
+                "arguments": {"content": "Rust ownership ensures memory safety", "memory_type": "semantic"}
+            }
+        }),
+        &[("X-User-Id", uid.as_str())],
+    )
+    .await;
+
+    assert_eq!(resp["jsonrpc"], "2.0");
+    assert_eq!(resp["id"], 3);
+    assert!(resp["error"].is_null(), "unexpected error: {}", resp["error"]);
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap_or("");
+    assert!(text.contains("Stored"), "expected 'Stored' in: {text}");
+    println!("✅ POST /mcp tools/call memory_store: {text}");
+}
+
+#[tokio::test]
+async fn test_mcp_invalid_json_returns_parse_error() {
+    let (base, client) = spawn_server().await;
+
+    let resp: Value = client
+        .post(format!("{base}/mcp"))
+        .header("Content-Type", "application/json")
+        .header("X-User-Id", "test_user")
+        .body("this is not json {{{")
+        .send()
+        .await
+        .expect("send")
+        .json()
+        .await
+        .expect("parse");
+
+    assert_eq!(resp["jsonrpc"], "2.0");
+    assert!(resp["id"].is_null());
+    assert_eq!(resp["error"]["code"], -32700, "expected parse error code");
+    println!("✅ POST /mcp invalid JSON → -32700 parse error");
+}
+
+#[tokio::test]
+async fn test_mcp_invalid_request_non_object() {
+    let (base, client) = spawn_server().await;
+
+    // A JSON array is valid JSON but not a JSON-RPC object → -32600
+    let resp: Value = client
+        .post(format!("{base}/mcp"))
+        .header("Content-Type", "application/json")
+        .header("X-User-Id", "test_user")
+        .body("[1,2,3]")
+        .send()
+        .await
+        .expect("send")
+        .json()
+        .await
+        .expect("parse");
+
+    assert_eq!(resp["jsonrpc"], "2.0");
+    assert!(resp["id"].is_null());
+    assert_eq!(resp["error"]["code"], -32600, "expected invalid request code");
+    println!("✅ POST /mcp array payload → -32600 Invalid Request");
+}
+
+#[tokio::test]
+async fn test_mcp_invalid_request_wrong_version() {
+    let (base, client) = spawn_server().await;
+
+    // jsonrpc != "2.0" → -32600
+    let resp: Value = client
+        .post(format!("{base}/mcp"))
+        .header("Content-Type", "application/json")
+        .header("X-User-Id", "test_user")
+        .body(r#"{"jsonrpc":"1.0","id":1,"method":"initialize"}"#)
+        .send()
+        .await
+        .expect("send")
+        .json()
+        .await
+        .expect("parse");
+
+    assert_eq!(resp["jsonrpc"], "2.0");
+    assert_eq!(resp["error"]["code"], -32600, "expected invalid request code");
+    println!("✅ POST /mcp jsonrpc=1.0 → -32600 Invalid Request");
+}
+
+#[tokio::test]
+async fn test_mcp_invalid_request_missing_method() {
+    let (base, client) = spawn_server().await;
+
+    // No method field → -32600 (not mistaken for a Notification)
+    let resp: Value = client
+        .post(format!("{base}/mcp"))
+        .header("Content-Type", "application/json")
+        .header("X-User-Id", "test_user")
+        .body(r#"{"jsonrpc":"2.0","id":1}"#)
+        .send()
+        .await
+        .expect("send")
+        .json()
+        .await
+        .expect("parse");
+
+    assert_eq!(resp["jsonrpc"], "2.0");
+    assert_eq!(resp["error"]["code"], -32600, "expected invalid request code");
+    println!("✅ POST /mcp missing method → -32600 Invalid Request");
+}
+
+#[tokio::test]
+async fn test_mcp_auth_required_when_master_key_set() {
+    let (base, client) = spawn_server_with_key("test-master-secret").await;
+
+    // No Authorization header → 401
+    let status = client
+        .post(format!("{base}/mcp"))
+        .header("Content-Type", "application/json")
+        .body(serde_json::to_string(&json!({"jsonrpc":"2.0","id":1,"method":"initialize"})).unwrap())
+        .send()
+        .await
+        .expect("send")
+        .status();
+    assert_eq!(status, 401, "expected 401 without token");
+    println!("✅ POST /mcp without token → 401");
+
+    // Wrong Bearer token → 401
+    let status = client
+        .post(format!("{base}/mcp"))
+        .header("Content-Type", "application/json")
+        .header("Authorization", "Bearer sk-wrong-token")
+        .body(serde_json::to_string(&json!({"jsonrpc":"2.0","id":1,"method":"initialize"})).unwrap())
+        .send()
+        .await
+        .expect("send")
+        .status();
+    assert_eq!(status, 401, "expected 401 with wrong token");
+    println!("✅ POST /mcp with wrong token → 401");
+
+    // Correct master key → 200
+    let resp: Value = client
+        .post(format!("{base}/mcp"))
+        .header("Content-Type", "application/json")
+        .header("Authorization", "Bearer test-master-secret")
+        .body(serde_json::to_string(&json!({"jsonrpc":"2.0","id":1,"method":"initialize"})).unwrap())
+        .send()
+        .await
+        .expect("send")
+        .json()
+        .await
+        .expect("parse");
+    assert_eq!(resp["result"]["protocolVersion"], "2024-11-05");
+    println!("✅ POST /mcp with master key → initialize OK");
+}
+
+#[tokio::test]
+async fn test_mcp_notifications_initialized_no_error() {
+    let (base, client) = spawn_server().await;
+
+    // JSON-RPC 2.0: a Notification has no "id" field.
+    // The server MUST NOT reply — expected HTTP 204 No Content with no body.
+    let status = client
+        .post(format!("{base}/mcp"))
+        .header("Content-Type", "application/json")
+        .header("X-User-Id", "test_user")
+        .body(
+            serde_json::to_string(
+                &json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+            )
+            .unwrap(),
+        )
+        .send()
+        .await
+        .expect("send")
+        .status();
+
+    assert_eq!(status.as_u16(), 204, "notification must return 204 No Content");
+    println!("✅ POST /mcp notifications/initialized → 204 No Content");
 }

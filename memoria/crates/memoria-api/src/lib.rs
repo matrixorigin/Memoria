@@ -84,6 +84,8 @@ async fn call_log_mw(
 /// Build the full API router with all routes.
 pub fn build_router(state: AppState) -> Router {
     Router::new()
+        // Streamable HTTP MCP endpoint
+        .route("/mcp", post(routes::mcp::mcp_handler))
         // Health
         .route("/health", get(routes::memory::health))
         .route("/health/instance", get(routes::memory::health_instance))
