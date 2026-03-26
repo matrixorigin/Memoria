@@ -515,7 +515,7 @@ async fn test_list_active_lite() {
         .expect("soft_delete");
 
     let results = store
-        .list_active_lite("mem_memories", &uid, 10)
+        .list_active_lite("mem_memories", &uid, 10, None, None)
         .await
         .expect("list_active_lite");
     assert_eq!(results.len(), 2, "should exclude soft-deleted");
@@ -544,16 +544,16 @@ async fn test_list_active_lite_limit_cap() {
     }
     // Request limit=2, should only get 2
     let results = store
-        .list_active_lite("mem_memories", &uid, 2)
+        .list_active_lite("mem_memories", &uid, 2, None, None)
         .await
         .expect("list_active_lite");
     assert_eq!(results.len(), 2, "should respect limit");
 
     // Request absurdly large limit — capped at 500 internally
     let results = store
-        .list_active_lite("mem_memories", &uid, 999999)
+        .list_active_lite("mem_memories", &uid, 999999, None, None)
         .await
         .expect("list_active_lite");
-    assert!(results.len() <= 500, "should cap at 500");
+    assert!(results.len() <= 501, "should cap at 501");
     println!("✅ list_active_lite_limit_cap");
 }

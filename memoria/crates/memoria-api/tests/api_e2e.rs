@@ -132,6 +132,9 @@ async fn test_api_store_and_list() {
     let body: Value = r.json().await.unwrap();
     assert_eq!(body["content"], "Rust is fast");
     let mid = body["memory_id"].as_str().unwrap().to_string();
+    // memory_id must be UUIDv7 (32-char hex, version nibble '7' at position 12)
+    assert_eq!(mid.len(), 32, "memory_id must be 32-char hex");
+    assert_eq!(&mid[12..13], "7", "memory_id must be UUIDv7 (version nibble)");
     println!("✅ POST /v1/memories: {mid}");
 
     let r = client
@@ -160,19 +163,27 @@ async fn test_api_list_no_embedding_and_limit() {
     let (base, client) = spawn_server().await;
     let uid = uid();
 
-    // Store 3 memories
-    for i in 0..3 {
+    // Store 3 memories: 2 semantic + 1 profile, with small delays for distinct created_at
+    for i in 0..2 {
         let r = client
             .post(format!("{base}/v1/memories"))
             .header("X-User-Id", &uid)
-            .json(&json!({"content": format!("item {i}"), "memory_type": "semantic"}))
+            .json(&json!({"content": format!("semantic {i}"), "memory_type": "semantic"}))
             .send()
             .await
             .expect("post");
         assert_eq!(r.status(), 201);
     }
+    let r = client
+        .post(format!("{base}/v1/memories"))
+        .header("X-User-Id", &uid)
+        .json(&json!({"content": "profile item", "memory_type": "profile"}))
+        .send()
+        .await
+        .expect("post");
+    assert_eq!(r.status(), 201);
 
-    // List all — verify no embedding field in response
+    // ── List all — verify excluded fields and required fields ──
     let r = client
         .get(format!("{base}/v1/memories"))
         .header("X-User-Id", &uid)
@@ -183,24 +194,443 @@ async fn test_api_list_no_embedding_and_limit() {
     let body: Value = r.json().await.unwrap();
     let items = body["items"].as_array().unwrap();
     assert_eq!(items.len(), 3);
+    assert!(body["next_cursor"].is_null(), "no cursor when all items fit");
     for item in items {
-        assert!(item.get("embedding").is_none(), "response must not contain embedding");
-        assert!(item.get("source_event_ids").is_none(), "response must not contain source_event_ids");
-        assert!(item["content"].as_str().is_some(), "content must be present");
+        // Must NOT contain heavy fields
+        assert!(item.get("embedding").is_none(), "must not contain embedding");
+        assert!(item.get("source_event_ids").is_none(), "must not contain source_event_ids");
+        assert!(item.get("extra_metadata").is_none(), "must not contain extra_metadata");
+        // Must contain core fields
+        assert!(item["memory_id"].as_str().is_some(), "memory_id required");
+        assert!(item["content"].as_str().is_some(), "content required");
+        assert!(item["memory_type"].as_str().is_some(), "memory_type required");
+        assert!(item["trust_tier"].as_str().is_some(), "trust_tier required");
+    }
+    // Ordering: newest first (created_at DESC)
+    let ts: Vec<&str> = items.iter().map(|i| i["created_at"].as_str().unwrap()).collect();
+    for w in ts.windows(2) {
+        assert!(w[0] >= w[1], "must be ordered by created_at DESC");
     }
 
-    // List with limit=1
+    // ── memory_type filter ──
     let r = client
-        .get(format!("{base}/v1/memories?limit=1"))
+        .get(format!("{base}/v1/memories?memory_type=profile"))
         .header("X-User-Id", &uid)
         .send()
         .await
         .expect("get");
     assert_eq!(r.status(), 200);
     let body: Value = r.json().await.unwrap();
-    assert_eq!(body["items"].as_array().unwrap().len(), 1);
-    assert!(body["next_cursor"].as_str().is_some(), "should have cursor when truncated");
-    println!("✅ list: no embedding, limit works");
+    let items = body["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["memory_type"].as_str().unwrap(), "profile");
+
+    // ── Cursor pagination: page through with limit=1 ──
+    let mut seen_ids: Vec<String> = Vec::new();
+    let mut url = format!("{base}/v1/memories?limit=1");
+    loop {
+        let r = client
+            .get(&url)
+            .header("X-User-Id", &uid)
+            .send()
+            .await
+            .expect("get");
+        assert_eq!(r.status(), 200);
+        let body: Value = r.json().await.unwrap();
+        let page = body["items"].as_array().unwrap();
+        assert!(!page.is_empty(), "page must not be empty while paginating");
+        for item in page {
+            seen_ids.push(item["memory_id"].as_str().unwrap().to_string());
+        }
+        match body["next_cursor"].as_str() {
+            Some(c) => {
+                assert!(!c.is_empty(), "cursor must not be empty");
+                // Cursor format: "YYYY-MM-DD HH:MM:SS.ffffff|memory_id"
+                let (ts_part, id_part) = c.split_once('|').expect("cursor must contain '|'");
+                assert!(!id_part.is_empty(), "cursor must contain memory_id");
+                // Must be MySQL datetime, NOT RFC3339 (no 'T', no '+')
+                assert!(!ts_part.contains('T'), "cursor timestamp must not be RFC3339 (found 'T')");
+                assert!(!ts_part.contains('+'), "cursor timestamp must not contain timezone offset");
+                assert!(ts_part.starts_with("20"), "cursor timestamp must look like a datetime");
+                // percent-encode the cursor for query string
+                url = format!("{base}/v1/memories?limit=1&cursor={}", pct_encode(c));
+            }
+            None => break,
+        }
+    }
+    assert_eq!(seen_ids.len(), 3, "cursor pagination must visit all items");
+    // All IDs must be unique (no duplicates across pages)
+    let unique: std::collections::HashSet<&String> = seen_ids.iter().collect();
+    assert_eq!(unique.len(), 3, "no duplicate items across pages");
+
+    println!("✅ list: fields, ordering, filter, cursor pagination");
+}
+
+// ── 2b. list: cursor + memory_type combined ───────────────────────────────────
+
+fn pct_encode(s: &str) -> String {
+    s.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn test_api_list_cursor_with_type_filter() {
+    let (base, client) = spawn_server().await;
+    let uid = uid();
+
+    // Store 3 semantic + 1 profile
+    for i in 0..3 {
+        let r = client
+            .post(format!("{base}/v1/memories"))
+            .header("X-User-Id", &uid)
+            .json(&json!({"content": format!("sem {i}"), "memory_type": "semantic"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 201);
+    }
+    let r = client
+        .post(format!("{base}/v1/memories"))
+        .header("X-User-Id", &uid)
+        .json(&json!({"content": "prof", "memory_type": "profile"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 201);
+
+    // Paginate semantic only with limit=1
+    let mut seen: Vec<String> = Vec::new();
+    let mut url = format!("{base}/v1/memories?memory_type=semantic&limit=1");
+    loop {
+        let body: Value = client
+            .get(&url)
+            .header("X-User-Id", &uid)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let page = body["items"].as_array().unwrap();
+        if page.is_empty() {
+            break;
+        }
+        for item in page {
+            assert_eq!(item["memory_type"].as_str().unwrap(), "semantic");
+            seen.push(item["memory_id"].as_str().unwrap().to_string());
+        }
+        match body["next_cursor"].as_str() {
+            Some(c) => url = format!("{base}/v1/memories?memory_type=semantic&limit=1&cursor={}", pct_encode(c)),
+            None => break,
+        }
+    }
+    assert_eq!(seen.len(), 3, "must see all 3 semantic memories");
+    let unique: std::collections::HashSet<&String> = seen.iter().collect();
+    assert_eq!(unique.len(), 3, "no duplicates");
+    println!("✅ list: cursor + memory_type filter");
+}
+
+// ── 2c. list: soft-deleted excluded ───────────────────────────────────────────
+
+#[tokio::test]
+async fn test_api_list_excludes_deleted() {
+    let (base, client) = spawn_server().await;
+    let uid = uid();
+
+    // Store 2 memories
+    let mut ids = Vec::new();
+    for i in 0..2 {
+        let body: Value = client
+            .post(format!("{base}/v1/memories"))
+            .header("X-User-Id", &uid)
+            .json(&json!({"content": format!("del {i}"), "memory_type": "semantic"}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        ids.push(body["memory_id"].as_str().unwrap().to_string());
+    }
+
+    // Delete the first one
+    let r = client
+        .delete(format!("{base}/v1/memories/{}", ids[0]))
+        .header("X-User-Id", &uid)
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success());
+
+    // List should only return the second
+    let body: Value = client
+        .get(format!("{base}/v1/memories"))
+        .header("X-User-Id", &uid)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let items = body["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["memory_id"].as_str().unwrap(), ids[1]);
+    println!("✅ list: soft-deleted excluded");
+}
+
+// ── 2d. list: empty result ────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_api_list_empty() {
+    let (base, client) = spawn_server().await;
+    let uid = uid(); // fresh user, no memories
+
+    let body: Value = client
+        .get(format!("{base}/v1/memories"))
+        .header("X-User-Id", &uid)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["items"].as_array().unwrap().len(), 0);
+    assert!(body["next_cursor"].is_null(), "no cursor for empty result");
+    println!("✅ list: empty result");
+}
+
+// ── 2e. list: limit capped at 500 ────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_api_list_limit_cap() {
+    let (base, client) = spawn_server().await;
+    let uid = uid();
+
+    // Store 2 memories, request limit=9999 — should still work (capped internally)
+    for i in 0..2 {
+        let r = client
+            .post(format!("{base}/v1/memories"))
+            .header("X-User-Id", &uid)
+            .json(&json!({"content": format!("cap {i}"), "memory_type": "semantic"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 201);
+    }
+
+    let body: Value = client
+        .get(format!("{base}/v1/memories?limit=9999"))
+        .header("X-User-Id", &uid)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let items = body["items"].as_array().unwrap();
+    assert_eq!(items.len(), 2, "returns all items even with huge limit");
+    assert!(body["next_cursor"].is_null(), "no cursor when all fit");
+    println!("✅ list: limit cap at 500");
+}
+
+// ── 2f. list: invalid cursor doesn't crash ────────────────────────────────────
+
+#[tokio::test]
+async fn test_api_list_invalid_cursor() {
+    let (base, client) = spawn_server().await;
+    let uid = uid();
+
+    // Store 1 memory so user exists
+    let r = client
+        .post(format!("{base}/v1/memories"))
+        .header("X-User-Id", &uid)
+        .json(&json!({"content": "x", "memory_type": "semantic"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 201);
+
+    // Garbage cursor — should not 500
+    let r = client
+        .get(format!("{base}/v1/memories?limit=10&cursor=garbage"))
+        .header("X-User-Id", &uid)
+        .send()
+        .await
+        .unwrap();
+    // Either 200 with empty/some results, or 400 — but NOT 500
+    assert_ne!(r.status(), 500, "invalid cursor must not cause server error");
+
+    // Cursor without '|' separator — split_once returns None, treated as no cursor
+    let r = client
+        .get(format!("{base}/v1/memories?limit=10&cursor=no-pipe-here"))
+        .header("X-User-Id", &uid)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200, "cursor without | should be treated as no cursor");
+    println!("✅ list: invalid cursor handled gracefully");
+}
+
+// ── 2g. list: user isolation ──────────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_api_list_user_isolation() {
+    let (base, client) = spawn_server().await;
+    let uid_a = uid();
+    let uid_b = uid();
+
+    // User A stores a memory
+    let r = client
+        .post(format!("{base}/v1/memories"))
+        .header("X-User-Id", &uid_a)
+        .json(&json!({"content": "user A secret", "memory_type": "semantic"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 201);
+
+    // User B stores a memory
+    let r = client
+        .post(format!("{base}/v1/memories"))
+        .header("X-User-Id", &uid_b)
+        .json(&json!({"content": "user B data", "memory_type": "semantic"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 201);
+
+    // User A list — should only see their own
+    let body: Value = client
+        .get(format!("{base}/v1/memories"))
+        .header("X-User-Id", &uid_a)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let items = body["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["content"].as_str().unwrap(), "user A secret");
+
+    // User B list — should only see their own
+    let body: Value = client
+        .get(format!("{base}/v1/memories"))
+        .header("X-User-Id", &uid_b)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let items = body["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["content"].as_str().unwrap(), "user B data");
+    println!("✅ list: user isolation");
+}
+
+// ── 2h. list: default limit ──────────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_api_list_default_limit() {
+    let (base, client) = spawn_server().await;
+    let uid = uid();
+
+    // Store 3 memories, don't pass limit param
+    for i in 0..3 {
+        let r = client
+            .post(format!("{base}/v1/memories"))
+            .header("X-User-Id", &uid)
+            .json(&json!({"content": format!("dflt {i}"), "memory_type": "semantic"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 201);
+    }
+
+    // No limit param — default is 100, so all 3 should come back
+    let body: Value = client
+        .get(format!("{base}/v1/memories"))
+        .header("X-User-Id", &uid)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let items = body["items"].as_array().unwrap();
+    assert_eq!(items.len(), 3);
+    assert!(body["next_cursor"].is_null(), "no cursor when under default limit");
+    println!("✅ list: default limit");
+}
+
+// ── 2i. list: has_more works at limit boundary (regression: double-clamp) ────
+
+#[tokio::test]
+async fn test_api_list_has_more_at_limit_boundary() {
+    let (base, client) = spawn_server().await;
+    let uid = uid();
+
+    // Store 2 memories
+    for i in 0..2 {
+        let r = client
+            .post(format!("{base}/v1/memories"))
+            .header("X-User-Id", &uid)
+            .json(&json!({"content": format!("boundary {i}"), "memory_type": "semantic"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 201);
+    }
+
+    // Request limit=1 — there are 2 items, so has_more must be true (next_cursor present)
+    let body: Value = client
+        .get(format!("{base}/v1/memories?limit=1"))
+        .header("X-User-Id", &uid)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let items = body["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    assert!(
+        body["next_cursor"].as_str().is_some(),
+        "must have next_cursor when more items exist"
+    );
+
+    // Follow cursor — should get the second item with no further cursor
+    let cursor = body["next_cursor"].as_str().unwrap();
+    let body: Value = client
+        .get(format!(
+            "{base}/v1/memories?limit=1&cursor={}",
+            pct_encode(cursor)
+        ))
+        .header("X-User-Id", &uid)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let items2 = body["items"].as_array().unwrap();
+    assert_eq!(items2.len(), 1);
+    assert!(body["next_cursor"].is_null(), "no more items after page 2");
+
+    // The two pages must return different items
+    assert_ne!(
+        items[0]["memory_id"].as_str().unwrap(),
+        items2[0]["memory_id"].as_str().unwrap(),
+        "pages must not overlap"
+    );
+    println!("✅ list: has_more at limit boundary");
 }
 
 // ── 3. batch store ────────────────────────────────────────────────────────────
@@ -5679,10 +6109,6 @@ async fn spawn_server_with_key(master_key: &str) -> (String, reqwest::Client) {
 }
 
 /// POST /mcp helper: sends a JSON-RPC request and returns the parsed response.
-async fn mcp_post(client: &reqwest::Client, base: &str, body: Value) -> Value {
-    mcp_post_with_headers(client, base, body, &[]).await
-}
-
 async fn mcp_post_with_headers(
     client: &reqwest::Client,
     base: &str,

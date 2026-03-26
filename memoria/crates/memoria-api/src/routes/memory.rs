@@ -77,29 +77,39 @@ pub async fn list_memories(
     AuthUser { user_id, .. }: AuthUser,
     Query(q): Query<ListQuery>,
 ) -> ApiResult<ListResponse> {
-    let limit = q.limit.min(500);
-    let memories = state
+    let limit = q.limit.max(1).min(500);
+    // Parse cursor: "created_at|memory_id" — validate timestamp before passing to SQL
+    let cursor_parts = q.cursor.as_deref().and_then(|c| {
+        let (ts, id) = c.split_once('|')?;
+        // Validate timestamp format to avoid SQL errors from garbage input
+        chrono::NaiveDateTime::parse_from_str(ts, "%Y-%m-%d %H:%M:%S%.6f").ok()?;
+        Some((ts, id))
+    });
+    // Fetch limit+1 to detect whether there's a next page, return only limit items
+    let fetch_limit = limit + 1;
+    let mut memories = state
         .service
-        .list_active(&user_id, limit)
+        .list_active_paged(
+            &user_id,
+            fetch_limit,
+            q.memory_type.as_deref(),
+            cursor_parts,
+        )
         .await
         .map_err(api_err)?;
-    let items: Vec<MemoryResponse> = memories
-        .into_iter()
-        .filter(|m| {
-            q.memory_type
-                .as_deref()
-                .map(|t| m.memory_type.to_string() == t)
-                .unwrap_or(true)
+    let has_more = memories.len() > limit as usize;
+    memories.truncate(limit as usize);
+    // Build cursor from last item on this page
+    let next_cursor = if has_more {
+        memories.last().and_then(|m| {
+            m.created_at.map(|dt| {
+                format!("{}|{}", dt.format("%Y-%m-%d %H:%M:%S%.6f"), m.memory_id)
+            })
         })
-        .map(Into::into)
-        .collect();
-    let next_cursor = if items.len() == limit as usize {
-        items
-            .last()
-            .map(|m| format!("{}|{}", m.observed_at.as_deref().unwrap_or(""), m.memory_id))
     } else {
         None
     };
+    let items: Vec<MemoryResponse> = memories.into_iter().map(Into::into).collect();
     Ok(Json(ListResponse { items, next_cursor }))
 }
 

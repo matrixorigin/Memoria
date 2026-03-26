@@ -892,7 +892,7 @@ impl MemoryService {
         let embedding = self.embed(content).await?;
         let t_embed = t0.elapsed();
         let memory = Memory {
-            memory_id: Uuid::new_v4().simple().to_string(),
+            memory_id: Uuid::now_v7().simple().to_string(),
             user_id: user_id.to_string(),
             memory_type,
             content: content.to_string(),
@@ -1460,7 +1460,7 @@ impl MemoryService {
                 .await?
                 .ok_or_else(|| MemoriaError::NotFound(memory_id.to_string()))?;
 
-            let new_id = Uuid::new_v4().simple().to_string();
+            let new_id = Uuid::now_v7().simple().to_string();
             let new_mem = Memory {
                 memory_id: new_id,
                 user_id: old.user_id.clone(),
@@ -1514,7 +1514,7 @@ impl MemoryService {
                 .await?
                 .ok_or_else(|| MemoriaError::NotFound(memory_id.to_string()))?;
 
-            let new_id = Uuid::new_v4().simple().to_string();
+            let new_id = Uuid::now_v7().simple().to_string();
             let new_mem = Memory {
                 memory_id: new_id,
                 user_id: old.user_id.clone(),
@@ -1662,9 +1662,45 @@ impl MemoryService {
     ) -> Result<Vec<Memory>, MemoriaError> {
         if let Some(sql) = &self.sql_store {
             let table = sql.active_table(user_id).await?;
-            return sql.list_active_lite(&table, user_id, limit).await;
+            return sql
+                .list_active_lite(&table, user_id, limit, None, None)
+                .await;
         }
         self.store.list_active(user_id, limit).await
+    }
+
+    /// Paginated list with optional memory_type filter and cursor-based keyset pagination.
+    pub async fn list_active_paged(
+        &self,
+        user_id: &str,
+        limit: i64,
+        memory_type: Option<&str>,
+        cursor: Option<(&str, &str)>,
+    ) -> Result<Vec<Memory>, MemoriaError> {
+        if let Some(sql) = &self.sql_store {
+            let table = sql.active_table(user_id).await?;
+            return sql
+                .list_active_lite(&table, user_id, limit, memory_type, cursor)
+                .await;
+        }
+        // Fallback: trait path — no SQL store means no server-side filter/cursor.
+        // Production always uses SQL store; this path is for trait-only test doubles.
+        let mut mems = self.store.list_active(user_id, limit).await?;
+        if let Some(mt) = memory_type {
+            mems.retain(|m| m.memory_type.to_string() == mt);
+        }
+        if let Some((ts, id)) = cursor {
+            if let Ok(cutoff) = chrono::NaiveDateTime::parse_from_str(ts, "%Y-%m-%d %H:%M:%S%.6f")
+            {
+                let cutoff = cutoff.and_utc();
+                let id = id.to_string();
+                mems.retain(|m| match m.created_at {
+                    Some(c) => c < cutoff || (c == cutoff && m.memory_id < id),
+                    None => false,
+                });
+            }
+        }
+        Ok(mems)
     }
 
     pub async fn embed(&self, text: &str) -> Result<Option<Vec<f32>>, MemoriaError> {
@@ -1749,7 +1785,7 @@ impl MemoryService {
             let effective_tier = tier.unwrap_or(TrustTier::T1Verified);
             let embedding = embeddings.as_ref().map(|v| v[i].clone());
             let memory = Memory {
-                memory_id: Uuid::new_v4().simple().to_string(),
+                memory_id: Uuid::now_v7().simple().to_string(),
                 user_id: user_id.to_string(),
                 memory_type: mt,
                 content,
@@ -1877,7 +1913,7 @@ impl MemoryService {
                 .unwrap_or(0.7);
 
             result.push(Memory {
-                memory_id: Uuid::new_v4().simple().to_string(),
+                memory_id: Uuid::now_v7().simple().to_string(),
                 user_id: user_id.to_string(),
                 memory_type: mtype,
                 content: content.to_string(),
@@ -1920,7 +1956,7 @@ impl MemoryService {
                     return None;
                 }
                 Some(Memory {
-                    memory_id: Uuid::new_v4().simple().to_string(),
+                    memory_id: Uuid::now_v7().simple().to_string(),
                     user_id: user_id.to_string(),
                     memory_type: MemoryType::Semantic,
                     content: content.to_string(),

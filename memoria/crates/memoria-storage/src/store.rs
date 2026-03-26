@@ -365,7 +365,7 @@ impl SqlMemoryStore {
                 observed_at     DATETIME(6)  NOT NULL,
                 created_at      DATETIME(6)  NOT NULL,
                 updated_at      DATETIME(6),
-                INDEX idx_user_active (user_id, is_active, memory_type),
+                INDEX idx_user_active (user_id, is_active, memory_type, created_at),
                 INDEX idx_user_active_created (user_id, is_active, created_at),
                 INDEX idx_user_session (user_id, session_id),
                 FULLTEXT INDEX ft_content (content) WITH PARSER ngram -- MO#23861: breaks on concurrent snapshot restore
@@ -705,20 +705,22 @@ impl SqlMemoryStore {
         .execute(&self.pool)
         .await;
 
-        // Migrate idx_user_active to include memory_type (idempotent)
-        let needs_upgrade: bool = sqlx::query_scalar(
-            "SELECT COUNT(*) = 0 FROM information_schema.statistics \
+        // Migrate idx_user_active to (user_id, is_active, memory_type, created_at).
+        // Covers memory_type filter + ORDER BY created_at DESC without filesort.
+        let idx_active_col_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM information_schema.statistics \
              WHERE table_schema = DATABASE() AND table_name = 'mem_memories' \
-             AND index_name = 'idx_user_active' AND column_name = 'memory_type'",
+             AND index_name = 'idx_user_active'",
         )
         .fetch_one(&self.pool)
         .await
-        .unwrap_or(false);
-        if needs_upgrade {
+        .unwrap_or(0);
+        // Need exactly 4 columns; older schemas have 2 or 3.
+        if idx_active_col_count > 0 && idx_active_col_count < 4 {
             let _ = sqlx::query("ALTER TABLE mem_memories DROP INDEX idx_user_active")
                 .execute(&self.pool)
                 .await;
-            let _ = sqlx::query("ALTER TABLE mem_memories ADD INDEX idx_user_active (user_id, is_active, memory_type)")
+            let _ = sqlx::query("ALTER TABLE mem_memories ADD INDEX idx_user_active (user_id, is_active, memory_type, created_at)")
                 .execute(&self.pool).await;
         }
 
@@ -1019,6 +1021,15 @@ impl SqlMemoryStore {
                 }
             }
         }
+
+        // Migration: nullify zero-dimension embedding vectors.
+        // MatrixOne PREPARE/EXECUTE stores Option<Vec<f32>>::None as '[]' instead of NULL.
+        let _ = sqlx::raw_sql(
+            "UPDATE mem_memories SET embedding = NULL \
+             WHERE embedding IS NOT NULL AND vector_dims(embedding) = 0",
+        )
+        .execute(&self.pool)
+        .await;
 
         Ok(())
     }
@@ -1845,6 +1856,16 @@ impl SqlMemoryStore {
     /// Rebuild IVF vector index for a table. lists = max(1, rows/50), capped at 1024.
     pub async fn rebuild_vector_index(&self, table: &str) -> Result<i64, MemoriaError> {
         Self::validate_table_name(table)?;
+
+        // Workaround: MO PREPARE/EXECUTE stores None vecf32 as '[]' instead of NULL.
+        // Nullify zero-dimension vectors before counting/indexing.
+        let _ = sqlx::raw_sql(&format!(
+            "UPDATE {table} SET embedding = NULL \
+             WHERE embedding IS NOT NULL AND vector_dims(embedding) = 0"
+        ))
+        .execute(&self.pool)
+        .await;
+
         let row: (i64,) = sqlx::query_as(&format!(
             "SELECT COUNT(*) FROM {table} WHERE embedding IS NOT NULL"
         ))
@@ -3127,20 +3148,34 @@ impl SqlMemoryStore {
         table: &str,
         user_id: &str,
         limit: i64,
+        memory_type: Option<&str>,
+        cursor: Option<(&str, &str)>,
     ) -> Result<Vec<Memory>, MemoriaError> {
-        let safe_limit = limit.min(500);
-        let rows = sqlx::query(&format!(
+        // Cap at 501 (not 500) so the caller can request limit+1 for has_more detection.
+        let safe_limit = limit.max(1).min(501);
+        let mut sql = format!(
             "SELECT memory_id, user_id, memory_type, content, \
              session_id, is_active, superseded_by, trust_tier, \
              initial_confidence, observed_at, created_at, updated_at \
-             FROM {table} WHERE user_id = ? AND is_active = 1 \
-             ORDER BY created_at DESC LIMIT ?"
-        ))
-        .bind(user_id)
-        .bind(safe_limit)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(db_err)?;
+             FROM {table} WHERE user_id = ? AND is_active = 1"
+        );
+        if memory_type.is_some() {
+            sql.push_str(" AND memory_type = ?");
+        }
+        if cursor.is_some() {
+            sql.push_str(" AND (created_at < ? OR (created_at = ? AND memory_id < ?))");
+        }
+        sql.push_str(" ORDER BY created_at DESC, memory_id DESC LIMIT ?");
+
+        let mut q = sqlx::query(&sql).bind(user_id);
+        if let Some(mt) = memory_type {
+            q = q.bind(mt);
+        }
+        if let Some((ts, id)) = cursor {
+            q = q.bind(ts).bind(ts).bind(id);
+        }
+        q = q.bind(safe_limit);
+        let rows = q.fetch_all(&self.pool).await.map_err(db_err)?;
         rows.iter().map(row_to_memory_lite).collect()
     }
 
@@ -3766,74 +3801,8 @@ impl MemoryStore for SqlMemoryStore {
     }
 }
 
-fn row_to_memory(row: &sqlx::mysql::MySqlRow) -> Result<Memory, MemoriaError> {
-    let memory_type_str: String = row.try_get("memory_type").map_err(db_err)?;
-    let trust_tier_str: String = row.try_get("trust_tier").map_err(db_err)?;
-
-    let source_event_ids: Vec<String> = {
-        let s: String = row.try_get("src_ids").map_err(db_err)?;
-        serde_json::from_str(&s)?
-    };
-    let extra_metadata = {
-        let s: Option<String> = row.try_get("extra_meta").map_err(db_err)?;
-        // Workaround: MO#23859 — we store "{}" instead of NULL; treat empty object as None.
-        s.filter(|v| v != "{}")
-            .map(|v| serde_json::from_str(&v))
-            .transpose()?
-    };
-    let embedding: Option<Vec<f32>> = {
-        // Try emb_str first (for compatibility with old queries that use CAST)
-        if let Ok(Some(s)) = row.try_get::<Option<String>, _>("emb_str") {
-            Some(mo_to_vec(&s)?)
-        } else if let Ok(Some(s)) = row.try_get::<Option<String>, _>("embedding") {
-            // Direct embedding column (MatrixOne returns vector as string)
-            Some(mo_to_vec(&s)?)
-        } else {
-            // No embedding column in result set (e.g., vector search queries)
-            None
-        }
-    };
-    let observed_at = row
-        .try_get::<chrono::NaiveDateTime, _>("observed_at")
-        .ok()
-        .map(|dt| dt.and_utc());
-    let created_at = row
-        .try_get::<chrono::NaiveDateTime, _>("created_at")
-        .ok()
-        .map(|dt| dt.and_utc());
-    let updated_at = row
-        .try_get::<chrono::NaiveDateTime, _>("updated_at")
-        .ok()
-        .map(|dt| dt.and_utc());
-
-    Ok(Memory {
-        memory_id: row.try_get("memory_id").map_err(db_err)?,
-        user_id: row.try_get("user_id").map_err(db_err)?,
-        memory_type: MemoryType::from_str(&memory_type_str)?,
-        content: row.try_get("content").map_err(db_err)?,
-        initial_confidence: row
-            .try_get::<f32, _>("initial_confidence")
-            .map_err(db_err)? as f64,
-        embedding,
-        source_event_ids,
-        superseded_by: nullable_str_from_row(row.try_get("superseded_by").map_err(db_err)?),
-        is_active: {
-            let v: i8 = row.try_get("is_active").map_err(db_err)?;
-            v != 0
-        },
-        access_count: 0,
-        session_id: nullable_str_from_row(row.try_get("session_id").map_err(db_err)?),
-        observed_at,
-        created_at,
-        updated_at,
-        extra_metadata,
-        trust_tier: TrustTier::from_str(&trust_tier_str)?,
-        retrieval_score: None,
-    })
-}
-
-/// Lightweight row mapper — skips embedding, source_event_ids, extra_metadata.
-fn row_to_memory_lite(row: &sqlx::mysql::MySqlRow) -> Result<Memory, MemoriaError> {
+/// Shared base fields for both full and lite row mappers.
+fn row_to_memory_base(row: &sqlx::mysql::MySqlRow) -> Result<Memory, MemoriaError> {
     let memory_type_str: String = row.try_get("memory_type").map_err(db_err)?;
     let trust_tier_str: String = row.try_get("trust_tier").map_err(db_err)?;
     let observed_at = row
@@ -3873,4 +3842,38 @@ fn row_to_memory_lite(row: &sqlx::mysql::MySqlRow) -> Result<Memory, MemoriaErro
         trust_tier: TrustTier::from_str(&trust_tier_str)?,
         retrieval_score: None,
     })
+}
+
+fn row_to_memory(row: &sqlx::mysql::MySqlRow) -> Result<Memory, MemoriaError> {
+    let mut m = row_to_memory_base(row)?;
+
+    m.source_event_ids = {
+        let s: String = row.try_get("src_ids").map_err(db_err)?;
+        serde_json::from_str(&s)?
+    };
+    m.extra_metadata = {
+        let s: Option<String> = row.try_get("extra_meta").map_err(db_err)?;
+        // Workaround: MO#23859 — we store "{}" instead of NULL; treat empty object as None.
+        s.filter(|v| v != "{}")
+            .map(|v| serde_json::from_str(&v))
+            .transpose()?
+    };
+    m.embedding = {
+        // Try emb_str first (for compatibility with old queries that use CAST)
+        if let Ok(Some(s)) = row.try_get::<Option<String>, _>("emb_str") {
+            Some(mo_to_vec(&s)?)
+        } else if let Ok(Some(s)) = row.try_get::<Option<String>, _>("embedding") {
+            // Direct embedding column (MatrixOne returns vector as string)
+            Some(mo_to_vec(&s)?)
+        } else {
+            // No embedding column in result set (e.g., vector search queries)
+            None
+        }
+    };
+    Ok(m)
+}
+
+/// Lightweight row mapper — skips embedding, source_event_ids, extra_metadata.
+fn row_to_memory_lite(row: &sqlx::mysql::MySqlRow) -> Result<Memory, MemoriaError> {
+    row_to_memory_base(row)
 }

@@ -74,7 +74,7 @@ impl MemoryPipeline {
                 }
             };
             validated.push(Memory {
-                memory_id: Uuid::new_v4().simple().to_string(),
+                memory_id: Uuid::now_v7().simple().to_string(),
                 user_id: user_id.to_string(),
                 memory_type: mtype,
                 content,
