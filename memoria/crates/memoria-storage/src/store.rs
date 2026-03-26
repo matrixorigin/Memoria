@@ -841,24 +841,27 @@ impl SqlMemoryStore {
         // Migration: add rpc_success / rpc_error_code columns for Streamable HTTP MCP tracking.
         // These separate HTTP-level status from JSON-RPC business errors so Monitor stats
         // remain accurate for both /v1/* REST calls and /mcp JSON-RPC calls.
-        // Each column is checked and added independently so a partial failure (e.g. first ALTER
-        // succeeds but second fails) is self-healing on the next restart.
-        let has_rpc_success_col: bool = sqlx::query_scalar(
-            "SELECT COUNT(*) > 0 FROM information_schema.columns \
-             WHERE table_schema = DATABASE() AND table_name = 'mem_api_call_log' \
-             AND column_name = 'rpc_success'",
+        //
+        // We always attempt the ALTER TABLE rather than relying solely on information_schema,
+        // because some DB engines (e.g. MatrixOne) have a delay before newly-created columns
+        // appear in information_schema.columns, which would cause a false-negative check and
+        // a redundant (but harmless) ALTER.  MySQL error 1060 means "duplicate column name"
+        // (the column already exists), which is the desired idempotent outcome and is not fatal.
+        // Any other error is treated as startup-fatal because the call-log writer unconditionally
+        // inserts these columns; without them every flush would fail with "unknown column".
+        let add_rpc_success = sqlx::query(
+            "ALTER TABLE mem_api_call_log \
+             ADD COLUMN rpc_success TINYINT(1) NOT NULL DEFAULT 1",
         )
-        .fetch_one(&self.pool)
-        .await
-        .unwrap_or(false);
-        if !has_rpc_success_col {
-            sqlx::query(
-                "ALTER TABLE mem_api_call_log \
-                 ADD COLUMN rpc_success TINYINT(1) NOT NULL DEFAULT 1",
-            )
-            .execute(&self.pool)
-            .await
-            .map_err(|e| {
+        .execute(&self.pool)
+        .await;
+        if let Err(e) = add_rpc_success {
+            let is_dup = e
+                .as_database_error()
+                .and_then(|de| de.code())
+                .map(|c| c == "1060")
+                .unwrap_or(false);
+            if !is_dup {
                 tracing::error!(
                     error = %e,
                     "Migration fatal: mem_api_call_log.rpc_success could not be added. \
@@ -867,26 +870,24 @@ impl SqlMemoryStore {
                      every /v1/* and /mcp monitoring entry. \
                      Fix DB permissions or add the column manually, then restart."
                 );
-                db_err(e)
-            })?;
+                return Err(db_err(e));
+            }
+            // 1060 = column already exists — idempotent, safe to continue.
         }
 
-        let has_rpc_error_code_col: bool = sqlx::query_scalar(
-            "SELECT COUNT(*) > 0 FROM information_schema.columns \
-             WHERE table_schema = DATABASE() AND table_name = 'mem_api_call_log' \
-             AND column_name = 'rpc_error_code'",
+        let add_rpc_error_code = sqlx::query(
+            "ALTER TABLE mem_api_call_log \
+             ADD COLUMN rpc_error_code INT NULL",
         )
-        .fetch_one(&self.pool)
-        .await
-        .unwrap_or(false);
-        if !has_rpc_error_code_col {
-            sqlx::query(
-                "ALTER TABLE mem_api_call_log \
-                 ADD COLUMN rpc_error_code INT NULL",
-            )
-            .execute(&self.pool)
-            .await
-            .map_err(|e| {
+        .execute(&self.pool)
+        .await;
+        if let Err(e) = add_rpc_error_code {
+            let is_dup = e
+                .as_database_error()
+                .and_then(|de| de.code())
+                .map(|c| c == "1060")
+                .unwrap_or(false);
+            if !is_dup {
                 tracing::error!(
                     error = %e,
                     "Migration fatal: mem_api_call_log.rpc_error_code could not be added. \
@@ -894,8 +895,9 @@ impl SqlMemoryStore {
                      call-log flushes will fail with 'unknown column'. \
                      Fix DB permissions or add the column manually, then restart."
                 );
-                db_err(e)
-            })?;
+                return Err(db_err(e));
+            }
+            // 1060 = column already exists — idempotent, safe to continue.
         }
 
         // Migration: add composite index (user_id, memory_id) on mem_retrieval_feedback.
