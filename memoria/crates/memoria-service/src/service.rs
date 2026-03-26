@@ -589,13 +589,18 @@ impl MemoryService {
         op: &str,
     ) {
         let graph = sql.graph_store();
-        if let Err(e) = graph.deactivate_by_memory_id(memory_id).await {
+        let (r1, r2, r3) = tokio::join!(
+            graph.deactivate_by_memory_id(memory_id),
+            graph.delete_memory_entity_links(memory_id),
+            sql.delete_entity_links_by_memory_id(memory_id),
+        );
+        if let Err(e) = r1 {
             tracing::warn!(memory_id, error = %e, "{op}: failed to deactivate graph node");
         }
-        if let Err(e) = graph.delete_memory_entity_links(memory_id).await {
+        if let Err(e) = r2 {
             tracing::warn!(memory_id, error = %e, "{op}: failed to delete entity links");
         }
-        if let Err(e) = sql.delete_entity_links_by_memory_id(memory_id).await {
+        if let Err(e) = r3 {
             tracing::warn!(memory_id, error = %e, "{op}: failed to delete legacy entity links");
         }
     }
@@ -938,10 +943,12 @@ impl MemoryService {
                         let t2 = std::time::Instant::now();
                         sql.insert_into(&table, &memory).await?;
                         let t_insert = t2.elapsed();
-                        sql.supersede_memory(&table, &old_id, &memory.memory_id)
-                            .await?;
-                        // Clean up entity links for superseded memory (matches correct/purge behavior)
-                        Self::cleanup_entity_data_for_memory(sql, &old_id, "supersede").await;
+                        // Supersede + cleanup are independent — run in parallel
+                        let (sup_res, _) = tokio::join!(
+                            sql.supersede_memory(&table, &old_id, &memory.memory_id),
+                            Self::cleanup_entity_data_for_memory(sql, &old_id, "supersede"),
+                        );
+                        sup_res?;
                         let payload = serde_json::json!({"content": &memory.content, "type": memory.memory_type.to_string()}).to_string();
                         self.send_edit_log(
                             user_id,
@@ -1482,11 +1489,12 @@ impl MemoryService {
             };
 
             sql.insert_into(&table, &new_mem).await?;
-            sql.supersede_memory(&table, memory_id, &new_mem.memory_id)
-                .await?;
-
-            // Graph sync: deactivate old node + entity links, new node gets entities via extraction
-            Self::cleanup_entity_data_for_memory(sql, memory_id, "correct").await;
+            // Supersede + cleanup are independent — run in parallel
+            let (sup_res, _) = tokio::join!(
+                sql.supersede_memory(&table, memory_id, &new_mem.memory_id),
+                Self::cleanup_entity_data_for_memory(sql, memory_id, "correct"),
+            );
+            sup_res?;
 
             let payload = serde_json::json!({
                 "new_content": new_content,
