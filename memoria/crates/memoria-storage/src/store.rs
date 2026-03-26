@@ -1607,7 +1607,7 @@ impl SqlMemoryStore {
         for (tier, hl) in tiers {
             loop {
                 let res = sqlx::query(&format!(
-                    "UPDATE mem_memories SET is_active = 0, updated_at = NOW() \
+                    "DELETE FROM mem_memories \
                      WHERE user_id = ? AND is_active = 1 AND trust_tier = ? \
                        AND (initial_confidence * EXP(-TIMESTAMPDIFF(DAY, observed_at, NOW()) / {hl})) < {THRESHOLD} \
                      LIMIT {BATCH}"
@@ -1624,15 +1624,24 @@ impl SqlMemoryStore {
         Ok(total)
     }
 
-    /// Delete inactive memories with very low initial_confidence (already superseded/stale).
+    /// Delete inactive memories that are not part of a version chain.
+    /// Rows with superseded_by are kept — they form the history trail
+    /// exposed by `/v1/memories/:id/history`.
+    /// A 24-hour grace period prevents deleting freshly-archived memories
+    /// (e.g. working memories archived by the same governance run).
     pub async fn cleanup_stale(&self, user_id: &str) -> Result<i64, MemoriaError> {
         const BATCH: u64 = 500;
         let mut total = 0i64;
         loop {
             let res = sqlx::query(
-                "DELETE FROM mem_memories WHERE user_id = ? AND is_active = 0 AND initial_confidence < 0.1 LIMIT 500"
+                "DELETE FROM mem_memories WHERE user_id = ? AND is_active = 0 \
+                 AND (superseded_by IS NULL OR superseded_by = '') \
+                 AND updated_at < DATE_SUB(NOW(), INTERVAL 24 HOUR) LIMIT 500",
             )
-            .bind(user_id).execute(&self.pool).await.map_err(db_err)?;
+            .bind(user_id)
+            .execute(&self.pool)
+            .await
+            .map_err(db_err)?;
             let n = res.rows_affected();
             total += n as i64;
             if n < BATCH {
@@ -1774,7 +1783,7 @@ impl SqlMemoryStore {
             }
         }
 
-        let mut to_deactivate: Vec<(String, String)> = vec![];
+        let mut to_delete: Vec<String> = vec![];
         let mut deactivated_ids: std::collections::HashSet<String> = Default::default();
         let mut pairs_checked = 0;
 
@@ -1806,47 +1815,36 @@ impl SqlMemoryStore {
                         })
                         .sum();
                     if (dist_sq as f64) < l2_sq_threshold {
-                        let (older, newer) = if group[i].ts >= group[j].ts {
-                            (group[j].id.clone(), group[i].id.clone())
+                        let older = if group[i].ts >= group[j].ts {
+                            group[j].id.clone()
                         } else {
-                            (group[i].id.clone(), group[j].id.clone())
+                            group[i].id.clone()
                         };
                         deactivated_ids.insert(older.clone());
-                        to_deactivate.push((older, newer));
+                        to_delete.push(older);
                     }
                 }
             }
         }
 
-        if to_deactivate.is_empty() {
+        if to_delete.is_empty() {
             return Ok(0);
         }
 
-        // Batch UPDATE with CASE for superseded_by (preserves audit trail for all rows)
-        // Split into chunks of 100 to avoid SQL statement size limits
-        for chunk in to_deactivate.chunks(100) {
+        // Batch DELETE redundant memories (edit_log provides audit trail)
+        for chunk in to_delete.chunks(100) {
             let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-            let case_clauses = chunk
-                .iter()
-                .map(|_| "WHEN ? THEN ?")
-                .collect::<Vec<_>>()
-                .join(" ");
             let sql = format!(
-                "UPDATE mem_memories SET is_active = 0, superseded_by = CASE memory_id {case_clauses} END, updated_at = NOW() WHERE memory_id IN ({placeholders})"
+                "DELETE FROM mem_memories WHERE memory_id IN ({placeholders})"
             );
             let mut q = sqlx::query(&sql);
-            // Bind CASE values first
-            for (older, newer) in chunk {
-                q = q.bind(older).bind(newer);
-            }
-            // Then bind IN clause values
-            for (older, _) in chunk {
-                q = q.bind(older);
+            for id in chunk {
+                q = q.bind(id);
             }
             q.execute(&self.pool).await.map_err(db_err)?;
         }
 
-        Ok(to_deactivate.len() as i64)
+        Ok(to_delete.len() as i64)
     }
 
     /// Rebuild IVF vector index for a table. lists = max(1, rows/50), capped at 1024.
@@ -2745,7 +2743,7 @@ impl SqlMemoryStore {
         user_id: &str,
         since_hours: i64,
     ) -> Result<bool, MemoriaError> {
-        let row: (i64, i64) = sqlx::query_as(
+        let row: (i64, Option<i64>) = sqlx::query_as(
             "SELECT COUNT(*) as total_changes, \
              SUM(CASE WHEN superseded_by IS NOT NULL AND superseded_by != '' THEN 1 ELSE 0 END) as supersedes \
              FROM mem_memories \
@@ -2760,7 +2758,133 @@ impl SqlMemoryStore {
         if total == 0 {
             return Ok(false);
         }
-        Ok(supersedes as f64 / total as f64 > 0.3)
+        Ok(supersedes.unwrap_or(0) as f64 / total as f64 > 0.3)
+    }
+
+    /// Hygiene diagnostics: orphan counts and stale data that governance can clean.
+    pub async fn health_hygiene(&self, user_id: &str) -> Result<serde_json::Value, MemoriaError> {
+        let (inactive,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM mem_memories WHERE user_id = ? AND is_active = 0 \
+             AND (superseded_by IS NULL OR superseded_by = '') \
+             AND updated_at < DATE_SUB(NOW(), INTERVAL 24 HOUR)",
+        )
+        .bind(user_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(db_err)?;
+
+        let (stale_working,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM mem_memories WHERE user_id = ? AND memory_type = 'working' \
+             AND is_active = 1 AND TIMESTAMPDIFF(HOUR, observed_at, NOW()) > 24",
+        )
+        .bind(user_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(db_err)?;
+
+        let (orphan_mel,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM mem_memory_entity_links l \
+             LEFT JOIN mem_memories m ON l.memory_id = m.memory_id AND m.is_active = 1 \
+             WHERE l.user_id = ? AND m.memory_id IS NULL",
+        )
+        .bind(user_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(db_err)?;
+
+        let (orphan_el,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM mem_entity_links l \
+             LEFT JOIN mem_memories m ON l.memory_id = m.memory_id AND m.is_active = 1 \
+             WHERE l.user_id = ? AND m.memory_id IS NULL",
+        )
+        .bind(user_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(db_err)?;
+
+        let (orphan_graph_nodes,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM memory_graph_nodes g \
+             LEFT JOIN mem_memories m ON g.memory_id = m.memory_id \
+             WHERE g.user_id = ? AND g.is_active = 1 AND g.memory_id IS NOT NULL \
+               AND (m.is_active = 0 OR m.memory_id IS NULL)",
+        )
+        .bind(user_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(db_err)?;
+
+        Ok(serde_json::json!({
+            "inactive_memories": inactive,
+            "stale_working_memories": stale_working,
+            "orphan_memory_entity_links": orphan_mel,
+            "orphan_entity_links": orphan_el,
+            "orphan_graph_nodes": orphan_graph_nodes,
+        }))
+    }
+
+    /// Global hygiene diagnostics (admin).
+    pub async fn health_hygiene_global(&self) -> Result<serde_json::Value, MemoriaError> {
+        let (inactive,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM mem_memories WHERE is_active = 0 \
+             AND (superseded_by IS NULL OR superseded_by = '') \
+             AND updated_at < DATE_SUB(NOW(), INTERVAL 24 HOUR)")
+                .fetch_one(&self.pool)
+                .await
+                .map_err(db_err)?;
+
+        let (stale_working,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM mem_memories WHERE memory_type = 'working' \
+             AND is_active = 1 AND TIMESTAMPDIFF(HOUR, observed_at, NOW()) > 24",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(db_err)?;
+
+        let (orphan_mel,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM mem_memory_entity_links l \
+             LEFT JOIN mem_memories m ON l.memory_id = m.memory_id AND m.is_active = 1 \
+             WHERE m.memory_id IS NULL",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(db_err)?;
+
+        let (orphan_el,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM mem_entity_links l \
+             LEFT JOIN mem_memories m ON l.memory_id = m.memory_id AND m.is_active = 1 \
+             WHERE m.memory_id IS NULL",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(db_err)?;
+
+        let (orphan_graph_nodes,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM memory_graph_nodes g \
+             LEFT JOIN mem_memories m ON g.memory_id = m.memory_id \
+             WHERE g.is_active = 1 AND g.memory_id IS NOT NULL \
+               AND (m.is_active = 0 OR m.memory_id IS NULL)",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(db_err)?;
+
+        let (orphan_stats,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM mem_memories_stats s \
+             LEFT JOIN mem_memories m ON s.memory_id = m.memory_id \
+             WHERE m.memory_id IS NULL",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(db_err)?;
+
+        Ok(serde_json::json!({
+            "inactive_memories": inactive,
+            "stale_working_memories": stale_working,
+            "orphan_memory_entity_links": orphan_mel,
+            "orphan_entity_links": orphan_el,
+            "orphan_graph_nodes": orphan_graph_nodes,
+            "orphan_stats": orphan_stats,
+        }))
     }
 
     /// Per-type stats: count, avg_confidence, contradiction_rate, avg_staleness_hours.

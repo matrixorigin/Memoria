@@ -1074,14 +1074,13 @@ impl DefaultGovernanceStrategy {
         state: &mut ExecutionState,
     ) {
         self.quarantine_operation(&plan.users, store, state).await;
-        // Orphan graph cleanup runs daily (after quarantine) to keep graph nodes
-        // consistent with quarantined memories.  Weekly run_weekly also calls this
-        // as a catch-all for orphans from other sources (rollback, branch drops).
-        self.cleanup_orphan_graph_data_operation(plan, store, state)
-            .await;
         self.cleanup_stale_operation(GovernanceTask::Daily, store, &plan.users, state)
             .await;
         self.compress_redundant_operation(&plan.users, store, state)
+            .await;
+        // Orphan graph cleanup runs after physical deletions (quarantine, cleanup_stale,
+        // compress_redundant) so it catches all newly-orphaned graph nodes in one pass.
+        self.cleanup_orphan_graph_data_operation(plan, store, state)
             .await;
         self.cleanup_orphaned_incrementals_operation(&plan.users, store, state)
             .await;

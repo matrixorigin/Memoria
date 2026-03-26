@@ -2809,6 +2809,49 @@ async fn test_health_endpoints() {
     let body: Value = r.json().await.unwrap();
     assert_eq!(body["recommendation"].as_str().unwrap(), "ok");
     println!("✅ health capacity: {body}");
+
+    // GET /v1/health/hygiene
+    let r = client
+        .get(format!("{base}/v1/health/hygiene"))
+        .header("X-User-Id", &user)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let body: Value = r.json().await.unwrap();
+    assert!(body.get("inactive_memories").is_some(), "must have inactive_memories");
+    assert!(body.get("stale_working_memories").is_some(), "must have stale_working_memories");
+    assert!(body.get("orphan_graph_nodes").is_some(), "must have orphan_graph_nodes");
+    println!("✅ health hygiene: {body}");
+}
+
+#[tokio::test]
+async fn test_admin_health_hygiene_global() {
+    let mk = "test-master-key-hygiene";
+    let (base, client) = spawn_server_with_master_key(mk).await;
+    let auth = format!("Bearer {mk}");
+
+    let r = client
+        .get(format!("{base}/admin/health/hygiene"))
+        .header("Authorization", &auth)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let body: Value = r.json().await.unwrap();
+    assert!(body.get("inactive_memories").is_some());
+    assert!(body.get("orphan_graph_nodes").is_some());
+    assert!(body.get("orphan_stats").is_some());
+    println!("✅ admin health hygiene global: {body}");
+
+    // Without master key → 401
+    let r = client
+        .get(format!("{base}/admin/health/hygiene"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 401);
+    println!("✅ admin health hygiene: 401 without master key");
 }
 
 // ── Sandbox validation ────────────────────────────────────────────────────────
@@ -4839,11 +4882,11 @@ async fn test_api_feedback_stats() {
     let uid = uid();
 
     // Store memories and give feedback
-    for signal in &["useful", "useful", "irrelevant", "outdated"] {
+    for (i, signal) in ["useful", "useful", "irrelevant", "outdated"].iter().enumerate() {
         let r = client
             .post(format!("{base}/v1/memories"))
             .header("X-User-Id", &uid)
-            .json(&json!({"content": format!("Stats test {signal}"), "memory_type": "semantic"}))
+            .json(&json!({"content": format!("Stats test {signal} {i}"), "memory_type": "semantic"}))
             .send()
             .await
             .unwrap();

@@ -1000,15 +1000,12 @@ async fn test_governance_quarantine_verify_db() {
     let body: Value = r.json().await.unwrap();
     let quarantined = body["quarantined"].as_i64().unwrap_or(0);
 
-    // DB: check if low-confidence memory was quarantined (is_active=0)
-    let row = db_get_memory(&pool, &low_mid).await;
+    // DB: check if low-confidence memory was deleted by quarantine
     if quarantined > 0 {
-        assert_eq!(
-            row.get::<i8, _>("is_active"),
-            0,
-            "low-conf should be quarantined"
-        );
-        println!("✅ governance: low-conf memory quarantined (is_active=0)");
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM mem_memories WHERE memory_id = ?")
+            .bind(&low_mid).fetch_one(&pool).await.unwrap();
+        assert_eq!(count, 0, "low-conf should be physically deleted by quarantine");
+        println!("✅ governance: low-conf memory deleted by quarantine");
     } else {
         println!("✅ governance: ran successfully, quarantined={quarantined}");
     }
@@ -1224,8 +1221,10 @@ async fn test_admin_governance_orphan_graph_cleanup_verify_db() {
         .send()
         .await
         .unwrap();
-    assert_eq!(r.status(), 200);
-    let body: Value = r.json().await.unwrap();
+    let status = r.status();
+    let body_text = r.text().await.unwrap();
+    assert_eq!(status, 200, "admin governance failed: {body_text}");
+    let body: Value = serde_json::from_str(&body_text).unwrap();
 
     // 3. Verify response has all fields
     assert_eq!(body["op"].as_str().unwrap(), "governance");

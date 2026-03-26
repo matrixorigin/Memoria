@@ -1021,8 +1021,9 @@ impl GraphStore {
         // Two-step: find orphan node_ids, then update by primary key.
         let orphans: Vec<(String,)> = sqlx::query_as(
             "SELECT g.node_id FROM memory_graph_nodes g \
-             JOIN mem_memories m ON g.memory_id = m.memory_id \
-             WHERE m.is_active = 0 AND g.is_active = 1 AND g.memory_id IS NOT NULL \
+             LEFT JOIN mem_memories m ON g.memory_id = m.memory_id \
+             WHERE g.is_active = 1 AND g.memory_id IS NOT NULL \
+               AND (m.is_active = 0 OR m.memory_id IS NULL) \
              LIMIT 5000",
         )
         .fetch_all(&self.pool)

@@ -244,6 +244,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/health/analyze", get(routes::admin::health_analyze))
         .route("/v1/health/storage", get(routes::admin::health_storage))
         .route("/v1/health/capacity", get(routes::admin::health_capacity))
+        .route("/v1/health/hygiene", get(routes::admin::health_hygiene))
+        .route("/admin/health/hygiene", get(routes::admin::health_hygiene_global))
         // Pipeline
         .route("/v1/pipeline/run", post(routes::memory::run_pipeline))
         // Tool usage (in-memory cache, no DB hit)

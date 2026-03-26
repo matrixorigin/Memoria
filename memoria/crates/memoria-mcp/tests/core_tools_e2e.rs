@@ -566,15 +566,14 @@ async fn test_governance_quarantine_and_cooldown() {
     assert!(t.contains("Governance complete"), "{t}");
     println!("✅ governance: {t}");
 
-    // Verify the old memory is now inactive in DB
-    let row = sqlx::query("SELECT is_active FROM mem_memories WHERE memory_id = ?")
+    // Verify the old memory is physically deleted by quarantine
+    let remaining: Vec<(String,)> = sqlx::query_as("SELECT memory_id FROM mem_memories WHERE memory_id = ?")
         .bind(&mid)
-        .fetch_one(sql.pool())
+        .fetch_all(sql.pool())
         .await
-        .expect("fetch");
-    let active: i8 = row.try_get("is_active").unwrap_or(1);
-    assert_eq!(active, 0, "quarantined memory should have is_active=0");
-    println!("✅ quarantined memory has is_active=0 in DB");
+        .unwrap();
+    assert!(remaining.is_empty(), "quarantined memory should be physically deleted");
+    println!("✅ quarantined memory physically deleted from DB");
 
     // High-confidence memory should still be active
     let list = svc.list_active(&uid, 10).await.unwrap();
@@ -607,8 +606,9 @@ async fn test_governance_cleanup_stale() {
     let mid = format!("stale_{}", uuid::Uuid::new_v4().simple());
     sqlx::query(
         "INSERT INTO mem_memories (memory_id, user_id, memory_type, content, source_event_ids, \
-         is_active, trust_tier, initial_confidence, observed_at, created_at) \
-         VALUES (?, ?, 'semantic', 'stale deleted memory', '[]', 0, 'T4', 0.05, NOW(), NOW())",
+         is_active, trust_tier, initial_confidence, observed_at, created_at, updated_at) \
+         VALUES (?, ?, 'semantic', 'stale deleted memory', '[]', 0, 'T4', 0.05, NOW(), NOW(), \
+         DATE_SUB(NOW(), INTERVAL 25 HOUR))",
     )
     .bind(&mid)
     .bind(&uid)

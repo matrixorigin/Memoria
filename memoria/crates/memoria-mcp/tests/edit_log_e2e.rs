@@ -548,10 +548,10 @@ async fn test_governance_quarantine_edit_log() {
     assert!(row.reason.as_ref().unwrap().contains("quarantined"), "reason");
     assert!(row.snapshot_before.is_none(), "MCP governance doesn't create snapshot");
 
-    // Verify the memory is actually quarantined in DB
-    let active: Vec<(i8,)> = sqlx::query_as("SELECT is_active FROM mem_memories WHERE memory_id = ?")
+    // Verify the memory is physically deleted by quarantine
+    let remaining: Vec<(String,)> = sqlx::query_as("SELECT memory_id FROM mem_memories WHERE memory_id = ?")
         .bind(&mid).fetch_all(&pool).await.unwrap();
-    assert_eq!(active[0].0, 0, "memory should be inactive after quarantine");
+    assert!(remaining.is_empty(), "memory should be physically deleted by quarantine");
 
     cleanup(&pool, &uid).await;
     println!("✅ governance quarantine: all fields verified + DB state checked");
@@ -566,13 +566,13 @@ async fn test_governance_quarantine_edit_log() {
 async fn test_governance_cleanup_stale_edit_log() {
     let (svc, _git, pool, uid) = setup().await;
 
-    // Insert a memory that's already inactive with very low confidence → cleanup_stale target
+    // Insert a memory and mark it inactive → cleanup_stale target
     let r = call("memory_store", json!({"content": "stale fact"}), &svc, &uid).await;
     let mid = extract_mid(&r);
     svc.flush_edit_log().await;
 
-    // Make it inactive + low confidence so cleanup_stale deletes it
-    sqlx::query("UPDATE mem_memories SET is_active = 0, initial_confidence = 0.05 WHERE memory_id = ?")
+    // Make it inactive AND old enough to pass the 24h grace period
+    sqlx::query("UPDATE mem_memories SET is_active = 0, updated_at = DATE_SUB(NOW(), INTERVAL 25 HOUR) WHERE memory_id = ?")
         .bind(&mid).execute(&pool).await.unwrap();
 
     // Clear previous edit logs so we only see governance logs
