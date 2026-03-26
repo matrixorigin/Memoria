@@ -366,6 +366,7 @@ impl SqlMemoryStore {
                 created_at      DATETIME(6)  NOT NULL,
                 updated_at      DATETIME(6),
                 INDEX idx_user_active (user_id, is_active, memory_type),
+                INDEX idx_user_active_created (user_id, is_active, created_at),
                 INDEX idx_user_session (user_id, session_id),
                 FULLTEXT INDEX ft_content (content) WITH PARSER ngram -- MO#23861: breaks on concurrent snapshot restore
             )"#,
@@ -964,6 +965,25 @@ impl SqlMemoryStore {
             let _ = sqlx::query(
                 "ALTER TABLE mem_memories \
                  ADD INDEX idx_memories_user_observed (user_id, observed_at)",
+            )
+            .execute(&self.pool)
+            .await;
+        }
+
+        // Migration: add idx_user_active_created for list_active ORDER BY created_at DESC.
+        let has_user_active_created_idx: bool = sqlx::query_scalar(
+            "SELECT COUNT(*) > 0 FROM information_schema.statistics \
+             WHERE table_schema = DATABASE() \
+               AND table_name = 'mem_memories' \
+               AND index_name = 'idx_user_active_created'",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .unwrap_or(false);
+        if !has_user_active_created_idx {
+            let _ = sqlx::query(
+                "ALTER TABLE mem_memories \
+                 ADD INDEX idx_user_active_created (user_id, is_active, created_at)",
             )
             .execute(&self.pool)
             .await;
@@ -3100,6 +3120,30 @@ impl SqlMemoryStore {
         rows.iter().map(row_to_memory).collect()
     }
 
+    /// Lightweight list for API responses — skips embedding, source_event_ids,
+    /// extra_metadata to reduce I/O and deserialization cost.
+    pub async fn list_active_lite(
+        &self,
+        table: &str,
+        user_id: &str,
+        limit: i64,
+    ) -> Result<Vec<Memory>, MemoriaError> {
+        let safe_limit = limit.min(500);
+        let rows = sqlx::query(&format!(
+            "SELECT memory_id, user_id, memory_type, content, \
+             session_id, is_active, superseded_by, trust_tier, \
+             initial_confidence, observed_at, created_at, updated_at \
+             FROM {table} WHERE user_id = ? AND is_active = 1 \
+             ORDER BY created_at DESC LIMIT ?"
+        ))
+        .bind(user_id)
+        .bind(safe_limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        rows.iter().map(row_to_memory_lite).collect()
+    }
+
     /// Find memory IDs whose content contains `topic` (exact substring match).
     /// Uses fulltext boolean MUST with LIKE refinement. Requires topic >= 3 chars.
     pub async fn find_ids_by_topic(
@@ -3783,6 +3827,49 @@ fn row_to_memory(row: &sqlx::mysql::MySqlRow) -> Result<Memory, MemoriaError> {
         created_at,
         updated_at,
         extra_metadata,
+        trust_tier: TrustTier::from_str(&trust_tier_str)?,
+        retrieval_score: None,
+    })
+}
+
+/// Lightweight row mapper — skips embedding, source_event_ids, extra_metadata.
+fn row_to_memory_lite(row: &sqlx::mysql::MySqlRow) -> Result<Memory, MemoriaError> {
+    let memory_type_str: String = row.try_get("memory_type").map_err(db_err)?;
+    let trust_tier_str: String = row.try_get("trust_tier").map_err(db_err)?;
+    let observed_at = row
+        .try_get::<chrono::NaiveDateTime, _>("observed_at")
+        .ok()
+        .map(|dt| dt.and_utc());
+    let created_at = row
+        .try_get::<chrono::NaiveDateTime, _>("created_at")
+        .ok()
+        .map(|dt| dt.and_utc());
+    let updated_at = row
+        .try_get::<chrono::NaiveDateTime, _>("updated_at")
+        .ok()
+        .map(|dt| dt.and_utc());
+
+    Ok(Memory {
+        memory_id: row.try_get("memory_id").map_err(db_err)?,
+        user_id: row.try_get("user_id").map_err(db_err)?,
+        memory_type: MemoryType::from_str(&memory_type_str)?,
+        content: row.try_get("content").map_err(db_err)?,
+        initial_confidence: row
+            .try_get::<f32, _>("initial_confidence")
+            .map_err(db_err)? as f64,
+        embedding: None,
+        source_event_ids: Vec::new(),
+        superseded_by: nullable_str_from_row(row.try_get("superseded_by").map_err(db_err)?),
+        is_active: {
+            let v: i8 = row.try_get("is_active").map_err(db_err)?;
+            v != 0
+        },
+        access_count: 0,
+        session_id: nullable_str_from_row(row.try_get("session_id").map_err(db_err)?),
+        observed_at,
+        created_at,
+        updated_at,
+        extra_metadata: None,
         trust_tier: TrustTier::from_str(&trust_tier_str)?,
         retrieval_score: None,
     })

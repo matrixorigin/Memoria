@@ -1662,7 +1662,7 @@ impl MemoryService {
     ) -> Result<Vec<Memory>, MemoriaError> {
         if let Some(sql) = &self.sql_store {
             let table = sql.active_table(user_id).await?;
-            return sql.list_active_from(&table, user_id, limit).await;
+            return sql.list_active_lite(&table, user_id, limit).await;
         }
         self.store.list_active(user_id, limit).await
     }
