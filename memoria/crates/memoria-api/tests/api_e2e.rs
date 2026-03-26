@@ -206,10 +206,10 @@ async fn test_api_list_no_embedding_and_limit() {
         assert!(item["memory_type"].as_str().is_some(), "memory_type required");
         assert!(item["trust_tier"].as_str().is_some(), "trust_tier required");
     }
-    // Ordering: newest first (created_at DESC)
-    let ts: Vec<&str> = items.iter().map(|i| i["created_at"].as_str().unwrap()).collect();
-    for w in ts.windows(2) {
-        assert!(w[0] >= w[1], "must be ordered by created_at DESC");
+    // Ordering: newest first (memory_id DESC — UUIDv7 is time-ordered)
+    let ids: Vec<&str> = items.iter().map(|i| i["memory_id"].as_str().unwrap()).collect();
+    for w in ids.windows(2) {
+        assert!(w[0] >= w[1], "must be ordered by memory_id DESC");
     }
 
     // ── memory_type filter ──
@@ -245,15 +245,10 @@ async fn test_api_list_no_embedding_and_limit() {
         match body["next_cursor"].as_str() {
             Some(c) => {
                 assert!(!c.is_empty(), "cursor must not be empty");
-                // Cursor format: "YYYY-MM-DD HH:MM:SS.ffffff|memory_id"
-                let (ts_part, id_part) = c.split_once('|').expect("cursor must contain '|'");
-                assert!(!id_part.is_empty(), "cursor must contain memory_id");
-                // Must be MySQL datetime, NOT RFC3339 (no 'T', no '+')
-                assert!(!ts_part.contains('T'), "cursor timestamp must not be RFC3339 (found 'T')");
-                assert!(!ts_part.contains('+'), "cursor timestamp must not contain timezone offset");
-                assert!(ts_part.starts_with("20"), "cursor timestamp must look like a datetime");
-                // percent-encode the cursor for query string
-                url = format!("{base}/v1/memories?limit=1&cursor={}", pct_encode(c));
+                // Cursor is a memory_id (32-char hex UUIDv7)
+                assert_eq!(c.len(), 32, "cursor must be 32-char hex");
+                assert!(c.chars().all(|ch| ch.is_ascii_hexdigit()), "cursor must be hex");
+                url = format!("{base}/v1/memories?limit=1&cursor={c}");
             }
             None => break,
         }
@@ -267,17 +262,6 @@ async fn test_api_list_no_embedding_and_limit() {
 }
 
 // ── 2b. list: cursor + memory_type combined ───────────────────────────────────
-
-fn pct_encode(s: &str) -> String {
-    s.bytes()
-        .map(|b| match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                (b as char).to_string()
-            }
-            _ => format!("%{b:02X}"),
-        })
-        .collect()
-}
 
 #[tokio::test]
 async fn test_api_list_cursor_with_type_filter() {
@@ -326,7 +310,7 @@ async fn test_api_list_cursor_with_type_filter() {
             seen.push(item["memory_id"].as_str().unwrap().to_string());
         }
         match body["next_cursor"].as_str() {
-            Some(c) => url = format!("{base}/v1/memories?memory_type=semantic&limit=1&cursor={}", pct_encode(c)),
+            Some(c) => url = format!("{base}/v1/memories?memory_type=semantic&limit=1&cursor={c}"),
             None => break,
         }
     }
@@ -466,14 +450,14 @@ async fn test_api_list_invalid_cursor() {
     // Either 200 with empty/some results, or 400 — but NOT 500
     assert_ne!(r.status(), 500, "invalid cursor must not cause server error");
 
-    // Cursor without '|' separator — split_once returns None, treated as no cursor
+    // Cursor without '|' separator — not a valid timestamp, treated as no cursor
     let r = client
         .get(format!("{base}/v1/memories?limit=10&cursor=no-pipe-here"))
         .header("X-User-Id", &uid)
         .send()
         .await
         .unwrap();
-    assert_eq!(r.status(), 200, "cursor without | should be treated as no cursor");
+    assert_eq!(r.status(), 200, "non-timestamp cursor should be treated as no cursor");
     println!("✅ list: invalid cursor handled gracefully");
 }
 
@@ -609,10 +593,7 @@ async fn test_api_list_has_more_at_limit_boundary() {
     // Follow cursor — should get the second item with no further cursor
     let cursor = body["next_cursor"].as_str().unwrap();
     let body: Value = client
-        .get(format!(
-            "{base}/v1/memories?limit=1&cursor={}",
-            pct_encode(cursor)
-        ))
+        .get(format!("{base}/v1/memories?limit=1&cursor={cursor}"))
         .header("X-User-Id", &uid)
         .send()
         .await
