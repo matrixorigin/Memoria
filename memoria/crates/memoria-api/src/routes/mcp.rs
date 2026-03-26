@@ -23,6 +23,26 @@ use serde_json::json;
 
 use crate::{auth::AuthUser, state::AppState};
 
+/// Derive a stable tracking path from the JSON-RPC method + params so that
+/// Streamable HTTP calls appear alongside the existing `/v1/*` entries in
+/// `mem_api_call_log` and surface correctly in the Usage / Monitor dashboards.
+///
+/// Convention:
+///   `tools/call` → `/mcp/<tool_name>`   (e.g. `/mcp/memory_store`)
+///   anything else → `/mcp/<method>`     (e.g. `/mcp/initialize`, `/mcp/tools.list`)
+fn tracking_path(method: &str, params: Option<&serde_json::Value>) -> String {
+    if method == "tools/call" {
+        if let Some(name) = params
+            .and_then(|p| p.get("name"))
+            .and_then(|n| n.as_str())
+        {
+            return format!("/mcp/{}", name);
+        }
+    }
+    // Replace `/` with `.` so the path stays URL-like without ambiguity.
+    format!("/mcp/{}", method.replace('/', "."))
+}
+
 pub async fn mcp_handler(
     State(state): State<AppState>,
     auth: AuthUser,
@@ -75,10 +95,12 @@ pub async fn mcp_handler(
     };
 
     let params = req.get("params").cloned();
+    let track_path = tracking_path(&method, params.as_ref());
 
     // JSON-RPC 2.0: a Notification is a *valid* Request without an "id" member.
     // The server MUST NOT reply to Notifications.
     if req.get("id").is_none() {
+        let t = std::time::Instant::now();
         let _ = memoria_mcp::dispatch_http(
             &method,
             params,
@@ -87,23 +109,48 @@ pub async fn mcp_handler(
             &auth.user_id,
         )
         .await;
+        state.call_log_batcher.record(
+            auth.user_id,
+            "POST".to_string(),
+            track_path,
+            204,
+            t.elapsed().as_millis() as u32,
+        );
         return StatusCode::NO_CONTENT.into_response();
     }
 
     let id = req["id"].clone();
+    let t = std::time::Instant::now();
 
-    match memoria_mcp::dispatch_http(&method, params, &state.service, &state.git, &auth.user_id)
-        .await
-    {
-        Ok(v) => {
-            let result = if v.is_null() { json!({}) } else { v };
-            Json(json!({"jsonrpc": "2.0", "id": id, "result": result})).into_response()
-        }
-        Err(e) => Json(json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "error": {"code": e.code, "message": e.message}
-        }))
-        .into_response(),
-    }
+    let (response, status_code) =
+        match memoria_mcp::dispatch_http(&method, params, &state.service, &state.git, &auth.user_id)
+            .await
+        {
+            Ok(v) => {
+                let result = if v.is_null() { json!({}) } else { v };
+                (
+                    Json(json!({"jsonrpc": "2.0", "id": id, "result": result})).into_response(),
+                    200u16,
+                )
+            }
+            Err(e) => (
+                Json(json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": {"code": e.code, "message": e.message}
+                }))
+                .into_response(),
+                500u16,
+            ),
+        };
+
+    state.call_log_batcher.record(
+        auth.user_id,
+        "POST".to_string(),
+        track_path,
+        status_code,
+        t.elapsed().as_millis() as u32,
+    );
+
+    response
 }
