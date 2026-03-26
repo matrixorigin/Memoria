@@ -15,6 +15,18 @@ pub(crate) fn db_err(e: sqlx::Error) -> MemoriaError {
     MemoriaError::Database(e.to_string())
 }
 
+/// Returns true when a failed ALTER TABLE ADD COLUMN was rejected because
+/// the column already exists (MySQL/MatrixOne error 1060).
+/// This is the expected outcome when the column was created by CREATE TABLE
+/// before information_schema reflects it, so it should be treated as a no-op.
+fn is_duplicate_column(e: &sqlx::Error) -> bool {
+    use sqlx::mysql::MySqlDatabaseError;
+    e.as_database_error()
+        .and_then(|de| de.as_error().downcast_ref::<MySqlDatabaseError>())
+        .map(|me| me.number() == 1060)
+        .unwrap_or(false)
+}
+
 /// Spawn a background task that periodically logs pool utilization.
 /// Warns when idle connections drop below 10% of pool size.
 /// Stops automatically when the pool is closed.
@@ -856,12 +868,7 @@ impl SqlMemoryStore {
         .execute(&self.pool)
         .await;
         if let Err(e) = add_rpc_success {
-            let is_dup = e
-                .as_database_error()
-                .and_then(|de| de.code())
-                .map(|c| c == "1060")
-                .unwrap_or(false);
-            if !is_dup {
+            if !is_duplicate_column(&e) {
                 tracing::error!(
                     error = %e,
                     "Migration fatal: mem_api_call_log.rpc_success could not be added. \
@@ -872,7 +879,7 @@ impl SqlMemoryStore {
                 );
                 return Err(db_err(e));
             }
-            // 1060 = column already exists — idempotent, safe to continue.
+            // Column already exists — idempotent, safe to continue.
         }
 
         let add_rpc_error_code = sqlx::query(
@@ -882,12 +889,7 @@ impl SqlMemoryStore {
         .execute(&self.pool)
         .await;
         if let Err(e) = add_rpc_error_code {
-            let is_dup = e
-                .as_database_error()
-                .and_then(|de| de.code())
-                .map(|c| c == "1060")
-                .unwrap_or(false);
-            if !is_dup {
+            if !is_duplicate_column(&e) {
                 tracing::error!(
                     error = %e,
                     "Migration fatal: mem_api_call_log.rpc_error_code could not be added. \
@@ -897,7 +899,7 @@ impl SqlMemoryStore {
                 );
                 return Err(db_err(e));
             }
-            // 1060 = column already exists — idempotent, safe to continue.
+            // Column already exists — idempotent, safe to continue.
         }
 
         // Migration: add composite index (user_id, memory_id) on mem_retrieval_feedback.
