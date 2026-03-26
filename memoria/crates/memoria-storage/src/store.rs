@@ -1632,6 +1632,7 @@ impl SqlMemoryStore {
     pub async fn cleanup_stale(&self, user_id: &str) -> Result<i64, MemoriaError> {
         const BATCH: u64 = 500;
         let mut total = 0i64;
+        // Phase 1: delete plain inactive (no version chain, past grace period)
         loop {
             let res = sqlx::query(
                 "DELETE FROM mem_memories WHERE user_id = ? AND is_active = 0 \
@@ -1647,6 +1648,31 @@ impl SqlMemoryStore {
             if n < BATCH {
                 break;
             }
+        }
+        // Phase 2: delete broken chain rows (superseded_by target no longer exists)
+        loop {
+            let ids: Vec<(String,)> = sqlx::query_as(
+                "SELECT old.memory_id FROM mem_memories old \
+                 LEFT JOIN mem_memories new ON old.superseded_by = new.memory_id \
+                 WHERE old.user_id = ? AND old.is_active = 0 \
+                   AND old.superseded_by IS NOT NULL AND old.superseded_by != '' \
+                   AND new.memory_id IS NULL LIMIT 500",
+            )
+            .bind(user_id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(db_err)?;
+            if ids.is_empty() {
+                break;
+            }
+            let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let sql = format!("DELETE FROM mem_memories WHERE memory_id IN ({placeholders})");
+            let mut q = sqlx::query(&sql);
+            for (id,) in &ids {
+                q = q.bind(id);
+            }
+            let r = q.execute(&self.pool).await.map_err(db_err)?;
+            total += r.rows_affected() as i64;
         }
         Ok(total)
     }

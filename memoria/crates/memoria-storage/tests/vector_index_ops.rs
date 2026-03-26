@@ -614,6 +614,14 @@ async fn test_cleanup_stale_preserves_history_chain() {
     let new_mid = uuid::Uuid::new_v4().to_string();
     let plain_mid = uuid::Uuid::new_v4().to_string();
 
+    // Insert the target of the version chain (active, the "new" version)
+    sqlx::query(
+        "INSERT INTO mem_memories (memory_id, user_id, memory_type, content, source_event_ids, \
+         is_active, observed_at, created_at) \
+         VALUES (?, ?, 'semantic', 'new version', '[]', 1, NOW(), NOW())"
+    ).bind(&new_mid).bind(&uid)
+    .execute(store.pool()).await.unwrap();
+
     // Insert a superseded memory (part of version chain) — inactive, old, has superseded_by
     sqlx::query(
         "INSERT INTO mem_memories (memory_id, user_id, memory_type, content, source_event_ids, \
@@ -646,6 +654,102 @@ async fn test_cleanup_stale_preserves_history_chain() {
     assert_eq!(c, 0, "plain inactive memory should be deleted");
 
     // Cleanup
-    sqlx::query("DELETE FROM mem_memories WHERE memory_id = ?")
-        .bind(&old_mid).execute(store.pool()).await.ok();
+    sqlx::query("DELETE FROM mem_memories WHERE memory_id IN (?, ?)")
+        .bind(&old_mid).bind(&new_mid).execute(store.pool()).await.ok();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// cleanup_stale — deletes broken version chain (superseded_by target gone)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn test_cleanup_stale_deletes_broken_chain() {
+    let store = setup().await;
+    let uid = uuid::Uuid::new_v4().to_string();
+    let broken_mid = uuid::Uuid::new_v4().to_string();
+    let gone_target = uuid::Uuid::new_v4().to_string(); // never inserted
+
+    // Insert inactive memory whose superseded_by points to a nonexistent memory
+    sqlx::query(
+        "INSERT INTO mem_memories (memory_id, user_id, memory_type, content, source_event_ids, \
+         is_active, superseded_by, updated_at, observed_at, created_at) \
+         VALUES (?, ?, 'semantic', 'broken chain', '[]', 0, ?, \
+         DATE_SUB(NOW(), INTERVAL 48 HOUR), DATE_SUB(NOW(), INTERVAL 48 HOUR), NOW())"
+    ).bind(&broken_mid).bind(&uid).bind(&gone_target)
+    .execute(store.pool()).await.unwrap();
+
+    let cleaned = store.cleanup_stale(&uid).await.unwrap();
+    assert_eq!(cleaned, 1, "should delete broken chain row");
+
+    let (c,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM mem_memories WHERE memory_id = ?")
+        .bind(&broken_mid).fetch_one(store.pool()).await.unwrap();
+    assert_eq!(c, 0, "broken chain memory should be deleted");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// cleanup_stale — cascading broken chain deletion (A→B→C, C gone → B gone → A gone)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn test_cleanup_stale_cascading_broken_chain() {
+    let store = setup().await;
+    let uid = uuid::Uuid::new_v4().to_string();
+    let mid_a = uuid::Uuid::new_v4().to_string();
+    let mid_b = uuid::Uuid::new_v4().to_string();
+    let mid_c = uuid::Uuid::new_v4().to_string(); // never inserted — the root break
+
+    // Chain: A → B → C (C doesn't exist)
+    // B is inactive with superseded_by = C (broken)
+    sqlx::query(
+        "INSERT INTO mem_memories (memory_id, user_id, memory_type, content, source_event_ids, \
+         is_active, superseded_by, updated_at, observed_at, created_at) \
+         VALUES (?, ?, 'semantic', 'version B', '[]', 0, ?, \
+         DATE_SUB(NOW(), INTERVAL 48 HOUR), DATE_SUB(NOW(), INTERVAL 48 HOUR), NOW())"
+    ).bind(&mid_b).bind(&uid).bind(&mid_c)
+    .execute(store.pool()).await.unwrap();
+
+    // A is inactive with superseded_by = B (valid chain, but B will be deleted)
+    sqlx::query(
+        "INSERT INTO mem_memories (memory_id, user_id, memory_type, content, source_event_ids, \
+         is_active, superseded_by, updated_at, observed_at, created_at) \
+         VALUES (?, ?, 'semantic', 'version A', '[]', 0, ?, \
+         DATE_SUB(NOW(), INTERVAL 48 HOUR), DATE_SUB(NOW(), INTERVAL 48 HOUR), NOW())"
+    ).bind(&mid_a).bind(&uid).bind(&mid_b)
+    .execute(store.pool()).await.unwrap();
+
+    let cleaned = store.cleanup_stale(&uid).await.unwrap();
+    assert_eq!(cleaned, 2, "should cascade-delete both A and B");
+
+    let (c,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM mem_memories WHERE memory_id IN (?, ?)"
+    ).bind(&mid_a).bind(&mid_b).fetch_one(store.pool()).await.unwrap();
+    assert_eq!(c, 0, "both chain nodes should be gone");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// detect_pollution — normal user returns false
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn test_detect_pollution_normal_user() {
+    let store = setup().await;
+    let uid = uuid::Uuid::new_v4().to_string();
+
+    // Insert 5 active memories, none superseded → ratio = 0/5 = 0 < 0.3
+    for i in 0..5 {
+        let mid = uuid::Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO mem_memories (memory_id, user_id, memory_type, content, source_event_ids, \
+             is_active, observed_at, created_at, updated_at) \
+             VALUES (?, ?, 'semantic', ?, '[]', 1, NOW(), NOW(), NOW())"
+        ).bind(&mid).bind(&uid).bind(format!("fact {i}"))
+        .execute(store.pool()).await.unwrap();
+    }
+
+    let result = store.detect_pollution(&uid, 24).await.unwrap();
+    assert!(!result, "normal user with no supersedes should not be polluted");
+
+    // Cleanup
+    sqlx::query("DELETE FROM mem_memories WHERE user_id = ?")
+        .bind(&uid).execute(store.pool()).await.ok();
 }
