@@ -1675,7 +1675,7 @@ impl MemoryService {
         user_id: &str,
         limit: i64,
         memory_type: Option<&str>,
-        cursor: Option<(&str, &str)>,
+        cursor: Option<&str>,
     ) -> Result<Vec<Memory>, MemoriaError> {
         if let Some(sql) = &self.sql_store {
             let table = sql.active_table(user_id).await?;
@@ -1689,16 +1689,8 @@ impl MemoryService {
         if let Some(mt) = memory_type {
             mems.retain(|m| m.memory_type.to_string() == mt);
         }
-        if let Some((ts, id)) = cursor {
-            if let Ok(cutoff) = chrono::NaiveDateTime::parse_from_str(ts, "%Y-%m-%d %H:%M:%S%.6f")
-            {
-                let cutoff = cutoff.and_utc();
-                let id = id.to_string();
-                mems.retain(|m| match m.created_at {
-                    Some(c) => c < cutoff || (c == cutoff && m.memory_id < id),
-                    None => false,
-                });
-            }
+        if let Some(cursor_id) = cursor {
+            mems.retain(|m| m.memory_id.as_str() < cursor_id);
         }
         Ok(mems)
     }

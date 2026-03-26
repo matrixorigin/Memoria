@@ -365,8 +365,7 @@ impl SqlMemoryStore {
                 observed_at     DATETIME(6)  NOT NULL,
                 created_at      DATETIME(6)  NOT NULL,
                 updated_at      DATETIME(6),
-                INDEX idx_user_active (user_id, is_active, memory_type, created_at),
-                INDEX idx_user_active_created (user_id, is_active, created_at),
+                INDEX idx_user_active (user_id, is_active, memory_type),
                 INDEX idx_user_session (user_id, session_id),
                 FULLTEXT INDEX ft_content (content) WITH PARSER ngram -- MO#23861: breaks on concurrent snapshot restore
             )"#,
@@ -705,22 +704,20 @@ impl SqlMemoryStore {
         .execute(&self.pool)
         .await;
 
-        // Migrate idx_user_active to (user_id, is_active, memory_type, created_at).
-        // Covers memory_type filter + ORDER BY created_at DESC without filesort.
-        let idx_active_col_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM information_schema.statistics \
+        // Migrate idx_user_active to include memory_type (idempotent)
+        let needs_upgrade: bool = sqlx::query_scalar(
+            "SELECT COUNT(*) = 0 FROM information_schema.statistics \
              WHERE table_schema = DATABASE() AND table_name = 'mem_memories' \
-             AND index_name = 'idx_user_active'",
+             AND index_name = 'idx_user_active' AND column_name = 'memory_type'",
         )
         .fetch_one(&self.pool)
         .await
-        .unwrap_or(0);
-        // Need exactly 4 columns; older schemas have 2 or 3.
-        if idx_active_col_count > 0 && idx_active_col_count < 4 {
+        .unwrap_or(false);
+        if needs_upgrade {
             let _ = sqlx::query("ALTER TABLE mem_memories DROP INDEX idx_user_active")
                 .execute(&self.pool)
                 .await;
-            let _ = sqlx::query("ALTER TABLE mem_memories ADD INDEX idx_user_active (user_id, is_active, memory_type, created_at)")
+            let _ = sqlx::query("ALTER TABLE mem_memories ADD INDEX idx_user_active (user_id, is_active, memory_type)")
                 .execute(&self.pool).await;
         }
 
@@ -972,7 +969,7 @@ impl SqlMemoryStore {
             .await;
         }
 
-        // Migration: add idx_user_active_created for list_active ORDER BY created_at DESC.
+        // Migration: drop idx_user_active_created — no longer needed, list now orders by PK.
         let has_user_active_created_idx: bool = sqlx::query_scalar(
             "SELECT COUNT(*) > 0 FROM information_schema.statistics \
              WHERE table_schema = DATABASE() \
@@ -982,10 +979,9 @@ impl SqlMemoryStore {
         .fetch_one(&self.pool)
         .await
         .unwrap_or(false);
-        if !has_user_active_created_idx {
+        if has_user_active_created_idx {
             let _ = sqlx::query(
-                "ALTER TABLE mem_memories \
-                 ADD INDEX idx_user_active_created (user_id, is_active, created_at)",
+                "ALTER TABLE mem_memories DROP INDEX idx_user_active_created",
             )
             .execute(&self.pool)
             .await;
@@ -3130,8 +3126,11 @@ impl SqlMemoryStore {
              CAST(extra_metadata AS CHAR) AS extra_meta, \
              is_active, superseded_by, trust_tier, initial_confidence, \
              observed_at, created_at, updated_at \
-             FROM {table} WHERE user_id = ? AND is_active = 1 \
-             ORDER BY created_at DESC LIMIT ?"
+             FROM {table} WHERE memory_id IN (\
+               SELECT memory_id FROM {table} \
+               WHERE user_id = ? AND is_active = 1 \
+               ORDER BY memory_id DESC LIMIT ?\
+             ) ORDER BY memory_id DESC"
         ))
         .bind(user_id)
         .bind(limit)
@@ -3149,30 +3148,36 @@ impl SqlMemoryStore {
         user_id: &str,
         limit: i64,
         memory_type: Option<&str>,
-        cursor: Option<(&str, &str)>,
+        cursor: Option<&str>,
     ) -> Result<Vec<Memory>, MemoriaError> {
         // Cap at 501 (not 500) so the caller can request limit+1 for has_more detection.
         let safe_limit = limit.clamp(1, 501);
-        let mut sql = format!(
+        // Subquery: sort only memory_id in the index, then fetch full rows for the top-N.
+        let mut inner = format!(
+            "SELECT memory_id FROM {table} WHERE user_id = ? AND is_active = 1"
+        );
+        if memory_type.is_some() {
+            inner.push_str(" AND memory_type = ?");
+        }
+        if cursor.is_some() {
+            inner.push_str(" AND memory_id < ?");
+        }
+        inner.push_str(" ORDER BY memory_id DESC LIMIT ?");
+
+        let sql = format!(
             "SELECT memory_id, user_id, memory_type, content, \
              session_id, is_active, superseded_by, trust_tier, \
              initial_confidence, observed_at, created_at, updated_at \
-             FROM {table} WHERE user_id = ? AND is_active = 1"
+             FROM {table} WHERE memory_id IN ({inner}) \
+             ORDER BY memory_id DESC"
         );
-        if memory_type.is_some() {
-            sql.push_str(" AND memory_type = ?");
-        }
-        if cursor.is_some() {
-            sql.push_str(" AND (created_at < ? OR (created_at = ? AND memory_id < ?))");
-        }
-        sql.push_str(" ORDER BY created_at DESC, memory_id DESC LIMIT ?");
 
         let mut q = sqlx::query(&sql).bind(user_id);
         if let Some(mt) = memory_type {
             q = q.bind(mt);
         }
-        if let Some((ts, id)) = cursor {
-            q = q.bind(ts).bind(ts).bind(id);
+        if let Some(c) = cursor {
+            q = q.bind(c);
         }
         q = q.bind(safe_limit);
         let rows = q.fetch_all(&self.pool).await.map_err(db_err)?;

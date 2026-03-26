@@ -78,34 +78,18 @@ pub async fn list_memories(
     Query(q): Query<ListQuery>,
 ) -> ApiResult<ListResponse> {
     let limit = q.limit.clamp(1, 500);
-    // Parse cursor: "created_at|memory_id" — validate timestamp before passing to SQL
-    let cursor_parts = q.cursor.as_deref().and_then(|c| {
-        let (ts, id) = c.split_once('|')?;
-        // Validate timestamp format to avoid SQL errors from garbage input
-        chrono::NaiveDateTime::parse_from_str(ts, "%Y-%m-%d %H:%M:%S%.6f").ok()?;
-        Some((ts, id))
-    });
-    // Fetch limit+1 to detect whether there's a next page, return only limit items
+    // Cursor is a memory_id; validate it looks like a hex string
+    let cursor = q.cursor.as_deref().filter(|c| c.len() == 32 && c.chars().all(|ch| ch.is_ascii_hexdigit()));
     let fetch_limit = limit + 1;
     let mut memories = state
         .service
-        .list_active_paged(
-            &user_id,
-            fetch_limit,
-            q.memory_type.as_deref(),
-            cursor_parts,
-        )
+        .list_active_paged(&user_id, fetch_limit, q.memory_type.as_deref(), cursor)
         .await
         .map_err(api_err)?;
     let has_more = memories.len() > limit as usize;
     memories.truncate(limit as usize);
-    // Build cursor from last item on this page
     let next_cursor = if has_more {
-        memories.last().and_then(|m| {
-            m.created_at.map(|dt| {
-                format!("{}|{}", dt.format("%Y-%m-%d %H:%M:%S%.6f"), m.memory_id)
-            })
-        })
+        memories.last().map(|m| m.memory_id.clone())
     } else {
         None
     };
