@@ -273,6 +273,25 @@ pub fn spawn_tool_usage_flusher(
 #[derive(Clone, Default)]
 pub struct CallLogContext(pub std::sync::Arc<Mutex<Option<String>>>);
 
+/// RPC-level outcome metadata for `/mcp` calls.
+/// Kept separate from the HTTP status so the two observability dimensions
+/// (transport health vs. business logic errors) don't pollute each other.
+pub struct RpcMeta {
+    /// false when the JSON-RPC dispatch returned an error result.
+    pub success: bool,
+    /// JSON-RPC error code (e.g. -32601) when success = false; None otherwise.
+    pub error_code: Option<i32>,
+}
+
+impl RpcMeta {
+    pub fn ok() -> Self {
+        Self { success: true, error_code: None }
+    }
+    pub fn err(code: i32) -> Self {
+        Self { success: false, error_code: Some(code) }
+    }
+}
+
 /// A single pending call log entry buffered in memory.
 struct CallLogEntry {
     user_id: String,
@@ -280,6 +299,11 @@ struct CallLogEntry {
     path: String,
     status_code: u16,
     latency_ms: u32,
+    /// Always true for /v1/* REST calls.
+    /// For /mcp JSON-RPC calls: false when the dispatch returned an error result.
+    rpc_success: bool,
+    /// JSON-RPC error code (e.g. -32601) when rpc_success = false; NULL otherwise.
+    rpc_error_code: Option<i32>,
 }
 
 /// Accumulates call log entries in memory and flushes them in batches to DB.
@@ -300,7 +324,7 @@ impl CallLogBatcher {
         }
     }
 
-    /// Enqueue a single call log entry. Lock-free hot path relative to DB.
+    /// Enqueue a REST call log entry (`/v1/*`). RPC fields default to success.
     pub fn record(
         &self,
         user_id: String,
@@ -309,6 +333,21 @@ impl CallLogBatcher {
         status_code: u16,
         latency_ms: u32,
     ) {
+        self.record_rpc(user_id, method, path, status_code, latency_ms, RpcMeta::ok());
+    }
+
+    /// Enqueue a call log entry with explicit JSON-RPC success/error metadata.
+    /// Use this for `/mcp` calls so that HTTP status (always 200 for JSON-RPC)
+    /// and business-level error tracking are kept separate.
+    pub fn record_rpc(
+        &self,
+        user_id: String,
+        method: String,
+        path: String,
+        status_code: u16,
+        latency_ms: u32,
+        rpc: RpcMeta,
+    ) {
         if let Ok(mut v) = self.pending.lock() {
             v.push(CallLogEntry {
                 user_id,
@@ -316,6 +355,8 @@ impl CallLogBatcher {
                 path,
                 status_code,
                 latency_ms,
+                rpc_success: rpc.success,
+                rpc_error_code: rpc.error_code,
             });
         }
     }
@@ -336,11 +377,12 @@ impl CallLogBatcher {
         for chunk in entries.chunks(200) {
             let placeholders: String = chunk
                 .iter()
-                .map(|_| "(?, ?, ?, ?, ?)")
+                .map(|_| "(?, ?, ?, ?, ?, ?, ?)")
                 .collect::<Vec<_>>()
                 .join(",");
             let sql = format!(
-                "INSERT INTO mem_api_call_log (user_id, method, path, status_code, latency_ms) \
+                "INSERT INTO mem_api_call_log \
+                 (user_id, method, path, status_code, latency_ms, rpc_success, rpc_error_code) \
                  VALUES {placeholders}"
             );
             let mut query = sqlx::query(&sql);
@@ -350,7 +392,9 @@ impl CallLogBatcher {
                     .bind(&e.method)
                     .bind(&e.path)
                     .bind(e.status_code as i16)
-                    .bind(e.latency_ms as i32);
+                    .bind(e.latency_ms as i32)
+                    .bind(e.rpc_success as i8)
+                    .bind(e.rpc_error_code);
             }
             if let Err(e) = query.execute(pool).await {
                 warn!("call_log batch flush failed ({} entries): {e}", chunk.len());

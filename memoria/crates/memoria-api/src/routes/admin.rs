@@ -481,11 +481,14 @@ pub async fn user_call_stats(
     let days = params.days.unwrap_or(7).clamp(1, 90) as i64;
 
     // Aggregate totals for the requested time window.
+    // Error counting unifies HTTP errors (/v1/*) and JSON-RPC errors (/mcp/*):
+    //   - /v1/* REST calls: HTTP status_code >= 400 signals an error
+    //   - /mcp/* JSON-RPC calls: HTTP is always 200; rpc_success = 0 signals an error
     let row = sqlx::query(
         "SELECT \
             CAST(COUNT(*) AS SIGNED) AS total, \
             CAST(COALESCE(AVG(latency_ms), 0) AS DOUBLE) AS avg_ms, \
-            CAST(SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END) AS SIGNED) AS errors \
+            CAST(SUM(CASE WHEN status_code >= 400 OR rpc_success = 0 THEN 1 ELSE 0 END) AS SIGNED) AS errors \
          FROM mem_api_call_log \
          WHERE user_id = ? AND called_at >= DATE_SUB(NOW(6), INTERVAL ? DAY)",
     )
@@ -509,7 +512,8 @@ pub async fn user_call_stats(
             CAST(COUNT(*) AS SIGNED) AS cnt, \
             CAST(COALESCE(AVG(latency_ms), 0) AS DOUBLE) AS avg_ms, \
             CAST(COALESCE(MAX(latency_ms), 0) AS SIGNED) AS max_ms, \
-            CAST(SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END) AS SIGNED) AS err_cnt \
+            CAST(SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END) AS SIGNED) AS err_cnt, \
+            CAST(SUM(CASE WHEN rpc_success = 0 THEN 1 ELSE 0 END) AS SIGNED) AS rpc_err_cnt \
          FROM mem_api_call_log \
          WHERE user_id = ? AND called_at >= DATE_SUB(NOW(6), INTERVAL ? DAY) \
          GROUP BY method, path \
@@ -531,23 +535,28 @@ pub async fn user_call_stats(
             let p_avg: f64 = r.try_get("avg_ms").unwrap_or(0.0);
             let max_ms: i64 = r.try_get("max_ms").unwrap_or(0);
             let err_cnt: i64 = r.try_get("err_cnt").unwrap_or(0);
+            let rpc_err_cnt: i64 = r.try_get("rpc_err_cnt").unwrap_or(0);
+            // Unified error count: HTTP errors for /v1/* + RPC errors for /mcp/*
+            let total_err = err_cnt + rpc_err_cnt;
             serde_json::json!({
                 "method": method,
                 "path": path,
                 "count": cnt,
                 "avg_ms": p_avg as i64,
                 "max_ms": max_ms,
-                "error_count": err_cnt,
+                "error_count": total_err,
+                "rpc_error_count": rpc_err_cnt,
                 "error_rate": if cnt > 0 {
-                    (err_cnt as f64 / cnt as f64 * 100.0).round() / 100.0
+                    (total_err as f64 / cnt as f64 * 100.0).round() / 100.0
                 } else { 0.0 },
             })
         })
         .collect();
 
     // Most recent 50 calls for the live "Recent Calls" feed.
+    // Include rpc_success so /mcp errors (HTTP 200 but RPC failure) show as "err".
     let recent_rows = sqlx::query(
-        "SELECT method, path, status_code, latency_ms, called_at \
+        "SELECT method, path, status_code, latency_ms, called_at, rpc_success \
          FROM mem_api_call_log \
          WHERE user_id = ? \
          ORDER BY called_at DESC \
@@ -568,14 +577,17 @@ pub async fn user_call_stats(
             let called_at: chrono::DateTime<chrono::Utc> = r
                 .try_get("called_at")
                 .unwrap_or_else(|_| chrono::Utc::now());
+            // rpc_success defaults to true (1) for /v1/* rows that predate the column.
+            let rpc_success: i8 = r.try_get("rpc_success").unwrap_or(1);
+            let is_err = status_code >= 400 || rpc_success == 0;
             serde_json::json!({
                 "method": method,
                 "path": path,
                 "status_code": status_code,
                 "latency_ms": latency_ms,
                 "called_at": called_at.to_rfc3339(),
-                // Friendly status string for existing dashboard display
-                "status": if status_code < 400 { "ok" } else { "err" },
+                // Unified status: HTTP error (/v1/*) OR JSON-RPC error (/mcp/*)
+                "status": if is_err { "err" } else { "ok" },
             })
         })
         .collect();

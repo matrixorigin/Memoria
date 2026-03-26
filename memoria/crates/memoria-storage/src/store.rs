@@ -792,18 +792,24 @@ impl SqlMemoryStore {
         .map_err(db_err)?;
 
         // mem_api_call_log — per-user API call statistics for the Monitor dashboard.
-        // Records every authenticated /v1/* request: method, path, HTTP status,
-        // latency, and timestamp.  Insertions are batched (every 5 s) to avoid
-        // per-request DB pressure.
+        // Records every authenticated request from two entry points:
+        //   - /v1/* REST endpoints: HTTP status_code reflects the real outcome;
+        //     rpc_success = 1 and rpc_error_code = NULL (not applicable).
+        //   - /mcp  JSON-RPC endpoint: HTTP status_code is 200 for standard requests
+        //     and 204 for notifications (no-reply per JSON-RPC 2.0 §4);
+        //     rpc_success / rpc_error_code carry the business-level result.
+        // Insertions are batched (every 5 s) to avoid per-request DB pressure.
         sqlx::query(
             r#"CREATE TABLE IF NOT EXISTS mem_api_call_log (
-                id           BIGINT       NOT NULL AUTO_INCREMENT,
-                user_id      VARCHAR(64)  NOT NULL,
-                method       VARCHAR(10)  NOT NULL DEFAULT '',
-                path         VARCHAR(256) NOT NULL,
-                status_code  SMALLINT     NOT NULL DEFAULT 0,
-                latency_ms   INT          NOT NULL DEFAULT 0,
-                called_at    DATETIME(6)  NOT NULL DEFAULT NOW(6),
+                id              BIGINT       NOT NULL AUTO_INCREMENT,
+                user_id         VARCHAR(64)  NOT NULL,
+                method          VARCHAR(10)  NOT NULL DEFAULT '',
+                path            VARCHAR(256) NOT NULL,
+                status_code     SMALLINT     NOT NULL DEFAULT 0,
+                latency_ms      INT          NOT NULL DEFAULT 0,
+                called_at       DATETIME(6)  NOT NULL DEFAULT NOW(6),
+                rpc_success     TINYINT(1)   NOT NULL DEFAULT 1,
+                rpc_error_code  INT          NULL,
                 PRIMARY KEY (id),
                 INDEX idx_user_called (user_id, called_at)
             )"#,
@@ -830,6 +836,66 @@ impl SqlMemoryStore {
             )
             .execute(&self.pool)
             .await;
+        }
+
+        // Migration: add rpc_success / rpc_error_code columns for Streamable HTTP MCP tracking.
+        // These separate HTTP-level status from JSON-RPC business errors so Monitor stats
+        // remain accurate for both /v1/* REST calls and /mcp JSON-RPC calls.
+        // Each column is checked and added independently so a partial failure (e.g. first ALTER
+        // succeeds but second fails) is self-healing on the next restart.
+        let has_rpc_success_col: bool = sqlx::query_scalar(
+            "SELECT COUNT(*) > 0 FROM information_schema.columns \
+             WHERE table_schema = DATABASE() AND table_name = 'mem_api_call_log' \
+             AND column_name = 'rpc_success'",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .unwrap_or(false);
+        if !has_rpc_success_col {
+            sqlx::query(
+                "ALTER TABLE mem_api_call_log \
+                 ADD COLUMN rpc_success TINYINT(1) NOT NULL DEFAULT 1",
+            )
+            .execute(&self.pool)
+            .await
+            .map_err(|e| {
+                tracing::error!(
+                    error = %e,
+                    "Migration fatal: mem_api_call_log.rpc_success could not be added. \
+                     The call-log writer always inserts this column; without it ALL \
+                     call-log flushes will fail with 'unknown column', silently dropping \
+                     every /v1/* and /mcp monitoring entry. \
+                     Fix DB permissions or add the column manually, then restart."
+                );
+                db_err(e)
+            })?;
+        }
+
+        let has_rpc_error_code_col: bool = sqlx::query_scalar(
+            "SELECT COUNT(*) > 0 FROM information_schema.columns \
+             WHERE table_schema = DATABASE() AND table_name = 'mem_api_call_log' \
+             AND column_name = 'rpc_error_code'",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .unwrap_or(false);
+        if !has_rpc_error_code_col {
+            sqlx::query(
+                "ALTER TABLE mem_api_call_log \
+                 ADD COLUMN rpc_error_code INT NULL",
+            )
+            .execute(&self.pool)
+            .await
+            .map_err(|e| {
+                tracing::error!(
+                    error = %e,
+                    "Migration fatal: mem_api_call_log.rpc_error_code could not be added. \
+                     The call-log writer always inserts this column; without it ALL \
+                     call-log flushes will fail with 'unknown column'. \
+                     Fix DB permissions or add the column manually, then restart."
+                );
+                db_err(e)
+            })?;
         }
 
         // Migration: add composite index (user_id, memory_id) on mem_retrieval_feedback.
