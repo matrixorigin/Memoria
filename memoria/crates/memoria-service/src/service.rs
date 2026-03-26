@@ -1616,9 +1616,11 @@ impl MemoryService {
             let (snap, warning) = sql.create_safety_snapshot("purge").await;
             let table = sql.active_table(user_id).await?;
             let ids = sql.find_ids_by_topic(&table, user_id, topic).await?;
-            for id in &ids {
-                sql.soft_delete_from(&table, id).await?;
-                Self::cleanup_entity_data_for_memory(sql, id, "purge_topic").await;
+            if !ids.is_empty() {
+                // Batch soft-delete in chunks
+                sql.soft_delete_batch_from(&table, &ids).await?;
+                // Batch entity cleanup
+                sql.cleanup_entity_data_batch(&ids).await;
             }
             let reason = format!("topic:{topic}");
             for id in &ids {

@@ -490,6 +490,72 @@ async fn test_purge_by_topic_verify_db() {
     println!("✅ purge by topic: 2 matched deactivated, 1 unrelated remains");
 }
 
+#[tokio::test]
+async fn test_purge_by_topic_special_chars_verify_db() {
+    let (base, client, pool) = spawn_server().await;
+    let uid = uid();
+
+    // Content with special chars that fulltext can't match — triggers LIKE fallback
+    for content in ["[#100] build report ok", "[#200] build report fail", "normal memory"] {
+        client
+            .post(format!("{base}/v1/memories"))
+            .header("X-User-Id", &uid)
+            .json(&json!({"content": content}))
+            .send()
+            .await
+            .unwrap();
+    }
+    assert_eq!(db_count_active(&pool, &uid).await, 3);
+
+    // Purge with special char topic — sanitize strips [#, fulltext may miss,
+    // LIKE fallback should find them
+    let r = client
+        .post(format!("{base}/v1/memories/purge"))
+        .header("X-User-Id", &uid)
+        .json(&json!({"topic": "[#100] build"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let body: Value = r.json().await.unwrap();
+    assert_eq!(body["purged"], 1, "should purge the [#100] memory");
+
+    assert_eq!(db_count_active(&pool, &uid).await, 2);
+    println!("✅ purge by topic with special chars: LIKE fallback works");
+}
+
+#[tokio::test]
+async fn test_purge_by_topic_batch_perf_verify_db() {
+    let (base, client, pool) = spawn_server().await;
+    let uid = uid();
+
+    // Store 10 memories with same topic — verifies batch soft_delete
+    for i in 0..10 {
+        client
+            .post(format!("{base}/v1/memories"))
+            .header("X-User-Id", &uid)
+            .json(&json!({"content": format!("batch_purge_test item {i}"), "memory_type": "semantic"}))
+            .send()
+            .await
+            .unwrap();
+    }
+    assert_eq!(db_count_active(&pool, &uid).await, 10);
+
+    let r = client
+        .post(format!("{base}/v1/memories/purge"))
+        .header("X-User-Id", &uid)
+        .json(&json!({"topic": "batch_purge_test"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let body: Value = r.json().await.unwrap();
+    assert_eq!(body["purged"], 10, "should batch-purge all 10");
+
+    assert_eq!(db_count_active(&pool, &uid).await, 0);
+    println!("✅ purge by topic batch: 10 memories purged in one call");
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // 4. BATCH STORE — verify all rows in DB with correct types
 // ═══════════════════════════════════════════════════════════════════════════════

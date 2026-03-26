@@ -100,9 +100,12 @@ fn sanitize_sql_literal(s: &str) -> String {
 fn sanitize_fulltext_query(s: &str) -> String {
     s.chars()
         .filter(|c| *c != '\0')
-        .map(|c| match c {
-            '\'' | '\\' | '"' | '+' | '-' | '<' | '>' | '(' | ')' | '~' | '*' | '@' => ' ',
-            _ => c,
+        .map(|c| {
+            if c.is_alphanumeric() || c == '_' {
+                c
+            } else {
+                ' '
+            }
         })
         .collect::<String>()
         .split_whitespace()
@@ -3120,6 +3123,54 @@ impl SqlMemoryStore {
         Ok(())
     }
 
+    /// Batch soft-delete: deactivate multiple memories in one round trip per chunk.
+    pub async fn soft_delete_batch_from(&self, table: &str, ids: &[String]) -> Result<(), MemoriaError> {
+        for chunk in ids.chunks(200) {
+            let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let sql = format!(
+                "UPDATE {table} SET is_active = 0, updated_at = NOW() WHERE memory_id IN ({placeholders})"
+            );
+            let mut q = sqlx::query(&sql);
+            for id in chunk {
+                q = q.bind(id);
+            }
+            q.execute(&self.pool).await.map_err(db_err)?;
+        }
+        Ok(())
+    }
+
+    /// Batch cleanup entity data for multiple memory IDs.
+    pub async fn cleanup_entity_data_batch(&self, ids: &[String]) {
+        let graph = self.graph_store();
+        for chunk in ids.chunks(200) {
+            let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+
+            // Deactivate graph nodes
+            let sql = format!("UPDATE memory_graph_nodes SET is_active = 0 WHERE memory_id IN ({placeholders})");
+            let mut q = sqlx::query(&sql);
+            for id in chunk { q = q.bind(id); }
+            if let Err(e) = q.execute(&self.pool).await {
+                tracing::warn!("batch deactivate graph nodes failed: {e}");
+            }
+
+            // Delete memory_entity_links
+            let sql = format!("DELETE FROM mem_memory_entity_links WHERE memory_id IN ({placeholders})");
+            let mut q = sqlx::query(&sql);
+            for id in chunk { q = q.bind(id); }
+            if let Err(e) = q.execute(graph.pool()).await {
+                tracing::warn!("batch delete memory_entity_links failed: {e}");
+            }
+
+            // Delete entity_links
+            let sql = format!("DELETE FROM mem_entity_links WHERE memory_id IN ({placeholders})");
+            let mut q = sqlx::query(&sql);
+            for id in chunk { q = q.bind(id); }
+            if let Err(e) = q.execute(&self.pool).await {
+                tracing::warn!("batch delete entity_links failed: {e}");
+            }
+        }
+    }
+
     /// Branch-aware get: fetch an active memory from the given table.
     pub async fn get_from(
         &self,
@@ -3350,21 +3401,37 @@ impl SqlMemoryStore {
         }
         let ft_safe = sanitize_fulltext_query(topic);
         let like_safe = sanitize_like_pattern(topic);
-        if ft_safe.is_empty() {
-            return Ok(vec![]);
+        let like_pat = format!("%{like_safe}%");
+
+        // Try fulltext + LIKE first (fast path)
+        if !ft_safe.is_empty() {
+            let ft_terms: String = ft_safe
+                .split_whitespace()
+                .map(|w| format!("+{w}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let sql = format!(
+                "SELECT memory_id FROM {table} \
+                 WHERE user_id = ? AND is_active = 1 \
+                   AND MATCH(content) AGAINST('{ft_terms}' IN BOOLEAN MODE) \
+                   AND content LIKE ?"
+            );
+            let rows: Vec<(String,)> = sqlx::query_as(&sql)
+                .bind(user_id)
+                .bind(&like_pat)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(db_err)?;
+            if !rows.is_empty() {
+                return Ok(rows.into_iter().map(|r| r.0).collect());
+            }
         }
-        let ft_terms: String = ft_safe
-            .split_whitespace()
-            .map(|w| format!("+{w}"))
-            .collect::<Vec<_>>()
-            .join(" ");
+
+        // Fallback: LIKE on user's active memories (idx_user_active narrows scan)
         let sql = format!(
             "SELECT memory_id FROM {table} \
-             WHERE user_id = ? AND is_active = 1 \
-               AND MATCH(content) AGAINST('{ft_terms}' IN BOOLEAN MODE) \
-               AND content LIKE ?"
+             WHERE user_id = ? AND is_active = 1 AND content LIKE ? LIMIT 500"
         );
-        let like_pat = format!("%{like_safe}%");
         let rows: Vec<(String,)> = sqlx::query_as(&sql)
             .bind(user_id)
             .bind(&like_pat)
