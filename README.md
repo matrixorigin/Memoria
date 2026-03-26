@@ -1,21 +1,24 @@
 <div align="center">
   <img src="assets/memoria-logo.png" alt="Memoria Logo" width="300"/>
-  
+
   # Memoria
-  
+
   **The World's First Git for AI Agent Memory**
-  
+
   *Snapshot · Branch · Merge · Rollback — for memory, not code.*
-  
+
   > Git made code safe to change. Memoria makes memory safe to change.
-  
-  [![MatrixOne](https://img.shields.io/badge/Powered%20by-MatrixOne-00ADD8?style=flat-square&logo=database)](https://github.com/matrixorigin/matrixone)
-  [![MCP](https://img.shields.io/badge/Protocol-MCP-7C3AED?style=flat-square)](https://modelcontextprotocol.io)
-  [![Git for Data](https://img.shields.io/badge/Git%20for%20Data-Enabled-00A3CC?style=flat-square)](https://github.com/matrixorigin/matrixone)
+
+  [![CI](https://github.com/matrixorigin/Memoria/actions/workflows/test.yml/badge.svg)](https://github.com/matrixorigin/Memoria/actions/workflows/test.yml)
+  [![Release](https://img.shields.io/github/v/release/matrixorigin/Memoria?style=flat-square&color=00d4aa)](https://github.com/matrixorigin/Memoria/releases)
+  [![GitHub Stars](https://img.shields.io/github/stars/matrixorigin/Memoria?style=flat-square&color=7C3AED)](https://github.com/matrixorigin/Memoria/stargazers)
+  [![Downloads](https://img.shields.io/github/downloads/matrixorigin/Memoria/total?style=flat-square)](https://github.com/matrixorigin/Memoria/releases)
   [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg?style=flat-square)](LICENSE)
-  
-  [See It in Action](#see-git-for-data-in-action) · [Quick Start](#quick-start) · [Steering Rules](#steering-rules) · [API Reference](#api-reference) · [For AI Agents](#for-ai-agents)
-  
+  [![MCP](https://img.shields.io/badge/Protocol-MCP-7C3AED?style=flat-square)](https://modelcontextprotocol.io)
+  [![MatrixOne](https://img.shields.io/badge/Powered%20by-MatrixOne-00ADD8?style=flat-square&logo=database)](https://github.com/matrixorigin/matrixone)
+
+  [Quick Start](#-quick-start) · [Why Memoria](#-why-memoria) · [See It in Action](#-see-git-for-data-in-action) · [API Reference](#-api-reference) · [Architecture](#-architecture) · [Development](#-development)
+
 </div>
 
 ---
@@ -23,117 +26,176 @@
 ## Overview
 
 Memoria is a **persistent memory layer** for AI agents with Git-level version control.
-Every memory change is tracked, auditable, and reversible — snapshots, branches, merges, and time-travel rollback, all powered by MatrixOne's native Copy-on-Write engine.
+Every memory change is tracked, auditable, and reversible — snapshots, branches, merges, and time-travel rollback, all powered by [MatrixOne](https://github.com/matrixorigin/matrixone)'s native Copy-on-Write engine.
 
-**Core Capabilities:**
-- **Cross-conversation memory** — preferences, facts, and decisions persist across sessions
-- **Semantic search** — retrieves memories by meaning, not just keywords
-- **Git for Data** — zero-copy branching, instant snapshots, point-in-time rollback
-- **Audit trail** — every memory mutation has a snapshot + provenance chain
-- **Self-maintaining** — built-in governance detects contradictions, quarantines low-confidence memories
-- **Private by default** — local embedding model option, no data leaves your machine
+<table>
+<tr>
+<td align="center" width="33%">
 
-**Supported Agents:** [Kiro](https://kiro.dev) · [Cursor](https://cursor.sh) · [Claude Code](https://docs.anthropic.com/en/docs/claude-code) · [Codex](https://openai.com/index/introducing-codex/) · [Gemini CLI](https://geminicli.com) · [OpenClaw](plugins/openclaw/README.md) · Any MCP-compatible agent
+**🔀 Git for Memory**
 
-**Storage Backend:** [MatrixOne](https://github.com/matrixorigin/matrixone) — Distributed database with native vector indexing
+Zero-copy branching, instant snapshots, point-in-time rollback — version control for every memory mutation
+
+</td>
+<td align="center" width="33%">
+
+**🔍 Semantic Search**
+
+Vector + full-text hybrid retrieval finds memories by meaning, not just keywords
+
+</td>
+<td align="center" width="33%">
+
+**🛡️ Self-Governing**
+
+Auto-detects contradictions, quarantines low-confidence memories, maintains audit trails
+
+</td>
+</tr>
+</table>
+
+<table>
+<tr>
+<td align="center" width="33%">
+
+**🔒 Private by Default**
+
+Local embedding model option — no data leaves your machine
+
+</td>
+<td align="center" width="33%">
+
+**🧠 Cross-Conversation**
+
+Preferences, facts, and decisions persist across sessions
+
+</td>
+<td align="center" width="33%">
+
+**📋 Full Audit Trail**
+
+Every memory mutation has a snapshot + provenance chain
+
+</td>
+</tr>
+</table>
+
+### Supported Agents
+
+<p align="center">
+  <a href="https://kiro.dev"><img src="https://img.shields.io/badge/Kiro-00C853?style=for-the-badge&logo=data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCI+PHRleHQgeD0iNCIgeT0iMTgiIGZvbnQtc2l6ZT0iMTYiIGZpbGw9IndoaXRlIj5LPC90ZXh0Pjwvc3ZnPg==&logoColor=white" alt="Kiro"/></a>
+  <a href="https://cursor.sh"><img src="https://img.shields.io/badge/Cursor-000000?style=for-the-badge&logo=cursor&logoColor=white" alt="Cursor"/></a>
+  <a href="https://docs.anthropic.com/en/docs/claude-code"><img src="https://img.shields.io/badge/Claude_Code-D97757?style=for-the-badge&logo=anthropic&logoColor=white" alt="Claude Code"/></a>
+  <a href="https://openai.com/index/introducing-codex/"><img src="https://img.shields.io/badge/Codex-412991?style=for-the-badge&logo=openai&logoColor=white" alt="Codex"/></a>
+  <a href="https://geminicli.com"><img src="https://img.shields.io/badge/Gemini_CLI-4285F4?style=for-the-badge&logo=google&logoColor=white" alt="Gemini CLI"/></a>
+  <a href="plugins/openclaw/README.md"><img src="https://img.shields.io/badge/OpenClaw-FF6B6B?style=for-the-badge" alt="OpenClaw"/></a>
+</p>
+
+<p align="center"><i>Works with any MCP-compatible agent</i></p>
 
 ---
 
-## See Git for Data in Action
+## 🚀 Quick Start
+
+<details open>
+<summary><b>☁️ Memoria Cloud (Recommended — no Docker, no database)</b></summary>
+<br/>
+
+**1. Sign up** at [thememoria.ai](https://thememoria.ai/auth) and get your token
+
+**2. Install & configure**
+```bash
+curl -sSL https://raw.githubusercontent.com/matrixorigin/Memoria/main/scripts/install.sh | bash
+cd your-project
+memoria init -i   # Select "Remote" mode, paste your token
+```
+
+**3. Restart & verify** — restart your AI tool, then ask: *"Do you have memory tools available?"*
+
+</details>
+
+<details>
+<summary><b>🐳 Self-Hosted (Docker — full data control)</b></summary>
+<br/>
+
+```bash
+# 1. Start MatrixOne + API
+git clone https://github.com/matrixorigin/Memoria.git
+cd Memoria
+docker compose up -d
+
+# 2. Install CLI
+curl -sSL https://raw.githubusercontent.com/matrixorigin/Memoria/main/scripts/install.sh | bash
+
+# 3. Configure your AI tool
+cd your-project
+memoria init -i   # Select "Embedded" mode
+```
+
+Restart your AI tool, then ask: *"Do you have memory tools available?"*
+
+</details>
+
+<details>
+<summary><b>🦞 OpenClaw Plugin</b></summary>
+<br/>
+
+Use the native OpenClaw plugin: [OpenClaw Plugin Setup](plugins/openclaw/README.md)
+
+```bash
+# ensure memoria CLI exists
+command -v memoria >/dev/null || curl -sSL https://raw.githubusercontent.com/matrixorigin/Memoria/main/scripts/install.sh | bash -s -- -y -d ~/.local/bin
+
+# install & enable
+openclaw plugins install @matrixorigin/memory-memoria
+openclaw plugins enable memory-memoria
+
+# cloud-first setup
+openclaw memoria setup --mode cloud --api-url <MEMORIA_API_URL> --api-key <MEMORIA_API_KEY> --install-memoria
+openclaw memoria health
+```
+
+</details>
+
+Or download binaries directly from [GitHub Releases](https://github.com/matrixorigin/Memoria/releases). For detailed setup, see [Setup Skill](skills/setup/SKILL.md).
+
+---
+
+## 💡 Why Memoria?
+
+| Capability | Memoria | Letta / Mem0 / Traditional RAG |
+|---|---|---|
+| **Git-level version control** | Native zero-copy snapshots & branches | File-level or none |
+| **Isolated experimentation** | One-click branch, merge after validation | Manual data duplication |
+| **Audit trail** | Full snapshot + provenance on every mutation | Limited logging |
+| **Semantic retrieval** | Vector + full-text hybrid search | Vector only |
+| **Self-governance** | Automatic contradiction detection & quarantine | Manual cleanup |
+
+---
+
+## 🎬 See Git for Data in Action
 
 <p align="center">
   <img src="assets/git4data-story-writing-demo.svg" alt="Animated Memoria Git-for-Data demo showing an author branching a story draft, merging a better plot direction into the main storyline, and rolling back the last two unsatisfying beats." width="100%"/>
 </p>
 
-A story-writing scenario makes the core idea visible faster: an author already has a few accepted story-memory nodes, then opens an experimental branch to try a different plot direction. When the branch feels better, it is merged into the main storyline. Later, if the newest beats do not work, the author rolls back to an earlier snapshot and keeps writing from there.
+A story-writing scenario demonstrates the core concept: an author has accepted story beats on `main`, opens an experimental branch for a different plot direction, merges the stronger draft back, and rolls back when the newest beats don't work.
 
-**What the demo shows:**
+<details>
+<summary><b>What the demo shows</b></summary>
+
 - **Main storyline** — accepted story beats live on `main`
 - **Experimental branch** — the author tries a new plot turn without rewriting canon
 - **Merge** — the stronger draft is promoted back into the main storyline
 - **Rollback** — the last two bad turns are discarded, and writing resumes from a safe snapshot
 
----
-
-## Why Memoria?
-
-| Capability | Memoria | Letta / Mem0 / Traditional RAG |
-|---|---|---|
-| Git-level version control | Native zero-copy snapshots & branches | File-level or none |
-| Isolated experimentation | One-click branch, merge after validation | Manual data duplication |
-| Audit trail | Full snapshot + provenance on every mutation | Limited logging |
-| Semantic retrieval | Vector + full-text hybrid search | Vector only |
-| Self-governance | Automatic contradiction detection & quarantine | Manual cleanup |
+</details>
 
 ---
 
-## Quick Start
-
-### Option A: Memoria Cloud (Recommended)
-
-The fastest way to get started — no Docker, no database setup.
-
-1. **Sign up** at [thememoria.ai](https://thememoria.ai/auth) and get your token
-2. **Install Memoria CLI**
-   ```bash
-   curl -sSL https://raw.githubusercontent.com/matrixorigin/Memoria/main/scripts/install.sh | bash
-   ```
-   Or download from [GitHub Releases](https://github.com/matrixorigin/Memoria/releases).
-3. **Configure your AI tool**
-   ```bash
-   cd your-project
-   memoria init -i   # Interactive wizard — select "Remote" mode, paste your token
-   ```
-   This creates MCP config + steering rules for your AI tool (Kiro, Cursor, Claude, Codex, or Gemini CLI).
-4. **Restart & verify** — restart your AI tool, then ask: *"Do you have memory tools available?"*
-
-### Option B: Self-Hosted (Docker)
-
-Run your own Memoria stack with full control over data.
-
-1. **Start MatrixOne + API**
-   ```bash
-   git clone https://github.com/matrixorigin/Memoria.git
-   cd Memoria
-   docker compose up -d
-   ```
-2. **Install Memoria CLI**
-   ```bash
-   curl -sSL https://raw.githubusercontent.com/matrixorigin/Memoria/main/scripts/install.sh | bash
-   ```
-3. **Configure your AI tool**
-   ```bash
-   cd your-project
-   memoria init -i   # Interactive wizard — select "Embedded" mode
-   ```
-4. **Restart & verify** — restart your AI tool, then ask: *"Do you have memory tools available?"*
-
-### 🦞 OpenClaw Plugin (Already Using OpenClaw?)
-
-Use the native OpenClaw plugin guide: [OpenClaw Plugin Setup](plugins/openclaw/README.md).
-
-```bash
-# ensure memoria CLI exists (required as MCP bridge)
-command -v memoria >/dev/null || curl -sSL https://raw.githubusercontent.com/matrixorigin/Memoria/main/scripts/install.sh | bash -s -- -y -d ~/.local/bin
-
-# npm path
-openclaw plugins install @matrixorigin/memory-memoria
-openclaw plugins enable memory-memoria
-
-# cloud-first setup flow
-openclaw memoria setup --mode cloud --api-url <MEMORIA_API_URL> --api-key <MEMORIA_API_KEY> --install-memoria
-openclaw memoria health
-```
-
-For detailed setup, see [Setup Skill](skills/setup/SKILL.md).
-
----
-
-## Steering Rules
+## 📖 Steering Rules
 
 Steering rules teach your AI agent **when and how** to use memory tools. Without them, the agent has tools but no guidance — like having a database without knowing the schema.
-
-### What They Do
 
 | Rule | Purpose |
 |------|---------|
@@ -143,7 +205,12 @@ Steering rules teach your AI agent **when and how** to use memory tools. Without
 | `memory-branching-patterns` | Isolated experiments with branches |
 | `goal-driven-evolution` | Track goals, plans, progress across conversations |
 
-### Example: Conversation Lifecycle
+**File locations:** Kiro: `.kiro/steering/*.md` · Cursor: `.cursor/rules/*.mdc` · Claude: `.claude/rules/*.md` · Codex: `AGENTS.md` · Gemini CLI: `GEMINI.md` + `.gemini/*.md`
+
+After upgrading: `memoria rules --force`
+
+<details>
+<summary><b>Example: Conversation Lifecycle</b></summary>
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
@@ -168,16 +235,19 @@ Steering rules teach your AI agent **when and how** to use memory tools. Without
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### Example: Goal-Driven Evolution
+</details>
+
+<details>
+<summary><b>Example: Goal-Driven Evolution</b></summary>
 
 ```
 You: "I want to add OAuth support to the API"
 
 AI:  → memory_search(query="GOAL OAuth")           ← check for existing goal
      → memory_store(content="🎯 GOAL: Add OAuth support\nStatus: ACTIVE", type="procedural")
-     
+
      ... works on implementation, stores progress as working memories ...
-     
+
      → memory_store(content="✅ STEP 1/3: Added OAuth routes", type="working")
      → memory_store(content="❌ STEP 2/3: Token refresh failed — need to fix expiry logic", type="working")
 
@@ -194,39 +264,29 @@ AI:  → memory_correct(query="GOAL OAuth", new_content="🎯 GOAL: OAuth — �
      → memory_purge(topic="STEP for GOAL OAuth")   ← clean up working memories
 ```
 
-### Example: Branch for Risky Experiments
+</details>
+
+<details>
+<summary><b>Example: Branch for Risky Experiments</b></summary>
 
 ```
 You: "Let's try switching from PostgreSQL to SQLite"
 
 AI:  → memory_branch(name="eval_sqlite")
      → memory_checkout(name="eval_sqlite")
-     
+
      ... experiments on branch, stores findings ...
-     
+
      → memory_diff(source="eval_sqlite")     ← preview changes
      → memory_checkout(name="main")
      → memory_merge(source="eval_sqlite")    ← or delete if failed
 ```
 
-### File Locations
-
-- Kiro: `.kiro/steering/*.md`
-- Cursor: `.cursor/rules/*.mdc`
-- Claude: `.claude/rules/*.md`
-- Codex: `AGENTS.md`
-- Gemini CLI: `GEMINI.md` + `.gemini/*.md`
-
-### Update Rules
-
-After upgrading Memoria:
-```bash
-memoria rules --force
-```
+</details>
 
 ---
 
-## API Reference
+## 📚 API Reference
 
 ### Core Tools
 
@@ -242,7 +302,8 @@ memoria rules --force
 | `memory_feedback` | Record relevance feedback (useful/irrelevant/outdated/wrong) |
 | `memory_capabilities` | List available memory tools |
 
-### Snapshots & Branches
+<details>
+<summary><b>Snapshots & Branches</b></summary>
 
 | Tool | Description |
 |------|-------------|
@@ -257,7 +318,10 @@ memoria rules --force
 | `memory_branch_delete` | Delete a branch |
 | `memory_diff` | Preview merge changes |
 
-### Maintenance
+</details>
+
+<details>
+<summary><b>Maintenance</b></summary>
 
 | Tool | Description |
 |------|-------------|
@@ -267,11 +331,9 @@ memoria rules --force
 
 > `memory_rebuild_index`, `memory_observe`, `memory_get_retrieval_params`, `memory_tune_params`, `memory_extract_entities`, and `memory_link_entities` are available via REST API but hidden from MCP tool listing — they are ops/debug tools not intended for agent use.
 
-Full API details: [API Reference Skill](skills/api-reference/SKILL.md)
+</details>
 
----
-
-## Memory Types
+### Memory Types
 
 | Type | Use for | Example |
 |------|---------|---------|
@@ -281,9 +343,11 @@ Full API details: [API Reference Skill](skills/api-reference/SKILL.md)
 | `working` | Temporary task context | "Currently debugging auth module" |
 | `episodic` | Session summaries | "Session: optimized DB, added indexes" |
 
+Full API details: [API Reference Skill](skills/api-reference/SKILL.md)
+
 ---
 
-## Commands
+## 🔧 Commands
 
 | Command | Description |
 |---------|-------------|
@@ -296,24 +360,20 @@ Full API details: [API Reference Skill](skills/api-reference/SKILL.md)
 
 ---
 
-## For AI Agents
+## 🤖 For AI Agents
 
 If you're an AI agent helping a user set up Memoria:
 
 1. **Load the [Setup Skill](skills/setup/SKILL.md)** — it has step-by-step instructions
-2. **Ask before acting**:
-   - Which AI tool? (Kiro / Cursor / Claude / Codex / Gemini CLI)
-   - Database? ([Memoria Cloud](https://thememoria.ai/auth) / Docker / existing)
-   - Embedding service? (OpenAI / SiliconFlow / local) — *Self-Hosted only, Cloud handles this*
+2. **Ask before acting**: which AI tool? · database mode? · embedding service? *(Self-Hosted only)*
 3. **Run `memoria init -i`** in the user's project directory
-4. **Tell user to restart** their AI tool
-5. **Verify** with `memory_retrieve("test")`
+4. **Tell user to restart** their AI tool, then **verify** with `memory_retrieve("test")`
 
-⚠️ **Self-Hosted only:** Configure embedding BEFORE first MCP server start — dimension is locked into schema.
+> **Self-Hosted only:** Configure embedding BEFORE first MCP server start — dimension is locked into schema.
 
 ---
 
-## Architecture
+## 🏗️ Architecture
 
 ```
 Cloud / Remote Mode:
@@ -337,7 +397,7 @@ For codebase details, see [Architecture Skill](skills/architecture/SKILL.md).
 
 ---
 
-## Development
+## 🛠️ Development
 
 ```bash
 make up              # Start MatrixOne + API
@@ -355,6 +415,16 @@ make release VERSION=0.2.0   # Bump, tag, push
 | [Plugin Development](skills/plugin-development/SKILL.md) | Governance plugins |
 | [Release](skills/release/SKILL.md) | Version bump, CI/CD |
 | [Local Embedding](skills/local-embedding/SKILL.md) | Offline embedding build |
+
+---
+
+## 🌟 Community
+
+We'd love your support! If Memoria helps you, consider giving us a star.
+
+[![Star History Chart](https://api.star-history.com/svg?repos=matrixorigin/Memoria&type=Date)](https://star-history.com/#matrixorigin/Memoria&Date)
+
+**Contributing** — See the [developer documentation](#-development) above and check out our [issue templates](https://github.com/matrixorigin/Memoria/issues/new/choose) for bug reports, feature requests, and more.
 
 ---
 
