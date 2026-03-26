@@ -77,7 +77,7 @@ pub async fn list_memories(
     AuthUser { user_id, .. }: AuthUser,
     Query(q): Query<ListQuery>,
 ) -> ApiResult<ListResponse> {
-    let limit = q.limit.max(1).min(500);
+    let limit = q.limit.clamp(1, 500);
     // Parse cursor: "created_at|memory_id" — validate timestamp before passing to SQL
     let cursor_parts = q.cursor.as_deref().and_then(|c| {
         let (ts, id) = c.split_once('|')?;

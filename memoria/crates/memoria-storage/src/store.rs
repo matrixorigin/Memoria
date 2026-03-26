@@ -3152,7 +3152,7 @@ impl SqlMemoryStore {
         cursor: Option<(&str, &str)>,
     ) -> Result<Vec<Memory>, MemoriaError> {
         // Cap at 501 (not 500) so the caller can request limit+1 for has_more detection.
-        let safe_limit = limit.max(1).min(501);
+        let safe_limit = limit.clamp(1, 501);
         let mut sql = format!(
             "SELECT memory_id, user_id, memory_type, content, \
              session_id, is_active, superseded_by, trust_tier, \
