@@ -6,7 +6,7 @@ use axum::{
     http::StatusCode,
     Json,
 };
-use memoria_service::{ConsolidationInput, ConsolidationStrategy, DefaultConsolidationStrategy};
+use memoria_service::{ConsolidationInput, ConsolidationStrategy, DefaultConsolidationStrategy, GovernanceStore};
 use serde::{Deserialize, Serialize};
 use sqlx::{MySqlPool, Row};
 
@@ -225,6 +225,10 @@ pub async fn trigger_governance(
                 .await
                 .map_err(db_err)?;
             let pollution_detected = sql.detect_pollution(&user_id, 24).await.map_err(db_err)?;
+            let orphan_graph_cleaned = sql.cleanup_orphan_graph_data().await.unwrap_or_else(|e| {
+                tracing::warn!("orphan graph cleanup failed: {e}");
+                0
+            });
             Ok(Json(serde_json::json!({
                 "op": op, "user_id": user_id,
                 "quarantined": quarantined,
@@ -234,6 +238,7 @@ pub async fn trigger_governance(
                 "compressed_redundant": compressed,
                 "cleaned_incrementals": cleaned_incrementals,
                 "pollution_detected": pollution_detected,
+                "orphan_graph_cleaned": orphan_graph_cleaned,
             })))
         }
         "consolidate" => {

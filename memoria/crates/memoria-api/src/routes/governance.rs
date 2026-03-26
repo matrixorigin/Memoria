@@ -1,5 +1,5 @@
 use axum::{extract::State, http::StatusCode, Json};
-use memoria_service::{ConsolidationInput, ConsolidationStrategy, DefaultConsolidationStrategy};
+use memoria_service::{ConsolidationInput, ConsolidationStrategy, DefaultConsolidationStrategy, GovernanceStore};
 use serde_json::json;
 use tracing::warn;
 
@@ -34,6 +34,33 @@ pub async fn governance(
         .await
         .map_err(api_err)?;
     let cleaned = sql.cleanup_stale(&user_id).await.map_err(api_err)?;
+    let orphan_graph_cleaned = if req.force {
+        sql.cleanup_orphan_graph_data().await.unwrap_or_else(|e| {
+            warn!("orphan graph cleanup failed: {e}");
+            0
+        })
+    } else {
+        match sql
+            .check_cooldown("__global__", "orphan_graph_cleanup", COOLDOWN_SECS)
+            .await
+        {
+            Ok(Some(_)) => 0,
+            Ok(None) => sql.cleanup_orphan_graph_data().await.unwrap_or_else(|e| {
+                warn!("orphan graph cleanup failed: {e}");
+                0
+            }),
+            Err(e) => {
+                warn!("orphan graph cooldown check failed, proceeding: {e}");
+                sql.cleanup_orphan_graph_data().await.unwrap_or_else(|e| {
+                    warn!("orphan graph cleanup failed: {e}");
+                    0
+                })
+            }
+        }
+    };
+    if orphan_graph_cleaned > 0 {
+        let _ = sql.set_cooldown("__global__", "orphan_graph_cleanup").await;
+    }
     if quarantined > 0 {
         let payload = serde_json::json!({"quarantined": quarantined}).to_string();
         state.service.send_edit_log(
@@ -56,11 +83,22 @@ pub async fn governance(
             None,
         );
     }
+    if orphan_graph_cleaned > 0 {
+        let payload = serde_json::json!({"orphan_graph_cleaned": orphan_graph_cleaned}).to_string();
+        state.service.send_edit_log(
+            &user_id,
+            "governance:cleanup_orphan_graph",
+            None,
+            Some(&payload),
+            &format!("cleaned {orphan_graph_cleaned} orphan graph entries"),
+            None,
+        );
+    }
     sql.set_cooldown(&user_id, "governance")
         .await
         .map_err(api_err)?;
     Ok(Json(
-        json!({ "quarantined": quarantined, "cleaned_stale": cleaned }),
+        json!({ "quarantined": quarantined, "cleaned_stale": cleaned, "orphan_graph_cleaned": orphan_graph_cleaned }),
     ))
 }
 

@@ -1070,6 +1070,195 @@ async fn test_governance_cooldown_verify_db() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// 8b. GOVERNANCE — orphan graph cleanup via /v1/governance and admin trigger
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn test_governance_orphan_graph_cleanup_verify_db() {
+    let (base, client, pool) = spawn_server().await;
+    let uid = uid();
+
+    // 1. Store a memory so we have a valid memory_id
+    let r = client
+        .post(format!("{base}/v1/memories"))
+        .header("X-User-Id", &uid)
+        .json(&json!({"content": "orphan graph test memory"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 201);
+    let mid = r.json::<Value>().await.unwrap()["memory_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // 2. Insert orphan rows: entity_links, memory_entity_links, graph_nodes
+    //    pointing to a fake inactive memory_id
+    let fake_mid = format!("{:032x}", uuid::Uuid::new_v4().as_u128());
+    let fake_entity_id = format!("{:032x}", uuid::Uuid::new_v4().as_u128());
+    let fake_link_id = format!("{:064x}", uuid::Uuid::new_v4().as_u128());
+    let fake_node_id = format!("{:032x}", uuid::Uuid::new_v4().as_u128());
+
+    // Insert a fake inactive memory so JOINs can find it
+    sqlx::query(
+        "INSERT INTO mem_memories (memory_id, user_id, memory_type, content, is_active, trust_tier, initial_confidence, source_event_ids, observed_at, created_at, updated_at) \
+         VALUES (?, ?, 'semantic', 'fake inactive', 0, 'T1', 0.95, '[]', NOW(), NOW(), NOW())"
+    )
+    .bind(&fake_mid).bind(&uid)
+    .execute(&pool).await.expect("insert fake inactive memory");
+
+    // Insert orphan entity_link (mem_entity_links)
+    sqlx::query(
+        "INSERT INTO mem_entity_links (id, user_id, memory_id, entity_name, entity_type, source, created_at) \
+         VALUES (?, ?, ?, 'orphan_entity', 'concept', 'manual', NOW())"
+    )
+    .bind(&fake_link_id).bind(&uid).bind(&fake_mid)
+    .execute(&pool).await.expect("insert orphan entity_link");
+
+    // Insert orphan memory_entity_link (mem_memory_entity_links)
+    sqlx::query(
+        "INSERT INTO mem_memory_entity_links (memory_id, entity_id, user_id, source, weight, created_at) \
+         VALUES (?, ?, ?, 'regex', 0.8, NOW())"
+    )
+    .bind(&fake_mid).bind(&fake_entity_id).bind(&uid)
+    .execute(&pool).await.expect("insert orphan memory_entity_link");
+
+    // Insert orphan graph_node (memory_graph_nodes) pointing to inactive memory
+    sqlx::query(
+        "INSERT INTO memory_graph_nodes (node_id, user_id, node_type, content, memory_id, is_active, created_at) \
+         VALUES (?, ?, 'memory', 'orphan node', ?, 1, NOW())"
+    )
+    .bind(&fake_node_id).bind(&uid).bind(&fake_mid)
+    .execute(&pool).await.expect("insert orphan graph_node");
+
+    // 3. Trigger governance via /v1/governance (orphans may also be cleaned
+    //    by concurrent tests since cleanup is global; we verify the response
+    //    field exists and DB state is clean after the call).
+    let r = client
+        .post(format!("{base}/v1/governance"))
+        .header("X-User-Id", &uid)
+        .json(&json!({"force": true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let body: Value = r.json().await.unwrap();
+
+    // 4. Verify response fields
+    assert!(body.get("quarantined").is_some(), "response must have quarantined");
+    assert!(body.get("cleaned_stale").is_some(), "response must have cleaned_stale");
+    assert!(body.get("orphan_graph_cleaned").is_some(), "response must have orphan_graph_cleaned");
+
+    // 5. Verify DB: orphan entity_link deleted
+    let el_after: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM mem_entity_links WHERE id = ?"
+    ).bind(&fake_link_id).fetch_one(&pool).await.unwrap();
+    assert_eq!(el_after, 0, "orphan entity_link should be deleted after governance");
+
+    // 6. Verify DB: orphan memory_entity_link deleted
+    let mel_after: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM mem_memory_entity_links WHERE memory_id = ? AND entity_id = ?"
+    ).bind(&fake_mid).bind(&fake_entity_id).fetch_one(&pool).await.unwrap();
+    assert_eq!(mel_after, 0, "orphan memory_entity_link should be deleted after governance");
+
+    // 7. Verify DB: orphan graph_node deactivated (is_active=0)
+    let gn_after: i8 = sqlx::query_scalar(
+        "SELECT is_active FROM memory_graph_nodes WHERE node_id = ?"
+    ).bind(&fake_node_id).fetch_one(&pool).await.unwrap();
+    assert_eq!(gn_after, 0, "orphan graph_node should be deactivated after governance");
+
+    // 8. Verify: the real active memory's links are NOT affected
+    let real_active: i8 = sqlx::query_scalar(
+        "SELECT is_active FROM mem_memories WHERE memory_id = ?"
+    ).bind(&mid).fetch_one(&pool).await.unwrap();
+    assert_eq!(real_active, 1, "real memory should still be active");
+
+    println!("✅ governance orphan graph cleanup: all 3 orphan types cleaned, DB verified");
+}
+
+#[tokio::test]
+async fn test_admin_governance_orphan_graph_cleanup_verify_db() {
+    let mk = "test-master-key-orphan-admin";
+    let (base, client, pool) = spawn_server_with_master_key(mk).await;
+    let uid = uid();
+    let auth = format!("Bearer {mk}");
+
+    // 1. Insert fake inactive memory + orphan rows
+    let fake_mid = format!("{:032x}", uuid::Uuid::new_v4().as_u128());
+    let fake_entity_id = format!("{:032x}", uuid::Uuid::new_v4().as_u128());
+    let fake_link_id = format!("{:064x}", uuid::Uuid::new_v4().as_u128());
+    let fake_node_id = format!("{:032x}", uuid::Uuid::new_v4().as_u128());
+
+    sqlx::query(
+        "INSERT INTO mem_memories (memory_id, user_id, memory_type, content, is_active, trust_tier, initial_confidence, source_event_ids, observed_at, created_at, updated_at) \
+         VALUES (?, ?, 'semantic', 'admin orphan test', 0, 'T1', 0.95, '[]', NOW(), NOW(), NOW())"
+    )
+    .bind(&fake_mid).bind(&uid)
+    .execute(&pool).await.expect("insert fake inactive memory");
+
+    sqlx::query(
+        "INSERT INTO mem_entity_links (id, user_id, memory_id, entity_name, entity_type, source, created_at) \
+         VALUES (?, ?, ?, 'admin_orphan', 'concept', 'manual', NOW())"
+    )
+    .bind(&fake_link_id).bind(&uid).bind(&fake_mid)
+    .execute(&pool).await.expect("insert orphan entity_link");
+
+    sqlx::query(
+        "INSERT INTO mem_memory_entity_links (memory_id, entity_id, user_id, source, weight, created_at) \
+         VALUES (?, ?, ?, 'regex', 0.8, NOW())"
+    )
+    .bind(&fake_mid).bind(&fake_entity_id).bind(&uid)
+    .execute(&pool).await.expect("insert orphan memory_entity_link");
+
+    sqlx::query(
+        "INSERT INTO memory_graph_nodes (node_id, user_id, node_type, content, memory_id, is_active, created_at) \
+         VALUES (?, ?, 'memory', 'admin orphan node', ?, 1, NOW())"
+    )
+    .bind(&fake_node_id).bind(&uid).bind(&fake_mid)
+    .execute(&pool).await.expect("insert orphan graph_node");
+
+    // 2. Trigger via admin endpoint
+    let r = client
+        .post(format!("{base}/admin/governance/{uid}/trigger?op=governance"))
+        .header("Authorization", &auth)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let body: Value = r.json().await.unwrap();
+
+    // 3. Verify response has all fields
+    assert_eq!(body["op"].as_str().unwrap(), "governance");
+    assert_eq!(body["user_id"].as_str().unwrap(), uid);
+    assert!(body.get("quarantined").is_some(), "must have quarantined");
+    assert!(body.get("cleaned_stale").is_some(), "must have cleaned_stale");
+    assert!(body.get("cleaned_tool_results").is_some(), "must have cleaned_tool_results");
+    assert!(body.get("archived_working").is_some(), "must have archived_working");
+    assert!(body.get("compressed_redundant").is_some(), "must have compressed_redundant");
+    assert!(body.get("cleaned_incrementals").is_some(), "must have cleaned_incrementals");
+    assert!(body.get("pollution_detected").is_some(), "must have pollution_detected");
+    assert!(body.get("orphan_graph_cleaned").is_some(), "must have orphan_graph_cleaned");
+
+    // 4. Verify DB: all orphans cleaned (regardless of who cleaned them)
+    let el_after: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM mem_entity_links WHERE id = ?"
+    ).bind(&fake_link_id).fetch_one(&pool).await.unwrap();
+    assert_eq!(el_after, 0, "orphan entity_link should be deleted");
+
+    let mel_after: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM mem_memory_entity_links WHERE memory_id = ? AND entity_id = ?"
+    ).bind(&fake_mid).bind(&fake_entity_id).fetch_one(&pool).await.unwrap();
+    assert_eq!(mel_after, 0, "orphan memory_entity_link should be deleted");
+
+    let gn_after: i8 = sqlx::query_scalar(
+        "SELECT is_active FROM memory_graph_nodes WHERE node_id = ?"
+    ).bind(&fake_node_id).fetch_one(&pool).await.unwrap();
+    assert_eq!(gn_after, 0, "orphan graph_node should be deactivated");
+
+    println!("✅ admin governance orphan graph cleanup: all fields verified + DB state checked");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // 9. OBSERVE — verify auto-stored memories in DB
 // ═══════════════════════════════════════════════════════════════════════════════
 
