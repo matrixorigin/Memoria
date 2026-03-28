@@ -208,6 +208,10 @@ fn classify_pool_health(size: u32, idle: u32) -> PoolHealthLevel {
     }
 }
 
+fn should_repeat_pool_log(consecutive_observations: u32) -> bool {
+    consecutive_observations.checked_rem(POOL_MONITOR_REPEAT_AFTER_TICKS) == Some(0)
+}
+
 /// Spawn a background task that periodically logs pool utilization.
 /// Warns when idle connections drop below 10% of pool size.
 /// Stops automatically when the pool is closed.
@@ -264,9 +268,7 @@ pub fn spawn_pool_monitor(
                     if recent_anomaly {
                         previous_level != level
                             || guard.consecutive_observations == 1
-                            || guard
-                                .consecutive_observations
-                                .is_multiple_of(POOL_MONITOR_REPEAT_AFTER_TICKS)
+                            || should_repeat_pool_log(guard.consecutive_observations)
                     } else {
                         previous_level != level
                     }
@@ -274,9 +276,7 @@ pub fn spawn_pool_monitor(
                 _ => {
                     previous_level != level
                         || guard.consecutive_observations == 1
-                        || guard
-                            .consecutive_observations
-                            .is_multiple_of(POOL_MONITOR_REPEAT_AFTER_TICKS)
+                        || should_repeat_pool_log(guard.consecutive_observations)
                 }
             };
 
