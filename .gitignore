@@ -24,6 +24,7 @@ CLAUDE.md
 # Rust
 memoria/target/
 memoria/.env
+memoria/Dockerfile.prebuilt
 
 # Python (legacy)
 __pycache__/

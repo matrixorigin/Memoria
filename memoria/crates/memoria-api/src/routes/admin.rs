@@ -632,13 +632,17 @@ pub async fn user_call_stats(
     let at_row = sqlx::query(
         "SELECT \
             CAST(COUNT(*) AS SIGNED) AS total, \
-            CAST(SUM(CASE WHEN path = '/v1/memories' AND method = 'POST' \
+            CAST(SUM(CASE WHEN (path = '/v1/memories' AND method = 'POST') \
+                              OR path IN ('/mcp/memory_store','/mcp/memory_correct') \
                          THEN 1 ELSE 0 END) AS SIGNED) AS writes, \
-            CAST(SUM(CASE WHEN path IN ('/v1/memories/search','/v1/memories/retrieve') \
+            CAST(SUM(CASE WHEN path IN ('/v1/memories/search','/v1/memories/retrieve', \
+                                        '/mcp/memory_retrieve','/mcp/memory_search') \
                          THEN 1 ELSE 0 END) AS SIGNED) AS retrieves, \
-            CAST(SUM(CASE WHEN method = 'DELETE' AND path LIKE '/v1/memories/%' \
+            CAST(SUM(CASE WHEN (method = 'DELETE' AND path LIKE '/v1/memories/%') \
+                              OR path = '/mcp/memory_purge' \
                          THEN 1 ELSE 0 END) AS SIGNED) AS deletes, \
-            CAST(COALESCE(AVG(CASE WHEN path IN ('/v1/memories/search','/v1/memories/retrieve') \
+            CAST(COALESCE(AVG(CASE WHEN path IN ('/v1/memories/search','/v1/memories/retrieve', \
+                                                  '/mcp/memory_retrieve','/mcp/memory_search') \
                               THEN latency_ms END), 0) AS DOUBLE) AS avg_retrieval_ms \
          FROM mem_api_call_log \
          WHERE user_id = ?",
@@ -661,11 +665,14 @@ pub async fn user_call_stats(
         "SELECT \
             CAST(DATEDIFF(DATE(called_at), \
                           DATE(DATE_SUB(NOW(6), INTERVAL ? DAY))) AS SIGNED) AS day_idx, \
-            CAST(SUM(CASE WHEN path = '/v1/memories' AND method = 'POST' \
+            CAST(SUM(CASE WHEN (path = '/v1/memories' AND method = 'POST') \
+                              OR path IN ('/mcp/memory_store','/mcp/memory_correct') \
                          THEN 1 ELSE 0 END) AS SIGNED) AS writes, \
-            CAST(SUM(CASE WHEN method = 'DELETE' AND path LIKE '/v1/memories/%' \
+            CAST(SUM(CASE WHEN (method = 'DELETE' AND path LIKE '/v1/memories/%') \
+                              OR path = '/mcp/memory_purge' \
                          THEN 1 ELSE 0 END) AS SIGNED) AS deletes, \
-            CAST(SUM(CASE WHEN path IN ('/v1/memories/search','/v1/memories/retrieve') \
+            CAST(SUM(CASE WHEN path IN ('/v1/memories/search','/v1/memories/retrieve', \
+                                        '/mcp/memory_retrieve','/mcp/memory_search') \
                          THEN 1 ELSE 0 END) AS SIGNED) AS retrieves, \
             CAST(COUNT(*) AS SIGNED) AS total \
          FROM mem_api_call_log \
