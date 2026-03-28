@@ -6,11 +6,18 @@ use memoria_core::{
 };
 use sqlx::{mysql::MySqlPool, Row};
 use std::str::FromStr;
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 pub(crate) fn db_err(e: sqlx::Error) -> MemoriaError {
-    if matches!(&e, sqlx::Error::PoolTimedOut) {
-        tracing::error!("pool timed out while waiting for an open connection");
+    if let Some(kind) = detect_connection_anomaly(&e) {
+        record_connection_anomaly(kind);
+        tracing::error!(
+            error_kind = kind.as_str(),
+            error = %e,
+            "database connection anomaly"
+        );
     }
     MemoriaError::Database(e.to_string())
 }
@@ -29,6 +36,113 @@ fn is_duplicate_column(e: &sqlx::Error) -> bool {
 
 const POOL_MONITOR_INTERVAL_SECS: u64 = 30;
 const POOL_MONITOR_REPEAT_AFTER_TICKS: u32 = 10;
+const POOL_ANOMALY_RECENT_WINDOW_SECS: u64 = 600;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConnectionAnomalyKind {
+    None = 0,
+    PoolTimedOut = 1,
+    PoolClosed = 2,
+    Io = 3,
+    Tls = 4,
+    Protocol = 5,
+    TooManyConnections = 6,
+}
+
+impl ConnectionAnomalyKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::PoolTimedOut => "pool_timed_out",
+            Self::PoolClosed => "pool_closed",
+            Self::Io => "io",
+            Self::Tls => "tls",
+            Self::Protocol => "protocol",
+            Self::TooManyConnections => "too_many_connections",
+        }
+    }
+}
+
+impl From<u8> for ConnectionAnomalyKind {
+    fn from(value: u8) -> Self {
+        match value {
+            1 => Self::PoolTimedOut,
+            2 => Self::PoolClosed,
+            3 => Self::Io,
+            4 => Self::Tls,
+            5 => Self::Protocol,
+            6 => Self::TooManyConnections,
+            _ => Self::None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ConnectionAnomalySnapshot {
+    kind: ConnectionAnomalyKind,
+    age_secs: Option<u64>,
+    total: u64,
+    pool_timeouts_total: u64,
+}
+
+static LAST_CONNECTION_ANOMALY_AT_SECS: AtomicU64 = AtomicU64::new(0);
+static LAST_CONNECTION_ANOMALY_KIND: AtomicU8 = AtomicU8::new(ConnectionAnomalyKind::None as u8);
+static CONNECTION_ANOMALIES_TOTAL: AtomicU64 = AtomicU64::new(0);
+static POOL_TIMEOUTS_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+fn unix_now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn detect_connection_anomaly(e: &sqlx::Error) -> Option<ConnectionAnomalyKind> {
+    match e {
+        sqlx::Error::PoolTimedOut => Some(ConnectionAnomalyKind::PoolTimedOut),
+        sqlx::Error::PoolClosed => Some(ConnectionAnomalyKind::PoolClosed),
+        sqlx::Error::Io(_) => Some(ConnectionAnomalyKind::Io),
+        sqlx::Error::Tls(_) => Some(ConnectionAnomalyKind::Tls),
+        sqlx::Error::Protocol(_) => Some(ConnectionAnomalyKind::Protocol),
+        _ => e
+            .as_database_error()
+            .and_then(|de| {
+                de.as_error()
+                    .downcast_ref::<sqlx::mysql::MySqlDatabaseError>()
+            })
+            .and_then(|me| {
+                if me.number() == 1040 {
+                    Some(ConnectionAnomalyKind::TooManyConnections)
+                } else {
+                    None
+                }
+            }),
+    }
+}
+
+fn record_connection_anomaly(kind: ConnectionAnomalyKind) {
+    LAST_CONNECTION_ANOMALY_AT_SECS.store(unix_now_secs(), Ordering::Relaxed);
+    LAST_CONNECTION_ANOMALY_KIND.store(kind as u8, Ordering::Relaxed);
+    CONNECTION_ANOMALIES_TOTAL.fetch_add(1, Ordering::Relaxed);
+    if matches!(kind, ConnectionAnomalyKind::PoolTimedOut) {
+        POOL_TIMEOUTS_TOTAL.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+fn connection_anomaly_snapshot() -> ConnectionAnomalySnapshot {
+    let last_at = LAST_CONNECTION_ANOMALY_AT_SECS.load(Ordering::Relaxed);
+    let age_secs = if last_at == 0 {
+        None
+    } else {
+        Some(unix_now_secs().saturating_sub(last_at))
+    };
+    ConnectionAnomalySnapshot {
+        kind: ConnectionAnomalyKind::from(LAST_CONNECTION_ANOMALY_KIND.load(Ordering::Relaxed)),
+        age_secs,
+        total: CONNECTION_ANOMALIES_TOTAL.load(Ordering::Relaxed),
+        pool_timeouts_total: POOL_TIMEOUTS_TOTAL.load(Ordering::Relaxed),
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PoolHealthLevel {
@@ -58,6 +172,10 @@ pub struct PoolHealthSnapshot {
     pub level: PoolHealthLevel,
     pub since: std::time::Instant,
     pub consecutive_observations: u32,
+    pub last_connection_anomaly_kind: &'static str,
+    pub last_connection_anomaly_age_secs: Option<u64>,
+    pub connection_anomalies_total: u64,
+    pub pool_timeouts_total: u64,
 }
 
 impl PoolHealthSnapshot {
@@ -70,6 +188,10 @@ impl PoolHealthSnapshot {
             level: PoolHealthLevel::Healthy,
             since: std::time::Instant::now(),
             consecutive_observations: 0,
+            last_connection_anomaly_kind: ConnectionAnomalyKind::None.as_str(),
+            last_connection_anomaly_age_secs: None,
+            connection_anomalies_total: 0,
+            pool_timeouts_total: 0,
         }
     }
 }
@@ -108,6 +230,7 @@ pub fn spawn_pool_monitor(
             let idle = pool.num_idle();
             let active = size.saturating_sub(idle as u32);
             let level = classify_pool_health(size, idle as u32);
+            let anomaly = connection_anomaly_snapshot();
 
             let mut guard = health.lock().unwrap();
             let previous_level = guard.level;
@@ -125,13 +248,36 @@ pub fn spawn_pool_monitor(
             guard.size = size;
             guard.active = active;
             guard.idle = idle as u32;
+            guard.last_connection_anomaly_kind = anomaly.kind.as_str();
+            guard.last_connection_anomaly_age_secs = anomaly.age_secs;
+            guard.connection_anomalies_total = anomaly.total;
+            guard.pool_timeouts_total = anomaly.pool_timeouts_total;
 
-            let should_log = if level == PoolHealthLevel::Healthy {
-                previous_level != PoolHealthLevel::Healthy
-            } else {
-                previous_level != level
-                    || guard.consecutive_observations == 1
-                    || guard.consecutive_observations % POOL_MONITOR_REPEAT_AFTER_TICKS == 0
+            let recent_anomaly = anomaly
+                .age_secs
+                .map(|age| age <= POOL_ANOMALY_RECENT_WINDOW_SECS)
+                .unwrap_or(false);
+
+            let should_log = match level {
+                PoolHealthLevel::Healthy => previous_level != PoolHealthLevel::Healthy,
+                PoolHealthLevel::Empty => {
+                    if recent_anomaly {
+                        previous_level != level
+                            || guard.consecutive_observations == 1
+                            || guard
+                                .consecutive_observations
+                                .is_multiple_of(POOL_MONITOR_REPEAT_AFTER_TICKS)
+                    } else {
+                        previous_level != level
+                    }
+                }
+                _ => {
+                    previous_level != level
+                        || guard.consecutive_observations == 1
+                        || guard
+                            .consecutive_observations
+                            .is_multiple_of(POOL_MONITOR_REPEAT_AFTER_TICKS)
+                }
             };
 
             if !should_log {
@@ -152,16 +298,33 @@ pub fn spawn_pool_monitor(
                     );
                 }
                 PoolHealthLevel::Empty => {
-                    tracing::warn!(
-                        pool_size = size,
-                        pool_active = active,
-                        pool_idle = idle,
-                        configured_max_connections,
-                        state = level.as_str(),
-                        state_duration_secs = guard.since.elapsed().as_secs(),
-                        consecutive_observations = guard.consecutive_observations,
-                        "connection pool has no established connections; existing connections may have been dropped or new ones cannot be established"
-                    );
+                    if recent_anomaly {
+                        tracing::warn!(
+                            pool_size = size,
+                            pool_active = active,
+                            pool_idle = idle,
+                            configured_max_connections,
+                            state = level.as_str(),
+                            state_duration_secs = guard.since.elapsed().as_secs(),
+                            consecutive_observations = guard.consecutive_observations,
+                            last_connection_anomaly_kind = anomaly.kind.as_str(),
+                            last_connection_anomaly_age_secs = anomaly.age_secs.unwrap_or_default(),
+                            connection_anomalies_total = anomaly.total,
+                            pool_timeouts_total = anomaly.pool_timeouts_total,
+                            "connection pool has no established connections after recent connectivity failures; existing connections may have been dropped or new ones cannot be established"
+                        );
+                    } else {
+                        tracing::info!(
+                            pool_size = size,
+                            pool_active = active,
+                            pool_idle = idle,
+                            configured_max_connections,
+                            state = level.as_str(),
+                            state_duration_secs = guard.since.elapsed().as_secs(),
+                            consecutive_observations = guard.consecutive_observations,
+                            "connection pool currently has no established connections; this is expected when idle_timeout has drained the pool and no requests are using it"
+                        );
+                    }
                 }
                 PoolHealthLevel::Saturated => {
                     tracing::warn!(
@@ -3987,7 +4150,10 @@ impl SqlMemoryStore {
 
 #[cfg(test)]
 mod tests {
-    use super::{classify_pool_health, OwnedEditLogEntry, PoolHealthLevel, SqlMemoryStore};
+    use super::{
+        classify_pool_health, detect_connection_anomaly, ConnectionAnomalyKind, OwnedEditLogEntry,
+        PoolHealthLevel, SqlMemoryStore,
+    };
     use sqlx::mysql::MySqlPoolOptions;
     use std::io::{self, Write};
     use std::sync::{Arc, Mutex, OnceLock};
@@ -4112,6 +4278,14 @@ mod tests {
             PoolHealthLevel::HighUtilization
         );
         assert_eq!(classify_pool_health(8, 3), PoolHealthLevel::Healthy);
+    }
+
+    #[test]
+    fn detect_connection_anomaly_catches_pool_timeout() {
+        assert_eq!(
+            detect_connection_anomaly(&sqlx::Error::PoolTimedOut),
+            Some(ConnectionAnomalyKind::PoolTimedOut)
+        );
     }
 }
 

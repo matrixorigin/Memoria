@@ -214,6 +214,45 @@ async fn collect_metrics(state: &AppState) -> Result<Arc<String>, String> {
         "memoria_pool_state_consecutive_observations {}\n",
         pool_health.consecutive_observations
     ));
+    out.push_str("# HELP memoria_pool_connection_anomalies_total Total observed main-pool connectivity anomalies in this process.\n");
+    out.push_str("# TYPE memoria_pool_connection_anomalies_total counter\n");
+    out.push_str(&format!(
+        "memoria_pool_connection_anomalies_total {}\n",
+        pool_health.connection_anomalies_total
+    ));
+    out.push_str("# HELP memoria_pool_timeouts_total Total main-pool timeout anomalies observed in this process.\n");
+    out.push_str("# TYPE memoria_pool_timeouts_total counter\n");
+    out.push_str(&format!(
+        "memoria_pool_timeouts_total {}\n",
+        pool_health.pool_timeouts_total
+    ));
+    out.push_str("# HELP memoria_pool_last_connection_anomaly Main-pool last connectivity anomaly as one-hot gauges.\n");
+    out.push_str("# TYPE memoria_pool_last_connection_anomaly gauge\n");
+    for kind in [
+        "none",
+        "pool_timed_out",
+        "pool_closed",
+        "io",
+        "tls",
+        "protocol",
+        "too_many_connections",
+    ] {
+        let value = if pool_health.last_connection_anomaly_kind == kind {
+            1
+        } else {
+            0
+        };
+        out.push_str(&format!(
+            "memoria_pool_last_connection_anomaly{{kind=\"{kind}\"}} {value}\n"
+        ));
+    }
+    if let Some(age) = pool_health.last_connection_anomaly_age_secs {
+        out.push_str("# HELP memoria_pool_last_connection_anomaly_age_seconds Seconds since the last main-pool connectivity anomaly.\n");
+        out.push_str("# TYPE memoria_pool_last_connection_anomaly_age_seconds gauge\n");
+        out.push_str(&format!(
+            "memoria_pool_last_connection_anomaly_age_seconds {age}\n"
+        ));
+    }
     out.push_str(
         "# HELP memoria_pool_empty_hint Main pool has zero established connections (1=true).\n",
     );
