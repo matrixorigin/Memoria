@@ -131,9 +131,7 @@ pub fn spawn_pool_monitor(
             } else {
                 previous_level != level
                     || guard.consecutive_observations == 1
-                    || guard
-                        .consecutive_observations
-                        .is_multiple_of(POOL_MONITOR_REPEAT_AFTER_TICKS)
+                    || guard.consecutive_observations % POOL_MONITOR_REPEAT_AFTER_TICKS == 0
             };
 
             if !should_log {
