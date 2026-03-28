@@ -48,7 +48,7 @@ help:
 	@echo "  make test-unit          Unit tests (no DB)"
 	@echo "  make test-e2e           E2E API tests (needs DB)"
 	@echo "  make bench              Run benchmark (needs: make up)"
-	@echo "  make dev-bench          Load test API (DURATION=60 USERS=10 SCENARIO=all)"
+	@echo "  make dev-bench          Load test API (DURATION=60 USERS=10 SEED=20 RPS=0 SCENARIO=all)"
 	@echo ""
 	@echo "API Keys:"
 	@echo "  make new-key USER=alice NAME=dev-key"
@@ -220,6 +220,8 @@ dev-bench: check-env
 		--api-url "$(BENCH_URL)" --token "$(BENCH_TOKEN)" \
 		$(if $(DURATION),--duration $(DURATION),) \
 		$(if $(USERS),--users $(USERS),) \
+		$(if $(SEED),--seed $(SEED),) \
+		$(if $(RPS),--rps $(RPS),) \
 		$(if $(SCENARIO),--scenario $(SCENARIO),)
 
 # ── API Keys ────────────────────────────────────────────────────────

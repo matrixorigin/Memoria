@@ -567,12 +567,16 @@ async fn test_governance_quarantine_and_cooldown() {
     println!("✅ governance: {t}");
 
     // Verify the old memory is physically deleted by quarantine
-    let remaining: Vec<(String,)> = sqlx::query_as("SELECT memory_id FROM mem_memories WHERE memory_id = ?")
-        .bind(&mid)
-        .fetch_all(sql.pool())
-        .await
-        .unwrap();
-    assert!(remaining.is_empty(), "quarantined memory should be physically deleted");
+    let remaining: Vec<(String,)> =
+        sqlx::query_as("SELECT memory_id FROM mem_memories WHERE memory_id = ?")
+            .bind(&mid)
+            .fetch_all(sql.pool())
+            .await
+            .unwrap();
+    assert!(
+        remaining.is_empty(),
+        "quarantined memory should be physically deleted"
+    );
     println!("✅ quarantined memory physically deleted from DB");
 
     // High-confidence memory should still be active

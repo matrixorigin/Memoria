@@ -6,7 +6,9 @@ use axum::{
     http::StatusCode,
     Json,
 };
-use memoria_service::{ConsolidationInput, ConsolidationStrategy, DefaultConsolidationStrategy, GovernanceStore};
+use memoria_service::{
+    ConsolidationInput, ConsolidationStrategy, DefaultConsolidationStrategy, GovernanceStore,
+};
 use serde::{Deserialize, Serialize};
 use sqlx::{MySqlPool, Row};
 

@@ -522,24 +522,29 @@ async fn test_list_active_lite() {
     // lite results must NOT carry embedding or source_event_ids
     for m in &results {
         assert!(m.embedding.is_none(), "lite should skip embedding");
-        assert!(m.source_event_ids.is_empty(), "lite should skip source_event_ids");
-        assert!(m.extra_metadata.is_none(), "lite should skip extra_metadata");
+        assert!(
+            m.source_event_ids.is_empty(),
+            "lite should skip source_event_ids"
+        );
+        assert!(
+            m.extra_metadata.is_none(),
+            "lite should skip extra_metadata"
+        );
         assert!(!m.content.is_empty(), "content must be present");
     }
     // Verify ordering: newest first
     assert!(results[0].created_at >= results[1].created_at);
-    println!("✅ list_active_lite: {} results, no embedding", results.len());
+    println!(
+        "✅ list_active_lite: {} results, no embedding",
+        results.len()
+    );
 }
 
 #[tokio::test]
 async fn test_list_active_lite_limit_cap() {
     let (store, uid) = setup().await;
     for i in 0..5 {
-        let m = make_memory(
-            &format!("cap-{i}-{uid}"),
-            &format!("cap memory {i}"),
-            &uid,
-        );
+        let m = make_memory(&format!("cap-{i}-{uid}"), &format!("cap memory {i}"), &uid);
         store.insert(&m).await.expect("insert");
     }
     // Request limit=2, should only get 2

@@ -120,7 +120,10 @@ impl AccessCounter {
             }
             tracing::debug!("access counter flusher exiting");
         });
-        Self { pending, _shutdown: shutdown_tx }
+        Self {
+            pending,
+            _shutdown: shutdown_tx,
+        }
     }
 
     fn bump(&self, ids: &[String]) {
@@ -309,9 +312,18 @@ impl EditLogBuffer {
         drop(self.tx);
         drop(self.flush_tx);
         match tokio::time::timeout(timeout, self.handle).await {
-            Ok(Ok(())) => { tracing::info!("edit log drained"); true }
-            Ok(Err(e)) => { tracing::error!("edit log drain task panicked: {e}"); false }
-            Err(_) => { tracing::error!("edit log drain timed out after {timeout:?}"); false }
+            Ok(Ok(())) => {
+                tracing::info!("edit log drained");
+                true
+            }
+            Ok(Err(e)) => {
+                tracing::error!("edit log drain task panicked: {e}");
+                false
+            }
+            Err(_) => {
+                tracing::error!("edit log drain timed out after {timeout:?}");
+                false
+            }
         }
     }
 
@@ -583,11 +595,7 @@ impl MemoryService {
 
     /// Best-effort cleanup of graph node + entity links for a deactivated memory.
     /// Used by correct, purge, and dedup-supersede paths.
-    async fn cleanup_entity_data_for_memory(
-        sql: &SqlMemoryStore,
-        memory_id: &str,
-        op: &str,
-    ) {
+    async fn cleanup_entity_data_for_memory(sql: &SqlMemoryStore, memory_id: &str, op: &str) {
         let graph = sql.graph_store();
         let (r1, r2, r3) = tokio::join!(
             graph.deactivate_by_memory_id(memory_id),

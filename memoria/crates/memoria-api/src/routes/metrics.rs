@@ -175,17 +175,68 @@ async fn collect_metrics(state: &AppState) -> Result<Arc<String>, String> {
     ));
 
     // ── Connection pool ───────────────────────────────────────────────────
-    out.push_str("# HELP memoria_pool_size Total connections in main pool.\n");
+    let pool_health = sql.pool_health_snapshot();
+    out.push_str("# HELP memoria_pool_size Total established connections in main pool.\n");
     out.push_str("# TYPE memoria_pool_size gauge\n");
-    out.push_str(&format!("memoria_pool_size {}\n", pool.size()));
+    out.push_str(&format!("memoria_pool_size {}\n", pool_health.size));
+    out.push_str("# HELP memoria_pool_active Busy connections in main pool.\n");
+    out.push_str("# TYPE memoria_pool_active gauge\n");
+    out.push_str(&format!("memoria_pool_active {}\n", pool_health.active));
     out.push_str("# HELP memoria_pool_idle Idle connections in main pool.\n");
     out.push_str("# TYPE memoria_pool_idle gauge\n");
-    out.push_str(&format!("memoria_pool_idle {}\n", pool.num_idle()));
+    out.push_str(&format!("memoria_pool_idle {}\n", pool_health.idle));
+    if let Some(max) = sql.configured_max_connections() {
+        out.push_str("# HELP memoria_pool_configured_max_connections Configured max connections for the main pool.\n");
+        out.push_str("# TYPE memoria_pool_configured_max_connections gauge\n");
+        out.push_str(&format!("memoria_pool_configured_max_connections {max}\n"));
+    }
+    out.push_str("# HELP memoria_pool_state Main pool health state as one-hot gauges.\n");
+    out.push_str("# TYPE memoria_pool_state gauge\n");
+    for state_name in ["healthy", "high_utilization", "saturated", "empty"] {
+        let value = if pool_health.level.as_str() == state_name {
+            1
+        } else {
+            0
+        };
+        out.push_str(&format!(
+            "memoria_pool_state{{state=\"{state_name}\"}} {value}\n"
+        ));
+    }
+    out.push_str("# HELP memoria_pool_state_duration_seconds Seconds spent in the current main-pool health state.\n");
+    out.push_str("# TYPE memoria_pool_state_duration_seconds gauge\n");
+    out.push_str(&format!(
+        "memoria_pool_state_duration_seconds {}\n",
+        pool_health.since.elapsed().as_secs()
+    ));
+    out.push_str("# HELP memoria_pool_state_consecutive_observations Consecutive pool-monitor observations in the current main-pool health state.\n");
+    out.push_str("# TYPE memoria_pool_state_consecutive_observations gauge\n");
+    out.push_str(&format!(
+        "memoria_pool_state_consecutive_observations {}\n",
+        pool_health.consecutive_observations
+    ));
+    out.push_str(
+        "# HELP memoria_pool_empty_hint Main pool has zero established connections (1=true).\n",
+    );
+    out.push_str("# TYPE memoria_pool_empty_hint gauge\n");
+    out.push_str(&format!(
+        "memoria_pool_empty_hint {}\n",
+        if pool_health.level.as_str() == "empty" {
+            1
+        } else {
+            0
+        }
+    ));
 
     if let Some(auth_pool) = &state.auth_pool {
         out.push_str("# HELP memoria_auth_pool_size Total connections in auth pool.\n");
         out.push_str("# TYPE memoria_auth_pool_size gauge\n");
         out.push_str(&format!("memoria_auth_pool_size {}\n", auth_pool.size()));
+        out.push_str("# HELP memoria_auth_pool_active Busy connections in auth pool.\n");
+        out.push_str("# TYPE memoria_auth_pool_active gauge\n");
+        out.push_str(&format!(
+            "memoria_auth_pool_active {}\n",
+            auth_pool.size().saturating_sub(auth_pool.num_idle() as u32)
+        ));
         out.push_str("# HELP memoria_auth_pool_idle Idle connections in auth pool.\n");
         out.push_str("# TYPE memoria_auth_pool_idle gauge\n");
         out.push_str(&format!(

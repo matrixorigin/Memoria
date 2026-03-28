@@ -1,6 +1,7 @@
 /// Comprehensive API tests that verify DB state after every operation.
 /// Each test simulates real user workflows and checks all DB fields.
 use serde_json::{json, Value};
+use serial_test::serial;
 use sqlx::{MySqlPool, Row};
 
 fn test_dim() -> usize {
@@ -125,6 +126,7 @@ fn db_opt(row: &sqlx::mysql::MySqlRow, col: &str) -> Option<String> {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 #[tokio::test]
+#[serial]
 async fn test_store_verify_all_db_fields() {
     let (base, client, pool) = spawn_server().await;
     let uid = uid();
@@ -193,6 +195,7 @@ async fn test_store_verify_all_db_fields() {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_store_defaults() {
     let (base, client, pool) = spawn_server().await;
     let uid = uid();
@@ -239,6 +242,7 @@ async fn test_store_defaults() {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 #[tokio::test]
+#[serial]
 async fn test_correct_by_id_verify_db() {
     let (base, client, pool) = spawn_server().await;
     let uid = uid();
@@ -307,6 +311,7 @@ async fn test_correct_by_id_verify_db() {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_correct_by_query_verify_db() {
     let (base, client, pool) = spawn_server().await;
     let uid = uid();
@@ -355,6 +360,7 @@ async fn test_correct_by_query_verify_db() {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 #[tokio::test]
+#[serial]
 async fn test_delete_single_verify_db() {
     let (base, client, pool) = spawn_server().await;
     let uid = uid();
@@ -400,6 +406,7 @@ async fn test_delete_single_verify_db() {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_purge_bulk_verify_db() {
     let (base, client, pool) = spawn_server().await;
     let uid = uid();
@@ -450,6 +457,7 @@ async fn test_purge_bulk_verify_db() {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_purge_by_topic_verify_db() {
     let (base, client, pool) = spawn_server().await;
     let uid = uid();
@@ -491,12 +499,17 @@ async fn test_purge_by_topic_verify_db() {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_purge_by_topic_special_chars_verify_db() {
     let (base, client, pool) = spawn_server().await;
     let uid = uid();
 
     // Content with special chars that fulltext can't match — triggers LIKE fallback
-    for content in ["[#100] build report ok", "[#200] build report fail", "normal memory"] {
+    for content in [
+        "[#100] build report ok",
+        "[#200] build report fail",
+        "normal memory",
+    ] {
         client
             .post(format!("{base}/v1/memories"))
             .header("X-User-Id", &uid)
@@ -525,6 +538,7 @@ async fn test_purge_by_topic_special_chars_verify_db() {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_purge_by_topic_batch_perf_verify_db() {
     let (base, client, pool) = spawn_server().await;
     let uid = uid();
@@ -561,6 +575,7 @@ async fn test_purge_by_topic_batch_perf_verify_db() {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 #[tokio::test]
+#[serial]
 async fn test_batch_store_verify_db() {
     let (base, client, pool) = spawn_server().await;
     let uid = uid();
@@ -613,6 +628,7 @@ async fn test_batch_store_verify_db() {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 #[tokio::test]
+#[serial]
 async fn test_list_matches_db() {
     let (base, client, pool) = spawn_server().await;
     let uid = uid();
@@ -670,6 +686,7 @@ async fn test_list_matches_db() {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_get_single_memory_all_fields() {
     let (base, client, pool) = spawn_server().await;
     let uid = uid();
@@ -723,6 +740,7 @@ async fn test_get_single_memory_all_fields() {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_search_returns_correct_fields() {
     let (base, client, pool) = spawn_server().await;
     let uid = uid();
@@ -762,6 +780,7 @@ async fn test_search_returns_correct_fields() {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 #[tokio::test]
+#[serial]
 async fn test_api_key_lifecycle_verify_db() {
     let mk = "test-mk-db-verify";
     let (base, client, pool) = spawn_server_with_master_key(mk).await;
@@ -867,6 +886,7 @@ async fn test_api_key_lifecycle_verify_db() {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 #[tokio::test]
+#[serial]
 async fn test_admin_stats_match_db() {
     let (base, client, pool) = spawn_server().await;
     let uid = uid();
@@ -916,6 +936,7 @@ async fn test_admin_stats_match_db() {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_admin_delete_user_verify_db() {
     let (base, client, pool) = spawn_server().await;
     let uid = uid();
@@ -964,6 +985,7 @@ async fn test_admin_delete_user_verify_db() {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_admin_list_revoke_user_keys_verify_db() {
     let mk = "test-mk-admin-keys-db";
     let (base, client, pool) = spawn_server_with_master_key(mk).await;
@@ -1028,6 +1050,7 @@ async fn test_admin_list_revoke_user_keys_verify_db() {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 #[tokio::test]
+#[serial]
 async fn test_governance_quarantine_verify_db() {
     let (base, client, pool) = spawn_server().await;
     let uid = uid();
@@ -1068,9 +1091,16 @@ async fn test_governance_quarantine_verify_db() {
 
     // DB: check if low-confidence memory was deleted by quarantine
     if quarantined > 0 {
-        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM mem_memories WHERE memory_id = ?")
-            .bind(&low_mid).fetch_one(&pool).await.unwrap();
-        assert_eq!(count, 0, "low-conf should be physically deleted by quarantine");
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM mem_memories WHERE memory_id = ?")
+                .bind(&low_mid)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            count, 0,
+            "low-conf should be physically deleted by quarantine"
+        );
         println!("✅ governance: low-conf memory deleted by quarantine");
     } else {
         println!("✅ governance: ran successfully, quarantined={quarantined}");
@@ -1084,6 +1114,7 @@ async fn test_governance_quarantine_verify_db() {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_governance_cooldown_verify_db() {
     let (base, client, pool) = spawn_server().await;
     let uid = uid();
@@ -1137,6 +1168,7 @@ async fn test_governance_cooldown_verify_db() {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 #[tokio::test]
+#[serial]
 async fn test_governance_orphan_graph_cleanup_verify_db() {
     let (base, client, pool) = spawn_server().await;
     let uid = uid();
@@ -1208,38 +1240,70 @@ async fn test_governance_orphan_graph_cleanup_verify_db() {
     let body: Value = r.json().await.unwrap();
 
     // 4. Verify response fields
-    assert!(body.get("quarantined").is_some(), "response must have quarantined");
-    assert!(body.get("cleaned_stale").is_some(), "response must have cleaned_stale");
-    assert!(body.get("orphan_graph_cleaned").is_some(), "response must have orphan_graph_cleaned");
+    assert!(
+        body.get("quarantined").is_some(),
+        "response must have quarantined"
+    );
+    assert!(
+        body.get("cleaned_stale").is_some(),
+        "response must have cleaned_stale"
+    );
+    assert!(
+        body.get("orphan_graph_cleaned").is_some(),
+        "response must have orphan_graph_cleaned"
+    );
 
     // 5. Verify DB: orphan entity_link deleted
-    let el_after: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM mem_entity_links WHERE id = ?"
-    ).bind(&fake_link_id).fetch_one(&pool).await.unwrap();
-    assert_eq!(el_after, 0, "orphan entity_link should be deleted after governance");
+    let el_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM mem_entity_links WHERE id = ?")
+        .bind(&fake_link_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        el_after, 0,
+        "orphan entity_link should be deleted after governance"
+    );
 
     // 6. Verify DB: orphan memory_entity_link deleted
     let mel_after: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM mem_memory_entity_links WHERE memory_id = ? AND entity_id = ?"
-    ).bind(&fake_mid).bind(&fake_entity_id).fetch_one(&pool).await.unwrap();
-    assert_eq!(mel_after, 0, "orphan memory_entity_link should be deleted after governance");
+        "SELECT COUNT(*) FROM mem_memory_entity_links WHERE memory_id = ? AND entity_id = ?",
+    )
+    .bind(&fake_mid)
+    .bind(&fake_entity_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        mel_after, 0,
+        "orphan memory_entity_link should be deleted after governance"
+    );
 
     // 7. Verify DB: orphan graph_node deactivated (is_active=0)
-    let gn_after: i8 = sqlx::query_scalar(
-        "SELECT is_active FROM memory_graph_nodes WHERE node_id = ?"
-    ).bind(&fake_node_id).fetch_one(&pool).await.unwrap();
-    assert_eq!(gn_after, 0, "orphan graph_node should be deactivated after governance");
+    let gn_after: i8 =
+        sqlx::query_scalar("SELECT is_active FROM memory_graph_nodes WHERE node_id = ?")
+            .bind(&fake_node_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        gn_after, 0,
+        "orphan graph_node should be deactivated after governance"
+    );
 
     // 8. Verify: the real active memory's links are NOT affected
-    let real_active: i8 = sqlx::query_scalar(
-        "SELECT is_active FROM mem_memories WHERE memory_id = ?"
-    ).bind(&mid).fetch_one(&pool).await.unwrap();
+    let real_active: i8 =
+        sqlx::query_scalar("SELECT is_active FROM mem_memories WHERE memory_id = ?")
+            .bind(&mid)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     assert_eq!(real_active, 1, "real memory should still be active");
 
     println!("✅ governance orphan graph cleanup: all 3 orphan types cleaned, DB verified");
 }
 
 #[tokio::test]
+#[serial]
 async fn test_admin_governance_orphan_graph_cleanup_verify_db() {
     let mk = "test-master-key-orphan-admin";
     let (base, client, pool) = spawn_server_with_master_key(mk).await;
@@ -1282,7 +1346,9 @@ async fn test_admin_governance_orphan_graph_cleanup_verify_db() {
 
     // 2. Trigger via admin endpoint
     let r = client
-        .post(format!("{base}/admin/governance/{uid}/trigger?op=governance"))
+        .post(format!(
+            "{base}/admin/governance/{uid}/trigger?op=governance"
+        ))
         .header("Authorization", &auth)
         .send()
         .await
@@ -1296,28 +1362,59 @@ async fn test_admin_governance_orphan_graph_cleanup_verify_db() {
     assert_eq!(body["op"].as_str().unwrap(), "governance");
     assert_eq!(body["user_id"].as_str().unwrap(), uid);
     assert!(body.get("quarantined").is_some(), "must have quarantined");
-    assert!(body.get("cleaned_stale").is_some(), "must have cleaned_stale");
-    assert!(body.get("cleaned_tool_results").is_some(), "must have cleaned_tool_results");
-    assert!(body.get("archived_working").is_some(), "must have archived_working");
-    assert!(body.get("compressed_redundant").is_some(), "must have compressed_redundant");
-    assert!(body.get("cleaned_incrementals").is_some(), "must have cleaned_incrementals");
-    assert!(body.get("pollution_detected").is_some(), "must have pollution_detected");
-    assert!(body.get("orphan_graph_cleaned").is_some(), "must have orphan_graph_cleaned");
+    assert!(
+        body.get("cleaned_stale").is_some(),
+        "must have cleaned_stale"
+    );
+    assert!(
+        body.get("cleaned_tool_results").is_some(),
+        "must have cleaned_tool_results"
+    );
+    assert!(
+        body.get("archived_working").is_some(),
+        "must have archived_working"
+    );
+    assert!(
+        body.get("compressed_redundant").is_some(),
+        "must have compressed_redundant"
+    );
+    assert!(
+        body.get("cleaned_incrementals").is_some(),
+        "must have cleaned_incrementals"
+    );
+    assert!(
+        body.get("pollution_detected").is_some(),
+        "must have pollution_detected"
+    );
+    assert!(
+        body.get("orphan_graph_cleaned").is_some(),
+        "must have orphan_graph_cleaned"
+    );
 
     // 4. Verify DB: all orphans cleaned (regardless of who cleaned them)
-    let el_after: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM mem_entity_links WHERE id = ?"
-    ).bind(&fake_link_id).fetch_one(&pool).await.unwrap();
+    let el_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM mem_entity_links WHERE id = ?")
+        .bind(&fake_link_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
     assert_eq!(el_after, 0, "orphan entity_link should be deleted");
 
     let mel_after: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM mem_memory_entity_links WHERE memory_id = ? AND entity_id = ?"
-    ).bind(&fake_mid).bind(&fake_entity_id).fetch_one(&pool).await.unwrap();
+        "SELECT COUNT(*) FROM mem_memory_entity_links WHERE memory_id = ? AND entity_id = ?",
+    )
+    .bind(&fake_mid)
+    .bind(&fake_entity_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
     assert_eq!(mel_after, 0, "orphan memory_entity_link should be deleted");
 
-    let gn_after: i8 = sqlx::query_scalar(
-        "SELECT is_active FROM memory_graph_nodes WHERE node_id = ?"
-    ).bind(&fake_node_id).fetch_one(&pool).await.unwrap();
+    let gn_after: i8 =
+        sqlx::query_scalar("SELECT is_active FROM memory_graph_nodes WHERE node_id = ?")
+            .bind(&fake_node_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     assert_eq!(gn_after, 0, "orphan graph_node should be deactivated");
 
     println!("✅ admin governance orphan graph cleanup: all fields verified + DB state checked");
@@ -1328,6 +1425,7 @@ async fn test_admin_governance_orphan_graph_cleanup_verify_db() {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 #[tokio::test]
+#[serial]
 async fn test_observe_verify_db() {
     let (base, client, pool) = spawn_server().await;
     let uid = uid();
@@ -1376,6 +1474,7 @@ async fn test_observe_verify_db() {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 #[tokio::test]
+#[serial]
 async fn test_history_chain_verify_db() {
     let (base, client, pool) = spawn_server().await;
     let uid = uid();
@@ -1461,6 +1560,7 @@ async fn test_history_chain_verify_db() {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 #[tokio::test]
+#[serial]
 async fn test_branch_lifecycle_verify_db() {
     let (base, client, pool) = spawn_server().await;
     let uid = uid();
@@ -1578,6 +1678,7 @@ async fn test_branch_lifecycle_verify_db() {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 #[tokio::test]
+#[serial]
 async fn test_pipeline_sensitivity_verify_db() {
     let (base, client, pool) = spawn_server().await;
     let uid = uid();
@@ -1629,6 +1730,7 @@ async fn test_pipeline_sensitivity_verify_db() {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 #[tokio::test]
+#[serial]
 async fn test_entity_link_verify_db() {
     let (base, client, pool) = spawn_server().await;
     let uid = uid();
@@ -1721,6 +1823,7 @@ async fn test_entity_link_verify_db() {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 #[tokio::test]
+#[serial]
 async fn test_auth_master_key_verify_db() {
     let mk = "test-mk-auth-flow";
     let (base, client, pool) = spawn_server_with_master_key(mk).await;
@@ -1795,6 +1898,7 @@ async fn test_auth_master_key_verify_db() {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 #[tokio::test]
+#[serial]
 async fn test_full_user_workflow() {
     let (base, client, pool) = spawn_server().await;
     let uid = uid();
@@ -2075,7 +2179,9 @@ async fn store_with_entity_links(
 async fn count_by_memory_id(pool: &MySqlPool, table: LinkTable, mid: &str) -> i64 {
     let sql = match table {
         LinkTable::EntityLinks => "SELECT COUNT(*) FROM mem_entity_links WHERE memory_id = ?",
-        LinkTable::MemoryEntityLinks => "SELECT COUNT(*) FROM mem_memory_entity_links WHERE memory_id = ?",
+        LinkTable::MemoryEntityLinks => {
+            "SELECT COUNT(*) FROM mem_memory_entity_links WHERE memory_id = ?"
+        }
     };
     sqlx::query_scalar(sql)
         .bind(mid)
@@ -2104,13 +2210,17 @@ async fn graph_node_active(pool: &MySqlPool, mid: &str) -> bool {
 // ── REST API: DELETE /v1/memories/:id cleans graph + entity links ────────────
 
 #[tokio::test]
+#[serial]
 async fn test_delete_cleans_graph_and_entity_links() {
     let (base, client, pool) = spawn_server().await;
     let uid = uid();
     let mid = store_with_entity_links(&base, &client, &pool, &uid, "REST delete graph test").await;
 
     // Verify graph node + entity links exist
-    assert!(graph_node_active(&pool, &mid).await, "graph node should exist");
+    assert!(
+        graph_node_active(&pool, &mid).await,
+        "graph node should exist"
+    );
     assert!(
         count_by_memory_id(&pool, LinkTable::EntityLinks, &mid).await > 0,
         "mem_entity_links should exist"
@@ -2146,6 +2256,7 @@ async fn test_delete_cleans_graph_and_entity_links() {
 // ── REST API: POST /v1/memories/purge (bulk) cleans graph + entity links ────
 
 #[tokio::test]
+#[serial]
 async fn test_purge_bulk_cleans_graph_and_entity_links() {
     let (base, client, pool) = spawn_server().await;
     let uid = uid();
@@ -2188,6 +2299,7 @@ async fn test_purge_bulk_cleans_graph_and_entity_links() {
 // ── REST API: POST /v1/memories/purge (topic) cleans graph + entity links ───
 
 #[tokio::test]
+#[serial]
 async fn test_purge_topic_cleans_graph_and_entity_links() {
     let (base, client, pool) = spawn_server().await;
     let uid = uid();
@@ -2228,6 +2340,7 @@ async fn test_purge_topic_cleans_graph_and_entity_links() {
 // ── REST API: PUT /v1/memories/:id/correct cleans old graph + entity links ──
 
 #[tokio::test]
+#[serial]
 async fn test_correct_by_id_cleans_graph_and_entity_links() {
     let (base, client, pool) = spawn_server().await;
     let uid = uid();
@@ -2274,6 +2387,7 @@ async fn test_correct_by_id_cleans_graph_and_entity_links() {
 // ── REST API: POST /v1/memories/correct (by query) cleans old graph ─────────
 
 #[tokio::test]
+#[serial]
 async fn test_correct_by_query_cleans_graph_and_entity_links() {
     let (base, client, pool) = spawn_server().await;
     let uid = uid();

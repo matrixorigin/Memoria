@@ -285,10 +285,16 @@ pub struct RpcMeta {
 
 impl RpcMeta {
     pub fn ok() -> Self {
-        Self { success: true, error_code: None }
+        Self {
+            success: true,
+            error_code: None,
+        }
     }
     pub fn err(code: i32) -> Self {
-        Self { success: false, error_code: Some(code) }
+        Self {
+            success: false,
+            error_code: Some(code),
+        }
     }
 }
 
@@ -333,7 +339,14 @@ impl CallLogBatcher {
         status_code: u16,
         latency_ms: u32,
     ) {
-        self.record_rpc(user_id, method, path, status_code, latency_ms, RpcMeta::ok());
+        self.record_rpc(
+            user_id,
+            method,
+            path,
+            status_code,
+            latency_ms,
+            RpcMeta::ok(),
+        );
     }
 
     /// Enqueue a call log entry with explicit JSON-RPC success/error metadata.

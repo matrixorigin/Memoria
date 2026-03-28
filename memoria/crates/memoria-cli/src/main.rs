@@ -852,71 +852,74 @@ fn build_embedder(
     use memoria_api::InstrumentedEmbedder;
     use memoria_embedding::{HttpEmbedder, RoundRobinEmbedder};
 
-    let (raw, provider_label): (Arc<dyn memoria_core::interfaces::EmbeddingProvider>, &str) =
-        if cfg.embedding_provider == "mock" {
-            tracing::info!(dim = cfg.embedding_dim, "using mock embedder");
+    let (raw, provider_label): (Arc<dyn memoria_core::interfaces::EmbeddingProvider>, &str) = if cfg
+        .embedding_provider
+        == "mock"
+    {
+        tracing::info!(dim = cfg.embedding_dim, "using mock embedder");
+        (
+            Arc::new(memoria_embedding::MockEmbedder::new(cfg.embedding_dim)),
+            "mock",
+        )
+    } else if cfg.has_embedding() {
+        let endpoints = cfg.resolved_embedding_endpoints();
+        if endpoints.len() > 1 {
+            tracing::info!(
+                count = endpoints.len(),
+                model = %cfg.embedding_model,
+                "using round-robin HTTP embedder"
+            );
             (
-                Arc::new(memoria_embedding::MockEmbedder::new(cfg.embedding_dim)),
-                "mock",
+                Arc::new(RoundRobinEmbedder::new(
+                    endpoints.into_iter().map(|e| (e.url, e.api_key)).collect(),
+                    &cfg.embedding_model,
+                    cfg.embedding_dim,
+                )),
+                "round-robin",
             )
-        } else if cfg.has_embedding() {
-            let endpoints = cfg.resolved_embedding_endpoints();
-            if endpoints.len() > 1 {
-                tracing::info!(
-                    count = endpoints.len(),
-                    model = %cfg.embedding_model,
-                    "using round-robin HTTP embedder"
-                );
-                (
-                    Arc::new(RoundRobinEmbedder::new(
-                        endpoints.into_iter().map(|e| (e.url, e.api_key)).collect(),
-                        &cfg.embedding_model,
-                        cfg.embedding_dim,
-                    )),
-                    "round-robin",
-                )
-            } else {
-                let ep = endpoints
-                    .into_iter()
-                    .next()
-                    .expect("has_embedding() guarantees at least one endpoint");
-                tracing::info!(url = %ep.url, model = %cfg.embedding_model, "using single HTTP embedder");
-                (
-                    Arc::new(HttpEmbedder::new(
-                        ep.url,
-                        ep.api_key,
-                        &cfg.embedding_model,
-                        cfg.embedding_dim,
-                    )),
-                    "http",
-                )
-            }
-        } else if cfg.embedding_provider == "local" {
-            #[cfg(feature = "local-embedding")]
-            {
-                let local = memoria_embedding::LocalEmbedder::new(&cfg.embedding_model)
-                    .expect("Failed to load local embedding model");
-                (Arc::new(local) as Arc<dyn memoria_core::interfaces::EmbeddingProvider>, "local")
-            }
-            #[cfg(not(feature = "local-embedding"))]
-            {
-                tracing::error!(
-                    "EMBEDDING_PROVIDER=local but compiled without local-embedding feature"
-                );
-                return None;
-            }
         } else {
-            tracing::warn!(
-                provider = %cfg.embedding_provider,
-                "no embedding backend initialised — check EMBEDDING_BASE_URL / EMBEDDING_ENDPOINTS"
+            let ep = endpoints
+                .into_iter()
+                .next()
+                .expect("has_embedding() guarantees at least one endpoint");
+            tracing::info!(url = %ep.url, model = %cfg.embedding_model, "using single HTTP embedder");
+            (
+                Arc::new(HttpEmbedder::new(
+                    ep.url,
+                    ep.api_key,
+                    &cfg.embedding_model,
+                    cfg.embedding_dim,
+                )),
+                "http",
+            )
+        }
+    } else if cfg.embedding_provider == "local" {
+        #[cfg(feature = "local-embedding")]
+        {
+            let local = memoria_embedding::LocalEmbedder::new(&cfg.embedding_model)
+                .expect("Failed to load local embedding model");
+            (
+                Arc::new(local) as Arc<dyn memoria_core::interfaces::EmbeddingProvider>,
+                "local",
+            )
+        }
+        #[cfg(not(feature = "local-embedding"))]
+        {
+            tracing::error!(
+                "EMBEDDING_PROVIDER=local but compiled without local-embedding feature"
             );
             return None;
-        };
+        }
+    } else {
+        tracing::warn!(
+            provider = %cfg.embedding_provider,
+            "no embedding backend initialised — check EMBEDDING_BASE_URL / EMBEDDING_ENDPOINTS"
+        );
+        return None;
+    };
 
-    Some(
-        Arc::new(InstrumentedEmbedder::new(raw, provider_label))
-            as Arc<dyn memoria_core::interfaces::EmbeddingProvider>,
-    )
+    Some(Arc::new(InstrumentedEmbedder::new(raw, provider_label))
+        as Arc<dyn memoria_core::interfaces::EmbeddingProvider>)
 }
 
 fn validate_embedding_config(cfg: &memoria_service::Config) -> Result<()> {
@@ -954,7 +957,9 @@ where
     if !service.drain_edit_log().await {
         // Surface drain failure even if the main task succeeded,
         // so external supervisors see a non-zero exit code.
-        return Err(anyhow::anyhow!("edit-log drain failed; some audit records may be lost"));
+        return Err(anyhow::anyhow!(
+            "edit-log drain failed; some audit records may be lost"
+        ));
     }
     result
 }
