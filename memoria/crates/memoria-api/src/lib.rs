@@ -245,7 +245,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/health/storage", get(routes::admin::health_storage))
         .route("/v1/health/capacity", get(routes::admin::health_capacity))
         .route("/v1/health/hygiene", get(routes::admin::health_hygiene))
-        .route("/admin/health/hygiene", get(routes::admin::health_hygiene_global))
+        .route(
+            "/admin/health/hygiene",
+            get(routes::admin::health_hygiene_global),
+        )
         // Pipeline
         .route("/v1/pipeline/run", post(routes::memory::run_pipeline))
         // Tool usage (in-memory cache, no DB hit)
@@ -288,9 +291,7 @@ pub fn build_router(state: AppState) -> Router {
         )
         .with_state(state.clone())
         .layer(DefaultBodyLimit::max(2 * 1024 * 1024)) // 2 MB
-        .layer(axum::middleware::from_fn(
-            metrics::middleware::http_metrics,
-        ))
+        .layer(axum::middleware::from_fn(metrics::middleware::http_metrics))
         .layer(
             tower_http::trace::TraceLayer::new_for_http()
                 .make_span_with(|req: &axum::http::Request<_>| {

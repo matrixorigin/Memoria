@@ -185,9 +185,7 @@ impl CounterVec {
     /// Snapshot all label→value pairs (unsorted).
     pub fn snapshot(&self) -> Vec<(String, u64)> {
         let map = self.values.read().unwrap();
-        map.iter()
-            .map(|(k, v)| (k.clone(), v.load(ORD)))
-            .collect()
+        map.iter().map(|(k, v)| (k.clone(), v.load(ORD))).collect()
     }
 }
 
@@ -227,9 +225,7 @@ impl HistogramVec {
     /// Snapshot all labeled histograms.
     pub fn snapshot(&self) -> Vec<(String, HistogramSnapshot)> {
         let map = self.values.read().unwrap();
-        map.iter()
-            .map(|(k, h)| (k.clone(), h.snapshot()))
-            .collect()
+        map.iter().map(|(k, h)| (k.clone(), h.snapshot())).collect()
     }
 }
 
@@ -260,9 +256,9 @@ mod tests {
         static BOUNDS: &[f64] = &[0.01, 0.1, 1.0];
         let h = Histogram::new(BOUNDS);
         h.observe(0.005); // bucket 0 (le=0.01)
-        h.observe(0.05);  // bucket 1 (le=0.1)
-        h.observe(0.5);   // bucket 2 (le=1.0)
-        h.observe(5.0);   // bucket 3 (+Inf)
+        h.observe(0.05); // bucket 1 (le=0.1)
+        h.observe(0.5); // bucket 2 (le=1.0)
+        h.observe(5.0); // bucket 3 (+Inf)
         let snap = h.snapshot();
         assert_eq!(snap.count, 4);
         assert_eq!(snap.buckets, vec![(0.01, 1), (0.1, 2), (1.0, 3)]);

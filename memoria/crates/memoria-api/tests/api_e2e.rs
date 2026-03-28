@@ -134,7 +134,11 @@ async fn test_api_store_and_list() {
     let mid = body["memory_id"].as_str().unwrap().to_string();
     // memory_id must be UUIDv7 (32-char hex, version nibble '7' at position 12)
     assert_eq!(mid.len(), 32, "memory_id must be 32-char hex");
-    assert_eq!(&mid[12..13], "7", "memory_id must be UUIDv7 (version nibble)");
+    assert_eq!(
+        &mid[12..13],
+        "7",
+        "memory_id must be UUIDv7 (version nibble)"
+    );
     println!("✅ POST /v1/memories: {mid}");
 
     let r = client
@@ -194,20 +198,38 @@ async fn test_api_list_no_embedding_and_limit() {
     let body: Value = r.json().await.unwrap();
     let items = body["items"].as_array().unwrap();
     assert_eq!(items.len(), 3);
-    assert!(body["next_cursor"].is_null(), "no cursor when all items fit");
+    assert!(
+        body["next_cursor"].is_null(),
+        "no cursor when all items fit"
+    );
     for item in items {
         // Must NOT contain heavy fields
-        assert!(item.get("embedding").is_none(), "must not contain embedding");
-        assert!(item.get("source_event_ids").is_none(), "must not contain source_event_ids");
-        assert!(item.get("extra_metadata").is_none(), "must not contain extra_metadata");
+        assert!(
+            item.get("embedding").is_none(),
+            "must not contain embedding"
+        );
+        assert!(
+            item.get("source_event_ids").is_none(),
+            "must not contain source_event_ids"
+        );
+        assert!(
+            item.get("extra_metadata").is_none(),
+            "must not contain extra_metadata"
+        );
         // Must contain core fields
         assert!(item["memory_id"].as_str().is_some(), "memory_id required");
         assert!(item["content"].as_str().is_some(), "content required");
-        assert!(item["memory_type"].as_str().is_some(), "memory_type required");
+        assert!(
+            item["memory_type"].as_str().is_some(),
+            "memory_type required"
+        );
         assert!(item["trust_tier"].as_str().is_some(), "trust_tier required");
     }
     // Ordering: newest first (memory_id DESC — UUIDv7 is time-ordered)
-    let ids: Vec<&str> = items.iter().map(|i| i["memory_id"].as_str().unwrap()).collect();
+    let ids: Vec<&str> = items
+        .iter()
+        .map(|i| i["memory_id"].as_str().unwrap())
+        .collect();
     for w in ids.windows(2) {
         assert!(w[0] >= w[1], "must be ordered by memory_id DESC");
     }
@@ -247,7 +269,10 @@ async fn test_api_list_no_embedding_and_limit() {
                 assert!(!c.is_empty(), "cursor must not be empty");
                 // Cursor is a memory_id (32-char hex UUIDv7)
                 assert_eq!(c.len(), 32, "cursor must be 32-char hex");
-                assert!(c.chars().all(|ch| ch.is_ascii_hexdigit()), "cursor must be hex");
+                assert!(
+                    c.chars().all(|ch| ch.is_ascii_hexdigit()),
+                    "cursor must be hex"
+                );
                 url = format!("{base}/v1/memories?limit=1&cursor={c}");
             }
             None => break,
@@ -448,7 +473,11 @@ async fn test_api_list_invalid_cursor() {
         .await
         .unwrap();
     // Either 200 with empty/some results, or 400 — but NOT 500
-    assert_ne!(r.status(), 500, "invalid cursor must not cause server error");
+    assert_ne!(
+        r.status(),
+        500,
+        "invalid cursor must not cause server error"
+    );
 
     // Cursor without '|' separator — not a valid timestamp, treated as no cursor
     let r = client
@@ -457,7 +486,11 @@ async fn test_api_list_invalid_cursor() {
         .send()
         .await
         .unwrap();
-    assert_eq!(r.status(), 200, "non-timestamp cursor should be treated as no cursor");
+    assert_eq!(
+        r.status(),
+        200,
+        "non-timestamp cursor should be treated as no cursor"
+    );
     println!("✅ list: invalid cursor handled gracefully");
 }
 
@@ -550,7 +583,10 @@ async fn test_api_list_default_limit() {
         .unwrap();
     let items = body["items"].as_array().unwrap();
     assert_eq!(items.len(), 3);
-    assert!(body["next_cursor"].is_null(), "no cursor when under default limit");
+    assert!(
+        body["next_cursor"].is_null(),
+        "no cursor when under default limit"
+    );
     println!("✅ list: default limit");
 }
 
@@ -2819,9 +2855,18 @@ async fn test_health_endpoints() {
         .unwrap();
     assert_eq!(r.status(), 200);
     let body: Value = r.json().await.unwrap();
-    assert!(body.get("inactive_memories").is_some(), "must have inactive_memories");
-    assert!(body.get("stale_working_memories").is_some(), "must have stale_working_memories");
-    assert!(body.get("orphan_graph_nodes").is_some(), "must have orphan_graph_nodes");
+    assert!(
+        body.get("inactive_memories").is_some(),
+        "must have inactive_memories"
+    );
+    assert!(
+        body.get("stale_working_memories").is_some(),
+        "must have stale_working_memories"
+    );
+    assert!(
+        body.get("orphan_graph_nodes").is_some(),
+        "must have orphan_graph_nodes"
+    );
     println!("✅ health hygiene: {body}");
 }
 
@@ -4882,11 +4927,16 @@ async fn test_api_feedback_stats() {
     let uid = uid();
 
     // Store memories and give feedback
-    for (i, signal) in ["useful", "useful", "irrelevant", "outdated"].iter().enumerate() {
+    for (i, signal) in ["useful", "useful", "irrelevant", "outdated"]
+        .iter()
+        .enumerate()
+    {
         let r = client
             .post(format!("{base}/v1/memories"))
             .header("X-User-Id", &uid)
-            .json(&json!({"content": format!("Stats test {signal} {i}"), "memory_type": "semantic"}))
+            .json(
+                &json!({"content": format!("Stats test {signal} {i}"), "memory_type": "semantic"}),
+            )
             .send()
             .await
             .unwrap();
@@ -5907,16 +5957,21 @@ async fn test_remote_purge_cleans_graph_and_entity_links() {
 
     // Verify graph node deactivated
     let cnt: i64 = graph_node_active_count(&pool, &mid).await;
-    assert_eq!(cnt, 0, "graph node should be deactivated after remote purge");
+    assert_eq!(
+        cnt, 0,
+        "graph node should be deactivated after remote purge"
+    );
 
     // Verify entity links cleaned
-    let cnt: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM mem_entity_links WHERE memory_id = ?")
-            .bind(&mid)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-    assert_eq!(cnt, 0, "mem_entity_links should be cleaned after remote purge");
+    let cnt: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM mem_entity_links WHERE memory_id = ?")
+        .bind(&mid)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        cnt, 0,
+        "mem_entity_links should be cleaned after remote purge"
+    );
 
     println!("✅ remote purge: graph + entity links cleaned");
 }
@@ -5983,12 +6038,11 @@ async fn test_remote_purge_topic_cleans_graph_and_entity_links() {
     let cnt: i64 = graph_node_active_count(&pool, &mid).await;
     assert_eq!(cnt, 0, "graph node should be deactivated after topic purge");
 
-    let cnt: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM mem_entity_links WHERE memory_id = ?")
-            .bind(&mid)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+    let cnt: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM mem_entity_links WHERE memory_id = ?")
+        .bind(&mid)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
     assert_eq!(cnt, 0, "entity links should be cleaned after topic purge");
 
     println!("✅ remote purge topic: graph + entity links cleaned");
@@ -6029,12 +6083,11 @@ async fn test_remote_correct_cleans_graph_and_entity_links() {
     );
 
     // Old entity links cleaned
-    let cnt: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM mem_entity_links WHERE memory_id = ?")
-            .bind(&old_mid)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+    let cnt: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM mem_entity_links WHERE memory_id = ?")
+        .bind(&old_mid)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
     assert_eq!(
         cnt, 0,
         "old entity links should be cleaned after remote correct"
@@ -6128,7 +6181,10 @@ async fn spawn_server_with_key(master_key: &str) -> (String, reqwest::Client) {
     tokio::spawn(async move { axum::serve(listener, app).await });
     tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
 
-    let client = reqwest::Client::builder().no_proxy().build().expect("client");
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("client");
     (format!("http://127.0.0.1:{port}"), client)
 }
 
@@ -6173,7 +6229,10 @@ async fn test_mcp_initialize() {
     assert_eq!(resp["result"]["serverInfo"]["name"], "memoria-mcp-rs");
     assert!(resp["result"]["capabilities"]["tools"].is_object());
     assert!(resp["error"].is_null());
-    println!("✅ POST /mcp initialize: {:?}", resp["result"]["serverInfo"]);
+    println!(
+        "✅ POST /mcp initialize: {:?}",
+        resp["result"]["serverInfo"]
+    );
 }
 
 #[tokio::test]
@@ -6198,7 +6257,10 @@ async fn test_mcp_tools_list() {
         .map(|t| t["name"].as_str().unwrap_or(""))
         .collect();
     assert!(names.contains(&"memory_store"), "missing memory_store");
-    assert!(names.contains(&"memory_retrieve"), "missing memory_retrieve");
+    assert!(
+        names.contains(&"memory_retrieve"),
+        "missing memory_retrieve"
+    );
     println!("✅ POST /mcp tools/list: {} tools", tools.len());
 }
 
@@ -6225,7 +6287,11 @@ async fn test_mcp_tools_call_memory_store() {
 
     assert_eq!(resp["jsonrpc"], "2.0");
     assert_eq!(resp["id"], 3);
-    assert!(resp["error"].is_null(), "unexpected error: {}", resp["error"]);
+    assert!(
+        resp["error"].is_null(),
+        "unexpected error: {}",
+        resp["error"]
+    );
     let text = resp["result"]["content"][0]["text"].as_str().unwrap_or("");
     assert!(text.contains("Stored"), "expected 'Stored' in: {text}");
     println!("✅ POST /mcp tools/call memory_store: {text}");
@@ -6272,7 +6338,10 @@ async fn test_mcp_invalid_request_non_object() {
 
     assert_eq!(resp["jsonrpc"], "2.0");
     assert!(resp["id"].is_null());
-    assert_eq!(resp["error"]["code"], -32600, "expected invalid request code");
+    assert_eq!(
+        resp["error"]["code"], -32600,
+        "expected invalid request code"
+    );
     println!("✅ POST /mcp array payload → -32600 Invalid Request");
 }
 
@@ -6294,7 +6363,10 @@ async fn test_mcp_invalid_request_wrong_version() {
         .expect("parse");
 
     assert_eq!(resp["jsonrpc"], "2.0");
-    assert_eq!(resp["error"]["code"], -32600, "expected invalid request code");
+    assert_eq!(
+        resp["error"]["code"], -32600,
+        "expected invalid request code"
+    );
     println!("✅ POST /mcp jsonrpc=1.0 → -32600 Invalid Request");
 }
 
@@ -6316,7 +6388,10 @@ async fn test_mcp_invalid_request_missing_method() {
         .expect("parse");
 
     assert_eq!(resp["jsonrpc"], "2.0");
-    assert_eq!(resp["error"]["code"], -32600, "expected invalid request code");
+    assert_eq!(
+        resp["error"]["code"], -32600,
+        "expected invalid request code"
+    );
     println!("✅ POST /mcp missing method → -32600 Invalid Request");
 }
 
@@ -6328,7 +6403,9 @@ async fn test_mcp_auth_required_when_master_key_set() {
     let status = client
         .post(format!("{base}/mcp"))
         .header("Content-Type", "application/json")
-        .body(serde_json::to_string(&json!({"jsonrpc":"2.0","id":1,"method":"initialize"})).unwrap())
+        .body(
+            serde_json::to_string(&json!({"jsonrpc":"2.0","id":1,"method":"initialize"})).unwrap(),
+        )
         .send()
         .await
         .expect("send")
@@ -6341,7 +6418,9 @@ async fn test_mcp_auth_required_when_master_key_set() {
         .post(format!("{base}/mcp"))
         .header("Content-Type", "application/json")
         .header("Authorization", "Bearer sk-wrong-token")
-        .body(serde_json::to_string(&json!({"jsonrpc":"2.0","id":1,"method":"initialize"})).unwrap())
+        .body(
+            serde_json::to_string(&json!({"jsonrpc":"2.0","id":1,"method":"initialize"})).unwrap(),
+        )
         .send()
         .await
         .expect("send")
@@ -6354,7 +6433,9 @@ async fn test_mcp_auth_required_when_master_key_set() {
         .post(format!("{base}/mcp"))
         .header("Content-Type", "application/json")
         .header("Authorization", "Bearer test-master-secret")
-        .body(serde_json::to_string(&json!({"jsonrpc":"2.0","id":1,"method":"initialize"})).unwrap())
+        .body(
+            serde_json::to_string(&json!({"jsonrpc":"2.0","id":1,"method":"initialize"})).unwrap(),
+        )
         .send()
         .await
         .expect("send")
@@ -6386,6 +6467,10 @@ async fn test_mcp_notifications_initialized_no_error() {
         .expect("send")
         .status();
 
-    assert_eq!(status.as_u16(), 204, "notification must return 204 No Content");
+    assert_eq!(
+        status.as_u16(),
+        204,
+        "notification must return 204 No Content"
+    );
     println!("✅ POST /mcp notifications/initialized → 204 No Content");
 }

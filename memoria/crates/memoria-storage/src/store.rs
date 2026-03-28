@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use chrono::Utc;
 use memoria_core::{
-    interfaces::MemoryStore, nullable_str, nullable_str_from_row, Memory, MemoriaError, MemoryType,
+    interfaces::MemoryStore, nullable_str, nullable_str_from_row, MemoriaError, Memory, MemoryType,
     TrustTier,
 };
 use sqlx::{mysql::MySqlPool, Row};
@@ -27,12 +27,76 @@ fn is_duplicate_column(e: &sqlx::Error) -> bool {
         .unwrap_or(false)
 }
 
+const POOL_MONITOR_INTERVAL_SECS: u64 = 30;
+const POOL_MONITOR_REPEAT_AFTER_TICKS: u32 = 10;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PoolHealthLevel {
+    Healthy,
+    HighUtilization,
+    Saturated,
+    Empty,
+}
+
+impl PoolHealthLevel {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Healthy => "healthy",
+            Self::HighUtilization => "high_utilization",
+            Self::Saturated => "saturated",
+            Self::Empty => "empty",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PoolHealthSnapshot {
+    pub configured_max_connections: Option<u32>,
+    pub size: u32,
+    pub active: u32,
+    pub idle: u32,
+    pub level: PoolHealthLevel,
+    pub since: std::time::Instant,
+    pub consecutive_observations: u32,
+}
+
+impl PoolHealthSnapshot {
+    fn new(configured_max_connections: Option<u32>) -> Self {
+        Self {
+            configured_max_connections,
+            size: 0,
+            active: 0,
+            idle: 0,
+            level: PoolHealthLevel::Healthy,
+            since: std::time::Instant::now(),
+            consecutive_observations: 0,
+        }
+    }
+}
+
+fn classify_pool_health(size: u32, idle: u32) -> PoolHealthLevel {
+    if size == 0 {
+        PoolHealthLevel::Empty
+    } else if idle == 0 {
+        PoolHealthLevel::Saturated
+    } else if idle < size / 10 + 1 {
+        PoolHealthLevel::HighUtilization
+    } else {
+        PoolHealthLevel::Healthy
+    }
+}
+
 /// Spawn a background task that periodically logs pool utilization.
 /// Warns when idle connections drop below 10% of pool size.
 /// Stops automatically when the pool is closed.
-pub fn spawn_pool_monitor(pool: MySqlPool) {
+pub fn spawn_pool_monitor(
+    pool: MySqlPool,
+    configured_max_connections: Option<u32>,
+    health: Arc<std::sync::Mutex<PoolHealthSnapshot>>,
+) {
     ::tokio::spawn(async move {
-        let mut interval = ::tokio::time::interval(std::time::Duration::from_secs(30));
+        let mut interval =
+            ::tokio::time::interval(std::time::Duration::from_secs(POOL_MONITOR_INTERVAL_SECS));
         interval.tick().await; // skip immediate
         loop {
             interval.tick().await;
@@ -42,21 +106,89 @@ pub fn spawn_pool_monitor(pool: MySqlPool) {
             }
             let size = pool.size();
             let idle = pool.num_idle();
-            let active = size - idle as u32;
-            if idle == 0 {
-                tracing::warn!(
-                    pool_size = size,
-                    pool_active = active,
-                    pool_idle = idle,
-                    "connection pool saturated — 0 idle connections"
-                );
-            } else if (idle as u32) < size / 10 + 1 {
-                tracing::warn!(
-                    pool_size = size,
-                    pool_active = active,
-                    pool_idle = idle,
-                    "connection pool high utilization"
-                );
+            let active = size.saturating_sub(idle as u32);
+            let level = classify_pool_health(size, idle as u32);
+
+            let mut guard = health.lock().unwrap();
+            let previous_level = guard.level;
+            let previous_since = guard.since;
+
+            if previous_level == level {
+                guard.consecutive_observations = guard.consecutive_observations.saturating_add(1);
+            } else {
+                guard.level = level;
+                guard.since = std::time::Instant::now();
+                guard.consecutive_observations = 1;
+            }
+
+            guard.configured_max_connections = configured_max_connections;
+            guard.size = size;
+            guard.active = active;
+            guard.idle = idle as u32;
+
+            let should_log = if level == PoolHealthLevel::Healthy {
+                previous_level != PoolHealthLevel::Healthy
+            } else {
+                previous_level != level
+                    || guard.consecutive_observations == 1
+                    || guard
+                        .consecutive_observations
+                        .is_multiple_of(POOL_MONITOR_REPEAT_AFTER_TICKS)
+            };
+
+            if !should_log {
+                continue;
+            }
+
+            let unhealthy_for_secs = previous_since.elapsed().as_secs();
+            match level {
+                PoolHealthLevel::Healthy => {
+                    tracing::info!(
+                        previous_state = previous_level.as_str(),
+                        previous_state_duration_secs = unhealthy_for_secs,
+                        pool_size = size,
+                        pool_active = active,
+                        pool_idle = idle,
+                        configured_max_connections,
+                        "connection pool recovered"
+                    );
+                }
+                PoolHealthLevel::Empty => {
+                    tracing::warn!(
+                        pool_size = size,
+                        pool_active = active,
+                        pool_idle = idle,
+                        configured_max_connections,
+                        state = level.as_str(),
+                        state_duration_secs = guard.since.elapsed().as_secs(),
+                        consecutive_observations = guard.consecutive_observations,
+                        "connection pool has no established connections; existing connections may have been dropped or new ones cannot be established"
+                    );
+                }
+                PoolHealthLevel::Saturated => {
+                    tracing::warn!(
+                        pool_size = size,
+                        pool_active = active,
+                        pool_idle = idle,
+                        configured_max_connections,
+                        state = level.as_str(),
+                        state_duration_secs = guard.since.elapsed().as_secs(),
+                        consecutive_observations = guard.consecutive_observations,
+                        "connection pool saturated — all established connections are busy"
+                    );
+                }
+                PoolHealthLevel::HighUtilization => {
+                    tracing::warn!(
+                        pool_size = size,
+                        pool_active = active,
+                        pool_idle = idle,
+                        configured_max_connections,
+                        state = level.as_str(),
+                        state_duration_secs = guard.since.elapsed().as_secs(),
+                        consecutive_observations = guard.consecutive_observations,
+                        "connection pool high utilization"
+                    );
+                }
             }
         }
     });
@@ -156,6 +288,8 @@ pub struct SqlMemoryStore {
     embedding_dim: usize,
     instance_id: String,
     database_url: Option<String>,
+    configured_max_connections: Option<u32>,
+    pool_health: Arc<std::sync::Mutex<PoolHealthSnapshot>>,
     /// Cache: user_id → active table name (TTL 5s, invalidated on branch switch)
     active_table_cache: moka::future::Cache<String, String>,
     /// Cache: (user_id, operation) → last_run Instant (avoids DB query for cooldown checks)
@@ -228,6 +362,8 @@ impl SqlMemoryStore {
             embedding_dim,
             instance_id,
             database_url: None,
+            configured_max_connections: None,
+            pool_health: Arc::new(std::sync::Mutex::new(PoolHealthSnapshot::new(None))),
             // Short TTL: multi-instance deployments without sticky sessions could
             // serve stale branch mappings after a branch switch on another instance.
             // 5s keeps the hot-path benefit while limiting the inconsistency window.
@@ -259,6 +395,14 @@ impl SqlMemoryStore {
 
     pub fn pool(&self) -> &MySqlPool {
         &self.pool
+    }
+
+    pub fn configured_max_connections(&self) -> Option<u32> {
+        self.configured_max_connections
+    }
+
+    pub fn pool_health_snapshot(&self) -> PoolHealthSnapshot {
+        self.pool_health.lock().unwrap().clone()
     }
 
     pub fn graph_store(&self) -> crate::graph::GraphStore {
@@ -311,9 +455,14 @@ impl SqlMemoryStore {
             max_lifetime_secs = max_lifetime_secs,
             "Main connection pool initialized"
         );
-        spawn_pool_monitor(pool.clone());
-        let mut store = Self::new(pool, embedding_dim, instance_id);
+        let mut store = Self::new(pool.clone(), embedding_dim, instance_id);
         store.database_url = Some(database_url.to_string());
+        store.configured_max_connections = Some(max_conns);
+        {
+            let mut health = store.pool_health.lock().unwrap();
+            health.configured_max_connections = Some(max_conns);
+        }
+        spawn_pool_monitor(pool, Some(max_conns), store.pool_health.clone());
         Ok(store)
     }
 
@@ -983,22 +1132,19 @@ impl SqlMemoryStore {
         .await
         .unwrap_or(false);
         if has_user_active_created_idx {
-            let _ = sqlx::query(
-                "ALTER TABLE mem_memories DROP INDEX idx_user_active_created",
-            )
-            .execute(&self.pool)
-            .await;
+            let _ = sqlx::query("ALTER TABLE mem_memories DROP INDEX idx_user_active_created")
+                .execute(&self.pool)
+                .await;
         }
 
         // Migration: MO#24001 — normalize empty-string NULLable VARCHAR columns to real NULL.
         // MatrixOne PREPARE/EXECUTE stores Option<String>::None as '' instead of NULL.
         // Effectively runs once: after fix, new writes use nullable_str() and never produce ''.
-        let has_empty_superseded: bool = sqlx::query_scalar(
-            "SELECT COUNT(*) > 0 FROM mem_memories WHERE superseded_by = ''",
-        )
-        .fetch_one(&self.pool)
-        .await
-        .unwrap_or(false);
+        let has_empty_superseded: bool =
+            sqlx::query_scalar("SELECT COUNT(*) > 0 FROM mem_memories WHERE superseded_by = ''")
+                .fetch_one(&self.pool)
+                .await
+                .unwrap_or(false);
         if has_empty_superseded {
             for (tbl, col) in [
                 ("mem_memories", "superseded_by"),
@@ -1010,11 +1156,10 @@ impl SqlMemoryStore {
                 ("memory_graph_nodes", "conflicts_with"),
                 ("memory_graph_nodes", "conflict_resolution"),
             ] {
-                if let Err(e) = sqlx::query(&format!(
-                    "UPDATE {tbl} SET {col} = NULL WHERE {col} = ''"
-                ))
-                .execute(&self.pool)
-                .await
+                if let Err(e) =
+                    sqlx::query(&format!("UPDATE {tbl} SET {col} = NULL WHERE {col} = ''"))
+                        .execute(&self.pool)
+                        .await
                 {
                     tracing::warn!(table = tbl, column = col, error = %e, "MO#24001 migration: failed to normalize empty strings");
                 }
@@ -1143,19 +1288,27 @@ impl SqlMemoryStore {
         // TODO: revert to plain `(?, ?, ?, ?, ?, ?, ?, ?)` + direct bind once MO fixes this.
         let mid_ph = if memory_id.is_some() { "?" } else { "NULL" };
         let pay_ph = if payload.is_some() { "?" } else { "NULL" };
-        let snap_ph = if snapshot_before.is_some() { "?" } else { "NULL" };
+        let snap_ph = if snapshot_before.is_some() {
+            "?"
+        } else {
+            "NULL"
+        };
         let sql = format!(
             "INSERT INTO mem_edit_log (edit_id, user_id, memory_id, operation, payload, reason, snapshot_before, created_by) \
              VALUES (?, ?, {mid_ph}, ?, {pay_ph}, ?, {snap_ph}, ?)"
         );
-        let mut q = sqlx::query(&sql)
-            .bind(&edit_id)
-            .bind(user_id);
-        if let Some(v) = memory_id { q = q.bind(v); }
+        let mut q = sqlx::query(&sql).bind(&edit_id).bind(user_id);
+        if let Some(v) = memory_id {
+            q = q.bind(v);
+        }
         q = q.bind(operation);
-        if let Some(v) = payload { q = q.bind(v); }
+        if let Some(v) = payload {
+            q = q.bind(v);
+        }
         q = q.bind(reason);
-        if let Some(v) = snapshot_before { q = q.bind(v); }
+        if let Some(v) = snapshot_before {
+            q = q.bind(v);
+        }
         let _ = q.bind(user_id).execute(&self.pool).await;
     }
 
@@ -1177,7 +1330,11 @@ impl SqlMemoryStore {
                 .map(|e| {
                     let mid = if e.memory_id.is_some() { "?" } else { "NULL" };
                     let pay = if e.payload.is_some() { "?" } else { "NULL" };
-                    let snap = if e.snapshot_before.is_some() { "?" } else { "NULL" };
+                    let snap = if e.snapshot_before.is_some() {
+                        "?"
+                    } else {
+                        "NULL"
+                    };
                     format!("(?, ?, {mid}, ?, {pay}, ?, {snap}, ?)")
                 })
                 .collect();
@@ -1187,14 +1344,18 @@ impl SqlMemoryStore {
             );
             let mut q = sqlx::query(&sql);
             for e in chunk {
-                q = q
-                    .bind(&e.edit_id)
-                    .bind(&e.user_id);
-                if let Some(v) = &e.memory_id { q = q.bind(v); }
+                q = q.bind(&e.edit_id).bind(&e.user_id);
+                if let Some(v) = &e.memory_id {
+                    q = q.bind(v);
+                }
                 q = q.bind(&e.operation);
-                if let Some(v) = &e.payload { q = q.bind(v); }
+                if let Some(v) = &e.payload {
+                    q = q.bind(v);
+                }
                 q = q.bind(&e.reason);
-                if let Some(v) = &e.snapshot_before { q = q.bind(v); }
+                if let Some(v) = &e.snapshot_before {
+                    q = q.bind(v);
+                }
                 q = q.bind(&e.user_id);
             }
             q.execute(&self.pool).await.map_err(db_err)?;
@@ -1863,9 +2024,7 @@ impl SqlMemoryStore {
         // Batch DELETE redundant memories (edit_log provides audit trail)
         for chunk in to_delete.chunks(100) {
             let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-            let sql = format!(
-                "DELETE FROM mem_memories WHERE memory_id IN ({placeholders})"
-            );
+            let sql = format!("DELETE FROM mem_memories WHERE memory_id IN ({placeholders})");
             let mut q = sqlx::query(&sql);
             for id in chunk {
                 q = q.bind(id);
@@ -2853,13 +3012,14 @@ impl SqlMemoryStore {
 
     /// Global hygiene diagnostics (admin).
     pub async fn health_hygiene_global(&self) -> Result<serde_json::Value, MemoriaError> {
-        let (inactive,): (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM mem_memories WHERE is_active = 0 \
+        let (inactive,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM mem_memories WHERE is_active = 0 \
              AND (superseded_by IS NULL OR superseded_by = '') \
-             AND updated_at < DATE_SUB(NOW(), INTERVAL 24 HOUR)")
-                .fetch_one(&self.pool)
-                .await
-                .map_err(db_err)?;
+             AND updated_at < DATE_SUB(NOW(), INTERVAL 24 HOUR)",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(db_err)?;
 
         let (stale_working,): (i64,) = sqlx::query_as(
             "SELECT COUNT(*) FROM mem_memories WHERE memory_type = 'working' \
@@ -3124,7 +3284,11 @@ impl SqlMemoryStore {
     }
 
     /// Batch soft-delete: deactivate multiple memories in one round trip per chunk.
-    pub async fn soft_delete_batch_from(&self, table: &str, ids: &[String]) -> Result<(), MemoriaError> {
+    pub async fn soft_delete_batch_from(
+        &self,
+        table: &str,
+        ids: &[String],
+    ) -> Result<(), MemoriaError> {
         for chunk in ids.chunks(200) {
             let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
             let sql = format!(
@@ -3146,17 +3310,24 @@ impl SqlMemoryStore {
             let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
 
             // Deactivate graph nodes
-            let sql = format!("UPDATE memory_graph_nodes SET is_active = 0 WHERE memory_id IN ({placeholders})");
+            let sql = format!(
+                "UPDATE memory_graph_nodes SET is_active = 0 WHERE memory_id IN ({placeholders})"
+            );
             let mut q = sqlx::query(&sql);
-            for id in chunk { q = q.bind(id); }
+            for id in chunk {
+                q = q.bind(id);
+            }
             if let Err(e) = q.execute(&self.pool).await {
                 tracing::warn!("batch deactivate graph nodes failed: {e}");
             }
 
             // Delete memory_entity_links
-            let sql = format!("DELETE FROM mem_memory_entity_links WHERE memory_id IN ({placeholders})");
+            let sql =
+                format!("DELETE FROM mem_memory_entity_links WHERE memory_id IN ({placeholders})");
             let mut q = sqlx::query(&sql);
-            for id in chunk { q = q.bind(id); }
+            for id in chunk {
+                q = q.bind(id);
+            }
             if let Err(e) = q.execute(graph.pool()).await {
                 tracing::warn!("batch delete memory_entity_links failed: {e}");
             }
@@ -3164,7 +3335,9 @@ impl SqlMemoryStore {
             // Delete entity_links
             let sql = format!("DELETE FROM mem_entity_links WHERE memory_id IN ({placeholders})");
             let mut q = sqlx::query(&sql);
-            for id in chunk { q = q.bind(id); }
+            for id in chunk {
+                q = q.bind(id);
+            }
             if let Err(e) = q.execute(&self.pool).await {
                 tracing::warn!("batch delete entity_links failed: {e}");
             }
@@ -3354,9 +3527,8 @@ impl SqlMemoryStore {
         // Cap at 501 (not 500) so the caller can request limit+1 for has_more detection.
         let safe_limit = limit.clamp(1, 501);
         // Subquery: sort only memory_id in the index, then fetch full rows for the top-N.
-        let mut inner = format!(
-            "SELECT memory_id FROM {table} WHERE user_id = ? AND is_active = 1"
-        );
+        let mut inner =
+            format!("SELECT memory_id FROM {table} WHERE user_id = ? AND is_active = 1");
         if memory_type.is_some() {
             inner.push_str(" AND memory_type = ?");
         }
@@ -3817,7 +3989,7 @@ impl SqlMemoryStore {
 
 #[cfg(test)]
 mod tests {
-    use super::{OwnedEditLogEntry, SqlMemoryStore};
+    use super::{classify_pool_health, OwnedEditLogEntry, PoolHealthLevel, SqlMemoryStore};
     use sqlx::mysql::MySqlPoolOptions;
     use std::io::{self, Write};
     use std::sync::{Arc, Mutex, OnceLock};
@@ -3931,6 +4103,17 @@ mod tests {
             !output.contains("dropping entry"),
             "closed channel should fall back to direct INSERT, not drop: {output}"
         );
+    }
+
+    #[test]
+    fn classify_pool_health_distinguishes_empty_from_saturated() {
+        assert_eq!(classify_pool_health(0, 0), PoolHealthLevel::Empty);
+        assert_eq!(classify_pool_health(8, 0), PoolHealthLevel::Saturated);
+        assert_eq!(
+            classify_pool_health(20, 1),
+            PoolHealthLevel::HighUtilization
+        );
+        assert_eq!(classify_pool_health(8, 3), PoolHealthLevel::Healthy);
     }
 }
 

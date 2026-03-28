@@ -1,5 +1,7 @@
 use axum::{extract::State, http::StatusCode, Json};
-use memoria_service::{ConsolidationInput, ConsolidationStrategy, DefaultConsolidationStrategy, GovernanceStore};
+use memoria_service::{
+    ConsolidationInput, ConsolidationStrategy, DefaultConsolidationStrategy, GovernanceStore,
+};
 use serde_json::json;
 use tracing::warn;
 

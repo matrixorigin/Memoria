@@ -47,7 +47,12 @@ struct EditLogRow {
 
 // ── Setup / teardown ──────────────────────────────────────────────────────────
 
-async fn setup() -> (Arc<MemoryService>, Arc<GitForDataService>, MySqlPool, String) {
+async fn setup() -> (
+    Arc<MemoryService>,
+    Arc<GitForDataService>,
+    MySqlPool,
+    String,
+) {
     let pool = MySqlPool::connect(&db_url()).await.expect("pool");
     let db_name = db_url().rsplit('/').next().unwrap_or("memoria").to_string();
     let store = SqlMemoryStore::connect(&db_url(), test_dim(), Uuid::new_v4().to_string())
@@ -62,7 +67,12 @@ async fn setup() -> (Arc<MemoryService>, Arc<GitForDataService>, MySqlPool, Stri
 }
 
 /// Setup with real embedder. Returns None if EMBEDDING_* env vars not set.
-async fn setup_with_embedder() -> Option<(Arc<MemoryService>, Arc<GitForDataService>, MySqlPool, String)> {
+async fn setup_with_embedder() -> Option<(
+    Arc<MemoryService>,
+    Arc<GitForDataService>,
+    MySqlPool,
+    String,
+)> {
     let base_url = std::env::var("EMBEDDING_BASE_URL").unwrap_or_default();
     let api_key = std::env::var("EMBEDDING_API_KEY").unwrap_or_default();
     if base_url.is_empty() || api_key.is_empty() {
@@ -80,9 +90,8 @@ async fn setup_with_embedder() -> Option<(Arc<MemoryService>, Arc<GitForDataServ
         .expect("store");
     store.migrate().await.expect("migrate");
     let git = Arc::new(GitForDataService::new(pool.clone(), &db_name));
-    let svc = Arc::new(
-        MemoryService::new_sql_with_llm(Arc::new(store), Some(embedder), None).await,
-    );
+    let svc =
+        Arc::new(MemoryService::new_sql_with_llm(Arc::new(store), Some(embedder), None).await);
     let user_id = uid();
     cleanup(&pool, &user_id).await;
     Some((svc, git, pool, user_id))
@@ -169,18 +178,31 @@ async fn get_logs_by_op(pool: &MySqlPool, user_id: &str, op: &str) -> Vec<EditLo
 fn assert_common(row: &EditLogRow, expected_user: &str, expected_op: &str) {
     // edit_id: 32-char hex (UUID v7 simple)
     assert_eq!(row.edit_id.len(), 32, "edit_id len: {}", row.edit_id);
-    assert!(row.edit_id.chars().all(|c| c.is_ascii_hexdigit()), "edit_id hex: {}", row.edit_id);
+    assert!(
+        row.edit_id.chars().all(|c| c.is_ascii_hexdigit()),
+        "edit_id hex: {}",
+        row.edit_id
+    );
     assert_eq!(row.user_id, expected_user, "user_id");
     assert_eq!(row.operation, expected_op, "operation");
     assert_eq!(row.created_by, expected_user, "created_by");
     let now = chrono::Utc::now().naive_utc();
     let age = now - row.created_at;
-    assert!(age.num_seconds() < 60 && age.num_seconds() >= 0,
-        "created_at should be recent: {:?} (age={}s)", row.created_at, age.num_seconds());
+    assert!(
+        age.num_seconds() < 60 && age.num_seconds() >= 0,
+        "created_at should be recent: {:?} (age={}s)",
+        row.created_at,
+        age.num_seconds()
+    );
 }
 
 fn extract_mid(response: &Value) -> String {
-    text(response).split_whitespace().nth(2).unwrap().trim_end_matches(':').to_string()
+    text(response)
+        .split_whitespace()
+        .nth(2)
+        .unwrap()
+        .trim_end_matches(':')
+        .to_string()
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -192,7 +214,13 @@ fn extract_mid(response: &Value) -> String {
 async fn test_inject_all_fields() {
     let (svc, _git, pool, uid) = setup().await;
 
-    let r = call("memory_store", json!({"content": "Rust is fast", "memory_type": "semantic"}), &svc, &uid).await;
+    let r = call(
+        "memory_store",
+        json!({"content": "Rust is fast", "memory_type": "semantic"}),
+        &svc,
+        &uid,
+    )
+    .await;
     let mid = extract_mid(&r);
     svc.flush_edit_log().await;
 
@@ -224,7 +252,13 @@ async fn test_correct_all_fields() {
     let old_mid = extract_mid(&r);
     svc.flush_edit_log().await;
 
-    let r = call("memory_correct", json!({"memory_id": old_mid, "new_content": "uses ruff"}), &svc, &uid).await;
+    let r = call(
+        "memory_correct",
+        json!({"memory_id": old_mid, "new_content": "uses ruff"}),
+        &svc,
+        &uid,
+    )
+    .await;
     assert!(text(&r).contains("Corrected"));
     svc.flush_edit_log().await;
 
@@ -268,13 +302,23 @@ async fn test_purge_single_all_fields() {
     let row = &logs[0];
     assert_common(row, &uid, "purge");
     assert_eq!(row.memory_id.as_deref(), Some(mid.as_str()));
-    assert!(row.payload.is_none(), "payload should be None, got: {:?}", row.payload);
+    assert!(
+        row.payload.is_none(),
+        "payload should be None, got: {:?}",
+        row.payload
+    );
     assert_eq!(row.reason.as_deref(), Some(""));
-    let snap = row.snapshot_before.as_ref().expect("snapshot_before should be set");
+    let snap = row
+        .snapshot_before
+        .as_ref()
+        .expect("snapshot_before should be set");
     assert!(snap.starts_with("mem_snap_pre_purge_"));
     let exists: Vec<(String,)> =
         sqlx::query_as("SELECT sname FROM mo_catalog.mo_snapshots WHERE sname = ?")
-            .bind(snap).fetch_all(&pool).await.unwrap();
+            .bind(snap)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
     assert_eq!(exists.len(), 1, "safety snapshot should exist in DB");
 
     cleanup(&pool, &uid).await;
@@ -293,7 +337,13 @@ async fn test_purge_batch_all_fields() {
 
     let mut mids = vec![];
     for i in 0..3 {
-        let r = call("memory_store", json!({"content": format!("batch item {i}")}), &svc, &uid).await;
+        let r = call(
+            "memory_store",
+            json!({"content": format!("batch item {i}")}),
+            &svc,
+            &uid,
+        )
+        .await;
         mids.push(extract_mid(&r));
     }
     svc.flush_edit_log().await;
@@ -312,11 +362,17 @@ async fn test_purge_batch_all_fields() {
         assert_common(row, &uid, "purge");
         assert!(row.payload.is_none(), "payload[{i}]");
         assert_eq!(row.reason.as_deref(), Some(""), "reason[{i}]");
-        assert_eq!(row.snapshot_before.as_ref(), Some(snap), "snapshot_before[{i}]");
+        assert_eq!(
+            row.snapshot_before.as_ref(),
+            Some(snap),
+            "snapshot_before[{i}]"
+        );
         logged_mids.push(row.memory_id.as_ref().unwrap().clone());
         edit_ids.insert(row.edit_id.clone());
     }
-    for mid in &mids { assert!(logged_mids.contains(mid), "missing {mid}"); }
+    for mid in &mids {
+        assert!(logged_mids.contains(mid), "missing {mid}");
+    }
     assert_eq!(edit_ids.len(), 3, "edit_ids should be unique");
 
     cleanup(&pool, &uid).await;
@@ -333,9 +389,27 @@ async fn test_purge_topic_all_fields() {
     let (svc, _git, pool, uid) = setup().await;
     ensure_snapshot_quota(&pool).await;
 
-    call("memory_store", json!({"content": "rust ownership rules"}), &svc, &uid).await;
-    call("memory_store", json!({"content": "rust borrow checker"}), &svc, &uid).await;
-    call("memory_store", json!({"content": "python is great"}), &svc, &uid).await;
+    call(
+        "memory_store",
+        json!({"content": "rust ownership rules"}),
+        &svc,
+        &uid,
+    )
+    .await;
+    call(
+        "memory_store",
+        json!({"content": "rust borrow checker"}),
+        &svc,
+        &uid,
+    )
+    .await;
+    call(
+        "memory_store",
+        json!({"content": "python is great"}),
+        &svc,
+        &uid,
+    )
+    .await;
     svc.flush_edit_log().await;
 
     call("memory_purge", json!({"topic": "rust"}), &svc, &uid).await;
@@ -349,7 +423,11 @@ async fn test_purge_topic_all_fields() {
         assert!(row.memory_id.is_some(), "memory_id[{i}]");
         assert!(row.payload.is_none(), "payload[{i}]");
         assert_eq!(row.reason.as_deref(), Some("topic:rust"), "reason[{i}]");
-        assert_eq!(row.snapshot_before.as_ref(), Some(snap), "snapshot_before[{i}]");
+        assert_eq!(
+            row.snapshot_before.as_ref(),
+            Some(snap),
+            "snapshot_before[{i}]"
+        );
     }
 
     cleanup(&pool, &uid).await;
@@ -366,8 +444,18 @@ async fn test_store_batch_all_fields() {
     let (svc, _git, pool, uid) = setup().await;
 
     let items = vec![
-        ("batch alpha".to_string(), memoria_core::MemoryType::Semantic, None, None),
-        ("batch beta".to_string(), memoria_core::MemoryType::Procedural, None, None),
+        (
+            "batch alpha".to_string(),
+            memoria_core::MemoryType::Semantic,
+            None,
+            None,
+        ),
+        (
+            "batch beta".to_string(),
+            memoria_core::MemoryType::Procedural,
+            None,
+            None,
+        ),
     ];
     let results = svc.store_batch(&uid, items).await.unwrap();
     assert_eq!(results.len(), 2);
@@ -375,7 +463,10 @@ async fn test_store_batch_all_fields() {
 
     let logs = get_logs_by_op(&pool, &uid, "inject").await;
     assert_eq!(logs.len(), 2);
-    let log_mids: Vec<_> = logs.iter().map(|r| r.memory_id.as_ref().unwrap().clone()).collect();
+    let log_mids: Vec<_> = logs
+        .iter()
+        .map(|r| r.memory_id.as_ref().unwrap().clone())
+        .collect();
     let mut log_contents = vec![];
     let mut log_types = vec![];
     for (i, row) in logs.iter().enumerate() {
@@ -386,7 +477,9 @@ async fn test_store_batch_all_fields() {
         log_contents.push(p["content"].as_str().unwrap().to_string());
         log_types.push(p["type"].as_str().unwrap().to_string());
     }
-    for m in &results { assert!(log_mids.contains(&m.memory_id)); }
+    for m in &results {
+        assert!(log_mids.contains(&m.memory_id));
+    }
     assert!(log_contents.contains(&"batch alpha".to_string()));
     assert!(log_contents.contains(&"batch beta".to_string()));
     assert!(log_types.contains(&"semantic".to_string()));
@@ -406,12 +499,29 @@ async fn test_full_audit_trail_chronological() {
     let (svc, _git, pool, uid) = setup().await;
     ensure_snapshot_quota(&pool).await;
 
-    let r = call("memory_store", json!({"content": "original fact"}), &svc, &uid).await;
+    let r = call(
+        "memory_store",
+        json!({"content": "original fact"}),
+        &svc,
+        &uid,
+    )
+    .await;
     let mid1 = extract_mid(&r);
     svc.flush_edit_log().await;
 
-    let r = call("memory_correct", json!({"memory_id": mid1, "new_content": "corrected fact"}), &svc, &uid).await;
-    let new_mid = text(&r).split_whitespace().nth(2).unwrap().trim_end_matches(':').to_string();
+    let r = call(
+        "memory_correct",
+        json!({"memory_id": mid1, "new_content": "corrected fact"}),
+        &svc,
+        &uid,
+    )
+    .await;
+    let new_mid = text(&r)
+        .split_whitespace()
+        .nth(2)
+        .unwrap()
+        .trim_end_matches(':')
+        .to_string();
     svc.flush_edit_log().await;
 
     call("memory_purge", json!({"memory_id": new_mid}), &svc, &uid).await;
@@ -427,8 +537,12 @@ async fn test_full_audit_trail_chronological() {
 
     // Timestamps monotonically non-decreasing
     for w in logs.windows(2) {
-        assert!(w[0].created_at <= w[1].created_at,
-            "{:?} > {:?}", w[0].created_at, w[1].created_at);
+        assert!(
+            w[0].created_at <= w[1].created_at,
+            "{:?} > {:?}",
+            w[0].created_at,
+            w[1].created_at
+        );
     }
     // All edit_ids unique
     let ids: std::collections::HashSet<_> = logs.iter().map(|r| &r.edit_id).collect();
@@ -456,20 +570,42 @@ async fn test_purge_rollback_restores_memory() {
     let (svc, git, pool, uid) = setup().await;
     ensure_snapshot_quota(&pool).await;
 
-    let r = call("memory_store", json!({"content": "important fact"}), &svc, &uid).await;
+    let r = call(
+        "memory_store",
+        json!({"content": "important fact"}),
+        &svc,
+        &uid,
+    )
+    .await;
     let mid = extract_mid(&r);
     svc.flush_edit_log().await;
 
     let r = call("memory_purge", json!({"memory_id": mid}), &svc, &uid).await;
     svc.flush_edit_log().await;
     let t = text(&r);
-    let snap_line = t.lines().find(|l| l.contains("Safety snapshot")).expect("snapshot line");
-    let snap_name = snap_line.split("Safety snapshot: ").nth(1).unwrap().split_whitespace().next().unwrap();
+    let snap_line = t
+        .lines()
+        .find(|l| l.contains("Safety snapshot"))
+        .expect("snapshot line");
+    let snap_name = snap_line
+        .split("Safety snapshot: ")
+        .nth(1)
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap();
 
     assert_eq!(svc.list_active(&uid, 10).await.unwrap().len(), 0);
 
-    let r = memoria_mcp::git_tools::call("memory_rollback", json!({"name": snap_name}), &git, &svc, &uid)
-        .await.expect("rollback");
+    let r = memoria_mcp::git_tools::call(
+        "memory_rollback",
+        json!({"name": snap_name}),
+        &git,
+        &svc,
+        &uid,
+    )
+    .await
+    .expect("rollback");
     assert!(text(&r).contains("Rolled back"));
 
     let active = svc.list_active(&uid, 10).await.unwrap();
@@ -496,8 +632,20 @@ async fn test_user_isolation() {
     let uid2 = uid();
     cleanup(&pool, &uid2).await;
 
-    call("memory_store", json!({"content": "user1 fact"}), &svc, &uid1).await;
-    call("memory_store", json!({"content": "user2 fact"}), &svc, &uid2).await;
+    call(
+        "memory_store",
+        json!({"content": "user1 fact"}),
+        &svc,
+        &uid1,
+    )
+    .await;
+    call(
+        "memory_store",
+        json!({"content": "user2 fact"}),
+        &svc,
+        &uid2,
+    )
+    .await;
     svc.flush_edit_log().await;
 
     let logs1 = get_logs(&pool, &uid1).await;
@@ -528,7 +676,13 @@ async fn test_governance_quarantine_edit_log() {
     let (svc, _git, pool, uid) = setup().await;
 
     // T4 tier with initial_confidence=0.5, aged 60 days → confidence decays below 0.2 threshold
-    let r = call("memory_store", json!({"content": "low confidence fact", "trust_tier": "T4"}), &svc, &uid).await;
+    let r = call(
+        "memory_store",
+        json!({"content": "low confidence fact", "trust_tier": "T4"}),
+        &svc,
+        &uid,
+    )
+    .await;
     let mid = extract_mid(&r);
     svc.flush_edit_log().await;
 
@@ -539,19 +693,41 @@ async fn test_governance_quarantine_edit_log() {
     svc.flush_edit_log().await;
 
     let logs = get_logs_by_op(&pool, &uid, "governance:quarantine").await;
-    assert!(!logs.is_empty(), "governance should quarantine T4 memory aged 60 days");
+    assert!(
+        !logs.is_empty(),
+        "governance should quarantine T4 memory aged 60 days"
+    );
     let row = &logs[0];
     assert_common(row, &uid, "governance:quarantine");
-    assert!(row.memory_id.is_none(), "governance quarantine has no specific memory_id");
+    assert!(
+        row.memory_id.is_none(),
+        "governance quarantine has no specific memory_id"
+    );
     let payload: Value = serde_json::from_str(row.payload.as_ref().unwrap()).unwrap();
-    assert!(payload["quarantined"].as_i64().unwrap() >= 1, "payload.quarantined >= 1");
-    assert!(row.reason.as_ref().unwrap().contains("quarantined"), "reason");
-    assert!(row.snapshot_before.is_none(), "MCP governance doesn't create snapshot");
+    assert!(
+        payload["quarantined"].as_i64().unwrap() >= 1,
+        "payload.quarantined >= 1"
+    );
+    assert!(
+        row.reason.as_ref().unwrap().contains("quarantined"),
+        "reason"
+    );
+    assert!(
+        row.snapshot_before.is_none(),
+        "MCP governance doesn't create snapshot"
+    );
 
     // Verify the memory is physically deleted by quarantine
-    let remaining: Vec<(String,)> = sqlx::query_as("SELECT memory_id FROM mem_memories WHERE memory_id = ?")
-        .bind(&mid).fetch_all(&pool).await.unwrap();
-    assert!(remaining.is_empty(), "memory should be physically deleted by quarantine");
+    let remaining: Vec<(String,)> =
+        sqlx::query_as("SELECT memory_id FROM mem_memories WHERE memory_id = ?")
+            .bind(&mid)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert!(
+        remaining.is_empty(),
+        "memory should be physically deleted by quarantine"
+    );
 
     cleanup(&pool, &uid).await;
     println!("✅ governance quarantine: all fields verified + DB state checked");
@@ -577,7 +753,10 @@ async fn test_governance_cleanup_stale_edit_log() {
 
     // Clear previous edit logs so we only see governance logs
     sqlx::query("DELETE FROM mem_edit_log WHERE user_id = ?")
-        .bind(&uid).execute(&pool).await.unwrap();
+        .bind(&uid)
+        .execute(&pool)
+        .await
+        .unwrap();
 
     call("memory_governance", json!({"force": true}), &svc, &uid).await;
     svc.flush_edit_log().await;
@@ -593,9 +772,16 @@ async fn test_governance_cleanup_stale_edit_log() {
     assert!(row.snapshot_before.is_none());
 
     // Verify the memory is actually deleted from DB
-    let remaining: Vec<(String,)> = sqlx::query_as("SELECT memory_id FROM mem_memories WHERE memory_id = ?")
-        .bind(&mid).fetch_all(&pool).await.unwrap();
-    assert!(remaining.is_empty(), "stale memory should be deleted from DB");
+    let remaining: Vec<(String,)> =
+        sqlx::query_as("SELECT memory_id FROM mem_memories WHERE memory_id = ?")
+            .bind(&mid)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert!(
+        remaining.is_empty(),
+        "stale memory should be deleted from DB"
+    );
 
     cleanup(&pool, &uid).await;
     println!("✅ governance cleanup_stale: all fields verified + DB state checked");
@@ -618,7 +804,9 @@ async fn spawn_server() -> (String, reqwest::Client, MySqlPool, Arc<MemoryServic
     let state = memoria_api::AppState::new(Arc::clone(&service), git, String::new());
     let app = memoria_api::build_router(state);
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
     let port = listener.local_addr().unwrap().port();
     tokio::spawn(async move { axum::serve(listener, app).await });
     tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
@@ -635,22 +823,31 @@ async fn test_api_governance_quarantine_edit_log() {
     cleanup(&pool, &uid).await;
 
     // Store via API
-    let r = client.post(format!("{base}/v1/memories"))
+    let r = client
+        .post(format!("{base}/v1/memories"))
         .header("X-User-Id", &uid)
         .json(&json!({"content": "api low conf", "trust_tier": "T4"}))
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
     assert!(r.status().is_success(), "store status: {}", r.status());
-    let mid = r.json::<Value>().await.unwrap()["memory_id"].as_str().unwrap().to_string();
+    let mid = r.json::<Value>().await.unwrap()["memory_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
 
     // Age it
     sqlx::query("UPDATE mem_memories SET observed_at = DATE_SUB(NOW(), INTERVAL 60 DAY) WHERE memory_id = ?")
         .bind(&mid).execute(&pool).await.unwrap();
 
     // Governance via API
-    let r = client.post(format!("{base}/v1/governance"))
+    let r = client
+        .post(format!("{base}/v1/governance"))
         .header("X-User-Id", &uid)
         .json(&json!({"force": true}))
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
     assert_eq!(r.status(), 200);
     let body: Value = r.json().await.unwrap();
     assert!(body["quarantined"].as_i64().unwrap() >= 1);
@@ -659,7 +856,10 @@ async fn test_api_governance_quarantine_edit_log() {
     svc.flush_edit_log().await;
 
     let logs = get_logs_by_op(&pool, &uid, "governance:quarantine").await;
-    assert!(!logs.is_empty(), "API governance should write quarantine edit log");
+    assert!(
+        !logs.is_empty(),
+        "API governance should write quarantine edit log"
+    );
     let row = &logs[0];
     assert_common(row, &uid, "governance:quarantine");
     let payload: Value = serde_json::from_str(row.payload.as_ref().unwrap()).unwrap();
@@ -681,16 +881,25 @@ async fn test_api_purge_edit_log_all_fields() {
     cleanup(&pool, &uid).await;
     ensure_snapshot_quota(&pool).await;
 
-    let r = client.post(format!("{base}/v1/memories"))
+    let r = client
+        .post(format!("{base}/v1/memories"))
         .header("X-User-Id", &uid)
         .json(&json!({"content": "api purge test"}))
-        .send().await.unwrap();
-    let mid = r.json::<Value>().await.unwrap()["memory_id"].as_str().unwrap().to_string();
+        .send()
+        .await
+        .unwrap();
+    let mid = r.json::<Value>().await.unwrap()["memory_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
 
-    let r = client.post(format!("{base}/v1/memories/purge"))
+    let r = client
+        .post(format!("{base}/v1/memories/purge"))
         .header("X-User-Id", &uid)
         .json(&json!({"memory_ids": [mid]}))
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
     assert_eq!(r.status(), 200);
     let body: Value = r.json().await.unwrap();
     assert_eq!(body["purged"], 1);
@@ -710,8 +919,12 @@ async fn test_api_purge_edit_log_all_fields() {
     assert_eq!(row.snapshot_before.as_deref(), Some(snap));
 
     // Verify snapshot exists
-    let exists: Vec<(String,)> = sqlx::query_as("SELECT sname FROM mo_catalog.mo_snapshots WHERE sname = ?")
-        .bind(snap).fetch_all(&pool).await.unwrap();
+    let exists: Vec<(String,)> =
+        sqlx::query_as("SELECT sname FROM mo_catalog.mo_snapshots WHERE sname = ?")
+            .bind(snap)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
     assert_eq!(exists.len(), 1);
 
     cleanup(&pool, &uid).await;
@@ -731,16 +944,22 @@ async fn test_api_purge_topic_edit_log_all_fields() {
     ensure_snapshot_quota(&pool).await;
 
     for c in ["topicZ alpha", "topicZ beta", "unrelated"] {
-        client.post(format!("{base}/v1/memories"))
+        client
+            .post(format!("{base}/v1/memories"))
             .header("X-User-Id", &uid)
             .json(&json!({"content": c}))
-            .send().await.unwrap();
+            .send()
+            .await
+            .unwrap();
     }
 
-    let r = client.post(format!("{base}/v1/memories/purge"))
+    let r = client
+        .post(format!("{base}/v1/memories/purge"))
         .header("X-User-Id", &uid)
         .json(&json!({"topic": "topicZ"}))
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
     let body: Value = r.json().await.unwrap();
     assert_eq!(body["purged"], 2);
 
@@ -754,7 +973,11 @@ async fn test_api_purge_topic_edit_log_all_fields() {
         assert!(row.memory_id.is_some(), "memory_id[{i}]");
         assert!(row.payload.is_none(), "payload[{i}]");
         assert_eq!(row.reason.as_deref(), Some("topic:topicZ"), "reason[{i}]");
-        assert_eq!(row.snapshot_before.as_ref(), Some(snap), "snapshot_before[{i}]");
+        assert_eq!(
+            row.snapshot_before.as_ref(),
+            Some(snap),
+            "snapshot_before[{i}]"
+        );
     }
 
     cleanup(&pool, &uid).await;
@@ -775,12 +998,33 @@ async fn test_edit_id_globally_unique() {
     let r = call("memory_store", json!({"content": "fact A"}), &svc, &uid).await;
     let mid = extract_mid(&r);
     // correct
-    call("memory_correct", json!({"memory_id": mid, "new_content": "fact B"}), &svc, &uid).await;
+    call(
+        "memory_correct",
+        json!({"memory_id": mid, "new_content": "fact B"}),
+        &svc,
+        &uid,
+    )
+    .await;
     // store_batch
-    svc.store_batch(&uid, vec![
-        ("batch1".into(), memoria_core::MemoryType::Semantic, None, None),
-        ("batch2".into(), memoria_core::MemoryType::Semantic, None, None),
-    ]).await.unwrap();
+    svc.store_batch(
+        &uid,
+        vec![
+            (
+                "batch1".into(),
+                memoria_core::MemoryType::Semantic,
+                None,
+                None,
+            ),
+            (
+                "batch2".into(),
+                memoria_core::MemoryType::Semantic,
+                None,
+                None,
+            ),
+        ],
+    )
+    .await
+    .unwrap();
     // purge by topic
     call("memory_purge", json!({"topic": "batch"}), &svc, &uid).await;
     svc.flush_edit_log().await;
@@ -788,7 +1032,11 @@ async fn test_edit_id_globally_unique() {
     let logs = get_logs(&pool, &uid).await;
     assert!(logs.len() >= 4, "expected >=4 logs, got {}", logs.len());
     let ids: std::collections::HashSet<_> = logs.iter().map(|r| &r.edit_id).collect();
-    assert_eq!(ids.len(), logs.len(), "all edit_ids must be globally unique");
+    assert_eq!(
+        ids.len(),
+        logs.len(),
+        "all edit_ids must be globally unique"
+    );
     // All are valid 32-char hex
     for row in &logs {
         assert_eq!(row.edit_id.len(), 32);
@@ -812,23 +1060,38 @@ async fn test_inject_supersede_all_fields() {
     };
 
     // Store original
-    let r = call("memory_store", json!({"content": "Go is a compiled language"}), &svc, &uid).await;
+    let r = call(
+        "memory_store",
+        json!({"content": "Go is a compiled language"}),
+        &svc,
+        &uid,
+    )
+    .await;
     let _mid1 = extract_mid(&r);
     svc.flush_edit_log().await;
 
     // Store near-duplicate with slightly different wording → should supersede
-    let r2 = call("memory_store", json!({"content": "Go is a compiled programming language"}), &svc, &uid).await;
+    let r2 = call(
+        "memory_store",
+        json!({"content": "Go is a compiled programming language"}),
+        &svc,
+        &uid,
+    )
+    .await;
     let mid2 = extract_mid(&r2);
     svc.flush_edit_log().await;
 
     let logs = get_logs_by_op(&pool, &uid, "inject").await;
-    let supersede_logs: Vec<_> = logs.iter()
+    let supersede_logs: Vec<_> = logs
+        .iter()
         .filter(|r| r.reason.as_deref() == Some("store_memory:supersede"))
         .collect();
 
     if supersede_logs.is_empty() {
         // Embeddings weren't close enough — not a test failure, just skip
-        println!("⚠️  supersede not triggered (embeddings not close enough), verifying normal inject");
+        println!(
+            "⚠️  supersede not triggered (embeddings not close enough), verifying normal inject"
+        );
         assert!(logs.len() >= 2);
         cleanup(&pool, &uid).await;
         return;
@@ -836,7 +1099,11 @@ async fn test_inject_supersede_all_fields() {
 
     let row = supersede_logs[0];
     assert_common(row, &uid, "inject");
-    assert_eq!(row.memory_id.as_deref(), Some(mid2.as_str()), "memory_id should be new");
+    assert_eq!(
+        row.memory_id.as_deref(),
+        Some(mid2.as_str()),
+        "memory_id should be new"
+    );
     let payload: Value = serde_json::from_str(row.payload.as_ref().unwrap()).unwrap();
     assert_eq!(payload["content"], "Go is a compiled programming language");
     assert_eq!(payload["type"], "semantic");
@@ -848,7 +1115,11 @@ async fn test_inject_supersede_all_fields() {
         "SELECT superseded_by FROM mem_memories WHERE user_id = ? AND memory_id != ? AND is_active = 0"
     ).bind(&uid).bind(&mid2).fetch_all(&pool).await.unwrap();
     assert!(!old_rows.is_empty(), "old memory should be superseded");
-    assert_eq!(old_rows[0].0.as_deref(), Some(mid2.as_str()), "superseded_by should point to new");
+    assert_eq!(
+        old_rows[0].0.as_deref(),
+        Some(mid2.as_str()),
+        "superseded_by should point to new"
+    );
 
     cleanup(&pool, &uid).await;
     println!("✅ inject supersede: all fields verified + old memory superseded in DB");
@@ -864,7 +1135,13 @@ async fn test_governance_archive_working_edit_log() {
     let (svc, _git, pool, uid) = setup().await;
 
     // Store a working memory and age it beyond the 72h threshold
-    let r = call("memory_store", json!({"content": "debugging auth module", "memory_type": "working"}), &svc, &uid).await;
+    let r = call(
+        "memory_store",
+        json!({"content": "debugging auth module", "memory_type": "working"}),
+        &svc,
+        &uid,
+    )
+    .await;
     let mid = extract_mid(&r);
     svc.flush_edit_log().await;
 
@@ -873,13 +1150,19 @@ async fn test_governance_archive_working_edit_log() {
 
     // Clear previous edit logs
     sqlx::query("DELETE FROM mem_edit_log WHERE user_id = ?")
-        .bind(&uid).execute(&pool).await.unwrap();
+        .bind(&uid)
+        .execute(&pool)
+        .await
+        .unwrap();
 
     // Run full governance via the scheduler strategy
     let store = SqlMemoryStore::connect(&db_url(), test_dim(), Uuid::new_v4().to_string())
-        .await.expect("store");
+        .await
+        .expect("store");
     let strategy = memoria_service::DefaultGovernanceStrategy;
-    let _ = strategy.run(&store, memoria_service::GovernanceTask::Hourly).await;
+    let _ = strategy
+        .run(&store, memoria_service::GovernanceTask::Hourly)
+        .await;
 
     let logs = get_logs_by_op(&pool, &uid, "governance:archive_working").await;
     assert!(!logs.is_empty(), "should have archive_working edit log");
@@ -891,8 +1174,12 @@ async fn test_governance_archive_working_edit_log() {
     assert!(row.reason.as_ref().unwrap().contains("archived"));
 
     // Verify memory is actually archived (is_active = 0)
-    let active: Vec<(i8,)> = sqlx::query_as("SELECT is_active FROM mem_memories WHERE memory_id = ?")
-        .bind(&mid).fetch_all(&pool).await.unwrap();
+    let active: Vec<(i8,)> =
+        sqlx::query_as("SELECT is_active FROM mem_memories WHERE memory_id = ?")
+            .bind(&mid)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
     assert_eq!(active[0].0, 0, "working memory should be archived");
 
     cleanup(&pool, &uid).await;
@@ -916,16 +1203,26 @@ async fn test_governance_cleanup_orphaned_edit_log() {
     // Mark as inactive + superseded (simulates an orphaned incremental)
     sqlx::query(
         "UPDATE mem_memories SET is_active = 0, superseded_by = 'nonexistent', \
-         observed_at = DATE_SUB(NOW(), INTERVAL 30 DAY) WHERE memory_id = ?"
-    ).bind(&mid).execute(&pool).await.unwrap();
+         observed_at = DATE_SUB(NOW(), INTERVAL 30 DAY) WHERE memory_id = ?",
+    )
+    .bind(&mid)
+    .execute(&pool)
+    .await
+    .unwrap();
 
     sqlx::query("DELETE FROM mem_edit_log WHERE user_id = ?")
-        .bind(&uid).execute(&pool).await.unwrap();
+        .bind(&uid)
+        .execute(&pool)
+        .await
+        .unwrap();
 
     let store = SqlMemoryStore::connect(&db_url(), test_dim(), Uuid::new_v4().to_string())
-        .await.expect("store");
+        .await
+        .expect("store");
     let strategy = memoria_service::DefaultGovernanceStrategy;
-    let _ = strategy.run(&store, memoria_service::GovernanceTask::Daily).await;
+    let _ = strategy
+        .run(&store, memoria_service::GovernanceTask::Daily)
+        .await;
 
     let logs = get_logs_by_op(&pool, &uid, "governance:cleanup_orphaned_incrementals").await;
     if !logs.is_empty() {

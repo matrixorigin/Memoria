@@ -52,3 +52,4 @@ memoria-service = { workspace = true }
 memoria-test-utils = { workspace = true }
 ed25519-dalek = { version = "2.1", default-features = false, features = ["std"] }
 uuid = { workspace = true }
+serial_test = "3.4.0"

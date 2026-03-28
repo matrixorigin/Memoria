@@ -968,17 +968,12 @@ impl GraphStore {
     }
 
     /// Deactivate entity links in `mem_memory_entity_links` for a memory_id.
-    pub async fn delete_memory_entity_links(
-        &self,
-        memory_id: &str,
-    ) -> Result<i64, MemoriaError> {
-        let r = sqlx::query(
-            "DELETE FROM mem_memory_entity_links WHERE memory_id = ?",
-        )
-        .bind(memory_id)
-        .execute(&self.pool)
-        .await
-        .map_err(db_err)?;
+    pub async fn delete_memory_entity_links(&self, memory_id: &str) -> Result<i64, MemoriaError> {
+        let r = sqlx::query("DELETE FROM mem_memory_entity_links WHERE memory_id = ?")
+            .bind(memory_id)
+            .execute(&self.pool)
+            .await
+            .map_err(db_err)?;
         Ok(r.rows_affected() as i64)
     }
 
@@ -1116,20 +1111,38 @@ fn row_to_node_inner(r: &sqlx::mysql::MySqlRow, embedding: Option<Vec<f32>>) -> 
         user_id: r.try_get("user_id").unwrap_or_default(),
         node_type: node_type_str.parse().unwrap(),
         content: r.try_get("content").unwrap_or_default(),
-        entity_type: nullable_str_from_row(r.try_get::<Option<String>, _>("entity_type").ok().flatten()),
+        entity_type: nullable_str_from_row(
+            r.try_get::<Option<String>, _>("entity_type").ok().flatten(),
+        ),
         embedding,
-        memory_id: nullable_str_from_row(r.try_get::<Option<String>, _>("memory_id").ok().flatten()),
-        session_id: nullable_str_from_row(r.try_get::<Option<String>, _>("session_id").ok().flatten()),
+        memory_id: nullable_str_from_row(
+            r.try_get::<Option<String>, _>("memory_id").ok().flatten(),
+        ),
+        session_id: nullable_str_from_row(
+            r.try_get::<Option<String>, _>("session_id").ok().flatten(),
+        ),
         confidence: r.try_get::<f32, _>("confidence").unwrap_or(0.75),
         trust_tier: r.try_get("trust_tier").unwrap_or_else(|_| "T3".to_string()),
         importance: r.try_get::<f32, _>("importance").unwrap_or(0.0),
         source_nodes,
-        conflicts_with: nullable_str_from_row(r.try_get::<Option<String>, _>("conflicts_with").ok().flatten()),
-        conflict_resolution: nullable_str_from_row(r.try_get::<Option<String>, _>("conflict_resolution").ok().flatten()),
+        conflicts_with: nullable_str_from_row(
+            r.try_get::<Option<String>, _>("conflicts_with")
+                .ok()
+                .flatten(),
+        ),
+        conflict_resolution: nullable_str_from_row(
+            r.try_get::<Option<String>, _>("conflict_resolution")
+                .ok()
+                .flatten(),
+        ),
         access_count: r.try_get::<i32, _>("access_count").unwrap_or(0),
         cross_session_count: r.try_get::<i32, _>("cross_session_count").unwrap_or(0),
         is_active: r.try_get::<i16, _>("is_active").unwrap_or(1) != 0,
-        superseded_by: nullable_str_from_row(r.try_get::<Option<String>, _>("superseded_by").ok().flatten()),
+        superseded_by: nullable_str_from_row(
+            r.try_get::<Option<String>, _>("superseded_by")
+                .ok()
+                .flatten(),
+        ),
         created_at: r.try_get("created_at").ok(),
     }
 }

@@ -79,7 +79,10 @@ pub async fn list_memories(
 ) -> ApiResult<ListResponse> {
     let limit = q.limit.clamp(1, 500);
     // Cursor is a memory_id; validate it looks like a hex string
-    let cursor = q.cursor.as_deref().filter(|c| c.len() == 32 && c.chars().all(|ch| ch.is_ascii_hexdigit()));
+    let cursor = q
+        .cursor
+        .as_deref()
+        .filter(|c| c.len() == 32 && c.chars().all(|ch| ch.is_ascii_hexdigit()));
     let fetch_limit = limit + 1;
     let mut memories = state
         .service
@@ -555,7 +558,8 @@ pub async fn get_memory_history(
         match row {
             Some(r) => {
                 let mid: String = r.try_get("memory_id").unwrap_or_default();
-                let sup: Option<String> = nullable_str_from_row(r.try_get("superseded_by").ok().flatten());
+                let sup: Option<String> =
+                    nullable_str_from_row(r.try_get("superseded_by").ok().flatten());
                 chain.push(serde_json::json!({
                     "memory_id": mid,
                     "content": r.try_get::<String, _>("content").unwrap_or_default(),

@@ -166,10 +166,18 @@ impl AppState {
         );
         // Start the batched last_used_at flusher using the auth pool
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
-        let h1 = spawn_last_used_flusher(self.last_used_batcher.clone(), pool.clone(), shutdown_rx.clone());
+        let h1 = spawn_last_used_flusher(
+            self.last_used_batcher.clone(),
+            pool.clone(),
+            shutdown_rx.clone(),
+        );
         // Rebuild tool-usage cache from DB, then start the periodic flusher
         self.tool_usage_batcher.rebuild_from_db(&pool).await;
-        let h2 = spawn_tool_usage_flusher(self.tool_usage_batcher.clone(), pool.clone(), shutdown_rx.clone());
+        let h2 = spawn_tool_usage_flusher(
+            self.tool_usage_batcher.clone(),
+            pool.clone(),
+            shutdown_rx.clone(),
+        );
         // Start the call-log flush loop (writes mem_api_call_log every 5 s)
         let h3 = spawn_call_log_flusher(self.call_log_batcher.clone(), pool.clone(), shutdown_rx);
         self.auth_pool = Some(pool);

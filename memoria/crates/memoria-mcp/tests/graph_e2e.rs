@@ -1247,13 +1247,12 @@ async fn test_purge_cleans_entity_links() {
     );
 
     // Verify mem_memory_entity_links cleaned
-    let rows: Vec<(String,)> = sqlx::query_as(
-        "SELECT entity_id FROM mem_memory_entity_links WHERE memory_id = ?",
-    )
-    .bind(&mid)
-    .fetch_all(sql.pool())
-    .await
-    .unwrap();
+    let rows: Vec<(String,)> =
+        sqlx::query_as("SELECT entity_id FROM mem_memory_entity_links WHERE memory_id = ?")
+            .bind(&mid)
+            .fetch_all(sql.pool())
+            .await
+            .unwrap();
     assert!(
         rows.is_empty(),
         "mem_memory_entity_links should be cleaned after purge"
@@ -1382,18 +1381,21 @@ async fn test_correct_cleans_old_graph_node_via_service() {
 
     // Old graph node should be deactivated
     assert!(
-        graph.get_node_by_memory_id(&old_mid).await.unwrap().is_none(),
+        graph
+            .get_node_by_memory_id(&old_mid)
+            .await
+            .unwrap()
+            .is_none(),
         "old graph node should be deactivated after correct"
     );
 
     // Old mem_entity_links should be cleaned
-    let rows: Vec<(String,)> = sqlx::query_as(
-        "SELECT entity_name FROM mem_entity_links WHERE memory_id = ?",
-    )
-    .bind(&old_mid)
-    .fetch_all(sql.pool())
-    .await
-    .unwrap();
+    let rows: Vec<(String,)> =
+        sqlx::query_as("SELECT entity_name FROM mem_entity_links WHERE memory_id = ?")
+            .bind(&old_mid)
+            .fetch_all(sql.pool())
+            .await
+            .unwrap();
     assert!(
         rows.is_empty(),
         "old mem_entity_links should be cleaned after correct"
@@ -1452,10 +1454,7 @@ async fn test_governance_cleans_orphan_graph_data() {
         .await;
 
     let entities: Vec<(&str, &str, &str)> = vec![("orphan_entity", "Orphan Entity", "concept")];
-    let resolved = graph
-        .batch_upsert_entities(&uid, &entities)
-        .await
-        .unwrap();
+    let resolved = graph.batch_upsert_entities(&uid, &entities).await.unwrap();
     let links: Vec<(&str, &str, &str)> = resolved
         .iter()
         .map(|(_, eid)| (mid.as_str(), eid.as_str(), "regex"))
@@ -1469,13 +1468,12 @@ async fn test_governance_cleans_orphan_graph_data() {
 
     // Verify orphans exist
     assert!(graph.get_node_by_memory_id(&mid).await.unwrap().is_some());
-    let el_rows: Vec<(String,)> = sqlx::query_as(
-        "SELECT entity_name FROM mem_entity_links WHERE memory_id = ?",
-    )
-    .bind(&mid)
-    .fetch_all(sql.pool())
-    .await
-    .unwrap();
+    let el_rows: Vec<(String,)> =
+        sqlx::query_as("SELECT entity_name FROM mem_entity_links WHERE memory_id = ?")
+            .bind(&mid)
+            .fetch_all(sql.pool())
+            .await
+            .unwrap();
     assert!(!el_rows.is_empty(), "orphan entity links should exist");
 
     // Run governance cleanup
@@ -1491,13 +1489,12 @@ async fn test_governance_cleans_orphan_graph_data() {
 
     // Verify all cleaned
     assert!(graph.get_node_by_memory_id(&mid).await.unwrap().is_none());
-    let el_rows: Vec<(String,)> = sqlx::query_as(
-        "SELECT entity_name FROM mem_entity_links WHERE memory_id = ?",
-    )
-    .bind(&mid)
-    .fetch_all(sql.pool())
-    .await
-    .unwrap();
+    let el_rows: Vec<(String,)> =
+        sqlx::query_as("SELECT entity_name FROM mem_entity_links WHERE memory_id = ?")
+            .bind(&mid)
+            .fetch_all(sql.pool())
+            .await
+            .unwrap();
     assert!(el_rows.is_empty(), "orphan entity links should be cleaned");
 
     println!(

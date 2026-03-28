@@ -21,7 +21,10 @@
 use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use serde_json::json;
 
-use crate::{auth::{AuthUser, RpcMeta}, state::AppState};
+use crate::{
+    auth::{AuthUser, RpcMeta},
+    state::AppState,
+};
 
 /// Derive a stable tracking path from the JSON-RPC method + params so that
 /// Streamable HTTP calls appear alongside the existing `/v1/*` entries in
@@ -64,7 +67,9 @@ fn tracking_path(method: &str, params: Option<&serde_json::Value>) -> String {
         .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '.')
         .take(64)
         .collect();
-    let has_alnum = sanitized.chars().any(|c| c.is_ascii_alphanumeric() || c == '_');
+    let has_alnum = sanitized
+        .chars()
+        .any(|c| c.is_ascii_alphanumeric() || c == '_');
     if sanitized.is_empty() || !has_alnum {
         return "/mcp/unknown".to_string();
     }
@@ -150,23 +155,18 @@ pub async fn mcp_handler(
     // JSON-RPC 2.0: a Notification is a *valid* Request without an "id" member.
     // The server MUST NOT reply to Notifications.
     if req.get("id").is_none() {
-        let dispatch_result = memoria_mcp::dispatch_http(
-            &method,
-            params,
-            &state.service,
-            &state.git,
-            &auth.user_id,
-        )
-        .await;
+        let dispatch_result =
+            memoria_mcp::dispatch_http(&method, params, &state.service, &state.git, &auth.user_id)
+                .await;
         let rpc = match &dispatch_result {
-            Ok(_)  => RpcMeta::ok(),
+            Ok(_) => RpcMeta::ok(),
             Err(e) => RpcMeta::err(e.code),
         };
         state.call_log_batcher.record_rpc(
             auth.user_id,
             "POST".to_string(),
             track_path,
-            204,   // HTTP 204 No Content — correct for notifications
+            204, // HTTP 204 No Content — correct for notifications
             t.elapsed().as_millis() as u32,
             rpc,
         );
@@ -177,33 +177,38 @@ pub async fn mcp_handler(
 
     // JSON-RPC spec: the HTTP response is always 200 OK, even for RPC errors.
     // Business-level error tracking uses rpc_success / rpc_error_code in the call log.
-    let (response, rpc) =
-        match memoria_mcp::dispatch_http(&method, params, &state.service, &state.git, &auth.user_id)
-            .await
-        {
-            Ok(v) => {
-                let result = if v.is_null() { json!({}) } else { v };
-                (
-                    Json(json!({"jsonrpc": "2.0", "id": id, "result": result})).into_response(),
-                    RpcMeta::ok(),
-                )
-            }
-            Err(e) => (
-                Json(json!({
-                    "jsonrpc": "2.0",
-                    "id": id,
-                    "error": {"code": e.code, "message": e.message}
-                }))
-                .into_response(),
-                RpcMeta::err(e.code),
-            ),
-        };
+    let (response, rpc) = match memoria_mcp::dispatch_http(
+        &method,
+        params,
+        &state.service,
+        &state.git,
+        &auth.user_id,
+    )
+    .await
+    {
+        Ok(v) => {
+            let result = if v.is_null() { json!({}) } else { v };
+            (
+                Json(json!({"jsonrpc": "2.0", "id": id, "result": result})).into_response(),
+                RpcMeta::ok(),
+            )
+        }
+        Err(e) => (
+            Json(json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "error": {"code": e.code, "message": e.message}
+            }))
+            .into_response(),
+            RpcMeta::err(e.code),
+        ),
+    };
 
     state.call_log_batcher.record_rpc(
         auth.user_id,
         "POST".to_string(),
         track_path,
-        200,   // HTTP 200 — always correct for JSON-RPC responses
+        200, // HTTP 200 — always correct for JSON-RPC responses
         t.elapsed().as_millis() as u32,
         rpc,
     );
@@ -221,7 +226,10 @@ mod tests {
     #[test]
     fn tools_call_known_tool() {
         let params = json!({"name": "memory_store", "arguments": {}});
-        assert_eq!(tracking_path("tools/call", Some(&params)), "/mcp/memory_store");
+        assert_eq!(
+            tracking_path("tools/call", Some(&params)),
+            "/mcp/memory_store"
+        );
     }
 
     #[test]
@@ -229,11 +237,7 @@ mod tests {
         // Spot-checks a sample of valid tool names to verify the happy-path formatting.
         // This is NOT an exhaustive registry check — tool names are defined in
         // memoria-mcp and may change independently of this list.
-        for name in &[
-            "memory_store",
-            "memory_search",
-            "memory_purge",
-        ] {
+        for name in &["memory_store", "memory_search", "memory_purge"] {
             let params = json!({"name": name});
             assert_eq!(
                 tracking_path("tools/call", Some(&params)),
@@ -248,7 +252,10 @@ mod tests {
     #[test]
     fn tools_call_missing_name_falls_back() {
         let params = json!({});
-        assert_eq!(tracking_path("tools/call", Some(&params)), "/mcp/tools.call");
+        assert_eq!(
+            tracking_path("tools/call", Some(&params)),
+            "/mcp/tools.call"
+        );
     }
 
     #[test]
@@ -259,7 +266,10 @@ mod tests {
     #[test]
     fn tools_call_empty_name_falls_back() {
         let params = json!({"name": ""});
-        assert_eq!(tracking_path("tools/call", Some(&params)), "/mcp/tools.call");
+        assert_eq!(
+            tracking_path("tools/call", Some(&params)),
+            "/mcp/tools.call"
+        );
     }
 
     // ── tools/call — sanitization ─────────────────────────────────────────────
@@ -270,10 +280,21 @@ mod tests {
         let params = json!({"name": "../../etc/passwd"});
         let path = tracking_path("tools/call", Some(&params));
         // The tool segment (everything after "/mcp/") must contain no '/' or '.'.
-        let segment = path.strip_prefix("/mcp/").expect("path must start with /mcp/");
-        assert!(!segment.contains('/'), "slash must not appear in tool segment: {segment}");
-        assert!(!segment.contains('.'), "dot must not appear in tool segment: {segment}");
-        assert!(!segment.contains(".."), "path traversal must not survive: {segment}");
+        let segment = path
+            .strip_prefix("/mcp/")
+            .expect("path must start with /mcp/");
+        assert!(
+            !segment.contains('/'),
+            "slash must not appear in tool segment: {segment}"
+        );
+        assert!(
+            !segment.contains('.'),
+            "dot must not appear in tool segment: {segment}"
+        );
+        assert!(
+            !segment.contains(".."),
+            "path traversal must not survive: {segment}"
+        );
         // Only alphanumeric + '_' survive → "etcpasswd"
         assert_eq!(path, "/mcp/etcpasswd");
     }
@@ -281,7 +302,10 @@ mod tests {
     #[test]
     fn tools_call_name_only_special_chars_falls_back() {
         let params = json!({"name": "/../"});
-        assert_eq!(tracking_path("tools/call", Some(&params)), "/mcp/tools.call");
+        assert_eq!(
+            tracking_path("tools/call", Some(&params)),
+            "/mcp/tools.call"
+        );
     }
 
     #[test]
@@ -291,7 +315,11 @@ mod tests {
         let path = tracking_path("tools/call", Some(&params));
         // "/mcp/" is 5 chars; the rest must be ≤ 64.
         let segment = path.strip_prefix("/mcp/").unwrap();
-        assert!(segment.len() <= 64, "segment length {} exceeds 64", segment.len());
+        assert!(
+            segment.len() <= 64,
+            "segment length {} exceeds 64",
+            segment.len()
+        );
     }
 
     // ── non-tools/call methods ────────────────────────────────────────────────
@@ -309,7 +337,10 @@ mod tests {
 
     #[test]
     fn unknown_method_sanitized() {
-        assert_eq!(tracking_path("notifications/initialized", None), "/mcp/notifications.initialized");
+        assert_eq!(
+            tracking_path("notifications/initialized", None),
+            "/mcp/notifications.initialized"
+        );
     }
 
     #[test]

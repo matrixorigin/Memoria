@@ -76,11 +76,13 @@ pub async fn http_metrics(
     reg.http.inflight.dec();
 
     // Counter: method|route|status|source
-    reg.http.requests_total
+    reg.http
+        .requests_total
         .inc(&format!("{method}|{route}|{status}|{source}"));
 
     // Histogram: route|source
-    reg.http.request_duration
+    reg.http
+        .request_duration
         .observe(&format!("{route}|{source}"), elapsed);
 
     response

@@ -27,7 +27,7 @@ struct Args {
     /// Concurrent users
     #[arg(long, default_value = "10")]
     users: usize,
-    /// Scenario: session, git, maintenance, burst, all
+    /// Scenario: session, git, maintenance, burst, realistic, all
     #[arg(long, default_value = "all")]
     scenario: String,
     /// Skip preflight checks
@@ -36,6 +36,9 @@ struct Args {
     /// Seed memories per user before load test
     #[arg(long, default_value = "20")]
     seed: usize,
+    /// Target requests per second per user (realistic scenario only, 0 = unlimited)
+    #[arg(long, default_value = "0")]
+    rps: u64,
 }
 
 #[tokio::main]
@@ -645,6 +648,83 @@ async fn burst_loop(c: &ApiClient, duration: Duration) -> Vec<Arc<Stats>> {
     vec![retrieve, store, search]
 }
 
+// ── Scenario 5: Realistic (production traffic distribution) ──────────────────
+//
+// Models real-world MCP traffic: 92% retrieve/search, 7.5% store, 0.5% correct.
+// No artificial think pauses — pure throughput under concurrency.
+// Each user is pre-seeded with M memories, then hammers the API at the given ratio.
+
+async fn realistic_loop(c: &ApiClient, duration: Duration, rps: u64) -> Vec<Arc<Stats>> {
+    let retrieve = Arc::new(Stats::new("retrieve"));
+    let store = Arc::new(Stats::new("store"));
+    let correct = Arc::new(Stats::new("correct"));
+
+    let deadline = Instant::now() + duration;
+    let interval = if rps > 0 {
+        Some(Duration::from_secs_f64(1.0 / rps as f64))
+    } else {
+        None
+    };
+
+    while Instant::now() < deadline {
+        let roll = fastrand::u32(0..1000);
+        match roll {
+            // 92% retrieve/search (0..920)
+            0..920 => {
+                if fastrand::bool() {
+                    c.post(
+                        "/v1/memories/retrieve",
+                        serde_json::json!({"query": rand_pick(QUERIES), "top_k": 5}),
+                        &retrieve,
+                        &[200],
+                    )
+                    .await;
+                } else {
+                    c.post(
+                        "/v1/memories/search",
+                        serde_json::json!({"query": rand_pick(QUERIES), "top_k": 10}),
+                        &retrieve,
+                        &[200],
+                    )
+                    .await;
+                }
+            }
+            // 7.5% store (920..995)
+            920..995 => {
+                c.post(
+                    "/v1/memories",
+                    serde_json::json!({
+                        "content": rand_pick(CONTENTS),
+                        "memory_type": rand_pick(MEMORY_TYPES),
+                    }),
+                    &store,
+                    &[201],
+                )
+                .await;
+            }
+            // 0.5% correct (995..1000)
+            _ => {
+                c.post(
+                    "/v1/memories/correct",
+                    serde_json::json!({
+                        "query": rand_pick(QUERIES),
+                        "new_content": format!("{} [corrected]", rand_pick(CONTENTS)),
+                        "reason": "realistic-bench",
+                    }),
+                    &correct,
+                    &[200],
+                )
+                .await;
+            }
+        }
+
+        if let Some(iv) = interval {
+            tokio::time::sleep(iv).await;
+        }
+    }
+    vec![retrieve, store, correct]
+}
+
 // ── Seed data ────────────────────────────────────────────────────────────────
 
 async fn seed_user(c: &ApiClient, count: usize) {
@@ -915,6 +995,21 @@ async fn run(args: &Args) -> anyhow::Result<()> {
             token,
             seed,
             |c, d| async move { burst_loop(&c, d).await },
+        )
+        .await;
+    }
+
+    if s == "realistic" || s == "all" {
+        let ids: Vec<String> = (0..n).map(|i| format!("lt-real-{i}")).collect();
+        let rps = args.rps;
+        run_scenario(
+            &format!("realistic (92/7.5/0.5 ratio, rps={rps})"),
+            ids,
+            dur,
+            base,
+            token,
+            seed,
+            move |c, d| async move { realistic_loop(&c, d, rps).await },
         )
         .await;
     }

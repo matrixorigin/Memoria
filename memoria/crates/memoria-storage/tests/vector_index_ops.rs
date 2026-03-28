@@ -384,17 +384,26 @@ async fn test_cleanup_tool_results() {
 
     // Old tool_result gone
     let (c,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM mem_memories WHERE memory_id = ?")
-        .bind(&old_id).fetch_one(store.pool()).await.unwrap();
+        .bind(&old_id)
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
     assert_eq!(c, 0, "old tool_result should be deleted");
 
     // Fresh tool_result still there
     let (c,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM mem_memories WHERE memory_id = ?")
-        .bind(&fresh_id).fetch_one(store.pool()).await.unwrap();
+        .bind(&fresh_id)
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
     assert_eq!(c, 1, "fresh tool_result should remain");
 
     // Semantic memory untouched
     let (c,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM mem_memories WHERE memory_id = ?")
-        .bind(&semantic_id).fetch_one(store.pool()).await.unwrap();
+        .bind(&semantic_id)
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
     assert_eq!(c, 1, "semantic memory should remain");
 }
 
@@ -427,12 +436,18 @@ async fn test_cleanup_orphaned_incrementals() {
 
     // Incremental deactivated
     let (active,): (i8,) = sqlx::query_as("SELECT is_active FROM mem_memories WHERE memory_id = ?")
-        .bind(&inc_id).fetch_one(store.pool()).await.unwrap();
+        .bind(&inc_id)
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
     assert_eq!(active, 0, "incremental should be deactivated");
 
     // Normal memory untouched
     let (active,): (i8,) = sqlx::query_as("SELECT is_active FROM mem_memories WHERE memory_id = ?")
-        .bind(&normal_id).fetch_one(store.pool()).await.unwrap();
+        .bind(&normal_id)
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
     assert_eq!(active, 1, "normal memory should remain active");
 }
 
@@ -469,23 +484,34 @@ async fn test_compress_redundant() {
          VALUES (?, ?, 'semantic', 'different', ?, 1, 0.9, '[]', NOW(), NOW(), NOW())"
     ).bind(&id_diff).bind(&uid).bind(&diff_emb).execute(store.pool()).await.unwrap();
 
-    let compressed = store.compress_redundant(&uid, 0.95, 30, 10_000).await.unwrap();
+    let compressed = store
+        .compress_redundant(&uid, 0.95, 30, 10_000)
+        .await
+        .unwrap();
     assert_eq!(compressed, 1, "should compress 1 redundant pair");
 
     // Older duplicate physically deleted
-    let (c,): (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM mem_memories WHERE memory_id = ?"
-    ).bind(&id_old).fetch_one(store.pool()).await.unwrap();
+    let (c,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM mem_memories WHERE memory_id = ?")
+        .bind(&id_old)
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
     assert_eq!(c, 0, "older duplicate should be physically deleted");
 
     // Newer duplicate still active
     let (active,): (i8,) = sqlx::query_as("SELECT is_active FROM mem_memories WHERE memory_id = ?")
-        .bind(&id_new).fetch_one(store.pool()).await.unwrap();
+        .bind(&id_new)
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
     assert_eq!(active, 1, "newer duplicate should remain active");
 
     // Different memory untouched
     let (active,): (i8,) = sqlx::query_as("SELECT is_active FROM mem_memories WHERE memory_id = ?")
-        .bind(&id_diff).fetch_one(store.pool()).await.unwrap();
+        .bind(&id_diff)
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
     assert_eq!(active, 1, "different memory should remain active");
 }
 
@@ -499,13 +525,14 @@ async fn test_cleanup_orphan_branches() {
 
     // Create a sandbox table that looks like an orphan branch
     let (db_name,): (String,) = sqlx::query_as("SELECT DATABASE()")
-        .fetch_one(store.pool()).await.unwrap();
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
     let table_name = format!("memories_sandbox_{}", uuid::Uuid::new_v4().simple());
 
     // Create via DATA BRANCH (the same mechanism the app uses)
-    let create_sql = format!(
-        "DATA BRANCH CREATE TABLE {db_name}.{table_name} FROM {db_name}.mem_memories"
-    );
+    let create_sql =
+        format!("DATA BRANCH CREATE TABLE {db_name}.{table_name} FROM {db_name}.mem_memories");
     let create_result = sqlx::raw_sql(&create_sql).execute(store.pool()).await;
 
     if create_result.is_err() {
@@ -515,9 +542,12 @@ async fn test_cleanup_orphan_branches() {
     }
 
     // Verify table exists
-    let (count,): (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM information_schema.tables WHERE table_name = ?"
-    ).bind(&table_name).fetch_one(store.pool()).await.unwrap();
+    let (count,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM information_schema.tables WHERE table_name = ?")
+            .bind(&table_name)
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
     assert_eq!(count, 1, "sandbox table should exist");
 
     // Clean orphan branches
@@ -525,9 +555,12 @@ async fn test_cleanup_orphan_branches() {
     assert!(cleaned >= 1, "should clean at least 1 orphan branch table");
 
     // Verify table is gone
-    let (count,): (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM information_schema.tables WHERE table_name = ?"
-    ).bind(&table_name).fetch_one(store.pool()).await.unwrap();
+    let (count,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM information_schema.tables WHERE table_name = ?")
+            .bind(&table_name)
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
     assert_eq!(count, 0, "sandbox table should be deleted");
 }
 
@@ -551,16 +584,25 @@ async fn test_health_hygiene_detects_dangling_graph_nodes() {
 
     let result = store.health_hygiene(&uid).await.unwrap();
     let orphan_gn = result["orphan_graph_nodes"].as_i64().unwrap();
-    assert!(orphan_gn >= 1, "should detect dangling graph node (memory physically deleted)");
+    assert!(
+        orphan_gn >= 1,
+        "should detect dangling graph node (memory physically deleted)"
+    );
 
     // Also verify global
     let global = store.health_hygiene_global().await.unwrap();
     let global_gn = global["orphan_graph_nodes"].as_i64().unwrap();
-    assert!(global_gn >= 1, "global should also detect dangling graph node");
+    assert!(
+        global_gn >= 1,
+        "global should also detect dangling graph node"
+    );
 
     // Cleanup
     sqlx::query("DELETE FROM memory_graph_nodes WHERE node_id = ?")
-        .bind(&node_id).execute(store.pool()).await.ok();
+        .bind(&node_id)
+        .execute(store.pool())
+        .await
+        .ok();
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -582,11 +624,17 @@ async fn test_health_hygiene_does_not_misreport_entity_nodes() {
 
     let result = store.health_hygiene(&uid).await.unwrap();
     let orphan_gn = result["orphan_graph_nodes"].as_i64().unwrap();
-    assert_eq!(orphan_gn, 0, "entity node (memory_id=NULL) must not be counted as orphan");
+    assert_eq!(
+        orphan_gn, 0,
+        "entity node (memory_id=NULL) must not be counted as orphan"
+    );
 
     // Cleanup
     sqlx::query("DELETE FROM memory_graph_nodes WHERE node_id = ?")
-        .bind(&node_id).execute(store.pool()).await.ok();
+        .bind(&node_id)
+        .execute(store.pool())
+        .await
+        .ok();
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -618,44 +666,70 @@ async fn test_cleanup_stale_preserves_history_chain() {
     sqlx::query(
         "INSERT INTO mem_memories (memory_id, user_id, memory_type, content, source_event_ids, \
          is_active, observed_at, created_at) \
-         VALUES (?, ?, 'semantic', 'new version', '[]', 1, NOW(), NOW())"
-    ).bind(&new_mid).bind(&uid)
-    .execute(store.pool()).await.unwrap();
+         VALUES (?, ?, 'semantic', 'new version', '[]', 1, NOW(), NOW())",
+    )
+    .bind(&new_mid)
+    .bind(&uid)
+    .execute(store.pool())
+    .await
+    .unwrap();
 
     // Insert a superseded memory (part of version chain) — inactive, old, has superseded_by
     sqlx::query(
         "INSERT INTO mem_memories (memory_id, user_id, memory_type, content, source_event_ids, \
          is_active, superseded_by, updated_at, observed_at, created_at) \
          VALUES (?, ?, 'semantic', 'old version', '[]', 0, ?, \
-         DATE_SUB(NOW(), INTERVAL 48 HOUR), DATE_SUB(NOW(), INTERVAL 48 HOUR), NOW())"
-    ).bind(&old_mid).bind(&uid).bind(&new_mid)
-    .execute(store.pool()).await.unwrap();
+         DATE_SUB(NOW(), INTERVAL 48 HOUR), DATE_SUB(NOW(), INTERVAL 48 HOUR), NOW())",
+    )
+    .bind(&old_mid)
+    .bind(&uid)
+    .bind(&new_mid)
+    .execute(store.pool())
+    .await
+    .unwrap();
 
     // Insert a plain inactive memory (no superseded_by, old enough) — should be deleted
     sqlx::query(
         "INSERT INTO mem_memories (memory_id, user_id, memory_type, content, source_event_ids, \
          is_active, updated_at, observed_at, created_at) \
          VALUES (?, ?, 'semantic', 'plain stale', '[]', 0, \
-         DATE_SUB(NOW(), INTERVAL 48 HOUR), DATE_SUB(NOW(), INTERVAL 48 HOUR), NOW())"
-    ).bind(&plain_mid).bind(&uid)
-    .execute(store.pool()).await.unwrap();
+         DATE_SUB(NOW(), INTERVAL 48 HOUR), DATE_SUB(NOW(), INTERVAL 48 HOUR), NOW())",
+    )
+    .bind(&plain_mid)
+    .bind(&uid)
+    .execute(store.pool())
+    .await
+    .unwrap();
 
     let cleaned = store.cleanup_stale(&uid).await.unwrap();
     assert_eq!(cleaned, 1, "should delete only the plain inactive memory");
 
     // Version chain row preserved
     let (c,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM mem_memories WHERE memory_id = ?")
-        .bind(&old_mid).fetch_one(store.pool()).await.unwrap();
-    assert_eq!(c, 1, "superseded memory must be preserved for history chain");
+        .bind(&old_mid)
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        c, 1,
+        "superseded memory must be preserved for history chain"
+    );
 
     // Plain stale deleted
     let (c,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM mem_memories WHERE memory_id = ?")
-        .bind(&plain_mid).fetch_one(store.pool()).await.unwrap();
+        .bind(&plain_mid)
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
     assert_eq!(c, 0, "plain inactive memory should be deleted");
 
     // Cleanup
     sqlx::query("DELETE FROM mem_memories WHERE memory_id IN (?, ?)")
-        .bind(&old_mid).bind(&new_mid).execute(store.pool()).await.ok();
+        .bind(&old_mid)
+        .bind(&new_mid)
+        .execute(store.pool())
+        .await
+        .ok();
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -674,15 +748,23 @@ async fn test_cleanup_stale_deletes_broken_chain() {
         "INSERT INTO mem_memories (memory_id, user_id, memory_type, content, source_event_ids, \
          is_active, superseded_by, updated_at, observed_at, created_at) \
          VALUES (?, ?, 'semantic', 'broken chain', '[]', 0, ?, \
-         DATE_SUB(NOW(), INTERVAL 48 HOUR), DATE_SUB(NOW(), INTERVAL 48 HOUR), NOW())"
-    ).bind(&broken_mid).bind(&uid).bind(&gone_target)
-    .execute(store.pool()).await.unwrap();
+         DATE_SUB(NOW(), INTERVAL 48 HOUR), DATE_SUB(NOW(), INTERVAL 48 HOUR), NOW())",
+    )
+    .bind(&broken_mid)
+    .bind(&uid)
+    .bind(&gone_target)
+    .execute(store.pool())
+    .await
+    .unwrap();
 
     let cleaned = store.cleanup_stale(&uid).await.unwrap();
     assert_eq!(cleaned, 1, "should delete broken chain row");
 
     let (c,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM mem_memories WHERE memory_id = ?")
-        .bind(&broken_mid).fetch_one(store.pool()).await.unwrap();
+        .bind(&broken_mid)
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
     assert_eq!(c, 0, "broken chain memory should be deleted");
 }
 
@@ -704,25 +786,39 @@ async fn test_cleanup_stale_cascading_broken_chain() {
         "INSERT INTO mem_memories (memory_id, user_id, memory_type, content, source_event_ids, \
          is_active, superseded_by, updated_at, observed_at, created_at) \
          VALUES (?, ?, 'semantic', 'version B', '[]', 0, ?, \
-         DATE_SUB(NOW(), INTERVAL 48 HOUR), DATE_SUB(NOW(), INTERVAL 48 HOUR), NOW())"
-    ).bind(&mid_b).bind(&uid).bind(&mid_c)
-    .execute(store.pool()).await.unwrap();
+         DATE_SUB(NOW(), INTERVAL 48 HOUR), DATE_SUB(NOW(), INTERVAL 48 HOUR), NOW())",
+    )
+    .bind(&mid_b)
+    .bind(&uid)
+    .bind(&mid_c)
+    .execute(store.pool())
+    .await
+    .unwrap();
 
     // A is inactive with superseded_by = B (valid chain, but B will be deleted)
     sqlx::query(
         "INSERT INTO mem_memories (memory_id, user_id, memory_type, content, source_event_ids, \
          is_active, superseded_by, updated_at, observed_at, created_at) \
          VALUES (?, ?, 'semantic', 'version A', '[]', 0, ?, \
-         DATE_SUB(NOW(), INTERVAL 48 HOUR), DATE_SUB(NOW(), INTERVAL 48 HOUR), NOW())"
-    ).bind(&mid_a).bind(&uid).bind(&mid_b)
-    .execute(store.pool()).await.unwrap();
+         DATE_SUB(NOW(), INTERVAL 48 HOUR), DATE_SUB(NOW(), INTERVAL 48 HOUR), NOW())",
+    )
+    .bind(&mid_a)
+    .bind(&uid)
+    .bind(&mid_b)
+    .execute(store.pool())
+    .await
+    .unwrap();
 
     let cleaned = store.cleanup_stale(&uid).await.unwrap();
     assert_eq!(cleaned, 2, "should cascade-delete both A and B");
 
-    let (c,): (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM mem_memories WHERE memory_id IN (?, ?)"
-    ).bind(&mid_a).bind(&mid_b).fetch_one(store.pool()).await.unwrap();
+    let (c,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM mem_memories WHERE memory_id IN (?, ?)")
+            .bind(&mid_a)
+            .bind(&mid_b)
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
     assert_eq!(c, 0, "both chain nodes should be gone");
 }
 
@@ -747,9 +843,15 @@ async fn test_detect_pollution_normal_user() {
     }
 
     let result = store.detect_pollution(&uid, 24).await.unwrap();
-    assert!(!result, "normal user with no supersedes should not be polluted");
+    assert!(
+        !result,
+        "normal user with no supersedes should not be polluted"
+    );
 
     // Cleanup
     sqlx::query("DELETE FROM mem_memories WHERE user_id = ?")
-        .bind(&uid).execute(store.pool()).await.ok();
+        .bind(&uid)
+        .execute(store.pool())
+        .await
+        .ok();
 }
