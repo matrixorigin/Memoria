@@ -1,4 +1,3 @@
-import { spawnSync } from "node:child_process";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
@@ -44,9 +43,6 @@ const MEMORIA_AGENT_GUIDANCE = [
 ].join("\n");
 
 const PLUGIN_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const INSTALLER_SCRIPT = path.join(PLUGIN_ROOT, "scripts", "install-openclaw-memoria.sh");
-const VERIFY_SCRIPT = path.join(PLUGIN_ROOT, "scripts", "verify_plugin_install.mjs");
-const CONNECT_SCRIPT = path.join(PLUGIN_ROOT, "scripts", "connect_openclaw_memoria.mjs");
 
 function resolveOpenClawBinFromProcess(): string {
   return typeof process.argv[1] === "string" && process.argv[1].trim()
@@ -54,104 +50,16 @@ function resolveOpenClawBinFromProcess(): string {
     : "openclaw";
 }
 
-function stripAnsi(value: string): string {
-  return value.replace(/\x1B\[[0-?]*[ -/]*[@-~]/g, "");
-}
-
-function extractConfigPathFromCliOutput(rawOutput: string): string | undefined {
-  const cleanedLines = stripAnsi(rawOutput)
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter(Boolean);
-
-  for (let index = cleanedLines.length - 1; index >= 0; index -= 1) {
-    const line = cleanedLines[index];
-    const directPathMatch = line.match(/(~?\/[^\s]*openclaw\.json)$/);
-    if (directPathMatch?.[1]) {
-      return directPathMatch[1];
-    }
-
-    const embeddedPathMatch = line.match(/((?:~|\/)[^\s]*openclaw\.json)/);
-    if (embeddedPathMatch?.[1]) {
-      return embeddedPathMatch[1];
-    }
-  }
-
-  return undefined;
-}
-
 function resolveOpenClawConfigFile(): string {
-  const explicitConfigPath =
-    typeof process.env.OPENCLAW_CONFIG_PATH === "string" ? process.env.OPENCLAW_CONFIG_PATH.trim() : "";
+  const home = process.env.HOME ?? "";
+  const explicitConfigPath = process.env.OPENCLAW_CONFIG_PATH?.trim() ?? "";
   if (explicitConfigPath) {
-    return explicitConfigPath.replace(/^~(?=$|\/|\\)/, process.env.HOME ?? "~");
+    return explicitConfigPath.replace(/^~(?=$|\/|\\)/, home);
   }
-
-  const openclawBin = resolveOpenClawBinFromProcess();
-  const fromCli = spawnSync(openclawBin, ["config", "file"], {
-    cwd: PLUGIN_ROOT,
-    env: process.env,
-    encoding: "utf8",
-    stdio: ["ignore", "pipe", "pipe"],
-  });
-  const candidate = extractConfigPathFromCliOutput(
-    typeof fromCli.stdout === "string" ? fromCli.stdout : "",
-  );
-  if (fromCli.status === 0 && candidate) {
-    return candidate.replace(/^~(?=$|\/|\\)/, process.env.HOME ?? "~");
-  }
-
-  const openclawHome = typeof process.env.OPENCLAW_HOME === "string" ? process.env.OPENCLAW_HOME : "";
+  const openclawHome = process.env.OPENCLAW_HOME?.trim() ?? "";
   return openclawHome
     ? path.join(openclawHome, ".openclaw", "openclaw.json")
-    : path.join(process.env.HOME ?? "", ".openclaw", "openclaw.json");
-}
-
-function runLocalCommand(
-  command: string,
-  args: string[],
-  options: { env?: NodeJS.ProcessEnv } = {},
-) {
-  const env = options.env ? { ...process.env, ...options.env } : process.env;
-  const result = spawnSync(command, args, {
-    cwd: PLUGIN_ROOT,
-    env,
-    stdio: "inherit",
-  });
-
-  if (result.error) {
-    throw result.error;
-  }
-  if (typeof result.status === "number" && result.status !== 0) {
-    throw new Error(`${path.basename(command)} exited with status ${result.status}`);
-  }
-  if (result.signal) {
-    throw new Error(`${path.basename(command)} terminated by signal ${result.signal}`);
-  }
-}
-
-function isExecutableAvailable(command: string): boolean {
-  const probe = spawnSync(command, ["--version"], {
-    cwd: PLUGIN_ROOT,
-    env: process.env,
-    stdio: ["ignore", "ignore", "ignore"],
-  });
-
-  if (probe.error && "code" in probe.error && probe.error.code === "ENOENT") {
-    return false;
-  }
-  return true;
-}
-
-function assertMemoriaExecutableAvailable(command: string, mode: "cloud" | "local") {
-  if (isExecutableAvailable(command)) {
-    return;
-  }
-  const installHint =
-    "curl -sSL https://raw.githubusercontent.com/matrixorigin/Memoria/main/scripts/install.sh | bash -s -- -y -d ~/.local/bin";
-  throw new Error(
-    `Memoria executable '${command}' was not found. Install Memoria CLI first (${installHint}), rerun setup with --install-memoria, or rerun with --memoria-bin <path>. This plugin uses local memoria CLI as the MCP bridge even in mode=${mode}.`,
-  );
+    : path.join(home, ".openclaw", "openclaw.json");
 }
 
 function objectSchema(
@@ -385,8 +293,6 @@ function buildMemoryPath(memoryId: string): string {
   return `memoria://${memoryId}`;
 }
 
-const EMBEDDED_ONLY_TOOL_NAMES: string[] = [];
-
 const CLI_COMMAND_NAMES = ["memoria", "ltm"] as const;
 
 const MEMORY_TOOL_ALIASES: Record<string, string> = {
@@ -434,7 +340,7 @@ function buildCapabilitiesPayload(config: MemoriaPluginConfig): Record<string, u
     autoObserve: config.autoObserve,
     llmConfigured: Boolean(config.llmApiKey || config.backend === "api"),
     tools: supportedToolNames(),
-    embeddedOnly: [...EMBEDDED_ONLY_TOOL_NAMES],
+    embeddedOnly: [],
     cliCommands: [...CLI_COMMAND_NAMES],
     aliases: MEMORY_TOOL_ALIASES,
     backendFeatures: {
@@ -568,7 +474,7 @@ function shouldLogOnboardingHintOnce(): boolean {
 const plugin = {
   id: "thememoria",
   name: "Memory (Memoria)",
-  description: "Memoria-backed long-term memory plugin for OpenClaw. Supports direct HTTP API mode (no binary) and embedded mode (local Rust CLI).",
+  description: "Memoria-backed long-term memory plugin for OpenClaw. Uses direct HTTP API mode (no binary required).",
   kind: "memory" as const,
   configSchema: memoriaPluginConfigSchema,
 
@@ -1630,364 +1536,6 @@ const plugin = {
           };
         };
 
-        const runMemoriaInstaller = (opts: {
-          memoriaBin?: string;
-          memoriaVersion?: string;
-          memoriaInstallDir?: string;
-          skipMemoriaInstall?: boolean;
-          binaryOnly?: boolean;
-          verify?: boolean;
-        }) => {
-          const args = [
-            INSTALLER_SCRIPT,
-            "--source-dir",
-            PLUGIN_ROOT,
-            "--openclaw-bin",
-            resolveOpenClawBinFromProcess(),
-            "--skip-plugin-install",
-          ];
-          if (opts.memoriaBin) {
-            args.push("--memoria-bin", opts.memoriaBin);
-          }
-          if (opts.memoriaVersion) {
-            args.push("--memoria-version", opts.memoriaVersion);
-          }
-          if (opts.memoriaInstallDir) {
-            args.push("--memoria-install-dir", opts.memoriaInstallDir);
-          }
-          if (opts.skipMemoriaInstall) {
-            args.push("--skip-memoria-install");
-          }
-          if (opts.binaryOnly) {
-            args.push("--binary-only");
-          }
-          if (opts.verify !== false) {
-            args.push("--verify");
-          }
-          runLocalCommand("bash", args);
-        };
-
-        const runMemoriaVerifier = (opts: { memoriaBin?: string }) => {
-          const args = [
-            VERIFY_SCRIPT,
-            "--openclaw-bin",
-            resolveOpenClawBinFromProcess(),
-            "--config-file",
-            resolveOpenClawConfigFile(),
-          ];
-          if (opts.memoriaBin) {
-            args.push("--memoria-bin", opts.memoriaBin);
-          }
-          runLocalCommand("node", args);
-        };
-
-        const runMemoriaConnector = (opts: {
-          configFile: string;
-          mode: "cloud" | "local";
-          apiUrl?: string;
-          apiKey?: string;
-          dbUrl?: string;
-          memoriaBin?: string;
-          userId?: string;
-          embeddingProvider?: string;
-          embeddingModel?: string;
-          embeddingApiKey?: string;
-          embeddingBaseUrl?: string;
-          embeddingDim?: number;
-        }) => {
-          const args = [
-            CONNECT_SCRIPT,
-            "--config-file",
-            opts.configFile,
-            "--mode",
-            opts.mode,
-          ];
-
-          if (opts.apiUrl) {
-            args.push("--api-url", opts.apiUrl);
-          }
-          if (opts.apiKey) {
-            args.push("--api-key", opts.apiKey);
-          }
-          if (opts.dbUrl) {
-            args.push("--db-url", opts.dbUrl);
-          }
-          if (opts.memoriaBin) {
-            args.push("--memoria-executable", opts.memoriaBin);
-          }
-          if (opts.userId) {
-            args.push("--default-user-id", opts.userId);
-          }
-          if (opts.embeddingProvider) {
-            args.push("--embedding-provider", opts.embeddingProvider);
-          }
-          if (opts.embeddingModel) {
-            args.push("--embedding-model", opts.embeddingModel);
-          }
-          if (opts.embeddingApiKey) {
-            args.push("--embedding-api-key", opts.embeddingApiKey);
-          }
-          if (opts.embeddingBaseUrl) {
-            args.push("--embedding-base-url", opts.embeddingBaseUrl);
-          }
-          if (typeof opts.embeddingDim === "number" && Number.isFinite(opts.embeddingDim)) {
-            args.push("--embedding-dim", String(Math.trunc(opts.embeddingDim)));
-          }
-
-          runLocalCommand("node", args);
-        };
-
-        type RawConnectCliOptions = {
-          mode?: unknown;
-          apiUrl?: unknown;
-          apiKey?: unknown;
-          dbUrl?: unknown;
-          memoriaBin?: unknown;
-          memoriaVersion?: unknown;
-          memoriaInstallDir?: unknown;
-          installMemoria?: unknown;
-          userId?: unknown;
-          embeddingProvider?: unknown;
-          embeddingModel?: unknown;
-          embeddingApiKey?: unknown;
-          embeddingBaseUrl?: unknown;
-          embeddingDim?: unknown;
-          skipValidate?: unknown;
-          skipHealthCheck?: unknown;
-        };
-
-        type NormalizedConnectOptions = {
-          mode: "cloud" | "local";
-          apiUrl?: string;
-          apiKey?: string;
-          dbUrl?: string;
-          memoriaBin?: string;
-          memoriaVersion?: string;
-          memoriaInstallDir?: string;
-          installMemoria: boolean;
-          userId?: string;
-          embeddingProvider?: string;
-          embeddingModel?: string;
-          embeddingApiKey?: string;
-          embeddingBaseUrl?: string;
-          embeddingDim?: number;
-          validateConfig: boolean;
-          healthCheck: boolean;
-        };
-
-        const readOptionalCliString = (
-          raw: unknown,
-          opts: { trimTrailingSlashes?: boolean } = {},
-        ): string | undefined => {
-          if (typeof raw !== "string") {
-            return undefined;
-          }
-          const normalized = raw.trim();
-          if (!normalized) {
-            return undefined;
-          }
-          return opts.trimTrailingSlashes ? normalized.replace(/\/+$/, "") : normalized;
-        };
-
-        const readOptionalEnvString = (
-          envName: string,
-          opts: { trimTrailingSlashes?: boolean } = {},
-        ): string | undefined => {
-          const value = readOptionalCliString(process.env[envName], opts);
-          return value;
-        };
-
-        const normalizeConnectOptions = (
-          raw: RawConnectCliOptions,
-          defaultMode: "cloud" | "local" = "cloud",
-        ): NormalizedConnectOptions => {
-          const modeRaw =
-            typeof raw.mode === "string" && raw.mode.trim()
-              ? raw.mode.trim().toLowerCase()
-              : defaultMode;
-          if (modeRaw !== "cloud" && modeRaw !== "local") {
-            throw new Error("mode must be one of: cloud, local");
-          }
-          const mode = modeRaw as "cloud" | "local";
-
-          const apiUrl =
-            readOptionalCliString(raw.apiUrl, { trimTrailingSlashes: true }) ??
-            readOptionalEnvString("MEMORIA_API_URL", { trimTrailingSlashes: true });
-          const apiKey =
-            readOptionalCliString(raw.apiKey) ?? readOptionalEnvString("MEMORIA_API_KEY");
-          const dbUrl =
-            readOptionalCliString(raw.dbUrl) ??
-            readOptionalEnvString("MEMORIA_DB_URL") ??
-            config.dbUrl;
-          const memoriaBin =
-            readOptionalCliString(raw.memoriaBin) ?? readOptionalEnvString("MEMORIA_EXECUTABLE");
-          const memoriaVersion =
-            readOptionalCliString(raw.memoriaVersion) ?? readOptionalEnvString("MEMORIA_RELEASE_TAG");
-          const memoriaInstallDir =
-            readOptionalCliString(raw.memoriaInstallDir) ??
-            readOptionalEnvString("MEMORIA_BINARY_INSTALL_DIR");
-          const installMemoria = raw.installMemoria === true;
-          const userId =
-            readOptionalCliString(raw.userId) ?? readOptionalEnvString("MEMORIA_DEFAULT_USER_ID");
-          const embeddingProvider =
-            readOptionalCliString(raw.embeddingProvider) ??
-            readOptionalEnvString("MEMORIA_EMBEDDING_PROVIDER") ??
-            config.embeddingProvider;
-          const embeddingModel =
-            readOptionalCliString(raw.embeddingModel) ??
-            readOptionalEnvString("MEMORIA_EMBEDDING_MODEL") ??
-            config.embeddingModel;
-          const embeddingApiKey =
-            readOptionalCliString(raw.embeddingApiKey) ??
-            readOptionalEnvString("MEMORIA_EMBEDDING_API_KEY") ??
-            config.embeddingApiKey;
-          const embeddingBaseUrl =
-            readOptionalCliString(raw.embeddingBaseUrl, { trimTrailingSlashes: true }) ??
-            readOptionalEnvString("MEMORIA_EMBEDDING_BASE_URL", { trimTrailingSlashes: true }) ??
-            config.embeddingBaseUrl;
-
-          const embeddingDimRaw = String(raw.embeddingDim ?? "").trim();
-          const parsedEmbeddingDim = Number.parseInt(embeddingDimRaw, 10);
-          if (embeddingDimRaw && !Number.isFinite(parsedEmbeddingDim)) {
-            throw new Error("--embedding-dim must be a valid positive integer");
-          }
-          const embeddingDim = Number.isFinite(parsedEmbeddingDim)
-            ? parsedEmbeddingDim
-            : config.embeddingDim;
-
-          if (mode === "cloud") {
-            if (!apiUrl || !apiKey) {
-              throw new Error(
-                "cloud mode requires api-url and api-key. Example: openclaw memoria setup --mode cloud --api-url <MEMORIA_API_URL> --api-key <MEMORIA_API_KEY>",
-              );
-            }
-          } else if (!dbUrl) {
-            throw new Error(
-              "local mode requires db-url. Example: openclaw memoria setup --mode local --db-url <MATRIXONE_DSN>",
-            );
-          } else if (embeddingProvider !== "local" && !embeddingApiKey) {
-            throw new Error(
-              "local mode requires embedding API key when embedding-provider is not 'local'. Quick start: openclaw memoria setup --mode local --install-memoria --embedding-api-key <EMBEDDING_API_KEY>",
-            );
-          }
-
-          return {
-            mode,
-            apiUrl,
-            apiKey,
-            dbUrl,
-            memoriaBin,
-            memoriaVersion,
-            memoriaInstallDir,
-            installMemoria,
-            userId,
-            embeddingProvider,
-            embeddingModel,
-            embeddingApiKey,
-            embeddingBaseUrl,
-            embeddingDim,
-            validateConfig: raw.skipValidate !== true,
-            healthCheck: raw.skipHealthCheck !== true,
-          };
-        };
-
-        const applyConnectOptions = async (normalized: NormalizedConnectOptions) => {
-          const resolvedConfigFile = resolveOpenClawConfigFile();
-          let memoriaBinForConfig = normalized.memoriaBin;
-          const installDirFallback =
-            normalized.memoriaInstallDir ??
-            (memoriaBinForConfig && memoriaBinForConfig.includes("/")
-              ? path.dirname(memoriaBinForConfig)
-              : path.join(process.env.HOME ?? "", ".local", "bin"));
-          let effectiveMemoriaExecutable = memoriaBinForConfig ?? config.memoriaExecutable;
-
-          if (normalized.mode === "local" && normalized.installMemoria && !isExecutableAvailable(effectiveMemoriaExecutable)) {
-            runMemoriaInstaller({
-              memoriaVersion: normalized.memoriaVersion,
-              memoriaInstallDir: installDirFallback,
-              binaryOnly: true,
-              verify: false,
-            });
-            const installedPath =
-              memoriaBinForConfig && memoriaBinForConfig.includes("/")
-                ? memoriaBinForConfig
-                : path.join(installDirFallback, "memoria");
-            if (isExecutableAvailable(installedPath)) {
-              memoriaBinForConfig = installedPath;
-              effectiveMemoriaExecutable = installedPath;
-            }
-          }
-
-          runMemoriaConnector({
-            configFile: resolvedConfigFile,
-            mode: normalized.mode,
-            apiUrl: normalized.apiUrl,
-            apiKey: normalized.apiKey,
-            dbUrl: normalized.dbUrl,
-            memoriaBin: memoriaBinForConfig,
-            userId: normalized.userId,
-            embeddingProvider: normalized.embeddingProvider,
-            embeddingModel: normalized.embeddingModel,
-            embeddingApiKey: normalized.embeddingApiKey,
-            embeddingBaseUrl: normalized.embeddingBaseUrl,
-            embeddingDim: normalized.embeddingDim,
-          });
-
-          const openclawBin = resolveOpenClawBinFromProcess();
-          const openclawEnv = { OPENCLAW_CONFIG_PATH: resolvedConfigFile };
-
-          if (normalized.validateConfig) {
-            runLocalCommand(openclawBin, ["config", "validate"], { env: openclawEnv });
-          }
-
-          if (normalized.healthCheck) {
-            if (normalized.mode === "cloud") {
-              // API mode: direct HTTP health check, no binary needed
-              const healthUrl = `${normalized.apiUrl}/health/instance`;
-              const controller = new AbortController();
-              const timer = setTimeout(() => controller.abort(), 10_000);
-              try {
-                const resp = await fetch(healthUrl, {
-                  headers: {
-                    "Authorization": `Bearer ${normalized.apiKey}`,
-                    "Content-Type": "application/json",
-                  },
-                  signal: controller.signal,
-                });
-                if (!resp.ok) {
-                  throw new Error(`Health check returned ${resp.status}: ${await resp.text()}`);
-                }
-                const data = await resp.json();
-                printJson({ healthCheck: "ok", ...data });
-              } catch (error) {
-                throw new Error(
-                  `Health check failed against ${healthUrl}: ${error instanceof Error ? error.message : String(error)}`,
-                );
-              } finally {
-                clearTimeout(timer);
-              }
-            } else {
-              assertMemoriaExecutableAvailable(effectiveMemoriaExecutable, normalized.mode);
-              const healthArgs = ["memoria", "health"];
-              if (normalized.userId) {
-                healthArgs.push("--user-id", normalized.userId);
-              }
-              runLocalCommand(openclawBin, healthArgs, { env: openclawEnv });
-            }
-          }
-
-          printJson({
-            ok: true,
-            mode: normalized.mode,
-            configFile: resolvedConfigFile,
-            validated: normalized.validateConfig,
-            healthChecked: normalized.healthCheck,
-            next: normalized.healthCheck
-              ? "Connected and health-checked."
-              : "Config updated. Run `openclaw memoria health` to verify.",
-          });
-        };
-
         memoria
           .command("health")
           .description("Check Memoria connectivity")
@@ -2091,88 +1639,50 @@ const plugin = {
           }));
 
         memoria
-          .command("install")
-          .description("Install or repair the local Memoria runtime and plugin config")
-          .option("--memoria-bin <path>", "Use an existing memoria executable")
-          .option("--memoria-version <tag>", "Rust Memoria release tag to install")
-          .option("--memoria-install-dir <path>", "Where to install memoria if it is missing")
-          .option("--skip-memoria-install", "Require an existing memoria executable", false)
-          .option("--no-verify", "Skip post-install verification")
-          .action(withCliClient(async (opts) => {
-            runMemoriaInstaller({
-              memoriaBin:
-                typeof opts.memoriaBin === "string" && opts.memoriaBin.trim()
-                  ? opts.memoriaBin.trim()
-                  : undefined,
-              memoriaVersion:
-                typeof opts.memoriaVersion === "string" && opts.memoriaVersion.trim()
-                  ? opts.memoriaVersion.trim()
-                  : undefined,
-              memoriaInstallDir:
-                typeof opts.memoriaInstallDir === "string" && opts.memoriaInstallDir.trim()
-                  ? opts.memoriaInstallDir.trim()
-                  : undefined,
-              skipMemoriaInstall: Boolean(opts.skipMemoriaInstall),
-              verify: opts.verify !== false,
-            });
-          }));
-
-        memoria
-          .command("verify")
-          .description("Validate the current Memoria plugin install and backend status")
-          .option("--memoria-bin <path>", "Use an explicit memoria executable for verification")
-          .action(withCliClient(async (opts) => {
-            runMemoriaVerifier({
-              memoriaBin:
-                typeof opts.memoriaBin === "string" && opts.memoriaBin.trim()
-                  ? opts.memoriaBin.trim()
-                  : undefined,
-            });
-          }));
-
-        memoria
           .command("setup")
-          .description("Recommended onboarding entrypoint: configure cloud/local backend then validate")
-          .option("--mode <cloud|local>", "Backend mode to configure", "cloud")
-          .option("--api-url <url>", "Memoria API URL (required for mode=cloud)")
-          .option("--api-key <token>", "Memoria API token (required for mode=cloud)")
-          .option("--db-url <dsn>", "MatrixOne DSN (required for mode=local)")
-          .option("--memoria-bin <path>", "Path to memoria executable to pin in plugin config")
-          .option("--install-memoria", "Install memoria binary automatically if it is missing", false)
-          .option("--memoria-version <tag>", "Rust Memoria release tag to install when --install-memoria")
-          .option("--memoria-install-dir <path>", "Install directory for memoria when --install-memoria")
+          .description("Configure Memoria cloud API backend")
+          .option("--mode <mode>", "Backend mode (only 'cloud' is supported)", "cloud")
+          .option("--api-url <url>", "Memoria API URL")
+          .option("--api-key <token>", "Memoria API token")
           .option("--user-id <user>", "Default Memoria user id")
-          .option("--embedding-provider <provider>", "Embedding provider for mode=local")
-          .option("--embedding-model <model>", "Embedding model for mode=local")
-          .option("--embedding-api-key <key>", "Embedding API key for mode=local")
-          .option("--embedding-base-url <url>", "Embedding API base URL for mode=local")
-          .option("--embedding-dim <n>", "Embedding dimensions for mode=local")
-          .option("--skip-validate", "Skip `openclaw config validate`", false)
-          .option("--skip-health-check", "Skip `openclaw memoria health`", false)
           .action(withCliClient(async (opts) => {
-            const normalized = normalizeConnectOptions(opts as RawConnectCliOptions, "cloud");
-            await applyConnectOptions(normalized);
-          }));
-
-        memoria
-          .command("connect")
-          .description("Configure cloud/local Memoria backend in OpenClaw config")
-          .option("--mode <cloud|local>", "Backend mode to configure", "cloud")
-          .option("--api-url <url>", "Memoria API URL (required for mode=cloud)")
-          .option("--api-key <token>", "Memoria API token (required for mode=cloud)")
-          .option("--db-url <dsn>", "MatrixOne DSN (required for mode=local)")
-          .option("--memoria-bin <path>", "Path to memoria executable to pin in plugin config")
-          .option("--user-id <user>", "Default Memoria user id")
-          .option("--embedding-provider <provider>", "Embedding provider for mode=local")
-          .option("--embedding-model <model>", "Embedding model for mode=local")
-          .option("--embedding-api-key <key>", "Embedding API key for mode=local")
-          .option("--embedding-base-url <url>", "Embedding API base URL for mode=local")
-          .option("--embedding-dim <n>", "Embedding dimensions for mode=local")
-          .option("--skip-validate", "Skip `openclaw config validate`", false)
-          .option("--skip-health-check", "Skip `openclaw memoria health`", false)
-          .action(withCliClient(async (opts) => {
-            const normalized = normalizeConnectOptions(opts as RawConnectCliOptions, "cloud");
-            await applyConnectOptions(normalized);
+            const mode = typeof opts.mode === "string" ? opts.mode.trim().toLowerCase() : "cloud";
+            if (mode !== "cloud") {
+              throw new Error("Only cloud mode is supported. Example: openclaw memoria setup --mode cloud --api-url <URL> --api-key <KEY>");
+            }
+            const apiUrl = typeof opts.apiUrl === "string" ? opts.apiUrl.trim().replace(/\/+$/, "") : "";
+            const apiKey = typeof opts.apiKey === "string" ? opts.apiKey.trim() : "";
+            if (!apiUrl || !apiKey) {
+              throw new Error("--api-url and --api-key are required. Example: openclaw memoria setup --mode cloud --api-url <URL> --api-key <KEY>");
+            }
+            const userId = typeof opts.userId === "string" && opts.userId.trim() ? opts.userId.trim() : undefined;
+            const configFile = resolveOpenClawConfigFile();
+            const fs = await import("node:fs");
+            let data: Record<string, unknown> = {};
+            if (fs.existsSync(configFile)) {
+              data = JSON.parse(fs.readFileSync(configFile, "utf8"));
+            } else {
+              const dir = path.dirname(configFile);
+              fs.mkdirSync(dir, { recursive: true });
+            }
+            const plugins = (data.plugins ?? {}) as Record<string, unknown>;
+            const entries = (plugins.entries ?? {}) as Record<string, unknown>;
+            const entry = (entries.thememoria ?? {}) as Record<string, unknown>;
+            const pluginConfig = (entry.config ?? {}) as Record<string, unknown>;
+            pluginConfig.backend = "api";
+            pluginConfig.apiUrl = apiUrl;
+            pluginConfig.apiKey = apiKey;
+            if (userId) pluginConfig.defaultUserId = userId;
+            entry.enabled = true;
+            entry.config = pluginConfig;
+            entries.thememoria = entry;
+            plugins.entries = entries;
+            const slots = (plugins.slots ?? {}) as Record<string, unknown>;
+            slots.memory = "thememoria";
+            plugins.slots = slots;
+            data.plugins = plugins;
+            fs.writeFileSync(configFile, `${JSON.stringify(data, null, 2)}\n`, "utf8");
+            printJson({ ok: true, configFile, apiUrl, apiKeySet: true });
           }));
 
         ltm
