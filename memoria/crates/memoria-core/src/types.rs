@@ -2,9 +2,16 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-/// Memory type — must have exactly 6 variants matching Python implementation.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+/// Memory type classification.
+///
+/// The built-in variants cover standard agent memory categories.
+/// `Custom(String)` allows downstream applications to define their own
+/// domain-specific types (e.g. `brand_theme`, `layout_catalog`) without
+/// requiring changes to Memoria itself.
+///
+/// Custom types are stored as-is in the database `memory_type VARCHAR(64)`
+/// column and participate in retrieval filtering just like built-in types.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum MemoryType {
     Semantic,
     Working,
@@ -12,6 +19,28 @@ pub enum MemoryType {
     Profile,
     ToolResult,
     Procedural,
+    /// Application-defined memory type. The inner string is stored verbatim.
+    Custom(String),
+}
+
+impl MemoryType {
+    /// Returns `true` for the six built-in variants, `false` for `Custom`.
+    pub fn is_builtin(&self) -> bool {
+        !matches!(self, MemoryType::Custom(_))
+    }
+}
+
+impl Serialize for MemoryType {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for MemoryType {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        Ok(s.parse().expect("MemoryType::from_str is infallible"))
+    }
 }
 
 impl std::fmt::Display for MemoryType {
@@ -23,23 +52,24 @@ impl std::fmt::Display for MemoryType {
             MemoryType::Profile => "profile",
             MemoryType::ToolResult => "tool_result",
             MemoryType::Procedural => "procedural",
+            MemoryType::Custom(name) => name.as_str(),
         };
         write!(f, "{s}")
     }
 }
 
 impl std::str::FromStr for MemoryType {
-    type Err = crate::MemoriaError;
+    type Err = std::convert::Infallible;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "semantic" => Ok(MemoryType::Semantic),
-            "working" => Ok(MemoryType::Working),
-            "episodic" => Ok(MemoryType::Episodic),
-            "profile" => Ok(MemoryType::Profile),
-            "tool_result" => Ok(MemoryType::ToolResult),
-            "procedural" => Ok(MemoryType::Procedural),
-            other => Err(crate::MemoriaError::InvalidMemoryType(other.to_string())),
-        }
+        Ok(match s {
+            "semantic" => MemoryType::Semantic,
+            "working" => MemoryType::Working,
+            "episodic" => MemoryType::Episodic,
+            "profile" => MemoryType::Profile,
+            "tool_result" => MemoryType::ToolResult,
+            "procedural" => MemoryType::Procedural,
+            other => MemoryType::Custom(other.to_string()),
+        })
     }
 }
 
@@ -142,20 +172,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_memory_type_has_six_variants() {
-        let types = [
-            MemoryType::Semantic,
-            MemoryType::Working,
-            MemoryType::Episodic,
-            MemoryType::Profile,
-            MemoryType::ToolResult,
-            MemoryType::Procedural,
-        ];
-        assert_eq!(types.len(), 6);
-    }
-
-    #[test]
-    fn test_memory_type_roundtrip() {
+    fn test_builtin_types_roundtrip() {
         for (s, expected) in [
             ("semantic", MemoryType::Semantic),
             ("working", MemoryType::Working),
@@ -167,7 +184,25 @@ mod tests {
             let parsed: MemoryType = s.parse().unwrap();
             assert_eq!(parsed, expected);
             assert_eq!(parsed.to_string(), s);
+            assert!(parsed.is_builtin());
         }
+    }
+
+    #[test]
+    fn test_custom_type_roundtrip() {
+        let parsed: MemoryType = "brand_theme".parse().unwrap();
+        assert_eq!(parsed, MemoryType::Custom("brand_theme".to_string()));
+        assert_eq!(parsed.to_string(), "brand_theme");
+        assert!(!parsed.is_builtin());
+    }
+
+    #[test]
+    fn test_custom_type_serde_roundtrip() {
+        let mt = MemoryType::Custom("layout_catalog".to_string());
+        let json = serde_json::to_string(&mt).unwrap();
+        assert_eq!(json, "\"layout_catalog\"");
+        let back: MemoryType = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, mt);
     }
 
     #[test]

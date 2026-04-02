@@ -212,7 +212,7 @@ fn default_strategy() -> String {
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 pub fn parse_memory_type(s: &str) -> Result<MemoryType, String> {
-    MemoryType::from_str(s).map_err(|e| e.to_string())
+    Ok(s.parse::<MemoryType>().unwrap())
 }
 
 pub fn parse_trust_tier(s: &str) -> Result<TrustTier, String> {
