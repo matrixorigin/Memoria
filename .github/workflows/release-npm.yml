@@ -1,14 +1,13 @@
 name: Release OpenClaw npm Package
 
-# Trigger: push a tag like openclaw-v*.*.* or run manually.
+# Version is determined automatically from npm registry.
+# Default: patch bump from latest published version.
+# Override: provide an explicit version string (e.g. 0.5.0, 1.0.0).
 on:
-  push:
-    tags:
-      - 'openclaw-v*.*.*'
   workflow_dispatch:
     inputs:
       version:
-        description: 'Version to publish (e.g. 0.4.3). Leave empty to publish current package.json version.'
+        description: 'Explicit version to publish (e.g. 0.5.0). Leave empty for auto patch bump.'
         required: false
         type: string
 
@@ -24,8 +23,6 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
-          cache: 'npm'
-          cache-dependency-path: plugins/openclaw/package-lock.json
       - run: rm -f package-lock.json && npm install
       - run: npm test
 
@@ -48,18 +45,29 @@ jobs:
       - name: Install dependencies
         run: rm -f package-lock.json && npm install
 
-      - name: Set version (if provided)
-        if: inputs.version != ''
-        run: npm version ${{ inputs.version }} --no-git-tag-version
+      - name: Determine next version
+        id: version
+        run: |
+          EXPLICIT="${{ inputs.version }}"
+          if [ -n "$EXPLICIT" ]; then
+            echo "next=$EXPLICIT" >> "$GITHUB_OUTPUT"
+            echo "Using explicit version: $EXPLICIT"
+          else
+            CURRENT=$(npm view @matrixorigin/thememoria version 2>/dev/null || echo "0.0.0")
+            echo "Current npm version: $CURRENT"
+            # Bump patch: 0.4.3 -> 0.4.4
+            NEXT=$(node -e "const [ma,mi,pa] = '${CURRENT}'.split('.').map(Number); console.log(ma+'.'+mi+'.'+(pa+1))")
+            echo "next=$NEXT" >> "$GITHUB_OUTPUT"
+            echo "Auto patch bump: $CURRENT -> $NEXT"
+          fi
+
+      - name: Set version in package.json
+        run: npm version ${{ steps.version.outputs.next }} --no-git-tag-version
 
       - name: Publish
         run: npm publish --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
-      - name: Get published version
-        id: pkg
-        run: echo "version=$(node -p 'require("./package.json").version')" >> "$GITHUB_OUTPUT"
-
       - name: Summary
-        run: echo "### Published @matrixorigin/thememoria@${{ steps.pkg.outputs.version }} ✅" >> "$GITHUB_STEP_SUMMARY"
+        run: echo "### Published @matrixorigin/thememoria@${{ steps.version.outputs.next }} ✅" >> "$GITHUB_STEP_SUMMARY"

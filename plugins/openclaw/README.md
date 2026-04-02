@@ -212,3 +212,24 @@ Removes the plugin entry, tool policy additions, managed skills, and the default
 - Plugin manifest and config use `memoriaExecutable` for embedded mode
 - Installer/uninstaller are pure shell + Node, no Python dependency
 - No bundled Python runtime
+
+
+## Publishing to npm
+
+Version is managed automatically by CI. **Do not manually edit the version in `package.json`.**
+
+The workflow queries npm for the latest published version and auto-bumps patch by default.
+
+```bash
+# Patch release (e.g. 0.4.3 → 0.4.4) — most common
+gh workflow run release-npm.yml --repo matrixorigin/Memoria
+
+# Explicit version for minor/major releases
+gh workflow run release-npm.yml --repo matrixorigin/Memoria -f version=0.5.0
+```
+
+After publishing, users can upgrade with:
+
+```bash
+openclaw plugins install @matrixorigin/thememoria
+```
