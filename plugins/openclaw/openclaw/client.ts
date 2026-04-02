@@ -1,5 +1,3 @@
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { createInterface, type Interface as ReadlineInterface } from "node:readline";
 import type {
   MemoriaMemoryType,
   MemoriaPluginConfig,
@@ -63,30 +61,11 @@ export type MemoriaStatsResponse = {
   limitations?: string[];
 };
 
-type JsonRpcError = {
-  code?: number;
-  message?: string;
-};
-
-type JsonRpcResponse = {
-  id?: number | null;
-  result?: unknown;
-  error?: JsonRpcError;
-};
-
-type PendingRequest = {
-  reject: (error: Error) => void;
-  resolve: (value: unknown) => void;
-  timer: NodeJS.Timeout;
-};
-
 type McpContentBlock = {
   type?: string;
   text?: string;
 };
 
-const MCP_PROTOCOL_VERSION = "2024-11-05";
-const PLUGIN_VERSION = "0.4.0";
 const MEMORY_LINE_RE = /^\[([^\]]+)\] \(([^)]+)\) ?([\s\S]*)$/;
 
 function asRecord(value: unknown): Record<string, unknown> | null {
@@ -316,230 +295,8 @@ function parseGenericResult(text: string): Record<string, unknown> {
   return parseJsonText(text) ?? { message: text };
 }
 
-class MemoriaMcpSession {
-  private child: ChildProcessWithoutNullStreams | null = null;
-  private stdoutReader: ReadlineInterface | null = null;
-  private initialized: Promise<void> | null = null;
-  private nextId = 1;
-  private readonly pending = new Map<number, PendingRequest>();
-  private readonly stderrLines: string[] = [];
-
-  constructor(
-    private readonly config: MemoriaPluginConfig,
-    private readonly userId: string,
-  ) {}
-
-  isAlive(): boolean {
-    return Boolean(this.child && this.child.exitCode === null && !this.child.killed);
-  }
-
-  async callTool(name: string, args: Record<string, unknown>): Promise<unknown> {
-    await this.ensureInitialized();
-    return this.request("tools/call", {
-      name,
-      arguments: args,
-    });
-  }
-
-  close() {
-    this.stdoutReader?.close();
-    this.stdoutReader = null;
-    if (this.child && this.child.exitCode === null && !this.child.killed) {
-      this.child.kill("SIGTERM");
-    }
-    this.failPending(new Error("Memoria MCP session closed."));
-    this.child = null;
-    this.initialized = null;
-  }
-
-  private async ensureInitialized(): Promise<void> {
-    if (this.isAlive() && this.initialized) {
-      return this.initialized;
-    }
-    this.initialized = this.start();
-    try {
-      await this.initialized;
-    } catch (error) {
-      this.initialized = null;
-      throw error;
-    }
-  }
-
-  private async start(): Promise<void> {
-    const child = spawn(this.config.memoriaExecutable, this.buildArgs(), {
-      cwd: process.cwd(),
-      env: this.buildEnv(),
-      stdio: ["pipe", "pipe", "pipe"],
-    });
-    this.child = child;
-
-    this.stdoutReader = createInterface({ input: child.stdout });
-    this.stdoutReader.on("line", (line) => {
-      this.handleStdout(line);
-    });
-
-    child.stderr.setEncoding("utf8");
-    child.stderr.on("data", (chunk: string) => {
-      for (const line of chunk.split(/\r?\n/)) {
-        const trimmed = line.trim();
-        if (!trimmed) {
-          continue;
-        }
-        this.stderrLines.push(trimmed);
-        if (this.stderrLines.length > 20) {
-          this.stderrLines.shift();
-        }
-      }
-    });
-
-    child.on("error", (error) => {
-      this.failPending(
-        new Error(`Failed to start memoria executable '${this.config.memoriaExecutable}': ${error.message}`),
-      );
-      this.child = null;
-      this.initialized = null;
-    });
-
-    child.on("close", (code, signal) => {
-      this.stdoutReader?.close();
-      this.stdoutReader = null;
-      const tail = this.stderrLines.length > 0 ? ` stderr: ${this.stderrLines.join(" | ")}` : "";
-      this.failPending(
-        new Error(
-          `Memoria MCP exited for user '${this.userId}' (code=${String(code)} signal=${String(signal)}).${tail}`,
-        ),
-      );
-      this.child = null;
-      this.initialized = null;
-    });
-
-    await this.request("initialize", {
-      protocolVersion: MCP_PROTOCOL_VERSION,
-      capabilities: {},
-      clientInfo: {
-        name: "openclaw-memoria",
-        version: PLUGIN_VERSION,
-      },
-    });
-    this.notify("notifications/initialized");
-  }
-
-  private buildArgs(): string[] {
-    const args = ["mcp"];
-    // MemoriaMcpSession is only used for embedded mode now.
-    // API mode uses MemoriaHttpTransport directly.
-    args.push("--db-url", this.config.dbUrl);
-    args.push("--user", this.userId);
-    return args;
-  }
-
-  private buildEnv(): NodeJS.ProcessEnv {
-    const env: NodeJS.ProcessEnv = { ...process.env };
-    if (this.config.backend === "embedded") {
-      // Embedded mode must not inherit remote-mode overrides from the shell.
-      delete env.MEMORIA_API_URL;
-      delete env.MEMORIA_TOKEN;
-      env.EMBEDDING_PROVIDER = this.config.embeddingProvider;
-      env.EMBEDDING_MODEL = this.config.embeddingModel;
-      if (this.config.embeddingBaseUrl) {
-        env.EMBEDDING_BASE_URL = this.config.embeddingBaseUrl;
-      }
-      if (this.config.embeddingApiKey) {
-        env.EMBEDDING_API_KEY = this.config.embeddingApiKey;
-      }
-      if (typeof this.config.embeddingDim === "number") {
-        env.EMBEDDING_DIM = String(this.config.embeddingDim);
-      }
-      if (this.config.llmApiKey) {
-        env.LLM_API_KEY = this.config.llmApiKey;
-      }
-      if (this.config.llmBaseUrl) {
-        env.LLM_BASE_URL = this.config.llmBaseUrl;
-      }
-      if (this.config.llmModel) {
-        env.LLM_MODEL = this.config.llmModel;
-      }
-    }
-    return env;
-  }
-
-  private handleStdout(rawLine: string) {
-    const line = rawLine.trim();
-    if (!line) {
-      return;
-    }
-
-    const parsed = tryParseJson(line);
-    const response = asRecord(parsed) as JsonRpcResponse | null;
-    if (!response || typeof response.id !== "number") {
-      return;
-    }
-
-    const pending = this.pending.get(response.id);
-    if (!pending) {
-      return;
-    }
-
-    this.pending.delete(response.id);
-    clearTimeout(pending.timer);
-
-    if (response.error?.message) {
-      pending.reject(new Error(response.error.message));
-      return;
-    }
-
-    pending.resolve(response.result);
-  }
-
-  private notify(method: string, params?: Record<string, unknown>) {
-    if (!this.child) {
-      return;
-    }
-    this.child.stdin.write(
-      `${JSON.stringify({
-        jsonrpc: "2.0",
-        method,
-        ...(params ? { params } : {}),
-      })}\n`,
-    );
-  }
-
-  private request(method: string, params?: Record<string, unknown>): Promise<unknown> {
-    if (!this.child) {
-      return Promise.reject(new Error("Memoria MCP process is not running."));
-    }
-
-    const id = this.nextId++;
-    return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        this.pending.delete(id);
-        reject(new Error(`Memoria MCP request timed out after ${this.config.timeoutMs}ms: ${method}`));
-        this.close();
-      }, this.config.timeoutMs);
-
-      this.pending.set(id, { resolve, reject, timer });
-      this.child!.stdin.write(
-        `${JSON.stringify({
-          jsonrpc: "2.0",
-          id,
-          method,
-          ...(params ? { params } : {}),
-        })}\n`,
-      );
-    });
-  }
-
-  private failPending(error: Error) {
-    for (const pending of this.pending.values()) {
-      clearTimeout(pending.timer);
-      pending.reject(error);
-    }
-    this.pending.clear();
-  }
-}
-
 export class MemoriaClient {
-  private readonly sessions = new Map<string, MemoriaMcpSession | MemoriaHttpTransport>();
+  private readonly sessions = new Map<string, MemoriaHttpTransport>();
   private readonly memoryCache = new Map<string, MemoriaMemoryRecord>();
 
   constructor(private readonly config: MemoriaPluginConfig) {}
@@ -552,21 +309,13 @@ export class MemoriaClient {
   }
 
   async health(userId: string) {
-    if (this.config.backend === "api") {
-      const transport = this.getSession(userId) as MemoriaHttpTransport;
-      const result = await transport.healthCheck();
-      return {
-        status: result.status,
-        mode: this.config.backend,
-        instance_id: result.instance_id,
-        db: result.db,
-        warnings: [],
-      };
-    }
-    await this.callToolText(userId, "memory_list", { limit: 1 });
+    const transport = this.getSession(userId);
+    const result = await transport.healthCheck();
     return {
-      status: "ok",
+      status: result.status,
       mode: this.config.backend,
+      instance_id: result.instance_id,
+      db: result.db,
       warnings: [],
     };
   }
@@ -872,14 +621,7 @@ export class MemoriaClient {
   }
 
   async rebuildIndex(table: string) {
-    if (this.config.backend === "api") {
-      return { message: "rebuild_index is managed by the cloud service and not available via API." };
-    }
-    return parseGenericResult(
-      await this.callToolText(this.config.defaultUserId, "memory_rebuild_index", {
-        table,
-      }),
-    );
+    return { message: "rebuild_index is managed by the cloud service and not available via API." };
   }
 
   async observe(params: {
@@ -1026,20 +768,14 @@ export class MemoriaClient {
     throw new Error(`Memoria tool '${name}' returned no text content.`);
   }
 
-  private getSession(userId: string): MemoriaMcpSession | MemoriaHttpTransport {
-    const key = `${this.config.backend}:${userId}`;
+  private getSession(userId: string): MemoriaHttpTransport {
+    const key = userId;
     const existing = this.sessions.get(key);
     if (existing?.isAlive()) {
       return existing;
     }
     existing?.close();
-
-    let created: MemoriaMcpSession | MemoriaHttpTransport;
-    if (this.config.backend === "api") {
-      created = new MemoriaHttpTransport(this.config, userId);
-    } else {
-      created = new MemoriaMcpSession(this.config, userId);
-    }
+    const created = new MemoriaHttpTransport(this.config, userId);
     this.sessions.set(key, created);
     return created;
   }

@@ -1,7 +1,7 @@
 {
   "name": "@matrixorigin/thememoria",
   "version": "0.4.2",
-  "description": "OpenClaw memory plugin that uses the Rust Memoria CLI/API for embedded and remote backends.",
+  "description": "OpenClaw memory plugin that uses the Memoria cloud API.",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/matrixorigin/Memoria.git"
@@ -22,7 +22,6 @@
   "type": "module",
   "files": [
     "README.md",
-    "scripts/",
     "skills/",
     "openclaw/",
     "openclaw.plugin.json"
