@@ -113,6 +113,14 @@ struct VisibleSnapshot {
     registered: bool,
 }
 
+#[derive(Debug, Clone)]
+struct ReplaceCandidate {
+    main_memory_id: String,
+    branch_memory_id: String,
+    replacement_content: String,
+    conflict_distance: f64,
+}
+
 fn milestone_internal(name: &str) -> Option<String> {
     if let Some(rest) = name.strip_prefix("auto:") {
         Some(format!("{MILESTONE_PREFIX}{rest}"))
@@ -697,64 +705,24 @@ pub async fn call(
                 .map_err(db_err)?
                 .rows_affected();
 
-            // Conflict count: branch memories with real embeddings that have semantic match in main
-            let conflict_where = format!(
-                "FROM {table_name} b \
-                 WHERE b.user_id = ? AND b.is_active = 1 \
-                   AND b.embedding IS NOT NULL AND vector_dims(b.embedding) > 0 \
-                   AND NOT EXISTS (SELECT 1 FROM mem_memories m2 WHERE m2.memory_id = b.memory_id AND m2.is_active = 1) \
-                   AND EXISTS ( \
-                     SELECT 1 FROM mem_memories m \
-                     WHERE m.user_id = ? AND m.is_active = 1 \
-                       AND m.embedding IS NOT NULL AND vector_dims(m.embedding) > 0 \
-                       AND m.memory_type = b.memory_type \
-                       AND l2_distance(m.embedding, b.embedding) < {L2_CONFLICT} \
-                   )"
-            );
-            let conflict_count: i64 =
-                sqlx::query(&format!("SELECT COUNT(*) as cnt {conflict_where}"))
-                    .bind(user_id)
-                    .bind(user_id)
-                    .fetch_one(sql.pool())
-                    .await
-                    .map_err(db_err)?
-                    .try_get("cnt")
-                    .unwrap_or(0);
-
-            let (replaced, skipped) = if strategy == "replace" && conflict_count > 0 {
-                let update_sql = format!(
-                    "UPDATE mem_memories m \
-                     SET m.content = ( \
-                       SELECT b.content FROM {table_name} b \
-                       WHERE b.user_id = ? AND b.is_active = 1 \
-                       AND b.memory_type = m.memory_type \
-                       AND b.embedding IS NOT NULL AND vector_dims(b.embedding) > 0 \
-                       AND NOT EXISTS (SELECT 1 FROM mem_memories m2 WHERE m2.memory_id = b.memory_id AND m2.is_active = 1) \
-                       AND l2_distance(m.embedding, b.embedding) < {L2_CONFLICT} \
-                       LIMIT 1 \
-                     ), \
-                     m.updated_at = NOW() \
-                     WHERE m.user_id = ? AND m.is_active = 1 \
-                       AND m.embedding IS NOT NULL AND vector_dims(m.embedding) > 0 \
-                     AND EXISTS ( \
-                       SELECT 1 FROM {table_name} b \
-                       WHERE b.user_id = ? AND b.is_active = 1 \
-                       AND b.memory_type = m.memory_type \
-                       AND b.embedding IS NOT NULL AND vector_dims(b.embedding) > 0 \
-                       AND NOT EXISTS (SELECT 1 FROM mem_memories m2 WHERE m2.memory_id = b.memory_id AND m2.is_active = 1) \
-                       AND l2_distance(m.embedding, b.embedding) < {L2_CONFLICT} \
-                     )"
-                );
-                sqlx::query(&update_sql)
-                    .bind(user_id)
-                    .bind(user_id)
-                    .bind(user_id)
-                    .execute(sql.pool())
+            let replacements =
+                collect_replace_candidates(sql.pool(), &table_name, user_id, L2_CONFLICT).await?;
+            let (replaced, skipped) = if !replacements.is_empty() {
+                let mut tx = sql.pool().begin().await.map_err(db_err)?;
+                for candidate in &replacements {
+                    sqlx::query(
+                        "UPDATE mem_memories SET content = ?, updated_at = NOW() WHERE memory_id = ?",
+                    )
+                    .bind(&candidate.replacement_content)
+                    .bind(&candidate.main_memory_id)
+                    .execute(&mut *tx)
                     .await
                     .map_err(db_err)?;
-                (conflict_count as u64, 0u64)
+                }
+                tx.commit().await.map_err(db_err)?;
+                (replacements.len() as u64, 0u64)
             } else {
-                (0u64, conflict_count as u64)
+                (0u64, 0u64)
             };
 
             Ok(mcp_text(&format!(
@@ -843,6 +811,63 @@ pub async fn call(
 
         _ => Err(MemoriaError::NotFound(format!("Unknown git tool: {name}"))),
     }
+}
+
+async fn collect_replace_candidates(
+    pool: &sqlx::MySqlPool,
+    table_name: &str,
+    user_id: &str,
+    l2_conflict: f64,
+) -> Result<Vec<ReplaceCandidate>, MemoriaError> {
+    let sql = format!(
+        "SELECT m.memory_id AS main_memory_id, \
+                b.memory_id AS branch_memory_id, \
+                b.content AS replacement_content, \
+                CAST(l2_distance(m.embedding, b.embedding) AS DOUBLE) AS conflict_distance \
+         FROM mem_memories m \
+         JOIN {table_name} b \
+           ON b.user_id = ? AND b.is_active = 1 \
+          AND b.content IS NOT NULL \
+          AND b.memory_type = m.memory_type \
+          AND b.embedding IS NOT NULL AND vector_dims(b.embedding) > 0 \
+         WHERE m.user_id = ? AND m.is_active = 1 \
+           AND m.embedding IS NOT NULL AND vector_dims(m.embedding) > 0 \
+           AND NOT EXISTS (SELECT 1 FROM mem_memories m2 WHERE m2.memory_id = b.memory_id AND m2.is_active = 1) \
+           AND l2_distance(m.embedding, b.embedding) < {l2_conflict}"
+    );
+    let rows = sqlx::query(&sql)
+        .bind(user_id)
+        .bind(user_id)
+        .fetch_all(pool)
+        .await
+        .map_err(db_err)?;
+
+    let mut chosen: HashMap<String, ReplaceCandidate> = HashMap::new();
+    for row in rows {
+        let candidate = ReplaceCandidate {
+            main_memory_id: row.try_get("main_memory_id").map_err(db_err)?,
+            branch_memory_id: row.try_get("branch_memory_id").map_err(db_err)?,
+            replacement_content: row.try_get("replacement_content").map_err(db_err)?,
+            conflict_distance: row.try_get("conflict_distance").map_err(db_err)?,
+        };
+        match chosen.get_mut(&candidate.main_memory_id) {
+            Some(current)
+                if candidate.conflict_distance < current.conflict_distance
+                    || (candidate.conflict_distance == current.conflict_distance
+                        && candidate.branch_memory_id < current.branch_memory_id) =>
+            {
+                *current = candidate;
+            }
+            None => {
+                chosen.insert(candidate.main_memory_id.clone(), candidate);
+            }
+            _ => {}
+        }
+    }
+
+    let mut replacements = chosen.into_values().collect::<Vec<_>>();
+    replacements.sort_by(|a, b| a.main_memory_id.cmp(&b.main_memory_id));
+    Ok(replacements)
 }
 
 fn mcp_text(text: &str) -> Value {

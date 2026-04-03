@@ -1,3 +1,5 @@
+use memoria_core::interfaces::EmbeddingProvider;
+use memoria_embedding::MockEmbedder;
 /// Branch end-to-end tests — from the user's perspective.
 /// Covers: create, checkout, store, merge, diff, delete, limits, from_snapshot,
 ///         from_timestamp, multi-user isolation, delete-main protection.
@@ -11,7 +13,7 @@ use memoria_git::GitForDataService;
 use memoria_service::MemoryService;
 use memoria_storage::SqlMemoryStore;
 use serde_json::{json, Value};
-use sqlx::mysql::MySqlPool;
+use sqlx::{mysql::MySqlPool, Row};
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -43,6 +45,25 @@ async fn setup() -> (Arc<MemoryService>, Arc<GitForDataService>, String) {
     let git = Arc::new(GitForDataService::new(pool, &db_name));
     let svc = Arc::new(MemoryService::new_sql_with_llm(Arc::new(store), None, None).await);
     (svc, git, uid())
+}
+
+async fn setup_with_mock_embedder() -> (
+    Arc<MemoryService>,
+    Arc<GitForDataService>,
+    MySqlPool,
+    String,
+) {
+    let pool = MySqlPool::connect(&db_url()).await.expect("pool");
+    let db_name = db_url().rsplit('/').next().unwrap_or("memoria").to_string();
+    let store = SqlMemoryStore::connect(&db_url(), test_dim(), uuid::Uuid::new_v4().to_string())
+        .await
+        .expect("store");
+    store.migrate().await.expect("migrate");
+    let git = Arc::new(GitForDataService::new(pool.clone(), &db_name));
+    let embedder: Option<Arc<dyn EmbeddingProvider>> =
+        Some(Arc::new(MockEmbedder::new(test_dim())));
+    let svc = Arc::new(MemoryService::new_sql_with_llm(Arc::new(store), embedder, None).await);
+    (svc, git, pool, uid())
 }
 
 async fn gc(
@@ -134,6 +155,93 @@ async fn test_merge_accept_alias() {
     );
     assert_eq!(svc.list_active(&uid, 10).await.unwrap().len(), 2);
     println!("✅ accept alias: {}", text(&r));
+
+    gc(
+        "memory_branch_delete",
+        json!({"name": branch}),
+        &git,
+        &svc,
+        &uid,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_merge_replace_updates_conflicting_memory() {
+    let (svc, git, pool, uid) = setup_with_mock_embedder().await;
+    let branch = bname("replace");
+    let replacement = "branch replacement memory";
+
+    store_mem("shared conflict memory", &svc, &uid).await;
+    let original = svc
+        .list_active(&uid, 10)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|memory| memory.content == "shared conflict memory")
+        .expect("original memory");
+
+    gc("memory_branch", json!({"name": branch}), &git, &svc, &uid).await;
+    let branch_table = svc
+        .sql_store
+        .as_ref()
+        .expect("sql store")
+        .list_branches(&uid)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|(name, _)| name == &branch)
+        .map(|(_, table)| table)
+        .expect("branch table");
+
+    let branch_memory_id = Uuid::new_v4().simple().to_string();
+    let insert_sql = format!(
+        "INSERT INTO {branch_table} \
+            (memory_id, user_id, memory_type, content, embedding, session_id, \
+             source_event_ids, extra_metadata, is_active, superseded_by, \
+             trust_tier, initial_confidence, observed_at, created_at, updated_at) \
+         SELECT ?, user_id, memory_type, ?, embedding, session_id, \
+                source_event_ids, extra_metadata, is_active, superseded_by, \
+                trust_tier, initial_confidence, observed_at, created_at, updated_at \
+         FROM mem_memories WHERE memory_id = ?"
+    );
+    sqlx::query(&insert_sql)
+        .bind(&branch_memory_id)
+        .bind(replacement)
+        .bind(&original.memory_id)
+        .execute(&pool)
+        .await
+        .expect("insert conflicting branch row");
+
+    let r = gc(
+        "memory_merge",
+        json!({"source": branch, "strategy": "replace"}),
+        &git,
+        &svc,
+        &uid,
+    )
+    .await;
+    assert!(
+        text(&r).contains("1 replaced"),
+        "expected one replacement, got: {}",
+        text(&r)
+    );
+
+    let active = svc.list_active(&uid, 10).await.unwrap();
+    assert!(
+        active.iter().any(|memory| memory.content == replacement),
+        "replacement content should be visible in main"
+    );
+    let row = sqlx::query("SELECT content FROM mem_memories WHERE memory_id = ?")
+        .bind(&original.memory_id)
+        .fetch_one(&pool)
+        .await
+        .expect("main row after replace");
+    assert_eq!(
+        row.try_get::<String, _>("content").unwrap(),
+        replacement,
+        "main row should be updated without NULL content"
+    );
 
     gc(
         "memory_branch_delete",

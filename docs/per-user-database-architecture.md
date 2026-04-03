@@ -1041,6 +1041,7 @@ memoria migrate legacy-to-multi-db \
    - 运行 `memoria migrate legacy-to-multi-db ... --execute`
    - 观察 stdout / `migration-run.json`
    - execute 会先自动创建一个 account snapshot；如果这一步失败，迁移会直接终止，不会继续改目标库
+   - account snapshot 名保持 `mem_migrate_account_pre_*_<uuid8>` 前缀风格；如果 legacy 库名过长，会自动截断中间的库名片段，确保不超过 MatrixOne 的 64 字符标识符限制
    - 注意：`--execute` 会清空并重建目标 `shared_db_url` 以及本次涉及的每个 `mem_u_*`，不要把它指向仍需保留业务数据的库
    - 期望结果：
       - 报告中能看到 pre-execute account snapshot 名称，便于必要时整账号 restore

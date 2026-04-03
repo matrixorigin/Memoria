@@ -9,6 +9,9 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 const MIGRATION_INSTANCE_ID: &str = "migration-cli";
+const MAX_IDENTIFIER_LEN: usize = 64;
+const PRE_EXECUTE_ACCOUNT_SNAPSHOT_PREFIX: &str = "mem_migrate_account_pre_";
+const PRE_EXECUTE_ACCOUNT_SNAPSHOT_SUFFIX_LEN: usize = 8;
 const SHARED_DURABLE_TABLES: &[&str] = &[
     "mem_api_keys",
     "mem_governance_runtime_state",
@@ -396,11 +399,7 @@ async fn create_required_account_snapshot(
     pool: &MySqlPool,
     legacy_db_name: &str,
 ) -> Result<String, MemoriaError> {
-    let snapshot_name = format!(
-        "mem_migrate_account_pre_{}_{}",
-        sanitize_identifier_fragment(legacy_db_name),
-        &uuid::Uuid::new_v4().simple().to_string()[..8]
-    );
+    let snapshot_name = pre_execute_account_snapshot_name(legacy_db_name);
     sqlx::raw_sql(&format!("CREATE SNAPSHOT {snapshot_name} FOR ACCOUNT sys"))
         .execute(pool)
         .await
@@ -451,6 +450,19 @@ fn sanitize_identifier_fragment(value: &str) -> String {
     } else {
         sanitized
     }
+}
+
+fn pre_execute_account_snapshot_name(legacy_db_name: &str) -> String {
+    let suffix =
+        &uuid::Uuid::new_v4().simple().to_string()[..PRE_EXECUTE_ACCOUNT_SNAPSHOT_SUFFIX_LEN];
+    let max_fragment_len = MAX_IDENTIFIER_LEN.saturating_sub(
+        PRE_EXECUTE_ACCOUNT_SNAPSHOT_PREFIX.len() + 1 + PRE_EXECUTE_ACCOUNT_SNAPSHOT_SUFFIX_LEN,
+    );
+    let fragment: String = sanitize_identifier_fragment(legacy_db_name)
+        .chars()
+        .take(max_fragment_len)
+        .collect();
+    format!("{PRE_EXECUTE_ACCOUNT_SNAPSHOT_PREFIX}{fragment}_{suffix}")
 }
 
 async fn snapshot_exists(pool: &MySqlPool, snapshot_name: &str) -> Result<bool, MemoriaError> {
@@ -1057,7 +1069,11 @@ fn db_err(e: sqlx::Error) -> MemoriaError {
 
 #[cfg(test)]
 mod tests {
-    use super::{copyable_columns, quote_ident, sanitize_identifier_fragment, ColumnSpec};
+    use super::{
+        copyable_columns, pre_execute_account_snapshot_name, quote_ident,
+        sanitize_identifier_fragment, ColumnSpec, MAX_IDENTIFIER_LEN,
+        PRE_EXECUTE_ACCOUNT_SNAPSHOT_PREFIX, PRE_EXECUTE_ACCOUNT_SNAPSHOT_SUFFIX_LEN,
+    };
 
     fn col(name: &str, nullable: bool, has_default: bool, auto_increment: bool) -> ColumnSpec {
         ColumnSpec {
@@ -1107,5 +1123,15 @@ mod tests {
             sanitize_identifier_fragment("memoria-legacy.cli/e2e"),
             "memoria_legacy_cli_e2e"
         );
+    }
+
+    #[test]
+    fn pre_execute_account_snapshot_name_is_bounded() {
+        let name =
+            pre_execute_account_snapshot_name("memoria_immersive_r1_legacy_e8c60c_extra_suffix");
+        assert!(name.len() <= MAX_IDENTIFIER_LEN);
+        assert!(name.starts_with(PRE_EXECUTE_ACCOUNT_SNAPSHOT_PREFIX));
+        let suffix = name.rsplit('_').next().expect("snapshot suffix");
+        assert_eq!(suffix.len(), PRE_EXECUTE_ACCOUNT_SNAPSHOT_SUFFIX_LEN);
     }
 }
