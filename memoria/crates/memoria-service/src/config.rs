@@ -214,8 +214,18 @@ fn env_bool(name: &str) -> bool {
 }
 
 fn replace_db_name(database_url: &str, db_name: &str) -> Option<String> {
-    let (base, _) = database_url.rsplit_once('/')?;
-    Some(format!("{base}/{db_name}"))
+    let (base, _, suffix) = split_database_url(database_url)?;
+    Some(format!("{base}/{db_name}{suffix}"))
+}
+
+fn split_database_url(database_url: &str) -> Option<(&str, &str, &str)> {
+    let suffix_start = database_url.find(['?', '#']).unwrap_or(database_url.len());
+    let (without_suffix, suffix) = database_url.split_at(suffix_start);
+    let (base, db_name) = without_suffix.rsplit_once('/')?;
+    if db_name.is_empty() {
+        return None;
+    }
+    Some((base, db_name, suffix))
 }
 
 #[cfg(test)]

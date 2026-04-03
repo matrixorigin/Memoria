@@ -26,7 +26,13 @@ fn db_url() -> String {
 }
 
 fn test_db_name() -> String {
-    db_url().rsplit('/').next().unwrap_or("memoria").to_string()
+    let db = db_url();
+    let suffix_start = db.find(['?', '#']).unwrap_or(db.len());
+    db[..suffix_start]
+        .rsplit('/')
+        .next()
+        .unwrap_or("memoria")
+        .to_string()
 }
 
 fn uid() -> String {
@@ -57,17 +63,45 @@ fn sanitize_name(name: &str) -> String {
 }
 
 fn sanitize_snapshot_scope(scope: &str) -> String {
-    scope
+    compact_identifier_fragment(scope, 11)
+}
+
+fn sanitize_identifier_fragment(value: &str) -> String {
+    let sanitized = value
         .chars()
         .map(|c| {
-            if c.is_alphanumeric() || c == '_' {
+            if c.is_ascii_alphanumeric() || c == '_' {
                 c
             } else {
                 '_'
             }
         })
-        .take(24)
-        .collect()
+        .collect::<String>()
+        .trim_matches('_')
+        .to_string();
+    if sanitized.is_empty() {
+        "db".to_string()
+    } else {
+        sanitized
+    }
+}
+
+fn compact_identifier_fragment(value: &str, max_len: usize) -> String {
+    let sanitized = sanitize_identifier_fragment(value);
+    if sanitized.len() <= max_len {
+        return sanitized;
+    }
+    if max_len <= 4 {
+        return sanitized.chars().take(max_len).collect();
+    }
+    let head_len = (max_len - 1) / 2;
+    let tail_len = max_len - head_len - 1;
+    let head: String = sanitized.chars().take(head_len).collect();
+    let tail_chars: Vec<char> = sanitized.chars().collect();
+    let tail: String = tail_chars[tail_chars.len().saturating_sub(tail_len)..]
+        .iter()
+        .collect();
+    format!("{head}_{tail}")
 }
 
 /// Mirror of git_tools::snap_internal so white-box assertions follow scoped names.

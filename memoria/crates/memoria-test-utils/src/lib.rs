@@ -5,6 +5,7 @@
 //! extra `(prompt_contains, response_json)` pairs for domain-specific prompts.
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 /// A `(needle, response_body)` pair: if the prompt contains `needle`,
 /// the fake server returns `response_body` as the assistant message content.
@@ -100,4 +101,101 @@ pub async fn spawn_fake_llm(
         "fake-model".into(),
     ));
     (client, shutdown_tx)
+}
+
+/// Wait until a MySQL/MatrixOne database is actually queryable, not just listening on TCP.
+pub async fn wait_for_mysql_ready(db_url: &str, timeout: Duration) {
+    let started = Instant::now();
+    let mut last_err = None;
+    let (base_url, db_name) = split_db_url(db_url).unwrap_or_else(|err| panic!("{err}"));
+
+    while started.elapsed() < timeout {
+        match sqlx::mysql::MySqlPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(Duration::from_secs(2))
+            .connect(&base_url)
+            .await
+        {
+            Ok(pool) => {
+                let exists = sqlx::query_scalar::<_, i64>(
+                    "SELECT COUNT(*) FROM INFORMATION_SCHEMA.SCHEMATA WHERE SCHEMA_NAME = ?",
+                )
+                .bind(&db_name)
+                .fetch_one(&pool)
+                .await;
+
+                match exists {
+                    Ok(0) => {
+                        if let Err(err) = sqlx::raw_sql(&format!(
+                            "CREATE DATABASE IF NOT EXISTS {}",
+                            quote_ident(&db_name)
+                        ))
+                        .execute(&pool)
+                        .await
+                        {
+                            last_err = Some(err.to_string());
+                            pool.close().await;
+                            tokio::time::sleep(Duration::from_millis(500)).await;
+                            continue;
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(err) => {
+                        last_err = Some(err.to_string());
+                        pool.close().await;
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                        continue;
+                    }
+                }
+                pool.close().await;
+            }
+            Err(err) => {
+                last_err = Some(err.to_string());
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                continue;
+            }
+        }
+
+        match sqlx::mysql::MySqlPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(Duration::from_secs(2))
+            .connect(db_url)
+            .await
+        {
+            Ok(pool) => {
+                match sqlx::query("SELECT 1").execute(&pool).await {
+                    Ok(_) => {
+                        pool.close().await;
+                        return;
+                    }
+                    Err(err) => last_err = Some(err.to_string()),
+                }
+                pool.close().await;
+            }
+            Err(err) => last_err = Some(err.to_string()),
+        }
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    panic!(
+        "database did not become ready within {:?}: {}",
+        timeout,
+        last_err.unwrap_or_else(|| "unknown error".to_string())
+    );
+}
+
+fn split_db_url(db_url: &str) -> Result<(String, String), String> {
+    let (base_url, db_name) = db_url
+        .rsplit_once('/')
+        .ok_or_else(|| "database URL is missing a database name".to_string())?;
+    let db_name = db_name.split(['?', '#']).next().unwrap_or(db_name).trim();
+    if db_name.is_empty() {
+        return Err("database URL is missing a database name".to_string());
+    }
+    Ok((base_url.to_string(), db_name.to_string()))
+}
+
+fn quote_ident(name: &str) -> String {
+    format!("`{}`", name.replace('`', "``"))
 }

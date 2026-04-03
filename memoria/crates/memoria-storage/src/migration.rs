@@ -417,7 +417,7 @@ async fn create_required_account_snapshot(
 }
 
 async fn reset_database(database_url: &str) -> Result<(), MemoriaError> {
-    let (base_url, db_name) = database_url.rsplit_once('/').ok_or_else(|| {
+    let (base_url, db_name, _suffix) = split_database_url(database_url).ok_or_else(|| {
         MemoriaError::Validation("database URL is missing a database name".into())
     })?;
     let pool = MySqlPoolOptions::new()
@@ -478,11 +478,19 @@ async fn snapshot_exists(pool: &MySqlPool, snapshot_name: &str) -> Result<bool, 
 }
 
 fn parse_db_name(database_url: &str) -> Result<String, MemoriaError> {
-    database_url
-        .rsplit_once('/')
-        .map(|(_, db_name)| db_name.to_string())
-        .filter(|db_name| !db_name.is_empty())
+    split_database_url(database_url)
+        .map(|(_, db_name, _)| db_name.to_string())
         .ok_or_else(|| MemoriaError::Validation("database URL is missing a database name".into()))
+}
+
+fn split_database_url(database_url: &str) -> Option<(&str, &str, &str)> {
+    let suffix_start = database_url.find(['?', '#']).unwrap_or(database_url.len());
+    let (without_suffix, suffix) = database_url.split_at(suffix_start);
+    let (base, db_name) = without_suffix.rsplit_once('/')?;
+    if db_name.is_empty() {
+        return None;
+    }
+    Some((base, db_name, suffix))
 }
 
 async fn discover_users(pool: &MySqlPool, db_name: &str) -> Result<Vec<String>, MemoriaError> {

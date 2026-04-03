@@ -480,16 +480,23 @@ impl CallLogBatcher {
                     .or_default()
                     .push(entry);
             }
+            let mut retry_entries = Vec::new();
             for (user_id, entries) in by_user {
                 let user_store = match service.user_sql_store(&user_id).await {
                     Ok(user_store) => user_store,
                     Err(e) => {
                         warn!("call_log flush failed to route user {user_id}: {e}");
-                        return;
+                        retry_entries.extend(entries);
+                        continue;
                     }
                 };
                 if let Err(e) = flush_call_log_chunked(user_store.pool(), &entries).await {
                     warn!("call_log batch flush failed for user {user_id}: {e}");
+                }
+            }
+            if !retry_entries.is_empty() {
+                if let Ok(mut pending) = self.pending.lock() {
+                    pending.extend(retry_entries);
                 }
             }
             return;

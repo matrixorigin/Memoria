@@ -46,6 +46,10 @@ async fn query_has_rows(pool: &MySqlPool, sql: &str) -> bool {
 const POOL_MONITOR_INTERVAL_SECS: u64 = 30;
 const POOL_MONITOR_REPEAT_AFTER_TICKS: u32 = 10;
 const POOL_ANOMALY_RECENT_WINDOW_SECS: u64 = 600;
+const MAX_IDENTIFIER_LEN: usize = 64;
+const SAFETY_SNAPSHOT_SCOPE_MAX_LEN: usize = 21;
+const SAFETY_SNAPSHOT_OPERATION_MAX_LEN: usize = 20;
+const SAFETY_SNAPSHOT_UUID_LEN: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ConnectionAnomalyKind {
@@ -580,8 +584,7 @@ impl SqlMemoryStore {
     pub fn database_name(&self) -> Option<&str> {
         self.database_url
             .as_deref()
-            .and_then(|database_url| database_url.rsplit_once('/').map(|(_, db_name)| db_name))
-            .filter(|db_name| !db_name.is_empty())
+            .and_then(parse_db_name_from_url)
     }
 
     pub fn configured_max_connections(&self) -> Option<u32> {
@@ -606,17 +609,18 @@ impl SqlMemoryStore {
         instance_id: String,
     ) -> Result<Self, MemoriaError> {
         // Auto-create database if it doesn't exist
-        if let Some((base_url, db_name)) = database_url.rsplit_once('/') {
-            if !db_name.is_empty() {
-                let base_pool = sqlx::mysql::MySqlPoolOptions::new()
-                    .max_connections(1)
-                    .connect(base_url)
-                    .await;
-                if let Ok(base_pool) = base_pool {
-                    let _ = sqlx::query(&format!("CREATE DATABASE IF NOT EXISTS {db_name}"))
-                        .execute(&base_pool)
-                        .await;
-                }
+        if let Some((base_url, db_name, _suffix)) = split_database_url(database_url) {
+            let base_pool = sqlx::mysql::MySqlPoolOptions::new()
+                .max_connections(1)
+                .connect(base_url)
+                .await;
+            if let Ok(base_pool) = base_pool {
+                let _ = sqlx::raw_sql(&format!(
+                    "CREATE DATABASE IF NOT EXISTS {}",
+                    quote_ident(db_name)
+                ))
+                .execute(&base_pool)
+                .await;
             }
         }
         const DB_MAX_CONNECTIONS_UPPER: u32 = 512;
@@ -1414,18 +1418,15 @@ impl SqlMemoryStore {
         &self,
         operation: &str,
     ) -> (Option<String>, Option<String>) {
-        let snapshot_prefix = match self.database_name() {
-            Some(db_name) => format!("mem_snap_{db_name}_pre_"),
-            None => "mem_snap_pre_".to_string(),
-        };
-        let name = format!(
-            "{}{}_{}",
-            snapshot_prefix,
-            operation,
-            &uuid::Uuid::new_v4().simple().to_string()[..8]
-        );
+        let snapshot_prefix = safety_snapshot_prefix(self.database_name());
+        let legacy_prefix = legacy_safety_snapshot_prefix(self.database_name());
+        let name = build_safety_snapshot_name(self.database_name(), operation);
+        debug_assert!(name.len() <= MAX_IDENTIFIER_LEN);
         let sql = match self.database_name() {
-            Some(db_name) => format!("CREATE SNAPSHOT {name} FOR DATABASE {db_name}"),
+            Some(db_name) => format!(
+                "CREATE SNAPSHOT {name} FOR DATABASE {}",
+                quote_ident(db_name)
+            ),
             None => format!("CREATE SNAPSHOT {name} FOR ACCOUNT sys"),
         };
 
@@ -1435,9 +1436,16 @@ impl SqlMemoryStore {
         }
 
         // Failed — try to reclaim space by dropping oldest pre_ snapshots
-        let dropped = self
+        let mut dropped = self
             .cleanup_oldest_safety_snapshots(&snapshot_prefix, 10)
             .await;
+        if let Some(legacy_prefix) = legacy_prefix.as_deref() {
+            if legacy_prefix != snapshot_prefix && dropped < 10 {
+                dropped += self
+                    .cleanup_oldest_safety_snapshots(legacy_prefix, 10 - dropped)
+                    .await;
+            }
+        }
         if dropped > 0 {
             // Retry
             if sqlx::raw_sql(&sql).execute(&self.pool).await.is_ok() {
@@ -1613,9 +1621,44 @@ impl SqlMemoryStore {
                     .or_default()
                     .push(entry.clone());
             }
+            let mut first_err = None;
+            let mut flushed_any = false;
             for (user_id, user_entries) in by_user {
-                let store = router.user_store(user_id).await?;
-                store.flush_edit_log_batch_direct(&user_entries).await?;
+                match router.user_store(user_id).await {
+                    Ok(store) => match store.flush_edit_log_batch_direct(&user_entries).await {
+                        Ok(()) => flushed_any = true,
+                        Err(err) => {
+                            tracing::warn!(
+                                user_id,
+                                error = %err,
+                                "failed to flush edit log batch for routed user"
+                            );
+                            if first_err.is_none() {
+                                first_err = Some(err);
+                            }
+                        }
+                    },
+                    Err(err) => {
+                        tracing::warn!(
+                            user_id,
+                            error = %err,
+                            "failed to resolve routed user store for edit log flush"
+                        );
+                        if first_err.is_none() {
+                            first_err = Some(err);
+                        }
+                    }
+                }
+            }
+            if let Some(err) = first_err {
+                if flushed_any {
+                    tracing::warn!(
+                        error = %err,
+                        "edit log batch flushed partially; some routed user entries were dropped"
+                    );
+                    return Ok(());
+                }
+                return Err(err);
             }
             return Ok(());
         }
@@ -4341,6 +4384,86 @@ impl SqlMemoryStore {
         }
         Ok((to_insert.len(), reused))
     }
+}
+
+fn parse_db_name_from_url(database_url: &str) -> Option<&str> {
+    split_database_url(database_url).map(|(_, db_name, _)| db_name)
+}
+
+fn split_database_url(database_url: &str) -> Option<(&str, &str, &str)> {
+    let suffix_start = database_url.find(['?', '#']).unwrap_or(database_url.len());
+    let (without_suffix, suffix) = database_url.split_at(suffix_start);
+    let (base, db_name) = without_suffix.rsplit_once('/')?;
+    if db_name.is_empty() {
+        return None;
+    }
+    Some((base, db_name, suffix))
+}
+
+fn quote_ident(name: &str) -> String {
+    format!("`{}`", name.replace('`', "``"))
+}
+
+fn sanitize_identifier_fragment(value: &str) -> String {
+    let sanitized = value
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('_')
+        .to_string();
+    if sanitized.is_empty() {
+        "db".to_string()
+    } else {
+        sanitized
+    }
+}
+
+fn compact_identifier_fragment(value: &str, max_len: usize) -> String {
+    let sanitized = sanitize_identifier_fragment(value);
+    if sanitized.len() <= max_len {
+        return sanitized;
+    }
+    if max_len <= 4 {
+        return sanitized.chars().take(max_len).collect();
+    }
+    let head_len = (max_len - 1) / 2;
+    let tail_len = max_len - head_len - 1;
+    let head: String = sanitized.chars().take(head_len).collect();
+    let tail_chars: Vec<char> = sanitized.chars().collect();
+    let tail: String = tail_chars[tail_chars.len().saturating_sub(tail_len)..]
+        .iter()
+        .collect();
+    format!("{head}_{tail}")
+}
+
+fn safety_snapshot_scope(db_name: &str) -> String {
+    compact_identifier_fragment(db_name, SAFETY_SNAPSHOT_SCOPE_MAX_LEN)
+}
+
+fn safety_snapshot_prefix(db_name: Option<&str>) -> String {
+    match db_name {
+        Some(db_name) => format!("mem_snap_{}_pre_", safety_snapshot_scope(db_name)),
+        None => "mem_snap_pre_".to_string(),
+    }
+}
+
+fn legacy_safety_snapshot_prefix(db_name: Option<&str>) -> Option<String> {
+    db_name.map(|db_name| format!("mem_snap_{db_name}_pre_"))
+}
+
+fn build_safety_snapshot_name(db_name: Option<&str>, operation: &str) -> String {
+    let prefix = safety_snapshot_prefix(db_name);
+    let operation = compact_identifier_fragment(operation, SAFETY_SNAPSHOT_OPERATION_MAX_LEN);
+    let suffix = &uuid::Uuid::new_v4().simple().to_string()[..SAFETY_SNAPSHOT_UUID_LEN];
+    let name = format!("{prefix}{operation}_{suffix}");
+    debug_assert!(name.len() <= MAX_IDENTIFIER_LEN);
+    name
 }
 
 #[cfg(test)]

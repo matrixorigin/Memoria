@@ -39,7 +39,11 @@ async fn spawn_tiny_pool_server() -> (String, reqwest::Client, sqlx::MySqlPool) 
     store.migrate().await.expect("migrate");
 
     let raw_pool = MySqlPool::connect(&db).await.expect("git pool");
-    let db_name = db.rsplit_once('/').map(|(_, n)| n).unwrap_or("memoria");
+    let suffix_start = db.find(['?', '#']).unwrap_or(db.len());
+    let db_name = db[..suffix_start]
+        .rsplit_once('/')
+        .map(|(_, n)| n)
+        .unwrap_or("memoria");
     let git = Arc::new(GitForDataService::new(raw_pool, db_name));
     let service = Arc::new(MemoryService::new_sql_with_llm(Arc::new(store), None, None).await);
     let state = memoria_api::AppState::new(service, git, String::new());

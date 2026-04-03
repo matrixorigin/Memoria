@@ -2312,6 +2312,7 @@ dependencies = [
  "axum",
  "memoria-embedding",
  "serde_json",
+ "sqlx",
  "tokio",
 ]
 

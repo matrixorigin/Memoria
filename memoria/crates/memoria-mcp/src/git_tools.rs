@@ -33,9 +33,34 @@ fn git_err(e: impl std::fmt::Display) -> MemoriaError {
 
 const MAX_USER_SNAPSHOTS: i64 = 20;
 const MAX_BRANCHES: i64 = 20;
+const MAX_IDENTIFIER_LEN: usize = 64;
 const SNAP_PREFIX: &str = "mem_snap_";
 const MILESTONE_PREFIX: &str = "mem_milestone_";
 const SAFETY_PREFIX: &str = "mem_snap_pre_";
+const SNAP_SCOPE_MAX_LEN: usize = MAX_IDENTIFIER_LEN - SNAP_PREFIX.len() - 2 - 2 - 40;
+const SAFETY_SCOPE_MAX_LEN: usize = 21;
+
+fn safety_prefix(db_name: Option<&str>) -> String {
+    match db_name {
+        Some(db_name) => format!(
+            "mem_snap_{}_pre_",
+            compact_identifier_fragment(db_name, SAFETY_SCOPE_MAX_LEN)
+        ),
+        None => SAFETY_PREFIX.to_string(),
+    }
+}
+
+fn legacy_safety_prefix(db_name: Option<&str>) -> Option<String> {
+    db_name.map(|db_name| format!("mem_snap_{db_name}_pre_"))
+}
+
+fn is_safety_snapshot_name(name: &str, db_name: Option<&str>) -> bool {
+    name.starts_with(SAFETY_PREFIX)
+        || name.starts_with(&safety_prefix(db_name))
+        || legacy_safety_prefix(db_name)
+            .as_deref()
+            .is_some_and(|prefix| name.starts_with(prefix))
+}
 
 /// Sanitize a user-provided name: keep alphanumeric+underscore, truncate to 40 chars.
 /// If result starts with non-alpha, prepend "s_".
@@ -58,17 +83,45 @@ fn sanitize_name(name: &str) -> String {
 }
 
 fn sanitize_snapshot_scope(scope: &str) -> String {
-    scope
+    compact_identifier_fragment(scope, SNAP_SCOPE_MAX_LEN)
+}
+
+fn sanitize_identifier_fragment(value: &str) -> String {
+    let sanitized = value
         .chars()
         .map(|c| {
-            if c.is_alphanumeric() || c == '_' {
+            if c.is_ascii_alphanumeric() || c == '_' {
                 c
             } else {
                 '_'
             }
         })
-        .take(24)
-        .collect()
+        .collect::<String>()
+        .trim_matches('_')
+        .to_string();
+    if sanitized.is_empty() {
+        "db".to_string()
+    } else {
+        sanitized
+    }
+}
+
+fn compact_identifier_fragment(value: &str, max_len: usize) -> String {
+    let sanitized = sanitize_identifier_fragment(value);
+    if sanitized.len() <= max_len {
+        return sanitized;
+    }
+    if max_len <= 4 {
+        return sanitized.chars().take(max_len).collect();
+    }
+    let head_len = (max_len - 1) / 2;
+    let tail_len = max_len - head_len - 1;
+    let head: String = sanitized.chars().take(head_len).collect();
+    let tail_chars: Vec<char> = sanitized.chars().collect();
+    let tail: String = tail_chars[tail_chars.len().saturating_sub(tail_len)..]
+        .iter()
+        .collect();
+    format!("{head}_{tail}")
 }
 
 /// Convert user-facing snapshot name → internal MatrixOne snapshot name.
@@ -77,11 +130,13 @@ fn snap_internal(db_name: &str, name: &str) -> String {
         name.to_string()
     } else {
         let scope = sanitize_snapshot_scope(db_name);
-        format!(
+        let internal = format!(
             "{SNAP_PREFIX}{}_{scope}_{}",
             scope.len(),
             sanitize_name(name)
-        )
+        );
+        debug_assert!(internal.len() <= MAX_IDENTIFIER_LEN);
+        internal
     }
 }
 
@@ -103,6 +158,15 @@ fn snap_display(internal: &str) -> String {
     } else {
         internal.to_string()
     }
+}
+
+fn safety_display_name(internal: &str) -> Option<String> {
+    if let Some(rest) = internal.strip_prefix(SAFETY_PREFIX) {
+        return Some(format!("pre_{rest}"));
+    }
+    let rest = internal.strip_prefix(SNAP_PREFIX)?;
+    let (_, after_prefix) = rest.split_once("_pre_")?;
+    Some(format!("pre_{after_prefix}"))
 }
 
 #[derive(Clone)]
@@ -155,6 +219,7 @@ async fn visible_snapshots_for_user(
     user_id: &str,
 ) -> Result<Vec<VisibleSnapshot>, MemoriaError> {
     let sql = snapshot_store(svc, user_id).await?;
+    let db_name = sql.database_name();
     let git = git_for_store(&sql)?;
     let all = git.list_snapshots().await.map_err(git_err)?;
     let actual_by_name: HashMap<String, memoria_git::Snapshot> = all
@@ -183,10 +248,15 @@ async fn visible_snapshots_for_user(
     for actual in actual_by_name.values() {
         if !seen_internal.contains(&actual.snapshot_name)
             && (actual.snapshot_name.starts_with(MILESTONE_PREFIX)
-                || actual.snapshot_name.starts_with(SAFETY_PREFIX))
+                || is_safety_snapshot_name(&actual.snapshot_name, db_name))
         {
             snapshots.push(VisibleSnapshot {
-                display_name: snap_display(&actual.snapshot_name),
+                display_name: if is_safety_snapshot_name(&actual.snapshot_name, db_name) {
+                    safety_display_name(&actual.snapshot_name)
+                        .unwrap_or_else(|| snap_display(&actual.snapshot_name))
+                } else {
+                    snap_display(&actual.snapshot_name)
+                },
                 internal_name: actual.snapshot_name.clone(),
                 timestamp: actual.timestamp,
                 registered: false,
@@ -205,6 +275,7 @@ async fn resolve_snapshot_for_user(
 ) -> Result<Option<String>, MemoriaError> {
     let sql = snapshot_store(svc, user_id).await?;
     let git = git_for_store(&sql)?;
+    let db_name = sql.database_name();
     if let Some(internal) = milestone_internal(name) {
         return Ok(git
             .get_snapshot(&internal)
@@ -212,7 +283,7 @@ async fn resolve_snapshot_for_user(
             .map_err(git_err)?
             .map(|_| internal));
     }
-    if name.starts_with(SAFETY_PREFIX) {
+    if is_safety_snapshot_name(name, db_name) {
         return Ok(git
             .get_snapshot(name)
             .await
@@ -226,7 +297,14 @@ async fn resolve_snapshot_for_user(
     } else {
         sql.get_snapshot_registration(user_id, name).await?
     };
-    Ok(reg.map(|r| r.snapshot_name))
+    if let Some(reg) = reg {
+        return Ok(Some(reg.snapshot_name));
+    }
+    Ok(visible_snapshots_for_user(svc, user_id)
+        .await?
+        .into_iter()
+        .find(|snapshot| snapshot.display_name == name)
+        .map(|snapshot| snapshot.internal_name))
 }
 
 pub fn list() -> Value {
@@ -883,4 +961,26 @@ async fn collect_replace_candidates(
 
 fn mcp_text(text: &str) -> Value {
     json!({"content": [{"type": "text", "text": text}]})
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{safety_prefix, snap_internal, MAX_IDENTIFIER_LEN};
+
+    #[test]
+    fn scoped_snapshot_internal_names_stay_within_matrixone_limit() {
+        let internal = snap_internal(
+            "memoria_shared_db_with_a_really_long_name_for_product_runs",
+            "snapshot_name_that_is_long_but_should_still_fit_with_db_scope",
+        );
+        assert!(internal.len() <= MAX_IDENTIFIER_LEN, "{internal}");
+    }
+
+    #[test]
+    fn scoped_safety_prefix_stays_bounded() {
+        let prefix = safety_prefix(Some(
+            "memoria_shared_db_with_a_really_long_name_for_product_runs",
+        ));
+        assert!(prefix.len() < MAX_IDENTIFIER_LEN, "{prefix}");
+    }
 }

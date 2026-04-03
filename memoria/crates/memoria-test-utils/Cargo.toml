@@ -8,3 +8,4 @@ memoria-embedding = { workspace = true }
 axum = { workspace = true }
 tokio = { workspace = true }
 serde_json = { workspace = true }
+sqlx = { workspace = true }

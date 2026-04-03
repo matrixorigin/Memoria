@@ -438,7 +438,8 @@ async fn cmd_serve(db_url: Option<String>, port: u16, master_key: String) -> Res
     };
 
     let pool = MySqlPool::connect(&git_db_url).await?;
-    let git = Arc::new(GitForDataService::new(pool, &cfg.db_name));
+    let git_db_name = parse_db_name(&git_db_url).unwrap_or_else(|| cfg.db_name.clone());
+    let git = Arc::new(GitForDataService::new(pool, git_db_name));
 
     let embedder = build_embedder(&cfg);
     let llm = build_llm(&cfg);
@@ -463,6 +464,16 @@ async fn cmd_serve(db_url: Option<String>, port: u16, master_key: String) -> Res
     .await?;
     state.drain_flushers().await;
     Ok(())
+}
+
+fn parse_db_name(database_url: &str) -> Option<String> {
+    let suffix_start = database_url.find(['?', '#']).unwrap_or(database_url.len());
+    let without_suffix = &database_url[..suffix_start];
+    let (_, db_name) = without_suffix.rsplit_once('/')?;
+    if db_name.is_empty() {
+        return None;
+    }
+    Some(db_name.to_string())
 }
 
 // ── MCP server ────────────────────────────────────────────────────────────────
@@ -578,7 +589,8 @@ async fn cmd_mcp(
     };
 
     let pool = MySqlPool::connect(&git_db_url).await?;
-    let git = Arc::new(GitForDataService::new(pool, &cfg.db_name));
+    let git_db_name = parse_db_name(&git_db_url).unwrap_or_else(|| cfg.db_name.clone());
+    let git = Arc::new(GitForDataService::new(pool, git_db_name));
 
     let embedder = build_embedder(&cfg);
     let llm = build_llm(&cfg);

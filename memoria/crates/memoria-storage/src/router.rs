@@ -234,36 +234,45 @@ impl DbRouter {
 }
 
 async fn create_database_if_missing(database_url: &str) -> Result<(), MemoriaError> {
-    let Some((base_url, db_name)) = database_url.rsplit_once('/') else {
+    let Some((base_url, db_name, _suffix)) = split_database_url(database_url) else {
         return Err(MemoriaError::Internal(
             "database_url missing db name".into(),
         ));
     };
-    if db_name.is_empty() {
-        return Err(MemoriaError::Internal(
-            "database_url missing db name".into(),
-        ));
-    }
     let base_pool = MySqlPoolOptions::new()
         .max_connections(1)
         .connect(base_url)
         .await
         .map_err(db_err)?;
-    sqlx::query(&format!("CREATE DATABASE IF NOT EXISTS {db_name}"))
-        .execute(&base_pool)
-        .await
-        .map_err(db_err)?;
+    sqlx::raw_sql(&format!(
+        "CREATE DATABASE IF NOT EXISTS {}",
+        quote_ident(db_name)
+    ))
+    .execute(&base_pool)
+    .await
+    .map_err(db_err)?;
     Ok(())
 }
 
 fn parse_db_name(database_url: &str) -> Option<String> {
-    database_url
-        .rsplit_once('/')
-        .map(|(_, db_name)| db_name.to_string())
-        .filter(|db_name| !db_name.is_empty())
+    split_database_url(database_url).map(|(_, db_name, _)| db_name.to_string())
 }
 
 fn replace_db_name(database_url: &str, db_name: &str) -> Option<String> {
-    let (base, _) = database_url.rsplit_once('/')?;
-    Some(format!("{base}/{db_name}"))
+    let (base, _, suffix) = split_database_url(database_url)?;
+    Some(format!("{base}/{db_name}{suffix}"))
+}
+
+fn split_database_url(database_url: &str) -> Option<(&str, &str, &str)> {
+    let suffix_start = database_url.find(['?', '#']).unwrap_or(database_url.len());
+    let (without_suffix, suffix) = database_url.split_at(suffix_start);
+    let (base, db_name) = without_suffix.rsplit_once('/')?;
+    if db_name.is_empty() {
+        return None;
+    }
+    Some((base, db_name, suffix))
+}
+
+fn quote_ident(name: &str) -> String {
+    format!("`{}`", name.replace('`', "``"))
 }

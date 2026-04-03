@@ -26,6 +26,7 @@ async fn spawn_server() -> (String, reqwest::Client, MySqlPool) {
 
     let cfg = Config::from_env();
     let db = db_url();
+    memoria_test_utils::wait_for_mysql_ready(&db, std::time::Duration::from_secs(30)).await;
     let store = SqlMemoryStore::connect(&db, test_dim(), uuid::Uuid::new_v4().to_string())
         .await
         .expect("connect");
@@ -56,6 +57,7 @@ async fn spawn_server_with_master_key(master_key: &str) -> (String, reqwest::Cli
 
     let cfg = Config::from_env();
     let db = db_url();
+    memoria_test_utils::wait_for_mysql_ready(&db, std::time::Duration::from_secs(30)).await;
     let store = SqlMemoryStore::connect(&db, test_dim(), uuid::Uuid::new_v4().to_string())
         .await
         .expect("connect");

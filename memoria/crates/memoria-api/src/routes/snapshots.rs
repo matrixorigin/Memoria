@@ -95,6 +95,70 @@ fn milestone_internal(name: &str) -> Option<String> {
     }
 }
 
+fn sanitize_identifier_fragment(value: &str) -> String {
+    let sanitized = value
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('_')
+        .to_string();
+    if sanitized.is_empty() {
+        "db".to_string()
+    } else {
+        sanitized
+    }
+}
+
+fn compact_identifier_fragment(value: &str, max_len: usize) -> String {
+    let sanitized = sanitize_identifier_fragment(value);
+    if sanitized.len() <= max_len {
+        return sanitized;
+    }
+    if max_len <= 4 {
+        return sanitized.chars().take(max_len).collect();
+    }
+    let head_len = (max_len - 1) / 2;
+    let tail_len = max_len - head_len - 1;
+    let head: String = sanitized.chars().take(head_len).collect();
+    let tail_chars: Vec<char> = sanitized.chars().collect();
+    let tail: String = tail_chars[tail_chars.len().saturating_sub(tail_len)..]
+        .iter()
+        .collect();
+    format!("{head}_{tail}")
+}
+
+fn compact_safety_prefix(db_name: &str) -> String {
+    format!("mem_snap_{}_pre_", compact_identifier_fragment(db_name, 21))
+}
+
+fn safety_snapshot_display_name(internal: &str) -> Option<String> {
+    if let Some(rest) = internal.strip_prefix("mem_snap_pre_") {
+        return Some(format!("pre_{rest}"));
+    }
+    let rest = internal.strip_prefix("mem_snap_")?;
+    let (_, after_prefix) = rest.split_once("_pre_")?;
+    Some(format!("pre_{after_prefix}"))
+}
+
+fn is_safety_snapshot_name(sql: &Arc<memoria_storage::SqlMemoryStore>, name: &str) -> bool {
+    if name.starts_with("mem_snap_pre_") {
+        return true;
+    }
+    match sql.database_name() {
+        Some(db_name) => {
+            name.starts_with(&format!("mem_snap_{db_name}_pre_"))
+                || name.starts_with(&compact_safety_prefix(db_name))
+        }
+        None => false,
+    }
+}
+
 async fn resolve_snapshot_internal(
     state: &AppState,
     user_id: &str,
@@ -105,6 +169,12 @@ async fn resolve_snapshot_internal(
 
     let internal = if let Some(milestone) = milestone_internal(name) {
         milestone
+    } else if is_safety_snapshot_name(&sql, name) {
+        git.get_snapshot(name)
+            .await
+            .map_err(api_err)?
+            .map(|_| name.to_string())
+            .ok_or((StatusCode::NOT_FOUND, "Snapshot not found".into()))?
     } else if name.starts_with("mem_snap_") {
         sql.get_snapshot_registration_by_internal(user_id, name)
             .await
@@ -112,11 +182,26 @@ async fn resolve_snapshot_internal(
             .map(|r| r.snapshot_name)
             .ok_or((StatusCode::NOT_FOUND, "Snapshot not found".into()))?
     } else {
-        sql.get_snapshot_registration(user_id, name)
+        if let Some(internal) = sql
+            .get_snapshot_registration(user_id, name)
             .await
             .map_err(api_err)?
             .map(|r| r.snapshot_name)
-            .ok_or((StatusCode::NOT_FOUND, "Snapshot not found".into()))?
+        {
+            internal
+        } else if name.starts_with("pre_") {
+            git.list_snapshots()
+                .await
+                .map_err(api_err)?
+                .into_iter()
+                .find(|snapshot| {
+                    safety_snapshot_display_name(&snapshot.snapshot_name).as_deref() == Some(name)
+                })
+                .map(|snapshot| snapshot.snapshot_name)
+                .ok_or((StatusCode::NOT_FOUND, "Snapshot not found".into()))?
+        } else {
+            return Err((StatusCode::NOT_FOUND, "Snapshot not found".into()));
+        }
     };
 
     let internal = validate_snapshot_identifier(&internal)?.to_string();

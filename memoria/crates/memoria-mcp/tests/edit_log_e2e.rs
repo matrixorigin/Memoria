@@ -26,8 +26,66 @@ fn db_url() -> String {
     std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "mysql://root:111@localhost:6001/memoria".to_string())
 }
+fn test_db_name() -> String {
+    let db = db_url();
+    let suffix_start = db.find(['?', '#']).unwrap_or(db.len());
+    db[..suffix_start]
+        .rsplit('/')
+        .next()
+        .unwrap_or("memoria")
+        .to_string()
+}
 fn uid() -> String {
     format!("elog_{}", &Uuid::new_v4().simple().to_string()[..8])
+}
+
+fn safety_snapshot_prefix() -> String {
+    format!(
+        "mem_snap_{}_pre_",
+        compact_identifier_fragment(&test_db_name(), 21)
+    )
+}
+
+fn sanitize_identifier_fragment(value: &str) -> String {
+    let sanitized = value
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('_')
+        .to_string();
+    if sanitized.is_empty() {
+        "db".to_string()
+    } else {
+        sanitized
+    }
+}
+
+fn compact_identifier_fragment(value: &str, max_len: usize) -> String {
+    let sanitized = sanitize_identifier_fragment(value);
+    if sanitized.len() <= max_len {
+        return sanitized;
+    }
+    if max_len <= 4 {
+        return sanitized.chars().take(max_len).collect();
+    }
+    let head_len = (max_len - 1) / 2;
+    let tail_len = max_len - head_len - 1;
+    let head: String = sanitized.chars().take(head_len).collect();
+    let tail_chars: Vec<char> = sanitized.chars().collect();
+    let tail: String = tail_chars[tail_chars.len().saturating_sub(tail_len)..]
+        .iter()
+        .collect();
+    format!("{head}_{tail}")
+}
+
+fn is_purge_safety_snapshot(name: &str) -> bool {
+    name.starts_with(&format!("{}purge_", safety_snapshot_prefix()))
 }
 
 // ── Full edit-log row with ALL columns ────────────────────────────────────────
@@ -106,12 +164,13 @@ async fn cleanup(pool: &MySqlPool, user_id: &str) {
         .bind(user_id)
         .execute(pool)
         .await;
-    let rows: Vec<(String,)> = sqlx::query_as(
-        "SELECT sname FROM mo_catalog.mo_snapshots WHERE prefix_eq(sname, 'mem_snap_pre_')",
-    )
-    .fetch_all(pool)
-    .await
-    .unwrap_or_default();
+    let prefix = safety_snapshot_prefix();
+    let rows: Vec<(String,)> =
+        sqlx::query_as("SELECT sname FROM mo_catalog.mo_snapshots WHERE prefix_eq(sname, ?)")
+            .bind(prefix)
+            .fetch_all(pool)
+            .await
+            .unwrap_or_default();
     for (name,) in rows {
         let _ = sqlx::raw_sql(&format!("DROP SNAPSHOT {name}"))
             .execute(pool)
@@ -312,7 +371,10 @@ async fn test_purge_single_all_fields() {
         .snapshot_before
         .as_ref()
         .expect("snapshot_before should be set");
-    assert!(snap.starts_with("mem_snap_pre_purge_"));
+    assert!(
+        is_purge_safety_snapshot(snap),
+        "unexpected snapshot name: {snap}"
+    );
     let exists: Vec<(String,)> =
         sqlx::query_as("SELECT sname FROM mo_catalog.mo_snapshots WHERE sname = ?")
             .bind(snap)
@@ -904,7 +966,10 @@ async fn test_api_purge_edit_log_all_fields() {
     let body: Value = r.json().await.unwrap();
     assert_eq!(body["purged"], 1);
     let snap = body["snapshot_name"].as_str().unwrap();
-    assert!(snap.starts_with("mem_snap_pre_purge_"));
+    assert!(
+        is_purge_safety_snapshot(snap),
+        "unexpected snapshot name: {snap}"
+    );
 
     // Wait for async flush
     svc.flush_edit_log().await;
