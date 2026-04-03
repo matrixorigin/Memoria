@@ -355,7 +355,7 @@ async fn cmd_serve(db_url: Option<String>, port: u16, master_key: String) -> Res
     use memoria_api::{build_router, AppState};
     use memoria_git::GitForDataService;
     use memoria_service::{shutdown_signal, Config, MemoryService};
-    use memoria_storage::SqlMemoryStore;
+    use memoria_storage::{DbRouter, SqlMemoryStore};
     use sqlx::mysql::MySqlPool;
     use tower_http::trace::TraceLayer;
 
@@ -369,7 +369,10 @@ async fn cmd_serve(db_url: Option<String>, port: u16, master_key: String) -> Res
     validate_embedding_config(&cfg)?;
 
     tracing::info!(
-        db_url = %cfg.db_url, port = port,
+        db_url = %cfg.db_url,
+        shared_db_url = %cfg.shared_db_url,
+        multi_db = cfg.multi_db,
+        port = port,
         instance_id = %cfg.instance_id,
         has_llm = cfg.has_llm(),
         embedding_provider = %cfg.embedding_provider,
@@ -377,22 +380,38 @@ async fn cmd_serve(db_url: Option<String>, port: u16, master_key: String) -> Res
         "Starting Memoria API server"
     );
 
-    let store =
-        SqlMemoryStore::connect(&cfg.db_url, cfg.embedding_dim, cfg.instance_id.clone()).await?;
-    store.migrate().await?;
+    let (store, db_router, git_db_url) = if cfg.multi_db {
+        let router = Arc::new(
+            DbRouter::connect(&cfg.shared_db_url, cfg.embedding_dim, cfg.instance_id.clone())
+                .await?,
+        );
+        let mut store =
+            SqlMemoryStore::connect(&cfg.shared_db_url, cfg.embedding_dim, cfg.instance_id.clone())
+                .await?;
+        store.migrate_shared().await?;
+        store.set_db_router(router.clone());
+        (Arc::new(store), Some(router), cfg.shared_db_url.clone())
+    } else {
+        let store =
+            SqlMemoryStore::connect(&cfg.db_url, cfg.embedding_dim, cfg.instance_id.clone()).await?;
+        store.migrate().await?;
+        (Arc::new(store), None, cfg.db_url.clone())
+    };
 
-    let pool = MySqlPool::connect(&cfg.db_url).await?;
+    let pool = MySqlPool::connect(&git_db_url).await?;
     let git = Arc::new(GitForDataService::new(pool, &cfg.db_name));
 
     let embedder = build_embedder(&cfg);
     let llm = build_llm(&cfg);
 
-    let service = Arc::new(MemoryService::new_sql_with_llm(Arc::new(store), embedder, llm).await);
+    let service = Arc::new(
+        MemoryService::new_sql_with_llm_and_router(store, db_router, embedder, llm).await,
+    );
     Arc::new(memoria_service::GovernanceScheduler::from_config(service.clone(), &cfg).await?)
         .start();
     let state = AppState::new(service.clone(), git, master_key)
         .with_instance_id(cfg.instance_id.clone())
-        .init_auth_pool(&cfg.db_url)
+        .init_auth_pool(cfg.effective_sql_url())
         .await?;
 
     let app = build_router(state.clone()).layer(TraceLayer::new_for_http());
@@ -430,7 +449,7 @@ async fn cmd_mcp(
 ) -> Result<()> {
     use memoria_git::GitForDataService;
     use memoria_service::{Config, MemoryService};
-    use memoria_storage::SqlMemoryStore;
+    use memoria_storage::{DbRouter, SqlMemoryStore};
     use sqlx::mysql::MySqlPool;
 
     tracing_subscriber::fmt()
@@ -485,6 +504,8 @@ async fn cmd_mcp(
 
     tracing::info!(
         db_url = %cfg.db_url,
+        shared_db_url = %cfg.shared_db_url,
+        multi_db = cfg.multi_db,
         embedding_provider = %cfg.embedding_provider,
         has_llm = cfg.has_llm(),
         governance_plugin_binding = %cfg.governance_plugin_binding,
@@ -492,17 +513,33 @@ async fn cmd_mcp(
         "Starting Memoria MCP (embedded mode)"
     );
 
-    let store =
-        SqlMemoryStore::connect(&cfg.db_url, cfg.embedding_dim, cfg.instance_id.clone()).await?;
-    store.migrate().await?;
+    let (store, db_router, git_db_url) = if cfg.multi_db {
+        let router = Arc::new(
+            DbRouter::connect(&cfg.shared_db_url, cfg.embedding_dim, cfg.instance_id.clone())
+                .await?,
+        );
+        let mut store =
+            SqlMemoryStore::connect(&cfg.shared_db_url, cfg.embedding_dim, cfg.instance_id.clone())
+                .await?;
+        store.migrate_shared().await?;
+        store.set_db_router(router.clone());
+        (Arc::new(store), Some(router), cfg.shared_db_url.clone())
+    } else {
+        let store =
+            SqlMemoryStore::connect(&cfg.db_url, cfg.embedding_dim, cfg.instance_id.clone()).await?;
+        store.migrate().await?;
+        (Arc::new(store), None, cfg.db_url.clone())
+    };
 
-    let pool = MySqlPool::connect(&cfg.db_url).await?;
+    let pool = MySqlPool::connect(&git_db_url).await?;
     let git = Arc::new(GitForDataService::new(pool, &cfg.db_name));
 
     let embedder = build_embedder(&cfg);
     let llm = build_llm(&cfg);
 
-    let service = Arc::new(MemoryService::new_sql_with_llm(Arc::new(store), embedder, llm).await);
+    let service = Arc::new(
+        MemoryService::new_sql_with_llm_and_router(store, db_router, embedder, llm).await,
+    );
     Arc::new(memoria_service::GovernanceScheduler::from_config(service.clone(), &cfg).await?)
         .start();
 
@@ -3080,6 +3117,8 @@ mod tests {
         Config {
             db_url: "mysql://root:111@localhost:6001/memoria".to_string(),
             db_name: "memoria".to_string(),
+            shared_db_url: "mysql://root:111@localhost:6001/memoria_shared".to_string(),
+            multi_db: false,
             embedding_provider: "openai".to_string(),
             embedding_model: "BAAI/bge-m3".to_string(),
             embedding_dim: 1024,

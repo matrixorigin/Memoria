@@ -3,14 +3,31 @@
 
 use anyhow::Result;
 use memoria_core::{MemoryType, TrustTier};
+use memoria_git::GitForDataService;
 use memoria_service::{
     ConsolidationInput, ConsolidationStrategy, DefaultConsolidationStrategy, MemoryService,
 };
+use memoria_storage::SqlMemoryStore;
 use serde_json::{json, Value};
 use sqlx::Row;
 use std::str::FromStr;
 use std::sync::Arc;
 use uuid::Uuid;
+
+async fn user_sql_store(
+    service: &Arc<MemoryService>,
+    user_id: &str,
+) -> Result<Arc<SqlMemoryStore>> {
+    service
+        .user_sql_store(user_id)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+fn git_for_store(sql: &Arc<SqlMemoryStore>) -> Option<GitForDataService> {
+    sql.database_name()
+        .map(|db_name| GitForDataService::new(sql.pool().clone(), db_name.to_string()))
+}
 
 pub fn list() -> Value {
     json!([
@@ -187,7 +204,7 @@ pub async fn call(
             };
 
             // Graph sync: create SEMANTIC node + auto entity extraction (best-effort)
-            if let Some(sql) = &service.sql_store {
+            if let Ok(sql) = user_sql_store(service, user_id).await {
                 let graph = sql.graph_store();
                 let node = memoria_storage::GraphNode {
                     node_id: uuid::Uuid::new_v4().simple().to_string()[..32].to_string(),
@@ -378,10 +395,7 @@ pub async fn call(
 
         "memory_governance" => {
             let force = args["force"].as_bool().unwrap_or(false);
-            let sql = match &service.sql_store {
-                Some(s) => s.clone(),
-                None => return Ok(mcp_text("Governance requires SQL store")),
-            };
+            let sql = user_sql_store(service, user_id).await?;
             const COOLDOWN_SECS: i64 = 3600; // 1 hour
             if !force {
                 if let Some(remaining) = sql
@@ -423,16 +437,18 @@ pub async fn call(
 
             // Snapshot health
             let snap_health = {
-                let snaps = sqlx::query("SHOW SNAPSHOTS")
-                    .fetch_all(sql.pool())
-                    .await
-                    .unwrap_or_default();
+                let snaps = git_for_store(&sql)
+                    .map(|git| async move { git.list_snapshots().await.unwrap_or_default() });
+                let snaps = match snaps {
+                    Some(fut) => fut.await,
+                    None => Vec::new(),
+                };
                 let total = snaps.len();
                 let auto = snaps
                     .iter()
-                    .filter(|r| {
-                        let name: String = r.try_get("SNAPSHOT_NAME").unwrap_or_default();
-                        name.starts_with("mem_milestone_") || name.starts_with("mem_snap_pre_")
+                    .filter(|snap| {
+                        snap.snapshot_name.starts_with("mem_milestone_")
+                            || snap.snapshot_name.contains("_pre_")
                     })
                     .count();
                 let ratio = if total > 0 {
@@ -458,10 +474,7 @@ pub async fn call(
                     "Invalid table '{table}'. Use mem_memories or memory_graph_nodes"
                 )));
             }
-            let sql = match &service.sql_store {
-                Some(s) => s.clone(),
-                None => return Ok(mcp_text("Rebuild index requires SQL store")),
-            };
+            let sql = user_sql_store(service, user_id).await?;
             let total_rows = sql
                 .rebuild_vector_index(table)
                 .await
@@ -473,10 +486,7 @@ pub async fn call(
 
         "memory_consolidate" => {
             let force = args["force"].as_bool().unwrap_or(false);
-            let sql = match &service.sql_store {
-                Some(s) => s.clone(),
-                None => return Ok(mcp_text("Consolidate requires SQL store")),
-            };
+            let sql = user_sql_store(service, user_id).await?;
             const COOLDOWN_SECS: i64 = 1800; // 30 minutes
             if !force {
                 if let Some(remaining) = sql
@@ -513,10 +523,7 @@ pub async fn call(
         "memory_reflect" => {
             let force = args["force"].as_bool().unwrap_or(false);
             let mode = args["mode"].as_str().unwrap_or("auto");
-            let sql = match &service.sql_store {
-                Some(s) => s.clone(),
-                None => return Ok(mcp_text("Reflect requires SQL store")),
-            };
+            let sql = user_sql_store(service, user_id).await?;
 
             if mode == "internal" && service.llm.is_none() {
                 return Ok(mcp_text(
@@ -570,12 +577,14 @@ pub async fn call(
             // auto/internal mode: use LLM to synthesize insights
             let llm = service.llm.as_ref().unwrap();
             let mut scenes_created = 0usize;
+            let table = sql.active_table(user_id).await?;
 
             // Get existing high-confidence memories as "existing knowledge"
-            let existing_rows = sqlx::query(
-                "SELECT content FROM mem_memories WHERE user_id = ? AND is_active = 1 \
-                 AND trust_tier IN ('T1','T2') ORDER BY created_at DESC LIMIT 10",
-            )
+            let existing_sql = format!(
+                "SELECT content FROM `{table}` WHERE user_id = ? AND is_active = 1 \
+                 AND trust_tier IN ('T1','T2') ORDER BY created_at DESC LIMIT 10"
+            );
+            let existing_rows = sqlx::query(&existing_sql)
             .bind(user_id)
             .fetch_all(sql.pool())
             .await
@@ -651,10 +660,7 @@ pub async fn call(
 
         "memory_extract_entities" => {
             let mode = args["mode"].as_str().unwrap_or("auto");
-            let sql = match &service.sql_store {
-                Some(s) => s.clone(),
-                None => return Ok(mcp_text("Extract entities requires SQL store")),
-            };
+            let sql = user_sql_store(service, user_id).await?;
 
             if mode == "internal" && service.llm.is_none() {
                 return Ok(mcp_text(
@@ -757,10 +763,7 @@ pub async fn call(
 
         "memory_link_entities" => {
             let entities_str = args["entities"].as_str().unwrap_or("");
-            let sql = match &service.sql_store {
-                Some(s) => s.clone(),
-                None => return Ok(mcp_text("Link entities requires SQL store")),
-            };
+            let sql = user_sql_store(service, user_id).await?;
 
             let parsed: Vec<serde_json::Value> = match serde_json::from_str(entities_str) {
                 Ok(v) => v,
@@ -852,10 +855,7 @@ pub async fn call(
         }
 
         "memory_get_retrieval_params" => {
-            let sql = service
-                .sql_store
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("SQL store not available"))?;
+            let sql = user_sql_store(service, user_id).await?;
             let params = sql.get_user_retrieval_params(user_id).await?;
             Ok(mcp_text(&serde_json::to_string_pretty(&params)?))
         }
@@ -863,10 +863,7 @@ pub async fn call(
         "memory_tune_params" => {
             use memoria_service::scoring::{DefaultScoringPlugin, ScoringPlugin};
 
-            let sql = service
-                .sql_store
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("SQL store not available"))?;
+            let sql = user_sql_store(service, user_id).await?;
 
             let old_params = sql.get_user_retrieval_params(user_id).await?;
             let plugin = DefaultScoringPlugin;
@@ -892,9 +889,12 @@ pub async fn call(
                 .await?;
 
             // Graph sync (best-effort) for each stored memory
+            let graph = user_sql_store(service, user_id)
+                .await
+                .ok()
+                .map(|sql| sql.graph_store());
             for m in &memories {
-                if let Some(sql) = &service.sql_store {
-                    let graph = sql.graph_store();
+                if let Some(graph) = graph.as_ref() {
                     let node = memoria_storage::GraphNode {
                         node_id: Uuid::new_v4().simple().to_string()[..32].to_string(),
                         user_id: user_id.to_string(),

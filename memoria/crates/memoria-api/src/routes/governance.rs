@@ -12,12 +12,7 @@ pub async fn governance(
     AuthUser { user_id, .. }: AuthUser,
     Json(req): Json<GovernanceRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let sql = state.service.sql_store.as_ref().ok_or_else(|| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "SQL store required".to_string(),
-        )
-    })?;
+    let sql = state.service.user_sql_store(&user_id).await.map_err(api_err)?;
 
     const COOLDOWN_SECS: i64 = 3600;
     if !req.force {
@@ -43,7 +38,7 @@ pub async fn governance(
         })
     } else {
         match sql
-            .check_cooldown("__global__", "orphan_graph_cleanup", COOLDOWN_SECS)
+            .check_cooldown(&user_id, "orphan_graph_cleanup", COOLDOWN_SECS)
             .await
         {
             Ok(Some(_)) => 0,
@@ -61,7 +56,7 @@ pub async fn governance(
         }
     };
     if orphan_graph_cleaned > 0 {
-        let _ = sql.set_cooldown("__global__", "orphan_graph_cleanup").await;
+        let _ = sql.set_cooldown(&user_id, "orphan_graph_cleanup").await;
     }
     if quarantined > 0 {
         let payload = serde_json::json!({"quarantined": quarantined}).to_string();
@@ -109,12 +104,7 @@ pub async fn consolidate(
     AuthUser { user_id, .. }: AuthUser,
     Json(req): Json<GovernanceRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let sql = state.service.sql_store.as_ref().ok_or_else(|| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "SQL store required".to_string(),
-        )
-    })?;
+    let sql = state.service.user_sql_store(&user_id).await.map_err(api_err)?;
 
     const COOLDOWN_SECS: i64 = 1800;
     if !req.force {
@@ -152,12 +142,7 @@ pub async fn reflect(
     AuthUser { user_id, .. }: AuthUser,
     Json(req): Json<ReflectRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let sql = state.service.sql_store.as_ref().ok_or_else(|| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "SQL store required".to_string(),
-        )
-    })?;
+    let sql = state.service.user_sql_store(&user_id).await.map_err(api_err)?;
 
     if req.mode == "internal" && state.service.llm.is_none() {
         return Err((
@@ -268,12 +253,7 @@ pub async fn extract_entities(
     AuthUser { user_id, .. }: AuthUser,
     Json(req): Json<ExtractEntitiesRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let sql = state.service.sql_store.as_ref().ok_or_else(|| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "SQL store required".to_string(),
-        )
-    })?;
+    let sql = state.service.user_sql_store(&user_id).await.map_err(api_err)?;
 
     if req.mode == "internal" && state.service.llm.is_none() {
         return Err((
@@ -365,12 +345,7 @@ pub async fn link_entities(
     AuthUser { user_id, .. }: AuthUser,
     Json(req): Json<LinkEntitiesRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let sql = state.service.sql_store.as_ref().ok_or_else(|| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "SQL store required".to_string(),
-        )
-    })?;
+    let sql = state.service.user_sql_store(&user_id).await.map_err(api_err)?;
     let graph = sql.graph_store();
     let mut created = 0usize;
     let mut reused = 0usize;
@@ -412,12 +387,7 @@ pub async fn get_entities(
     State(state): State<AppState>,
     AuthUser { user_id, .. }: AuthUser,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let sql = state.service.sql_store.as_ref().ok_or_else(|| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "SQL store required".to_string(),
-        )
-    })?;
+    let sql = state.service.user_sql_store(&user_id).await.map_err(api_err)?;
     let graph = sql.graph_store();
     let entities = graph.get_user_entities(&user_id).await.map_err(api_err)?;
     Ok(Json(json!({

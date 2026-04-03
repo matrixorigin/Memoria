@@ -5,13 +5,32 @@
 //! time and cached.  Process-level metrics (HTTP, auth, entity extraction) are
 //! rendered by [`crate::metrics::render`].
 
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 
 use crate::{state::CachedMetrics, AppState};
+
+async fn list_known_users(state: &AppState) -> Result<Vec<String>, String> {
+    let sql = state
+        .service
+        .sql_store
+        .as_ref()
+        .ok_or("SQL store not available")?;
+
+    if let Some(router) = sql.db_router() {
+        return router.list_active_users().await.map_err(|e| e.to_string());
+    }
+
+    let rows: Vec<(String,)> =
+        sqlx::query_as("SELECT DISTINCT user_id FROM mem_memories WHERE is_active > 0 ORDER BY user_id")
+            .fetch_all(sql.pool())
+            .await
+            .map_err(|e| e.to_string())?;
+    Ok(rows.into_iter().map(|row| row.0).collect())
+}
 
 /// GET /metrics — Prometheus text exposition format.
 pub async fn prometheus_metrics(State(state): State<AppState>) -> Response {
@@ -48,64 +67,92 @@ async fn collect_metrics(state: &AppState) -> Result<Arc<String>, String> {
         .sql_store
         .as_ref()
         .ok_or("SQL store not available")?;
-    let pool = sql.pool();
+    let shared_pool = state.auth_pool.as_ref().unwrap_or(sql.pool());
+    let user_ids = list_known_users(state).await?;
     let mut out = String::with_capacity(2048);
 
-    // ── Memory counts by type ─────────────────────────────────────────────
-    let rows: Vec<(String, i64)> = sqlx::query_as(
-        "SELECT memory_type, COUNT(*) FROM mem_memories WHERE is_active > 0 GROUP BY memory_type",
-    )
-    .fetch_all(pool)
-    .await
-    .map_err(|e| e.to_string())?;
+    let mut memory_counts = BTreeMap::<String, i64>::new();
+    let mut feedback_counts = BTreeMap::<String, i64>::new();
+    let mut total = 0i64;
+    let mut nodes = 0i64;
+    let mut edges = 0i64;
+    let mut snapshots = 0i64;
+    let mut branches = 0i64;
+
+    for user_id in &user_ids {
+        let user_store = state
+            .service
+            .user_sql_store(user_id)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT memory_type, COUNT(*) FROM mem_memories WHERE is_active > 0 GROUP BY memory_type",
+        )
+        .fetch_all(user_store.pool())
+        .await
+        .map_err(|e| e.to_string())?;
+        for (memory_type, count) in rows {
+            *memory_counts.entry(memory_type).or_default() += count;
+            total += count;
+        }
+
+        let fb_rows: Vec<(String, i64)> =
+            sqlx::query_as("SELECT signal, COUNT(*) FROM mem_retrieval_feedback GROUP BY signal")
+                .fetch_all(user_store.pool())
+                .await
+                .unwrap_or_default();
+        for (signal, count) in fb_rows {
+            *feedback_counts.entry(signal).or_default() += count;
+        }
+
+        nodes += sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM memory_graph_nodes WHERE is_active = 1",
+        )
+        .fetch_one(user_store.pool())
+        .await
+        .unwrap_or(0);
+        edges += sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM memory_graph_edges")
+            .fetch_one(user_store.pool())
+            .await
+            .unwrap_or(0);
+
+        snapshots += user_store
+            .list_snapshot_registrations(user_id)
+            .await
+            .unwrap_or_default()
+            .len() as i64;
+        branches += 1
+            + user_store
+                .list_branches(user_id)
+                .await
+                .unwrap_or_default()
+                .len() as i64;
+    }
 
     out.push_str("# HELP memoria_memories_total Active memories by type.\n");
     out.push_str("# TYPE memoria_memories_total gauge\n");
-    let mut total = 0i64;
-    for (mt, cnt) in &rows {
+    for (mt, cnt) in &memory_counts {
         out.push_str(&format!("memoria_memories_total{{type=\"{mt}\"}} {cnt}\n"));
-        total += cnt;
     }
     out.push_str(&format!("memoria_memories_total{{type=\"all\"}} {total}\n"));
 
     // ── Users ─────────────────────────────────────────────────────────────
-    let (users,): (i64,) =
-        sqlx::query_as("SELECT COUNT(DISTINCT user_id) FROM mem_memories WHERE is_active > 0")
-            .fetch_all(pool)
-            .await
-            .map_err(|e| e.to_string())?
-            .into_iter()
-            .next()
-            .unwrap_or((0,));
+    let users = user_ids.len() as i64;
     out.push_str("# HELP memoria_users_total Active users.\n");
     out.push_str("# TYPE memoria_users_total gauge\n");
     out.push_str(&format!("memoria_users_total {users}\n"));
 
     // ── Feedback counts ───────────────────────────────────────────────────
-    let fb_rows: Vec<(String, i64)> =
-        sqlx::query_as("SELECT signal, COUNT(*) FROM mem_retrieval_feedback GROUP BY signal")
-            .fetch_all(pool)
-            .await
-            .unwrap_or_default();
-
     out.push_str("# HELP memoria_feedback_total Feedback signals by type.\n");
     out.push_str("# TYPE memoria_feedback_total counter\n");
-    for (signal, cnt) in &fb_rows {
+    for (signal, cnt) in &feedback_counts {
         out.push_str(&format!(
             "memoria_feedback_total{{signal=\"{signal}\"}} {cnt}\n"
         ));
     }
 
     // ── Entity graph ──────────────────────────────────────────────────────
-    let (nodes,): (i64,) =
-        sqlx::query_as("SELECT COUNT(*) FROM memory_graph_nodes WHERE is_active = 1")
-            .fetch_one(pool)
-            .await
-            .unwrap_or((0,));
-    let (edges,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM memory_graph_edges")
-        .fetch_one(pool)
-        .await
-        .unwrap_or((0,));
     out.push_str("# HELP memoria_graph_nodes_total Entity graph nodes.\n");
     out.push_str("# TYPE memoria_graph_nodes_total gauge\n");
     out.push_str(&format!("memoria_graph_nodes_total {nodes}\n"));
@@ -114,25 +161,19 @@ async fn collect_metrics(state: &AppState) -> Result<Arc<String>, String> {
     out.push_str(&format!("memoria_graph_edges_total {edges}\n"));
 
     // ── Snapshots ─────────────────────────────────────────────────────────
-    let snapshots = state.git.list_snapshots().await.unwrap_or_default();
     out.push_str("# HELP memoria_snapshots_total Snapshots.\n");
     out.push_str("# TYPE memoria_snapshots_total gauge\n");
-    out.push_str(&format!("memoria_snapshots_total {}\n", snapshots.len()));
+    out.push_str(&format!("memoria_snapshots_total {snapshots}\n"));
 
     // ── Branches ──────────────────────────────────────────────────────────
-    let branches: Vec<(String,)> =
-        sqlx::query_as("SELECT DISTINCT branch_name FROM mem_branch_state")
-            .fetch_all(pool)
-            .await
-            .unwrap_or_default();
     out.push_str("# HELP memoria_branches_total Active branches.\n");
     out.push_str("# TYPE memoria_branches_total gauge\n");
-    out.push_str(&format!("memoria_branches_total {}\n", branches.len()));
+    out.push_str(&format!("memoria_branches_total {branches}\n"));
 
     // ── Async tasks ───────────────────────────────────────────────────────
     let task_rows: Vec<(String, i64)> =
         sqlx::query_as("SELECT status, COUNT(*) FROM mem_async_tasks GROUP BY status")
-            .fetch_all(pool)
+            .fetch_all(shared_pool)
             .await
             .unwrap_or_default();
 
@@ -148,7 +189,7 @@ async fn collect_metrics(state: &AppState) -> Result<Arc<String>, String> {
     let last_gov: Option<(String,)> = sqlx::query_as(
         "SELECT MAX(updated_at) FROM mem_async_tasks WHERE task_type LIKE 'governance_%'",
     )
-    .fetch_optional(pool)
+    .fetch_optional(shared_pool)
     .await
     .ok()
     .flatten();

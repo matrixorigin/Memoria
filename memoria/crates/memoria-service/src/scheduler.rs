@@ -1359,6 +1359,8 @@ mod tests {
         let config = Config {
             db_url: "mysql://root:111@localhost:6001/memoria".into(),
             db_name: "memoria".into(),
+            shared_db_url: "mysql://root:111@localhost:6001/memoria_shared".into(),
+            multi_db: false,
             embedding_provider: "mock".into(),
             embedding_model: "BAAI/bge-m3".into(),
             embedding_dim: 1024,

@@ -13,6 +13,8 @@ use crate::{
     routes::memory::{api_err, api_err_typed},
     state::AppState,
 };
+use memoria_git::GitForDataService;
+use std::sync::Arc;
 
 #[derive(Deserialize, Default)]
 pub struct ListSnapshotsQuery {
@@ -55,6 +57,22 @@ async fn git_call(
     Ok(json!({ "result": text }))
 }
 
+async fn user_snapshot_store(
+    state: &AppState,
+    user_id: &str,
+) -> Result<Arc<memoria_storage::SqlMemoryStore>, (StatusCode, String)> {
+    state.service.user_sql_store(user_id).await.map_err(api_err)
+}
+
+fn user_git_service(
+    sql: &Arc<memoria_storage::SqlMemoryStore>,
+) -> Result<GitForDataService, (StatusCode, String)> {
+    let db_name = sql
+        .database_name()
+        .ok_or((StatusCode::SERVICE_UNAVAILABLE, "SQL store missing database URL".into()))?;
+    Ok(GitForDataService::new(sql.pool().clone(), db_name.to_string()))
+}
+
 fn validate_snapshot_identifier(name: &str) -> Result<&str, (StatusCode, String)> {
     if !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_') {
         Ok(name)
@@ -78,11 +96,8 @@ async fn resolve_snapshot_internal(
     user_id: &str,
     name: &str,
 ) -> Result<String, (StatusCode, String)> {
-    let sql = state
-        .service
-        .sql_store
-        .as_ref()
-        .ok_or((StatusCode::SERVICE_UNAVAILABLE, "SQL store required".into()))?;
+    let sql = user_snapshot_store(state, user_id).await?;
+    let git = user_git_service(&sql)?;
 
     let internal = if let Some(milestone) = milestone_internal(name) {
         milestone
@@ -101,9 +116,7 @@ async fn resolve_snapshot_internal(
     };
 
     let internal = validate_snapshot_identifier(&internal)?.to_string();
-    state
-        .git
-        .get_snapshot(&internal)
+    git.get_snapshot(&internal)
         .await
         .map_err(api_err)?
         .ok_or((StatusCode::NOT_FOUND, "Snapshot not found".into()))?;
@@ -147,12 +160,9 @@ pub async fn get_snapshot(
     Path(name): Path<String>,
     Query(q): Query<GetSnapshotQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let pool = state
-        .service
-        .sql_store
-        .as_ref()
-        .map(|s| s.pool())
-        .ok_or((StatusCode::SERVICE_UNAVAILABLE, "SQL store required".into()))?;
+    let sql = user_snapshot_store(&state, &user_id).await?;
+    let pool = sql.pool();
+    let table = sql.active_table(&user_id).await.map_err(api_err)?;
 
     let snap_name = resolve_snapshot_internal(&state, &user_id, &name).await?;
     let limit = q.limit.unwrap_or(50).min(500);
@@ -161,7 +171,7 @@ pub async fn get_snapshot(
 
     // Total count via time-travel
     let count_sql = format!(
-        "SELECT COUNT(*) as cnt FROM mem_memories {{SNAPSHOT = '{snap_name}'}} WHERE user_id = ? AND is_active > 0"
+        "SELECT COUNT(*) as cnt FROM `{table}` {{SNAPSHOT = '{snap_name}'}} WHERE user_id = ? AND is_active > 0"
     );
     let total: i64 = sqlx::query_scalar(&count_sql)
         .bind(&user_id)
@@ -171,7 +181,7 @@ pub async fn get_snapshot(
 
     // Type distribution
     let type_sql = format!(
-        "SELECT memory_type, COUNT(*) as cnt FROM mem_memories {{SNAPSHOT = '{snap_name}'}} \
+        "SELECT memory_type, COUNT(*) as cnt FROM `{table}` {{SNAPSHOT = '{snap_name}'}} \
          WHERE user_id = ? AND is_active > 0 GROUP BY memory_type"
     );
     let type_rows = sqlx::query(&type_sql)
@@ -195,7 +205,7 @@ pub async fn get_snapshot(
         _ => 80,
     };
     let mem_sql = format!(
-        "SELECT memory_id, content, memory_type, initial_confidence FROM mem_memories {{SNAPSHOT = '{snap_name}'}} \
+        "SELECT memory_id, content, memory_type, initial_confidence FROM `{table}` {{SNAPSHOT = '{snap_name}'}} \
          WHERE user_id = ? AND is_active > 0 ORDER BY observed_at DESC LIMIT ? OFFSET ?"
     );
     let rows = sqlx::query(&mem_sql)
@@ -246,23 +256,22 @@ pub async fn diff_snapshot(
     Path(name): Path<String>,
     Query(q): Query<DiffSnapshotQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let pool = state
-        .service
-        .sql_store
-        .as_ref()
-        .map(|s| s.pool())
-        .ok_or((StatusCode::SERVICE_UNAVAILABLE, "SQL store required".into()))?;
+    let sql = user_snapshot_store(&state, &user_id).await?;
+    let pool = sql.pool();
+    let table = sql.active_table(&user_id).await.map_err(api_err)?;
 
     let snap_name = resolve_snapshot_internal(&state, &user_id, &name).await?;
     let limit = q.limit.unwrap_or(50).min(200);
 
     // Counts
     let snap_count: i64 = sqlx::query_scalar(&format!(
-        "SELECT COUNT(*) FROM mem_memories {{SNAPSHOT = '{snap_name}'}} WHERE user_id = ? AND is_active > 0"
+        "SELECT COUNT(*) FROM `{table}` {{SNAPSHOT = '{snap_name}'}} WHERE user_id = ? AND is_active > 0"
     )).bind(&user_id).fetch_one(pool).await.map_err(api_err)?;
 
     let curr_count: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM mem_memories WHERE user_id = ? AND is_active > 0")
+        sqlx::query_scalar(&format!(
+            "SELECT COUNT(*) FROM `{table}` WHERE user_id = ? AND is_active > 0"
+        ))
             .bind(&user_id)
             .fetch_one(pool)
             .await
@@ -270,8 +279,8 @@ pub async fn diff_snapshot(
 
     // Added (in current but not in snapshot)
     let added_sql = format!(
-        "SELECT c.memory_id, c.content, c.memory_type FROM mem_memories c \
-         LEFT JOIN mem_memories {{SNAPSHOT = '{snap_name}'}} s ON c.memory_id = s.memory_id AND s.is_active > 0 \
+        "SELECT c.memory_id, c.content, c.memory_type FROM `{table}` c \
+         LEFT JOIN `{table}` {{SNAPSHOT = '{snap_name}'}} s ON c.memory_id = s.memory_id AND s.is_active > 0 \
          WHERE c.user_id = ? AND c.is_active > 0 AND s.memory_id IS NULL LIMIT ?"
     );
     let added_rows = sqlx::query(&added_sql)
@@ -283,8 +292,8 @@ pub async fn diff_snapshot(
 
     // Removed (in snapshot but not in current)
     let removed_sql = format!(
-        "SELECT s.memory_id, s.content, s.memory_type FROM mem_memories {{SNAPSHOT = '{snap_name}'}} s \
-         LEFT JOIN mem_memories c ON s.memory_id = c.memory_id AND c.is_active > 0 \
+        "SELECT s.memory_id, s.content, s.memory_type FROM `{table}` {{SNAPSHOT = '{snap_name}'}} s \
+         LEFT JOIN `{table}` c ON s.memory_id = c.memory_id AND c.is_active > 0 \
          WHERE s.user_id = ? AND s.is_active > 0 AND c.memory_id IS NULL LIMIT ?"
     );
     let removed_rows = sqlx::query(&removed_sql)

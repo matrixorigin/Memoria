@@ -427,9 +427,10 @@ pub async fn get_profile(
     };
     let sql = state
         .service
-        .sql_store
-        .as_ref()
-        .ok_or_else(|| api_err("SQL store required"))?;
+        .user_sql_store(&resolved)
+        .await
+        .map_err(api_err)?;
+    let table = sql.active_table(&resolved).await.map_err(api_err)?;
     let memories = state
         .service
         .list_active(&resolved, 50)
@@ -441,14 +442,16 @@ pub async fn get_profile(
         .map(|m| m.content.as_str())
         .collect();
 
-    // Stats enrichment (matches Python)
-    // TODO: make branch-aware — currently hardcoded to mem_memories
-    let stats: serde_json::Value = sqlx::query(
+    // Stats enrichment follows the user's active branch table.
+    let stats_query = format!(
         "SELECT memory_type, COUNT(*) as cnt, \
          ROUND(AVG(initial_confidence), 2) as avg_conf, \
          MIN(observed_at) as oldest, MAX(observed_at) as newest \
-         FROM mem_memories WHERE user_id = ? AND is_active = 1 GROUP BY memory_type"
-    ).bind(&resolved).fetch_all(sql.pool()).await
+         FROM `{table}` WHERE user_id = ? AND is_active = 1 GROUP BY memory_type"
+    );
+    let stats: serde_json::Value = sqlx::query(&stats_query)
+    .bind(&resolved)
+    .fetch_all(sql.pool()).await
     .map(|rows| {
         let mut by_type = serde_json::Map::new();
         let mut total = 0i64;
@@ -527,12 +530,7 @@ pub async fn get_memory_history(
 ) -> ApiResult<serde_json::Value> {
     use sqlx::Row;
 
-    let sql = state.service.sql_store.as_ref().ok_or_else(|| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "SQL store required".to_string(),
-        )
-    })?;
+    let sql = state.service.user_sql_store(&user_id).await.map_err(api_err)?;
     let table = sql.active_table(&user_id).await.map_err(api_err)?;
 
     let mut chain = Vec::new();
@@ -747,12 +745,7 @@ pub async fn get_retrieval_params(
     State(state): State<AppState>,
     AuthUser { user_id, .. }: AuthUser,
 ) -> ApiResult<serde_json::Value> {
-    let sql = state.service.sql_store.as_ref().ok_or_else(|| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "SQL store not available".to_string(),
-        )
-    })?;
+    let sql = state.service.user_sql_store(&user_id).await.map_err(api_err)?;
     let params = sql
         .get_user_retrieval_params(&user_id)
         .await
@@ -773,12 +766,7 @@ pub async fn set_retrieval_params(
     AuthUser { user_id, .. }: AuthUser,
     Json(req): Json<SetRetrievalParamsRequest>,
 ) -> ApiResult<serde_json::Value> {
-    let sql = state.service.sql_store.as_ref().ok_or_else(|| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "SQL store not available".to_string(),
-        )
-    })?;
+    let sql = state.service.user_sql_store(&user_id).await.map_err(api_err)?;
 
     let mut params = sql
         .get_user_retrieval_params(&user_id)
@@ -808,12 +796,7 @@ pub async fn tune_retrieval_params(
 ) -> ApiResult<serde_json::Value> {
     use memoria_service::scoring::{DefaultScoringPlugin, ScoringPlugin};
 
-    let sql = state.service.sql_store.as_ref().ok_or_else(|| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "SQL store not available".to_string(),
-        )
-    })?;
+    let sql = state.service.user_sql_store(&user_id).await.map_err(api_err)?;
 
     let old_params = sql
         .get_user_retrieval_params(&user_id)

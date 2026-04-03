@@ -93,21 +93,22 @@ async fn generate_and_store(
 ) -> Result<(String, String, bool, serde_json::Value), String> {
     let sql = state
         .service
-        .sql_store
-        .as_ref()
-        .ok_or("SQL store required")?;
+        .user_sql_store(user_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    let table = sql.active_table(user_id).await.map_err(|e| e.to_string())?;
     let llm = state
         .service
         .llm
         .as_ref()
         .ok_or("LLM not configured — set LLM_API_KEY")?;
 
-    // TODO: make branch-aware — currently hardcoded to mem_memories
-    let rows = sqlx::query(
-        "SELECT memory_id, content, memory_type FROM mem_memories \
+    let query = format!(
+        "SELECT memory_id, content, memory_type FROM `{table}` \
          WHERE user_id = ? AND session_id = ? AND is_active = 1 \
-         ORDER BY created_at ASC",
-    )
+         ORDER BY created_at ASC"
+    );
+    let rows = sqlx::query(&query)
     .bind(user_id)
     .bind(session_id)
     .fetch_all(sql.pool())

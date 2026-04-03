@@ -1,5 +1,6 @@
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{NaiveDateTime, Utc};
+use crate::router::DbRouter;
 use memoria_core::{
     interfaces::MemoryStore, nullable_str, nullable_str_from_row, MemoriaError, Memory, MemoryType,
     TrustTier,
@@ -460,6 +461,7 @@ pub struct SqlMemoryStore {
     /// Optional: route log_edit through async buffer instead of direct INSERT.
     /// Shared across main store and background pool clones so a single clear drains all.
     edit_log_tx: Arc<std::sync::RwLock<Option<tokio::sync::mpsc::Sender<OwnedEditLogEntry>>>>,
+    db_router: Option<Arc<DbRouter>>,
 }
 
 #[derive(Debug, Clone)]
@@ -541,6 +543,7 @@ impl SqlMemoryStore {
                 .time_to_live(std::time::Duration::from_secs(120))
                 .build(),
             edit_log_tx: Arc::new(std::sync::RwLock::new(None)),
+            db_router: None,
         }
     }
 
@@ -556,6 +559,21 @@ impl SqlMemoryStore {
 
     pub fn pool(&self) -> &MySqlPool {
         &self.pool
+    }
+
+    pub fn set_db_router(&mut self, router: Arc<DbRouter>) {
+        self.db_router = Some(router);
+    }
+
+    pub fn db_router(&self) -> Option<&Arc<DbRouter>> {
+        self.db_router.as_ref()
+    }
+
+    pub fn database_name(&self) -> Option<&str> {
+        self.database_url
+            .as_deref()
+            .and_then(|database_url| database_url.rsplit_once('/').map(|(_, db_name)| db_name))
+            .filter(|db_name| !db_name.is_empty())
     }
 
     pub fn configured_max_connections(&self) -> Option<u32> {
@@ -653,6 +671,7 @@ impl SqlMemoryStore {
                 s.database_url = self.database_url.clone();
                 // Share the same edit_log_tx Arc so clear_edit_log_tx drains all stores at once
                 s.edit_log_tx = self.edit_log_tx.clone();
+                s.db_router = self.db_router.clone();
                 Ok(std::sync::Arc::new(s))
             }
             Err(e) => Err(db_err(e)),
@@ -660,6 +679,12 @@ impl SqlMemoryStore {
     }
 
     pub async fn migrate(&self) -> Result<(), MemoriaError> {
+        self.migrate_user().await?;
+        self.migrate_shared().await?;
+        Ok(())
+    }
+
+    pub async fn migrate_user(&self) -> Result<(), MemoriaError> {
         // mem_memories
         let sql = format!(
             r#"CREATE TABLE IF NOT EXISTS mem_memories (
@@ -741,133 +766,6 @@ impl SqlMemoryStore {
                 operation   VARCHAR(32)  NOT NULL,
                 last_run_at DATETIME(6)  NOT NULL,
                 PRIMARY KEY (user_id, operation)
-            )"#,
-        )
-        .execute(&self.pool)
-        .await
-        .map_err(db_err)?;
-
-        sqlx::query(
-            r#"CREATE TABLE IF NOT EXISTS mem_governance_runtime_state (
-                strategy_key       VARCHAR(128) NOT NULL,
-                task               VARCHAR(32)  NOT NULL,
-                failure_count      INT          NOT NULL DEFAULT 0,
-                circuit_open_until DATETIME(6)  DEFAULT NULL,
-                updated_at         DATETIME(6)  NOT NULL,
-                PRIMARY KEY (strategy_key, task)
-            )"#,
-        )
-        .execute(&self.pool)
-        .await
-        .map_err(db_err)?;
-
-        sqlx::query(
-            r#"CREATE TABLE IF NOT EXISTS mem_plugin_signers (
-                signer       VARCHAR(128) PRIMARY KEY,
-                algorithm    VARCHAR(32)  NOT NULL,
-                public_key   TEXT         NOT NULL,
-                is_active    TINYINT(1)   NOT NULL DEFAULT 1,
-                created_at   DATETIME(6)  NOT NULL,
-                updated_at   DATETIME(6)  NOT NULL,
-                created_by   VARCHAR(64)  NOT NULL
-            )"#,
-        )
-        .execute(&self.pool)
-        .await
-        .map_err(db_err)?;
-
-        sqlx::query(
-            r#"CREATE TABLE IF NOT EXISTS mem_plugin_packages (
-                plugin_key      VARCHAR(128) NOT NULL,
-                version         VARCHAR(32)  NOT NULL,
-                domain          VARCHAR(32)  NOT NULL,
-                name            VARCHAR(128) NOT NULL,
-                runtime         VARCHAR(32)  NOT NULL,
-                manifest_json   TEXT         NOT NULL,
-                package_payload LONGTEXT     NOT NULL,
-                sha256          VARCHAR(128) NOT NULL,
-                signature       TEXT         NOT NULL,
-                signer          VARCHAR(128) NOT NULL,
-                status          VARCHAR(16)  NOT NULL DEFAULT 'active',
-                published_at    DATETIME(6)  NOT NULL,
-                published_by    VARCHAR(64)  NOT NULL,
-                PRIMARY KEY (plugin_key, version),
-                INDEX idx_plugin_domain_status (domain, status),
-                INDEX idx_plugin_signer (signer)
-            )"#,
-        )
-        .execute(&self.pool)
-        .await
-        .map_err(db_err)?;
-
-        sqlx::query(
-            r#"CREATE TABLE IF NOT EXISTS mem_plugin_bindings (
-                domain      VARCHAR(32)  NOT NULL,
-                binding_key VARCHAR(64)  NOT NULL,
-                plugin_key  VARCHAR(128) NOT NULL,
-                version     VARCHAR(32)  NOT NULL,
-                updated_at  DATETIME(6)  NOT NULL,
-                updated_by  VARCHAR(64)  NOT NULL,
-                PRIMARY KEY (domain, binding_key)
-            )"#,
-        )
-        .execute(&self.pool)
-        .await
-        .map_err(db_err)?;
-
-        sqlx::query(
-            r#"CREATE TABLE IF NOT EXISTS mem_plugin_reviews (
-                plugin_key    VARCHAR(128) NOT NULL,
-                version       VARCHAR(32)  NOT NULL,
-                review_status VARCHAR(16)  NOT NULL DEFAULT 'pending',
-                score         DOUBLE       NOT NULL DEFAULT 0,
-                review_notes  TEXT         NOT NULL,
-                reviewed_at   DATETIME(6)  NOT NULL,
-                reviewed_by   VARCHAR(64)  NOT NULL,
-                PRIMARY KEY (plugin_key, version)
-            )"#,
-        )
-        .execute(&self.pool)
-        .await
-        .map_err(db_err)?;
-
-        sqlx::query(
-            r#"CREATE TABLE IF NOT EXISTS mem_plugin_binding_rules (
-                rule_id             VARCHAR(64)  PRIMARY KEY,
-                domain              VARCHAR(32)  NOT NULL,
-                binding_key         VARCHAR(64)  NOT NULL,
-                subject_key         VARCHAR(128) NOT NULL,
-                priority            BIGINT       NOT NULL DEFAULT 100,
-                plugin_key          VARCHAR(128) NOT NULL,
-                selector_kind       VARCHAR(16)  NOT NULL,
-                selector_value      VARCHAR(64)  NOT NULL,
-                rollout_percent     BIGINT       NOT NULL DEFAULT 100,
-                transport_endpoint  TEXT         NOT NULL,
-                status              VARCHAR(16)  NOT NULL DEFAULT 'active',
-                updated_at          DATETIME(6)  NOT NULL,
-                updated_by          VARCHAR(64)  NOT NULL,
-                UNIQUE KEY uniq_binding_rule (domain, binding_key, subject_key, priority)
-            )"#,
-        )
-        .execute(&self.pool)
-        .await
-        .map_err(db_err)?;
-
-        sqlx::query(
-            r#"CREATE TABLE IF NOT EXISTS mem_plugin_audit_events (
-                event_id      VARCHAR(64)  PRIMARY KEY,
-                domain        VARCHAR(32)  NOT NULL,
-                binding_key   VARCHAR(64)  NOT NULL,
-                subject_key   VARCHAR(128) NOT NULL,
-                plugin_key    VARCHAR(128) NOT NULL,
-                version       VARCHAR(32)  NOT NULL,
-                event_type    VARCHAR(32)  NOT NULL,
-                status        VARCHAR(16)  NOT NULL,
-                message       TEXT         NOT NULL,
-                metadata_json JSON         NOT NULL,
-                created_at    DATETIME(6)  NOT NULL,
-                actor         VARCHAR(64)  NOT NULL,
-                INDEX idx_plugin_audit_lookup (domain, binding_key, plugin_key, created_at)
             )"#,
         )
         .execute(&self.pool)
@@ -968,47 +866,6 @@ impl SqlMemoryStore {
 
         // Graph tables
         self.graph_store().migrate().await?;
-
-        // ── Distributed coordination tables ───────────────────────────────────
-
-        // mem_distributed_locks — DB-based mutual exclusion for multi-instance
-        sqlx::query(
-            r#"CREATE TABLE IF NOT EXISTS mem_distributed_locks (
-                lock_key    VARCHAR(128) PRIMARY KEY,
-                holder_id   VARCHAR(128) NOT NULL,
-                acquired_at DATETIME(6)  NOT NULL,
-                expires_at  DATETIME(6)  NOT NULL,
-                INDEX idx_lock_expires (expires_at)
-            )"#,
-        )
-        .execute(&self.pool)
-        .await
-        .map_err(db_err)?;
-
-        // mem_async_tasks — cross-instance async task tracking
-        sqlx::query(
-            r#"CREATE TABLE IF NOT EXISTS mem_async_tasks (
-                task_id     VARCHAR(64)  PRIMARY KEY,
-                instance_id VARCHAR(128) NOT NULL,
-                user_id     VARCHAR(64)  NOT NULL DEFAULT '',
-                status      VARCHAR(16)  NOT NULL DEFAULT 'processing',
-                result_json JSON         DEFAULT NULL,
-                error_json  JSON         DEFAULT NULL,
-                created_at  DATETIME(6)  NOT NULL,
-                updated_at  DATETIME(6)  NOT NULL,
-                INDEX idx_task_status (status, created_at)
-            )"#,
-        )
-        .execute(&self.pool)
-        .await
-        .map_err(db_err)?;
-
-        // Backfill user_id column for existing deployments (ignore if already exists)
-        let _ = sqlx::query(
-            "ALTER TABLE mem_async_tasks ADD COLUMN user_id VARCHAR(64) NOT NULL DEFAULT '' AFTER instance_id",
-        )
-        .execute(&self.pool)
-        .await;
 
         // Backfill extra_metadata column for existing deployments (ignore if already exists)
         let _ = sqlx::query(
@@ -1339,6 +1196,207 @@ impl SqlMemoryStore {
         Ok(())
     }
 
+    pub async fn migrate_shared(&self) -> Result<(), MemoriaError> {
+        sqlx::query(
+            r#"CREATE TABLE IF NOT EXISTS mem_user_registry (
+                user_id     VARCHAR(64)  PRIMARY KEY,
+                db_name     VARCHAR(128) NOT NULL UNIQUE,
+                status      VARCHAR(20)  NOT NULL DEFAULT 'active',
+                created_at  DATETIME(6)  NOT NULL,
+                updated_at  DATETIME(6)  NOT NULL,
+                INDEX idx_status (status)
+            )"#,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+
+        sqlx::query(
+            r#"CREATE TABLE IF NOT EXISTS mem_api_keys (
+                key_id       VARCHAR(36)  NOT NULL,
+                user_id      VARCHAR(64)  NOT NULL,
+                name         VARCHAR(100) NOT NULL,
+                key_hash     VARCHAR(64)  NOT NULL,
+                key_prefix   VARCHAR(12)  NOT NULL,
+                is_active    TINYINT(1)   NOT NULL DEFAULT 1,
+                created_at   DATETIME(6)  NOT NULL,
+                expires_at   DATETIME(6)  DEFAULT NULL,
+                last_used_at DATETIME(6)  DEFAULT NULL,
+                PRIMARY KEY (key_id),
+                KEY idx_key_hash (key_hash),
+                KEY idx_user_active (user_id, is_active)
+            )"#,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+
+        sqlx::query(
+            r#"CREATE TABLE IF NOT EXISTS mem_governance_runtime_state (
+                strategy_key       VARCHAR(128) NOT NULL,
+                task               VARCHAR(32)  NOT NULL,
+                failure_count      INT          NOT NULL DEFAULT 0,
+                circuit_open_until DATETIME(6)  DEFAULT NULL,
+                updated_at         DATETIME(6)  NOT NULL,
+                PRIMARY KEY (strategy_key, task)
+            )"#,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+
+        sqlx::query(
+            r#"CREATE TABLE IF NOT EXISTS mem_plugin_signers (
+                signer       VARCHAR(128) PRIMARY KEY,
+                algorithm    VARCHAR(32)  NOT NULL,
+                public_key   TEXT         NOT NULL,
+                is_active    TINYINT(1)   NOT NULL DEFAULT 1,
+                created_at   DATETIME(6)  NOT NULL,
+                updated_at   DATETIME(6)  NOT NULL,
+                created_by   VARCHAR(64)  NOT NULL
+            )"#,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+
+        sqlx::query(
+            r#"CREATE TABLE IF NOT EXISTS mem_plugin_packages (
+                plugin_key      VARCHAR(128) NOT NULL,
+                version         VARCHAR(32)  NOT NULL,
+                domain          VARCHAR(32)  NOT NULL,
+                name            VARCHAR(128) NOT NULL,
+                runtime         VARCHAR(32)  NOT NULL,
+                manifest_json   TEXT         NOT NULL,
+                package_payload LONGTEXT     NOT NULL,
+                sha256          VARCHAR(128) NOT NULL,
+                signature       TEXT         NOT NULL,
+                signer          VARCHAR(128) NOT NULL,
+                status          VARCHAR(16)  NOT NULL DEFAULT 'active',
+                published_at    DATETIME(6)  NOT NULL,
+                published_by    VARCHAR(64)  NOT NULL,
+                PRIMARY KEY (plugin_key, version),
+                INDEX idx_plugin_domain_status (domain, status),
+                INDEX idx_plugin_signer (signer)
+            )"#,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+
+        sqlx::query(
+            r#"CREATE TABLE IF NOT EXISTS mem_plugin_bindings (
+                domain      VARCHAR(32)  NOT NULL,
+                binding_key VARCHAR(64)  NOT NULL,
+                plugin_key  VARCHAR(128) NOT NULL,
+                version     VARCHAR(32)  NOT NULL,
+                updated_at  DATETIME(6)  NOT NULL,
+                updated_by  VARCHAR(64)  NOT NULL,
+                PRIMARY KEY (domain, binding_key)
+            )"#,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+
+        sqlx::query(
+            r#"CREATE TABLE IF NOT EXISTS mem_plugin_reviews (
+                plugin_key    VARCHAR(128) NOT NULL,
+                version       VARCHAR(32)  NOT NULL,
+                review_status VARCHAR(16)  NOT NULL DEFAULT 'pending',
+                score         DOUBLE       NOT NULL DEFAULT 0,
+                review_notes  TEXT         NOT NULL,
+                reviewed_at   DATETIME(6)  NOT NULL,
+                reviewed_by   VARCHAR(64)  NOT NULL,
+                PRIMARY KEY (plugin_key, version)
+            )"#,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+
+        sqlx::query(
+            r#"CREATE TABLE IF NOT EXISTS mem_plugin_binding_rules (
+                rule_id             VARCHAR(64)  PRIMARY KEY,
+                domain              VARCHAR(32)  NOT NULL,
+                binding_key         VARCHAR(64)  NOT NULL,
+                subject_key         VARCHAR(128) NOT NULL,
+                priority            BIGINT       NOT NULL DEFAULT 100,
+                plugin_key          VARCHAR(128) NOT NULL,
+                selector_kind       VARCHAR(16)  NOT NULL,
+                selector_value      VARCHAR(64)  NOT NULL,
+                rollout_percent     BIGINT       NOT NULL DEFAULT 100,
+                transport_endpoint  TEXT         NOT NULL,
+                status              VARCHAR(16)  NOT NULL DEFAULT 'active',
+                updated_at          DATETIME(6)  NOT NULL,
+                updated_by          VARCHAR(64)  NOT NULL,
+                UNIQUE KEY uniq_binding_rule (domain, binding_key, subject_key, priority)
+            )"#,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+
+        sqlx::query(
+            r#"CREATE TABLE IF NOT EXISTS mem_plugin_audit_events (
+                event_id      VARCHAR(64)  PRIMARY KEY,
+                domain        VARCHAR(32)  NOT NULL,
+                binding_key   VARCHAR(64)  NOT NULL,
+                subject_key   VARCHAR(128) NOT NULL,
+                plugin_key    VARCHAR(128) NOT NULL,
+                version       VARCHAR(32)  NOT NULL,
+                event_type    VARCHAR(32)  NOT NULL,
+                status        VARCHAR(16)  NOT NULL,
+                message       TEXT         NOT NULL,
+                metadata_json JSON         NOT NULL,
+                created_at    DATETIME(6)  NOT NULL,
+                actor         VARCHAR(64)  NOT NULL,
+                INDEX idx_plugin_audit_lookup (domain, binding_key, plugin_key, created_at)
+            )"#,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+
+        sqlx::query(
+            r#"CREATE TABLE IF NOT EXISTS mem_distributed_locks (
+                lock_key    VARCHAR(128) PRIMARY KEY,
+                holder_id   VARCHAR(128) NOT NULL,
+                acquired_at DATETIME(6)  NOT NULL,
+                expires_at  DATETIME(6)  NOT NULL,
+                INDEX idx_lock_expires (expires_at)
+            )"#,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+
+        sqlx::query(
+            r#"CREATE TABLE IF NOT EXISTS mem_async_tasks (
+                task_id     VARCHAR(64)  PRIMARY KEY,
+                instance_id VARCHAR(128) NOT NULL,
+                user_id     VARCHAR(64)  NOT NULL DEFAULT '',
+                status      VARCHAR(16)  NOT NULL DEFAULT 'processing',
+                result_json JSON         DEFAULT NULL,
+                error_json  JSON         DEFAULT NULL,
+                created_at  DATETIME(6)  NOT NULL,
+                updated_at  DATETIME(6)  NOT NULL,
+                INDEX idx_task_status (status, created_at)
+            )"#,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+
+        let _ = sqlx::query(
+            "ALTER TABLE mem_async_tasks ADD COLUMN user_id VARCHAR(64) NOT NULL DEFAULT '' AFTER instance_id",
+        )
+        .execute(&self.pool)
+        .await;
+
+        Ok(())
+    }
+
     // ── Audit log ─────────────────────────────────────────────────────────────
 
     /// Create a safety snapshot before destructive operations. Best-effort.
@@ -1349,12 +1407,20 @@ impl SqlMemoryStore {
         &self,
         operation: &str,
     ) -> (Option<String>, Option<String>) {
+        let snapshot_prefix = match self.database_name() {
+            Some(db_name) => format!("mem_snap_{db_name}_pre_"),
+            None => "mem_snap_pre_".to_string(),
+        };
         let name = format!(
-            "mem_snap_pre_{}_{}",
+            "{}{}_{}",
+            snapshot_prefix,
             operation,
             &uuid::Uuid::new_v4().simple().to_string()[..8]
         );
-        let sql = format!("CREATE SNAPSHOT {name} FOR ACCOUNT sys");
+        let sql = match self.database_name() {
+            Some(db_name) => format!("CREATE SNAPSHOT {name} FOR DATABASE {db_name}"),
+            None => format!("CREATE SNAPSHOT {name} FOR ACCOUNT sys"),
+        };
 
         // First attempt
         if sqlx::raw_sql(&sql).execute(&self.pool).await.is_ok() {
@@ -1362,7 +1428,7 @@ impl SqlMemoryStore {
         }
 
         // Failed — try to reclaim space by dropping oldest pre_ snapshots
-        let dropped = self.cleanup_oldest_safety_snapshots(10).await;
+        let dropped = self.cleanup_oldest_safety_snapshots(&snapshot_prefix, 10).await;
         if dropped > 0 {
             // Retry
             if sqlx::raw_sql(&sql).execute(&self.pool).await.is_ok() {
@@ -1383,11 +1449,12 @@ impl SqlMemoryStore {
     }
 
     /// Drop the N oldest `mem_snap_pre_` snapshots. Returns count dropped.
-    async fn cleanup_oldest_safety_snapshots(&self, n: usize) -> usize {
+    async fn cleanup_oldest_safety_snapshots(&self, prefix: &str, n: usize) -> usize {
         let rows: Vec<(String,)> = sqlx::query_as(
             "SELECT sname FROM mo_catalog.mo_snapshots \
-             WHERE prefix_eq(sname, 'mem_snap_pre_') ORDER BY ts ASC",
+             WHERE prefix_eq(sname, ?) ORDER BY ts ASC",
         )
+        .bind(prefix)
         .fetch_all(&self.pool)
         .await
         .unwrap_or_default();
@@ -1442,6 +1509,52 @@ impl SqlMemoryStore {
                 }
             }
         }
+        if let Some(router) = &self.db_router {
+            match router.user_store(user_id).await {
+                Ok(store) => {
+                    let _ = store
+                        .insert_edit_log_direct(
+                            user_id,
+                            operation,
+                            memory_id,
+                            payload,
+                            reason,
+                            snapshot_before,
+                        )
+                        .await;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        user_id,
+                        operation,
+                        error = %e,
+                        "failed to route edit log entry to user store"
+                    );
+                }
+            }
+            return;
+        }
+        let _ = self
+            .insert_edit_log_direct(
+                user_id,
+                operation,
+                memory_id,
+                payload,
+                reason,
+                snapshot_before,
+            )
+            .await;
+    }
+
+    async fn insert_edit_log_direct(
+        &self,
+        user_id: &str,
+        operation: &str,
+        memory_id: Option<&str>,
+        payload: Option<&str>,
+        reason: &str,
+        snapshot_before: Option<&str>,
+    ) -> Result<(), MemoriaError> {
         let edit_id = uuid7_id();
         // MO workaround (revert when fixed): MatrixOne prepared-statement bind of
         // Option<String>::None to nullable columns inherits the previous row's value
@@ -1470,7 +1583,8 @@ impl SqlMemoryStore {
         if let Some(v) = snapshot_before {
             q = q.bind(v);
         }
-        let _ = q.bind(user_id).execute(&self.pool).await;
+        q.bind(user_id).execute(&self.pool).await.map_err(db_err)?;
+        Ok(())
     }
 
     /// Batch-insert edit log entries in a single multi-row INSERT.
@@ -1481,6 +1595,28 @@ impl SqlMemoryStore {
         if entries.is_empty() {
             return Ok(());
         }
+        if let Some(router) = &self.db_router {
+            let mut by_user: std::collections::HashMap<&str, Vec<OwnedEditLogEntry>> =
+                std::collections::HashMap::new();
+            for entry in entries {
+                by_user
+                    .entry(entry.user_id.as_str())
+                    .or_default()
+                    .push(entry.clone());
+            }
+            for (user_id, user_entries) in by_user {
+                let store = router.user_store(user_id).await?;
+                store.flush_edit_log_batch_direct(&user_entries).await?;
+            }
+            return Ok(());
+        }
+        self.flush_edit_log_batch_direct(entries).await
+    }
+
+    async fn flush_edit_log_batch_direct(
+        &self,
+        entries: &[OwnedEditLogEntry],
+    ) -> Result<(), MemoriaError> {
         for chunk in entries.chunks(100) {
             // MO workaround (revert when fixed): MatrixOne prepared-statement bind of
             // Option<String>::None to nullable columns inherits the previous row's value
@@ -1587,6 +1723,16 @@ impl SqlMemoryStore {
         .map_err(db_err)?;
         self.active_table_cache.invalidate(user_id).await;
         Ok(())
+    }
+
+    pub async fn invalidate_user_caches(&self, user_id: &str) {
+        self.active_table_cache.invalidate(user_id).await;
+
+        // Keep rollback reconciliation scoped to the known per-user governance cooldowns.
+        for operation in ["governance", "consolidate", "reflect", "orphan_graph_cleanup"] {
+            let key = format!("{user_id}:{operation}");
+            self.cooldown_cache.invalidate(&key).await;
+        }
     }
 
     pub async fn register_branch(
@@ -2286,13 +2432,44 @@ impl SqlMemoryStore {
 
     /// Drop old milestone snapshots, keep last N (weekly).
     pub async fn cleanup_snapshots(&self, keep_last_n: usize) -> Result<i64, MemoriaError> {
-        let rows: Vec<(String,)> = sqlx::query_as(
-            "SELECT sname FROM mo_catalog.mo_snapshots \
-             WHERE prefix_eq(sname, 'mem_milestone_') ORDER BY ts DESC",
-        )
-        .fetch_all(&self.pool)
-        .await
-        .map_err(db_err)?;
+        let rows: Vec<(String,)> = if let Some(db_name) = self.database_name() {
+            let mut snapshots: Vec<(String, Option<NaiveDateTime>)> = sqlx::query("SHOW SNAPSHOTS")
+                .fetch_all(&self.pool)
+                .await
+                .map_err(db_err)?
+                .into_iter()
+                .filter_map(|row| {
+                    let snapshot_name: String = row.try_get("SNAPSHOT_NAME").ok()?;
+                    if !snapshot_name.starts_with("mem_milestone_") {
+                        return None;
+                    }
+                    let snapshot_db = row.try_get::<String, _>("DATABASE_NAME").ok()?;
+                    if snapshot_db != db_name {
+                        return None;
+                    }
+                    let timestamp = row.try_get::<NaiveDateTime, _>("TIMESTAMP").ok().or_else(|| {
+                        row.try_get::<String, _>("TIMESTAMP").ok().and_then(|s| {
+                            NaiveDateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S%.f")
+                                .ok()
+                                .or_else(|| {
+                                    NaiveDateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S").ok()
+                                })
+                        })
+                    });
+                    Some((snapshot_name, timestamp))
+                })
+                .collect();
+            snapshots.sort_by(|a, b| b.1.cmp(&a.1));
+            snapshots.into_iter().map(|(name, _)| (name,)).collect()
+        } else {
+            sqlx::query_as(
+                "SELECT sname FROM mo_catalog.mo_snapshots \
+                 WHERE prefix_eq(sname, 'mem_milestone_') ORDER BY ts DESC",
+            )
+            .fetch_all(&self.pool)
+            .await
+            .map_err(db_err)?
+        };
 
         if rows.len() <= keep_last_n {
             return Ok(0);

@@ -11,16 +11,39 @@ use memoria_service::{
 };
 use serde::{Deserialize, Serialize};
 use sqlx::{MySqlPool, Row};
+use std::sync::Arc;
 
 use crate::{auth::AuthUser, routes::memory::api_err, state::AppState};
 
-fn get_pool(state: &AppState) -> Result<&MySqlPool, (StatusCode, String)> {
-    state
+fn get_shared_pool(state: &AppState) -> Result<&MySqlPool, (StatusCode, String)> {
+    state.auth_pool.as_ref().or_else(|| state.service.sql_store.as_ref().map(|s| s.pool())).ok_or((
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "No shared SQL pool".into(),
+    ))
+}
+
+async fn get_user_store(
+    state: &AppState,
+    user_id: &str,
+) -> Result<Arc<memoria_storage::SqlMemoryStore>, (StatusCode, String)> {
+    state.service.user_sql_store(user_id).await.map_err(api_err)
+}
+
+async fn list_known_users(state: &AppState) -> Result<Vec<String>, (StatusCode, String)> {
+    let sql = state
         .service
         .sql_store
         .as_ref()
-        .map(|s| s.pool())
-        .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "No SQL store".into()))
+        .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "No SQL store".into()))?;
+    if let Some(router) = sql.db_router() {
+        return router.list_active_users().await.map_err(api_err);
+    }
+    let rows: Vec<(String,)> =
+        sqlx::query_as("SELECT DISTINCT user_id FROM mem_memories WHERE is_active > 0 ORDER BY user_id")
+            .fetch_all(sql.pool())
+            .await
+            .map_err(db_err)?;
+    Ok(rows.into_iter().map(|row| row.0).collect())
 }
 
 fn db_err(e: impl std::fmt::Display) -> (StatusCode, String) {
@@ -73,26 +96,24 @@ pub async fn system_stats(
     State(state): State<AppState>,
 ) -> Result<Json<SystemStats>, (StatusCode, String)> {
     auth.require_master()?;
-    let pool = get_pool(&state)?;
-
-    let (total_users,): (i64,) =
-        sqlx::query_as("SELECT COUNT(DISTINCT user_id) FROM mem_memories WHERE is_active > 0")
-            .fetch_one(pool)
-            .await
-            .map_err(db_err)?;
-
-    let (total_memories,): (i64,) =
-        sqlx::query_as("SELECT COUNT(*) FROM mem_memories WHERE is_active > 0")
-            .fetch_one(pool)
-            .await
-            .map_err(db_err)?;
-
-    let snapshots = state.git.list_snapshots().await.map_err(db_err)?;
+    let user_ids = list_known_users(&state).await?;
+    let mut total_memories = 0i64;
+    let mut total_snapshots = 0i64;
+    for user_id in &user_ids {
+        let user_store = get_user_store(&state, user_id).await?;
+        total_memories +=
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM mem_memories WHERE is_active > 0")
+                .fetch_one(user_store.pool())
+                .await
+                .map_err(db_err)?;
+        total_snapshots += user_store.list_snapshot_registrations(user_id).await.map_err(api_err)?.len()
+            as i64;
+    }
 
     Ok(Json(SystemStats {
-        total_users,
+        total_users: user_ids.len() as i64,
         total_memories,
-        total_snapshots: snapshots.len() as i64,
+        total_snapshots,
     }))
 }
 
@@ -103,29 +124,23 @@ pub async fn list_users(
     Query(params): Query<CursorParams>,
 ) -> Result<Json<UserListResponse>, (StatusCode, String)> {
     auth.require_master()?;
-    let pool = get_pool(&state)?;
     let limit = params.limit.unwrap_or(100);
+    let mut users = list_known_users(&state).await?;
+    if let Some(ref cursor) = params.cursor {
+        users.retain(|user_id| user_id > cursor);
+    }
+    let users: Vec<String> = users.into_iter().take(limit as usize).collect();
 
-    let rows: Vec<(String,)> = if let Some(ref cursor) = params.cursor {
-        sqlx::query_as(
-            "SELECT DISTINCT user_id FROM mem_memories WHERE is_active > 0 AND user_id > ? ORDER BY user_id LIMIT ?"
-        ).bind(cursor).bind(limit).fetch_all(pool).await
-    } else {
-        sqlx::query_as(
-            "SELECT DISTINCT user_id FROM mem_memories WHERE is_active > 0 ORDER BY user_id LIMIT ?"
-        ).bind(limit).fetch_all(pool).await
-    }.map_err(db_err)?;
-
-    let next_cursor = if rows.len() as i64 == limit {
-        rows.last().map(|r| r.0.clone())
+    let next_cursor = if users.len() as i64 == limit {
+        users.last().cloned()
     } else {
         None
     };
 
     Ok(Json(UserListResponse {
-        users: rows
+        users: users
             .into_iter()
-            .map(|r| UserEntry { user_id: r.0 })
+            .map(|user_id| UserEntry { user_id })
             .collect(),
         next_cursor,
     }))
@@ -138,21 +153,20 @@ pub async fn user_stats(
     Path(user_id): Path<String>,
 ) -> Result<Json<UserStats>, (StatusCode, String)> {
     auth.require_master()?;
-    let pool = get_pool(&state)?;
-
-    let (memory_count,): (i64,) =
-        sqlx::query_as("SELECT COUNT(*) FROM mem_memories WHERE user_id = ? AND is_active > 0")
+    let user_store = get_user_store(&state, &user_id).await?;
+    let memory_count =
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM mem_memories WHERE user_id = ? AND is_active > 0")
             .bind(&user_id)
-            .fetch_one(pool)
+            .fetch_one(user_store.pool())
             .await
             .map_err(db_err)?;
-
-    let snapshots = state.git.list_snapshots().await.map_err(db_err)?;
+    let snapshot_count = user_store.list_snapshot_registrations(&user_id).await.map_err(api_err)?.len()
+        as i64;
 
     Ok(Json(UserStats {
         user_id,
         memory_count,
-        snapshot_count: snapshots.len() as i64,
+        snapshot_count,
     }))
 }
 
@@ -163,10 +177,10 @@ pub async fn delete_user(
     Path(user_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     auth.require_master()?;
-    let pool = get_pool(&state)?;
+    let user_store = get_user_store(&state, &user_id).await?;
     sqlx::query("UPDATE mem_memories SET is_active = 0 WHERE user_id = ?")
         .bind(&user_id)
-        .execute(pool)
+        .execute(user_store.pool())
         .await
         .map_err(db_err)?;
     Ok(Json(
@@ -181,12 +195,7 @@ pub async fn reset_access_counts(
     Path(user_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     auth.require_master()?;
-    let sql = state.service.sql_store.as_ref().ok_or_else(|| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "SQL store required".to_string(),
-        )
-    })?;
+    let sql = get_user_store(&state, &user_id).await?;
     let reset = sql.reset_access_counts(&user_id).await.map_err(api_err)?;
     Ok(Json(
         serde_json::json!({"user_id": user_id, "reset": reset}),
@@ -203,11 +212,7 @@ pub async fn trigger_governance(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     auth.require_master()?;
     let op = params.op.as_deref().unwrap_or("governance");
-    let sql = state
-        .service
-        .sql_store
-        .as_ref()
-        .ok_or((StatusCode::SERVICE_UNAVAILABLE, "SQL store required".into()))?;
+    let sql = get_user_store(&state, &user_id).await?;
 
     match op {
         "governance" => {
@@ -262,7 +267,7 @@ pub async fn trigger_governance(
             })))
         }
         "extract_entities" => {
-            let r = memoria_storage::graph::backfill::backfill_graph(sql, &user_id)
+            let r = memoria_storage::graph::backfill::backfill_graph(&sql, &user_id)
                 .await
                 .map_err(db_err)?;
             Ok(Json(serde_json::json!({
@@ -293,11 +298,7 @@ pub async fn health_hygiene(
     AuthUser { user_id, .. }: AuthUser,
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let sql = state
-        .service
-        .sql_store
-        .as_ref()
-        .ok_or((StatusCode::SERVICE_UNAVAILABLE, "SQL store required".into()))?;
+    let sql = get_user_store(&state, &user_id).await?;
     let result = sql.health_hygiene(&user_id).await.map_err(db_err)?;
     Ok(Json(result))
 }
@@ -322,11 +323,7 @@ pub async fn health_analyze(
     AuthUser { user_id, .. }: AuthUser,
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let sql = state
-        .service
-        .sql_store
-        .as_ref()
-        .ok_or((StatusCode::SERVICE_UNAVAILABLE, "SQL store required".into()))?;
+    let sql = get_user_store(&state, &user_id).await?;
     let result = sql.health_analyze(&user_id).await.map_err(db_err)?;
     Ok(Json(result))
 }
@@ -336,11 +333,7 @@ pub async fn health_storage(
     AuthUser { user_id, .. }: AuthUser,
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let sql = state
-        .service
-        .sql_store
-        .as_ref()
-        .ok_or((StatusCode::SERVICE_UNAVAILABLE, "SQL store required".into()))?;
+    let sql = get_user_store(&state, &user_id).await?;
     let result = sql.health_storage_stats(&user_id).await.map_err(db_err)?;
     Ok(Json(result))
 }
@@ -350,11 +343,7 @@ pub async fn health_capacity(
     AuthUser { user_id, .. }: AuthUser,
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let sql = state
-        .service
-        .sql_store
-        .as_ref()
-        .ok_or((StatusCode::SERVICE_UNAVAILABLE, "SQL store required".into()))?;
+    let sql = get_user_store(&state, &user_id).await?;
     let result = sql.health_capacity(&user_id).await.map_err(db_err)?;
     Ok(Json(result))
 }
@@ -386,7 +375,7 @@ pub async fn list_user_keys(
     Path(user_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     auth.require_master()?;
-    let pool = get_pool(&state)?;
+    let pool = get_shared_pool(&state)?;
     let rows = sqlx::query(
         "SELECT key_id, name, key_prefix, created_at, expires_at, last_used_at \
          FROM mem_api_keys WHERE user_id = ? AND is_active = 1 ORDER BY created_at DESC",
@@ -417,7 +406,7 @@ pub async fn revoke_all_user_keys(
     Path(user_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     auth.require_master()?;
-    let pool = get_pool(&state)?;
+    let pool = get_shared_pool(&state)?;
     let result =
         sqlx::query("UPDATE mem_api_keys SET is_active = 0 WHERE user_id = ? AND is_active = 1")
             .bind(&user_id)
@@ -437,7 +426,7 @@ pub async fn set_user_params(
     Json(params): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     auth.require_master()?;
-    let pool = get_pool(&state)?;
+    let pool = get_shared_pool(&state)?;
     let pj = serde_json::to_string(&params).map_err(db_err)?;
     sqlx::query(
         "UPDATE mem_user_memory_config SET params_json = ?, updated_at = NOW() WHERE user_id = ?",
@@ -513,7 +502,7 @@ pub async fn user_call_stats(
     Query(params): Query<CallStatsQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     auth.require_master()?;
-    let pool = get_pool(&state)?;
+    let pool = get_user_store(&state, &user_id).await?;
 
     let days = params.days.unwrap_or(7).clamp(1, 90) as i64;
 
@@ -531,7 +520,7 @@ pub async fn user_call_stats(
     )
     .bind(&user_id)
     .bind(days)
-    .fetch_one(pool)
+    .fetch_one(pool.pool())
     .await
     .map_err(db_err)?;
 
@@ -559,7 +548,7 @@ pub async fn user_call_stats(
     )
     .bind(&user_id)
     .bind(days)
-    .fetch_all(pool)
+    .fetch_all(pool.pool())
     .await
     .map_err(db_err)?;
 
@@ -600,7 +589,7 @@ pub async fn user_call_stats(
          LIMIT 50",
     )
     .bind(&user_id)
-    .fetch_all(pool)
+    .fetch_all(pool.pool())
     .await
     .unwrap_or_default();
 
@@ -650,7 +639,7 @@ pub async fn user_call_stats(
          WHERE user_id = ?",
     )
     .bind(&user_id)
-    .fetch_one(pool)
+    .fetch_one(pool.pool())
     .await
     .map_err(db_err)?;
 
@@ -686,7 +675,7 @@ pub async fn user_call_stats(
     .bind(days - 1) // offset = days - 1 so day_idx 0 = oldest day
     .bind(&user_id)
     .bind(days - 1)
-    .fetch_all(pool)
+    .fetch_all(pool.pool())
     .await
     .unwrap_or_default();
 

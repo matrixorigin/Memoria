@@ -432,6 +432,8 @@ async fn repository_requires_review_before_activation_and_startup_load() {
     let config = Config {
         db_url: db_url(),
         db_name: "memoria_test".into(),
+        shared_db_url: db_url().replace("/memoria_test", "/memoria_shared"),
+        multi_db: false,
         embedding_provider: "mock".into(),
         embedding_model: "mock".into(),
         embedding_dim: test_dim(),

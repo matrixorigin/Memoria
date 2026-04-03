@@ -172,14 +172,18 @@ impl AppState {
             shutdown_rx.clone(),
         );
         // Rebuild tool-usage cache from DB, then start the periodic flusher
-        self.tool_usage_batcher.rebuild_from_db(&pool).await;
+        self.tool_usage_batcher.rebuild_from_db(&self.service).await;
         let h2 = spawn_tool_usage_flusher(
             self.tool_usage_batcher.clone(),
-            pool.clone(),
+            self.service.clone(),
             shutdown_rx.clone(),
         );
         // Start the call-log flush loop (writes mem_api_call_log every 5 s)
-        let h3 = spawn_call_log_flusher(self.call_log_batcher.clone(), pool.clone(), shutdown_rx);
+        let h3 = spawn_call_log_flusher(
+            self.call_log_batcher.clone(),
+            self.service.clone(),
+            shutdown_rx,
+        );
         self.auth_pool = Some(pool);
         {
             let mut fs = self.flusher_state.lock().unwrap();

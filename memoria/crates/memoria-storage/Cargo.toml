@@ -15,6 +15,7 @@ async-trait = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
 moka = { version = "0.12", features = ["future"] }
+sha2 = "0.10"
 
 [dev-dependencies]
 chrono = { workspace = true }

@@ -6,7 +6,7 @@ use memoria_core::{
 };
 use memoria_embedding::llm::ChatMessage;
 use memoria_embedding::LlmClient;
-use memoria_storage::{OwnedEditLogEntry, SqlMemoryStore};
+use memoria_storage::{DbRouter, OwnedEditLogEntry, SqlMemoryStore};
 use moka::future::Cache;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -95,7 +95,7 @@ pub struct PurgeResult {
 /// In-memory access counter that batches DB writes to avoid row-lock contention.
 /// Accumulates counts in a DashMap and flushes every `FLUSH_INTERVAL`.
 struct AccessCounter {
-    pending: Arc<dashmap::DashMap<String, AtomicU64>>,
+    pending: Arc<dashmap::DashMap<(String, String), AtomicU64>>,
     _shutdown: tokio::sync::watch::Sender<()>,
 }
 
@@ -103,7 +103,8 @@ const ACCESS_FLUSH_INTERVAL: Duration = Duration::from_secs(5);
 
 impl AccessCounter {
     fn new(store: Arc<SqlMemoryStore>) -> Self {
-        let pending: Arc<dashmap::DashMap<String, AtomicU64>> = Arc::new(dashmap::DashMap::new());
+        let pending: Arc<dashmap::DashMap<(String, String), AtomicU64>> =
+            Arc::new(dashmap::DashMap::new());
         let p = pending.clone();
         let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(());
         tokio::spawn(async move {
@@ -126,18 +127,21 @@ impl AccessCounter {
         }
     }
 
-    fn bump(&self, ids: &[String]) {
-        for id in ids {
+    fn bump(&self, ids: &[(String, String)]) {
+        for (user_id, id) in ids {
             self.pending
-                .entry(id.clone())
+                .entry((user_id.clone(), id.clone()))
                 .or_insert_with(|| AtomicU64::new(0))
                 .fetch_add(1, Ordering::Relaxed);
         }
     }
 
-    async fn flush(pending: &dashmap::DashMap<String, AtomicU64>, store: &SqlMemoryStore) {
+    async fn flush(
+        pending: &dashmap::DashMap<(String, String), AtomicU64>,
+        store: &SqlMemoryStore,
+    ) {
         // Drain all entries
-        let batch: Vec<(String, u64)> = pending
+        let batch: Vec<((String, String), u64)> = pending
             .iter()
             .map(|e| (e.key().clone(), e.value().swap(0, Ordering::Relaxed)))
             .filter(|(_, n)| *n > 0)
@@ -148,8 +152,39 @@ impl AccessCounter {
         if batch.is_empty() {
             return;
         }
-        if let Err(e) = store.bump_access_counts_batch(&batch).await {
-            tracing::warn!("access counter flush failed: {e}");
+        if let Some(router) = store.db_router() {
+            let mut by_user: std::collections::HashMap<String, Vec<(String, u64)>> =
+                std::collections::HashMap::new();
+            for ((user_id, memory_id), count) in batch {
+                by_user
+                    .entry(user_id)
+                    .or_default()
+                    .push((memory_id, count));
+            }
+            for (user_id, user_batch) in by_user {
+                match router.user_store(&user_id).await {
+                    Ok(user_store) => {
+                        if let Err(e) = user_store.bump_access_counts_batch(&user_batch).await {
+                            tracing::warn!(user_id, error = %e, "access counter flush failed");
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            user_id,
+                            error = %e,
+                            "failed to route access counter flush to user store"
+                        );
+                    }
+                }
+            }
+        } else {
+            let batch: Vec<(String, u64)> = batch
+                .into_iter()
+                .map(|((_user_id, memory_id), count)| (memory_id, count))
+                .collect();
+            if let Err(e) = store.bump_access_counts_batch(&batch).await {
+                tracing::warn!("access counter flush failed: {e}");
+            }
         }
     }
 }
@@ -338,6 +373,9 @@ pub struct MemoryService {
     pub store: Arc<dyn MemoryStore>,
     /// Concrete store for branch-aware ops (None in tests)
     pub sql_store: Option<Arc<SqlMemoryStore>>,
+    /// Optional multi-DB router. When present, per-user operations should resolve
+    /// a dedicated user store instead of using `sql_store` directly.
+    pub db_router: Option<Arc<DbRouter>>,
     pub embedder: Option<Arc<dyn EmbeddingProvider>>,
     /// LLM client for reflect/extract (None if LLM_API_KEY not set)
     pub llm: Option<Arc<LlmClient>>,
@@ -379,6 +417,16 @@ impl MemoryService {
         embedder: Option<Arc<dyn EmbeddingProvider>>,
         llm: Option<Arc<LlmClient>>,
     ) -> Self {
+        Self::new_sql_with_llm_and_router(store, None, embedder, llm).await
+    }
+
+    /// Production constructor with explicit multi-DB router.
+    pub async fn new_sql_with_llm_and_router(
+        store: Arc<SqlMemoryStore>,
+        db_router: Option<Arc<DbRouter>>,
+        embedder: Option<Arc<dyn EmbeddingProvider>>,
+        llm: Option<Arc<LlmClient>>,
+    ) -> Self {
         // Create edit-log buffer early so background stores inherit the sender
         let edit_log = EditLogBuffer::new(store.clone());
         store.set_edit_log_tx(edit_log.entry_sender());
@@ -388,25 +436,31 @@ impl MemoryService {
             .and_then(|s| s.parse().ok())
             .unwrap_or(512)
             .clamp(64, 8192);
-        let vector_monitor = match store.spawn_background_store(2).await {
-            Ok(rebuild_store) => {
-                let (rebuild_tx, rebuild_rx) = tokio::sync::mpsc::channel(4);
-                crate::vector_index_monitor::init_coarse_clock();
-                let vector_monitor =
-                    Arc::new(crate::vector_index_monitor::VectorIndexMonitor::new(
-                        "mem_memories".to_string(),
-                        rebuild_tx,
-                    ));
-                let worker = crate::rebuild_worker::RebuildWorker::new(rebuild_store, rebuild_rx);
-                tokio::spawn(async move { worker.run().await });
-                Some(vector_monitor)
-            }
-            Err(e) => {
-                error!(
-                    error = %e,
-                    "rebuild worker disabled because isolated pool initialization failed"
-                );
-                None
+        let vector_monitor = if db_router.is_some() {
+            info!("vector rebuild worker disabled in multi-db mode");
+            None
+        } else {
+            match store.spawn_background_store(2).await {
+                Ok(rebuild_store) => {
+                    let (rebuild_tx, rebuild_rx) = tokio::sync::mpsc::channel(4);
+                    crate::vector_index_monitor::init_coarse_clock();
+                    let vector_monitor =
+                        Arc::new(crate::vector_index_monitor::VectorIndexMonitor::new(
+                            "mem_memories".to_string(),
+                            rebuild_tx,
+                        ));
+                    let worker =
+                        crate::rebuild_worker::RebuildWorker::new(rebuild_store, rebuild_rx);
+                    tokio::spawn(async move { worker.run().await });
+                    Some(vector_monitor)
+                }
+                Err(e) => {
+                    error!(
+                        error = %e,
+                        "rebuild worker disabled because isolated pool initialization failed"
+                    );
+                    None
+                }
             }
         };
 
@@ -454,6 +508,7 @@ impl MemoryService {
         Self {
             store: store.clone(),
             sql_store: Some(store.clone()),
+            db_router,
             embedder,
             llm: llm.clone(),
             entity_tx,
@@ -496,6 +551,7 @@ impl MemoryService {
         Self {
             store: store.clone(),
             sql_store,
+            db_router: None,
             embedder,
             llm: None,
             entity_tx: None,
@@ -524,6 +580,7 @@ impl MemoryService {
             Self {
                 store,
                 sql_store: None,
+                db_router: None,
                 embedder,
                 llm: None,
                 entity_tx: None,
@@ -735,7 +792,22 @@ impl MemoryService {
             );
             return;
         }
-        let graph = store.graph_store();
+        let user_store = if let Some(router) = store.db_router() {
+            match router.user_store(user_id).await {
+                Ok(user_store) => Some(user_store),
+                Err(e) => {
+                    tracing::warn!(
+                        user_id,
+                        error = %e,
+                        "failed to route entity extraction to user store"
+                    );
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+        let graph = user_store.as_deref().unwrap_or(store).graph_store();
 
         // 1. Regex extraction — collect entities with their memory_id inline
         struct ExtractedEntity {
@@ -926,7 +998,8 @@ impl MemoryService {
         };
         // Dedup: if embedding exists, check for near-duplicate and supersede
         // TODO(concurrency): race between dedup check and insert can create duplicates
-        if let Some(sql) = &self.sql_store {
+        if self.sql_store.is_some() {
+            let sql = self.user_sql_store(user_id).await?;
             let table = sql.active_table(user_id).await?;
             if let Some(ref emb) = memory.embedding {
                 // L2 threshold from cosine similarity 0.95: sqrt(2*(1-0.95)) ≈ 0.3162
@@ -954,7 +1027,11 @@ impl MemoryService {
                         // Supersede + cleanup are independent — run in parallel
                         let (sup_res, _) = tokio::join!(
                             sql.supersede_memory(&table, &old_id, &memory.memory_id),
-                            Self::cleanup_entity_data_for_memory(sql, &old_id, "supersede"),
+                            Self::cleanup_entity_data_for_memory(
+                                sql.as_ref(),
+                                &old_id,
+                                "supersede",
+                            ),
                         );
                         sup_res?;
                         let payload = serde_json::json!({"content": &memory.content, "type": memory.memory_type.to_string()}).to_string();
@@ -1151,7 +1228,10 @@ impl MemoryService {
     /// Fire-and-forget bump of access counts for retrieved memories.
     fn bump_access_counts(&self, mems: &[Memory]) {
         if let Some(counter) = &self.access_counter {
-            let ids: Vec<String> = mems.iter().map(|m| m.memory_id.clone()).collect();
+            let ids: Vec<(String, String)> = mems
+                .iter()
+                .map(|m| (m.user_id.clone(), m.memory_id.clone()))
+                .collect();
             counter.bump(&ids);
         }
     }
@@ -1170,7 +1250,8 @@ impl MemoryService {
             ..Default::default()
         };
 
-        if let Some(sql) = &self.sql_store {
+        if self.sql_store.is_some() {
+            let sql = self.user_sql_store(user_id).await?;
             let table = sql.active_table(user_id).await?;
             // Load per-user feedback_weight lazily — only when needed for scoring
             // (avoids extra DB query when fulltext fallback has no feedback to apply)
@@ -1185,7 +1266,11 @@ impl MemoryService {
                 explain.graph_attempted = true;
                 let g_start = std::time::Instant::now();
                 // Use isolated graph pool to avoid starving main pool
-                let graph_sql = self.graph_pool.as_deref().unwrap_or(sql);
+                let graph_sql = if self.db_router.is_some() {
+                    sql.as_ref()
+                } else {
+                    self.graph_pool.as_deref().unwrap_or(sql.as_ref())
+                };
                 let graph_store = graph_sql.graph_store();
                 let retriever = memoria_storage::graph::ActivationRetriever::new(&graph_store);
                 match retriever
@@ -1234,7 +1319,7 @@ impl MemoryService {
                         let vs_start = std::time::Instant::now();
                         // Always use _scored directly with cached feedback_weight
                         // to avoid redundant get_user_retrieval_params query
-                        let fw = self.get_feedback_weight(user_id).await;
+                        let fw = self.get_feedback_weight(user_id).await?;
                         let (vec_results, scores) = sql
                             .search_hybrid_from_scored(&table, user_id, embedding, query, top_k, fw)
                             .await?;
@@ -1299,7 +1384,7 @@ impl MemoryService {
             if let Some(ref embedding) = emb {
                 explain.vector_attempted = true;
                 let vs_start = std::time::Instant::now();
-                let fw = self.get_feedback_weight(user_id).await;
+                let fw = self.get_feedback_weight(user_id).await?;
                 let (results, scores) = sql
                     .search_hybrid_from_scored(&table, user_id, embedding, query, top_k, fw)
                     .await?;
@@ -1341,7 +1426,7 @@ impl MemoryService {
             if !results.is_empty() {
                 let ids: Vec<String> = results.iter().map(|m| m.memory_id.clone()).collect();
                 if let Ok(fb_map) = sql.get_feedback_batch(&ids).await {
-                    let feedback_weight = self.get_feedback_weight(user_id).await;
+                    let feedback_weight = self.get_feedback_weight(user_id).await?;
                     for m in &mut results {
                         if let Some(fb) = fb_map.get(&m.memory_id) {
                             let positive = fb.useful as f64;
@@ -1468,7 +1553,8 @@ impl MemoryService {
             .unwrap_or(new_content);
 
         // Branch-aware: resolve table and fetch old memory from correct table
-        if let Some(sql) = &self.sql_store {
+        if self.sql_store.is_some() {
+            let sql = self.user_sql_store(user_id).await?;
             let table = sql.active_table(user_id).await?;
             let old = sql
                 .get_from(&table, memory_id)
@@ -1500,7 +1586,7 @@ impl MemoryService {
             // Supersede + cleanup are independent — run in parallel
             let (sup_res, _) = tokio::join!(
                 sql.supersede_memory(&table, memory_id, &new_mem.memory_id),
-                Self::cleanup_entity_data_for_memory(sql, memory_id, "correct"),
+                Self::cleanup_entity_data_for_memory(sql.as_ref(), memory_id, "correct"),
             );
             sup_res?;
 
@@ -1561,13 +1647,14 @@ impl MemoryService {
     }
 
     pub async fn purge(&self, user_id: &str, memory_id: &str) -> Result<PurgeResult, MemoriaError> {
-        if let Some(sql) = &self.sql_store {
+        if self.sql_store.is_some() {
+            let sql = self.user_sql_store(user_id).await?;
             let (snap, warning) = sql.create_safety_snapshot("purge").await;
             self.send_edit_log(user_id, "purge", Some(memory_id), None, "", snap.as_deref());
             let table = sql.active_table(user_id).await?;
             sql.soft_delete_from(&table, memory_id).await?;
             // Graph + entity link cleanup (best-effort, governance fallback covers crash)
-            Self::cleanup_entity_data_for_memory(sql, memory_id, "purge").await;
+            Self::cleanup_entity_data_for_memory(sql.as_ref(), memory_id, "purge").await;
             Ok(PurgeResult {
                 purged: 1,
                 snapshot_name: snap,
@@ -1589,13 +1676,14 @@ impl MemoryService {
         user_id: &str,
         ids: &[&str],
     ) -> Result<PurgeResult, MemoriaError> {
-        if let Some(sql) = &self.sql_store {
+        if self.sql_store.is_some() {
+            let sql = self.user_sql_store(user_id).await?;
             let (snap, warning) = sql.create_safety_snapshot("purge").await;
             let table = sql.active_table(user_id).await?;
             for id in ids {
                 sql.soft_delete_from(&table, id).await?;
                 self.send_edit_log(user_id, "purge", Some(id), None, "", snap.as_deref());
-                Self::cleanup_entity_data_for_memory(sql, id, "purge_batch").await;
+                Self::cleanup_entity_data_for_memory(sql.as_ref(), id, "purge_batch").await;
             }
             Ok(PurgeResult {
                 purged: ids.len(),
@@ -1620,7 +1708,8 @@ impl MemoryService {
         user_id: &str,
         topic: &str,
     ) -> Result<PurgeResult, MemoriaError> {
-        if let Some(sql) = &self.sql_store {
+        if self.sql_store.is_some() {
+            let sql = self.user_sql_store(user_id).await?;
             let (snap, warning) = sql.create_safety_snapshot("purge").await;
             let table = sql.active_table(user_id).await?;
             let ids = sql.find_ids_by_topic(&table, user_id, topic).await?;
@@ -1666,7 +1755,8 @@ impl MemoryService {
         user_id: &str,
         memory_id: &str,
     ) -> Result<Option<Memory>, MemoriaError> {
-        if let Some(sql) = &self.sql_store {
+        if self.sql_store.is_some() {
+            let sql = self.user_sql_store(user_id).await?;
             let table = sql.active_table(user_id).await?;
             return sql.get_from(&table, memory_id).await;
         }
@@ -1678,7 +1768,8 @@ impl MemoryService {
         user_id: &str,
         limit: i64,
     ) -> Result<Vec<Memory>, MemoriaError> {
-        if let Some(sql) = &self.sql_store {
+        if self.sql_store.is_some() {
+            let sql = self.user_sql_store(user_id).await?;
             let table = sql.active_table(user_id).await?;
             return sql
                 .list_active_lite(&table, user_id, limit, None, None)
@@ -1695,7 +1786,8 @@ impl MemoryService {
         memory_type: Option<&str>,
         cursor: Option<&str>,
     ) -> Result<Vec<Memory>, MemoriaError> {
-        if let Some(sql) = &self.sql_store {
+        if self.sql_store.is_some() {
+            let sql = self.user_sql_store(user_id).await?;
             let table = sql.active_table(user_id).await?;
             return sql
                 .list_active_lite(&table, user_id, limit, memory_type, cursor)
@@ -1743,11 +1835,12 @@ impl MemoryService {
     }
 
     /// Get per-user feedback_weight with caching (TTL 5 min).
-    pub async fn get_feedback_weight(&self, user_id: &str) -> f64 {
+    pub async fn get_feedback_weight(&self, user_id: &str) -> Result<f64, MemoriaError> {
         if let Some(fw) = self.feedback_weight_cache.get(user_id).await {
-            return fw;
+            return Ok(fw);
         }
-        let fw = if let Some(sql) = &self.sql_store {
+        let fw = if self.sql_store.is_some() {
+            let sql = self.user_sql_store(user_id).await?;
             sql.get_user_retrieval_params(user_id)
                 .await
                 .map(|p| p.feedback_weight)
@@ -1758,7 +1851,7 @@ impl MemoryService {
         self.feedback_weight_cache
             .insert(user_id.to_string(), fw)
             .await;
-        fw
+        Ok(fw)
     }
 
     /// Batch store with single embedding API call for all memories.
@@ -1815,7 +1908,8 @@ impl MemoryService {
             };
             results.push(memory);
         }
-        if let Some(sql) = &self.sql_store {
+        if self.sql_store.is_some() {
+            let sql = self.user_sql_store(user_id).await?;
             let table = sql.active_table(user_id).await?;
             let refs: Vec<&Memory> = results.iter().collect();
             sql.batch_insert_into(&table, &refs).await?;
@@ -2007,7 +2101,8 @@ impl MemoryService {
             mem.embedding = self.embed(&mem.content).await?;
         }
 
-        if let Some(sql) = &self.sql_store {
+        if self.sql_store.is_some() {
+            let sql = self.user_sql_store(user_id).await?;
             let table = sql.active_table(user_id).await?;
             if let Some(ref emb) = mem.embedding {
                 let l2_threshold = 0.3162;
@@ -2084,6 +2179,25 @@ impl MemoryService {
             .map_err(|e| MemoriaError::Internal(format!("LLM extraction: {e}")))?;
 
         parse_json_array(&result)
+    }
+
+    pub async fn user_sql_store(
+        &self,
+        user_id: &str,
+    ) -> Result<Arc<SqlMemoryStore>, MemoriaError> {
+        if let Some(router) = &self.db_router {
+            router.user_store(user_id).await
+        } else {
+            self.sql_store
+                .clone()
+                .ok_or_else(|| MemoriaError::Internal("SQL store required".into()))
+        }
+    }
+
+    pub fn shared_sql_store(&self) -> Result<Arc<SqlMemoryStore>, MemoriaError> {
+        self.sql_store
+            .clone()
+            .ok_or_else(|| MemoriaError::Internal("SQL store required".into()))
     }
 }
 

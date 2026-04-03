@@ -33,6 +33,8 @@ pub struct Config {
     // Database
     pub db_url: String,
     pub db_name: String,
+    pub shared_db_url: String,
+    pub multi_db: bool,
 
     // Embedding
     pub embedding_provider: String,
@@ -73,6 +75,13 @@ impl Config {
     pub fn from_env() -> Self {
         let db_url = std::env::var("DATABASE_URL")
             .unwrap_or_else(|_| "mysql://root:111@localhost:6001/memoria".to_string());
+        let multi_db = env_bool("MEMORIA_MULTI_DB");
+        let shared_db_url = std::env::var("MEMORIA_SHARED_DATABASE_URL")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| {
+                replace_db_name(&db_url, "memoria_shared").unwrap_or_else(|| db_url.clone())
+            });
 
         // Extract db_name from URL (last path segment) or from MEMORIA_DB_NAME
         let db_name = std::env::var("MEMORIA_DB_NAME")
@@ -88,6 +97,8 @@ impl Config {
         Self {
             db_url,
             db_name,
+            shared_db_url,
+            multi_db,
             embedding_provider: std::env::var("EMBEDDING_PROVIDER")
                 .unwrap_or_else(|_| "mock".to_string()),
             embedding_model: std::env::var("EMBEDDING_MODEL")
@@ -143,6 +154,14 @@ impl Config {
         }
     }
 
+    pub fn effective_sql_url(&self) -> &str {
+        if self.multi_db {
+            &self.shared_db_url
+        } else {
+            &self.db_url
+        }
+    }
+
     /// Returns true if LLM is configured.
     pub fn has_llm(&self) -> bool {
         self.llm_api_key.is_some()
@@ -180,6 +199,23 @@ impl Config {
     pub fn has_governance_plugin(&self) -> bool {
         !self.governance_plugin_binding.trim().is_empty()
     }
+}
+
+fn env_bool(name: &str) -> bool {
+    matches!(
+        std::env::var(name)
+            .ok()
+            .as_deref()
+            .map(str::trim)
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("1" | "true" | "yes" | "on")
+    )
+}
+
+fn replace_db_name(database_url: &str, db_name: &str) -> Option<String> {
+    let (base, _) = database_url.rsplit_once('/')?;
+    Some(format!("{base}/{db_name}"))
 }
 
 #[cfg(test)]

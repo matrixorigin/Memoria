@@ -10,6 +10,7 @@ use axum::{
     extract::FromRequestParts,
     http::{request::Parts, StatusCode},
 };
+use memoria_service::MemoryService;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use sqlx::Row;
@@ -170,29 +171,73 @@ impl ToolUsageBatcher {
     }
 
     /// Rebuild cache from DB. Call once at startup.
-    pub async fn rebuild_from_db(&self, pool: &sqlx::MySqlPool) {
-        let rows = match sqlx::query("SELECT user_id, tool_name, last_used_at FROM mem_tool_usage")
-            .fetch_all(pool)
-            .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                warn!("tool_usage rebuild failed: {e}");
-                return;
-            }
+    pub async fn rebuild_from_db(&self, service: &MemoryService) {
+        let mut rebuilt = std::collections::HashMap::new();
+        let Some(sql) = service.sql_store.as_ref() else {
+            return;
         };
-        if let Ok(mut map) = self.entries.lock() {
+
+        if let Some(router) = sql.db_router() {
+            let user_ids = match router.list_active_users().await {
+                Ok(user_ids) => user_ids,
+                Err(e) => {
+                    warn!("tool_usage rebuild failed to list users: {e}");
+                    return;
+                }
+            };
+            for user_id in user_ids {
+                let user_store = match service.user_sql_store(&user_id).await {
+                    Ok(user_store) => user_store,
+                    Err(e) => {
+                        warn!("tool_usage rebuild failed to route user {user_id}: {e}");
+                        continue;
+                    }
+                };
+                let rows = match sqlx::query(
+                    "SELECT user_id, tool_name, last_used_at FROM mem_tool_usage",
+                )
+                .fetch_all(user_store.pool())
+                .await
+                {
+                    Ok(rows) => rows,
+                    Err(e) => {
+                        warn!("tool_usage rebuild failed for user {user_id}: {e}");
+                        continue;
+                    }
+                };
+                for row in &rows {
+                    let uid: String = row.get("user_id");
+                    let tool: String = row.get("tool_name");
+                    let ts: DateTime<Utc> = row.get("last_used_at");
+                    rebuilt.insert((uid, tool), (ts, false));
+                }
+            }
+        } else {
+            let rows = match sqlx::query("SELECT user_id, tool_name, last_used_at FROM mem_tool_usage")
+                .fetch_all(sql.pool())
+                .await
+            {
+                Ok(rows) => rows,
+                Err(e) => {
+                    warn!("tool_usage rebuild failed: {e}");
+                    return;
+                }
+            };
             for row in &rows {
                 let uid: String = row.get("user_id");
                 let tool: String = row.get("tool_name");
                 let ts: DateTime<Utc> = row.get("last_used_at");
-                map.insert((uid, tool), (ts, false));
+                rebuilt.insert((uid, tool), (ts, false));
             }
+        }
+
+        if let Ok(mut map) = self.entries.lock() {
+            *map = rebuilt;
         }
     }
 
     /// Flush dirty entries to DB.
-    pub async fn flush(&self, pool: &sqlx::MySqlPool) {
+    pub async fn flush(&self, service: &MemoryService) {
         let dirty: Vec<(String, String, DateTime<Utc>)> = {
             let map = match self.entries.lock() {
                 Ok(m) => m,
@@ -207,27 +252,34 @@ impl ToolUsageBatcher {
             return;
         }
 
-        for chunk in dirty.chunks(500) {
-            let placeholders: String = chunk
-                .iter()
-                .map(|_| "(?, ?, ?)")
-                .collect::<Vec<_>>()
-                .join(",");
-            let sql = format!(
-                "INSERT INTO mem_tool_usage (user_id, tool_name, last_used_at) VALUES {placeholders} \
-                 ON DUPLICATE KEY UPDATE last_used_at = VALUES(last_used_at)"
-            );
-            let mut query = sqlx::query(&sql);
-            for (uid, tool, ts) in chunk {
-                query = query.bind(uid).bind(tool).bind(ts);
+        let Some(sql) = service.sql_store.as_ref() else {
+            return;
+        };
+        if let Some(_router) = sql.db_router() {
+            let mut by_user: std::collections::HashMap<String, Vec<(String, String, DateTime<Utc>)>> =
+                std::collections::HashMap::new();
+            for (uid, tool, ts) in &dirty {
+                by_user
+                    .entry(uid.clone())
+                    .or_default()
+                    .push((uid.clone(), tool.clone(), *ts));
             }
-            if let Err(e) = query.execute(pool).await {
-                warn!(
-                    "tool_usage batch flush failed ({} entries): {e}",
-                    chunk.len()
-                );
-                return; // keep dirty flags for retry on next cycle
+            for (user_id, entries) in by_user {
+                let user_store = match service.user_sql_store(&user_id).await {
+                    Ok(user_store) => user_store,
+                    Err(e) => {
+                        warn!("tool_usage flush failed to route user {user_id}: {e}");
+                        return;
+                    }
+                };
+                if let Err(e) = flush_tool_usage_chunked(user_store.pool(), &entries).await {
+                    warn!("tool_usage batch flush failed for user {user_id}: {e}");
+                    return;
+                }
             }
+        } else if let Err(e) = flush_tool_usage_chunked(sql.pool(), &dirty).await {
+            warn!("tool_usage batch flush failed ({} entries): {e}", dirty.len());
+            return;
         }
 
         // Only clear dirty flags after all chunks succeed.
@@ -241,10 +293,33 @@ impl ToolUsageBatcher {
     }
 }
 
+async fn flush_tool_usage_chunked(
+    pool: &sqlx::MySqlPool,
+    dirty: &[(String, String, DateTime<Utc>)],
+) -> Result<(), sqlx::Error> {
+    for chunk in dirty.chunks(500) {
+        let placeholders: String = chunk
+            .iter()
+            .map(|_| "(?, ?, ?)")
+            .collect::<Vec<_>>()
+            .join(",");
+            let sql = format!(
+                "INSERT INTO mem_tool_usage (user_id, tool_name, last_used_at) VALUES {placeholders} \
+                 ON DUPLICATE KEY UPDATE last_used_at = VALUES(last_used_at)"
+        );
+        let mut query = sqlx::query(&sql);
+        for (uid, tool, ts) in chunk {
+            query = query.bind(uid).bind(tool).bind(ts);
+        }
+        query.execute(pool).await?;
+    }
+    Ok(())
+}
+
 /// Spawn the background tool-usage flush loop (10-minute interval).
 pub fn spawn_tool_usage_flusher(
     batcher: std::sync::Arc<ToolUsageBatcher>,
-    pool: sqlx::MySqlPool,
+    service: std::sync::Arc<MemoryService>,
     mut shutdown: tokio::sync::watch::Receiver<()>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -254,11 +329,11 @@ pub fn spawn_tool_usage_flusher(
             tokio::select! {
                 _ = interval.tick() => {}
                 _ = shutdown.changed() => {
-                    batcher.flush(&pool).await;
+                    batcher.flush(&service).await;
                     break;
                 }
             }
-            batcher.flush(&pool).await;
+            batcher.flush(&service).await;
         }
         tracing::debug!("tool_usage flusher exiting");
     })
@@ -375,7 +450,7 @@ impl CallLogBatcher {
     }
 
     /// Drain pending entries and write them to `mem_api_call_log` in chunks.
-    pub async fn flush(&self, pool: &sqlx::MySqlPool) {
+    pub async fn flush(&self, service: &MemoryService) {
         let entries: Vec<CallLogEntry> = {
             let mut v = match self.pending.lock() {
                 Ok(v) => v,
@@ -387,10 +462,43 @@ impl CallLogBatcher {
             v.drain(..).collect()
         };
 
-        for chunk in entries.chunks(200) {
-            let placeholders: String = chunk
-                .iter()
-                .map(|_| "(?, ?, ?, ?, ?, ?, ?)")
+        let Some(sql) = service.sql_store.as_ref() else {
+            return;
+        };
+        if let Some(_router) = sql.db_router() {
+            let mut by_user: std::collections::HashMap<String, Vec<CallLogEntry>> =
+                std::collections::HashMap::new();
+            for entry in entries {
+                by_user.entry(entry.user_id.clone()).or_default().push(entry);
+            }
+            for (user_id, entries) in by_user {
+                let user_store = match service.user_sql_store(&user_id).await {
+                    Ok(user_store) => user_store,
+                    Err(e) => {
+                        warn!("call_log flush failed to route user {user_id}: {e}");
+                        return;
+                    }
+                };
+                if let Err(e) = flush_call_log_chunked(user_store.pool(), &entries).await {
+                    warn!("call_log batch flush failed for user {user_id}: {e}");
+                }
+            }
+            return;
+        }
+        if let Err(e) = flush_call_log_chunked(sql.pool(), &entries).await {
+            warn!("call_log batch flush failed ({} entries): {e}", entries.len());
+        }
+    }
+}
+
+async fn flush_call_log_chunked(
+    pool: &sqlx::MySqlPool,
+    entries: &[CallLogEntry],
+) -> Result<(), sqlx::Error> {
+    for chunk in entries.chunks(200) {
+        let placeholders: String = chunk
+            .iter()
+            .map(|_| "(?, ?, ?, ?, ?, ?, ?)")
                 .collect::<Vec<_>>()
                 .join(",");
             let sql = format!(
@@ -399,27 +507,25 @@ impl CallLogBatcher {
                  VALUES {placeholders}"
             );
             let mut query = sqlx::query(&sql);
-            for e in chunk {
-                query = query
-                    .bind(&e.user_id)
+        for e in chunk {
+            query = query
+                .bind(&e.user_id)
                     .bind(&e.method)
                     .bind(&e.path)
                     .bind(e.status_code as i16)
                     .bind(e.latency_ms as i32)
-                    .bind(e.rpc_success as i8)
-                    .bind(e.rpc_error_code);
-            }
-            if let Err(e) = query.execute(pool).await {
-                warn!("call_log batch flush failed ({} entries): {e}", chunk.len());
-            }
+                .bind(e.rpc_success as i8)
+                .bind(e.rpc_error_code);
         }
+        query.execute(pool).await?;
     }
+    Ok(())
 }
 
 /// Spawn the background call-log flush loop (5-second interval).
 pub fn spawn_call_log_flusher(
     batcher: std::sync::Arc<CallLogBatcher>,
-    pool: sqlx::MySqlPool,
+    service: std::sync::Arc<MemoryService>,
     mut shutdown: tokio::sync::watch::Receiver<()>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -429,11 +535,11 @@ pub fn spawn_call_log_flusher(
             tokio::select! {
                 _ = interval.tick() => {}
                 _ = shutdown.changed() => {
-                    batcher.flush(&pool).await;
+                    batcher.flush(&service).await;
                     break;
                 }
             }
-            batcher.flush(&pool).await;
+            batcher.flush(&service).await;
         }
         tracing::debug!("call_log flusher exiting");
     })

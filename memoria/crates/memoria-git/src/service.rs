@@ -66,7 +66,7 @@ impl GitForDataService {
         let safe = validate_identifier(name)?;
         exec_ddl(
             &self.pool,
-            &format!("CREATE SNAPSHOT {safe} FOR ACCOUNT sys"),
+            &format!("CREATE SNAPSHOT {safe} FOR DATABASE {}", self.db_name),
         )
         .await?;
         self.get_snapshot(name).await?.ok_or_else(|| {
@@ -97,6 +97,13 @@ impl GitForDataService {
                     database_name: r.try_get("DATABASE_NAME").ok(),
                     table_name: r.try_get("TABLE_NAME").ok(),
                 })
+            })
+            .filter(|result| {
+                result
+                    .as_ref()
+                    .ok()
+                    .and_then(|snapshot| snapshot.database_name.as_ref())
+                    .is_some_and(|db_name| db_name == &self.db_name)
             })
             .collect()
     }
