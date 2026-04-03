@@ -213,16 +213,17 @@ impl ToolUsageBatcher {
                 }
             }
         } else {
-            let rows = match sqlx::query("SELECT user_id, tool_name, last_used_at FROM mem_tool_usage")
-                .fetch_all(sql.pool())
-                .await
-            {
-                Ok(rows) => rows,
-                Err(e) => {
-                    warn!("tool_usage rebuild failed: {e}");
-                    return;
-                }
-            };
+            let rows =
+                match sqlx::query("SELECT user_id, tool_name, last_used_at FROM mem_tool_usage")
+                    .fetch_all(sql.pool())
+                    .await
+                {
+                    Ok(rows) => rows,
+                    Err(e) => {
+                        warn!("tool_usage rebuild failed: {e}");
+                        return;
+                    }
+                };
             for row in &rows {
                 let uid: String = row.get("user_id");
                 let tool: String = row.get("tool_name");
@@ -256,8 +257,10 @@ impl ToolUsageBatcher {
             return;
         };
         if let Some(_router) = sql.db_router() {
-            let mut by_user: std::collections::HashMap<String, Vec<(String, String, DateTime<Utc>)>> =
-                std::collections::HashMap::new();
+            let mut by_user: std::collections::HashMap<
+                String,
+                Vec<(String, String, DateTime<Utc>)>,
+            > = std::collections::HashMap::new();
             for (uid, tool, ts) in &dirty {
                 by_user
                     .entry(uid.clone())
@@ -278,7 +281,10 @@ impl ToolUsageBatcher {
                 }
             }
         } else if let Err(e) = flush_tool_usage_chunked(sql.pool(), &dirty).await {
-            warn!("tool_usage batch flush failed ({} entries): {e}", dirty.len());
+            warn!(
+                "tool_usage batch flush failed ({} entries): {e}",
+                dirty.len()
+            );
             return;
         }
 
@@ -303,8 +309,8 @@ async fn flush_tool_usage_chunked(
             .map(|_| "(?, ?, ?)")
             .collect::<Vec<_>>()
             .join(",");
-            let sql = format!(
-                "INSERT INTO mem_tool_usage (user_id, tool_name, last_used_at) VALUES {placeholders} \
+        let sql = format!(
+            "INSERT INTO mem_tool_usage (user_id, tool_name, last_used_at) VALUES {placeholders} \
                  ON DUPLICATE KEY UPDATE last_used_at = VALUES(last_used_at)"
         );
         let mut query = sqlx::query(&sql);
@@ -469,7 +475,10 @@ impl CallLogBatcher {
             let mut by_user: std::collections::HashMap<String, Vec<CallLogEntry>> =
                 std::collections::HashMap::new();
             for entry in entries {
-                by_user.entry(entry.user_id.clone()).or_default().push(entry);
+                by_user
+                    .entry(entry.user_id.clone())
+                    .or_default()
+                    .push(entry);
             }
             for (user_id, entries) in by_user {
                 let user_store = match service.user_sql_store(&user_id).await {
@@ -486,7 +495,10 @@ impl CallLogBatcher {
             return;
         }
         if let Err(e) = flush_call_log_chunked(sql.pool(), &entries).await {
-            warn!("call_log batch flush failed ({} entries): {e}", entries.len());
+            warn!(
+                "call_log batch flush failed ({} entries): {e}",
+                entries.len()
+            );
         }
     }
 }
@@ -499,21 +511,21 @@ async fn flush_call_log_chunked(
         let placeholders: String = chunk
             .iter()
             .map(|_| "(?, ?, ?, ?, ?, ?, ?)")
-                .collect::<Vec<_>>()
-                .join(",");
-            let sql = format!(
-                "INSERT INTO mem_api_call_log \
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "INSERT INTO mem_api_call_log \
                  (user_id, method, path, status_code, latency_ms, rpc_success, rpc_error_code) \
                  VALUES {placeholders}"
-            );
-            let mut query = sqlx::query(&sql);
+        );
+        let mut query = sqlx::query(&sql);
         for e in chunk {
             query = query
                 .bind(&e.user_id)
-                    .bind(&e.method)
-                    .bind(&e.path)
-                    .bind(e.status_code as i16)
-                    .bind(e.latency_ms as i32)
+                .bind(&e.method)
+                .bind(&e.path)
+                .bind(e.status_code as i16)
+                .bind(e.latency_ms as i32)
                 .bind(e.rpc_success as i8)
                 .bind(e.rpc_error_code);
         }

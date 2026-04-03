@@ -530,7 +530,11 @@ pub async fn get_memory_history(
 ) -> ApiResult<serde_json::Value> {
     use sqlx::Row;
 
-    let sql = state.service.user_sql_store(&user_id).await.map_err(api_err)?;
+    let sql = state
+        .service
+        .user_sql_store(&user_id)
+        .await
+        .map_err(api_err)?;
     let table = sql.active_table(&user_id).await.map_err(api_err)?;
 
     let mut chain = Vec::new();
@@ -745,7 +749,11 @@ pub async fn get_retrieval_params(
     State(state): State<AppState>,
     AuthUser { user_id, .. }: AuthUser,
 ) -> ApiResult<serde_json::Value> {
-    let sql = state.service.user_sql_store(&user_id).await.map_err(api_err)?;
+    let sql = state
+        .service
+        .user_sql_store(&user_id)
+        .await
+        .map_err(api_err)?;
     let params = sql
         .get_user_retrieval_params(&user_id)
         .await
@@ -766,7 +774,11 @@ pub async fn set_retrieval_params(
     AuthUser { user_id, .. }: AuthUser,
     Json(req): Json<SetRetrievalParamsRequest>,
 ) -> ApiResult<serde_json::Value> {
-    let sql = state.service.user_sql_store(&user_id).await.map_err(api_err)?;
+    let sql = state
+        .service
+        .user_sql_store(&user_id)
+        .await
+        .map_err(api_err)?;
 
     let mut params = sql
         .get_user_retrieval_params(&user_id)
@@ -796,7 +808,11 @@ pub async fn tune_retrieval_params(
 ) -> ApiResult<serde_json::Value> {
     use memoria_service::scoring::{DefaultScoringPlugin, ScoringPlugin};
 
-    let sql = state.service.user_sql_store(&user_id).await.map_err(api_err)?;
+    let sql = state
+        .service
+        .user_sql_store(&user_id)
+        .await
+        .map_err(api_err)?;
 
     let old_params = sql
         .get_user_retrieval_params(&user_id)

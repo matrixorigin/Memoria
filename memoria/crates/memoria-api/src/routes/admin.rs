@@ -16,10 +16,14 @@ use std::sync::Arc;
 use crate::{auth::AuthUser, routes::memory::api_err, state::AppState};
 
 fn get_shared_pool(state: &AppState) -> Result<&MySqlPool, (StatusCode, String)> {
-    state.auth_pool.as_ref().or_else(|| state.service.sql_store.as_ref().map(|s| s.pool())).ok_or((
-        StatusCode::INTERNAL_SERVER_ERROR,
-        "No shared SQL pool".into(),
-    ))
+    state
+        .auth_pool
+        .as_ref()
+        .or_else(|| state.service.sql_store.as_ref().map(|s| s.pool()))
+        .ok_or((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "No shared SQL pool".into(),
+        ))
 }
 
 async fn get_user_store(
@@ -38,11 +42,12 @@ async fn list_known_users(state: &AppState) -> Result<Vec<String>, (StatusCode, 
     if let Some(router) = sql.db_router() {
         return router.list_active_users().await.map_err(api_err);
     }
-    let rows: Vec<(String,)> =
-        sqlx::query_as("SELECT DISTINCT user_id FROM mem_memories WHERE is_active > 0 ORDER BY user_id")
-            .fetch_all(sql.pool())
-            .await
-            .map_err(db_err)?;
+    let rows: Vec<(String,)> = sqlx::query_as(
+        "SELECT DISTINCT user_id FROM mem_memories WHERE is_active > 0 ORDER BY user_id",
+    )
+    .fetch_all(sql.pool())
+    .await
+    .map_err(db_err)?;
     Ok(rows.into_iter().map(|row| row.0).collect())
 }
 
@@ -106,8 +111,11 @@ pub async fn system_stats(
                 .fetch_one(user_store.pool())
                 .await
                 .map_err(db_err)?;
-        total_snapshots += user_store.list_snapshot_registrations(user_id).await.map_err(api_err)?.len()
-            as i64;
+        total_snapshots += user_store
+            .list_snapshot_registrations(user_id)
+            .await
+            .map_err(api_err)?
+            .len() as i64;
     }
 
     Ok(Json(SystemStats {
@@ -154,14 +162,18 @@ pub async fn user_stats(
 ) -> Result<Json<UserStats>, (StatusCode, String)> {
     auth.require_master()?;
     let user_store = get_user_store(&state, &user_id).await?;
-    let memory_count =
-        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM mem_memories WHERE user_id = ? AND is_active > 0")
-            .bind(&user_id)
-            .fetch_one(user_store.pool())
-            .await
-            .map_err(db_err)?;
-    let snapshot_count = user_store.list_snapshot_registrations(&user_id).await.map_err(api_err)?.len()
-        as i64;
+    let memory_count = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM mem_memories WHERE user_id = ? AND is_active > 0",
+    )
+    .bind(&user_id)
+    .fetch_one(user_store.pool())
+    .await
+    .map_err(db_err)?;
+    let snapshot_count = user_store
+        .list_snapshot_registrations(&user_id)
+        .await
+        .map_err(api_err)?
+        .len() as i64;
 
     Ok(Json(UserStats {
         user_id,

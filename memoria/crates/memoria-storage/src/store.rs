@@ -1,6 +1,6 @@
+use crate::router::DbRouter;
 use async_trait::async_trait;
 use chrono::{NaiveDateTime, Utc};
-use crate::router::DbRouter;
 use memoria_core::{
     interfaces::MemoryStore, nullable_str, nullable_str_from_row, MemoriaError, Memory, MemoryType,
     TrustTier,
@@ -33,6 +33,14 @@ fn is_duplicate_column(e: &sqlx::Error) -> bool {
         .and_then(|de| de.as_error().downcast_ref::<MySqlDatabaseError>())
         .map(|me| me.number() == 1060)
         .unwrap_or(false)
+}
+
+async fn query_has_rows(pool: &MySqlPool, sql: &str) -> bool {
+    sqlx::query_scalar::<_, i64>(sql)
+        .fetch_one(pool)
+        .await
+        .unwrap_or(0)
+        > 0
 }
 
 const POOL_MONITOR_INTERVAL_SECS: u64 = 30;
@@ -892,10 +900,12 @@ impl SqlMemoryStore {
         }
 
         // Migration: mem_branches may lack table_name column (old schema)
-        let has_table_name: bool = sqlx::query_scalar(
-            "SELECT COUNT(*) > 0 FROM information_schema.columns \
+        let has_table_name = query_has_rows(
+            &self.pool,
+            "SELECT COUNT(*) FROM information_schema.columns \
              WHERE table_schema = DATABASE() AND table_name = 'mem_branches' AND column_name = 'table_name'"
-        ).fetch_one(&self.pool).await.unwrap_or(false);
+        )
+        .await;
         if !has_table_name {
             let _ = sqlx::query(
                 "ALTER TABLE mem_branches ADD COLUMN table_name VARCHAR(100) NOT NULL DEFAULT ''",
@@ -905,10 +915,12 @@ impl SqlMemoryStore {
         }
 
         // Migration: mem_branches old schema used branch_id/branch_db — recreate with new schema
-        let has_id: bool = sqlx::query_scalar(
-            "SELECT COUNT(*) > 0 FROM information_schema.columns \
+        let has_id = query_has_rows(
+            &self.pool,
+            "SELECT COUNT(*) FROM information_schema.columns \
              WHERE table_schema = DATABASE() AND table_name = 'mem_branches' AND column_name = 'id'"
-        ).fetch_one(&self.pool).await.unwrap_or(false);
+        )
+        .await;
         if !has_id {
             let _ = sqlx::query("DROP TABLE IF EXISTS mem_branches")
                 .execute(&self.pool)
@@ -1003,14 +1015,13 @@ impl SqlMemoryStore {
         // Migration: add `method` for tables created before this column existed.
         // MatrixOne / some MySQL forks do not reliably support
         // `ADD COLUMN IF NOT EXISTS ... AFTER ...`; use information_schema + plain ALTER.
-        let has_method_col: bool = sqlx::query_scalar(
-            "SELECT COUNT(*) > 0 FROM information_schema.columns \
+        let has_method_col = query_has_rows(
+            &self.pool,
+            "SELECT COUNT(*) FROM information_schema.columns \
              WHERE table_schema = DATABASE() AND table_name = 'mem_api_call_log' \
              AND column_name = 'method'",
         )
-        .fetch_one(&self.pool)
-        .await
-        .unwrap_or(false);
+        .await;
         if !has_method_col {
             // No `AFTER` — better compatibility with MatrixOne; INSERT lists columns explicitly.
             let _ = sqlx::query(
@@ -1075,15 +1086,14 @@ impl SqlMemoryStore {
         // Migration: add composite index (user_id, memory_id) on mem_retrieval_feedback.
         // The existing idx_feedback_user(user_id, created_at) does not cover the JOIN on
         // memory_id used by get_feedback_by_tier(), causing a full-table scan on feedback.
-        let has_feedback_memory_user_idx: bool = sqlx::query_scalar(
-            "SELECT COUNT(*) > 0 FROM information_schema.statistics \
+        let has_feedback_memory_user_idx = query_has_rows(
+            &self.pool,
+            "SELECT COUNT(*) FROM information_schema.statistics \
              WHERE table_schema = DATABASE() \
                AND table_name = 'mem_retrieval_feedback' \
                AND index_name = 'idx_feedback_memory_user'",
         )
-        .fetch_one(&self.pool)
-        .await
-        .unwrap_or(false);
+        .await;
         if !has_feedback_memory_user_idx {
             let _ = sqlx::query(
                 "ALTER TABLE mem_retrieval_feedback \
@@ -1097,15 +1107,14 @@ impl SqlMemoryStore {
         // cleanup_metrics_and_feedback() deletes old feedback rows with
         // `created_at < DATE_SUB(NOW(), INTERVAL ? DAY)`, which benefits from
         // a direct time index instead of scanning all rows.
-        let has_feedback_created_at_idx: bool = sqlx::query_scalar(
-            "SELECT COUNT(*) > 0 FROM information_schema.statistics \
+        let has_feedback_created_at_idx = query_has_rows(
+            &self.pool,
+            "SELECT COUNT(*) FROM information_schema.statistics \
              WHERE table_schema = DATABASE() \
                AND table_name = 'mem_retrieval_feedback' \
                AND index_name = 'idx_feedback_created_at'",
         )
-        .fetch_one(&self.pool)
-        .await
-        .unwrap_or(false);
+        .await;
         if !has_feedback_created_at_idx {
             let _ = sqlx::query(
                 "ALTER TABLE mem_retrieval_feedback \
@@ -1121,15 +1130,14 @@ impl SqlMemoryStore {
         // Note: TIMESTAMPDIFF-wrapped predicates (e.g. archive_stale_working) cannot
         // use a B-tree range scan regardless of the index; they are covered by the
         // existing idx_user_active (user_id, is_active, memory_type) instead.
-        let has_memories_user_observed_idx: bool = sqlx::query_scalar(
-            "SELECT COUNT(*) > 0 FROM information_schema.statistics \
+        let has_memories_user_observed_idx = query_has_rows(
+            &self.pool,
+            "SELECT COUNT(*) FROM information_schema.statistics \
              WHERE table_schema = DATABASE() \
                AND table_name = 'mem_memories' \
                AND index_name = 'idx_memories_user_observed'",
         )
-        .fetch_one(&self.pool)
-        .await
-        .unwrap_or(false);
+        .await;
         if !has_memories_user_observed_idx {
             let _ = sqlx::query(
                 "ALTER TABLE mem_memories \
@@ -1140,15 +1148,14 @@ impl SqlMemoryStore {
         }
 
         // Migration: drop idx_user_active_created — no longer needed, list now orders by PK.
-        let has_user_active_created_idx: bool = sqlx::query_scalar(
-            "SELECT COUNT(*) > 0 FROM information_schema.statistics \
+        let has_user_active_created_idx = query_has_rows(
+            &self.pool,
+            "SELECT COUNT(*) FROM information_schema.statistics \
              WHERE table_schema = DATABASE() \
                AND table_name = 'mem_memories' \
                AND index_name = 'idx_user_active_created'",
         )
-        .fetch_one(&self.pool)
-        .await
-        .unwrap_or(false);
+        .await;
         if has_user_active_created_idx {
             let _ = sqlx::query("ALTER TABLE mem_memories DROP INDEX idx_user_active_created")
                 .execute(&self.pool)
@@ -1158,11 +1165,11 @@ impl SqlMemoryStore {
         // Migration: MO#24001 — normalize empty-string NULLable VARCHAR columns to real NULL.
         // MatrixOne PREPARE/EXECUTE stores Option<String>::None as '' instead of NULL.
         // Effectively runs once: after fix, new writes use nullable_str() and never produce ''.
-        let has_empty_superseded: bool =
-            sqlx::query_scalar("SELECT COUNT(*) > 0 FROM mem_memories WHERE superseded_by = ''")
-                .fetch_one(&self.pool)
-                .await
-                .unwrap_or(false);
+        let has_empty_superseded = query_has_rows(
+            &self.pool,
+            "SELECT COUNT(*) FROM mem_memories WHERE superseded_by = ''",
+        )
+        .await;
         if has_empty_superseded {
             for (tbl, col) in [
                 ("mem_memories", "superseded_by"),
@@ -1428,7 +1435,9 @@ impl SqlMemoryStore {
         }
 
         // Failed — try to reclaim space by dropping oldest pre_ snapshots
-        let dropped = self.cleanup_oldest_safety_snapshots(&snapshot_prefix, 10).await;
+        let dropped = self
+            .cleanup_oldest_safety_snapshots(&snapshot_prefix, 10)
+            .await;
         if dropped > 0 {
             // Retry
             if sqlx::raw_sql(&sql).execute(&self.pool).await.is_ok() {
@@ -1729,7 +1738,12 @@ impl SqlMemoryStore {
         self.active_table_cache.invalidate(user_id).await;
 
         // Keep rollback reconciliation scoped to the known per-user governance cooldowns.
-        for operation in ["governance", "consolidate", "reflect", "orphan_graph_cleanup"] {
+        for operation in [
+            "governance",
+            "consolidate",
+            "reflect",
+            "orphan_graph_cleanup",
+        ] {
             let key = format!("{user_id}:{operation}");
             self.cooldown_cache.invalidate(&key).await;
         }
@@ -2447,15 +2461,19 @@ impl SqlMemoryStore {
                     if snapshot_db != db_name {
                         return None;
                     }
-                    let timestamp = row.try_get::<NaiveDateTime, _>("TIMESTAMP").ok().or_else(|| {
-                        row.try_get::<String, _>("TIMESTAMP").ok().and_then(|s| {
-                            NaiveDateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S%.f")
-                                .ok()
-                                .or_else(|| {
-                                    NaiveDateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S").ok()
+                    let timestamp =
+                        row.try_get::<NaiveDateTime, _>("TIMESTAMP")
+                            .ok()
+                            .or_else(|| {
+                                row.try_get::<String, _>("TIMESTAMP").ok().and_then(|s| {
+                                    NaiveDateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S%.f")
+                                        .ok()
+                                        .or_else(|| {
+                                            NaiveDateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S")
+                                                .ok()
+                                        })
                                 })
-                        })
-                    });
+                            });
                     Some((snapshot_name, timestamp))
                 })
                 .collect();

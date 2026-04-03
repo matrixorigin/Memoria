@@ -585,10 +585,10 @@ pub async fn call(
                  AND trust_tier IN ('T1','T2') ORDER BY created_at DESC LIMIT 10"
             );
             let existing_rows = sqlx::query(&existing_sql)
-            .bind(user_id)
-            .fetch_all(sql.pool())
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+                .bind(user_id)
+                .fetch_all(sql.pool())
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
             let existing_knowledge = existing_rows
                 .iter()
                 .filter_map(|r| r.try_get::<String, _>("content").ok())

@@ -90,12 +90,11 @@ impl DbRouter {
     }
 
     pub async fn list_registered_users(&self) -> Result<Vec<UserDatabaseRecord>, MemoriaError> {
-        let rows = sqlx::query(
-            "SELECT user_id, db_name, status FROM mem_user_registry ORDER BY user_id",
-        )
-        .fetch_all(&self.shared_pool)
-        .await
-        .map_err(db_err)?;
+        let rows =
+            sqlx::query("SELECT user_id, db_name, status FROM mem_user_registry ORDER BY user_id")
+                .fetch_all(&self.shared_pool)
+                .await
+                .map_err(db_err)?;
         rows.iter()
             .map(|row| {
                 Ok(UserDatabaseRecord {
@@ -198,13 +197,12 @@ impl DbRouter {
             Err(sqlx::Error::Database(e))
                 if e.message().contains("Duplicate") || e.message().contains("1062") =>
             {
-                let existing = sqlx::query(
-                    "SELECT db_name FROM mem_user_registry WHERE user_id = ?",
-                )
-                .bind(user_id)
-                .fetch_optional(&self.shared_pool)
-                .await
-                .map_err(db_err)?;
+                let existing =
+                    sqlx::query("SELECT db_name FROM mem_user_registry WHERE user_id = ?")
+                        .bind(user_id)
+                        .fetch_optional(&self.shared_pool)
+                        .await
+                        .map_err(db_err)?;
 
                 let Some(existing) = existing else {
                     return Err(MemoriaError::Internal(format!(
@@ -237,10 +235,14 @@ impl DbRouter {
 
 async fn create_database_if_missing(database_url: &str) -> Result<(), MemoriaError> {
     let Some((base_url, db_name)) = database_url.rsplit_once('/') else {
-        return Err(MemoriaError::Internal("database_url missing db name".into()));
+        return Err(MemoriaError::Internal(
+            "database_url missing db name".into(),
+        ));
     };
     if db_name.is_empty() {
-        return Err(MemoriaError::Internal("database_url missing db name".into()));
+        return Err(MemoriaError::Internal(
+            "database_url missing db name".into(),
+        ));
     }
     let base_pool = MySqlPoolOptions::new()
         .max_connections(1)

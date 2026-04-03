@@ -109,11 +109,11 @@ async fn generate_and_store(
          ORDER BY created_at ASC"
     );
     let rows = sqlx::query(&query)
-    .bind(user_id)
-    .bind(session_id)
-    .fetch_all(sql.pool())
-    .await
-    .map_err(|e| e.to_string())?;
+        .bind(user_id)
+        .bind(session_id)
+        .fetch_all(sql.pool())
+        .await
+        .map_err(|e| e.to_string())?;
 
     if rows.is_empty() {
         return Err(format!("No memories found for session {session_id}"));

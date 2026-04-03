@@ -67,10 +67,14 @@ async fn user_snapshot_store(
 fn user_git_service(
     sql: &Arc<memoria_storage::SqlMemoryStore>,
 ) -> Result<GitForDataService, (StatusCode, String)> {
-    let db_name = sql
-        .database_name()
-        .ok_or((StatusCode::SERVICE_UNAVAILABLE, "SQL store missing database URL".into()))?;
-    Ok(GitForDataService::new(sql.pool().clone(), db_name.to_string()))
+    let db_name = sql.database_name().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "SQL store missing database URL".into(),
+    ))?;
+    Ok(GitForDataService::new(
+        sql.pool().clone(),
+        db_name.to_string(),
+    ))
 }
 
 fn validate_snapshot_identifier(name: &str) -> Result<&str, (StatusCode, String)> {
@@ -268,14 +272,13 @@ pub async fn diff_snapshot(
         "SELECT COUNT(*) FROM `{table}` {{SNAPSHOT = '{snap_name}'}} WHERE user_id = ? AND is_active > 0"
     )).bind(&user_id).fetch_one(pool).await.map_err(api_err)?;
 
-    let curr_count: i64 =
-        sqlx::query_scalar(&format!(
-            "SELECT COUNT(*) FROM `{table}` WHERE user_id = ? AND is_active > 0"
-        ))
-            .bind(&user_id)
-            .fetch_one(pool)
-            .await
-            .map_err(api_err)?;
+    let curr_count: i64 = sqlx::query_scalar(&format!(
+        "SELECT COUNT(*) FROM `{table}` WHERE user_id = ? AND is_active > 0"
+    ))
+    .bind(&user_id)
+    .fetch_one(pool)
+    .await
+    .map_err(api_err)?;
 
     // Added (in current but not in snapshot)
     let added_sql = format!(

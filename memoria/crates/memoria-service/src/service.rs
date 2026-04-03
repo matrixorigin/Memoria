@@ -156,10 +156,7 @@ impl AccessCounter {
             let mut by_user: std::collections::HashMap<String, Vec<(String, u64)>> =
                 std::collections::HashMap::new();
             for ((user_id, memory_id), count) in batch {
-                by_user
-                    .entry(user_id)
-                    .or_default()
-                    .push((memory_id, count));
+                by_user.entry(user_id).or_default().push((memory_id, count));
             }
             for (user_id, user_batch) in by_user {
                 match router.user_store(&user_id).await {
@@ -2181,10 +2178,7 @@ impl MemoryService {
         parse_json_array(&result)
     }
 
-    pub async fn user_sql_store(
-        &self,
-        user_id: &str,
-    ) -> Result<Arc<SqlMemoryStore>, MemoriaError> {
+    pub async fn user_sql_store(&self, user_id: &str) -> Result<Arc<SqlMemoryStore>, MemoriaError> {
         if let Some(router) = &self.db_router {
             router.user_store(user_id).await
         } else {

@@ -7,6 +7,7 @@
 //!   memoria status        — show configuration status
 //!   memoria rules         — write/update steering rules (auto-detect or --tool)
 //!   memoria benchmark     — run benchmark against a Memoria API server
+//!   memoria migrate       — run offline migration and cutover tooling
 
 mod benchmark;
 
@@ -203,6 +204,11 @@ enum Commands {
         #[command(subcommand)]
         command: PluginCommands,
     },
+    /// Run offline migration tooling
+    Migrate {
+        #[command(subcommand)]
+        command: MigrationCommands,
+    },
 }
 
 #[derive(Subcommand)]
@@ -349,6 +355,31 @@ enum PluginCommands {
     },
 }
 
+#[derive(Subcommand)]
+enum MigrationCommands {
+    /// Migrate a legacy single-db deployment into shared DB + per-user DB layout
+    LegacyToMultiDb {
+        /// Legacy single-db DATABASE_URL (source)
+        #[arg(long, env = "DATABASE_URL")]
+        legacy_db_url: String,
+        /// Shared DB URL for the target multi-db deployment
+        #[arg(long, env = "MEMORIA_SHARED_DATABASE_URL")]
+        shared_db_url: String,
+        /// Embedding dimension used by the target schema
+        #[arg(long, env = "EMBEDDING_DIM", default_value_t = 1024)]
+        embedding_dim: usize,
+        /// Limit per-user migration to one or more users (for rehearsal/troubleshooting)
+        #[arg(long = "user")]
+        user_ids: Vec<String>,
+        /// Execute the migration; without this flag, the command performs a dry run only
+        #[arg(long)]
+        execute: bool,
+        /// Save the full migration report as JSON
+        #[arg(long)]
+        report_out: Option<String>,
+    },
+}
+
 // ── Serve (API server) ────────────────────────────────────────────────────────
 
 async fn cmd_serve(db_url: Option<String>, port: u16, master_key: String) -> Result<()> {
@@ -382,18 +413,26 @@ async fn cmd_serve(db_url: Option<String>, port: u16, master_key: String) -> Res
 
     let (store, db_router, git_db_url) = if cfg.multi_db {
         let router = Arc::new(
-            DbRouter::connect(&cfg.shared_db_url, cfg.embedding_dim, cfg.instance_id.clone())
-                .await?,
+            DbRouter::connect(
+                &cfg.shared_db_url,
+                cfg.embedding_dim,
+                cfg.instance_id.clone(),
+            )
+            .await?,
         );
-        let mut store =
-            SqlMemoryStore::connect(&cfg.shared_db_url, cfg.embedding_dim, cfg.instance_id.clone())
-                .await?;
+        let mut store = SqlMemoryStore::connect(
+            &cfg.shared_db_url,
+            cfg.embedding_dim,
+            cfg.instance_id.clone(),
+        )
+        .await?;
         store.migrate_shared().await?;
         store.set_db_router(router.clone());
         (Arc::new(store), Some(router), cfg.shared_db_url.clone())
     } else {
         let store =
-            SqlMemoryStore::connect(&cfg.db_url, cfg.embedding_dim, cfg.instance_id.clone()).await?;
+            SqlMemoryStore::connect(&cfg.db_url, cfg.embedding_dim, cfg.instance_id.clone())
+                .await?;
         store.migrate().await?;
         (Arc::new(store), None, cfg.db_url.clone())
     };
@@ -404,9 +443,8 @@ async fn cmd_serve(db_url: Option<String>, port: u16, master_key: String) -> Res
     let embedder = build_embedder(&cfg);
     let llm = build_llm(&cfg);
 
-    let service = Arc::new(
-        MemoryService::new_sql_with_llm_and_router(store, db_router, embedder, llm).await,
-    );
+    let service =
+        Arc::new(MemoryService::new_sql_with_llm_and_router(store, db_router, embedder, llm).await);
     Arc::new(memoria_service::GovernanceScheduler::from_config(service.clone(), &cfg).await?)
         .start();
     let state = AppState::new(service.clone(), git, master_key)
@@ -515,18 +553,26 @@ async fn cmd_mcp(
 
     let (store, db_router, git_db_url) = if cfg.multi_db {
         let router = Arc::new(
-            DbRouter::connect(&cfg.shared_db_url, cfg.embedding_dim, cfg.instance_id.clone())
-                .await?,
+            DbRouter::connect(
+                &cfg.shared_db_url,
+                cfg.embedding_dim,
+                cfg.instance_id.clone(),
+            )
+            .await?,
         );
-        let mut store =
-            SqlMemoryStore::connect(&cfg.shared_db_url, cfg.embedding_dim, cfg.instance_id.clone())
-                .await?;
+        let mut store = SqlMemoryStore::connect(
+            &cfg.shared_db_url,
+            cfg.embedding_dim,
+            cfg.instance_id.clone(),
+        )
+        .await?;
         store.migrate_shared().await?;
         store.set_db_router(router.clone());
         (Arc::new(store), Some(router), cfg.shared_db_url.clone())
     } else {
         let store =
-            SqlMemoryStore::connect(&cfg.db_url, cfg.embedding_dim, cfg.instance_id.clone()).await?;
+            SqlMemoryStore::connect(&cfg.db_url, cfg.embedding_dim, cfg.instance_id.clone())
+                .await?;
         store.migrate().await?;
         (Arc::new(store), None, cfg.db_url.clone())
     };
@@ -537,9 +583,8 @@ async fn cmd_mcp(
     let embedder = build_embedder(&cfg);
     let llm = build_llm(&cfg);
 
-    let service = Arc::new(
-        MemoryService::new_sql_with_llm_and_router(store, db_router, embedder, llm).await,
-    );
+    let service =
+        Arc::new(MemoryService::new_sql_with_llm_and_router(store, db_router, embedder, llm).await);
     Arc::new(memoria_service::GovernanceScheduler::from_config(service.clone(), &cfg).await?)
         .start();
 
@@ -798,6 +843,120 @@ async fn cmd_plugin(command: PluginCommands) -> Result<()> {
         }
         PluginCommands::Init { .. } | PluginCommands::DevKeygen { .. } => unreachable!(),
     }
+    Ok(())
+}
+
+async fn cmd_migrate(command: MigrationCommands) -> Result<()> {
+    use memoria_storage::{
+        execute_legacy_single_db_to_multi_db, plan_legacy_single_db_to_multi_db,
+        LegacyToMultiDbMigrationOptions, LegacyToMultiDbMigrationReport, TableMigrationReport,
+    };
+
+    fn print_table_group(label: &str, items: &[TableMigrationReport]) {
+        if items.is_empty() {
+            return;
+        }
+        println!("{label}:");
+        for item in items {
+            let target = item
+                .target_rows
+                .map(|rows| rows.to_string())
+                .unwrap_or_else(|| "-".to_string());
+            let note = item
+                .note
+                .as_deref()
+                .map(|note| format!(" ({note})"))
+                .unwrap_or_default();
+            println!(
+                "  - {}\tsource={}\ttarget={}\tstatus={}{}",
+                item.table_name, item.source_rows, target, item.status, note
+            );
+        }
+    }
+
+    fn print_report(report: &LegacyToMultiDbMigrationReport) {
+        println!(
+            "Migration mode: {}",
+            if report.dry_run { "dry-run" } else { "execute" }
+        );
+        println!(
+            "Legacy DB: {}\nShared DB: {}\nUsers: {}",
+            report.legacy_db_name,
+            report.shared_db_name,
+            report.selected_users.len()
+        );
+        if let Some(snapshot) = report.pre_execute_account_snapshot.as_deref() {
+            println!("Pre-execute account snapshot: {snapshot}");
+        }
+        if !report.skipped_shared_runtime_tables.is_empty() {
+            println!(
+                "Skipped runtime tables: {}",
+                report.skipped_shared_runtime_tables.join(", ")
+            );
+        }
+        if !report.warnings.is_empty() {
+            println!("Warnings:");
+            for warning in &report.warnings {
+                println!("  - {warning}");
+            }
+        }
+        print_table_group("Shared tables", &report.shared_tables);
+        for user in &report.users {
+            println!(
+                "\nUser {}\n  target_db={}\n  active_branch={}\n  active_legacy_snapshots={}",
+                user.user_id,
+                user.target_db,
+                user.active_branch.as_deref().unwrap_or("main"),
+                user.active_snapshot_count
+            );
+            for warning in &user.warnings {
+                println!("  warning: {warning}");
+            }
+            print_table_group("  User tables", &user.tables);
+            print_table_group("  Branch tables", &user.branch_tables);
+        }
+    }
+
+    match command {
+        MigrationCommands::LegacyToMultiDb {
+            legacy_db_url,
+            shared_db_url,
+            embedding_dim,
+            user_ids,
+            execute,
+            report_out,
+        } => {
+            let options = LegacyToMultiDbMigrationOptions { user_ids };
+            let report = if execute {
+                execute_legacy_single_db_to_multi_db(
+                    &legacy_db_url,
+                    &shared_db_url,
+                    embedding_dim,
+                    options,
+                )
+                .await?
+            } else {
+                plan_legacy_single_db_to_multi_db(
+                    &legacy_db_url,
+                    &shared_db_url,
+                    embedding_dim,
+                    options,
+                )
+                .await?
+            };
+            print_report(&report);
+            if let Some(path) = report_out {
+                std::fs::write(&path, serde_json::to_string_pretty(&report)?)?;
+                println!("Saved report: {path}");
+            }
+            if report.dry_run {
+                println!(
+                    "\nDry run only. Stop writers, resolve warnings, then rerun with --execute."
+                );
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -3056,14 +3215,23 @@ fn main() -> Result<()> {
                 .build()?
                 .block_on(cmd_plugin(command))?;
         }
+        Commands::Migrate { command } => {
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?
+                .block_on(cmd_migrate(command))?;
+        }
     }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{run_with_edit_log_drain, validate_embedding_config};
+    use super::{
+        run_with_edit_log_drain, validate_embedding_config, Cli, Commands, MigrationCommands,
+    };
     use async_trait::async_trait;
+    use clap::Parser;
     use memoria_core::{interfaces::MemoryStore, MemoriaError, Memory};
     use memoria_service::{Config, MemoryService};
     use memoria_storage::OwnedEditLogEntry;
@@ -3200,5 +3368,62 @@ mod tests {
         let drained = entries.lock().unwrap();
         assert_eq!(drained.len(), 1);
         assert_eq!(drained[0].operation, "purge");
+    }
+
+    #[test]
+    fn migrate_cli_defaults_to_dry_run() {
+        let cli = Cli::parse_from([
+            "memoria",
+            "migrate",
+            "legacy-to-multi-db",
+            "--legacy-db-url",
+            "mysql://root:111@localhost:6001/memoria",
+            "--shared-db-url",
+            "mysql://root:111@localhost:6001/memoria_shared",
+        ]);
+
+        match cli.command {
+            Commands::Migrate {
+                command:
+                    MigrationCommands::LegacyToMultiDb {
+                        execute, user_ids, ..
+                    },
+            } => {
+                assert!(!execute);
+                assert!(user_ids.is_empty());
+            }
+            _ => panic!("unexpected command"),
+        }
+    }
+
+    #[test]
+    fn migrate_cli_accepts_execute_and_users() {
+        let cli = Cli::parse_from([
+            "memoria",
+            "migrate",
+            "legacy-to-multi-db",
+            "--legacy-db-url",
+            "mysql://root:111@localhost:6001/memoria",
+            "--shared-db-url",
+            "mysql://root:111@localhost:6001/memoria_shared",
+            "--execute",
+            "--user",
+            "alice",
+            "--user",
+            "bob",
+        ]);
+
+        match cli.command {
+            Commands::Migrate {
+                command:
+                    MigrationCommands::LegacyToMultiDb {
+                        execute, user_ids, ..
+                    },
+            } => {
+                assert!(execute);
+                assert_eq!(user_ids, vec!["alice".to_string(), "bob".to_string()]);
+            }
+            _ => panic!("unexpected command"),
+        }
     }
 }

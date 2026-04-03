@@ -236,7 +236,9 @@ impl GovernanceStore for SqlMemoryStore {
         if let Some(user_stores) = routed_user_stores(self).await? {
             let mut results = Vec::new();
             for (_, store) in user_stores {
-                results.extend(SqlMemoryStore::archive_stale_working(store.as_ref(), stale_hours).await?);
+                results.extend(
+                    SqlMemoryStore::archive_stale_working(store.as_ref(), stale_hours).await?,
+                );
             }
             return Ok(results);
         }
@@ -412,7 +414,8 @@ impl GovernanceStore for SqlMemoryStore {
             let mut created = 0usize;
             let mut warnings = Vec::new();
             for (user_id, store) in user_stores {
-                let (snapshot, warning) = SqlMemoryStore::create_safety_snapshot(store.as_ref(), operation).await;
+                let (snapshot, warning) =
+                    SqlMemoryStore::create_safety_snapshot(store.as_ref(), operation).await;
                 if snapshot.is_some() {
                     created += 1;
                 }

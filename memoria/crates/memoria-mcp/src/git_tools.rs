@@ -77,7 +77,11 @@ fn snap_internal(db_name: &str, name: &str) -> String {
         name.to_string()
     } else {
         let scope = sanitize_snapshot_scope(db_name);
-        format!("{SNAP_PREFIX}{}_{scope}_{}", scope.len(), sanitize_name(name))
+        format!(
+            "{SNAP_PREFIX}{}_{scope}_{}",
+            scope.len(),
+            sanitize_name(name)
+        )
     }
 }
 
@@ -126,11 +130,16 @@ async fn snapshot_store(
     svc.user_sql_store(user_id).await
 }
 
-fn git_for_store(sql: &Arc<memoria_storage::SqlMemoryStore>) -> Result<GitForDataService, MemoriaError> {
-    let db_name = sql
-        .database_name()
-        .ok_or_else(|| MemoriaError::Internal("Git ops require a database-backed SQL store".into()))?;
-    Ok(GitForDataService::new(sql.pool().clone(), db_name.to_string()))
+fn git_for_store(
+    sql: &Arc<memoria_storage::SqlMemoryStore>,
+) -> Result<GitForDataService, MemoriaError> {
+    let db_name = sql.database_name().ok_or_else(|| {
+        MemoriaError::Internal("Git ops require a database-backed SQL store".into())
+    })?;
+    Ok(GitForDataService::new(
+        sql.pool().clone(),
+        db_name.to_string(),
+    ))
 }
 
 async fn visible_snapshots_for_user(

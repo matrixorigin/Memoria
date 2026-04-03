@@ -975,58 +975,127 @@ enum StoreMode {
 }
 ```
 
-### 10.2 在线迁移流程
+### 10.2 正式 migration CLI 形态
 
-```
-Phase 0: 准备 (无业务影响)
-  +-- 创建 memoria_shared 库
-  +-- 复制全局表到 memoria_shared (CREATE TABLE ... AS SELECT)
-  +-- 创建 mem_user_registry
-  +-- 部署新代码 (MEMORIA_MULTI_DB=false)
+新增正式离线迁移入口：
 
-Phase 1: 灰度切换
-  +-- 对新注册用户启用 per-user DB
-  +-- 老用户仍用单 DB 模式
-  +-- 验证新用户功能正常
+```bash
+# 1) dry-run（默认，不改目标库）
+memoria migrate legacy-to-multi-db \
+  --legacy-db-url mysql://root:111@host:6001/memoria \
+  --shared-db-url mysql://root:111@host:6001/memoria_shared \
+  --report-out migration-plan.json
 
-Phase 2: 存量迁移
-  +-- 后台脚本遍历 DISTINCT user_id
-  +-- 为每个用户创建 DB + 迁移数据
-  |   +-- CREATE DATABASE mem_u_xxx
-  |   +-- INSERT INTO mem_u_xxx.mem_memories
-  |   |   SELECT * FROM memoria.mem_memories WHERE user_id = ?
-  |   +-- 迁移所有用户级表（含分支表 br_*）
-  |   +-- 注册到 mem_user_registry
-  |   +-- 执行一次 snapshot/branch 对账
-  |   |   +-- 校验 `mem_snapshots` <-> `SHOW SNAPSHOTS`
-  |   |   +-- 校验 `mem_branches` <-> `SHOW TABLES LIKE 'br_%'`
-  +-- 数据校验（行数/checksum 对比）
-
-Phase 3: 全量切换
-  +-- MEMORIA_MULTI_DB=true
-  +-- 所有用户使用 per-user DB
-  +-- 旧 DB 保留 7 天作备份
-
-Phase 4: 清理
-  +-- DROP DATABASE memoria（旧共享 DB）
+# 2) execute（真正执行）
+memoria migrate legacy-to-multi-db \
+  --legacy-db-url mysql://root:111@host:6001/memoria \
+  --shared-db-url mysql://root:111@host:6001/memoria_shared \
+  --execute \
+  --report-out migration-run.json
 ```
 
-### 10.3 分支表迁移
+**命令语义**：
 
-分支表（`br_*`）需特殊处理：
+- 默认 **dry-run**：只读取 legacy DB，输出计划与风险，不创建 shared DB / user DB，不写任何目标表。
+- `--execute`：执行真实迁移。该模式要求业务写入已冻结（maintenance window / offline cutover），并且会先 **创建一个 MatrixOne account 级 safety snapshot**；只有 snapshot 创建成功后，才会继续 reset 目标 shared DB 和目标 user DB，再执行纯 `INSERT ... SELECT` 复制。
+- `--user alice --user bob`：仅迁移指定用户的**用户态数据**，主要用于 rehearsal / troubleshooting；共享持久表仍按全集同步，不建议把它当成正式灰度切流工具。
+- `--report-out`：输出完整 JSON 报告，便于变更单、审计和复盘。
+
+**当前 CLI 的安全边界**：
+
+1. 复制 **共享持久表**：`mem_api_keys`、`mem_governance_runtime_state`、`mem_plugin_*`
+2. **不复制共享运行态表**：`mem_distributed_locks`、`mem_async_tasks`，目标集群启动后重新建立
+3. 对每个用户：
+   - 重建对应的 `mem_u_*` 目标库
+   - 按 `user_id` 复制用户级表
+   - 复制 `mem_memories_stats`（按 `memory_id` 归属）
+   - 复制物理分支表 `br_*`
+   - 校验源/目标行数
+4. **Fail fast**：如果 legacy DB 中仍存在 `mem_snapshots.status = 'active'` 的快照，CLI 会拒绝 execute；当前版本**不会**把旧 shared-db snapshot 物化成新的 per-user DB snapshot。
+
+### 10.3 运维执行流程（operator runbook）
+
+**谁执行**：运维 / SRE / 发布负责人。不是普通用户命令，也不是每次发版都要跑。
+
+**什么时候执行**：
+
+- 旧单库架构 -> 新 per-user DB 架构的正式 cutover
+- staging / pre-prod 预演
+- 用 legacy 备份重建一套 multi-db 环境
+
+**推荐步骤**：
+
+1. **预检查（可在线）**
+   - 确认新版本代码已部署好，但仍保持 `MEMORIA_MULTI_DB=false`
+   - 先跑一次 dry-run，导出 `migration-plan.json`
+   - 检查报告中的：
+     - 用户数是否符合预期
+     - 是否存在 active legacy snapshots（若有，先清理或接受手工重建）
+     - branch 表数量、共享表数量是否异常
+
+2. **进入 maintenance window**
+   - 停止旧 API 写流量，冻结 MCP / REST 写入
+   - 保留 legacy DB 作为回滚基线，不要提前删库
+
+3. **执行迁移**
+   - 运行 `memoria migrate legacy-to-multi-db ... --execute`
+   - 观察 stdout / `migration-run.json`
+   - execute 会先自动创建一个 account snapshot；如果这一步失败，迁移会直接终止，不会继续改目标库
+   - 注意：`--execute` 会清空并重建目标 `shared_db_url` 以及本次涉及的每个 `mem_u_*`，不要把它指向仍需保留业务数据的库
+   - 期望结果：
+      - 报告中能看到 pre-execute account snapshot 名称，便于必要时整账号 restore
+      - `memoria_shared` 只包含 control-plane 表
+      - 每个用户都映射到唯一 `mem_u_*`
+     - 物理 branch 表 `br_*` 已复制到目标用户库
+
+4. **切换新架构**
+   - 启动新 API / MCP，设置 `MEMORIA_MULTI_DB=true`
+   - smoke check：
+     - 老 API key 仍可认证
+     - 关键用户的 branch / checkout / merge 正常
+     - snapshot / rollback 对新创建快照正常
+     - `/admin/users`、`/admin/stats`、`/metrics` 正常
+
+5. **观察期**
+   - legacy DB 至少保留 7 天
+   - 观察跨实例写入、后台任务、治理任务、恢复路径
+
+6. **回滚**
+   - 若 cutover 后发现问题：停止 multi-db API
+   - 优先根据 execute 报告里记录的 pre-execute account snapshot 执行整账号 restore
+   - 恢复旧配置：`MEMORIA_MULTI_DB=false`，重新指向 legacy `DATABASE_URL`
+   - 确认 legacy DB 已回到 cutover 前状态后，再继续使用 legacy DB 提供服务
+   - 保留已生成的 shared / `mem_u_*` 目标库用于排障，不要立即销毁
+
+### 10.4 分支表迁移
+
+分支表（`br_*`）需特殊处理；当前正式 CLI 的策略是**保留物理表名原样复制**，不做 rename：
 
 ```sql
--- 对每个用户的分支表:
 -- 1. 查 mem_branches 获取 user_id -> table_name 映射
-SELECT user_id, name, table_name FROM memoria.mem_branches WHERE status = 'active';
+SELECT user_id, name, table_name
+FROM memoria.mem_branches
+WHERE status = 'active';
 
--- 2. 复制到用户 DB (MatrixOne CTAS 或 INSERT SELECT)
-CREATE TABLE mem_u_xxx.br_mybranch AS SELECT * FROM memoria.br_a1b2c3d4_mybranch;
+-- 2. 在目标用户 DB 中重建同名物理表
+CREATE TABLE mem_u_xxx.br_a1b2c3d4_mybranch LIKE memoria.br_a1b2c3d4_mybranch;
 
--- 3. 更新 mem_branches.table_name（去掉 UUID 前缀）
-UPDATE mem_u_xxx.mem_branches SET table_name = 'br_mybranch'
-  WHERE table_name = 'br_a1b2c3d4_mybranch';
+-- 3. 复制数据
+INSERT INTO mem_u_xxx.br_a1b2c3d4_mybranch
+SELECT * FROM memoria.br_a1b2c3d4_mybranch;
 ```
+
+**原因**：
+
+- 当前运行时 `mem_branches.table_name` 直接作为 active table / merge / diff 的事实源
+- 保留原表名可以避免迁移阶段额外做 metadata rewrite
+- branch metadata 与 physical table 都按显式列复制，避免列顺序漂移
+
+**验证点**：
+
+- `mem_branches` 中每条 active row 都能在目标用户库找到对应 `br_*` 物理表
+- `mem_user_state.active_branch` 若不为 `main`，则对应 branch 必须存在
+- branch 表行数必须与源库一致
 
 
 ---
@@ -1038,11 +1107,14 @@ UPDATE mem_u_xxx.mem_branches SET table_name = 'br_mybranch'
 | `USE {db}` 连接池并发安全 | 数据串用到其他用户 | 中 | 使用独占连接（acquire 后整个请求持有），不 release 回池直到请求结束 |
 | 大量 DB 导致 MO 元数据膨胀 | DDL 性能下降 | 中 | 监控 DB 数量；设置上限（如 10000）；定期清理 deleted 用户 |
 | Admin 跨库聚合查询慢 | 管理体验差 | 高 | 异步后台聚合 + 缓存；metrics 延长 TTL；注册表增加聚合字段 |
-| 迁移期间数据不一致 | 数据丢失/重复 | 低 | 双写 + 校验；保留旧 DB 作备份；迁移脚本幂等 |
+| 迁移期间数据不一致 | 数据丢失/重复 | 低 | 先 dry-run，再 offline execute；execute 前冻结写流量，目标侧先 reset 再纯 INSERT 复制；保留旧 DB 作备份 |
 | 控制元数据被 restore 回退 | orphan snapshot、quota 失真、branch 漂移 | 中 | 明确 restore 白名单只含业务数据表；restore 后执行 snapshot/branch 对账；禁止用户 restore shared DB |
 | Snapshot 配额问题 | 用户操作失败 | 中 | Database 级 snapshot 配额独立管理；保留 safety snapshot 清理逻辑 |
 | 首次访问 DB 创建延迟 | 首请求 latency 高 | 中 | 异步预创建；或接受 ~100ms 首次延迟 |
 | embedded CLI 模式兼容性 | 单用户场景退化 | 低 | 保留 legacy 模式作为默认；embedded 可自动创建单用户 DB |
+| execute 前 account snapshot 创建失败 | 无法安全回滚 | 中 | execute 必须先成功创建 account safety snapshot；失败则直接终止，不进入目标库 reset / copy |
+| legacy active snapshot 无法自动物化为 per-user snapshot | 旧快照能力丢失 | 中 | execute 前 fail fast；运维先清理旧快照，或 cutover 后按需要重新创建用户级 snapshot |
+| 跳过运行态 shared 表 | 锁/异步任务状态丢失 | 低 | `mem_distributed_locks`、`mem_async_tasks` 在新集群启动后重建；迁移必须在停写窗口执行 |
 
 ---
 

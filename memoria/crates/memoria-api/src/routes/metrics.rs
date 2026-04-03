@@ -24,11 +24,12 @@ async fn list_known_users(state: &AppState) -> Result<Vec<String>, String> {
         return router.list_active_users().await.map_err(|e| e.to_string());
     }
 
-    let rows: Vec<(String,)> =
-        sqlx::query_as("SELECT DISTINCT user_id FROM mem_memories WHERE is_active > 0 ORDER BY user_id")
-            .fetch_all(sql.pool())
-            .await
-            .map_err(|e| e.to_string())?;
+    let rows: Vec<(String,)> = sqlx::query_as(
+        "SELECT DISTINCT user_id FROM mem_memories WHERE is_active > 0 ORDER BY user_id",
+    )
+    .fetch_all(sql.pool())
+    .await
+    .map_err(|e| e.to_string())?;
     Ok(rows.into_iter().map(|row| row.0).collect())
 }
 
@@ -122,12 +123,11 @@ async fn collect_metrics(state: &AppState) -> Result<Arc<String>, String> {
             .await
             .unwrap_or_default()
             .len() as i64;
-        branches += 1
-            + user_store
-                .list_branches(user_id)
-                .await
-                .unwrap_or_default()
-                .len() as i64;
+        branches += 1 + user_store
+            .list_branches(user_id)
+            .await
+            .unwrap_or_default()
+            .len() as i64;
     }
 
     out.push_str("# HELP memoria_memories_total Active memories by type.\n");
