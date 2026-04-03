@@ -182,19 +182,56 @@ impl DbRouter {
         let db_url = self.user_db_url(&db_name)?;
         create_database_if_missing(&db_url).await?;
         let now = Utc::now().naive_utc();
-        sqlx::query(
+        let insert = sqlx::query(
             r#"INSERT INTO mem_user_registry (user_id, db_name, status, created_at, updated_at)
-               VALUES (?, ?, 'active', ?, ?)
-               ON DUPLICATE KEY UPDATE db_name = VALUES(db_name), status = 'active', updated_at = VALUES(updated_at)"#,
+               VALUES (?, ?, 'active', ?, ?)"#,
         )
         .bind(user_id)
         .bind(&db_name)
         .bind(now)
         .bind(now)
         .execute(&self.shared_pool)
-        .await
-        .map_err(db_err)?;
-        Ok(db_name)
+        .await;
+
+        match insert {
+            Ok(_) => Ok(db_name),
+            Err(sqlx::Error::Database(e))
+                if e.message().contains("Duplicate") || e.message().contains("1062") =>
+            {
+                let existing = sqlx::query(
+                    "SELECT db_name FROM mem_user_registry WHERE user_id = ?",
+                )
+                .bind(user_id)
+                .fetch_optional(&self.shared_pool)
+                .await
+                .map_err(db_err)?;
+
+                let Some(existing) = existing else {
+                    return Err(MemoriaError::Internal(format!(
+                        "user db registration collision for {user_id} -> {db_name}"
+                    )));
+                };
+
+                let existing_db_name: String = existing.try_get("db_name").map_err(db_err)?;
+                if existing_db_name != db_name {
+                    return Err(MemoriaError::Internal(format!(
+                        "user {user_id} already registered to {existing_db_name}, expected {db_name}"
+                    )));
+                }
+
+                sqlx::query(
+                    "UPDATE mem_user_registry SET status = 'active', updated_at = ? WHERE user_id = ?",
+                )
+                .bind(now)
+                .bind(user_id)
+                .execute(&self.shared_pool)
+                .await
+                .map_err(db_err)?;
+
+                Ok(existing_db_name)
+            }
+            Err(e) => Err(db_err(e)),
+        }
     }
 }
 
