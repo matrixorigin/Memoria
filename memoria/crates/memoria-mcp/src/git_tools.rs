@@ -383,6 +383,17 @@ pub async fn call(
                 sanitize_name(snap_name)
             };
             let git = git_for_store(&sql)?;
+            if sql
+                .get_snapshot_registration(user_id, &display)
+                .await?
+                .is_some()
+                || sql
+                    .get_snapshot_registration_by_internal(user_id, &internal)
+                    .await?
+                    .is_some()
+            {
+                return Ok(mcp_text(&format!("Snapshot '{}' already exists.", display)));
+            }
             let snap = git.create_snapshot(&internal).await.map_err(git_err)?;
             sql.register_snapshot(user_id, &display, &snap.snapshot_name)
                 .await?;

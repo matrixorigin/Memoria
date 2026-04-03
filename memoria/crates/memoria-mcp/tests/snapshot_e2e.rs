@@ -25,6 +25,10 @@ fn db_url() -> String {
         .unwrap_or_else(|_| "mysql://root:111@localhost:6001/memoria".to_string())
 }
 
+fn test_db_name() -> String {
+    db_url().rsplit('/').next().unwrap_or("memoria").to_string()
+}
+
 fn uid() -> String {
     format!("snap_{}", &Uuid::new_v4().simple().to_string()[..8])
 }
@@ -52,9 +56,40 @@ fn sanitize_name(name: &str) -> String {
     clean
 }
 
+fn sanitize_snapshot_scope(scope: &str) -> String {
+    scope
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .take(24)
+        .collect()
+}
+
+/// Mirror of git_tools::snap_internal so white-box assertions follow scoped names.
+fn internal_snapshot_name(name: &str) -> String {
+    const SNAP_PREFIX: &str = "mem_snap_";
+    const MILESTONE_PREFIX: &str = "mem_milestone_";
+
+    if name.starts_with(SNAP_PREFIX) || name.starts_with(MILESTONE_PREFIX) {
+        name.to_string()
+    } else {
+        let scope = sanitize_snapshot_scope(&test_db_name());
+        format!(
+            "{SNAP_PREFIX}{}_{scope}_{}",
+            scope.len(),
+            sanitize_name(name)
+        )
+    }
+}
+
 async fn setup() -> (Arc<MemoryService>, Arc<GitForDataService>, String) {
     let pool = MySqlPool::connect(&db_url()).await.expect("pool");
-    let db_name = db_url().rsplit('/').next().unwrap_or("memoria").to_string();
+    let db_name = test_db_name();
     let store = SqlMemoryStore::connect(&db_url(), test_dim(), uuid::Uuid::new_v4().to_string())
         .await
         .expect("store");
@@ -290,9 +325,9 @@ async fn test_snapshot_delete_by_prefix() {
 
     // keeper should still exist (check by internal name)
     let snaps = git.list_snapshots().await.unwrap();
-    let keeper_internal = format!("mem_snap_{}", keeper);
-    let s1_internal = format!("mem_snap_{}", sanitize_name(&s1));
-    let s2_internal = format!("mem_snap_{}", sanitize_name(&s2));
+    let keeper_internal = internal_snapshot_name(&keeper);
+    let s1_internal = internal_snapshot_name(&s1);
+    let s2_internal = internal_snapshot_name(&s2);
     assert!(
         snaps.iter().any(|s| s.snapshot_name == keeper_internal),
         "keeper should survive"
@@ -347,9 +382,9 @@ async fn test_snapshot_delete_batch_names() {
     );
 
     let snaps = git.list_snapshots().await.unwrap();
-    let s1i = format!("mem_snap_{s1}");
-    let s2i = format!("mem_snap_{s2}");
-    let s3i = format!("mem_snap_{s3}");
+    let s1i = internal_snapshot_name(&s1);
+    let s2i = internal_snapshot_name(&s2);
+    let s3i = internal_snapshot_name(&s3);
     assert!(!snaps.iter().any(|s| s.snapshot_name == s1i));
     assert!(
         snaps.iter().any(|s| s.snapshot_name == s2i),
@@ -441,7 +476,7 @@ async fn test_snapshot_and_branch_independent() {
     .await;
 }
 
-// ── 8. Duplicate snapshot name is rejected ───────────────────────────────────
+// ── 8. Duplicate snapshot name is handled without creating a second snapshot ─
 
 #[tokio::test]
 #[serial]
@@ -449,7 +484,7 @@ async fn test_duplicate_snapshot_name_rejected() {
     let (svc, git, uid) = setup().await;
     let snap_name = snap("dup");
 
-    git_call(
+    let first = git_call(
         "memory_snapshot",
         json!({"name": snap_name}),
         &git,
@@ -457,9 +492,10 @@ async fn test_duplicate_snapshot_name_rejected() {
         &uid,
     )
     .await;
+    assert!(text(&first).contains("created"), "got: {}", text(&first));
 
-    // Second create with same name should error
-    let result = memoria_mcp::git_tools::call(
+    // Second create with same name should return an explicit duplicate message
+    let second = git_call(
         "memory_snapshot",
         json!({"name": snap_name}),
         &git,
@@ -467,8 +503,20 @@ async fn test_duplicate_snapshot_name_rejected() {
         &uid,
     )
     .await;
-    assert!(result.is_err(), "duplicate snapshot should fail");
-    println!("✅ duplicate snapshot rejected: {:?}", result.unwrap_err());
+    assert!(
+        text(&second).contains("already exists"),
+        "got: {}",
+        text(&second)
+    );
+
+    let sql = svc.user_sql_store(&uid).await.unwrap();
+    let regs = sql.list_snapshot_registrations(&uid).await.unwrap();
+    let count = regs.iter().filter(|reg| reg.name == snap_name).count();
+    assert_eq!(count, 1, "duplicate create should not register twice");
+    println!(
+        "✅ duplicate snapshot rejected without 500: {}",
+        text(&second)
+    );
 
     git_call(
         "memory_snapshot_delete",
@@ -701,13 +749,13 @@ async fn test_snapshot_delete_older_than() {
             let snaps = git.list_snapshots().await.unwrap();
             !snaps
                 .iter()
-                .any(|s| s.snapshot_name == format!("mem_snap_{s1}"))
+                .any(|s| s.snapshot_name == internal_snapshot_name(&s1))
                 && !snaps
                     .iter()
-                    .any(|s| s.snapshot_name == format!("mem_snap_{s2}"))
+                    .any(|s| s.snapshot_name == internal_snapshot_name(&s2))
                 && !snaps
                     .iter()
-                    .any(|s| s.snapshot_name == format!("mem_snap_{s3}"))
+                    .any(|s| s.snapshot_name == internal_snapshot_name(&s3))
         },
         "expected all 3 deleted, got: {t}"
     );
