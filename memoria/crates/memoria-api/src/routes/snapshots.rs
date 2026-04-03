@@ -181,27 +181,25 @@ async fn resolve_snapshot_internal(
             .map_err(api_err)?
             .map(|r| r.snapshot_name)
             .ok_or((StatusCode::NOT_FOUND, "Snapshot not found".into()))?
-    } else {
-        if let Some(internal) = sql
-            .get_snapshot_registration(user_id, name)
+    } else if let Some(internal) = sql
+        .get_snapshot_registration(user_id, name)
+        .await
+        .map_err(api_err)?
+        .map(|r| r.snapshot_name)
+    {
+        internal
+    } else if name.starts_with("pre_") {
+        git.list_snapshots()
             .await
             .map_err(api_err)?
-            .map(|r| r.snapshot_name)
-        {
-            internal
-        } else if name.starts_with("pre_") {
-            git.list_snapshots()
-                .await
-                .map_err(api_err)?
-                .into_iter()
-                .find(|snapshot| {
-                    safety_snapshot_display_name(&snapshot.snapshot_name).as_deref() == Some(name)
-                })
-                .map(|snapshot| snapshot.snapshot_name)
-                .ok_or((StatusCode::NOT_FOUND, "Snapshot not found".into()))?
-        } else {
-            return Err((StatusCode::NOT_FOUND, "Snapshot not found".into()));
-        }
+            .into_iter()
+            .find(|snapshot| {
+                safety_snapshot_display_name(&snapshot.snapshot_name).as_deref() == Some(name)
+            })
+            .map(|snapshot| snapshot.snapshot_name)
+            .ok_or((StatusCode::NOT_FOUND, "Snapshot not found".into()))?
+    } else {
+        return Err((StatusCode::NOT_FOUND, "Snapshot not found".into()));
     };
 
     let internal = validate_snapshot_identifier(&internal)?.to_string();
