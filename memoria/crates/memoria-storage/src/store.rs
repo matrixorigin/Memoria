@@ -608,6 +608,35 @@ impl SqlMemoryStore {
         embedding_dim: usize,
         instance_id: String,
     ) -> Result<Self, MemoriaError> {
+        const DB_MAX_CONNECTIONS_UPPER: u32 = 512;
+        let max_conns =
+            configured_max_connections("DB_MAX_CONNECTIONS", 64, DB_MAX_CONNECTIONS_UPPER);
+        Self::connect_with_pool_limit(database_url, embedding_dim, instance_id, max_conns, true)
+            .await
+    }
+
+    pub async fn connect_routed(
+        database_url: &str,
+        embedding_dim: usize,
+        instance_id: String,
+    ) -> Result<Self, MemoriaError> {
+        const ROUTED_DB_MAX_CONNECTIONS_UPPER: u32 = 64;
+        let max_conns = configured_max_connections(
+            "MEMORIA_ROUTED_DB_MAX_CONNECTIONS",
+            4,
+            ROUTED_DB_MAX_CONNECTIONS_UPPER,
+        );
+        Self::connect_with_pool_limit(database_url, embedding_dim, instance_id, max_conns, false)
+            .await
+    }
+
+    async fn connect_with_pool_limit(
+        database_url: &str,
+        embedding_dim: usize,
+        instance_id: String,
+        max_conns: u32,
+        log_info: bool,
+    ) -> Result<Self, MemoriaError> {
         // Auto-create database if it doesn't exist
         if let Some((base_url, db_name, _suffix)) = split_database_url(database_url) {
             let base_pool = sqlx::mysql::MySqlPoolOptions::new()
@@ -623,12 +652,6 @@ impl SqlMemoryStore {
                 .await;
             }
         }
-        const DB_MAX_CONNECTIONS_UPPER: u32 = 512;
-        let max_conns: u32 = std::env::var("DB_MAX_CONNECTIONS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(64)
-            .clamp(1, DB_MAX_CONNECTIONS_UPPER);
         let max_lifetime_secs: u64 = std::env::var("DB_MAX_LIFETIME_SECS")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -641,11 +664,13 @@ impl SqlMemoryStore {
             .connect(database_url)
             .await
             .map_err(db_err)?;
-        tracing::info!(
-            max_connections = max_conns,
-            max_lifetime_secs = max_lifetime_secs,
-            "Main connection pool initialized"
-        );
+        if log_info {
+            tracing::info!(
+                max_connections = max_conns,
+                max_lifetime_secs = max_lifetime_secs,
+                "Main connection pool initialized"
+            );
+        }
         let mut store = Self::new(pool.clone(), embedding_dim, instance_id);
         store.database_url = Some(database_url.to_string());
         store.configured_max_connections = Some(max_conns);
@@ -4388,6 +4413,14 @@ impl SqlMemoryStore {
 
 fn parse_db_name_from_url(database_url: &str) -> Option<&str> {
     split_database_url(database_url).map(|(_, db_name, _)| db_name)
+}
+
+fn configured_max_connections(env_name: &str, default: u32, upper: u32) -> u32 {
+    std::env::var(env_name)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default)
+        .clamp(1, upper)
 }
 
 fn split_database_url(database_url: &str) -> Option<(&str, &str, &str)> {

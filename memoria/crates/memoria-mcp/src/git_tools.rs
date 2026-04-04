@@ -31,6 +31,16 @@ fn git_err(e: impl std::fmt::Display) -> MemoriaError {
     MemoriaError::Internal(e.to_string())
 }
 
+fn validate_identifier(name: &str) -> Result<&str, MemoriaError> {
+    if !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        Ok(name)
+    } else {
+        Err(MemoriaError::Internal(format!(
+            "Invalid identifier: {name:?} — only alphanumeric and underscore allowed"
+        )))
+    }
+}
+
 const MAX_USER_SNAPSHOTS: i64 = 20;
 const MAX_BRANCHES: i64 = 20;
 const MAX_IDENTIFIER_LEN: usize = 64;
@@ -307,6 +317,36 @@ async fn resolve_snapshot_for_user(
         .map(|snapshot| snapshot.internal_name))
 }
 
+async fn acquire_snapshot_create_lock(
+    lock_store: &Arc<memoria_storage::SqlMemoryStore>,
+    sql: &Arc<memoria_storage::SqlMemoryStore>,
+    git: &GitForDataService,
+    user_id: &str,
+    display: &str,
+    internal: &str,
+) -> Result<Option<String>, MemoriaError> {
+    let lock_key = format!("snapshot_create:{user_id}:{internal}");
+    for _ in 0..20 {
+        if lock_store.try_acquire_lock(&lock_key, 30).await? {
+            return Ok(Some(lock_key));
+        }
+        if sql
+            .get_snapshot_registration(user_id, display)
+            .await?
+            .is_some()
+            || sql
+                .get_snapshot_registration_by_internal(user_id, internal)
+                .await?
+                .is_some()
+            || git.get_snapshot(internal).await.map_err(git_err)?.is_some()
+        {
+            return Ok(None);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    Ok(None)
+}
+
 pub fn list() -> Value {
     json!([
         {
@@ -461,24 +501,54 @@ pub async fn call(
                 sanitize_name(snap_name)
             };
             let git = git_for_store(&sql)?;
-            if sql
-                .get_snapshot_registration(user_id, &display)
-                .await?
-                .is_some()
-                || sql
-                    .get_snapshot_registration_by_internal(user_id, &internal)
+            let lock_store = svc.sql_store.as_ref().cloned().ok_or_else(|| {
+                MemoriaError::Internal("Snapshot ops require a database-backed SQL store".into())
+            })?;
+            let Some(lock_key) =
+                acquire_snapshot_create_lock(&lock_store, &sql, &git, user_id, &display, &internal)
+                    .await?
+            else {
+                return Ok(mcp_text(&format!("Snapshot '{}' already exists.", display)));
+            };
+            let result = async {
+                if sql
+                    .get_snapshot_registration(user_id, &display)
                     .await?
                     .is_some()
-            {
-                return Ok(mcp_text(&format!("Snapshot '{}' already exists.", display)));
+                    || sql
+                        .get_snapshot_registration_by_internal(user_id, &internal)
+                        .await?
+                        .is_some()
+                {
+                    return Ok(mcp_text(&format!("Snapshot '{}' already exists.", display)));
+                }
+                let snap = match git.create_snapshot(&internal).await {
+                    Ok(snap) => snap,
+                    Err(err) => {
+                        if git
+                            .get_snapshot(&internal)
+                            .await
+                            .map_err(git_err)?
+                            .is_some()
+                        {
+                            return Ok(mcp_text(&format!(
+                                "Snapshot '{}' already exists.",
+                                display
+                            )));
+                        }
+                        return Err(git_err(err));
+                    }
+                };
+                sql.register_snapshot(user_id, &display, &snap.snapshot_name)
+                    .await?;
+                Ok(mcp_text(&format!(
+                    "Snapshot '{}' created at {:?}",
+                    display, snap.timestamp
+                )))
             }
-            let snap = git.create_snapshot(&internal).await.map_err(git_err)?;
-            sql.register_snapshot(user_id, &display, &snap.snapshot_name)
-                .await?;
-            Ok(mcp_text(&format!(
-                "Snapshot '{}' created at {:?}",
-                display, snap.timestamp
-            )))
+            .await;
+            let _ = lock_store.release_lock(&lock_key).await;
+            result
         }
 
         "memory_snapshots" => {
@@ -718,6 +788,7 @@ pub async fn call(
                 .find(|(name, _)| name == source_branch)
                 .map(|(_, t)| t.clone())
                 .ok_or_else(|| MemoriaError::NotFound(format!("Branch '{source_branch}'")))?;
+            let table_name = validate_identifier(&table_name)?.to_string();
 
             // Safety limit: count new memories (branch rows not in main by PK)
             let count_sql = format!(
@@ -908,6 +979,7 @@ async fn collect_replace_candidates(
     user_id: &str,
     l2_conflict: f64,
 ) -> Result<Vec<ReplaceCandidate>, MemoriaError> {
+    let table_name = validate_identifier(table_name)?;
     let sql = format!(
         "SELECT m.memory_id AS main_memory_id, \
                 b.memory_id AS branch_memory_id, \
@@ -965,7 +1037,7 @@ fn mcp_text(text: &str) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use super::{safety_prefix, snap_internal, MAX_IDENTIFIER_LEN};
+    use super::{safety_prefix, snap_internal, validate_identifier, MAX_IDENTIFIER_LEN};
 
     #[test]
     fn scoped_snapshot_internal_names_stay_within_matrixone_limit() {
@@ -982,5 +1054,17 @@ mod tests {
             "memoria_shared_db_with_a_really_long_name_for_product_runs",
         ));
         assert!(prefix.len() < MAX_IDENTIFIER_LEN, "{prefix}");
+    }
+
+    #[test]
+    fn validate_identifier_accepts_safe_names() {
+        assert_eq!(validate_identifier("br_valid_123").unwrap(), "br_valid_123");
+    }
+
+    #[test]
+    fn validate_identifier_rejects_unsafe_names() {
+        assert!(validate_identifier("br_bad-name").is_err());
+        assert!(validate_identifier("br bad").is_err());
+        assert!(validate_identifier("br`bad").is_err());
     }
 }

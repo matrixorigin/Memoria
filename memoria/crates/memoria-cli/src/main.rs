@@ -398,10 +398,12 @@ async fn cmd_serve(db_url: Option<String>, port: u16, master_key: String) -> Res
     }
 
     validate_embedding_config(&cfg)?;
+    let redacted_db_url = redact_url(&cfg.db_url);
+    let redacted_shared_db_url = redact_url(&cfg.shared_db_url);
 
     tracing::info!(
-        db_url = %cfg.db_url,
-        shared_db_url = %cfg.shared_db_url,
+        db_url = %redacted_db_url,
+        shared_db_url = %redacted_shared_db_url,
         multi_db = cfg.multi_db,
         port = port,
         instance_id = %cfg.instance_id,
@@ -474,6 +476,24 @@ fn parse_db_name(database_url: &str) -> Option<String> {
         return None;
     }
     Some(db_name.to_string())
+}
+
+fn redact_url(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url.to_string();
+    };
+    let Some((userinfo, host)) = rest.split_once('@') else {
+        return url.to_string();
+    };
+    if userinfo.is_empty() {
+        return url.to_string();
+    }
+    let redacted_userinfo = if userinfo.contains(':') {
+        "***:***"
+    } else {
+        "***"
+    };
+    format!("{scheme}://{redacted_userinfo}@{host}")
 }
 
 // ── MCP server ────────────────────────────────────────────────────────────────
@@ -550,10 +570,12 @@ async fn cmd_mcp(
     if let Some(v) = db_name {
         cfg.db_name = v;
     }
+    let redacted_db_url = redact_url(&cfg.db_url);
+    let redacted_shared_db_url = redact_url(&cfg.shared_db_url);
 
     tracing::info!(
-        db_url = %cfg.db_url,
-        shared_db_url = %cfg.shared_db_url,
+        db_url = %redacted_db_url,
+        shared_db_url = %redacted_shared_db_url,
         multi_db = cfg.multi_db,
         embedding_provider = %cfg.embedding_provider,
         has_llm = cfg.has_llm(),
@@ -3240,7 +3262,8 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        run_with_edit_log_drain, validate_embedding_config, Cli, Commands, MigrationCommands,
+        redact_url, run_with_edit_log_drain, validate_embedding_config, Cli, Commands,
+        MigrationCommands,
     };
     use async_trait::async_trait;
     use clap::Parser;
@@ -3437,5 +3460,21 @@ mod tests {
             }
             _ => panic!("unexpected command"),
         }
+    }
+
+    #[test]
+    fn redact_url_masks_credentials() {
+        assert_eq!(
+            redact_url("mysql://root:111@localhost:6001/memoria"),
+            "mysql://***:***@localhost:6001/memoria"
+        );
+    }
+
+    #[test]
+    fn redact_url_leaves_non_credential_urls_unchanged() {
+        assert_eq!(
+            redact_url("mysql://localhost:6001/memoria"),
+            "mysql://localhost:6001/memoria"
+        );
     }
 }

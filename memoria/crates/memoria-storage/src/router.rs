@@ -4,12 +4,24 @@ use memoria_core::MemoriaError;
 use moka::future::Cache;
 use sha2::{Digest, Sha256};
 use sqlx::{mysql::MySqlPoolOptions, MySqlPool, Row};
-use std::{collections::HashMap, sync::Arc};
-use tokio::sync::Mutex;
+use std::sync::Arc;
 
 fn db_err(e: sqlx::Error) -> MemoriaError {
     MemoriaError::Database(e.to_string())
 }
+
+fn is_duplicate_key_error(e: &sqlx::Error) -> bool {
+    use sqlx::mysql::MySqlDatabaseError;
+
+    e.as_database_error()
+        .and_then(|de| de.as_error().downcast_ref::<MySqlDatabaseError>())
+        .map(|me| me.number() == 1062)
+        .unwrap_or(false)
+}
+
+const USER_DB_CACHE_MAX_CAPACITY: u64 = 10_000;
+const USER_STORE_CACHE_MAX_CAPACITY: u64 = 128;
+const USER_STORE_CACHE_IDLE_SECS: u64 = 600;
 
 #[derive(Debug, Clone)]
 pub struct UserDatabaseRecord {
@@ -26,7 +38,7 @@ pub struct DbRouter {
     embedding_dim: usize,
     instance_id: String,
     user_db_cache: Cache<String, String>,
-    user_store_cache: Arc<Mutex<HashMap<String, Arc<SqlMemoryStore>>>>,
+    user_store_cache: Cache<String, Arc<SqlMemoryStore>>,
 }
 
 impl DbRouter {
@@ -53,10 +65,13 @@ impl DbRouter {
             embedding_dim,
             instance_id,
             user_db_cache: Cache::builder()
-                .max_capacity(10_000)
+                .max_capacity(USER_DB_CACHE_MAX_CAPACITY)
                 .time_to_live(std::time::Duration::from_secs(300))
                 .build(),
-            user_store_cache: Arc::new(Mutex::new(HashMap::new())),
+            user_store_cache: Cache::builder()
+                .max_capacity(USER_STORE_CACHE_MAX_CAPACITY)
+                .time_to_idle(std::time::Duration::from_secs(USER_STORE_CACHE_IDLE_SECS))
+                .build(),
         };
         router.ensure_user_registry_table().await?;
         Ok(router)
@@ -117,46 +132,47 @@ impl DbRouter {
     }
 
     pub async fn user_db_name(&self, user_id: &str) -> Result<String, MemoriaError> {
-        if let Some(cached) = self.user_db_cache.get(user_id).await {
-            return Ok(cached);
-        }
-        let row = sqlx::query(
-            "SELECT db_name FROM mem_user_registry WHERE user_id = ? AND status = 'active'",
-        )
-        .bind(user_id)
-        .fetch_optional(&self.shared_pool)
-        .await
-        .map_err(db_err)?;
-        let db_name = match row {
-            Some(row) => row.try_get("db_name").map_err(db_err)?,
-            None => self.provision_user_db(user_id).await?,
-        };
         self.user_db_cache
-            .insert(user_id.to_string(), db_name.clone())
-            .await;
-        Ok(db_name)
+            .try_get_with_by_ref(user_id, async {
+                let row = sqlx::query(
+                    "SELECT db_name FROM mem_user_registry WHERE user_id = ? AND status = 'active'",
+                )
+                .bind(user_id)
+                .fetch_optional(&self.shared_pool)
+                .await
+                .map_err(db_err)?;
+                match row {
+                    Some(row) => row.try_get("db_name").map_err(db_err),
+                    None => self.provision_user_db(user_id).await,
+                }
+            })
+            .await
+            .map_err(|err: Arc<MemoriaError>| (*err).clone())
     }
 
     pub async fn user_store(&self, user_id: &str) -> Result<Arc<SqlMemoryStore>, MemoriaError> {
-        if let Some(store) = self.user_store_cache.lock().await.get(user_id).cloned() {
-            return Ok(store);
-        }
-        let db_name = self.user_db_name(user_id).await?;
-        let db_url = self.user_db_url(&db_name)?;
-        let store = Arc::new(
-            SqlMemoryStore::connect(&db_url, self.embedding_dim, self.instance_id.clone()).await?,
-        );
-        store.migrate_user().await?;
         self.user_store_cache
-            .lock()
+            .try_get_with_by_ref(user_id, async {
+                let db_name = self.user_db_name(user_id).await?;
+                let db_url = self.user_db_url(&db_name)?;
+                let store = Arc::new(
+                    SqlMemoryStore::connect_routed(
+                        &db_url,
+                        self.embedding_dim,
+                        self.instance_id.clone(),
+                    )
+                    .await?,
+                );
+                store.migrate_user().await?;
+                Ok(store)
+            })
             .await
-            .insert(user_id.to_string(), store.clone());
-        Ok(store)
+            .map_err(|err: Arc<MemoriaError>| (*err).clone())
     }
 
     pub async fn invalidate_user(&self, user_id: &str) {
         self.user_db_cache.invalidate(user_id).await;
-        self.user_store_cache.lock().await.remove(user_id);
+        self.user_store_cache.invalidate(user_id).await;
     }
 
     async fn ensure_user_registry_table(&self) -> Result<(), MemoriaError> {
@@ -194,9 +210,7 @@ impl DbRouter {
 
         match insert {
             Ok(_) => Ok(db_name),
-            Err(sqlx::Error::Database(e))
-                if e.message().contains("Duplicate") || e.message().contains("1062") =>
-            {
+            Err(e) if is_duplicate_key_error(&e) => {
                 let existing =
                     sqlx::query("SELECT db_name FROM mem_user_registry WHERE user_id = ?")
                         .bind(user_id)

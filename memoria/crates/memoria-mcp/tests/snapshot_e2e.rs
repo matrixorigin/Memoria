@@ -6,11 +6,12 @@
 /// - MO#23861: concurrent snapshot restore loses FULLTEXT INDEX secondary tables
 use memoria_git::GitForDataService;
 use memoria_service::MemoryService;
-use memoria_storage::SqlMemoryStore;
+use memoria_storage::{DbRouter, SqlMemoryStore};
 use serde_json::{json, Value};
 use serial_test::serial;
 use sqlx::mysql::MySqlPool;
 use std::sync::Arc;
+use tokio::sync::Barrier;
 use uuid::Uuid;
 
 fn test_dim() -> usize {
@@ -26,13 +27,26 @@ fn db_url() -> String {
 }
 
 fn test_db_name() -> String {
-    let db = db_url();
+    parse_db_name(&db_url())
+}
+
+fn parse_db_name(database_url: &str) -> String {
+    let db = database_url;
     let suffix_start = db.find(['?', '#']).unwrap_or(db.len());
     db[..suffix_start]
         .rsplit('/')
         .next()
         .unwrap_or("memoria")
         .to_string()
+}
+
+fn replace_db_name(database_url: &str, db_name: &str) -> String {
+    let suffix_start = database_url.find(['?', '#']).unwrap_or(database_url.len());
+    let (without_suffix, suffix) = database_url.split_at(suffix_start);
+    let (base, _) = without_suffix
+        .rsplit_once('/')
+        .expect("database url must include db name");
+    format!("{base}/{db_name}{suffix}")
 }
 
 fn uid() -> String {
@@ -131,6 +145,46 @@ async fn setup() -> (Arc<MemoryService>, Arc<GitForDataService>, String) {
     let git = Arc::new(GitForDataService::new(pool, &db_name));
     let svc = Arc::new(MemoryService::new_sql_with_llm(Arc::new(store), None, None).await);
     (svc, git, uid())
+}
+
+async fn setup_multi_db() -> (
+    Arc<MemoryService>,
+    Arc<GitForDataService>,
+    Arc<DbRouter>,
+    String,
+    String,
+) {
+    let shared_db_url = replace_db_name(
+        &db_url(),
+        &format!(
+            "memoria_snap_multi_{}",
+            &Uuid::new_v4().simple().to_string()[..8]
+        ),
+    );
+    let router = Arc::new(
+        DbRouter::connect(&shared_db_url, test_dim(), uuid::Uuid::new_v4().to_string())
+            .await
+            .expect("router"),
+    );
+    let mut store =
+        SqlMemoryStore::connect(&shared_db_url, test_dim(), uuid::Uuid::new_v4().to_string())
+            .await
+            .expect("store");
+    store.migrate_shared().await.expect("migrate_shared");
+    store.set_db_router(router.clone());
+
+    let pool = MySqlPool::connect(&shared_db_url).await.expect("pool");
+    let git = Arc::new(GitForDataService::new(pool, parse_db_name(&shared_db_url)));
+    let svc = Arc::new(
+        MemoryService::new_sql_with_llm_and_router(
+            Arc::new(store),
+            Some(router.clone()),
+            None,
+            None,
+        )
+        .await,
+    );
+    (svc, git, router, uid(), uid())
 }
 
 async fn git_call(
@@ -558,6 +612,140 @@ async fn test_duplicate_snapshot_name_rejected() {
         &git,
         &svc,
         &uid,
+    )
+    .await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_concurrent_duplicate_snapshot_name_is_coalesced() {
+    let (svc, git, uid) = setup().await;
+    let snap_name = snap("dupcon");
+    let barrier = Arc::new(Barrier::new(3));
+
+    let mut handles = Vec::new();
+    for _ in 0..2 {
+        let svc = svc.clone();
+        let git = git.clone();
+        let uid = uid.clone();
+        let snap_name = snap_name.clone();
+        let barrier = barrier.clone();
+        handles.push(tokio::spawn(async move {
+            barrier.wait().await;
+            git_call(
+                "memory_snapshot",
+                json!({"name": snap_name}),
+                &git,
+                &svc,
+                &uid,
+            )
+            .await
+        }));
+    }
+
+    barrier.wait().await;
+    let first = handles.remove(0).await.expect("first task join");
+    let second = handles.remove(0).await.expect("second task join");
+    let results = [text(&first).to_string(), text(&second).to_string()];
+
+    assert!(
+        results.iter().any(|result| result.contains("created")),
+        "expected one create result, got {results:?}"
+    );
+    assert!(
+        results
+            .iter()
+            .any(|result| result.contains("already exists")),
+        "expected one duplicate result, got {results:?}"
+    );
+
+    let sql = svc.user_sql_store(&uid).await.unwrap();
+    let regs = sql.list_snapshot_registrations(&uid).await.unwrap();
+    let count = regs.iter().filter(|reg| reg.name == snap_name).count();
+    assert_eq!(count, 1, "concurrent create should register once");
+
+    let internal = internal_snapshot_name(&snap_name);
+    let snaps = git.list_snapshots().await.unwrap();
+    let internal_count = snaps
+        .iter()
+        .filter(|snapshot| snapshot.snapshot_name == internal)
+        .count();
+    assert_eq!(
+        internal_count, 1,
+        "concurrent create should create one snapshot"
+    );
+
+    git_call(
+        "memory_snapshot_delete",
+        json!({"names": snap_name}),
+        &git,
+        &svc,
+        &uid,
+    )
+    .await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_multi_db_snapshot_rollback_isolates_users() {
+    let (svc, git, router, user_a, user_b) = setup_multi_db().await;
+    let snap_name = snap("multi");
+
+    store("alice before snapshot", &svc, &user_a).await;
+    store("bob steady state", &svc, &user_b).await;
+
+    let db_a = router.user_db_name(&user_a).await.unwrap();
+    let db_b = router.user_db_name(&user_b).await.unwrap();
+    assert_ne!(
+        db_a, db_b,
+        "multi-db test must route users to different databases"
+    );
+
+    let created = git_call(
+        "memory_snapshot",
+        json!({"name": snap_name}),
+        &git,
+        &svc,
+        &user_a,
+    )
+    .await;
+    assert!(
+        text(&created).contains("created"),
+        "got: {}",
+        text(&created)
+    );
+
+    store("alice after snapshot", &svc, &user_a).await;
+    assert_eq!(svc.list_active(&user_a, 10).await.unwrap().len(), 2);
+    assert_eq!(svc.list_active(&user_b, 10).await.unwrap().len(), 1);
+
+    let rolled_back = git_call(
+        "memory_rollback",
+        json!({"name": snap_name}),
+        &git,
+        &svc,
+        &user_a,
+    )
+    .await;
+    assert!(
+        text(&rolled_back).contains("Rolled back"),
+        "got: {}",
+        text(&rolled_back)
+    );
+
+    let alice = svc.list_active(&user_a, 10).await.unwrap();
+    let bob = svc.list_active(&user_b, 10).await.unwrap();
+    assert_eq!(alice.len(), 1);
+    assert_eq!(bob.len(), 1);
+    assert_eq!(alice[0].content, "alice before snapshot");
+    assert_eq!(bob[0].content, "bob steady state");
+
+    git_call(
+        "memory_snapshot_delete",
+        json!({"names": snap_name}),
+        &git,
+        &svc,
+        &user_a,
     )
     .await;
 }
