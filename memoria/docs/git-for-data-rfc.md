@@ -4,9 +4,9 @@
 
 ### Snapshots (account-level)
 ```sql
-CREATE SNAPSHOT <name> FOR ACCOUNT sys
+CREATE SNAPSHOT <name> FOR ACCOUNT
 SHOW SNAPSHOTS
-RESTORE ACCOUNT sys FROM SNAPSHOT <name>
+RESTORE ACCOUNT FROM SNAPSHOT <name>
 DROP SNAPSHOT <name>
 
 -- Time-travel read (non-destructive)
@@ -36,7 +36,7 @@ pub struct GitForDataService {
 impl GitForDataService {
     // ── Snapshots ──────────────────────────────────────────────────
 
-    /// CREATE SNAPSHOT <name> FOR ACCOUNT sys
+    /// CREATE SNAPSHOT <name> FOR ACCOUNT
     pub async fn create_snapshot(&self, name: &str) -> Result<Snapshot, MemoriaError>;
 
     /// SHOW SNAPSHOTS
@@ -45,7 +45,7 @@ impl GitForDataService {
     /// DROP SNAPSHOT <name>
     pub async fn drop_snapshot(&self, name: &str) -> Result<(), MemoriaError>;
 
-    /// RESTORE ACCOUNT sys FROM SNAPSHOT <name>
+    /// RESTORE ACCOUNT FROM SNAPSHOT <name>
     /// WARNING: destructive — all changes after snapshot are lost
     pub async fn restore_snapshot(&self, name: &str) -> Result<(), MemoriaError>;
 
@@ -122,6 +122,6 @@ impl GitForDataService {
 All 3 open questions confirmed:
 1. `SHOW SNAPSHOTS` works — columns: SNAPSHOT_NAME, TIMESTAMP, SNAPSHOT_LEVEL, ACCOUNT_NAME, DATABASE_NAME, TABLE_NAME
 2. `data branch create table <name> from mem_memories` works in memoria database
-3. `CREATE SNAPSHOT <name> FOR ACCOUNT sys` + `SELECT ... {SNAPSHOT = '<name>'}` works
+3. `CREATE SNAPSHOT <name> FOR ACCOUNT` + `SELECT ... {SNAPSHOT = '<name>'}` works
 
 Ready to implement Phase 5.

@@ -400,7 +400,7 @@ async fn create_required_account_snapshot(
     legacy_db_name: &str,
 ) -> Result<String, MemoriaError> {
     let snapshot_name = pre_execute_account_snapshot_name(legacy_db_name);
-    sqlx::raw_sql(&format!("CREATE SNAPSHOT {snapshot_name} FOR ACCOUNT sys"))
+    sqlx::raw_sql(&format!("CREATE SNAPSHOT {snapshot_name} FOR ACCOUNT"))
         .execute(pool)
         .await
         .map_err(|err| {
