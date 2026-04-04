@@ -4,7 +4,7 @@ use axum::{
     Json,
 };
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{json, Value};
 use sqlx::Row;
 
 use crate::{
@@ -40,20 +40,28 @@ pub struct DiffSnapshotQuery {
 }
 
 /// Delegate to git_tools::call for snapshot/branch operations.
+async fn git_call_text(
+    state: &AppState,
+    user_id: &str,
+    tool: &str,
+    args: serde_json::Value,
+) -> Result<String, (StatusCode, String)> {
+    let result = memoria_mcp::git_tools::call(tool, args, &state.git, &state.service, user_id)
+        .await
+        .map_err(api_err_typed)?;
+    Ok(result["content"][0]["text"]
+        .as_str()
+        .unwrap_or("")
+        .to_string())
+}
+
 async fn git_call(
     state: &AppState,
     user_id: &str,
     tool: &str,
     args: serde_json::Value,
 ) -> Result<serde_json::Value, (StatusCode, String)> {
-    let result = memoria_mcp::git_tools::call(tool, args, &state.git, &state.service, user_id)
-        .await
-        .map_err(api_err_typed)?;
-    // Extract text from MCP response
-    let text = result["content"][0]["text"]
-        .as_str()
-        .unwrap_or("")
-        .to_string();
+    let text = git_call_text(state, user_id, tool, args).await?;
     Ok(json!({ "result": text }))
 }
 
@@ -146,6 +154,111 @@ fn safety_snapshot_display_name(internal: &str) -> Option<String> {
     Some(format!("pre_{after_prefix}"))
 }
 
+fn format_snapshot_timestamp(timestamp: Option<chrono::NaiveDateTime>) -> Option<String> {
+    timestamp.map(|ts| ts.and_utc().to_rfc3339())
+}
+
+fn format_snapshot_list_result(snapshots: &[Value], total: usize) -> String {
+    if snapshots.is_empty() {
+        return "Snapshots (0):".to_string();
+    }
+    let text = snapshots
+        .iter()
+        .map(|snapshot| {
+            let name = snapshot["name"].as_str().unwrap_or_default();
+            let ts = snapshot["timestamp"]
+                .as_str()
+                .or_else(|| snapshot["created_at"].as_str())
+                .unwrap_or_default();
+            format!("{name} ({ts})")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("Snapshots ({total} total):\n{text}")
+}
+
+fn format_branch_list_result(branches: &[Value]) -> String {
+    if branches.is_empty() {
+        return "Branches:\nmain ← active".to_string();
+    }
+    let text = branches
+        .iter()
+        .map(|branch| {
+            let name = branch["name"].as_str().unwrap_or_default();
+            if branch["active"].as_bool().unwrap_or(false) {
+                format!("{name} ← active")
+            } else {
+                name.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("Branches:\n{text}")
+}
+
+fn parse_created_snapshot_result(text: &str) -> Option<(String, String)> {
+    let rest = text.strip_prefix("Snapshot '")?;
+    let (name, timestamp) = rest.split_once("' created at ")?;
+    Some((name.to_string(), timestamp.to_string()))
+}
+
+async fn snapshot_summary_value(
+    sql: &Arc<memoria_storage::SqlMemoryStore>,
+    user_id: &str,
+    snapshot: &memoria_mcp::git_tools::VisibleSnapshot,
+) -> Result<Value, (StatusCode, String)> {
+    let snapshot_name = validate_snapshot_identifier(&snapshot.internal_name)?.to_string();
+    let count_sql = format!(
+        "SELECT COUNT(*) as cnt FROM mem_memories {{SNAPSHOT = '{snapshot_name}'}} WHERE user_id = ? AND is_active > 0"
+    );
+    let memory_count: i64 = sqlx::query_scalar(&count_sql)
+        .bind(user_id)
+        .fetch_one(sql.pool())
+        .await
+        .map_err(api_err)?;
+    let timestamp = format_snapshot_timestamp(snapshot.timestamp);
+    Ok(json!({
+        "name": snapshot.display_name,
+        "snapshot_name": snapshot_name,
+        "description": Value::Null,
+        "memory_count": memory_count,
+        "created_at": timestamp,
+        "timestamp": timestamp,
+        "registered": snapshot.registered,
+    }))
+}
+
+async fn snapshot_list_payload(
+    state: &AppState,
+    user_id: &str,
+    limit: i64,
+    offset: i64,
+) -> Result<Value, (StatusCode, String)> {
+    let sql = user_snapshot_store(state, user_id).await?;
+    let all = memoria_mcp::git_tools::visible_snapshots_for_user(&state.service, user_id)
+        .await
+        .map_err(api_err_typed)?;
+    let total = all.len();
+    let mut snapshots = Vec::new();
+    for snapshot in all
+        .iter()
+        .skip(offset.max(0) as usize)
+        .take(limit.max(0) as usize)
+    {
+        snapshots.push(snapshot_summary_value(&sql, user_id, snapshot).await?);
+    }
+    let has_more = offset.max(0) as usize + snapshots.len() < total;
+    let result = format_snapshot_list_result(&snapshots, total);
+    Ok(json!({
+        "snapshots": snapshots,
+        "total": total,
+        "limit": limit.max(0),
+        "offset": offset.max(0),
+        "has_more": has_more,
+        "result": result,
+    }))
+}
+
 fn is_safety_snapshot_name(sql: &Arc<memoria_storage::SqlMemoryStore>, name: &str) -> bool {
     if name.starts_with("mem_snap_pre_") {
         return true;
@@ -215,14 +328,40 @@ pub async fn create_snapshot(
     AuthUser { user_id, .. }: AuthUser,
     Json(req): Json<CreateSnapshotRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, String)> {
-    let r = git_call(
+    let result = git_call_text(
         &state,
         &user_id,
         "memory_snapshot",
         json!({ "name": req.name }),
     )
     .await?;
-    Ok((StatusCode::CREATED, Json(r)))
+    let mut body = json!({
+        "name": req.name.clone(),
+        "description": req.description.clone(),
+        "result": result.clone(),
+    });
+    if let Some((display_name, created_at)) =
+        parse_created_snapshot_result(body["result"].as_str().unwrap_or_default())
+    {
+        body["name"] = json!(display_name.clone());
+        body["created_at"] = json!(created_at.clone());
+        body["timestamp"] = json!(created_at);
+
+        let sql = user_snapshot_store(&state, &user_id).await?;
+        let snapshots =
+            memoria_mcp::git_tools::visible_snapshots_for_user(&state.service, &user_id)
+                .await
+                .map_err(api_err_typed)?;
+        if let Some(snapshot) = snapshots
+            .iter()
+            .find(|snapshot| snapshot.display_name == display_name)
+        {
+            body = snapshot_summary_value(&sql, &user_id, snapshot).await?;
+            body["description"] = json!(req.description.clone());
+            body["result"] = json!(result.clone());
+        }
+    }
+    Ok((StatusCode::CREATED, Json(body)))
 }
 
 pub async fn list_snapshots(
@@ -230,14 +369,9 @@ pub async fn list_snapshots(
     AuthUser { user_id, .. }: AuthUser,
     Query(q): Query<ListSnapshotsQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let r = git_call(
-        &state,
-        &user_id,
-        "memory_snapshots",
-        json!({ "limit": q.limit, "offset": q.offset }),
-    )
-    .await?;
-    Ok(Json(r))
+    Ok(Json(
+        snapshot_list_payload(&state, &user_id, q.limit, q.offset).await?,
+    ))
 }
 
 /// GET /v1/snapshots/:name — read snapshot detail with time-travel query
@@ -447,8 +581,33 @@ pub async fn list_branches(
     State(state): State<AppState>,
     AuthUser { user_id, .. }: AuthUser,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let r = git_call(&state, &user_id, "memory_branches", json!({})).await?;
-    Ok(Json(r))
+    let sql = state
+        .service
+        .user_sql_store(&user_id)
+        .await
+        .map_err(api_err)?;
+    let active_table = sql.active_table(&user_id).await.map_err(api_err)?;
+    let mut branches = vec![json!({
+        "name": "main",
+        "active": active_table == "mem_memories",
+    })];
+    for (name, table_name) in sql.list_branches(&user_id).await.map_err(api_err)? {
+        branches.push(json!({
+            "name": name,
+            "active": table_name == active_table,
+        }));
+    }
+    if !branches
+        .iter()
+        .any(|branch| branch["active"].as_bool().unwrap_or(false))
+    {
+        branches[0]["active"] = json!(true);
+    }
+    let result = format_branch_list_result(&branches);
+    Ok(Json(json!({
+        "branches": branches,
+        "result": result,
+    })))
 }
 
 pub async fn create_branch(

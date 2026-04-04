@@ -3643,6 +3643,9 @@ async fn test_api_snapshot_limit_is_per_user() {
             result.contains("created"),
             "snapshot create failed: {result}"
         );
+        assert_eq!(body["name"], name.as_str());
+        assert!(body["created_at"].is_string(), "missing created_at: {body}");
+        assert!(body["timestamp"].is_string(), "missing timestamp: {body}");
     }
 
     let overflow = format!(
@@ -3693,6 +3696,7 @@ async fn test_api_snapshot_limit_is_per_user() {
     assert_eq!(r.status(), 200);
     let body: Value = r.json().await.unwrap();
     let listed = body["result"].as_str().unwrap_or("");
+    let snapshots = body["snapshots"].as_array().expect("snapshots array");
     assert!(
         listed.contains(&b_snap),
         "B should see own snapshot: {listed}"
@@ -3700,6 +3704,16 @@ async fn test_api_snapshot_limit_is_per_user() {
     assert!(
         !listed.contains(&names_a[0]),
         "B should not see A's snapshots: {listed}"
+    );
+    assert!(
+        snapshots.iter().any(|snapshot| snapshot["name"] == b_snap),
+        "B should see own snapshot in structured list: {body}"
+    );
+    assert!(
+        snapshots
+            .iter()
+            .all(|snapshot| snapshot["name"] != names_a[0]),
+        "B structured list should not see A's snapshots: {body}"
     );
 
     client
@@ -5226,6 +5240,66 @@ async fn test_api_snapshot_rollback() {
         "rollback response: {body}"
     );
     println!("✅ POST /v1/snapshots/:name/rollback: {}", body["result"]);
+}
+
+#[tokio::test]
+async fn test_api_branch_list_returns_structured_json() {
+    let (base, client) = spawn_server().await;
+    let uid = uid();
+    let branch = format!(
+        "api_branch_{}",
+        &uuid::Uuid::new_v4().simple().to_string()[..6]
+    );
+
+    let r = client
+        .post(format!("{base}/v1/branches"))
+        .header("X-User-Id", &uid)
+        .json(&json!({ "name": branch }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 201);
+
+    let r = client
+        .post(format!("{base}/v1/branches/{branch}/checkout"))
+        .header("X-User-Id", &uid)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+
+    let r = client
+        .get(format!("{base}/v1/branches"))
+        .header("X-User-Id", &uid)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let body: Value = r.json().await.unwrap();
+    let branches = body["branches"].as_array().expect("branches array");
+    assert!(
+        branches
+            .iter()
+            .any(|entry| entry["name"] == "main" && entry["active"] == false),
+        "main branch should be present and inactive after checkout: {body}"
+    );
+    assert!(
+        branches
+            .iter()
+            .any(|entry| entry["name"] == branch && entry["active"] == true),
+        "checked out branch should be marked active: {body}"
+    );
+    assert!(
+        body["result"].as_str().unwrap_or("").contains("Branches:"),
+        "compat text should still be present: {body}"
+    );
+
+    client
+        .delete(format!("{base}/v1/branches/{branch}"))
+        .header("X-User-Id", &uid)
+        .send()
+        .await
+        .unwrap();
 }
 
 // ── Entity list ───────────────────────────────────────────────────────────────

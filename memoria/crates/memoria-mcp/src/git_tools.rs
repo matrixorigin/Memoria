@@ -180,11 +180,11 @@ fn safety_display_name(internal: &str) -> Option<String> {
 }
 
 #[derive(Clone)]
-struct VisibleSnapshot {
-    display_name: String,
-    internal_name: String,
-    timestamp: Option<NaiveDateTime>,
-    registered: bool,
+pub struct VisibleSnapshot {
+    pub display_name: String,
+    pub internal_name: String,
+    pub timestamp: Option<NaiveDateTime>,
+    pub registered: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -224,7 +224,7 @@ fn git_for_store(
     ))
 }
 
-async fn visible_snapshots_for_user(
+pub async fn visible_snapshots_for_user(
     svc: &Arc<MemoryService>,
     user_id: &str,
 ) -> Result<Vec<VisibleSnapshot>, MemoriaError> {
