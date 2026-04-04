@@ -3397,6 +3397,10 @@ async fn test_snapshot_get_detail() {
         assert!(m["content"].as_str().is_some());
         assert_eq!(m["memory_type"], "semantic");
         assert!(
+            m["created_at"].as_str().is_some(),
+            "brief mode should include created_at"
+        );
+        assert!(
             m["trust_tier"].as_str().is_some(),
             "brief mode should include trust_tier"
         );
@@ -3425,6 +3429,10 @@ async fn test_snapshot_get_detail() {
     assert!(
         mems.iter().all(|m| m["trust_tier"].as_str().is_some()),
         "full detail should include trust_tier: {body}"
+    );
+    assert!(
+        mems.iter().all(|m| m["created_at"].as_str().is_some()),
+        "full detail should include created_at: {body}"
     );
     println!("✅ GET /v1/snapshots/:name (full): confidence present");
 
@@ -4046,6 +4054,14 @@ async fn test_remote_snapshot_detail_and_diff() {
     assert_eq!(r.status(), 200);
     let body: Value = r.json().await.unwrap();
     assert_eq!(body["memory_count"], 2, "snapshot should have 2 memories");
+    assert!(
+        body["memories"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|m| m["created_at"].as_str().is_some()),
+        "remote snapshot detail should include created_at: {body}"
+    );
     println!(
         "✅ remote snapshot detail: memory_count={}",
         body["memory_count"]

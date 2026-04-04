@@ -427,7 +427,7 @@ pub async fn get_snapshot(
         _ => 80,
     };
     let mem_sql = format!(
-        "SELECT memory_id, content, memory_type, trust_tier, initial_confidence FROM `{table}` {{SNAPSHOT = '{snap_name}'}} \
+        "SELECT memory_id, content, memory_type, trust_tier, initial_confidence, created_at FROM `{table}` {{SNAPSHOT = '{snap_name}'}} \
           WHERE user_id = ? AND is_active > 0 ORDER BY observed_at DESC LIMIT ? OFFSET ?"
     );
     let rows = sqlx::query(&mem_sql)
@@ -451,6 +451,11 @@ pub async fn get_snapshot(
                 "memory_id": r.try_get::<String, _>("memory_id").unwrap_or_default(),
                 "memory_type": r.try_get::<String, _>("memory_type").unwrap_or_default(),
                 "content": truncated,
+                "created_at": format_snapshot_timestamp(
+                    r.try_get::<Option<chrono::NaiveDateTime>, _>("created_at")
+                        .ok()
+                        .flatten(),
+                ),
                 "trust_tier": r
                     .try_get::<String, _>("trust_tier")
                     .unwrap_or_else(|_| TrustTier::default().to_string()),
