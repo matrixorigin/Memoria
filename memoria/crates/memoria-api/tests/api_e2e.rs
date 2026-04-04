@@ -3340,15 +3340,19 @@ async fn test_snapshot_get_detail() {
     let uid = uid();
 
     // Store memories
-    for content in [
-        "snapshot detail A",
-        "snapshot detail B",
-        "snapshot detail C",
+    for (content, trust_tier) in [
+        ("snapshot detail A", "T1"),
+        ("snapshot detail B", "T2"),
+        ("snapshot detail C", "T3"),
     ] {
         client
             .post(format!("{base}/v1/memories"))
             .header("X-User-Id", &uid)
-            .json(&json!({"content": content, "memory_type": "semantic"}))
+            .json(&json!({
+                "content": content,
+                "memory_type": "semantic",
+                "trust_tier": trust_tier
+            }))
             .send()
             .await
             .unwrap();
@@ -3381,11 +3385,21 @@ async fn test_snapshot_get_detail() {
     assert!(body["by_type"]["semantic"].as_i64().unwrap() >= 3);
     let mems = body["memories"].as_array().unwrap();
     assert_eq!(mems.len(), 3);
+    let mut tiers: Vec<_> = mems
+        .iter()
+        .map(|m| m["trust_tier"].as_str().unwrap_or_default().to_string())
+        .collect();
+    tiers.sort();
+    assert_eq!(tiers, vec!["T1", "T2", "T3"]);
     // Brief mode: content should be short
     for m in mems {
         assert!(m["memory_id"].as_str().is_some());
         assert!(m["content"].as_str().is_some());
         assert_eq!(m["memory_type"], "semantic");
+        assert!(
+            m["trust_tier"].as_str().is_some(),
+            "brief mode should include trust_tier"
+        );
     }
     println!(
         "✅ GET /v1/snapshots/:name (brief): {} memories, by_type={}",
@@ -3407,6 +3421,10 @@ async fn test_snapshot_get_detail() {
         mems[0].get("confidence").is_some(),
         "full detail should include confidence: {}",
         mems[0]
+    );
+    assert!(
+        mems.iter().all(|m| m["trust_tier"].as_str().is_some()),
+        "full detail should include trust_tier: {body}"
     );
     println!("✅ GET /v1/snapshots/:name (full): confidence present");
 
@@ -3454,11 +3472,11 @@ async fn test_snapshot_diff() {
 
     // Store 2 memories
     let mut mids = vec![];
-    for content in ["diff base A", "diff base B"] {
+    for (content, trust_tier) in [("diff base A", "T1"), ("diff base B", "T2")] {
         let r = client
             .post(format!("{base}/v1/memories"))
             .header("X-User-Id", &uid)
-            .json(&json!({"content": content}))
+            .json(&json!({"content": content, "trust_tier": trust_tier}))
             .send()
             .await
             .unwrap();
@@ -3487,7 +3505,7 @@ async fn test_snapshot_diff() {
     client
         .post(format!("{base}/v1/memories"))
         .header("X-User-Id", &uid)
-        .json(&json!({"content": "diff added C"}))
+        .json(&json!({"content": "diff added C", "trust_tier": "T3"}))
         .send()
         .await
         .unwrap();
@@ -3524,12 +3542,20 @@ async fn test_snapshot_diff() {
             .any(|m| m["content"].as_str().unwrap().contains("diff added C")),
         "should find added memory: {added:?}"
     );
+    assert!(
+        added.iter().any(|m| m["trust_tier"] == "T3"),
+        "added diff entries should include trust_tier: {added:?}"
+    );
     // "diff base A" should be in removed (deleted after snapshot)
     assert!(
         removed
             .iter()
             .any(|m| m["content"].as_str().unwrap().contains("diff base A")),
         "should find removed memory: {removed:?}"
+    );
+    assert!(
+        removed.iter().any(|m| m["trust_tier"] == "T1"),
+        "removed diff entries should include trust_tier: {removed:?}"
     );
     println!(
         "✅ GET /v1/snapshots/:name/diff: added={}, removed={}",

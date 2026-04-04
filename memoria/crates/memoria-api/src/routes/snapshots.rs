@@ -13,6 +13,7 @@ use crate::{
     routes::memory::{api_err, api_err_typed},
     state::AppState,
 };
+use memoria_core::TrustTier;
 use memoria_git::GitForDataService;
 use std::sync::Arc;
 
@@ -426,8 +427,8 @@ pub async fn get_snapshot(
         _ => 80,
     };
     let mem_sql = format!(
-        "SELECT memory_id, content, memory_type, initial_confidence FROM `{table}` {{SNAPSHOT = '{snap_name}'}} \
-         WHERE user_id = ? AND is_active > 0 ORDER BY observed_at DESC LIMIT ? OFFSET ?"
+        "SELECT memory_id, content, memory_type, trust_tier, initial_confidence FROM `{table}` {{SNAPSHOT = '{snap_name}'}} \
+          WHERE user_id = ? AND is_active > 0 ORDER BY observed_at DESC LIMIT ? OFFSET ?"
     );
     let rows = sqlx::query(&mem_sql)
         .bind(&user_id)
@@ -450,6 +451,9 @@ pub async fn get_snapshot(
                 "memory_id": r.try_get::<String, _>("memory_id").unwrap_or_default(),
                 "memory_type": r.try_get::<String, _>("memory_type").unwrap_or_default(),
                 "content": truncated,
+                "trust_tier": r
+                    .try_get::<String, _>("trust_tier")
+                    .unwrap_or_else(|_| TrustTier::default().to_string()),
             });
             if detail == "full" {
                 m["confidence"] = json!(r.try_get::<f64, _>("initial_confidence").unwrap_or(0.0));
@@ -499,9 +503,9 @@ pub async fn diff_snapshot(
 
     // Added (in current but not in snapshot)
     let added_sql = format!(
-        "SELECT c.memory_id, c.content, c.memory_type FROM `{table}` c \
-         LEFT JOIN `{table}` {{SNAPSHOT = '{snap_name}'}} s ON c.memory_id = s.memory_id AND s.is_active > 0 \
-         WHERE c.user_id = ? AND c.is_active > 0 AND s.memory_id IS NULL LIMIT ?"
+        "SELECT c.memory_id, c.content, c.memory_type, c.trust_tier FROM `{table}` c \
+          LEFT JOIN `{table}` {{SNAPSHOT = '{snap_name}'}} s ON c.memory_id = s.memory_id AND s.is_active > 0 \
+          WHERE c.user_id = ? AND c.is_active > 0 AND s.memory_id IS NULL LIMIT ?"
     );
     let added_rows = sqlx::query(&added_sql)
         .bind(&user_id)
@@ -512,9 +516,9 @@ pub async fn diff_snapshot(
 
     // Removed (in snapshot but not in current)
     let removed_sql = format!(
-        "SELECT s.memory_id, s.content, s.memory_type FROM `{table}` {{SNAPSHOT = '{snap_name}'}} s \
-         LEFT JOIN `{table}` c ON s.memory_id = c.memory_id AND c.is_active > 0 \
-         WHERE s.user_id = ? AND s.is_active > 0 AND c.memory_id IS NULL LIMIT ?"
+        "SELECT s.memory_id, s.content, s.memory_type, s.trust_tier FROM `{table}` {{SNAPSHOT = '{snap_name}'}} s \
+          LEFT JOIN `{table}` c ON s.memory_id = c.memory_id AND c.is_active > 0 \
+          WHERE s.user_id = ? AND s.is_active > 0 AND c.memory_id IS NULL LIMIT ?"
     );
     let removed_rows = sqlx::query(&removed_sql)
         .bind(&user_id)
@@ -530,6 +534,9 @@ pub async fn diff_snapshot(
                     "memory_id": r.try_get::<String, _>("memory_id").unwrap_or_default(),
                     "content": r.try_get::<String, _>("content").unwrap_or_default(),
                     "memory_type": r.try_get::<String, _>("memory_type").unwrap_or_default(),
+                    "trust_tier": r
+                        .try_get::<String, _>("trust_tier")
+                        .unwrap_or_else(|_| TrustTier::default().to_string()),
                 })
             })
             .collect()
