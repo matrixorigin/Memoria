@@ -1452,7 +1452,7 @@ impl SqlMemoryStore {
                 "CREATE SNAPSHOT {name} FOR DATABASE {}",
                 quote_ident(db_name)
             ),
-            None => format!("CREATE SNAPSHOT {name} FOR ACCOUNT sys"),
+            None => format!("CREATE SNAPSHOT {name} FOR ACCOUNT"),
         };
 
         // First attempt
