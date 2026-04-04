@@ -3340,10 +3340,10 @@ async fn test_snapshot_get_detail() {
     let uid = uid();
 
     // Store memories
-    for (content, trust_tier) in [
-        ("snapshot detail A", "T1"),
-        ("snapshot detail B", "T2"),
-        ("snapshot detail C", "T3"),
+    for (content, trust_tier, initial_confidence, observed_at) in [
+        ("snapshot detail A", "T1", 0.91, "2026-04-01T10:00:00Z"),
+        ("snapshot detail B", "T2", 0.82, "2026-04-02T10:00:00Z"),
+        ("snapshot detail C", "T3", 0.73, "2026-04-03T10:00:00Z"),
     ] {
         client
             .post(format!("{base}/v1/memories"))
@@ -3351,7 +3351,10 @@ async fn test_snapshot_get_detail() {
             .json(&json!({
                 "content": content,
                 "memory_type": "semantic",
-                "trust_tier": trust_tier
+                "trust_tier": trust_tier,
+                "initial_confidence": initial_confidence,
+                "session_id": "snapshot-detail-session",
+                "observed_at": observed_at
             }))
             .send()
             .await
@@ -3394,8 +3397,13 @@ async fn test_snapshot_get_detail() {
     // Brief mode: content should be short
     for m in mems {
         assert!(m["memory_id"].as_str().is_some());
+        assert_eq!(m["user_id"], uid);
         assert!(m["content"].as_str().is_some());
         assert_eq!(m["memory_type"], "semantic");
+        assert!(m["initial_confidence"].is_number());
+        assert_eq!(m["is_active"], true);
+        assert_eq!(m["session_id"], "snapshot-detail-session");
+        assert!(m["observed_at"].as_str().is_some());
         assert!(
             m["created_at"].as_str().is_some(),
             "brief mode should include created_at"
@@ -3403,6 +3411,10 @@ async fn test_snapshot_get_detail() {
         assert!(
             m["trust_tier"].as_str().is_some(),
             "brief mode should include trust_tier"
+        );
+        assert!(
+            m.get("retrieval_score").is_some(),
+            "brief mode should include retrieval_score"
         );
     }
     println!(
@@ -3433,6 +3445,18 @@ async fn test_snapshot_get_detail() {
     assert!(
         mems.iter().all(|m| m["created_at"].as_str().is_some()),
         "full detail should include created_at: {body}"
+    );
+    assert!(
+        mems.iter().all(|m| m["observed_at"].as_str().is_some()),
+        "full detail should include observed_at: {body}"
+    );
+    assert!(
+        mems.iter().all(|m| m["initial_confidence"].is_number()),
+        "full detail should include initial_confidence: {body}"
+    );
+    assert!(
+        mems.iter().all(|m| m.get("retrieval_score").is_some()),
+        "full detail should include retrieval_score: {body}"
     );
     println!("✅ GET /v1/snapshots/:name (full): confidence present");
 
@@ -4054,6 +4078,18 @@ async fn test_remote_snapshot_detail_and_diff() {
     assert_eq!(r.status(), 200);
     let body: Value = r.json().await.unwrap();
     assert_eq!(body["memory_count"], 2, "snapshot should have 2 memories");
+    assert!(
+        body["memories"].as_array().unwrap().iter().all(|m| {
+            m["user_id"] == uid
+                && m["initial_confidence"].is_number()
+                && m["is_active"] == true
+                && m.get("session_id").is_some()
+                && m["observed_at"].as_str().is_some()
+                && m["trust_tier"].as_str().is_some()
+                && m.get("retrieval_score").is_some()
+        }),
+        "remote snapshot detail should align with MemoryResponse metadata: {body}"
+    );
     assert!(
         body["memories"]
             .as_array()

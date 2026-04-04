@@ -427,7 +427,7 @@ pub async fn get_snapshot(
         _ => 80,
     };
     let mem_sql = format!(
-        "SELECT memory_id, content, memory_type, trust_tier, initial_confidence, created_at FROM `{table}` {{SNAPSHOT = '{snap_name}'}} \
+        "SELECT memory_id, user_id, content, memory_type, trust_tier, initial_confidence, is_active, session_id, observed_at, created_at FROM `{table}` {{SNAPSHOT = '{snap_name}'}} \
           WHERE user_id = ? AND is_active > 0 ORDER BY observed_at DESC LIMIT ? OFFSET ?"
     );
     let rows = sqlx::query(&mem_sql)
@@ -442,6 +442,7 @@ pub async fn get_snapshot(
         .iter()
         .map(|r| {
             let content: String = r.try_get("content").unwrap_or_default();
+            let initial_confidence = r.try_get::<f64, _>("initial_confidence").unwrap_or(0.0);
             let truncated = if content.len() > content_limit {
                 format!("{} [truncated]", &content[..content_limit])
             } else {
@@ -449,8 +450,17 @@ pub async fn get_snapshot(
             };
             let mut m = json!({
                 "memory_id": r.try_get::<String, _>("memory_id").unwrap_or_default(),
+                "user_id": r.try_get::<String, _>("user_id").unwrap_or_default(),
                 "memory_type": r.try_get::<String, _>("memory_type").unwrap_or_default(),
                 "content": truncated,
+                "initial_confidence": initial_confidence,
+                "is_active": r.try_get::<i8, _>("is_active").unwrap_or(1) != 0,
+                "session_id": r.try_get::<Option<String>, _>("session_id").ok().flatten(),
+                "observed_at": format_snapshot_timestamp(
+                    r.try_get::<Option<chrono::NaiveDateTime>, _>("observed_at")
+                        .ok()
+                        .flatten(),
+                ),
                 "created_at": format_snapshot_timestamp(
                     r.try_get::<Option<chrono::NaiveDateTime>, _>("created_at")
                         .ok()
@@ -459,9 +469,10 @@ pub async fn get_snapshot(
                 "trust_tier": r
                     .try_get::<String, _>("trust_tier")
                     .unwrap_or_else(|_| TrustTier::default().to_string()),
+                "retrieval_score": Value::Null,
             });
             if detail == "full" {
-                m["confidence"] = json!(r.try_get::<f64, _>("initial_confidence").unwrap_or(0.0));
+                m["confidence"] = json!(initial_confidence);
             }
             m
         })
