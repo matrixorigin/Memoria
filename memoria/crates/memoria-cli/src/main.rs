@@ -1259,9 +1259,55 @@ fn mcp_entry(
     full_args.push(tool_name.to_string());
     full_args.extend(args);
 
+    // All Memoria MCP tools — used to populate autoApprove so that
+    // editors like Kiro and Cursor do not prompt on every memory operation.
+    // The user has already established trust by installing Memoria and
+    // providing an API token; requiring per-call approval defeats ambient
+    // memory workflows.  Editors that do not recognise the field ignore it.
+    let auto_approve: Vec<serde_json::Value> = vec![
+        "memory_store",
+        "memory_retrieve",
+        "memory_search",
+        "memory_list",
+        "memory_correct",
+        "memory_purge",
+        "memory_profile",
+        "memory_feedback",
+        "memory_capabilities",
+        "memory_governance",
+        "memory_consolidate",
+        "memory_reflect",
+        "memory_snapshot",
+        "memory_snapshots",
+        "memory_snapshot_delete",
+        "memory_rollback",
+        "memory_branch",
+        "memory_branches",
+        "memory_checkout",
+        "memory_merge",
+        "memory_branch_delete",
+        "memory_diff",
+        "memory_count",
+        "memory_observe",
+        "memory_id",
+        "memory_ids",
+        "memory_type",
+        "memory_extract_entities",
+        "memory_link_entities",
+        "memory_graph_nodes",
+        "memory_graph_edges",
+        "memory_get_retrieval_params",
+        "memory_tune_params",
+        "memory_rebuild_index",
+    ]
+    .into_iter()
+    .map(serde_json::Value::from)
+    .collect();
+
     let mut entry = serde_json::json!({
         "command": "memoria",
         "args": full_args,
+        "autoApprove": auto_approve,
     });
     if !env.is_empty() {
         entry["env"] = serde_json::Value::Object(env);
@@ -3475,6 +3521,58 @@ mod tests {
         assert_eq!(
             redact_url("mysql://localhost:6001/memoria"),
             "mysql://localhost:6001/memoria"
+        );
+    }
+
+    #[test]
+    fn mcp_entry_includes_auto_approve() {
+        use super::mcp_entry;
+
+        // Remote mode
+        let entry = mcp_entry(
+            None,
+            Some("https://cloud.memoria.dev"),
+            Some("tok"),
+            "alice",
+            "kiro",
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let approved = entry["autoApprove"]
+            .as_array()
+            .expect("autoApprove must be an array");
+        assert!(
+            !approved.is_empty(),
+            "autoApprove must contain at least one tool"
+        );
+        // Core tools that the issue specifically calls out
+        for tool in &["memory_store", "memory_retrieve", "memory_search", "memory_purge"] {
+            assert!(
+                approved.iter().any(|v| v.as_str() == Some(tool)),
+                "autoApprove is missing tool: {tool}"
+            );
+        }
+
+        // Embedded mode
+        let entry_embedded = mcp_entry(
+            Some("mysql://root:111@localhost:6001/memoria"),
+            None,
+            None,
+            "alice",
+            "cursor",
+            Some("openai"),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(
+            entry_embedded["autoApprove"].is_array(),
+            "autoApprove must be present in embedded mode too"
         );
     }
 }
