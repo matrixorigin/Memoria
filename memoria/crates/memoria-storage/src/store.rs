@@ -6,6 +6,7 @@ use memoria_core::{
     TrustTier,
 };
 use sqlx::{mysql::MySqlPool, Row};
+use std::borrow::Cow;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
@@ -474,6 +475,9 @@ pub struct SqlMemoryStore {
     /// Shared across main store and background pool clones so a single clear drains all.
     edit_log_tx: Arc<std::sync::RwLock<Option<tokio::sync::mpsc::Sender<OwnedEditLogEntry>>>>,
     db_router: Option<Arc<DbRouter>>,
+    /// When Some, `t()` qualifies table names with this database prefix.
+    /// Enables a single global pool to serve queries for different per-user databases.
+    db_name: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -556,6 +560,7 @@ impl SqlMemoryStore {
                 .build(),
             edit_log_tx: Arc::new(std::sync::RwLock::new(None)),
             db_router: None,
+            db_name: None,
         }
     }
 
@@ -571,6 +576,41 @@ impl SqlMemoryStore {
 
     pub fn pool(&self) -> &MySqlPool {
         &self.pool
+    }
+
+    /// Acquire a connection from the pool and, when `db_name` is set,
+    /// issue `USE <db>` so every subsequent query targets the correct database.
+    ///
+    /// NOTE: due to rust-lang/rust#100013 (async_trait + sqlx Executor lifetime),
+    /// only use `conn()` in methods with ≤~18 queries. For larger migration
+    /// methods, use `self.t()` for qualified table names with `&self.pool`.
+    #[allow(dead_code)]
+    async fn conn(&self) -> Result<sqlx::pool::PoolConnection<sqlx::MySql>, MemoriaError> {
+        let mut c = self.pool.acquire().await.map_err(db_err)?;
+        if let Some(db) = &self.db_name {
+            sqlx::query(&format!("USE `{}`", db.replace('`', "``")))
+                .execute(&mut *c)
+                .await
+                .map_err(db_err)?;
+        }
+        Ok(c)
+    }
+
+    pub fn db_name(&self) -> Option<&str> {
+        self.db_name.as_deref()
+    }
+
+    pub fn set_db_name(&mut self, name: String) {
+        self.db_name = Some(name);
+    }
+
+    /// Qualify a table name with the database prefix when `db_name` is set.
+    /// Returns bare table name for shared-DB stores, or `` `db`.table `` for per-user stores.
+    pub fn t<'a>(&'a self, table: &'a str) -> Cow<'a, str> {
+        match &self.db_name {
+            None => Cow::Borrowed(table),
+            Some(db) => Cow::Owned(format!("`{}`.{}", db, table)),
+        }
     }
 
     pub fn set_db_router(&mut self, router: Arc<DbRouter>) {
@@ -596,11 +636,15 @@ impl SqlMemoryStore {
     }
 
     pub fn graph_store(&self) -> crate::graph::GraphStore {
-        crate::graph::GraphStore::with_node_count_cache(
+        let mut gs = crate::graph::GraphStore::with_node_count_cache(
             self.pool.clone(),
             self.embedding_dim,
             self.node_count_cache.clone(),
-        )
+        );
+        if let Some(db) = &self.db_name {
+            gs.set_db_name(db.clone());
+        }
+        gs
     }
 
     pub async fn connect(
@@ -4643,19 +4687,21 @@ mod tests {
 #[async_trait]
 impl MemoryStore for SqlMemoryStore {
     async fn insert(&self, memory: &Memory) -> Result<(), MemoriaError> {
-        self.insert_into("mem_memories", memory).await
+        let table = self.t("mem_memories");
+        self.insert_into(&table, memory).await
     }
 
     async fn get(&self, memory_id: &str) -> Result<Option<Memory>, MemoriaError> {
-        let row = sqlx::query(
+        let table = self.t("mem_memories");
+        let row = sqlx::query(&format!(
             "SELECT memory_id, user_id, memory_type, content, \
              embedding AS emb_str, session_id, \
              CAST(source_event_ids AS CHAR) AS src_ids, \
              CAST(extra_metadata AS CHAR) AS extra_meta, \
              is_active, superseded_by, trust_tier, initial_confidence, \
              observed_at, created_at, updated_at \
-             FROM mem_memories WHERE memory_id = ? AND is_active = 1",
-        )
+             FROM {table} WHERE memory_id = ? AND is_active = 1"
+        ))
         .bind(memory_id)
         .fetch_optional(&self.pool)
         .await
@@ -4665,6 +4711,7 @@ impl MemoryStore for SqlMemoryStore {
 
     async fn update(&self, memory: &Memory) -> Result<(), MemoriaError> {
         let now = Utc::now().naive_utc();
+        let table = self.t("mem_memories");
         // Workaround: MO#23859 — PREPARE/EXECUTE corrupts NULL JSON on 2nd+ execution.
         let extra_metadata = memory
             .extra_metadata
@@ -4672,13 +4719,13 @@ impl MemoryStore for SqlMemoryStore {
             .map(serde_json::to_string)
             .transpose()?
             .unwrap_or_else(|| "{}".to_string());
-        sqlx::query(
-            r#"UPDATE mem_memories
-               SET content = ?, memory_type = ?, trust_tier = ?,
-                   initial_confidence = ?, extra_metadata = ?,
-                   superseded_by = ?, updated_at = ?
-               WHERE memory_id = ?"#,
-        )
+        sqlx::query(&format!(
+            "UPDATE {table} \
+             SET content = ?, memory_type = ?, trust_tier = ?, \
+                 initial_confidence = ?, extra_metadata = ?, \
+                 superseded_by = ?, updated_at = ? \
+             WHERE memory_id = ?"
+        ))
         .bind(&memory.content)
         .bind(memory.memory_type.to_string())
         .bind(memory.trust_tier.to_string())
@@ -4695,7 +4742,10 @@ impl MemoryStore for SqlMemoryStore {
 
     async fn soft_delete(&self, memory_id: &str) -> Result<(), MemoriaError> {
         let now = Utc::now().naive_utc();
-        sqlx::query("UPDATE mem_memories SET is_active = 0, updated_at = ? WHERE memory_id = ?")
+        let table = self.t("mem_memories");
+        sqlx::query(&format!(
+            "UPDATE {table} SET is_active = 0, updated_at = ? WHERE memory_id = ?"
+        ))
             .bind(now)
             .bind(memory_id)
             .execute(&self.pool)
@@ -4705,7 +4755,8 @@ impl MemoryStore for SqlMemoryStore {
     }
 
     async fn list_active(&self, user_id: &str, limit: i64) -> Result<Vec<Memory>, MemoriaError> {
-        self.list_active_from("mem_memories", user_id, limit).await
+        let table = self.t("mem_memories");
+        self.list_active_from(&table, user_id, limit).await
     }
 
     async fn search_fulltext(
@@ -4714,7 +4765,8 @@ impl MemoryStore for SqlMemoryStore {
         query: &str,
         limit: i64,
     ) -> Result<Vec<Memory>, MemoriaError> {
-        self.search_fulltext_from("mem_memories", user_id, query, limit)
+        let table = self.t("mem_memories");
+        self.search_fulltext_from(&table, user_id, query, limit)
             .await
     }
 
@@ -4724,7 +4776,8 @@ impl MemoryStore for SqlMemoryStore {
         embedding: &[f32],
         limit: i64,
     ) -> Result<Vec<Memory>, MemoriaError> {
-        self.search_vector_from("mem_memories", user_id, embedding, limit)
+        let table = self.t("mem_memories");
+        self.search_vector_from(&table, user_id, embedding, limit)
             .await
     }
 }
