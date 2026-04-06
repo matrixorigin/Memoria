@@ -29,6 +29,28 @@ fn git_for_store(sql: &Arc<SqlMemoryStore>) -> Option<GitForDataService> {
         .map(|db_name| GitForDataService::new(sql.pool().clone(), db_name.to_string()))
 }
 
+enum ToolCallName {
+    MemoryStore,
+    MemoryRetrieve,
+    MemorySearch,
+    MemoryCorrect,
+    MemoryPurge,
+    MemoryProfile,
+    MemoryList,
+    MemoryCapabilities,
+    MemoryGovernance,
+    MemoryRebuildIndex,
+    MemoryConsolidate,
+    MemoryReflect,
+    MemoryExtractEntities,
+    MemoryLinkEntities,
+    MemoryFeedback,
+    MemoryGetRetrievalParams,
+    MemoryTuneParams,
+    MemoryObserve,
+    Unknown(String),
+}
+
 pub fn list() -> Value {
     json!([
         {
@@ -172,8 +194,29 @@ pub async fn call(
     user_id: &str,
 ) -> Result<Value> {
     tracing::debug!(tool = name, user_id, "MCP tool call");
-    match name {
-        "memory_store" => {
+    let tool = match name {
+        "memory_store" => ToolCallName::MemoryStore,
+        "memory_retrieve" => ToolCallName::MemoryRetrieve,
+        "memory_search" => ToolCallName::MemorySearch,
+        "memory_correct" => ToolCallName::MemoryCorrect,
+        "memory_purge" => ToolCallName::MemoryPurge,
+        "memory_profile" => ToolCallName::MemoryProfile,
+        "memory_list" => ToolCallName::MemoryList,
+        "memory_capabilities" => ToolCallName::MemoryCapabilities,
+        "memory_governance" => ToolCallName::MemoryGovernance,
+        "memory_rebuild_index" => ToolCallName::MemoryRebuildIndex,
+        "memory_consolidate" => ToolCallName::MemoryConsolidate,
+        "memory_reflect" => ToolCallName::MemoryReflect,
+        "memory_extract_entities" => ToolCallName::MemoryExtractEntities,
+        "memory_link_entities" => ToolCallName::MemoryLinkEntities,
+        "memory_feedback" => ToolCallName::MemoryFeedback,
+        "memory_get_retrieval_params" => ToolCallName::MemoryGetRetrievalParams,
+        "memory_tune_params" => ToolCallName::MemoryTuneParams,
+        "memory_observe" => ToolCallName::MemoryObserve,
+        _ => ToolCallName::Unknown(name.to_string()),
+    };
+    match tool {
+        ToolCallName::MemoryStore => {
             let content = args["content"].as_str().unwrap_or("").to_string();
             let memory_type = args["memory_type"].as_str().unwrap_or("semantic");
             let session_id = args["session_id"].as_str().map(String::from);
@@ -255,7 +298,7 @@ pub async fn call(
             )))
         }
 
-        "memory_retrieve" | "memory_search" => {
+        ToolCallName::MemoryRetrieve | ToolCallName::MemorySearch => {
             let query = args["query"].as_str().unwrap_or("").to_string();
             let top_k = args["top_k"].as_i64().unwrap_or(5);
             // explain accepts bool or string: true/"basic"/"verbose"/"analyze"
@@ -299,7 +342,7 @@ pub async fn call(
             }
         }
 
-        "memory_correct" => {
+        ToolCallName::MemoryCorrect => {
             let new_content = args["new_content"].as_str().unwrap_or("");
             if new_content.is_empty() {
                 return Ok(mcp_text("new_content is required"));
@@ -328,7 +371,7 @@ pub async fn call(
             )))
         }
 
-        "memory_purge" => {
+        ToolCallName::MemoryPurge => {
             let memory_id = args["memory_id"].as_str().unwrap_or("");
             let topic = args["topic"].as_str().unwrap_or("");
             if !memory_id.is_empty() {
@@ -355,7 +398,7 @@ pub async fn call(
             }
         }
 
-        "memory_profile" => {
+        ToolCallName::MemoryProfile => {
             let memories = service.list_active(user_id, 50).await?;
             let profile_mems: Vec<_> = memories
                 .iter()
@@ -372,7 +415,7 @@ pub async fn call(
             Ok(mcp_text(&text))
         }
 
-        "memory_list" => {
+        ToolCallName::MemoryList => {
             let limit = args["limit"].as_i64().unwrap_or(20);
             let memories = service.list_active(user_id, limit).await?;
             if memories.is_empty() {
@@ -386,14 +429,14 @@ pub async fn call(
             Ok(mcp_text(&text))
         }
 
-        "memory_capabilities" => Ok(mcp_text(
+        ToolCallName::MemoryCapabilities => Ok(mcp_text(
             "Available tools: memory_store, memory_retrieve, memory_search, \
              memory_correct, memory_purge, memory_profile, memory_list, \
              memory_capabilities, memory_governance, memory_consolidate, \
              memory_reflect, memory_feedback",
         )),
 
-        "memory_governance" => {
+        ToolCallName::MemoryGovernance => {
             let force = args["force"].as_bool().unwrap_or(false);
             let sql = user_sql_store(service, user_id).await?;
             const COOLDOWN_SECS: i64 = 3600; // 1 hour
@@ -467,7 +510,7 @@ pub async fn call(
             )))
         }
 
-        "memory_rebuild_index" => {
+        ToolCallName::MemoryRebuildIndex => {
             let table = args["table"].as_str().unwrap_or("mem_memories");
             if !["mem_memories", "memory_graph_nodes"].contains(&table) {
                 return Ok(mcp_text(&format!(
@@ -484,7 +527,7 @@ pub async fn call(
             )))
         }
 
-        "memory_consolidate" => {
+        ToolCallName::MemoryConsolidate => {
             let force = args["force"].as_bool().unwrap_or(false);
             let sql = user_sql_store(service, user_id).await?;
             const COOLDOWN_SECS: i64 = 1800; // 30 minutes
@@ -520,7 +563,7 @@ pub async fn call(
             Ok(mcp_text(&msg))
         }
 
-        "memory_reflect" => {
+        ToolCallName::MemoryReflect => {
             let force = args["force"].as_bool().unwrap_or(false);
             let mode = args["mode"].as_str().unwrap_or("auto");
             let sql = user_sql_store(service, user_id).await?;
@@ -581,7 +624,7 @@ pub async fn call(
 
             // Get existing high-confidence memories as "existing knowledge"
             let existing_sql = format!(
-                "SELECT content FROM `{table}` WHERE user_id = ? AND is_active = 1 \
+                "SELECT content FROM {table} WHERE user_id = ? AND is_active = 1 \
                  AND trust_tier IN ('T1','T2') ORDER BY created_at DESC LIMIT 10"
             );
             let existing_rows = sqlx::query(&existing_sql)
@@ -658,7 +701,7 @@ pub async fn call(
             )))
         }
 
-        "memory_extract_entities" => {
+        ToolCallName::MemoryExtractEntities => {
             let mode = args["mode"].as_str().unwrap_or("auto");
             let sql = user_sql_store(service, user_id).await?;
 
@@ -761,7 +804,7 @@ pub async fn call(
             }))?))
         }
 
-        "memory_link_entities" => {
+        ToolCallName::MemoryLinkEntities => {
             let entities_str = args["entities"].as_str().unwrap_or("");
             let sql = user_sql_store(service, user_id).await?;
 
@@ -835,7 +878,7 @@ pub async fn call(
             }))?))
         }
 
-        "memory_feedback" => {
+        ToolCallName::MemoryFeedback => {
             let memory_id = args["memory_id"]
                 .as_str()
                 .ok_or_else(|| anyhow::anyhow!("memory_id is required"))?;
@@ -854,13 +897,13 @@ pub async fn call(
             )))
         }
 
-        "memory_get_retrieval_params" => {
+        ToolCallName::MemoryGetRetrievalParams => {
             let sql = user_sql_store(service, user_id).await?;
             let params = sql.get_user_retrieval_params(user_id).await?;
             Ok(mcp_text(&serde_json::to_string_pretty(&params)?))
         }
 
-        "memory_tune_params" => {
+        ToolCallName::MemoryTuneParams => {
             use memoria_service::scoring::{DefaultScoringPlugin, ScoringPlugin};
 
             let sql = user_sql_store(service, user_id).await?;
@@ -880,7 +923,7 @@ pub async fn call(
             }
         }
 
-        "memory_observe" => {
+        ToolCallName::MemoryObserve => {
             let messages = args["messages"].as_array().cloned().unwrap_or_default();
             let session_id = args["session_id"].as_str().map(String::from);
 
@@ -956,8 +999,17 @@ pub async fn call(
             Ok(mcp_text(&serde_json::to_string_pretty(&result)?))
         }
 
-        _ => Err(anyhow::anyhow!("Unknown tool: {name}")),
+        ToolCallName::Unknown(name) => Err(anyhow::anyhow!("Unknown tool: {name}")),
     }
+}
+
+pub async fn call_owned(
+    name: String,
+    args: Value,
+    service: Arc<MemoryService>,
+    user_id: String,
+) -> Result<Value> {
+    call(&name, args, &service, &user_id).await
 }
 
 fn mcp_text(text: &str) -> Value {

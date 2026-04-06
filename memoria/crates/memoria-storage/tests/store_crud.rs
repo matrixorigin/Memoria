@@ -197,6 +197,40 @@ async fn test_search_vector() {
     println!("✅ search_vector: nearest={}", results[0].memory_id);
 }
 
+#[tokio::test]
+async fn test_search_vector_sets_retrieval_score() {
+    let (store, uid) = setup().await;
+
+    sqlx::query("DELETE FROM mem_memories WHERE user_id = ?")
+        .bind(&uid)
+        .execute(store.pool())
+        .await
+        .unwrap();
+
+    let mut near = make_memory(&format!("vec-score-1-{uid}"), "near query", &uid);
+    near.embedding = Some(dim_vec(0, 1.0));
+    let mut far = make_memory(&format!("vec-score-2-{uid}"), "far query", &uid);
+    far.embedding = Some(dim_vec(1, 1.0));
+
+    store.insert(&near).await.unwrap();
+    store.insert(&far).await.unwrap();
+
+    let results = store
+        .search_vector(&uid, &dim_vec(0, 1.0), 2)
+        .await
+        .expect("vector search");
+
+    assert!(!results.is_empty(), "Expected vector search results");
+    let top_score = results[0]
+        .retrieval_score
+        .expect("vector search should propagate similarity score");
+    assert!(
+        top_score > 0.0,
+        "retrieval_score should reflect vector similarity, got {top_score}"
+    );
+    println!("✅ search_vector_sets_retrieval_score: top_score={top_score:.4}");
+}
+
 // ── Field round-trip: every column written and read back ─────────────────────
 
 #[tokio::test]

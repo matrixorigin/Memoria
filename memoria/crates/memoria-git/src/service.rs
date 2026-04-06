@@ -135,6 +135,8 @@ impl GitForDataService {
     ) -> Result<(), MemoriaError> {
         let safe_table = validate_identifier(table)?;
         let safe_snap = validate_identifier(snapshot_name)?;
+        let db = quote_identifier(&self.db_name);
+        let qualified_table = format!("{db}.{safe_table}");
 
         // Verify snapshot exists
         self.get_snapshot(snapshot_name)
@@ -148,11 +150,11 @@ impl GitForDataService {
         // Note: ideally this would be transactional, but MatrixOne does not
         // support {SNAPSHOT = '...'} syntax inside transactions. The DELETE+INSERT
         // is non-atomic; callers should create a safety snapshot before rollback.
-        exec_ddl(&self.pool, &format!("DELETE FROM {safe_table}")).await?;
+        exec_ddl(&self.pool, &format!("DELETE FROM {qualified_table}")).await?;
         exec_ddl(
             &self.pool,
             &format!(
-                "INSERT INTO {safe_table} SELECT * FROM {safe_table} {{SNAPSHOT = '{safe_snap}'}}"
+                "INSERT INTO {qualified_table} SELECT * FROM {qualified_table} {{SNAPSHOT = '{safe_snap}'}}"
             ),
         )
         .await?;
@@ -170,9 +172,10 @@ impl GitForDataService {
     ) -> Result<(), MemoriaError> {
         let safe_branch = validate_identifier(branch_name)?;
         let safe_source = validate_identifier(source_table)?;
+        let db = quote_identifier(&self.db_name);
         exec_ddl(
             &self.pool,
-            &format!("data branch create table {safe_branch} from {safe_source}"),
+            &format!("data branch create table {db}.{safe_branch} from {db}.{safe_source}"),
         )
         .await
     }
@@ -188,10 +191,11 @@ impl GitForDataService {
         let safe_branch = validate_identifier(branch_name)?;
         let safe_source = validate_identifier(source_table)?;
         let safe_snap = validate_identifier(snapshot_name)?;
+        let db = quote_identifier(&self.db_name);
         exec_ddl(
             &self.pool,
             &format!(
-            "data branch create table {safe_branch} from {safe_source} {{snapshot = '{safe_snap}'}}"
+            "data branch create table {db}.{safe_branch} from {db}.{safe_source} {{snapshot = '{safe_snap}'}}"
         ),
         )
         .await
@@ -213,9 +217,12 @@ impl GitForDataService {
     ) -> Result<(), MemoriaError> {
         let safe_branch = validate_identifier(branch_table)?;
         let safe_main = validate_identifier(main_table)?;
+        let db = quote_identifier(&self.db_name);
         exec_ddl(
             &self.pool,
-            &format!("data branch merge {safe_branch} into {safe_main} when conflict skip"),
+            &format!(
+                "data branch merge {db}.{safe_branch} into {db}.{safe_main} when conflict skip"
+            ),
         )
         .await
     }
@@ -249,10 +256,11 @@ impl GitForDataService {
     ) -> Result<Vec<DiffRow>, MemoriaError> {
         let safe_branch = validate_identifier(branch_table)?;
         let safe_main = validate_identifier(main_table)?;
+        let db = quote_identifier(&self.db_name);
         // Fetch more than limit to account for filtering
         let fetch_limit = limit * 10 + 100;
         let sql = format!(
-            "data branch diff {safe_branch} against {safe_main} output limit {fetch_limit}"
+            "data branch diff {db}.{safe_branch} against {db}.{safe_main} output limit {fetch_limit}"
         );
         let rows = sqlx::raw_sql(&sql)
             .fetch_all(&self.pool)

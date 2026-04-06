@@ -26,15 +26,18 @@ pub trait ScoringStore: Send + Sync {
 #[async_trait]
 impl ScoringStore for SqlMemoryStore {
     async fn get_user_params(&self, user_id: &str) -> Result<UserRetrievalParams, MemoriaError> {
-        self.get_user_retrieval_params(user_id).await
+        let store = self.clone();
+        store.get_user_retrieval_params(user_id).await
     }
 
     async fn set_user_params(&self, params: &UserRetrievalParams) -> Result<(), MemoriaError> {
-        self.set_user_retrieval_params(params).await
+        let store = self.clone();
+        store.set_user_retrieval_params(params).await
     }
 
     async fn get_feedback_totals(&self, user_id: &str) -> Result<FeedbackTotals, MemoriaError> {
-        let stats = self.get_feedback_stats(user_id).await?;
+        let store = self.clone();
+        let stats = store.get_feedback_stats(user_id).await?;
         Ok(FeedbackTotals {
             useful: stats.useful,
             irrelevant: stats.irrelevant,

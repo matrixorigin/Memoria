@@ -13,7 +13,7 @@
 
 use chrono::NaiveDateTime;
 use memoria_core::MemoriaError;
-use memoria_git::GitForDataService;
+use memoria_git::{service::DiffRow, GitForDataService};
 use memoria_service::MemoryService;
 use serde_json::{json, Value};
 use sqlx::Row;
@@ -466,6 +466,20 @@ pub fn list() -> Value {
     ])
 }
 
+enum GitToolCallName {
+    MemorySnapshot,
+    MemorySnapshots,
+    MemorySnapshotDelete,
+    MemoryRollback,
+    MemoryBranch,
+    MemoryBranches,
+    MemoryCheckout,
+    MemoryMerge,
+    MemoryBranchDelete,
+    MemoryDiff,
+    Unknown(String),
+}
+
 pub async fn call(
     name: &str,
     args: Value,
@@ -473,8 +487,21 @@ pub async fn call(
     svc: &Arc<MemoryService>,
     user_id: &str,
 ) -> Result<Value, MemoriaError> {
-    match name {
-        "memory_snapshot" => {
+    let tool = match name {
+        "memory_snapshot" => GitToolCallName::MemorySnapshot,
+        "memory_snapshots" => GitToolCallName::MemorySnapshots,
+        "memory_snapshot_delete" => GitToolCallName::MemorySnapshotDelete,
+        "memory_rollback" => GitToolCallName::MemoryRollback,
+        "memory_branch" => GitToolCallName::MemoryBranch,
+        "memory_branches" => GitToolCallName::MemoryBranches,
+        "memory_checkout" => GitToolCallName::MemoryCheckout,
+        "memory_merge" => GitToolCallName::MemoryMerge,
+        "memory_branch_delete" => GitToolCallName::MemoryBranchDelete,
+        "memory_diff" => GitToolCallName::MemoryDiff,
+        _ => GitToolCallName::Unknown(name.to_string()),
+    };
+    match tool {
+        GitToolCallName::MemorySnapshot => {
             let user_snapshots = visible_snapshots_for_user(svc, user_id)
                 .await?
                 .into_iter()
@@ -551,7 +578,7 @@ pub async fn call(
             result
         }
 
-        "memory_snapshots" => {
+        GitToolCallName::MemorySnapshots => {
             let limit = args["limit"].as_i64().unwrap_or(20) as usize;
             let offset = args["offset"].as_i64().unwrap_or(0) as usize;
             let snaps = visible_snapshots_for_user(svc, user_id).await?;
@@ -574,7 +601,7 @@ pub async fn call(
             Ok(mcp_text(&format!("Snapshots ({total} total):\n{text}")))
         }
 
-        "memory_snapshot_delete" => {
+        GitToolCallName::MemorySnapshotDelete => {
             let sql = snapshot_store(svc, user_id).await?;
             let git = git_for_store(&sql)?;
             let snaps = visible_snapshots_for_user(svc, user_id).await?;
@@ -582,6 +609,18 @@ pub async fn call(
             let to_delete: Vec<VisibleSnapshot> = if let Some(names) = args["names"].as_str() {
                 let name_set: HashSet<String> =
                     names.split(',').map(|n| n.trim().to_string()).collect();
+                snaps
+                    .iter()
+                    .filter(|s| {
+                        name_set.contains(&s.display_name) || name_set.contains(&s.internal_name)
+                    })
+                    .cloned()
+                    .collect()
+            } else if let Some(names) = args["names"].as_array() {
+                let name_set: HashSet<String> = names
+                    .iter()
+                    .filter_map(|name| name.as_str().map(|s| s.trim().to_string()))
+                    .collect();
                 snaps
                     .iter()
                     .filter(|s| {
@@ -630,7 +669,7 @@ pub async fn call(
             )))
         }
 
-        "memory_rollback" => {
+        GitToolCallName::MemoryRollback => {
             let sql = snapshot_store(svc, user_id).await?;
             let git = git_for_store(&sql)?;
             let snap_name = args["name"].as_str().unwrap_or("");
@@ -648,7 +687,7 @@ pub async fn call(
             Ok(mcp_text(&format!("Rolled back to snapshot '{snap_name}'")))
         }
 
-        "memory_branch" => {
+        GitToolCallName::MemoryBranch => {
             let branch_name = args["name"].as_str().unwrap_or("");
             let from_snapshot = args["from_snapshot"].as_str();
             let from_timestamp = args["from_timestamp"].as_str();
@@ -690,9 +729,10 @@ pub async fn call(
             }
 
             // Duplicate name check (including deleted)
-            let dup = sqlx::query(
-                "SELECT COUNT(*) as cnt FROM mem_branches WHERE user_id = ? AND name = ?",
-            )
+            let branches_table = sql.t("mem_branches");
+            let dup = sqlx::query(&format!(
+                "SELECT COUNT(*) as cnt FROM {branches_table} WHERE user_id = ? AND name = ?"
+            ))
             .bind(user_id)
             .bind(branch_name)
             .fetch_one(sql.pool())
@@ -724,7 +764,7 @@ pub async fn call(
             Ok(mcp_text(&format!("Created branch '{branch_name}'")))
         }
 
-        "memory_branches" => {
+        GitToolCallName::MemoryBranches => {
             let branches = match svc.user_sql_store(user_id).await {
                 Ok(sql) => sql.list_branches(user_id).await?,
                 Err(_) => vec![],
@@ -750,7 +790,7 @@ pub async fn call(
             Ok(mcp_text(&format!("Branches:\nmain\n{text}")))
         }
 
-        "memory_checkout" => {
+        GitToolCallName::MemoryCheckout => {
             let branch = args["name"].as_str().unwrap_or("main");
             let sql = svc.user_sql_store(user_id).await?;
             if branch == "main" {
@@ -768,7 +808,7 @@ pub async fn call(
             )))
         }
 
-        "memory_merge" => {
+        GitToolCallName::MemoryMerge => {
             let source_branch = args["source"].as_str().unwrap_or("");
             let strategy = args["strategy"].as_str().unwrap_or("accept");
             let strategy = match strategy {
@@ -782,18 +822,20 @@ pub async fn call(
             };
             let sql = svc.user_sql_store(user_id).await?;
             let git = git_for_store(&sql)?;
+            let main_table = sql.t("mem_memories");
             let branches = sql.list_branches(user_id).await?;
             let table_name = branches
                 .iter()
                 .find(|(name, _)| name == source_branch)
                 .map(|(_, t)| t.clone())
                 .ok_or_else(|| MemoriaError::NotFound(format!("Branch '{source_branch}'")))?;
-            let table_name = validate_identifier(&table_name)?.to_string();
+            let branch_table_name = validate_identifier(&table_name)?.to_string();
+            let branch_table = sql.t(&branch_table_name);
 
             // Safety limit: count new memories (branch rows not in main by PK)
             let count_sql = format!(
-                "SELECT COUNT(*) as cnt FROM {table_name} b WHERE b.user_id = ? \
-                 AND NOT EXISTS (SELECT 1 FROM mem_memories m WHERE m.memory_id = b.memory_id)"
+                "SELECT COUNT(*) as cnt FROM {branch_table} b WHERE b.user_id = ? \
+                 AND NOT EXISTS (SELECT 1 FROM {main_table} m WHERE m.memory_id = b.memory_id)"
             );
             let new_count: i64 = sqlx::query(&count_sql)
                 .bind(user_id)
@@ -824,7 +866,7 @@ pub async fn call(
                 // We intentionally keep the native behavior here for now and leave richer
                 // reconcile/delete-propagation semantics for a future strategy.
                 if new_count > 0 {
-                    git.merge_branch(&table_name, "mem_memories")
+                    git.merge_branch(&branch_table_name, "mem_memories")
                         .await
                         .map_err(|e| MemoriaError::Internal(format!("merge failed: {e}")))?;
                 }
@@ -836,25 +878,25 @@ pub async fn call(
             // replace strategy: SQL merge with cosine conflict detection
             // Single-pass INSERT using OR short-circuit to avoid cosine on null/empty embeddings
             let insert_sql = format!(
-                "INSERT INTO mem_memories \
+                "INSERT INTO {main_table} \
                     (memory_id, user_id, memory_type, content, embedding, session_id, \
                      source_event_ids, extra_metadata, is_active, superseded_by, \
                      trust_tier, initial_confidence, observed_at, created_at, updated_at) \
-                 SELECT b.memory_id, b.user_id, b.memory_type, b.content, b.embedding, b.session_id, \
-                     b.source_event_ids, b.extra_metadata, b.is_active, b.superseded_by, \
-                     b.trust_tier, b.initial_confidence, b.observed_at, b.created_at, b.updated_at \
-                 FROM {table_name} b \
-                 WHERE b.user_id = ? AND b.is_active = 1 \
-                   AND NOT EXISTS (SELECT 1 FROM mem_memories m WHERE m.memory_id = b.memory_id) \
-                   AND ( \
-                     b.embedding IS NULL OR vector_dims(b.embedding) = 0 \
-                     OR NOT EXISTS ( \
-                       SELECT 1 FROM mem_memories m \
-                       WHERE m.user_id = ? AND m.is_active = 1 \
-                         AND m.embedding IS NOT NULL AND vector_dims(m.embedding) > 0 \
-                         AND m.memory_type = b.memory_type \
-                         AND l2_distance(m.embedding, b.embedding) < {L2_CONFLICT} \
-                     ) \
+                  SELECT b.memory_id, b.user_id, b.memory_type, b.content, b.embedding, b.session_id, \
+                      b.source_event_ids, b.extra_metadata, b.is_active, b.superseded_by, \
+                      b.trust_tier, b.initial_confidence, b.observed_at, b.created_at, b.updated_at \
+                  FROM {branch_table} b \
+                  WHERE b.user_id = ? AND b.is_active = 1 \
+                    AND NOT EXISTS (SELECT 1 FROM {main_table} m WHERE m.memory_id = b.memory_id) \
+                    AND ( \
+                      b.embedding IS NULL OR vector_dims(b.embedding) = 0 \
+                      OR NOT EXISTS ( \
+                        SELECT 1 FROM {main_table} m \
+                        WHERE m.user_id = ? AND m.is_active = 1 \
+                          AND m.embedding IS NOT NULL AND vector_dims(m.embedding) > 0 \
+                          AND m.memory_type = b.memory_type \
+                          AND l2_distance(m.embedding, b.embedding) < {L2_CONFLICT} \
+                      ) \
                    )"
             );
             let inserted = sqlx::query(&insert_sql)
@@ -865,19 +907,26 @@ pub async fn call(
                 .map_err(db_err)?
                 .rows_affected();
 
-            let replacements =
-                collect_replace_candidates(sql.pool(), &table_name, user_id, L2_CONFLICT).await?;
+            let replacements = collect_replace_candidates(
+                sql.pool(),
+                &main_table,
+                &branch_table,
+                user_id,
+                L2_CONFLICT,
+            )
+            .await?;
             let (replaced, skipped) = if !replacements.is_empty() {
                 let mut tx = sql.pool().begin().await.map_err(db_err)?;
                 for candidate in &replacements {
-                    sqlx::query(
-                        "UPDATE mem_memories SET content = ?, updated_at = NOW() WHERE memory_id = ?",
-                    )
-                    .bind(&candidate.replacement_content)
-                    .bind(&candidate.main_memory_id)
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(db_err)?;
+                    let update_sql = format!(
+                        "UPDATE {main_table} SET content = ?, updated_at = NOW() WHERE memory_id = ?"
+                    );
+                    sqlx::query(&update_sql)
+                        .bind(&candidate.replacement_content)
+                        .bind(&candidate.main_memory_id)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(db_err)?;
                 }
                 tx.commit().await.map_err(db_err)?;
                 (replacements.len() as u64, 0u64)
@@ -890,7 +939,7 @@ pub async fn call(
             )))
         }
 
-        "memory_branch_delete" => {
+        GitToolCallName::MemoryBranchDelete => {
             let branch = args["name"].as_str().unwrap_or("");
             if branch == "main" {
                 return Ok(mcp_text("Cannot delete main"));
@@ -911,33 +960,89 @@ pub async fn call(
             }
         }
 
-        "memory_diff" => {
+        GitToolCallName::MemoryDiff => {
             let source_branch = args["source"].as_str().unwrap_or("");
             let limit = args["limit"].as_i64().unwrap_or(50);
             let sql = svc.user_sql_store(user_id).await?;
-            let git = git_for_store(&sql)?;
             let branches = sql.list_branches(user_id).await?;
             let table_name = branches
                 .iter()
                 .find(|(name, _)| name == source_branch)
                 .map(|(_, t)| t.clone())
                 .ok_or_else(|| MemoriaError::NotFound(format!("Branch '{source_branch}'")))?;
+            let main_table = sql.t("mem_memories");
+            let branch_table = sql.t(&table_name);
 
-            // Use native LCA-based diff count, SQL JOIN for row details
-            // (native diff output limit returns unknown column types that sqlx can't decode)
-            let total = git
-                .diff_branch_count(&table_name, "mem_memories", user_id)
+            let inserted_or_updated_sql = format!(
+                "SELECT \
+                    CASE WHEN m.memory_id IS NULL THEN 'INSERT' ELSE 'UPDATE' END AS flag, \
+                    b.memory_id, b.content, b.memory_type \
+                 FROM {branch_table} b \
+                 LEFT JOIN {main_table} m ON m.memory_id = b.memory_id \
+                 WHERE b.user_id = ? \
+                   AND (m.memory_id IS NULL \
+                        OR COALESCE(m.content, '') <> COALESCE(b.content, '') \
+                        OR COALESCE(m.is_active, 0) <> COALESCE(b.is_active, 0)) \
+                 ORDER BY b.created_at DESC \
+                 LIMIT ?"
+            );
+            let deleted_sql = format!(
+                "SELECT \
+                    'DELETE' AS flag, \
+                    m.memory_id, m.content, m.memory_type \
+                 FROM {main_table} m \
+                 LEFT JOIN {branch_table} b ON b.memory_id = m.memory_id \
+                 WHERE m.user_id = ? AND m.is_active = 1 AND b.memory_id IS NULL \
+                 ORDER BY m.created_at DESC \
+                 LIMIT ?"
+            );
+
+            let mut rows: Vec<DiffRow> = sqlx::query(&inserted_or_updated_sql)
+                .bind(user_id)
+                .bind(limit)
+                .fetch_all(sql.pool())
                 .await
-                .unwrap_or(0);
+                .map_err(db_err)?
+                .into_iter()
+                .map(|row| {
+                    Ok(DiffRow {
+                        flag: row.try_get("flag").map_err(db_err)?,
+                        memory_id: row.try_get("memory_id").map_err(db_err)?,
+                        content: row.try_get("content").unwrap_or_default(),
+                        memory_type: row
+                            .try_get("memory_type")
+                            .unwrap_or_else(|_| "semantic".into()),
+                    })
+                })
+                .collect::<Result<Vec<_>, MemoriaError>>()?;
+
+            let deleted_rows: Vec<DiffRow> = sqlx::query(&deleted_sql)
+                .bind(user_id)
+                .bind(limit)
+                .fetch_all(sql.pool())
+                .await
+                .map_err(db_err)?
+                .into_iter()
+                .map(|row| {
+                    Ok(DiffRow {
+                        flag: row.try_get("flag").map_err(db_err)?,
+                        memory_id: row.try_get("memory_id").map_err(db_err)?,
+                        content: row.try_get("content").unwrap_or_default(),
+                        memory_type: row
+                            .try_get("memory_type")
+                            .unwrap_or_else(|_| "semantic".into()),
+                    })
+                })
+                .collect::<Result<Vec<_>, MemoriaError>>()?;
+
+            rows.extend(deleted_rows);
+            rows.truncate(limit.max(0) as usize);
+            let total = rows.len() as i64;
             if total == 0 {
                 return Ok(mcp_text(&format!(
                     "No changes in branch '{source_branch}' vs main."
                 )));
             }
-            let rows = git
-                .diff_branch_rows(&table_name, "mem_memories", user_id, limit)
-                .await
-                .map_err(git_err)?;
             let lines: Vec<String> = rows
                 .iter()
                 .map(|r| {
@@ -969,31 +1074,43 @@ pub async fn call(
             )))
         }
 
-        _ => Err(MemoriaError::NotFound(format!("Unknown git tool: {name}"))),
+        GitToolCallName::Unknown(name) => {
+            Err(MemoriaError::NotFound(format!("Unknown git tool: {name}")))
+        }
     }
+}
+
+pub async fn call_owned(
+    name: String,
+    args: Value,
+    git: Arc<GitForDataService>,
+    svc: Arc<MemoryService>,
+    user_id: String,
+) -> Result<Value, MemoriaError> {
+    call(&name, args, &git, &svc, &user_id).await
 }
 
 async fn collect_replace_candidates(
     pool: &sqlx::MySqlPool,
-    table_name: &str,
+    main_table: &str,
+    branch_table: &str,
     user_id: &str,
     l2_conflict: f64,
 ) -> Result<Vec<ReplaceCandidate>, MemoriaError> {
-    let table_name = validate_identifier(table_name)?;
     let sql = format!(
         "SELECT m.memory_id AS main_memory_id, \
                 b.memory_id AS branch_memory_id, \
                 b.content AS replacement_content, \
                 CAST(l2_distance(m.embedding, b.embedding) AS DOUBLE) AS conflict_distance \
-         FROM mem_memories m \
-         JOIN {table_name} b \
+         FROM {main_table} m \
+         JOIN {branch_table} b \
            ON b.user_id = ? AND b.is_active = 1 \
-          AND b.content IS NOT NULL \
-          AND b.memory_type = m.memory_type \
-          AND b.embedding IS NOT NULL AND vector_dims(b.embedding) > 0 \
+           AND b.content IS NOT NULL \
+           AND b.memory_type = m.memory_type \
+           AND b.embedding IS NOT NULL AND vector_dims(b.embedding) > 0 \
          WHERE m.user_id = ? AND m.is_active = 1 \
            AND m.embedding IS NOT NULL AND vector_dims(m.embedding) > 0 \
-           AND NOT EXISTS (SELECT 1 FROM mem_memories m2 WHERE m2.memory_id = b.memory_id AND m2.is_active = 1) \
+           AND NOT EXISTS (SELECT 1 FROM {main_table} m2 WHERE m2.memory_id = b.memory_id AND m2.is_active = 1) \
            AND l2_distance(m.embedding, b.embedding) < {l2_conflict}"
     );
     let rows = sqlx::query(&sql)

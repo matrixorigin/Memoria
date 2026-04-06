@@ -151,13 +151,31 @@ pub async fn mcp_handler(
 
     let params = req.get("params").cloned();
     let track_path = tracking_path(&method, params.as_ref());
+    let tracked_tool = if method == "tools/call" {
+        track_path
+            .strip_prefix("/mcp/")
+            .filter(|name| !name.is_empty() && *name != "tools.call")
+            .map(str::to_string)
+    } else {
+        None
+    };
+    if let Some(tool) = tracked_tool.clone() {
+        state
+            .tool_usage_batcher
+            .mark_used(auth.user_id.clone(), tool);
+    }
 
     // JSON-RPC 2.0: a Notification is a *valid* Request without an "id" member.
     // The server MUST NOT reply to Notifications.
     if req.get("id").is_none() {
-        let dispatch_result =
-            memoria_mcp::dispatch_http(&method, params, &state.service, &state.git, &auth.user_id)
-                .await;
+        let dispatch_result = memoria_mcp::dispatch_http(
+            method.clone(),
+            params,
+            state.service.clone(),
+            state.git.clone(),
+            auth.user_id.clone(),
+        )
+        .await;
         let rpc = match &dispatch_result {
             Ok(_) => RpcMeta::ok(),
             Err(e) => RpcMeta::err(e.code),
@@ -178,11 +196,11 @@ pub async fn mcp_handler(
     // JSON-RPC spec: the HTTP response is always 200 OK, even for RPC errors.
     // Business-level error tracking uses rpc_success / rpc_error_code in the call log.
     let (response, rpc) = match memoria_mcp::dispatch_http(
-        &method,
+        method.clone(),
         params,
-        &state.service,
-        &state.git,
-        &auth.user_id,
+        state.service.clone(),
+        state.git.clone(),
+        auth.user_id.clone(),
     )
     .await
     {

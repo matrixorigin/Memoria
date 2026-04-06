@@ -582,4 +582,8 @@ impl RemoteClient {
             _ => Ok(Self::mcp_text(&format!("Unknown tool: {name}"))),
         }
     }
+
+    pub async fn call_owned(self, name: String, args: Value) -> Result<Value> {
+        self.call(&name, args).await
+    }
 }

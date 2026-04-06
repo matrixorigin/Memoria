@@ -56,13 +56,6 @@ async fn collect_metrics(state: &AppState) -> Result<Arc<String>, String> {
         }
     }
 
-    let mut cache = state.metrics_cache.write().await;
-    if let Some(snapshot) = cache.as_ref() {
-        if snapshot.generated_at.elapsed() < state.metrics_cache_ttl {
-            return Ok(snapshot.body.clone());
-        }
-    }
-
     let sql = state
         .service
         .sql_store
@@ -332,10 +325,18 @@ async fn collect_metrics(state: &AppState) -> Result<Arc<String>, String> {
     crate::metrics::render::render_process_metrics(&mut out);
 
     let body = Arc::new(out);
-    *cache = Some(CachedMetrics {
-        body: body.clone(),
-        generated_at: std::time::Instant::now(),
-    });
+    {
+        let mut cache = state.metrics_cache.write().await;
+        if let Some(snapshot) = cache.as_ref() {
+            if snapshot.generated_at.elapsed() < state.metrics_cache_ttl {
+                return Ok(snapshot.body.clone());
+            }
+        }
+        *cache = Some(CachedMetrics {
+            body: body.clone(),
+            generated_at: std::time::Instant::now(),
+        });
+    }
 
     Ok(body)
 }

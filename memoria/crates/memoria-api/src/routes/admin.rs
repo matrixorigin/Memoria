@@ -514,7 +514,8 @@ pub async fn user_call_stats(
     Query(params): Query<CallStatsQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     auth.require_master()?;
-    let pool = get_user_store(&state, &user_id).await?;
+    let store = get_user_store(&state, &user_id).await?;
+    let call_log = store.t("mem_api_call_log");
 
     let days = params.days.unwrap_or(7).clamp(1, 90) as i64;
 
@@ -522,17 +523,17 @@ pub async fn user_call_stats(
     // Error counting unifies HTTP errors (/v1/*) and JSON-RPC errors (/mcp/*):
     //   - /v1/* REST calls: HTTP status_code >= 400 signals an error
     //   - /mcp/* JSON-RPC calls: HTTP is always 200; rpc_success = 0 signals an error
-    let row = sqlx::query(
+    let row = sqlx::query(&format!(
         "SELECT \
             CAST(COUNT(*) AS SIGNED) AS total, \
             CAST(COALESCE(AVG(latency_ms), 0) AS DOUBLE) AS avg_ms, \
             CAST(SUM(CASE WHEN status_code >= 400 OR rpc_success = 0 THEN 1 ELSE 0 END) AS SIGNED) AS errors \
-         FROM mem_api_call_log \
+         FROM {call_log} \
          WHERE user_id = ? AND called_at >= DATE_SUB(NOW(6), INTERVAL ? DAY)",
-    )
+    ))
     .bind(&user_id)
     .bind(days)
-    .fetch_one(pool.pool())
+    .fetch_one(store.pool())
     .await
     .map_err(db_err)?;
 
@@ -543,7 +544,7 @@ pub async fn user_call_stats(
     // Per-(method, path) breakdown — used as "by_tool" in the Monitor dashboard.
     // Grouping by method disambiguates e.g. POST /v1/memories (store) vs
     // GET /v1/memories (list).
-    let by_path_rows = sqlx::query(
+    let by_path_rows = sqlx::query(&format!(
         "SELECT \
             method, \
             path, \
@@ -552,15 +553,15 @@ pub async fn user_call_stats(
             CAST(COALESCE(MAX(latency_ms), 0) AS SIGNED) AS max_ms, \
             CAST(SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END) AS SIGNED) AS err_cnt, \
             CAST(SUM(CASE WHEN rpc_success = 0 THEN 1 ELSE 0 END) AS SIGNED) AS rpc_err_cnt \
-         FROM mem_api_call_log \
+         FROM {call_log} \
          WHERE user_id = ? AND called_at >= DATE_SUB(NOW(6), INTERVAL ? DAY) \
          GROUP BY method, path \
          ORDER BY cnt DESC \
          LIMIT 50",
-    )
+    ))
     .bind(&user_id)
     .bind(days)
-    .fetch_all(pool.pool())
+    .fetch_all(store.pool())
     .await
     .map_err(db_err)?;
 
@@ -593,15 +594,15 @@ pub async fn user_call_stats(
 
     // Most recent 50 calls for the live "Recent Calls" feed.
     // Include rpc_success so /mcp errors (HTTP 200 but RPC failure) show as "err".
-    let recent_rows = sqlx::query(
+    let recent_rows = sqlx::query(&format!(
         "SELECT method, path, status_code, latency_ms, called_at, rpc_success \
-         FROM mem_api_call_log \
+         FROM {call_log} \
          WHERE user_id = ? \
          ORDER BY called_at DESC \
          LIMIT 50",
-    )
+    ))
     .bind(&user_id)
-    .fetch_all(pool.pool())
+    .fetch_all(store.pool())
     .await
     .unwrap_or_default();
 
@@ -632,7 +633,7 @@ pub async fn user_call_stats(
 
     // ── All-time per-type aggregates (no days filter) ─────────────────────────
     // Used by the Usage panel's stats cards: total_writes, total_searches, etc.
-    let at_row = sqlx::query(
+    let at_row = sqlx::query(&format!(
         "SELECT \
             CAST(COUNT(*) AS SIGNED) AS total, \
             CAST(SUM(CASE WHEN (path = '/v1/memories' AND method = 'POST') \
@@ -647,11 +648,11 @@ pub async fn user_call_stats(
             CAST(COALESCE(AVG(CASE WHEN path IN ('/v1/memories/search','/v1/memories/retrieve', \
                                                   '/mcp/memory_retrieve','/mcp/memory_search') \
                               THEN latency_ms END), 0) AS DOUBLE) AS avg_retrieval_ms \
-         FROM mem_api_call_log \
+         FROM {call_log} \
          WHERE user_id = ?",
-    )
+    ))
     .bind(&user_id)
-    .fetch_one(pool.pool())
+    .fetch_one(store.pool())
     .await
     .map_err(db_err)?;
 
@@ -664,7 +665,7 @@ pub async fn user_call_stats(
     // ── Per-day series within the requested window ─────────────────────────────
     // Used by the Usage panel's API Call Tracking chart.
     // day_idx = 0 → oldest calendar day,  day_idx = days-1 → today  (DB timezone).
-    let series_rows = sqlx::query(
+    let series_rows = sqlx::query(&format!(
         "SELECT \
             CAST(DATEDIFF(DATE(called_at), \
                           DATE(DATE_SUB(NOW(6), INTERVAL ? DAY))) AS SIGNED) AS day_idx, \
@@ -678,16 +679,16 @@ pub async fn user_call_stats(
                                         '/mcp/memory_retrieve','/mcp/memory_search') \
                          THEN 1 ELSE 0 END) AS SIGNED) AS retrieves, \
             CAST(COUNT(*) AS SIGNED) AS total \
-         FROM mem_api_call_log \
-         WHERE user_id = ? \
-           AND DATE(called_at) >= DATE(DATE_SUB(NOW(6), INTERVAL ? DAY)) \
-         GROUP BY DATE(called_at) \
-         ORDER BY DATE(called_at) ASC",
-    )
+          FROM {call_log} \
+          WHERE user_id = ? \
+            AND DATE(called_at) >= DATE(DATE_SUB(NOW(6), INTERVAL ? DAY)) \
+          GROUP BY DATE(called_at) \
+          ORDER BY DATE(called_at) ASC",
+    ))
     .bind(days - 1) // offset = days - 1 so day_idx 0 = oldest day
     .bind(&user_id)
     .bind(days - 1)
-    .fetch_all(pool.pool())
+    .fetch_all(store.pool())
     .await
     .unwrap_or_default();
 

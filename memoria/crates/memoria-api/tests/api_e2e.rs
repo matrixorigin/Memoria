@@ -6450,6 +6450,51 @@ async fn test_mcp_tools_call_memory_store() {
 }
 
 #[tokio::test]
+async fn test_mcp_tools_call_records_tool_usage() {
+    let (base, client) = spawn_server().await;
+    let uid = uid();
+
+    let resp = mcp_post_with_headers(
+        &client,
+        &base,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "tools/call",
+            "params": {
+                "name": "memory_store",
+                "arguments": {"content": "mcp tool usage tracked", "memory_type": "semantic"}
+            }
+        }),
+        &[("X-User-Id", uid.as_str())],
+    )
+    .await;
+
+    assert!(
+        resp["error"].is_null(),
+        "unexpected error: {}",
+        resp["error"]
+    );
+
+    let usage: Value = client
+        .get(format!("{base}/v1/tool-usage"))
+        .header("X-User-Id", &uid)
+        .send()
+        .await
+        .expect("send")
+        .json()
+        .await
+        .expect("parse");
+
+    let items = usage.as_array().expect("usage array");
+    assert!(
+        items.iter().any(|item| item["tool_name"] == "memory_store"),
+        "memory_store missing from tool usage: {usage}"
+    );
+    println!("✅ POST /mcp tools/call records tool usage");
+}
+
+#[tokio::test]
 async fn test_mcp_invalid_json_returns_parse_error() {
     let (base, client) = spawn_server().await;
 
