@@ -996,6 +996,31 @@ pub async fn call(
                  ORDER BY m.created_at DESC \
                  LIMIT ?"
             );
+            let inserted_or_updated_count_sql = format!(
+                "SELECT COUNT(*) \
+                 FROM {branch_table} b \
+                 LEFT JOIN {main_table} m ON m.memory_id = b.memory_id \
+                 WHERE b.user_id = ? \
+                   AND (m.memory_id IS NULL \
+                        OR COALESCE(m.content, '') <> COALESCE(b.content, '') \
+                        OR COALESCE(m.is_active, 0) <> COALESCE(b.is_active, 0))"
+            );
+            let deleted_count_sql = format!(
+                "SELECT COUNT(*) \
+                 FROM {main_table} m \
+                 LEFT JOIN {branch_table} b ON b.memory_id = m.memory_id \
+                 WHERE m.user_id = ? AND m.is_active = 1 AND b.memory_id IS NULL"
+            );
+            let inserted_or_updated_total: i64 = sqlx::query_scalar(&inserted_or_updated_count_sql)
+                .bind(user_id)
+                .fetch_one(sql.pool())
+                .await
+                .map_err(db_err)?;
+            let deleted_total: i64 = sqlx::query_scalar(&deleted_count_sql)
+                .bind(user_id)
+                .fetch_one(sql.pool())
+                .await
+                .map_err(db_err)?;
 
             let mut rows: Vec<DiffRow> = sqlx::query(&inserted_or_updated_sql)
                 .bind(user_id)
@@ -1037,7 +1062,8 @@ pub async fn call(
 
             rows.extend(deleted_rows);
             rows.truncate(limit.max(0) as usize);
-            let total = rows.len() as i64;
+            let shown = rows.len() as i64;
+            let total = inserted_or_updated_total + deleted_total;
             if total == 0 {
                 return Ok(mcp_text(&format!(
                     "No changes in branch '{source_branch}' vs main."
@@ -1063,8 +1089,8 @@ pub async fn call(
                     )
                 })
                 .collect();
-            let truncated = if total > limit {
-                format!(" (showing {limit}/{total})")
+            let truncated = if total > shown {
+                format!(" (showing {shown}/{total})")
             } else {
                 String::new()
             };
