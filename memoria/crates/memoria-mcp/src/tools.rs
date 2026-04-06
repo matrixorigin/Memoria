@@ -51,18 +51,51 @@ enum ToolCallName {
     Unknown(String),
 }
 
+const MEMORY_STORE_DESCRIPTION: &str = concat!(
+    "Store a new memory. Set trust_tier explicitly when certainty matters: ",
+    "T1 for directly stated or explicitly confirmed facts/preferences/decisions, ",
+    "T2 for curated or corrected records, T3 for inferred summaries or soft conclusions ",
+    "(prefer T3 if unsure), T4 for speculative or unverified hypotheses."
+);
+
+const TRUST_TIER_DESCRIPTION: &str = concat!(
+    "Use exact values T1/T2/T3/T4 only. ",
+    "T1 = direct user-stated or explicitly confirmed fact/preference/decision. ",
+    "T2 = curated or corrected memory replacing an older record. ",
+    "T3 = inferred summary, extracted pattern, or soft conclusion not explicitly confirmed; ",
+    "prefer T3 if unsure. ",
+    "T4 = speculative, reflective, or otherwise unverified hypothesis."
+);
+
+pub(crate) const MEMORY_CAPABILITIES_TEXT: &str = concat!(
+    "Available tools: memory_store, memory_retrieve, memory_search, ",
+    "memory_correct, memory_purge, memory_profile, memory_list, ",
+    "memory_capabilities, memory_governance, memory_consolidate, ",
+    "memory_reflect, memory_feedback",
+    "\n\nmemory_store trust_tier guide:",
+    "\n- T1 (Verified): directly stated or explicitly confirmed facts, preferences, or decisions.",
+    "\n- T2 (Curated): corrected or manually curated memory replacing an older record.",
+    "\n- T3 (Inferred): summaries, extracted patterns, or soft conclusions not explicitly confirmed. Prefer T3 if unsure.",
+    "\n- T4 (Unverified): speculative, reflective, or otherwise unverified hypotheses.",
+    "\nUse exact values T1/T2/T3/T4; natural-language labels like 'verified' are invalid."
+);
+
 pub fn list() -> Value {
     json!([
         {
             "name": "memory_store",
-            "description": "Store a new memory",
+            "description": MEMORY_STORE_DESCRIPTION,
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "content": {"type": "string"},
                     "memory_type": {"type": "string", "default": "semantic"},
                     "session_id": {"type": "string"},
-                    "trust_tier": {"type": "string"}
+                    "trust_tier": {
+                        "type": "string",
+                        "enum": ["T1", "T2", "T3", "T4"],
+                        "description": TRUST_TIER_DESCRIPTION
+                    }
                 },
                 "required": ["content"]
             }
@@ -224,8 +257,7 @@ pub async fn call(
                 .as_str()
                 .map(TrustTier::from_str)
                 .transpose()
-                .ok()
-                .flatten();
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
             let mt = MemoryType::from_str(memory_type).unwrap_or(MemoryType::Semantic);
             let m = match service
                 .store_memory(
@@ -429,12 +461,7 @@ pub async fn call(
             Ok(mcp_text(&text))
         }
 
-        ToolCallName::MemoryCapabilities => Ok(mcp_text(
-            "Available tools: memory_store, memory_retrieve, memory_search, \
-             memory_correct, memory_purge, memory_profile, memory_list, \
-             memory_capabilities, memory_governance, memory_consolidate, \
-             memory_reflect, memory_feedback",
-        )),
+        ToolCallName::MemoryCapabilities => Ok(mcp_text(MEMORY_CAPABILITIES_TEXT)),
 
         ToolCallName::MemoryGovernance => {
             let force = args["force"].as_bool().unwrap_or(false);

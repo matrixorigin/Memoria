@@ -106,6 +106,26 @@ async fn test_store_session_and_trust_tier() {
     );
 }
 
+#[tokio::test]
+async fn test_store_rejects_invalid_trust_tier() {
+    let (svc, uid) = setup().await;
+    let err = memoria_mcp::tools::call(
+        "memory_store",
+        json!({"content": "bad tier memory", "trust_tier": "verified"}),
+        &svc,
+        &uid,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("Invalid trust tier: verified"),
+        "{err}"
+    );
+    let list = svc.list_active(&uid, 10).await.unwrap();
+    assert!(list.is_empty(), "invalid tier should not store a memory");
+    println!("✅ invalid trust_tier rejected explicitly");
+}
+
 // ── 3. memory_retrieve: returns relevant memories ────────────────────────────
 
 #[tokio::test]
@@ -511,6 +531,16 @@ async fn test_capabilities() {
             !t.contains(hidden),
             "hidden tool {hidden} should not be in capabilities: {t}"
         );
+    }
+    for hint in &[
+        "memory_store trust_tier guide",
+        "T1 (Verified)",
+        "T2 (Curated)",
+        "T3 (Inferred)",
+        "Prefer T3 if unsure",
+        "natural-language labels like 'verified' are invalid",
+    ] {
+        assert!(t.contains(hint), "missing tier hint {hint}: {t}");
     }
     println!("✅ capabilities: {t}");
 }
