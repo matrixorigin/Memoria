@@ -44,20 +44,34 @@ struct Response {
     error: Option<Value>,
 }
 
+enum RpcMethod {
+    Initialize,
+    ToolsList,
+    ToolsCall,
+    NotificationsInitialized,
+    Unknown(String),
+}
+
 /// Dispatch a single JSON-RPC method in embedded mode.
 /// Used by the server-side Streamable HTTP MCP endpoint.
 pub async fn dispatch_http(
-    method: &str,
+    method: String,
     params: Option<Value>,
-    service: &Arc<MemoryService>,
-    git: &Arc<GitForDataService>,
-    user_id: &str,
+    service: Arc<MemoryService>,
+    git: Arc<GitForDataService>,
+    user_id: String,
 ) -> Result<Value, McpRpcError> {
-    let mode = Mode::Embedded {
-        service: service.clone(),
-        git: git.clone(),
-    };
-    dispatch(method, params, &mode, user_id).await
+    let handle = tokio::runtime::Handle::current();
+    tokio::task::spawn_blocking(move || {
+        handle.block_on(dispatch_embedded_owned(
+            method, params, service, git, user_id,
+        ))
+    })
+    .await
+    .map_err(|e| McpRpcError {
+        code: -32000,
+        message: e.to_string(),
+    })?
 }
 
 /// Run in embedded mode (direct DB).
@@ -131,8 +145,14 @@ pub async fn run_sse(
             let id = req["id"].clone();
             let method = req["method"].as_str().unwrap_or("").to_string();
             let params = req["params"].clone();
-            let mode = Mode::Embedded { service: s.service.clone(), git: s.git.clone() };
-            let result = dispatch(&method, Some(params), &mode, &s.user_id).await;
+            let result = dispatch_http(
+                method,
+                Some(params),
+                s.service.clone(),
+                s.git.clone(),
+                s.user_id.clone(),
+            )
+            .await;
             let resp = match result {
                 Ok(v) => serde_json::json!({"jsonrpc":"2.0","id":id,"result":if v.is_null(){serde_json::json!({})}else{v}}),
                 Err(e) => serde_json::json!({"jsonrpc":"2.0","id":id,"error":{"code":e.code,"message":e.message}}),
@@ -234,18 +254,25 @@ async fn dispatch(
     user_id: &str,
 ) -> Result<Value, McpRpcError> {
     let p = params.unwrap_or(Value::Null);
+    let method = match method {
+        "initialize" => RpcMethod::Initialize,
+        "tools/list" => RpcMethod::ToolsList,
+        "tools/call" => RpcMethod::ToolsCall,
+        "notifications/initialized" => RpcMethod::NotificationsInitialized,
+        _ => RpcMethod::Unknown(method.to_string()),
+    };
     match method {
-        "initialize" => Ok(json!({
+        RpcMethod::Initialize => Ok(json!({
             "protocolVersion": "2024-11-05",
             "capabilities": {"tools": {}},
             "serverInfo": {"name": "memoria-mcp-rs", "version": "0.1.0"}
         })),
-        "tools/list" => {
+        RpcMethod::ToolsList => {
             let mut all_tools = tools::list().as_array().unwrap().clone();
             all_tools.extend(git_tools::list().as_array().unwrap().clone());
             Ok(json!({"tools": all_tools}))
         }
-        "tools/call" => {
+        RpcMethod::ToolsCall => {
             let name = p["name"].as_str().unwrap_or("").to_string();
             let args = p["arguments"].clone();
             let internal_err = |e: anyhow::Error| McpRpcError {
@@ -282,8 +309,74 @@ async fn dispatch(
                 }
             }
         }
-        "notifications/initialized" => Ok(Value::Null),
-        _ => Err(McpRpcError {
+        RpcMethod::NotificationsInitialized => Ok(Value::Null),
+        RpcMethod::Unknown(method) => Err(McpRpcError {
+            code: -32601,
+            message: format!("Method not found: {method}"),
+        }),
+    }
+}
+
+async fn dispatch_embedded_owned(
+    method: String,
+    params: Option<Value>,
+    service: Arc<MemoryService>,
+    git: Arc<GitForDataService>,
+    user_id: String,
+) -> Result<Value, McpRpcError> {
+    let p = params.unwrap_or(Value::Null);
+    let method = match method.as_str() {
+        "initialize" => RpcMethod::Initialize,
+        "tools/list" => RpcMethod::ToolsList,
+        "tools/call" => RpcMethod::ToolsCall,
+        "notifications/initialized" => RpcMethod::NotificationsInitialized,
+        _ => RpcMethod::Unknown(method),
+    };
+    match method {
+        RpcMethod::Initialize => Ok(json!({
+            "protocolVersion": "2024-11-05",
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": "memoria-mcp-rs", "version": "0.1.0"}
+        })),
+        RpcMethod::ToolsList => {
+            let mut all_tools = tools::list().as_array().unwrap().clone();
+            all_tools.extend(git_tools::list().as_array().unwrap().clone());
+            Ok(json!({"tools": all_tools}))
+        }
+        RpcMethod::ToolsCall => {
+            let name = p["name"].as_str().unwrap_or("").to_string();
+            let args = p["arguments"].clone();
+            let internal_err = |e: anyhow::Error| McpRpcError {
+                code: -32000,
+                message: e.to_string(),
+            };
+            let git_tool_names = [
+                "memory_snapshot",
+                "memory_snapshots",
+                "memory_snapshot_delete",
+                "memory_rollback",
+                "memory_branch",
+                "memory_branches",
+                "memory_checkout",
+                "memory_merge",
+                "memory_diff",
+                "memory_branch_delete",
+            ];
+            if git_tool_names.contains(&name.as_str()) {
+                git_tools::call_owned(name, args, git, service, user_id)
+                    .await
+                    .map_err(|e| McpRpcError {
+                        code: -32000,
+                        message: e.to_string(),
+                    })
+            } else {
+                tools::call_owned(name, args, service, user_id)
+                    .await
+                    .map_err(internal_err)
+            }
+        }
+        RpcMethod::NotificationsInitialized => Ok(Value::Null),
+        RpcMethod::Unknown(method) => Err(McpRpcError {
             code: -32601,
             message: format!("Method not found: {method}"),
         }),

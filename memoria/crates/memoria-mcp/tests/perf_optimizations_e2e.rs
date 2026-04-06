@@ -644,14 +644,12 @@ async fn test_find_near_duplicate_single_query_same_type_preference() {
         "should prefer same-type (procedural) match"
     );
 
-    // Search for type "working" — no same-type match, should fall back to closest (A)
+    // Search for type "working" — no same-type match, should not cross-supersede another type
     let result3 = store
         .find_near_duplicate("mem_memories", &uid, &base_emb, "working", &exclude, 10.0)
         .await
         .expect("find_near_duplicate working");
-    assert!(result3.is_some(), "should find cross-type duplicate");
-    let (found_id3, _, _) = result3.unwrap();
-    assert_eq!(found_id3, mid_a, "should fall back to closest match (A)");
+    assert!(result3.is_none(), "should not find cross-type duplicate");
 
     // Search with very tight threshold — should find nothing
     let _result4 = store

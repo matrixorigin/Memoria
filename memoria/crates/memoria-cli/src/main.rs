@@ -81,6 +81,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Start REST API server
+    #[cfg(feature = "server-runtime")]
     Serve {
         #[arg(long, env = "DATABASE_URL")]
         db_url: Option<String>,
@@ -90,6 +91,7 @@ enum Commands {
         master_key: String,
     },
     /// Start MCP server (embedded or remote mode)
+    #[cfg(feature = "server-runtime")]
     Mcp {
         /// AI tool that launched this MCP server (sent as X-Memoria-Tool header)
         #[arg(long, env = "MEMORIA_TOOL")]
@@ -371,6 +373,9 @@ enum MigrationCommands {
         /// Limit per-user migration to one or more users (for rehearsal/troubleshooting)
         #[arg(long = "user")]
         user_ids: Vec<String>,
+        /// Number of users to migrate in parallel (default: 1 = serial)
+        #[arg(long, default_value_t = 1)]
+        concurrency: usize,
         /// Execute the migration; without this flag, the command performs a dry run only
         #[arg(long)]
         execute: bool,
@@ -382,6 +387,7 @@ enum MigrationCommands {
 
 // ── Serve (API server) ────────────────────────────────────────────────────────
 
+#[cfg(feature = "server-runtime")]
 async fn cmd_serve(db_url: Option<String>, port: u16, master_key: String) -> Result<()> {
     use memoria_api::{build_router, AppState};
     use memoria_git::GitForDataService;
@@ -499,6 +505,7 @@ fn redact_url(url: &str) -> String {
 // ── MCP server ────────────────────────────────────────────────────────────────
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(feature = "server-runtime")]
 async fn cmd_mcp(
     tool: Option<String>,
     api_url: Option<String>,
@@ -957,10 +964,14 @@ async fn cmd_migrate(command: MigrationCommands) -> Result<()> {
             shared_db_url,
             embedding_dim,
             user_ids,
+            concurrency,
             execute,
             report_out,
         } => {
-            let options = LegacyToMultiDbMigrationOptions { user_ids };
+            let options = LegacyToMultiDbMigrationOptions {
+                user_ids,
+                concurrency,
+            };
             let report = if execute {
                 execute_legacy_single_db_to_multi_db(
                     &legacy_db_url,
@@ -1079,6 +1090,7 @@ fn cmd_plugin_dev_keygen(dir: &Path) -> Result<()> {
 fn build_embedder(
     cfg: &memoria_service::Config,
 ) -> Option<Arc<dyn memoria_core::interfaces::EmbeddingProvider>> {
+    #[cfg(feature = "server-runtime")]
     use memoria_api::InstrumentedEmbedder;
     use memoria_embedding::{HttpEmbedder, RoundRobinEmbedder};
 
@@ -1148,8 +1160,16 @@ fn build_embedder(
         return None;
     };
 
-    Some(Arc::new(InstrumentedEmbedder::new(raw, provider_label))
-        as Arc<dyn memoria_core::interfaces::EmbeddingProvider>)
+    #[cfg(feature = "server-runtime")]
+    {
+        Some(Arc::new(InstrumentedEmbedder::new(raw, provider_label))
+            as Arc<dyn memoria_core::interfaces::EmbeddingProvider>)
+    }
+    #[cfg(not(feature = "server-runtime"))]
+    {
+        let _ = provider_label;
+        Some(raw)
+    }
 }
 
 fn validate_embedding_config(cfg: &memoria_service::Config) -> Result<()> {
@@ -3136,6 +3156,7 @@ fn main() -> Result<()> {
     let project_dir = cli.dir.canonicalize().unwrap_or(cli.dir);
 
     match cli.command {
+        #[cfg(feature = "server-runtime")]
         Commands::Serve {
             db_url,
             port,
@@ -3146,6 +3167,7 @@ fn main() -> Result<()> {
                 .build()?
                 .block_on(cmd_serve(db_url, port, master_key))?;
         }
+        #[cfg(feature = "server-runtime")]
         Commands::Mcp {
             tool,
             api_url,

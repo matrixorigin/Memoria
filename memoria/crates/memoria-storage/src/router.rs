@@ -1,7 +1,7 @@
 use crate::SqlMemoryStore;
 use chrono::Utc;
 use memoria_core::MemoriaError;
-use moka::future::Cache;
+use moka::sync::Cache;
 use sha2::{Digest, Sha256};
 use sqlx::{mysql::MySqlPoolOptions, MySqlPool, Row};
 use std::sync::Arc;
@@ -20,8 +20,9 @@ fn is_duplicate_key_error(e: &sqlx::Error) -> bool {
 }
 
 const USER_DB_CACHE_MAX_CAPACITY: u64 = 10_000;
-const USER_STORE_CACHE_MAX_CAPACITY: u64 = 128;
+const USER_STORE_CACHE_MAX_CAPACITY: u64 = 10_000;
 const USER_STORE_CACHE_IDLE_SECS: u64 = 600;
+const GLOBAL_USER_POOL_MAX_CONNECTIONS: u32 = 120;
 
 #[derive(Debug, Clone)]
 pub struct UserDatabaseRecord {
@@ -33,6 +34,11 @@ pub struct UserDatabaseRecord {
 #[derive(Clone)]
 pub struct DbRouter {
     shared_pool: MySqlPool,
+    /// Global pool for all per-user DB queries. Connections are switched to
+    /// the correct database via `USE` (conn() pattern) or fully-qualified
+    /// table names (qualified_table() pattern). `statement_cache_capacity=0`
+    /// prevents cross-database prepared-statement pollution.
+    global_user_pool: MySqlPool,
     shared_db_url: String,
     shared_db_name: String,
     embedding_dim: usize,
@@ -56,10 +62,33 @@ impl DbRouter {
             .connect(shared_db_url)
             .await
             .map_err(db_err)?;
+
+        // Global pool for all per-user DB queries.
+        // statement_cache_capacity=0 prevents prepared-statement cross-DB pollution.
+        let global_max: u32 = std::env::var("MEMORIA_GLOBAL_USER_POOL_MAX")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(GLOBAL_USER_POOL_MAX_CONNECTIONS);
+        let global_url = append_url_param(shared_db_url, "statement_cache_capacity=0");
+        let global_user_pool = MySqlPoolOptions::new()
+            .max_connections(global_max)
+            .min_connections(2)
+            .max_lifetime(std::time::Duration::from_secs(3600))
+            .idle_timeout(std::time::Duration::from_secs(300))
+            .acquire_timeout(std::time::Duration::from_secs(15))
+            .connect(&global_url)
+            .await
+            .map_err(db_err)?;
+        tracing::info!(
+            max_connections = global_max,
+            "Global user pool initialized (statement_cache=0)"
+        );
+
         let shared_db_name = parse_db_name(shared_db_url)
             .ok_or_else(|| MemoriaError::Internal("invalid shared_db_url".into()))?;
         let router = Self {
             shared_pool: pool,
+            global_user_pool,
             shared_db_url: shared_db_url.to_string(),
             shared_db_name,
             embedding_dim,
@@ -79,6 +108,10 @@ impl DbRouter {
 
     pub fn shared_pool(&self) -> &MySqlPool {
         &self.shared_pool
+    }
+
+    pub fn global_user_pool(&self) -> &MySqlPool {
+        &self.global_user_pool
     }
 
     pub fn shared_db_name(&self) -> &str {
@@ -102,6 +135,42 @@ impl DbRouter {
     pub fn user_db_url(&self, db_name: &str) -> Result<String, MemoriaError> {
         replace_db_name(&self.shared_db_url, db_name)
             .ok_or_else(|| MemoriaError::Internal("invalid shared_db_url".into()))
+    }
+
+    pub fn embedding_dim(&self) -> usize {
+        self.embedding_dim
+    }
+
+    /// Register (or re-activate) a user→db mapping in mem_user_registry.
+    pub async fn register_user_db(&self, user_id: &str, db_name: &str) -> Result<(), MemoriaError> {
+        let now = Utc::now().naive_utc();
+        let insert = sqlx::query(
+            r#"INSERT INTO mem_user_registry (user_id, db_name, status, created_at, updated_at)
+               VALUES (?, ?, 'active', ?, ?)"#,
+        )
+        .bind(user_id)
+        .bind(db_name)
+        .bind(now)
+        .bind(now)
+        .execute(&self.shared_pool)
+        .await;
+
+        match insert {
+            Ok(_) => Ok(()),
+            Err(e) if is_duplicate_key_error(&e) => {
+                sqlx::query(
+                    "UPDATE mem_user_registry SET db_name = ?, status = 'active', updated_at = ? WHERE user_id = ?",
+                )
+                .bind(db_name)
+                .bind(now)
+                .bind(user_id)
+                .execute(&self.shared_pool)
+                .await
+                .map_err(db_err)?;
+                Ok(())
+            }
+            Err(e) => Err(db_err(e)),
+        }
     }
 
     pub async fn list_registered_users(&self) -> Result<Vec<UserDatabaseRecord>, MemoriaError> {
@@ -132,47 +201,108 @@ impl DbRouter {
     }
 
     pub async fn user_db_name(&self, user_id: &str) -> Result<String, MemoriaError> {
-        self.user_db_cache
-            .try_get_with_by_ref(user_id, async {
-                let row = sqlx::query(
-                    "SELECT db_name FROM mem_user_registry WHERE user_id = ? AND status = 'active'",
-                )
-                .bind(user_id)
-                .fetch_optional(&self.shared_pool)
-                .await
-                .map_err(db_err)?;
-                match row {
-                    Some(row) => row.try_get("db_name").map_err(db_err),
-                    None => self.provision_user_db(user_id).await,
-                }
-            })
-            .await
-            .map_err(|err: Arc<MemoriaError>| (*err).clone())
+        if let Some(cached) = self.user_db_cache.get(user_id) {
+            return Ok(cached);
+        }
+
+        // Avoid moka single-flight here: its init future makes upstream callers
+        // fail Send bounds under axum handlers and tokio::spawn.
+        let shared_pool = self.shared_pool.clone();
+        let shared_db_url = self.shared_db_url.clone();
+        let user_id_owned = user_id.to_string();
+        let row = sqlx::query(
+            "SELECT db_name FROM mem_user_registry WHERE user_id = ? AND status = 'active'",
+        )
+        .bind(&user_id_owned)
+        .fetch_optional(&shared_pool)
+        .await
+        .map_err(db_err)?;
+        let db_name = match row {
+            Some(row) => row.try_get("db_name").map_err(db_err)?,
+            None => {
+                provision_user_db_with_pool(&shared_pool, &shared_db_url, &user_id_owned).await?
+            }
+        };
+        self.user_db_cache.insert(user_id_owned, db_name.clone());
+        Ok(db_name)
     }
 
     pub async fn user_store(&self, user_id: &str) -> Result<Arc<SqlMemoryStore>, MemoriaError> {
-        self.user_store_cache
-            .try_get_with_by_ref(user_id, async {
-                let db_name = self.user_db_name(user_id).await?;
-                let db_url = self.user_db_url(&db_name)?;
-                let store = Arc::new(
-                    SqlMemoryStore::connect_routed(
-                        &db_url,
-                        self.embedding_dim,
-                        self.instance_id.clone(),
-                    )
-                    .await?,
-                );
-                store.migrate_user().await?;
-                Ok(store)
-            })
-            .await
-            .map_err(|err: Arc<MemoriaError>| (*err).clone())
+        if let Some(cached) = self.user_store_cache.get(user_id) {
+            return Ok(cached);
+        }
+
+        // Avoid moka single-flight here: its init future makes upstream callers
+        // fail Send bounds under axum handlers and tokio::spawn.
+        let shared_pool = self.shared_pool.clone();
+        let global_user_pool = self.global_user_pool.clone();
+        let shared_db_url = self.shared_db_url.clone();
+        let embedding_dim = self.embedding_dim;
+        let instance_id = self.instance_id.clone();
+        let user_db_cache = self.user_db_cache.clone();
+        let user_id_owned = user_id.to_string();
+        let existing = sqlx::query(
+            "SELECT db_name FROM mem_user_registry WHERE user_id = ? AND status = 'active'",
+        )
+        .bind(&user_id_owned)
+        .fetch_optional(&shared_pool)
+        .await
+        .map_err(db_err)?;
+        let (db_name, needs_init) = match existing {
+            Some(row) => (row.try_get("db_name").map_err(db_err)?, false),
+            None => (
+                provision_user_db_with_pool(&shared_pool, &shared_db_url, &user_id_owned).await?,
+                true,
+            ),
+        };
+        let db_url = user_db_url_from_shared(&shared_db_url, &db_name)?;
+        let init_result =
+            match SqlMemoryStore::connect_routed(&db_url, embedding_dim, instance_id.clone()).await
+            {
+                Ok(init_store) => init_store.migrate_user().await,
+                Err(err) => Err(err),
+            };
+        if let Err(err) = init_result {
+            if needs_init {
+                let _ =
+                    sqlx::query("DELETE FROM mem_user_registry WHERE user_id = ? AND db_name = ?")
+                        .bind(&user_id_owned)
+                        .bind(&db_name)
+                        .execute(&shared_pool)
+                        .await;
+            }
+            return Err(err);
+        }
+        user_db_cache.insert(user_id_owned.clone(), db_name.clone());
+        let store = Arc::new(build_routed_store(
+            global_user_pool,
+            &shared_db_url,
+            embedding_dim,
+            &instance_id,
+            &db_name,
+        )?);
+        self.user_store_cache.insert(user_id_owned, store.clone());
+        Ok(store)
+    }
+
+    pub fn routed_store_for_user(&self, user_id: &str) -> Result<SqlMemoryStore, MemoriaError> {
+        let db_name = Self::user_db_name_for_id(user_id);
+        self.routed_store_for_db_name(&db_name)
+    }
+
+    pub fn routed_store_for_db_name(&self, db_name: &str) -> Result<SqlMemoryStore, MemoriaError> {
+        build_routed_store(
+            self.global_user_pool.clone(),
+            &self.shared_db_url,
+            self.embedding_dim,
+            &self.instance_id,
+            db_name,
+        )
     }
 
     pub async fn invalidate_user(&self, user_id: &str) {
-        self.user_db_cache.invalidate(user_id).await;
-        self.user_store_cache.invalidate(user_id).await;
+        self.user_db_cache.invalidate(user_id);
+        self.user_store_cache.invalidate(user_id);
     }
 
     async fn ensure_user_registry_table(&self) -> Result<(), MemoriaError> {
@@ -191,59 +321,81 @@ impl DbRouter {
         .map_err(db_err)?;
         Ok(())
     }
+}
 
-    async fn provision_user_db(&self, user_id: &str) -> Result<String, MemoriaError> {
-        let db_name = Self::user_db_name_for_id(user_id);
-        let db_url = self.user_db_url(&db_name)?;
-        create_database_if_missing(&db_url).await?;
-        let now = Utc::now().naive_utc();
-        let insert = sqlx::query(
-            r#"INSERT INTO mem_user_registry (user_id, db_name, status, created_at, updated_at)
-               VALUES (?, ?, 'active', ?, ?)"#,
-        )
-        .bind(user_id)
-        .bind(&db_name)
-        .bind(now)
-        .bind(now)
-        .execute(&self.shared_pool)
-        .await;
+fn user_db_url_from_shared(shared_db_url: &str, db_name: &str) -> Result<String, MemoriaError> {
+    replace_db_name(shared_db_url, db_name)
+        .ok_or_else(|| MemoriaError::Internal("invalid shared_db_url".into()))
+}
 
-        match insert {
-            Ok(_) => Ok(db_name),
-            Err(e) if is_duplicate_key_error(&e) => {
-                let existing =
-                    sqlx::query("SELECT db_name FROM mem_user_registry WHERE user_id = ?")
-                        .bind(user_id)
-                        .fetch_optional(&self.shared_pool)
-                        .await
-                        .map_err(db_err)?;
+fn build_routed_store(
+    global_user_pool: MySqlPool,
+    shared_db_url: &str,
+    embedding_dim: usize,
+    instance_id: &str,
+    db_name: &str,
+) -> Result<SqlMemoryStore, MemoriaError> {
+    let db_url = user_db_url_from_shared(shared_db_url, db_name)?;
+    let mut store = SqlMemoryStore::new(global_user_pool, embedding_dim, instance_id.to_string());
+    store.set_db_name(db_name.to_string());
+    store.set_database_url(db_url);
+    Ok(store)
+}
 
-                let Some(existing) = existing else {
-                    return Err(MemoriaError::Internal(format!(
-                        "user db registration collision for {user_id} -> {db_name}"
-                    )));
-                };
+async fn provision_user_db_with_pool(
+    shared_pool: &MySqlPool,
+    shared_db_url: &str,
+    user_id: &str,
+) -> Result<String, MemoriaError> {
+    let db_name = DbRouter::user_db_name_for_id(user_id);
+    let db_url = user_db_url_from_shared(shared_db_url, &db_name)?;
+    create_database_if_missing(&db_url).await?;
+    let now = Utc::now().naive_utc();
+    let insert = sqlx::query(
+        r#"INSERT INTO mem_user_registry (user_id, db_name, status, created_at, updated_at)
+           VALUES (?, ?, 'active', ?, ?)"#,
+    )
+    .bind(user_id)
+    .bind(&db_name)
+    .bind(now)
+    .bind(now)
+    .execute(shared_pool)
+    .await;
 
-                let existing_db_name: String = existing.try_get("db_name").map_err(db_err)?;
-                if existing_db_name != db_name {
-                    return Err(MemoriaError::Internal(format!(
-                        "user {user_id} already registered to {existing_db_name}, expected {db_name}"
-                    )));
-                }
-
-                sqlx::query(
-                    "UPDATE mem_user_registry SET status = 'active', updated_at = ? WHERE user_id = ?",
-                )
-                .bind(now)
+    match insert {
+        Ok(_) => Ok(db_name),
+        Err(e) if is_duplicate_key_error(&e) => {
+            let existing = sqlx::query("SELECT db_name FROM mem_user_registry WHERE user_id = ?")
                 .bind(user_id)
-                .execute(&self.shared_pool)
+                .fetch_optional(shared_pool)
                 .await
                 .map_err(db_err)?;
 
-                Ok(existing_db_name)
+            let Some(existing) = existing else {
+                return Err(MemoriaError::Internal(format!(
+                    "user db registration collision for {user_id} -> {db_name}"
+                )));
+            };
+
+            let existing_db_name: String = existing.try_get("db_name").map_err(db_err)?;
+            if existing_db_name != db_name {
+                return Err(MemoriaError::Internal(format!(
+                    "user {user_id} already registered to {existing_db_name}, expected {db_name}"
+                )));
             }
-            Err(e) => Err(db_err(e)),
+
+            sqlx::query(
+                "UPDATE mem_user_registry SET status = 'active', updated_at = ? WHERE user_id = ?",
+            )
+            .bind(now)
+            .bind(user_id)
+            .execute(shared_pool)
+            .await
+            .map_err(db_err)?;
+
+            Ok(existing_db_name)
         }
+        Err(e) => Err(db_err(e)),
     }
 }
 
@@ -289,4 +441,12 @@ fn split_database_url(database_url: &str) -> Option<(&str, &str, &str)> {
 
 fn quote_ident(name: &str) -> String {
     format!("`{}`", name.replace('`', "``"))
+}
+
+fn append_url_param(url: &str, param: &str) -> String {
+    if url.contains('?') {
+        format!("{url}&{param}")
+    } else {
+        format!("{url}?{param}")
+    }
 }

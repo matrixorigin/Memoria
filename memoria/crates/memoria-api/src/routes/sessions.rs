@@ -104,7 +104,7 @@ async fn generate_and_store(
         .ok_or("LLM not configured — set LLM_API_KEY")?;
 
     let query = format!(
-        "SELECT memory_id, content, memory_type FROM `{table}` \
+        "SELECT memory_id, content, memory_type FROM {table} \
          WHERE user_id = ? AND session_id = ? AND is_active = 1 \
          ORDER BY created_at ASC"
     );

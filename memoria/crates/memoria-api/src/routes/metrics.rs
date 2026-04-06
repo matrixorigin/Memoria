@@ -56,13 +56,6 @@ async fn collect_metrics(state: &AppState) -> Result<Arc<String>, String> {
         }
     }
 
-    let mut cache = state.metrics_cache.write().await;
-    if let Some(snapshot) = cache.as_ref() {
-        if snapshot.generated_at.elapsed() < state.metrics_cache_ttl {
-            return Ok(snapshot.body.clone());
-        }
-    }
-
     let sql = state
         .service
         .sql_store
@@ -86,10 +79,14 @@ async fn collect_metrics(state: &AppState) -> Result<Arc<String>, String> {
             .user_sql_store(user_id)
             .await
             .map_err(|e| e.to_string())?;
+        let memories_table = user_store.t("mem_memories");
+        let feedback_table = user_store.t("mem_retrieval_feedback");
+        let graph_nodes_table = user_store.t("memory_graph_nodes");
+        let graph_edges_table = user_store.t("memory_graph_edges");
 
-        let rows: Vec<(String, i64)> = sqlx::query_as(
-            "SELECT memory_type, COUNT(*) FROM mem_memories WHERE is_active > 0 GROUP BY memory_type",
-        )
+        let rows: Vec<(String, i64)> = sqlx::query_as(&format!(
+            "SELECT memory_type, COUNT(*) FROM {memories_table} WHERE is_active > 0 GROUP BY memory_type"
+        ))
         .fetch_all(user_store.pool())
         .await
         .map_err(|e| e.to_string())?;
@@ -98,22 +95,23 @@ async fn collect_metrics(state: &AppState) -> Result<Arc<String>, String> {
             total += count;
         }
 
-        let fb_rows: Vec<(String, i64)> =
-            sqlx::query_as("SELECT signal, COUNT(*) FROM mem_retrieval_feedback GROUP BY signal")
-                .fetch_all(user_store.pool())
-                .await
-                .unwrap_or_default();
+        let fb_rows: Vec<(String, i64)> = sqlx::query_as(&format!(
+            "SELECT signal, COUNT(*) FROM {feedback_table} GROUP BY signal"
+        ))
+        .fetch_all(user_store.pool())
+        .await
+        .unwrap_or_default();
         for (signal, count) in fb_rows {
             *feedback_counts.entry(signal).or_default() += count;
         }
 
-        nodes += sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM memory_graph_nodes WHERE is_active = 1",
-        )
+        nodes += sqlx::query_scalar::<_, i64>(&format!(
+            "SELECT COUNT(*) FROM {graph_nodes_table} WHERE is_active = 1"
+        ))
         .fetch_one(user_store.pool())
         .await
         .unwrap_or(0);
-        edges += sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM memory_graph_edges")
+        edges += sqlx::query_scalar::<_, i64>(&format!("SELECT COUNT(*) FROM {graph_edges_table}"))
             .fetch_one(user_store.pool())
             .await
             .unwrap_or(0);
@@ -332,10 +330,18 @@ async fn collect_metrics(state: &AppState) -> Result<Arc<String>, String> {
     crate::metrics::render::render_process_metrics(&mut out);
 
     let body = Arc::new(out);
-    *cache = Some(CachedMetrics {
-        body: body.clone(),
-        generated_at: std::time::Instant::now(),
-    });
+    {
+        let mut cache = state.metrics_cache.write().await;
+        if let Some(snapshot) = cache.as_ref() {
+            if snapshot.generated_at.elapsed() < state.metrics_cache_ttl {
+                return Ok(snapshot.body.clone());
+            }
+        }
+        *cache = Some(CachedMetrics {
+            body: body.clone(),
+            generated_at: std::time::Instant::now(),
+        });
+    }
 
     Ok(body)
 }

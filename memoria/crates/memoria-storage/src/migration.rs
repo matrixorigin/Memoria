@@ -34,6 +34,7 @@ const USER_MIGRATION_SKIP_TABLES: &[&str] =
 #[derive(Debug, Clone, Default)]
 pub struct LegacyToMultiDbMigrationOptions {
     pub user_ids: Vec<String>,
+    pub concurrency: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -206,26 +207,65 @@ async fn run_legacy_single_db_to_multi_db(
         );
     }
 
+    let concurrency = options.concurrency.max(1);
     let mut users = Vec::with_capacity(selected_users.len());
-    for user_id in &selected_users {
-        if !dry_run {
-            println!("Migrating user {user_id}");
+    let report_legacy_db_name = legacy_db_name.clone();
+
+    if concurrency == 1 {
+        // Serial path (original behavior)
+        for user_id in &selected_users {
+            if !dry_run {
+                println!("Migrating user {user_id}");
+            }
+            users.push(
+                migrate_user(
+                    &legacy_pool,
+                    &legacy_db_name,
+                    router.as_deref(),
+                    user_id,
+                    !dry_run,
+                )
+                .await?,
+            );
         }
-        users.push(
-            migrate_user(
-                &legacy_pool,
-                &legacy_db_name,
-                router.as_deref(),
-                user_id,
-                !dry_run,
-            )
-            .await?,
-        );
+    } else {
+        // Concurrent path using buffer_unordered (no tokio::spawn needed,
+        // avoids Send + 'static lifetime constraints on async fns).
+        use futures::stream::{self, StreamExt};
+
+        let results: Vec<Result<UserMigrationReport, MemoriaError>> =
+            stream::iter(selected_users.iter())
+                .map(|user_id| {
+                    let pool = &legacy_pool;
+                    let db_name: &str = &legacy_db_name;
+                    let router_ref = router.as_deref();
+                    let execute = !dry_run;
+                    async move {
+                        if execute {
+                            println!("Migrating user {user_id}");
+                        }
+                        migrate_user(pool, db_name, router_ref, user_id, execute).await
+                    }
+                })
+                .buffer_unordered(concurrency)
+                .collect()
+                .await;
+
+        for (user_id, result) in selected_users.iter().zip(results) {
+            match result {
+                Ok(report) => users.push(report),
+                Err(e) => {
+                    return Err(MemoriaError::Internal(format!(
+                        "migration failed for user {user_id}: {e}"
+                    )));
+                }
+            }
+        }
     }
 
     Ok(LegacyToMultiDbMigrationReport {
         dry_run,
-        legacy_db_name,
+        legacy_db_name: report_legacy_db_name,
         shared_db_name,
         pre_execute_account_snapshot,
         selected_users,
@@ -250,9 +290,12 @@ async fn migrate_user(
         let router = router
             .ok_or_else(|| MemoriaError::Internal("missing router for execute mode".into()))?;
         let target_db = DbRouter::user_db_name_for_id(user_id);
+        let target_url = router.user_db_url(&target_db)?;
         println!("  Resetting target user database {target_db}");
-        reset_database(&router.user_db_url(&target_db)?).await?;
+        reset_database(&target_url).await?;
         router.invalidate_user(user_id).await;
+        // Register user in shared DB so runtime can discover it later
+        router.register_user_db(user_id, &target_db).await?;
         target_db
     } else {
         DbRouter::user_db_name_for_id(user_id)
@@ -266,12 +309,20 @@ async fn migrate_user(
         count_active_snapshots(legacy_pool, legacy_db_name, user_id).await?;
 
     if execute {
-        let user_store = router
-            .ok_or_else(|| MemoriaError::Internal("missing router for execute mode".into()))?
-            .user_store(user_id)
-            .await?;
-        let target_pool = user_store.pool();
-        let target_tables = list_tables_with_user_id(target_pool, &target_db)
+        let router = router
+            .ok_or_else(|| MemoriaError::Internal("missing router for execute mode".into()))?;
+        // Use a lightweight temporary pool (max 1 connection) instead of the
+        // cached user_store which keeps connections alive in a cache.
+        let target_url = router.user_db_url(&target_db)?;
+        let target_pool = connect_migration_pool(&target_url).await?;
+        // Run user-schema migration on the fresh database
+        let tmp_store = SqlMemoryStore::new(
+            target_pool.clone(),
+            router.embedding_dim(),
+            MIGRATION_INSTANCE_ID.into(),
+        );
+        tmp_store.migrate_user().await?;
+        let target_tables = list_tables_with_user_id(&target_pool, &target_db)
             .await?
             .into_iter()
             .filter(|table| !is_physical_branch_table(table))
@@ -282,7 +333,7 @@ async fn migrate_user(
                 copy_user_scoped_table(
                     legacy_pool,
                     legacy_db_name,
-                    target_pool,
+                    &target_pool,
                     &target_db,
                     &table,
                     user_id,
@@ -297,7 +348,7 @@ async fn migrate_user(
             copy_memories_stats_table(
                 legacy_pool,
                 legacy_db_name,
-                target_pool,
+                &target_pool,
                 &target_db,
                 user_id,
                 true,
@@ -311,7 +362,7 @@ async fn migrate_user(
             let mut report = copy_branch_table(
                 legacy_pool,
                 legacy_db_name,
-                target_pool,
+                &target_pool,
                 &target_db,
                 &branch.table_name,
                 true,
@@ -338,6 +389,9 @@ async fn migrate_user(
                 }
             }
         }
+        // MatrixOne can stall on graceful sqlx pool shutdown here; dropping the
+        // one-shot pool still releases the connection without blocking cutover.
+        drop(target_pool);
     } else {
         for table in list_source_user_scoped_tables(legacy_pool, legacy_db_name).await? {
             tables.push(
@@ -429,7 +483,26 @@ async fn reset_database(database_url: &str) -> Result<(), MemoriaError> {
         .execute(&pool)
         .await
         .map_err(db_err)?;
+    sqlx::raw_sql(&format!("CREATE DATABASE {}", quote_ident(db_name)))
+        .execute(&pool)
+        .await
+        .map_err(db_err)?;
+    // MatrixOne can stall on graceful sqlx pool shutdown after DROP/CREATE
+    // DATABASE; dropping this one-shot pool avoids hanging execute mode.
+    drop(pool);
     Ok(())
+}
+
+/// Lightweight pool (max 1 conn) for migration data copy. Caller should drop
+/// this pool after finishing the per-user migration to release the connection.
+async fn connect_migration_pool(database_url: &str) -> Result<MySqlPool, MemoriaError> {
+    MySqlPoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(std::time::Duration::from_secs(30))
+        .idle_timeout(std::time::Duration::from_secs(60))
+        .connect(database_url)
+        .await
+        .map_err(db_err)
 }
 
 fn sanitize_identifier_fragment(value: &str) -> String {

@@ -14,7 +14,8 @@ uuid = { workspace = true }
 async-trait = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
-moka = { version = "0.12", features = ["future"] }
+futures = { workspace = true }
+moka = { version = "0.12", features = ["future", "sync"] }
 sha2 = "0.10"
 
 [dev-dependencies]

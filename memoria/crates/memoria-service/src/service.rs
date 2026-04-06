@@ -7,7 +7,7 @@ use memoria_core::{
 use memoria_embedding::llm::ChatMessage;
 use memoria_embedding::LlmClient;
 use memoria_storage::{DbRouter, OwnedEditLogEntry, SqlMemoryStore};
-use moka::future::Cache;
+use moka::sync::Cache;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -113,11 +113,11 @@ impl AccessCounter {
                     _ = tokio::time::sleep(ACCESS_FLUSH_INTERVAL) => {}
                     _ = shutdown_rx.changed() => {
                         // Final flush before exit
-                        Self::flush(&p, &store).await;
+                        Self::flush(Arc::clone(&p), Arc::clone(&store)).await;
                         break;
                     }
                 }
-                Self::flush(&p, &store).await;
+                Self::flush(Arc::clone(&p), Arc::clone(&store)).await;
             }
             tracing::debug!("access counter flusher exiting");
         });
@@ -137,8 +137,8 @@ impl AccessCounter {
     }
 
     async fn flush(
-        pending: &dashmap::DashMap<(String, String), AtomicU64>,
-        store: &SqlMemoryStore,
+        pending: Arc<dashmap::DashMap<(String, String), AtomicU64>>,
+        store: Arc<SqlMemoryStore>,
     ) {
         // Drain all entries
         let batch: Vec<((String, String), u64)> = pending
@@ -159,7 +159,7 @@ impl AccessCounter {
                 by_user.entry(user_id).or_default().push((memory_id, count));
             }
             for (user_id, user_batch) in by_user {
-                match router.user_store(&user_id).await {
+                match router.routed_store_for_user(&user_id) {
                     Ok(user_store) => {
                         if let Err(e) = user_store.bump_access_counts_batch(&user_batch).await {
                             tracing::warn!(user_id, error = %e, "access counter flush failed");
@@ -197,7 +197,8 @@ trait EditLogFlusher: Send + Sync + 'static {
 #[async_trait::async_trait]
 impl EditLogFlusher for SqlMemoryStore {
     async fn flush_batch(&self, entries: &[OwnedEditLogEntry]) -> Result<(), MemoriaError> {
-        self.flush_edit_log_batch(entries).await
+        let store = self.clone();
+        store.flush_edit_log_batch(entries).await
     }
 }
 
@@ -488,17 +489,28 @@ impl MemoryService {
 
         // Isolated pool for graph retrieval (spreading activation, entity recall).
         // Keeps graph queries from competing with the main pool during retrieve.
-        let graph_pool = match store.spawn_background_store(8).await {
-            Ok(gp) => {
-                info!("Graph retrieval using isolated pool (8 connections)");
-                Some(gp)
-            }
-            Err(e) => {
-                warn!(
-                    error = %e,
-                    "graph isolated pool failed, graph queries will use main pool"
-                );
-                None
+        let graph_pool_size: u32 = std::env::var("GRAPH_POOL_SIZE")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(8)
+            .min(32);
+        let graph_pool = if graph_pool_size == 0 {
+            info!("Graph retrieval isolated pool disabled; graph queries will use main pool");
+            None
+        } else {
+            match store.spawn_background_store(graph_pool_size).await {
+                Ok(gp) => {
+                    info!(graph_pool_size, "Graph retrieval using isolated pool");
+                    Some(gp)
+                }
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        graph_pool_size,
+                        "graph isolated pool failed, graph queries will use main pool"
+                    );
+                    None
+                }
             }
         };
 
@@ -717,62 +729,59 @@ impl MemoryService {
             .and_then(|s| s.parse().ok())
             .unwrap_or(4)
             .clamp(1, 16);
-        let rx = Arc::new(tokio::sync::Mutex::new(rx));
-        for i in 0..worker_count {
-            let rx = Arc::clone(&rx);
-            let store = Arc::clone(&store);
-            let llm = llm.clone();
-            tokio::spawn(async move {
-                loop {
-                    // Hold lock across recv + drain to maximize batch size
-                    let batch = {
-                        let mut guard = rx.lock().await;
-                        let Some(first) = guard.recv().await else {
-                            break;
-                        };
-                        let mut batch = Vec::with_capacity(Self::ENTITY_BATCH_LIMIT);
-                        batch.push(first);
-                        while batch.len() < Self::ENTITY_BATCH_LIMIT {
-                            match guard.try_recv() {
-                                Ok(job) => batch.push(job),
-                                Err(_) => break,
-                            }
-                        }
-                        batch
-                    };
-
-                    // Group by user_id and process each group
-                    let batch_len = batch.len();
-                    let mut by_user: std::collections::HashMap<String, Vec<EntityJob>> =
-                        std::collections::HashMap::new();
-                    for job in batch {
-                        by_user.entry(job.user_id.clone()).or_default().push(job);
-                    }
-                    for (user_id, jobs) in &by_user {
-                        Self::process_entity_batch(&store, &llm, user_id, jobs).await;
-                    }
-                    if batch_len > 1 {
-                        tracing::debug!(
-                            worker_id = i,
-                            batch_len,
-                            users = by_user.len(),
-                            "micro-batch processed"
-                        );
+        let permits = Arc::new(tokio::sync::Semaphore::new(worker_count));
+        tokio::spawn(async move {
+            let mut rx = rx;
+            loop {
+                let Some(first) = rx.recv().await else {
+                    break;
+                };
+                let mut batch = Vec::with_capacity(Self::ENTITY_BATCH_LIMIT);
+                batch.push(first);
+                while batch.len() < Self::ENTITY_BATCH_LIMIT {
+                    match rx.try_recv() {
+                        Ok(job) => batch.push(job),
+                        Err(_) => break,
                     }
                 }
-                tracing::debug!(worker_id = i, "entity worker exiting");
-            });
-        }
-        tracing::info!(worker_count, "entity extraction workers started");
+
+                let batch_len = batch.len();
+                let mut by_user: std::collections::HashMap<String, Vec<EntityJob>> =
+                    std::collections::HashMap::new();
+                for job in batch {
+                    by_user.entry(job.user_id.clone()).or_default().push(job);
+                }
+                let user_count = by_user.len();
+
+                for (user_id, jobs) in by_user {
+                    let Ok(permit) = permits.clone().acquire_owned().await else {
+                        tracing::debug!("entity worker semaphore closed");
+                        return;
+                    };
+                    let store = Arc::clone(&store);
+                    let llm = llm.clone();
+                    tokio::spawn(async move {
+                        let _permit = permit;
+                        Self::process_entity_batch(store, llm, user_id, jobs).await;
+                    });
+                }
+
+                if batch_len > 1 {
+                    tracing::debug!(batch_len, users = user_count, "micro-batch dispatched");
+                }
+            }
+            tracing::debug!("entity dispatcher exiting");
+        });
+        tracing::info!(worker_count, "entity extraction dispatcher started");
     }
 
     /// Process a batch of jobs for the same user: merge all regex entities into
     /// one bulk upsert, then run LLM extraction individually for qualifying jobs.
     async fn process_entity_batch(
-        store: &SqlMemoryStore,
-        llm: &Option<Arc<LlmClient>>,
-        user_id: &str,
-        jobs: &[EntityJob],
+        store: Arc<SqlMemoryStore>,
+        llm: Option<Arc<LlmClient>>,
+        user_id: String,
+        jobs: Vec<EntityJob>,
     ) {
         // Sanity check: all jobs must belong to the same user
         if cfg!(debug_assertions) {
@@ -790,7 +799,7 @@ impl MemoryService {
             return;
         }
         let user_store = if let Some(router) = store.db_router() {
-            match router.user_store(user_id).await {
+            match router.routed_store_for_user(&user_id) {
                 Ok(user_store) => Some(user_store),
                 Err(e) => {
                     tracing::warn!(
@@ -804,7 +813,7 @@ impl MemoryService {
         } else {
             None
         };
-        let graph = user_store.as_deref().unwrap_or(store).graph_store();
+        let graph = user_store.as_ref().unwrap_or(store.as_ref()).graph_store();
 
         // 1. Regex extraction — collect entities with their memory_id inline
         struct ExtractedEntity {
@@ -816,7 +825,7 @@ impl MemoryService {
         let mut extracted: Vec<ExtractedEntity> = Vec::new();
         let mut job_entity_counts: Vec<usize> = Vec::new(); // count per job for LLM decision
 
-        for job in jobs {
+        for job in &jobs {
             let entities = memoria_storage::extract_entities(&job.content);
             job_entity_counts.push(entities.len());
             for ent in entities {
@@ -838,7 +847,7 @@ impl MemoryService {
                 .filter(|e| seen.insert(e.name.as_str()))
                 .map(|e| (e.name.as_str(), e.display.as_str(), e.entity_type.as_str()))
                 .collect();
-            if let Ok(resolved) = graph.batch_upsert_entities(user_id, &refs).await {
+            if let Ok(resolved) = graph.batch_upsert_entities(&user_id, &refs).await {
                 // Build name→entity_id map
                 let id_map: std::collections::HashMap<&str, &str> = resolved
                     .iter()
@@ -855,19 +864,19 @@ impl MemoryService {
                     .collect();
                 if !links.is_empty() {
                     let _ = graph
-                        .batch_upsert_memory_entity_links(user_id, &links)
+                        .batch_upsert_memory_entity_links(&user_id, &links)
                         .await;
                 }
             }
         }
 
         // 2. LLM extraction for qualifying jobs (few regex entities + long content)
-        if let Some(ref llm) = llm {
+        if let Some(llm) = llm.as_ref() {
             for (job, &entity_count) in jobs.iter().zip(&job_entity_counts) {
                 if entity_count < Self::ENTITY_LLM_THRESHOLD
                     && job.content.len() >= Self::ENTITY_LLM_MIN_CONTENT_LEN
                 {
-                    Self::llm_extract_entities(llm, &graph, user_id, &job.memory_id, &job.content)
+                    Self::llm_extract_entities(llm, &graph, &user_id, &job.memory_id, &job.content)
                         .await;
                 }
             }
@@ -1833,7 +1842,7 @@ impl MemoryService {
 
     /// Get per-user feedback_weight with caching (TTL 5 min).
     pub async fn get_feedback_weight(&self, user_id: &str) -> Result<f64, MemoriaError> {
-        if let Some(fw) = self.feedback_weight_cache.get(user_id).await {
+        if let Some(fw) = self.feedback_weight_cache.get(user_id) {
             return Ok(fw);
         }
         let fw = if self.sql_store.is_some() {
@@ -1845,9 +1854,7 @@ impl MemoryService {
         } else {
             0.1
         };
-        self.feedback_weight_cache
-            .insert(user_id.to_string(), fw)
-            .await;
+        self.feedback_weight_cache.insert(user_id.to_string(), fw);
         Ok(fw)
     }
 
@@ -2263,10 +2270,7 @@ impl MemoryService {
         signal: &str,
         context: Option<&str>,
     ) -> Result<String, MemoriaError> {
-        let sql = self
-            .sql_store
-            .as_ref()
-            .ok_or_else(|| MemoriaError::Internal("Feedback requires SQL store".into()))?;
+        let sql = self.user_sql_store(user_id).await?;
         sql.record_feedback(user_id, memory_id, signal, context)
             .await
     }
@@ -2276,10 +2280,7 @@ impl MemoryService {
         &self,
         user_id: &str,
     ) -> Result<memoria_storage::FeedbackStats, MemoriaError> {
-        let sql = self
-            .sql_store
-            .as_ref()
-            .ok_or_else(|| MemoriaError::Internal("Feedback requires SQL store".into()))?;
+        let sql = self.user_sql_store(user_id).await?;
         sql.get_feedback_stats(user_id).await
     }
 
@@ -2288,10 +2289,7 @@ impl MemoryService {
         &self,
         user_id: &str,
     ) -> Result<Vec<memoria_storage::TierFeedback>, MemoriaError> {
-        let sql = self
-            .sql_store
-            .as_ref()
-            .ok_or_else(|| MemoriaError::Internal("Feedback requires SQL store".into()))?;
+        let sql = self.user_sql_store(user_id).await?;
         sql.get_feedback_by_tier(user_id).await
     }
 }

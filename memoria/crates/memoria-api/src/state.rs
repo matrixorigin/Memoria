@@ -6,7 +6,7 @@ use crate::rate_limit::RateLimiter;
 use memoria_core::MemoriaError;
 use memoria_git::GitForDataService;
 use memoria_service::{AsyncTaskStore, MemoryService};
-use moka::future::Cache;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
@@ -22,6 +22,58 @@ pub struct CachedMetrics {
     pub generated_at: Instant,
 }
 
+struct ApiKeyCacheEntry {
+    user_id: String,
+    cached_at: Instant,
+}
+
+#[derive(Clone)]
+pub struct ApiKeyCache {
+    ttl: Duration,
+    inner: Arc<std::sync::RwLock<HashMap<String, ApiKeyCacheEntry>>>,
+}
+
+impl ApiKeyCache {
+    pub fn new(ttl: Duration) -> Self {
+        Self {
+            ttl,
+            inner: Arc::new(std::sync::RwLock::new(HashMap::new())),
+        }
+    }
+
+    pub fn get(&self, key_hash: &str) -> Option<String> {
+        let now = Instant::now();
+        if let Ok(cache) = self.inner.read() {
+            if let Some(entry) = cache.get(key_hash) {
+                if now.duration_since(entry.cached_at) < self.ttl {
+                    return Some(entry.user_id.clone());
+                }
+            }
+        }
+
+        self.invalidate(key_hash);
+        None
+    }
+
+    pub fn insert(&self, key_hash: String, user_id: String) {
+        if let Ok(mut cache) = self.inner.write() {
+            cache.insert(
+                key_hash,
+                ApiKeyCacheEntry {
+                    user_id,
+                    cached_at: Instant::now(),
+                },
+            );
+        }
+    }
+
+    pub fn invalidate(&self, key_hash: &str) {
+        if let Ok(mut cache) = self.inner.write() {
+            cache.remove(key_hash);
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub service: Arc<MemoryService>,
@@ -33,7 +85,7 @@ pub struct AppState {
     /// Instance identifier for distributed coordination
     pub instance_id: String,
     /// API key hash -> user_id cache (TTL 5 min)
-    pub api_key_cache: Cache<String, String>,
+    pub api_key_cache: ApiKeyCache,
     /// Dedicated connection pool for auth queries (isolated from business queries)
     pub auth_pool: Option<sqlx::MySqlPool>,
     /// Batched last_used_at updater
@@ -92,10 +144,7 @@ impl AppState {
             master_key,
             task_store,
             instance_id: "single".into(),
-            api_key_cache: Cache::builder()
-                .max_capacity(10_000)
-                .time_to_live(Duration::from_secs(300))
-                .build(),
+            api_key_cache: ApiKeyCache::new(Duration::from_secs(300)),
             auth_pool: None,
             last_used_batcher: Arc::new(LastUsedBatcher::new()),
             tool_usage_batcher: Arc::new(ToolUsageBatcher::new()),
@@ -171,8 +220,19 @@ impl AppState {
             pool.clone(),
             shutdown_rx.clone(),
         );
-        // Rebuild tool-usage cache from DB, then start the periodic flusher
-        self.tool_usage_batcher.rebuild_from_db(&self.service).await;
+        // In multi-db mode, eager rebuild would fan out across every user DB and can
+        // block startup for large tenants. Load per-user tool usage lazily instead.
+        if self
+            .service
+            .sql_store
+            .as_ref()
+            .and_then(|sql| sql.db_router())
+            .is_some()
+        {
+            info!("Skipping eager tool-usage rebuild in multi-db mode");
+        } else {
+            self.tool_usage_batcher.rebuild_from_db(&self.service).await;
+        }
         let h2 = spawn_tool_usage_flusher(
             self.tool_usage_batcher.clone(),
             self.service.clone(),

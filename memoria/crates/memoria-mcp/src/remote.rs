@@ -236,13 +236,10 @@ impl RemoteClient {
                 Ok(Self::mcp_text(&text))
             }
 
-            "memory_capabilities" => Ok(Self::mcp_text(
-                "Available tools: memory_store, memory_retrieve, memory_search, \
-                 memory_correct, memory_purge, memory_profile, memory_list, \
-                 memory_capabilities, memory_governance, memory_consolidate, \
-                 memory_reflect, memory_feedback \
-                 [remote mode — connected to Memoria API server]",
-            )),
+            "memory_capabilities" => Ok(Self::mcp_text(&format!(
+                "{}\n[remote mode — connected to Memoria API server]",
+                crate::tools::MEMORY_CAPABILITIES_TEXT
+            ))),
 
             "memory_get_retrieval_params" => {
                 let r = self
@@ -581,5 +578,9 @@ impl RemoteClient {
 
             _ => Ok(Self::mcp_text(&format!("Unknown tool: {name}"))),
         }
+    }
+
+    pub async fn call_owned(self, name: String, args: Value) -> Result<Value> {
+        self.call(&name, args).await
     }
 }

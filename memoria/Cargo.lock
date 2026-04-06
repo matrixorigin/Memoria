@@ -2292,6 +2292,7 @@ version = "0.2.3"
 dependencies = [
  "async-trait",
  "chrono",
+ "futures",
  "memoria-core",
  "moka",
  "serde",

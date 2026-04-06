@@ -447,7 +447,7 @@ pub async fn get_profile(
         "SELECT memory_type, COUNT(*) as cnt, \
          ROUND(AVG(initial_confidence), 2) as avg_conf, \
          MIN(observed_at) as oldest, MAX(observed_at) as newest \
-         FROM `{table}` WHERE user_id = ? AND is_active = 1 GROUP BY memory_type"
+         FROM {table} WHERE user_id = ? AND is_active = 1 GROUP BY memory_type"
     );
     let stats: serde_json::Value = sqlx::query(&stats_query)
     .bind(&resolved)
@@ -548,7 +548,7 @@ pub async fn get_memory_history(
         }
         let row = sqlx::query(&format!(
             "SELECT memory_id, content, is_active, superseded_by, observed_at, memory_type \
-                 FROM `{}` WHERE memory_id = ? AND user_id = ?",
+                 FROM {} WHERE memory_id = ? AND user_id = ?",
             table
         ))
         .bind(&cid)
@@ -587,7 +587,7 @@ pub async fn get_memory_history(
         loop {
             let older = sqlx::query(&format!(
                 "SELECT memory_id, content, is_active, superseded_by, observed_at, memory_type \
-                     FROM `{}` WHERE superseded_by = ? AND user_id = ?",
+                     FROM {} WHERE superseded_by = ? AND user_id = ?",
                 table
             ))
             .bind(&prev_id)
@@ -842,7 +842,14 @@ pub async fn get_tool_usage(
     State(state): State<AppState>,
     AuthUser { user_id, .. }: AuthUser,
 ) -> ApiResult<serde_json::Value> {
-    let usage = state.tool_usage_batcher.get_user_tool_usage(&user_id);
+    let mut usage = state.tool_usage_batcher.get_user_tool_usage(&user_id);
+    if usage.is_empty() {
+        state
+            .tool_usage_batcher
+            .load_user_from_db(&state.service, &user_id)
+            .await;
+        usage = state.tool_usage_batcher.get_user_tool_usage(&user_id);
+    }
     let items: Vec<serde_json::Value> = usage
         .into_iter()
         .map(|(tool, ts)| serde_json::json!({"tool_name": tool, "last_used_at": ts.to_rfc3339()}))
