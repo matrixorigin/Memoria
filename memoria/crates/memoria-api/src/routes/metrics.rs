@@ -111,9 +111,7 @@ async fn collect_metrics(state: &AppState) -> Result<Arc<String>, String> {
         .fetch_one(user_store.pool())
         .await
         .unwrap_or(0);
-        edges += sqlx::query_scalar::<_, i64>(&format!(
-            "SELECT COUNT(*) FROM {graph_edges_table}"
-        ))
+        edges += sqlx::query_scalar::<_, i64>(&format!("SELECT COUNT(*) FROM {graph_edges_table}"))
             .fetch_one(user_store.pool())
             .await
             .unwrap_or(0);

@@ -197,10 +197,10 @@ pub async fn delete_user(
     sqlx::query(&format!(
         "UPDATE {memories_table} SET is_active = 0 WHERE user_id = ?"
     ))
-        .bind(&user_id)
-        .execute(user_store.pool())
-        .await
-        .map_err(db_err)?;
+    .bind(&user_id)
+    .execute(user_store.pool())
+    .await
+    .map_err(db_err)?;
     Ok(Json(
         serde_json::json!({"status": "ok", "user_id": user_id}),
     ))

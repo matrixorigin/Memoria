@@ -4414,11 +4414,10 @@ impl SqlMemoryStore {
             };
             let mut final_score =
                 W_VEC * vec_score + W_KW * kw_score + W_TIME * time_score + W_CONF * conf_score;
-            // Frequency boost: log(1 + access_count) — mild boost for frequently retrieved memories
             let ac = ac_map.get(&m.memory_id).copied().unwrap_or(0);
-            if ac > 0 {
-                final_score *= 1.0 + 0.1 * ((1 + ac) as f64).ln();
-            }
+            // Keep access_count for observability, but exclude it from ranking.
+            // Repeated evaluation otherwise creates self-reinforcing winners that
+            // swamp fresher, more relevant memories.
 
             // Feedback adjustment: boost useful, penalize negative feedback
             if let Some(fb) = fb_map.get(&m.memory_id) {

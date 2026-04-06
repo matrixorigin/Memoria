@@ -231,6 +231,37 @@ async fn test_search_vector_sets_retrieval_score() {
     println!("✅ search_vector_sets_retrieval_score: top_score={top_score:.4}");
 }
 
+#[tokio::test]
+async fn test_search_hybrid_access_count_stays_tiebreaker() {
+    let (store, uid) = setup().await;
+
+    let mut relevant = make_memory(&format!("hybrid-relevant-{uid}"), "fresh relevant", &uid);
+    relevant.embedding = Some(dim_vec(0, 1.0));
+
+    let mut popular = make_memory(&format!("hybrid-popular-{uid}"), "stale popular", &uid);
+    popular.embedding = Some(dim_vec(0, 0.8));
+
+    store.insert(&relevant).await.unwrap();
+    store.insert(&popular).await.unwrap();
+
+    sqlx::query("INSERT INTO mem_memories_stats (memory_id, access_count) VALUES (?, 40)")
+        .bind(&popular.memory_id)
+        .execute(store.pool())
+        .await
+        .unwrap();
+
+    let (results, _) = store
+        .search_hybrid_from_scored("mem_memories", &uid, &dim_vec(0, 1.0), "zzzzzz", 2, 0.0)
+        .await
+        .expect("hybrid search");
+
+    assert_eq!(
+        results.first().map(|m| m.memory_id.as_str()),
+        Some(relevant.memory_id.as_str()),
+        "access_count should not outrank the stronger semantic match"
+    );
+}
+
 // ── Field round-trip: every column written and read back ─────────────────────
 
 #[tokio::test]
