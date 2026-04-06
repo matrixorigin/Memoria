@@ -948,7 +948,8 @@ pub async fn call(
                         other => other,
                     };
                     let preview = if r.content.len() > 80 {
-                        let end = r.content.floor_char_boundary(80);
+                        let mut end = 80;
+                        while !r.content.is_char_boundary(end) { end -= 1; }
                         format!("{}...", &r.content[..end])
                     } else {
                         r.content.clone()
