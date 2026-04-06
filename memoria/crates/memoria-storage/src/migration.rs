@@ -304,10 +304,9 @@ async fn migrate_user(
     let mut tables = Vec::new();
     let mut branch_tables = Vec::new();
     let mut warnings = Vec::new();
-    let active_branch =
-        fetch_optional_active_branch(&legacy_pool, &legacy_db_name, &user_id).await?;
+    let active_branch = fetch_optional_active_branch(legacy_pool, legacy_db_name, user_id).await?;
     let active_snapshot_count =
-        count_active_snapshots(&legacy_pool, &legacy_db_name, &user_id).await?;
+        count_active_snapshots(legacy_pool, legacy_db_name, user_id).await?;
 
     if execute {
         let router = router
@@ -332,12 +331,12 @@ async fn migrate_user(
             println!("  Copying user table {table}");
             tables.push(
                 copy_user_scoped_table(
-                    &legacy_pool,
-                    &legacy_db_name,
+                    legacy_pool,
+                    legacy_db_name,
                     &target_pool,
                     &target_db,
                     &table,
-                    &user_id,
+                    user_id,
                     true,
                 )
                 .await?,
@@ -347,22 +346,22 @@ async fn migrate_user(
         tables.push({
             println!("  Copying user table mem_memories_stats");
             copy_memories_stats_table(
-                &legacy_pool,
-                &legacy_db_name,
+                legacy_pool,
+                legacy_db_name,
                 &target_pool,
                 &target_db,
-                &user_id,
+                user_id,
                 true,
             )
             .await?
         });
 
-        let branches = load_branch_records(&legacy_pool, &legacy_db_name, &user_id).await?;
+        let branches = load_branch_records(legacy_pool, legacy_db_name, user_id).await?;
         for branch in branches {
             println!("  Copying branch table {}", branch.table_name);
             let mut report = copy_branch_table(
-                &legacy_pool,
-                &legacy_db_name,
+                legacy_pool,
+                legacy_db_name,
                 &target_pool,
                 &target_db,
                 &branch.table_name,
@@ -394,15 +393,15 @@ async fn migrate_user(
         // one-shot pool still releases the connection without blocking cutover.
         drop(target_pool);
     } else {
-        for table in list_source_user_scoped_tables(&legacy_pool, &legacy_db_name).await? {
+        for table in list_source_user_scoped_tables(legacy_pool, legacy_db_name).await? {
             tables.push(
                 copy_user_scoped_table(
-                    &legacy_pool,
-                    &legacy_db_name,
-                    &legacy_pool,
+                    legacy_pool,
+                    legacy_db_name,
+                    legacy_pool,
                     &target_db,
                     &table,
-                    &user_id,
+                    user_id,
                     false,
                 )
                 .await?,
@@ -410,19 +409,19 @@ async fn migrate_user(
         }
         tables.push(
             copy_memories_stats_table(
-                &legacy_pool,
-                &legacy_db_name,
-                &legacy_pool,
+                legacy_pool,
+                legacy_db_name,
+                legacy_pool,
                 &target_db,
-                &user_id,
+                user_id,
                 false,
             )
             .await?,
         );
-        for branch in load_branch_records(&legacy_pool, &legacy_db_name, &user_id).await? {
+        for branch in load_branch_records(legacy_pool, legacy_db_name, user_id).await? {
             branch_tables.push(TableMigrationReport {
                 table_name: branch.table_name.clone(),
-                source_rows: count_all_rows(&legacy_pool, &legacy_db_name, &branch.table_name)
+                source_rows: count_all_rows(legacy_pool, legacy_db_name, &branch.table_name)
                     .await?,
                 target_rows: None,
                 status: "planned".to_string(),
