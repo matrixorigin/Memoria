@@ -36,7 +36,16 @@ fn is_duplicate_column(e: &sqlx::Error) -> bool {
 }
 
 async fn query_has_rows(pool: &MySqlPool, sql: &str) -> bool {
-    sqlx::query_scalar::<_, i64>(sql)
+    // Strip "> 0" suffix if present — MatrixOne returns bool for "COUNT(*) > 0"
+    // which sqlx cannot decode as i64. Use plain COUNT(*) and compare in Rust.
+    let sql = sql
+        .trim()
+        .trim_end_matches(';')
+        .trim()
+        .strip_suffix("> 0")
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| sql.to_string());
+    sqlx::query_scalar::<_, i64>(&sql)
         .fetch_one(pool)
         .await
         .unwrap_or(0)
