@@ -106,11 +106,13 @@ pub async fn system_stats(
     let mut total_snapshots = 0i64;
     for user_id in &user_ids {
         let user_store = get_user_store(&state, user_id).await?;
-        total_memories +=
-            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM mem_memories WHERE is_active > 0")
-                .fetch_one(user_store.pool())
-                .await
-                .map_err(db_err)?;
+        let memories_table = user_store.t("mem_memories");
+        total_memories += sqlx::query_scalar::<_, i64>(&format!(
+            "SELECT COUNT(*) FROM {memories_table} WHERE is_active > 0"
+        ))
+        .fetch_one(user_store.pool())
+        .await
+        .map_err(db_err)?;
         total_snapshots += user_store
             .list_snapshot_registrations(user_id)
             .await
@@ -162,9 +164,10 @@ pub async fn user_stats(
 ) -> Result<Json<UserStats>, (StatusCode, String)> {
     auth.require_master()?;
     let user_store = get_user_store(&state, &user_id).await?;
-    let memory_count = sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*) FROM mem_memories WHERE user_id = ? AND is_active > 0",
-    )
+    let memories_table = user_store.t("mem_memories");
+    let memory_count = sqlx::query_scalar::<_, i64>(&format!(
+        "SELECT COUNT(*) FROM {memories_table} WHERE user_id = ? AND is_active > 0"
+    ))
     .bind(&user_id)
     .fetch_one(user_store.pool())
     .await
@@ -190,7 +193,10 @@ pub async fn delete_user(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     auth.require_master()?;
     let user_store = get_user_store(&state, &user_id).await?;
-    sqlx::query("UPDATE mem_memories SET is_active = 0 WHERE user_id = ?")
+    let memories_table = user_store.t("mem_memories");
+    sqlx::query(&format!(
+        "UPDATE {memories_table} SET is_active = 0 WHERE user_id = ?"
+    ))
         .bind(&user_id)
         .execute(user_store.pool())
         .await
