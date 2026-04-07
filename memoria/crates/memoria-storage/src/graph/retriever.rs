@@ -188,11 +188,6 @@ impl<'a> ActivationRetriever<'a> {
                 score *= (-age_hours / TEMPORAL_DECAY_HOURS).exp() as f32;
             }
 
-            // Frequency boost
-            if node.access_count > 0 {
-                score *= 1.0 + 0.1 * (1.0 + node.access_count as f32).ln();
-            }
-
             // Node type weight
             score *= node_type_weight(node.node_type.as_str());
 

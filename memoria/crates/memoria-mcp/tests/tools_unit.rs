@@ -113,6 +113,30 @@ async fn test_tools_list() {
     assert!(!names.contains(&"memory_extract_entities"));
     assert!(!names.contains(&"memory_link_entities"));
     assert!(!names.contains(&"memory_observe"));
+    let store = arr
+        .iter()
+        .find(|t| t["name"].as_str() == Some("memory_store"))
+        .expect("memory_store tool");
+    assert!(
+        store["description"]
+            .as_str()
+            .unwrap_or("")
+            .contains("prefer T3 if unsure"),
+        "memory_store description should expose tier choice guidance"
+    );
+    let trust_tier = &store["inputSchema"]["properties"]["trust_tier"];
+    assert_eq!(
+        trust_tier["enum"].as_array().map(|v| v.len()),
+        Some(4),
+        "trust_tier should expose the four exact enum values"
+    );
+    assert!(
+        trust_tier["description"]
+            .as_str()
+            .unwrap_or("")
+            .contains("Use exact values T1/T2/T3/T4"),
+        "trust_tier description should explain exact token usage"
+    );
     println!("✅ tools_list: 12 tools (6 hidden)");
 }
 

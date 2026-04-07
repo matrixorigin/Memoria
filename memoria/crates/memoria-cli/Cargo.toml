@@ -5,9 +5,10 @@ edition = "2021"
 default-run = "memoria"
 
 [features]
-default = []
+default = ["server-runtime"]
+server-runtime = ["dep:memoria-api", "dep:memoria-mcp"]
 local-embedding = ["memoria-embedding/local-embedding"]
-otel = ["memoria-api/otel"]
+otel = ["server-runtime", "memoria-api/otel"]
 
 [[bin]]
 name = "memoria"
@@ -19,8 +20,8 @@ memoria-storage = { workspace = true }
 memoria-embedding = { workspace = true }
 memoria-service = { workspace = true }
 memoria-git = { workspace = true }
-memoria-mcp = { workspace = true }
-memoria-api = { workspace = true }
+memoria-mcp = { workspace = true, optional = true }
+memoria-api = { workspace = true, optional = true }
 axum = { workspace = true }
 tokio = { workspace = true }
 clap = { workspace = true }

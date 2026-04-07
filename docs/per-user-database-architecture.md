@@ -1,1187 +1,766 @@
-# Per-User Database 隔离架构设计
+# Per-User Database 架构、迁移与部署说明
 
-> **状态**: RFC Draft
+> **状态**: Implemented and validated
 > **作者**: Copilot + ghs-mo
-> **日期**: 2026-04-03
-> **影响范围**: memoria-storage, memoria-git, memoria-service, memoria-mcp, memoria-api, memoria-cli
+> **最近更新**: 2026-04-06
+> **适用范围**: `memoria-storage`, `memoria-git`, `memoria-service`, `memoria-mcp`, `memoria-api`, `memoria-cli`
 
 ---
 
-## 目录
+## 1. 结论先行
 
-1. [Executive Summary](#1-executive-summary)
-2. [动机与问题分析](#2-动机与问题分析)
-3. [架构总览](#3-架构总览)
-4. [数据库布局设计](#4-数据库布局设计)
-5. [核心基础设施变更](#5-核心基础设施变更)
-6. [Snapshot / Branch / Restore 隔离设计](#6-snapshot--branch--restore-隔离设计)
-7. [受影响模块逐项分析](#7-受影响模块逐项分析)
-8. [后台任务与监控](#8-后台任务与监控)
-9. [CLI 与 Init 适配](#9-cli-与-init-适配)
-10. [迁移策略](#10-迁移策略)
-11. [风险与缓解](#11-风险与缓解)
-12. [MatrixOne 待验证项](#12-matrixone-待验证项)
+Memoria 已从“所有用户共享一个数据库、靠 `user_id` 行级过滤隔离”的旧模型，演进为：
 
----
+1. 一个 **shared DB** 承载全局控制平面数据。
+2. 一个用户一个 **per-user DB** 承载该用户的业务数据与用户级控制元数据。
+3. 运行时采用 **global user pool + qualified table names**，而不是为每个用户维护独立连接池，也不是在请求期频繁 `USE db`。
 
-## 1. Executive Summary
+这个改造的核心收益不是“查询更快”，而是把 **snapshot / branch / restore / rollback** 从“天然会误伤所有用户”的危险操作，收敛成“只作用于当前用户数据库”的安全操作。
 
-**现状**: 所有用户共享单个 MatrixOne 数据库 `memoria`，通过 `user_id` 列做行级过滤隔离。
+代价也很明确：
 
-**问题**: `memory_rollback` 操作会 DELETE + INSERT 整个 `mem_memories` 表，**一个用户的回滚会摧毁所有其他用户的数据**。Snapshot 是 Account 级别，同样影响全局。
-
-**目标**: 每用户独占一个 database，全局共享表提取到独立共享库。使 Git-for-Data 能力（snapshot / branch / restore）可以安全地 per-user 使用，互不影响。
-
-**核心改造**:
-
-| 改造项 | 现状 | 目标 |
-|--------|------|------|
-| 数据库粒度 | 单 DB，行级隔离 | Per-user DB，物理隔离 |
-| Snapshot 级别 | `FOR ACCOUNT sys` | `FOR DATABASE {user_db}` |
-| Rollback 安全性 | ❌ 影响所有用户 | ✅ 仅影响当前用户 |
-| Branch 命名 | UUID 前缀防冲突 | 用户 DB 内天然隔离 |
-| 用户删除 | 多表 DELETE WHERE | `DROP DATABASE` |
-| 共享表 | 混在同一 DB | 独立 `memoria_shared` 库 |
+1. 数据库对象数量会上升，运维和观测复杂度高于单库模型。
+2. `/admin/stats`、`/metrics` 这类全局聚合必须经过用户注册表遍历，不能再偷用单表全局聚合。
+3. 部署时必须明确 shared DB 的名字和 URL；不能再依赖“默认猜一个库名”。
 
 ---
 
-## 2. 动机与问题分析
+## 2. 为什么要改
 
-### 2.1 当前架构
+旧架构的问题不是“共享库不优雅”，而是 **Git-for-Data 语义在共享库里不成立**。
 
-```
-┌───────────────────────────────────────────────┐
-│              Database: memoria                │
-│                                               │
-│  mem_memories      (ALL users, row filter)    │
-│  mem_edit_log      (ALL users, row filter)    │
-│  mem_branches      (ALL users, row filter)    │
-│  mem_snapshots     (ALL users, row filter)    │
-│  memory_graph_*    (ALL users, row filter)    │
-│  mem_plugin_*      (global, no user_id)       │
-│  mem_distributed_* (global, no user_id)       │
-│  br_a1b2c3d4_*     (branch tables, mixed)     │
-│  ...共 27 张表                                 │
-└───────────────────────────────────────────────┘
-```
+旧模型下，`mem_memories`、`memory_graph_*`、`mem_edit_log` 等核心表都混在一个数据库里。这样会导致：
 
-27 张表中，约 18 张有 `user_id` 列做行级过滤，约 8 张是全局共享表，1 张混合使用。
+1. **rollback 风险不可接受**  
+   一个用户执行 restore / rollback，本质上是对全表做恢复；如果表里混着所有用户的数据，那么恢复操作天然是全局性的。
 
-### 2.2 安全隐患一览
+2. **snapshot 边界错误**  
+   snapshot 如果基于 account 或共享数据库创建，天然包含其他用户状态；用户 A 的“回到我的某个时刻”会变成“把整库带回某个时刻”。
 
-#### P0 致命：Rollback 摧毁所有用户数据
+3. **branch / diff 只能靠应用层过滤**  
+   数据分支和 diff 如果以 account 或共享表为边界，Rust 层再按 `user_id` 过滤，本质上只是补丁，不是隔离。
 
-`memory_rollback` 硬编码 `"mem_memories"` 表名（`git_tools.rs:420`），不使用 `active_table()` 分支解析：
-
-```rust
-// git_tools.rs:420-425 — 当前实现
-git.restore_table_from_snapshot("mem_memories", &internal).await?;
-for table in &["memory_graph_nodes", "memory_graph_edges", "mem_edit_log"] {
-    let _ = git.restore_table_from_snapshot(table, &internal).await;
-}
-```
-
-`restore_table_from_snapshot` 执行的 SQL（`service.rs:137-143`）：
-
-```sql
-DELETE FROM mem_memories;                                            -- 删除 ALL 用户
-INSERT INTO mem_memories SELECT * FROM mem_memories {SNAPSHOT = 'x'};  -- 恢复 ALL 用户到快照点
-```
-
-**灾难场景**：
-
-```
-T1: User A 创建 snapshot_1 → 记录 A(100条) + B(200条) 的状态
-T2: User B 写入 50 条新记忆 → B 现有 250 条
-T3: User A 执行 memory_rollback(snapshot_1)
-    → DELETE FROM mem_memories (删除所有人的数据)
-    → INSERT ... {SNAPSHOT='snapshot_1'} (恢复到 T1 状态)
-    → User B 丢失 50 条新记忆 ❌
-```
-
-Graph 表 (`memory_graph_nodes`, `memory_graph_edges`) 和审计表 (`mem_edit_log`) 同样被整表恢复。
-
-#### P1 高危：Snapshot 是 Account 级别
-
-```rust
-// service.rs:69
-exec_ddl(&self.pool, &format!("CREATE SNAPSHOT {safe} FOR ACCOUNT sys"))
-```
-
-`FOR ACCOUNT sys` 快照覆盖**整个 account 下所有数据库**。Safety snapshot（`store.rs:1357`）也用 `FOR ACCOUNT sys`。
-
-#### P2 中危：Branch Diff Account 级别泄露
-
-`data branch diff` 是 account 级命令，返回所有用户的行，靠 Rust 层过滤（`service.rs:225-264`）：
-
-```rust
-// service.rs:249-251 — 应用层过滤，非数据库层
-let rows: Vec<DiffRow> = all_rows.into_iter()
-    .filter(|r| r.user_id == user_id)
-    .collect();
-```
-
-### 2.3 完整风险矩阵
-
-| 操作 | 风险等级 | 影响描述 | 代码位置 |
-|------|---------|---------|---------|
-| `memory_rollback` | P0 致命 | 整表 DELETE+INSERT，影响所有用户 | `git_tools.rs:420-425` |
-| `CREATE SNAPSHOT` | P1 高危 | Account 级快照覆盖所有 DB | `service.rs:69` |
-| Safety snapshot | P1 高危 | 同上 | `store.rs:1357` |
-| `data branch diff` | P2 中危 | Account 级，应用层过滤 | `service.rs:225-264` |
-| `admin/trigger_governance` | P3 低危 | Master 权限限制，但操作面广 | `admin.rs:198-287` |
-
+因此，per-user DB 不是“性能优化”，而是 **把版本控制语义落到正确的数据边界上**。
 
 ---
 
-## 3. 架构总览
+## 3. 最终落地架构
 
-### 3.1 目标架构
+### 3.1 数据库布局
 
-```
-MatrixOne Account (sys)
+```text
+MatrixOne account
 |
-+-- memoria_shared                    <-- 全局共享库（系统表）
-|   +-- mem_user_registry             <-- 新增：user_id -> db_name 映射
-|   +-- mem_api_keys                  <-- API 密钥管理
-|   +-- mem_plugin_signers            \
-|   +-- mem_plugin_packages           |
-|   +-- mem_plugin_bindings           +-- 插件系统（6 张表）
-|   +-- mem_plugin_reviews            |
-|   +-- mem_plugin_binding_rules      |
-|   +-- mem_plugin_audit_events       /
-|   +-- mem_governance_runtime_state  <-- 全局熔断器
-|   +-- mem_distributed_locks         <-- 分布式锁
-|   +-- mem_async_tasks               <-- 跨实例异步任务
++-- memoria_shared*                 # shared DB（名字由部署决定，不要求固定）
+|   +-- mem_user_registry
+|   +-- mem_api_keys
+|   +-- mem_distributed_locks
+|   +-- mem_async_tasks
+|   +-- mem_governance_runtime_state
+|   +-- mem_plugin_*
 |
-+-- mem_u_{hash_alice}                <-- User Alice 独立库
-|   +-- mem_memories                  <-- 只有 Alice 的记忆
-|   +-- mem_memories_stats            <-- 访问/反馈统计
-|   +-- mem_user_state                <-- 活跃分支状态
-|   +-- mem_branches                  <-- 分支注册表
-|   +-- mem_snapshots                 <-- 快照注册表
-|   +-- mem_edit_log                  <-- 审计日志
-|   +-- mem_entity_links              <-- 实体链接
-|   +-- mem_entities                  <-- 实体注册
-|   +-- mem_memory_entity_links       <-- 记忆-实体映射
-|   +-- memory_graph_nodes            <-- 知识图谱节点
-|   +-- memory_graph_edges            <-- 知识图谱边
-|   +-- mem_retrieval_feedback        <-- 检索反馈
-|   +-- mem_user_retrieval_params     <-- 自适应检索参数
-|   +-- mem_governance_cooldown       <-- 治理限流
-|   +-- mem_tool_usage                <-- 工具使用统计
-|   +-- mem_api_call_log              <-- API 调用日志
-|   +-- br_mybranch                   <-- 分支表（无需 UUID 前缀）
++-- mem_u_<hash(user_id)>
+|   +-- mem_memories
+|   +-- mem_memories_stats
+|   +-- mem_branches
+|   +-- mem_snapshots
+|   +-- mem_user_state
+|   +-- mem_edit_log
+|   +-- mem_entities
+|   +-- mem_entity_links
+|   +-- mem_memory_entity_links
+|   +-- memory_graph_nodes
+|   +-- memory_graph_edges
+|   +-- mem_retrieval_feedback
+|   +-- mem_user_retrieval_params
+|   +-- mem_governance_cooldown
+|   +-- mem_tool_usage
+|   +-- mem_api_call_log
+|   +-- br_*
 |
-+-- mem_u_{hash_bob}                  <-- User Bob 独立库
-|   +-- (同上 schema)
-|
-+-- ...更多用户库
++-- mem_u_<hash(other_user)>
+    +-- ...
 ```
 
-### 3.2 表分类清单
+### 3.2 shared DB 放什么
 
-#### 共享库表（11 张）
+shared DB 只放 **跨用户共享、跨实例协调、或必须全局查询** 的控制平面数据：
 
-| 表名 | 有 user_id | 用途 | 备注 |
-|------|-----------|------|------|
-| `mem_user_registry` | 是 (PK) | 用户注册与 DB 映射 | **新增** |
-| `mem_api_keys` | 是 | API 密钥认证 | 需跨用户查询验证 token |
-| `mem_async_tasks` | 是 (nullable) | 异步任务跟踪 | 需路由到用户 DB |
-| `mem_distributed_locks` | 否 | 分布式互斥锁 | 全局 |
-| `mem_governance_runtime_state` | 否 | 熔断器状态 | 全局 |
-| `mem_plugin_signers` | 否 | 插件签名者 | 全局 |
-| `mem_plugin_packages` | 否 | 插件包 | 全局 |
-| `mem_plugin_bindings` | 否 | 插件绑定 | 全局 |
-| `mem_plugin_reviews` | 否 | 插件评审 | 全局 |
-| `mem_plugin_binding_rules` | 否 | 插件规则 | 全局 |
-| `mem_plugin_audit_events` | 否 | 插件审计 | 全局 |
+| 表 | 为什么必须留在 shared DB |
+|---|---|
+| `mem_user_registry` | `user_id -> db_name` 路由事实源 |
+| `mem_api_keys` | API key 校验必须跨用户查询 |
+| `mem_distributed_locks` | 分布式锁天然是全局控制面 |
+| `mem_async_tasks` | 跨实例异步任务状态 |
+| `mem_governance_runtime_state` | 治理熔断与运行态 |
+| `mem_plugin_*` | 插件包、签名者、绑定、审计均为全局能力 |
 
-> **Restore 边界规则**: `memory_rollback` 只允许作用于用户库中的业务数据表。`memoria_shared` 中的认证、任务、锁、插件、用户注册等控制平面数据永不纳入用户 restore 作用域；共享库只允许 admin / 运维级备份恢复。
+### 3.3 per-user DB 放什么
 
-#### 用户库表（17 张）
+per-user DB 放两类数据：
 
-| 表名 | 当前有 user_id | 改造后 | 用途 |
-|------|---------------|--------|------|
-| `mem_memories` | 是 | 可选保留 | 核心记忆存储 |
-| `mem_memories_stats` | 是 | 可选保留 | 访问/反馈统计 |
-| `mem_user_state` | 是 (PK) | 可简化 | 活跃分支 |
-| `mem_branches` | 是 | 可选保留 | 分支注册 |
-| `mem_snapshots` | 是 | 可选保留 | 快照注册 |
-| `mem_edit_log` | 是 | 可选保留 | 审计日志 |
-| `mem_entity_links` | 是 | 可选保留 | 实体链接 |
-| `mem_entities` | 是 | 可选保留 | 实体注册 |
-| `mem_memory_entity_links` | 是 | 可选保留 | 记忆-实体映射 |
-| `memory_graph_nodes` | 是 | 可选保留 | 图谱节点 |
-| `memory_graph_edges` | 是 | 可选保留 | 图谱边 |
-| `mem_retrieval_feedback` | 是 | 可选保留 | 检索反馈 |
-| `mem_user_retrieval_params` | 是 (PK) | 可简化 | 自适应参数 |
-| `mem_governance_cooldown` | 是 | 可选保留 | 治理限流 |
-| `mem_tool_usage` | 是 | 可选保留 | 工具统计 |
-| `mem_api_call_log` | 是 | 可选保留 | 调用日志 |
-| `br_*` (动态) | 是 | 去掉 UUID 前缀 | 分支表 |
+1. **业务数据**：记忆、图谱、反馈、调用日志、分支表。
+2. **用户级控制元数据**：`mem_branches`、`mem_snapshots`、`mem_user_state`、`mem_governance_cooldown`。
 
-> **控制元数据说明**: `mem_snapshots`、`mem_branches`、`mem_user_state`、`mem_governance_cooldown` 虽位于用户库，但属于控制元数据而非业务数据；它们负责 snapshot / branch 配额、当前分支与治理节流，默认**不随 `memory_rollback` 回退**。
->
-> 当前配额实现仍沿用现状：snapshot 上限读取 `mem_snapshots`（当前 MCP 常量 `MAX_USER_SNAPSHOTS = 20`），branch 上限读取 `mem_branches`（`MAX_BRANCHES = 20`）。因此这两张表必须保持“当前态”，不能被 restore 回旧版本。
-
-> **Phase 1 策略**: 保留所有 `user_id` 列和 `WHERE user_id = ?` 过滤，降低改造风险，方便灰度回退。
-> **Phase 2 可选优化**: 移除 `user_id` 列，简化索引和查询。
+注意：这些“用户级控制元数据”虽然在用户库里，但它们不是 rollback 的业务恢复目标；它们要保持当前态，否则会出现 branch / snapshot 注册表与底层事实不一致。
 
 ---
 
-## 4. 数据库布局设计
+## 4. 最终实现选择：global user pool + qualified tables
 
-### 4.1 用户注册表
+这次真正落地的不是最初 RFC 里那种“请求期 `USE db` 切换 + per-user pool”方案，而是下面这个版本：
 
-```sql
--- 位于 memoria_shared 库
-CREATE TABLE IF NOT EXISTS mem_user_registry (
-    user_id     VARCHAR(64)  PRIMARY KEY,
-    db_name     VARCHAR(128) NOT NULL UNIQUE,
-    status      VARCHAR(20)  NOT NULL DEFAULT 'active',  -- active / suspended / deleted
-    created_at  DATETIME(6)  NOT NULL,
-    updated_at  DATETIME(6)  NOT NULL,
-    INDEX idx_status (status)
-);
-```
+1. `DbRouter` 维护：
+   - 一个 **shared pool**
+   - 一个 **global user pool**
+2. 路由出来的 user store 本身携带 `db_name`
+3. 用户表通过全限定名访问，例如：
+   - `` `mem_u_53f19f9ab3e3d6f1`.mem_memories ``
+   - `` `mem_u_53f19f9ab3e3d6f1`.memory_graph_nodes ``
+4. shared 表继续走 shared DB 上下文，不做全限定用户库拼接
 
-### 4.2 用户 DB 命名规则
+### 为什么最终没有用 per-user pool
 
-```
-db_name = "mem_u_" + sha256(user_id)[0:16]
+因为 per-user pool 在真实多用户场景下会把问题从“隔离”变成“连接爆炸”：
 
-示例:
-  user_id = "alice@example.com"  -> db_name = "mem_u_a1b2c3d4e5f6g7h8"
-  user_id = "github|12345"       -> db_name = "mem_u_9f8e7d6c5b4a3210"
-```
+1. 用户数上来以后，连接数和空闲池数量线性增长。
+2. LRU 缓存 per-user pool 只能减轻冷用户问题，不能消除冷启动抖动。
+3. `USE db` 配合 statement cache、后台 worker、跨 shared/user 查询时会产生额外复杂性。
 
-- 使用 SHA-256 前 16 位 hex：避免特殊字符，确保唯一性
-- 通过 `mem_user_registry` 保证全局唯一
-- MatrixOne database 名最大 128 字符
+最终方案的取舍是：
 
-### 4.3 首次访问自动创建
+| 方案 | 好处 | 问题 |
+|---|---|---|
+| per-user pool + `USE db` | 语义直接 | 连接爆炸、池管理复杂 |
+| global user pool + qualified tables | 连接数稳定、shared/user 边界清晰 | SQL 需要系统性表名限定 |
 
-用户首次请求时自动创建 database + 初始化 schema（lazy provisioning）：
-
-```
-HTTP Request (user_id: alice)
-  -> DbRouter.resolve_user_db("alice")
-    -> Cache miss -> 查 mem_user_registry
-      -> 不存在 -> CREATE DATABASE mem_u_xxx
-                -> 执行 migrate() 初始化表结构
-                -> INSERT INTO mem_user_registry
-    -> 返回 db_name
-  -> USE mem_u_xxx
-  -> 执行业务 SQL
-```
-
+这也是当前代码最终落地的版本。
 
 ---
 
-## 5. 核心基础设施变更
+## 5. Snapshot / Branch / Restore 的最终边界
 
-### 5.1 DbRouter — 新增核心组件
+### 5.1 用户 rollback 只回退业务数据
 
-**位置**: `memoria-storage/src/router.rs`（新文件）
+用户级 restore / rollback 的边界是：
 
-```rust
-/// 数据库路由器：管理共享库和用户库连接
-pub struct DbRouter {
-    /// 共享库连接池（memoria_shared）
-    /// 用于 auth、plugin、lock 等全局操作
-    shared_pool: MySqlPool,
+| 域 | 典型表 | 是否纳入用户 restore |
+|---|---|---|
+| 业务数据域 | `mem_memories`, `memory_graph_nodes`, `memory_graph_edges`, `mem_edit_log` | 是 |
+| 用户级控制元数据 | `mem_snapshots`, `mem_branches`, `mem_user_state`, `mem_governance_cooldown` | 否，保持当前态 |
+| shared 控制平面 | `mem_user_registry`, `mem_api_keys`, `mem_distributed_locks`, `mem_async_tasks`, `mem_plugin_*` | 否，严禁用户 restore |
 
-    /// 用户库连接池
-    /// 通过 USE {db_name} 切换数据库上下文
-    user_pool: MySqlPool,
+### 5.2 这样设计的原因
 
-    /// 用户注册表缓存 (user_id -> db_name), TTL 60s
-    user_db_cache: Cache<String, String>,
+如果把 `mem_snapshots` / `mem_branches` / `mem_user_state` 一起回退，会出现：
 
-    /// 嵌入向量维度（创建新用户库时需要）
-    embedding_dim: usize,
-}
-```
+1. 物理上还存在的 branch / snapshot，在控制平面里“消失”。
+2. `active_branch` 静默切回旧值。
+3. 快照配额、branch 配额、治理 cooldown 状态和真实系统状态脱节。
 
-#### 核心方法
+因此，**“per-user DB” 不等于 “整库用户随意 restore”**。  
+真正安全的定义是：**业务数据按用户库隔离；控制平面保持当前态并做对账。**
 
-```rust
-impl DbRouter {
-    /// 获取用户 DB 的独占连接（已切换到用户库）
-    pub async fn user_conn(&self, user_id: &str) -> Result<PoolConnection<MySql>> {
-        let db_name = self.resolve_user_db(user_id).await?;
-        let mut conn = self.user_pool.acquire().await?;
-        sqlx::query(&format!("USE {}", validate_identifier(&db_name)?))
-            .execute(&mut *conn)
-            .await?;
-        Ok(conn)
-    }
+### 5.3 Branch / Snapshot 的现实约束
 
-    /// 获取共享库连接（始终在 memoria_shared 上下文）
-    pub async fn shared_conn(&self) -> Result<PoolConnection<MySql>> {
-        self.shared_pool.acquire().await
-            .map_err(|e| MemoriaError::Database(e.to_string()))
-    }
+当前实现里，迁移时会保留已有 `br_*` 物理表名，不做重命名重写。这样做的好处是：
 
-    /// 获取用户的 db_name（不获取连接）
-    pub async fn user_db_name(&self, user_id: &str) -> Result<String> {
-        self.resolve_user_db(user_id).await
-    }
+1. 减少迁移时对 branch metadata 的额外修改。
+2. 避免把“迁移用户数据”扩大成“迁移用户数据 + 重写所有 branch 元数据”。
 
-    /// 解析 user_id -> db_name, 不存在则自动创建
-    async fn resolve_user_db(&self, user_id: &str) -> Result<String> {
-        // 1. 查缓存
-        if let Some(db) = self.user_db_cache.get(user_id) {
-            return Ok(db);
-        }
-        // 2. 查注册表
-        let row = sqlx::query_scalar::<_, String>(
-            "SELECT db_name FROM mem_user_registry WHERE user_id = ? AND status = 'active'"
-        )
-        .bind(user_id)
-        .fetch_optional(&self.shared_pool)
-        .await?;
-
-        if let Some(db_name) = row {
-            self.user_db_cache.insert(user_id.to_string(), db_name.clone());
-            return Ok(db_name);
-        }
-        // 3. 首次访问，创建用户库
-        let db_name = self.provision_user_db(user_id).await?;
-        self.user_db_cache.insert(user_id.to_string(), db_name.clone());
-        Ok(db_name)
-    }
-
-    /// 创建用户库 + 初始化 schema + 注册
-    async fn provision_user_db(&self, user_id: &str) -> Result<String> {
-        let hash = &sha256_hex(user_id)[..16];
-        let db_name = format!("mem_u_{hash}");
-        let safe_db = validate_identifier(&db_name)?;
-
-        // CREATE DATABASE
-        sqlx::query(&format!("CREATE DATABASE IF NOT EXISTS {safe_db}"))
-            .execute(&self.shared_pool).await?;
-
-        // 初始化 schema (USE + migrate)
-        let mut conn = self.user_pool.acquire().await?;
-        sqlx::query(&format!("USE {safe_db}")).execute(&mut *conn).await?;
-        self.migrate_user_db(&mut conn).await?;
-
-        // 注册
-        sqlx::query(
-            "INSERT INTO mem_user_registry \
-             (user_id, db_name, status, created_at, updated_at) \
-             VALUES (?, ?, 'active', NOW(6), NOW(6))"
-        )
-        .bind(user_id).bind(&db_name)
-        .execute(&self.shared_pool).await?;
-
-        Ok(db_name)
-    }
-}
-```
-
-### 5.2 SqlMemoryStore 改造
-
-**文件**: `memoria-storage/src/store.rs`
-
-**改造前**:
-
-```rust
-pub struct SqlMemoryStore {
-    pool: MySqlPool,           // 单一连接池
-    embedding_dim: usize,
-    instance_id: String,
-    // ...caches
-}
-```
-
-**改造后**:
-
-```rust
-pub struct SqlMemoryStore {
-    router: Arc<DbRouter>,     // 替换 pool
-    embedding_dim: usize,
-    instance_id: String,
-    // ...caches (不变)
-}
-```
-
-**connect() 方法改造**（`store.rs:577-628`）:
-
-```rust
-// 改造前
-pub async fn connect(database_url: &str, embedding_dim: usize, instance_id: String) -> Result<Self>
-
-// 改造后
-pub async fn connect(
-    shared_db_url: &str,    // 指向 memoria_shared
-    user_db_url: &str,      // 不指定具体 DB，用 USE 切换
-    embedding_dim: usize,
-    instance_id: String,
-) -> Result<Self>
-```
-
-**查询方法改造模式** — 以 `insert_memory` 为例:
-
-```rust
-// 改造前
-pub async fn insert_memory(&self, user_id: &str, memory: &Memory) -> Result<String> {
-    let table = self.active_table(user_id).await?;
-    sqlx::query(&format!("INSERT INTO {table} ..."))
-        .execute(&self.pool)  // <-- 直接用 pool
-        .await?;
-}
-
-// 改造后
-pub async fn insert_memory(&self, user_id: &str, memory: &Memory) -> Result<String> {
-    let mut conn = self.router.user_conn(user_id).await?;  // <-- 获取用户 DB 连接
-    let table = self.active_table_from_conn(&mut conn, user_id).await?;
-    sqlx::query(&format!("INSERT INTO {table} ..."))
-        .execute(&mut *conn)  // <-- 使用用户连接
-        .await?;
-}
-```
-
-**共享表操作模式** — 以 `verify_api_key` 为例:
-
-```rust
-// 改造后
-pub async fn verify_api_key(&self, key_hash: &str) -> Result<Option<ApiKey>> {
-    let mut conn = self.router.shared_conn().await?;  // <-- 共享库连接
-    sqlx::query_as("SELECT * FROM mem_api_keys WHERE key_hash = ? AND is_active = 1")
-        .bind(key_hash)
-        .fetch_optional(&mut *conn)
-        .await
-}
-```
-
-### 5.3 GitForDataService 改造
-
-**文件**: `memoria-git/src/service.rs`
-
-**改造前**:
-
-```rust
-pub struct GitForDataService {
-    pool: MySqlPool,
-    db_name: String,        // 固定一个 DB 名
-}
-```
-
-**改造后**:
-
-```rust
-pub struct GitForDataService {
-    pool: MySqlPool,
-    // db_name 移除 — 由调用方传入 user_db
-}
-```
-
-**所有 public 方法增加 `user_db: &str` 参数**:
-
-| 方法 | 改造点 |
-|------|--------|
-| `create_snapshot(name, user_db)` | `CREATE SNAPSHOT {name} FOR DATABASE {user_db}` |
-| `list_snapshots()` | `SHOW SNAPSHOTS` + 过滤 `DATABASE_NAME` |
-| `drop_snapshot(name)` | `DROP SNAPSHOT {name}` (验证 database 作用域) |
-| `restore_table_from_snapshot(table, snap, user_db)` | 全限定名 `{user_db}.{table}` |
-| `create_branch(branch, source, user_db)` | `data branch create table {user_db}.{branch} from {user_db}.{source}` |
-| `create_branch_from_snapshot(...)` | 同上 + `{snapshot = '...'}` |
-| `drop_branch(branch, user_db)` | `data branch delete table {user_db}.{branch}` |
-| `merge_branch(branch, main, user_db)` | 全限定名 |
-| `diff_branch_rows(branch, main, user_db, limit)` | 全限定名，**去掉应用层 user_id 过滤**（天然隔离） |
-| `count_at_snapshot(table, snap, user_db)` | 全限定名 |
-
-### 5.4 MemoryService 改造
-
-**文件**: `memoria-service/src/service.rs`
-
-`MemoryService` 持有 `Arc<SqlMemoryStore>` 和 `Arc<GitForDataService>`。主要影响：
-
-1. **构造函数** (`new_sql_with_llm`, L377-475):
-   - `SqlMemoryStore` 改用 `DbRouter`，构造方式变化
-   - 后台 worker pool（entity extraction, graph isolation）需要感知 user DB
-
-2. **EditLogBuffer** (L95-267):
-   - 当前 flush 到共享的 `mem_edit_log`
-   - 改造后: flush 时需根据 `user_id` 路由到用户 DB
-   - 批量 flush 按 user_id 分组
-
-3. **AccessCounter** (L95-161):
-   - 当前 flush 到共享的 `mem_memories_stats`
-   - 改造后: 按 user_id 分组路由
-
-4. **所有 public 方法** — 已有 `user_id` 参数，改为通过 `router.user_conn(user_id)` 获取连接即可。
-
-### 5.5 Config 改造
-
-**文件**: `memoria-service/src/config.rs`
-
-```rust
-// 改造前
-pub struct Config {
-    pub db_url: String,      // 单一 DB URL
-    pub db_name: String,     // 单一 DB 名
-    // ...
-}
-
-// 改造后
-pub struct Config {
-    pub shared_db_url: String,  // 共享库 URL (memoria_shared)
-    pub user_db_url: String,    // 用户库 URL (不含具体 DB，用 USE 切换)
-    pub db_name: String,        // 保留向后兼容
-    // ...
-}
-```
-
-环境变量:
-
-| 变量 | 用途 | 默认值 |
-|------|------|--------|
-| `DATABASE_URL` | 向后兼容（单 DB 模式） | `mysql://root:111@localhost:6001/memoria` |
-| `SHARED_DB_URL` | 共享库连接（新） | 自动从 DATABASE_URL 推导 |
-| `MEMORIA_MULTI_DB` | 启用 per-user DB 模式 | `false`（Phase 1 灰度开关） |
-
+代价是历史 `br_*` 名字不会因为 per-user DB 而变得更漂亮；这是有意接受的兼容性取舍。
 
 ---
 
-## 6. Snapshot / Branch / Restore 隔离设计
+## 6. 迁移流程（正式 runbook）
 
-### 6.1 Snapshot 隔离
+这一节描述的是 **旧单库 -> 新 shared DB + per-user DB** 的正式迁移流程。
 
-| 维度 | 改造前 | 改造后 |
-|------|--------|--------|
-| 创建 | `CREATE SNAPSHOT s1 FOR ACCOUNT sys` | `CREATE SNAPSHOT s1 FOR DATABASE mem_u_xxx` |
-| 粒度 | Account 级（所有 DB） | Database 级（单用户） |
-| 列表 | `SHOW SNAPSHOTS` (全部) | `SHOW SNAPSHOTS` + 过滤 `DATABASE_NAME = user_db` |
-| 时间旅行 | `{SNAPSHOT = 's1'}` (全部) | `{SNAPSHOT = 's1'}` (仅该 DB) |
-| 删除 | `DROP SNAPSHOT s1` | `DROP SNAPSHOT s1`（需验证 database 作用域） |
-| 命名空间 | 全局共享，需 prefix 区分 | Per-database，天然隔离 |
+### 6.1 迁移 CLI
 
-**Safety Snapshot 改造**（`store.rs:1348-1383`）:
-
-```rust
-// 改造前
-let sql = format!("CREATE SNAPSHOT {name} FOR ACCOUNT sys");
-
-// 改造后
-let user_db = self.router.user_db_name(user_id).await?;
-let sql = format!("CREATE SNAPSHOT {name} FOR DATABASE {user_db}");
-```
-
-**Snapshot 命名简化**:
-
-Per-user DB 后，snapshot 命名空间天然隔离。可以考虑：
-- 保留 `mem_snap_` 前缀（兼容性）
-- 但**不再需要** UUID 段来防用户间冲突
-- `mem_milestone_` 自动快照仍然保留
-
-### 6.2 Restore / Rollback 隔离
-
-**这是本次改造解决的核心安全问题。**
-
-```
-改造前（致命）:
-  DELETE FROM mem_memories;                               <-- 删除 ALL 用户
-  INSERT INTO mem_memories SELECT * FROM ... {SNAPSHOT};   <-- 恢复 ALL 用户
-
-改造后（安全）:
-  DELETE FROM mem_u_alice.mem_memories;                    <-- 只删 Alice
-  INSERT INTO mem_u_alice.mem_memories SELECT * FROM ...;  <-- 只恢复 Alice
-```
-
-由于 `mem_memories` 在用户 DB 中只有该用户的数据，即使 `memory_rollback` 继续硬编码 `"mem_memories"` 也是安全的。但建议同时修复为使用 `active_table()` 以支持分支回滚场景。
-
-**Graph 表恢复同理安全**:
-
-```rust
-// 改造后，graph 表也在用户 DB 内，天然隔离
-for table in &["memory_graph_nodes", "memory_graph_edges", "mem_edit_log"] {
-    let _ = git.restore_table_from_snapshot(table, &internal, &user_db).await;
-}
-```
-
-**Restore 必须保持“业务数据域恢复”，不能演进成整库 restore**:
-
-| 域 | 典型表 | restore 行为 | 原因 |
-|----|--------|--------------|------|
-| 业务数据域 | `mem_memories`, `memory_graph_nodes`, `memory_graph_edges`, `mem_edit_log` | 回退到 snapshot | 用户真正希望回滚的数据 |
-| 用户控制元数据域 | `mem_snapshots`, `mem_branches`, `mem_user_state`, `mem_governance_cooldown` | 保持当前态 | 防止 quota / active branch / cooldown 被用户回滚 |
-| 共享控制平面 | `memoria_shared.*` | 严禁用户 restore | 认证、锁、异步任务、插件与用户路由均属全局控制面 |
-
-**为什么不能回滚控制元数据**:
-
-- 回滚 `mem_snapshots` 会让快照注册表回到旧状态，但 MatrixOne 中后续创建的 DB snapshot 仍存在，形成 orphan snapshot，用户不可见但继续占配额。
-- 回滚 `mem_branches` 会让仍存在的 `br_*` 表失去注册记录，导致分支不可管理，或后续创建时出现重名冲突。
-- 回滚 `mem_user_state` 可能把 `active_branch` 指针静默切回旧值，造成用户无感切分支。
-- 回滚 `mem_governance_cooldown` 可能绕过或异常放大治理节流。
-
-**恢复后对账机制（新增强制步骤）**:
-
-1. **缓存失效**：清理当前用户的 active-branch / cooldown 等本地缓存，避免实例继续使用 restore 前状态。
-2. **Snapshot 对账**：
-   - 事实源：`git.list_snapshots()` / `SHOW SNAPSHOTS`，并过滤当前 `user_db`
-   - 控制面：`mem_snapshots`
-   - `注册有 / 实际无` → 将 `mem_snapshots.status` 标记为 `deleted` 并告警
-   - `实际有 / 注册无`（`mem_snap_` 前缀） → 自动补注册，确保用户可见、可删、并正确计入配额
-3. **Branch 对账**：
-   - 事实源：`SHOW TABLES LIKE 'br_%'` / `information_schema`
-   - 控制面：`mem_branches`
-   - `注册有 / 实际无` → 标记 `deleted` 并告警
-   - `实际有 / 注册无` → 自动补注册，避免“有表无控制面”
-4. **配额统计**：snapshot 上限继续基于 `mem_snapshots`，branch 上限继续基于 `mem_branches`；但 create / list / delete 之前先执行轻量对账或读取最近一次对账缓存。
-
-> **安全原则**: 对账优先“补注册”而不是“自动删除”，避免误删用户仍需保留的数据。共享库中的 `mem_api_keys`、`mem_distributed_locks`、`mem_async_tasks`、`mem_user_registry` 与 `mem_plugin_*` 永远不受用户 restore 影响。
-
-### 6.3 Branch 隔离
-
-| 维度 | 改造前 | 改造后 |
-|------|--------|--------|
-| 创建 | `data branch create table br_a1b2c3d4_mybranch from mem_memories` | `data branch create table mem_u_xxx.br_mybranch from mem_u_xxx.mem_memories` |
-| 命名 | `br_{uuid8}_{name}` 防冲突 | `br_{name}` 天然隔离 |
-| 删除 | `data branch delete table memoria.br_xxx` | `data branch delete table mem_u_xxx.br_xxx` |
-| Merge | 全表 merge + 应用层过滤 | 用户 DB 内 merge，无需过滤 |
-| Diff | Account 级 + Rust 过滤 | 用户 DB 内 diff，天然只有该用户数据 |
-
-**分支表命名简化**（`git_tools.rs:486-487`）:
-
-```rust
-// 改造前 — 需要 UUID 防冲突
-let table_name = format!("br_{}_{}", &Uuid::new_v4().simple().to_string()[..8], safe);
-
-// 改造后 — 用户 DB 内唯一即可
-let table_name = format!("br_{}", safe);
-```
-
-### 6.4 改造后安全矩阵
-
-| 操作 | 当前风险 | 改造后 | 说明 |
-|------|---------|--------|------|
-| `memory_rollback` | P0 致命 | 安全 | 只恢复业务数据表；共享/控制元数据不回退；restore 后执行 snapshot/branch 对账 |
-| `memory_snapshot` | P1 高危 | 安全 | `FOR DATABASE` 只快照用户 DB |
-| `memory_snapshot_delete` | P2 中危 | 安全 | Database 作用域 |
-| `memory_branch` | 安全 | 安全 | 用户 DB 内创建 |
-| `memory_merge` | 安全 | 安全 | 用户 DB 内合并 |
-| `memory_diff` | P2 中危 | 安全 | 用户 DB 内 diff，无需过滤 |
-| `memory_checkout` | 安全 | 安全 | 切换用户 DB 内分支 |
-| `memory_store` | 安全 | 安全 | INSERT 到用户 DB |
-| `memory_retrieve` | 安全 | 安全 | SELECT 从用户 DB |
-| `memory_purge` | 安全 | 安全 | DELETE 在用户 DB |
-| `memory_governance` | 安全 | 安全 | Safety snapshot 改 FOR DATABASE |
-| `admin/delete_user` | 安全 | 更佳 | `DROP DATABASE` 一步到位 |
-
-
----
-
-## 7. 受影响模块逐项分析
-
-### 7.1 memoria-storage (核心改造)
-
-| 文件 | 影响 | 改造内容 |
-|------|------|---------|
-| `store.rs` SqlMemoryStore struct | 大 | `pool` -> `router: Arc<DbRouter>` |
-| `store.rs` `connect()` (L577-628) | 大 | 初始化 DbRouter，创建双池 |
-| `store.rs` `migrate()` (L662-1200) | 中 | 拆分为 `migrate_shared()` + `migrate_user()` |
-| `store.rs` `active_table()` (L1530-1571) | 小 | 改用 conn 参数而非 pool |
-| `store.rs` 所有查询方法 (~80个) | 中 | `&self.pool` -> `&mut *conn` |
-| `store.rs` `create_safety_snapshot()` (L1348) | 小 | `FOR ACCOUNT` -> `FOR DATABASE` |
-| `store.rs` snapshot/branch 注册方法 (L1530-1776) | 小 | 已在用户 DB，逻辑不变 |
-| `graph/store.rs` graph 表操作 | 中 | 同上模式，改用 conn |
-| `graph/retriever.rs` 检索管线 | 中 | 同上模式 |
-| **新增** `router.rs` DbRouter | 新 | 全新模块 |
-
-### 7.2 memoria-git (Snapshot/Branch DDL)
-
-| 文件 | 影响 | 改造内容 |
-|------|------|---------|
-| `service.rs` struct | 中 | 移除 `db_name` 字段 |
-| `service.rs` `create_snapshot()` (L65-75) | 中 | `FOR ACCOUNT sys` -> `FOR DATABASE {user_db}` |
-| `service.rs` `list_snapshots()` (L78-101) | 小 | 增加 database 过滤 |
-| `service.rs` `drop_snapshot()` (L109-112) | 小 | 验证 database 作用域 |
-| `service.rs` `restore_table_from_snapshot()` (L114-147) | 中 | 全限定名 `{user_db}.{table}` |
-| `service.rs` `create_branch()` (L151-164) | 中 | 全限定名 |
-| `service.rs` `create_branch_from_snapshot()` (L166-184) | 中 | 全限定名 |
-| `service.rs` `drop_branch()` (L186-190) | 小 | 改用 `{user_db}.{branch}` |
-| `service.rs` `merge_branch()` (L192-207) | 中 | 全限定名 |
-| `service.rs` `diff_branch_rows()` (L209-264) | 中 | 全限定名 + **去掉应用层过滤** |
-| `service.rs` `count_at_snapshot()` (L267-283) | 小 | 全限定名 |
-
-### 7.3 memoria-service (业务层)
-
-| 文件 | 影响 | 改造内容 |
-|------|------|---------|
-| `service.rs` `MemoryService::new_sql_with_llm()` (L377-475) | 中 | 构造 DbRouter, 传递给 store |
-| `service.rs` EditLogBuffer (L95-267) | 中 | flush 按 user_id 分组路由 |
-| `service.rs` AccessCounter (L95-161) | 中 | flush 按 user_id 分组路由 |
-| `service.rs` `store_memory()` (L883) | 小 | 透传到 store（store 负责路由） |
-| `service.rs` `retrieve()` (L1103) | 小 | 同上 |
-| `service.rs` 其他业务方法 (~30个) | 小 | 同上 |
-| `config.rs` Config struct (L32-69) | 小 | 增加 `shared_db_url`, `multi_db` 开关 |
-| `governance.rs` 定时任务 (L332-338) | 中 | 遍历用户 DB 执行治理 |
-| `vector_index_monitor.rs` | 小 | 需感知 user DB |
-
-### 7.4 memoria-mcp (MCP 工具层)
-
-| 文件 | 影响 | 改造内容 |
-|------|------|---------|
-| `git_tools.rs` `call()` 分发 (L304+) | 中 | 获取 `user_db` 传给 git service |
-| `git_tools.rs` `memory_rollback` (L414-427) | 高 | 核心修复点 |
-| `git_tools.rs` `memory_snapshot` (L307-344) | 中 | 传 user_db |
-| `git_tools.rs` `memory_branch` (L429-503) | 中 | 去掉 UUID 前缀，传 user_db |
-| `git_tools.rs` `memory_merge` (L552-713) | 中 | 全限定名 |
-| `git_tools.rs` `memory_diff` (L738-796) | 小 | 去掉应用层过滤 |
-| `git_tools.rs` `visible_snapshots_for_user()` (L106-152) | 小 | 过滤 database 级快照 |
-| `tools.rs` 核心 MCP tools (L151-1166) | 小 | 透传到 service（不直接操作 DB） |
-| `server.rs` `dispatch()` (L230-291) | 小 | 不变，user_id 已正确传递 |
-
-### 7.5 memoria-api (REST API 层)
-
-| 文件 | 影响 | 改造内容 |
-|------|------|---------|
-| `routes/memory.rs` CRUD endpoints | 小 | 透传 service（不直接操作 DB） |
-| `routes/snapshots.rs` snapshot/branch endpoints | 小 | 透传 git_tools |
-| `routes/governance.rs` 治理端点 | 小 | 透传 service |
-| `routes/admin.rs` `system_stats` | 中 | 需遍历用户 DB 聚合 |
-| `routes/admin.rs` `list_users` | 小 | 改查 `mem_user_registry` |
-| `routes/admin.rs` `delete_user` | 中 | 改为 `DROP DATABASE` |
-| `routes/admin.rs` `trigger_governance` | 中 | 切换到用户 DB 执行 |
-| `routes/admin.rs` health endpoints | 小 | 用户级别已有 user_id |
-| `routes/auth.rs` key management | 小 | 改用 `shared_conn()` |
-| `routes/metrics.rs` `/metrics` | 中 | 需跨库聚合（见第 8 章） |
-| `lib.rs` AppState & middleware | 小 | 持有 DbRouter 引用 |
-
-### 7.6 API 端点完整影响清单
-
-#### 无需修改逻辑的端点（透传 service/git_tools）
-
-这些端点只调用 service 层方法，service 内部通过 DbRouter 自动路由：
-
-| Method | Path | Handler |
-|--------|------|---------|
-| GET | `/health` | `health` |
-| GET | `/health/instance` | `health_instance` |
-| GET/POST | `/v1/memories` | `list_memories`, `store_memory` |
-| POST | `/v1/memories/batch` | `batch_store` |
-| POST | `/v1/memories/retrieve` | `retrieve` |
-| POST | `/v1/memories/search` | `search` |
-| GET | `/v1/memories/:id` | `get_memory` |
-| PUT | `/v1/memories/:id/correct` | `correct_memory` |
-| POST | `/v1/memories/correct` | `correct_by_query` |
-| DELETE | `/v1/memories/:id` | `delete_memory` |
-| POST | `/v1/memories/purge` | `purge_memories` |
-| GET | `/v1/memories/:id/history` | `get_memory_history` |
-| GET | `/v1/profiles/:id` | `get_profile` |
-| POST | `/v1/observe` | `observe_turn` |
-| POST | `/v1/memories/:id/feedback` | `record_feedback` |
-| GET | `/v1/feedback/*` | feedback stats |
-| GET/PUT | `/v1/retrieval-params` | retrieval params |
-| POST | `/v1/retrieval-params/tune` | auto-tune |
-| POST | `/v1/governance` | governance |
-| POST | `/v1/consolidate` | consolidate |
-| POST | `/v1/reflect` | reflect |
-| POST | `/v1/extract-entities` | entity extraction |
-| GET | `/v1/entities` | entity list |
-| POST | `/v1/pipeline/run` | pipeline |
-| POST | `/v1/sessions/:id/summary` | session summary |
-| GET/POST/DELETE | `/v1/snapshots/*` | snapshot ops |
-| GET/POST/DELETE | `/v1/branches/*` | branch ops |
-| GET | `/v1/health/*` | user health checks |
-
-#### 需要修改的端点
-
-| Method | Path | 改造点 |
-|--------|------|--------|
-| GET | `/admin/stats` | 遍历 `mem_user_registry` 聚合跨库统计 |
-| GET | `/admin/users` | 改查 `memoria_shared.mem_user_registry` |
-| GET | `/admin/users/:id/stats` | 路由到用户 DB 查询 |
-| DELETE | `/admin/users/:id` | `DROP DATABASE` + 清理注册表 + 撤销 keys |
-| POST | `/admin/governance/:id/trigger` | 路由到用户 DB 执行治理 |
-| GET | `/admin/health/hygiene` | 遍历用户 DB 聚合 |
-| POST/GET/DELETE | `/auth/keys/*` | 改用 `shared_conn()` 操作 `mem_api_keys` |
-| GET | `/metrics` | 跨库聚合（见第 8 章） |
-
-### 7.7 MCP Tools 影响分析
-
-| Tool | 当前风险 | 改造方式 | 改造后安全性 |
-|------|----------|----------|------------|
-| `memory_store` | 无 | 切换 DB | 安全 |
-| `memory_retrieve` | 无 | 切换 DB | 安全 |
-| `memory_correct` | 无 | 切换 DB | 安全 |
-| `memory_purge` | 无 | 切换 DB + safety snapshot 改 FOR DATABASE | 安全 |
-| `memory_rollback` | **P0 致命** | 切换 DB（核心修复） | 安全 |
-| `memory_snapshot` | **P1 高危** | FOR DATABASE | 安全 |
-| `memory_snapshot_delete` | P2 中危 | 验证 database 作用域 | 安全 |
-| `memory_branch` | 无 | 全限定表名 | 安全 |
-| `memory_merge` | 无 | 全限定表名 | 安全 |
-| `memory_diff` | **P2 中危** | 全限定表名（天然隔离） | 安全 |
-| `memory_checkout` | 无 | 切换 DB | 安全 |
-| `memory_governance` | 无 | 切换 DB + safety snapshot 改 FOR DATABASE | 安全 |
-| `memory_consolidate` | 无 | 切换 DB | 安全 |
-| `memory_reflect` | 无 | 切换 DB | 安全 |
-| `memory_feedback` | 无 | 切换 DB | 安全 |
-
-
----
-
-## 8. 后台任务与监控
-
-### 8.1 后台任务改造
-
-| 任务 | 当前行为 | 改造方案 |
-|------|---------|---------|
-| **EditLogBuffer** (2s flush) | 批量 INSERT `mem_edit_log` | 按 `user_id` 分组，每组路由到对应用户 DB |
-| **AccessCounter** (5s flush) | 批量 UPDATE `mem_memories_stats` | 按 `user_id` 分组路由 |
-| **VectorIndexMonitor** | 监控单 DB 查询延迟 | 分用户 DB 监控，或聚合后判断 |
-| **ConnectionPoolMonitor** (30s) | 监控单池 | 监控 shared_pool + user_pool 两个池 |
-| **RestoreReconciler** (post-rollback) | 无 | `memory_rollback` 完成后触发；在 shared `mem_async_tasks` 记录任务，执行 snapshot/branch 对账与缓存失效 |
-
-> `RestoreReconciler` 的任务状态保存在共享库，因此用户 restore 不会把“修复控制面元数据”的任务自己回滚掉。
-
-### 8.2 定时治理任务
-
-**文件**: `governance.rs`
-
-当前三个定时任务：
-
-| 任务 | 间隔 | 改造方案 |
-|------|------|---------|
-| Hourly | 3600s | 遍历 `mem_user_registry` -> 对每个活跃用户 DB 执行 |
-| Daily | 86400s | 同上 |
-| Weekly | 604800s | 同上 + 清理 per-user DB 级快照/分支 |
-
-**关键改造**: `list_active_users()` 当前从 `mem_memories` 聚合 `DISTINCT user_id`，改为从 `mem_user_registry` 查询。
-
-```rust
-// 改造前 (governance.rs:62)
-let users = store.list_active_users().await?;
-// -> SELECT DISTINCT user_id FROM mem_memories WHERE is_active = 1
-
-// 改造后
-let users = router.shared_conn().await?
-    .fetch_all("SELECT user_id, db_name FROM mem_user_registry WHERE status = 'active'")
-    .await?;
-
-for (user_id, db_name) in users {
-    let mut conn = router.user_conn(&user_id).await?;
-    // 在用户 DB 上下文中执行治理
-    governance_for_user(&mut conn, &user_id).await?;
-}
-```
-
-### 8.3 Prometheus Metrics 改造
-
-**文件**: `routes/metrics.rs`
-
-当前查询共享的 `mem_memories` 等表聚合全局统计。改造后需跨库聚合：
-
-| Metric | 当前数据源 | 改造方案 |
-|--------|-----------|---------|
-| `memoria_memories_total` | `COUNT(*) FROM mem_memories` | 遍历用户 DB 或用注册表估算 |
-| `memoria_users_total` | `COUNT(DISTINCT user_id)` | 直接查 `mem_user_registry` |
-| `memoria_feedback_total` | `COUNT(*) FROM mem_retrieval_feedback` | 遍历用户 DB |
-| `memoria_graph_nodes_total` | `COUNT(*) FROM memory_graph_nodes` | 遍历用户 DB |
-| `memoria_branches_total` | `COUNT(DISTINCT ...)` | 遍历用户 DB |
-
-**优化方案**:
-- Metrics 缓存 TTL 适当延长（如 60s）
-- 后台定时聚合线程，而非请求时遍历
-- 或在 `mem_user_registry` 增加 `memory_count` 等聚合字段，写入时异步更新
-
----
-
-## 9. CLI 与 Init 适配
-
-### 9.1 CLI 命令改造
-
-**文件**: `memoria-cli/src/main.rs`
-
-#### `memoria serve` (L354-409)
-
-```rust
-// 改造前
-let store = SqlMemoryStore::connect(&cfg.db_url, cfg.embedding_dim, ...).await?;
-let pool = MySqlPool::connect(&cfg.db_url).await?;
-let git = Arc::new(GitForDataService::new(pool, &cfg.db_name));
-
-// 改造后
-let router = Arc::new(DbRouter::connect(
-    &cfg.shared_db_url, &cfg.user_db_url, cfg.embedding_dim
-).await?);
-router.migrate_shared().await?;  // 迁移共享库 schema
-let store = SqlMemoryStore::new(router.clone(), cfg.embedding_dim, cfg.instance_id);
-let git = Arc::new(GitForDataService::new(router.user_pool().clone()));
-```
-
-#### `memoria mcp` -- Embedded Mode (L453-521)
-
-```rust
-// 改造后: 支持 multi-db
-if cfg.multi_db {
-    let router = Arc::new(DbRouter::connect(...).await?);
-    // ...
-} else {
-    // 向后兼容单 DB 模式
-    let store = SqlMemoryStore::connect_legacy(&cfg.db_url, ...).await?;
-}
-```
-
-#### `memoria mcp` -- Remote Mode (L440-451)
-
-**无需改造**: Remote 模式通过 HTTP 代理到 API 服务器，数据库路由在服务端处理。
-
-### 9.2 Init 命令适配
-
-**文件**: `memoria-cli/src/main.rs` -- `mcp_entry()` (L970-1040)
-
-当前生成的 MCP 配置中包含 `--db-url` 参数。多 DB 模式下：
-
-| 参数 | 单 DB 模式 | 多 DB 模式 |
-|------|-----------|-----------|
-| `--db-url` | `mysql://root:111@localhost:6001/memoria` | 不指定具体 DB: `mysql://root:111@localhost:6001` |
-| `--shared-db` | 不需要 | `memoria_shared`（新增） |
-| `--multi-db` | 不需要 | flag 开关（新增） |
-| `--user` | 有效 | 有效（用于 DB 路由） |
-
-### 9.3 user_id 流转（不变）
-
-当前 user_id 流转路径无需改变：
-
-```
-CLI --user "alice"
-  -> Config.user
-    -> run_stdio(service, git, cfg.user)
-      -> dispatch(method, params, mode, user_id)
-        -> tools::call(name, args, service, user_id)
-          -> service.store_memory(user_id, ...)    // user_id 用于 DB 路由
-            -> store.router.user_conn(user_id)     // 获取用户 DB 连接
-```
-
----
-
-## 10. 迁移策略
-
-### 10.1 灰度开关
-
-通过 `MEMORIA_MULTI_DB=true` 环境变量启用新架构。Phase 1 期间两种模式并存：
-
-```rust
-enum StoreMode {
-    /// 传统单 DB 模式（默认）
-    Legacy { pool: MySqlPool },
-    /// 多 DB 模式
-    MultiDb { router: Arc<DbRouter> },
-}
-```
-
-### 10.2 正式 migration CLI 形态
-
-新增正式离线迁移入口：
+当前正式命令是：
 
 ```bash
-# 1) dry-run（默认，不改目标库）
+# dry-run（默认）
 memoria migrate legacy-to-multi-db \
-  --legacy-db-url mysql://root:111@host:6001/memoria \
-  --shared-db-url mysql://root:111@host:6001/memoria_shared \
+  --legacy-db-url mysql://user:pass@host:6001/memoria_legacy \
+  --shared-db-url mysql://user:pass@host:6001/memoria_shared \
+  --embedding-dim 1024 \
   --report-out migration-plan.json
 
-# 2) execute（真正执行）
+# execute（真正执行）
 memoria migrate legacy-to-multi-db \
-  --legacy-db-url mysql://root:111@host:6001/memoria \
-  --shared-db-url mysql://root:111@host:6001/memoria_shared \
+  --legacy-db-url mysql://user:pass@host:6001/memoria_legacy \
+  --shared-db-url mysql://user:pass@host:6001/memoria_shared \
+  --embedding-dim 1024 \
+  --concurrency 4 \
   --execute \
   --report-out migration-run.json
 ```
 
-**命令语义**：
+也支持：
 
-- 默认 **dry-run**：只读取 legacy DB，输出计划与风险，不创建 shared DB / user DB，不写任何目标表。
-- `--execute`：执行真实迁移。该模式要求业务写入已冻结（maintenance window / offline cutover），并且会先 **创建一个 MatrixOne account 级 safety snapshot**；只有 snapshot 创建成功后，才会继续 reset 目标 shared DB 和目标 user DB，再执行纯 `INSERT ... SELECT` 复制。
-- `--user alice --user bob`：仅迁移指定用户的**用户态数据**，主要用于 rehearsal / troubleshooting；共享持久表仍按全集同步，不建议把它当成正式灰度切流工具。
-- `--report-out`：输出完整 JSON 报告，便于变更单、审计和复盘。
-
-**当前 CLI 的安全边界**：
-
-1. 复制 **共享持久表**：`mem_api_keys`、`mem_governance_runtime_state`、`mem_plugin_*`
-2. **不复制共享运行态表**：`mem_distributed_locks`、`mem_async_tasks`，目标集群启动后重新建立
-3. 对每个用户：
-   - 重建对应的 `mem_u_*` 目标库
-   - 按 `user_id` 复制用户级表
-   - 复制 `mem_memories_stats`（按 `memory_id` 归属）
-   - 复制物理分支表 `br_*`
-   - 校验源/目标行数
-4. **Fail fast**：如果 legacy DB 中仍存在 `mem_snapshots.status = 'active'` 的快照，CLI 会拒绝 execute；当前版本**不会**把旧 shared-db snapshot 物化成新的 per-user DB snapshot。
-
-### 10.3 运维执行流程（operator runbook）
-
-**谁执行**：运维 / SRE / 发布负责人。不是普通用户命令，也不是每次发版都要跑。
-
-**什么时候执行**：
-
-- 旧单库架构 -> 新 per-user DB 架构的正式 cutover
-- staging / pre-prod 预演
-- 用 legacy 备份重建一套 multi-db 环境
-
-**推荐步骤**：
-
-1. **预检查（可在线）**
-   - 确认新版本代码已部署好，但仍保持 `MEMORIA_MULTI_DB=false`
-   - 先跑一次 dry-run，导出 `migration-plan.json`
-   - 检查报告中的：
-     - 用户数是否符合预期
-     - 是否存在 active legacy snapshots（若有，先清理或接受手工重建）
-     - branch 表数量、共享表数量是否异常
-
-2. **进入 maintenance window**
-   - 停止旧 API 写流量，冻结 MCP / REST 写入
-   - 保留 legacy DB 作为回滚基线，不要提前删库
-
-3. **执行迁移**
-   - 运行 `memoria migrate legacy-to-multi-db ... --execute`
-   - 观察 stdout / `migration-run.json`
-   - execute 会先自动创建一个 account snapshot；如果这一步失败，迁移会直接终止，不会继续改目标库
-   - account snapshot 名保持 `mem_migrate_account_pre_*_<uuid8>` 前缀风格；如果 legacy 库名过长，会自动截断中间的库名片段，确保不超过 MatrixOne 的 64 字符标识符限制
-   - 注意：`--execute` 会清空并重建目标 `shared_db_url` 以及本次涉及的每个 `mem_u_*`，不要把它指向仍需保留业务数据的库
-   - 期望结果：
-      - 报告中能看到 pre-execute account snapshot 名称，便于必要时整账号 restore
-      - `memoria_shared` 只包含 control-plane 表
-      - 每个用户都映射到唯一 `mem_u_*`
-     - 物理 branch 表 `br_*` 已复制到目标用户库
-
-4. **切换新架构**
-   - 启动新 API / MCP，设置 `MEMORIA_MULTI_DB=true`
-   - smoke check：
-     - 老 API key 仍可认证
-     - 关键用户的 branch / checkout / merge 正常
-     - snapshot / rollback 对新创建快照正常
-     - `/admin/users`、`/admin/stats`、`/metrics` 正常
-
-5. **观察期**
-   - legacy DB 至少保留 7 天
-   - 观察跨实例写入、后台任务、治理任务、恢复路径
-
-6. **回滚**
-   - 若 cutover 后发现问题：停止 multi-db API
-   - 优先根据 execute 报告里记录的 pre-execute account snapshot 执行整账号 restore
-   - 恢复旧配置：`MEMORIA_MULTI_DB=false`，重新指向 legacy `DATABASE_URL`
-   - 确认 legacy DB 已回到 cutover 前状态后，再继续使用 legacy DB 提供服务
-   - 保留已生成的 shared / `mem_u_*` 目标库用于排障，不要立即销毁
-
-### 10.4 分支表迁移
-
-分支表（`br_*`）需特殊处理；当前正式 CLI 的策略是**保留物理表名原样复制**，不做 rename：
-
-```sql
--- 1. 查 mem_branches 获取 user_id -> table_name 映射
-SELECT user_id, name, table_name
-FROM memoria.mem_branches
-WHERE status = 'active';
-
--- 2. 在目标用户 DB 中重建同名物理表
-CREATE TABLE mem_u_xxx.br_a1b2c3d4_mybranch LIKE memoria.br_a1b2c3d4_mybranch;
-
--- 3. 复制数据
-INSERT INTO mem_u_xxx.br_a1b2c3d4_mybranch
-SELECT * FROM memoria.br_a1b2c3d4_mybranch;
+```bash
+memoria migrate legacy-to-multi-db \
+  --legacy-db-url ... \
+  --shared-db-url ... \
+  --user alice \
+  --user bob
 ```
 
-**原因**：
+这个 `--user` 主要用于 rehearsal / troubleshooting，不建议当正式灰度切流机制使用。
 
-- 当前运行时 `mem_branches.table_name` 直接作为 active table / merge / diff 的事实源
-- 保留原表名可以避免迁移阶段额外做 metadata rewrite
-- branch metadata 与 physical table 都按显式列复制，避免列顺序漂移
+### 6.2 dry-run 做什么
 
-**验证点**：
+dry-run 只做计划和风险检查，不写目标库。它应该回答四个问题：
 
-- `mem_branches` 中每条 active row 都能在目标用户库找到对应 `br_*` 物理表
-- `mem_user_state.active_branch` 若不为 `main`，则对应 branch 必须存在
-- branch 表行数必须与源库一致
+1. 有多少用户会被迁移。
+2. 每个用户会落到哪个 `mem_u_*`。
+3. 有多少业务表、branch 表、共享表需要搬运。
+4. 有没有 execute 前必须处理的阻断项。
 
+### 6.3 execute 做什么
+
+execute 的实际动作顺序是：
+
+1. **创建 pre-execute account snapshot**
+2. **reset 目标 shared DB**
+3. **迁移 shared 持久表**
+4. 按用户并发迁移：
+   - 创建 / 重建 `mem_u_*`
+   - 初始化用户库 schema
+   - 复制用户业务表
+   - 复制 `mem_memories_stats`
+   - 复制该用户的 `br_*` 物理分支表
+5. 写入 / 更新 `mem_user_registry`
+6. 生成完整报告
+
+### 6.4 execute 前的前置条件
+
+1. **先 dry-run 一次**
+2. **冻结写流量**
+   - MCP 写入
+   - REST 写入
+   - 后台任务可能触发的数据写入
+3. 保留 legacy DB，不要在 execute 前删库
+4. 确认目标 shared DB 和目标 `mem_u_*` 没有你还要保留的生产数据
+
+### 6.5 execute 后必须做的验证
+
+最少要检查：
+
+1. `mem_user_registry` 是否有完整用户映射。
+2. 老 API key 是否仍可认证。
+3. 关键老用户的 memories / branches / snapshots 是否可读。
+4. brand-new user 是否能在新架构下首次自动建库并正常读写。
+5. `/admin/users`、`/admin/stats`、`/metrics` 是否正常。
+6. MCP `tools/call` 是否走到正确的 multi-db 服务。
+
+### 6.6 回滚原则
+
+如果 cutover 后出现严重问题：
+
+1. 停止 multi-db 新服务。
+2. 优先使用 execute 前生成的 **pre-execute account snapshot** 回滚。
+3. 恢复旧配置，重新指向 legacy `DATABASE_URL`。
+4. 不要立即销毁已生成的 shared / `mem_u_*`，先保留现场用于排障。
+
+### 6.7 标准升级步骤：断流 -> 迁移 -> 部署新服务
+
+这一节是给运维执行的 **cutover 操作手册**。目标不是解释“原理”，而是让你按顺序执行并知道每一步为什么存在。
+
+> 适用前提：
+>
+> 1. 旧服务仍在 **single-DB / legacy DB** 上对外提供写服务。
+> 2. 新服务将切到 **shared DB + per-user DB**。
+> 3. 允许一次 **短暂写停机**。当前流程 **不支持 dual-write，也不支持不停写在线迁移**。
+
+#### Step 0. 切流前预演：这些事不要放到断流窗口里做
+
+先在正式 cutover 之前完成下面这些动作：
+
+1. 编译或准备好新版二进制 / 镜像。
+2. 用真实生产 URL 跑一次 **dry-run**。
+3. 确认新版运行时配置已经准备好，但 **先不要接流量**。
+4. 明确所有写入口：
+   - 旧 Memoria API 实例
+   - website backend（如果它会代理 `/api/chat` / `/api/memories` 并自动写记忆）
+   - 任何直接调用 `/v1/*` 或 `/mcp` 的 agent / cron / batch job
+
+推荐先准备统一变量：
+
+```bash
+export LEGACY_DB_URL='mysql://user:pass@host:6001/memoria_legacy_prod'
+export SHARED_DB_URL='mysql://user:pass@host:6001/memoria_shared_prod'
+export EMBEDDING_DIM=1024
+export PORT=8116
+export MASTER_KEY='replace-with-real-master-key'
+
+export REPORT_PLAN='migration-plan.json'
+export REPORT_RUN='migration-run.json'
+```
+
+先做 dry-run：
+
+```bash
+memoria migrate legacy-to-multi-db \
+  --legacy-db-url "$LEGACY_DB_URL" \
+  --shared-db-url "$SHARED_DB_URL" \
+  --embedding-dim "$EMBEDDING_DIM" \
+  --report-out "$REPORT_PLAN"
+```
+
+此时重点看四件事：
+
+1. 用户总数是否符合预期。
+2. 是否有 warnings / errors。
+3. 目标 shared DB 名字是否正确。
+4. 计划里生成的 `mem_u_*` 是否符合预期。
+
+如果 dry-run 都不干净，不要进入 cutover。
+
+#### Step 1. 预构建新版服务，但不要接流量
+
+如果你走二进制部署：
+
+```bash
+cd /path/to/Memoria/memoria
+source ~/.cargo/env
+cargo build --release
+```
+
+如果你走镜像部署，也应在这里把镜像构建好并推到仓库，但 **不要 rollout**。
+
+同时准备新服务运行时变量：
+
+```bash
+export DATABASE_URL="$SHARED_DB_URL"
+export MEMORIA_MULTI_DB=1
+export MEMORIA_SHARED_DATABASE_URL="$SHARED_DB_URL"
+
+export EMBEDDING_PROVIDER='openai'
+export EMBEDDING_BASE_URL='<embedding-endpoint>'
+export EMBEDDING_API_KEY='<embedding-secret>'
+export EMBEDDING_MODEL='<embedding-model>'
+export EMBEDDING_DIM="$EMBEDDING_DIM"
+```
+
+如果还要保留 reflect / entity extraction / episodic 等 LLM 能力，再额外准备：
+
+```bash
+export LLM_BASE_URL='<llm-endpoint>'
+export LLM_API_KEY='<llm-secret>'
+export LLM_MODEL='<llm-model>'
+```
+
+如果 website backend 在 cutover 后也要继续工作，提前确认它的新配置：
+
+- `memoria.api_url` -> 新 Memoria 服务 URL
+- `memoria.master_key` -> 新服务使用的 master key
+
+#### Step 2. 开始断流：先停所有写入口，再迁移
+
+这一阶段的要求很简单：**任何能够写 memory / key / branch / snapshot 的入口，都必须先停掉。**
+
+常见写入口包括：
+
+1. 旧 Memoria API 实例本身。
+2. website backend（因为它可能通过 `/api/chat` 自动提取并写记忆）。
+3. 直接调用 `/mcp` 或 `/v1/memories` 的 agent / batch 任务。
+
+根据你的部署方式，执行对应的停机动作：
+
+```bash
+# 本地/裸二进制
+kill <old-memoria-pid>
+kill <website-backend-pid>
+
+# systemd
+systemctl stop memoria
+systemctl stop memoria-srv
+
+# docker compose
+docker compose stop memoria
+docker compose stop memoria-srv
+
+# Kubernetes
+kubectl scale deploy/memoria --replicas=0 -n <ns>
+kubectl scale deploy/memoria-srv --replicas=0 -n <ns>
+```
+
+如果你前面还有 API Gateway / LB，先把旧实例从对外流量里摘掉，再停进程。
+
+#### Step 3. 确认断流真的生效
+
+不要“感觉已经停了”就往下走。至少做下面两类确认：
+
+1. **进程 / 服务侧确认**
+   - 旧 Memoria 实例已从对外入口摘除，或进程已停止
+   - website backend 不再可用，或者已切入维护状态
+
+2. **数据侧确认**
+   - 最近几秒内没有新的写请求进入旧库
+
+如果 legacy 库里保留了 `mem_api_call_log`，可以直接看最近写请求：
+
+```sql
+SELECT method, path, status_code, called_at
+FROM mem_api_call_log
+ORDER BY called_at DESC
+LIMIT 20;
+```
+
+你要确认的是：最近时间戳不再继续前进，尤其不要再出现新的 `POST` / `PUT` / `DELETE` 到 `/v1/*` 或 `/mcp/*`。
+
+#### Step 4. 在断流窗口内执行正式迁移
+
+真正执行时，用 `--execute`：
+
+```bash
+memoria migrate legacy-to-multi-db \
+  --legacy-db-url "$LEGACY_DB_URL" \
+  --shared-db-url "$SHARED_DB_URL" \
+  --embedding-dim "$EMBEDDING_DIM" \
+  --concurrency 4 \
+  --execute \
+  --report-out "$REPORT_RUN"
+```
+
+这里的关键语义是：
+
+1. 迁移器会先创建 **pre-execute account snapshot**。
+2. 然后重置目标 shared DB 并重建迁移结果。
+3. 再把 shared 表和用户业务表搬到新的 shared / `mem_u_*`。
+
+`--concurrency 4` 是 drill 中验证过的一个稳妥起点，不是硬编码要求。你的 DB 负载更高时，可以先保守，再逐步调大。
+
+#### Step 5. 迁移完成后，先做离线校验，不要急着起新服务
+
+先看迁移报告：
+
+1. 有没有 errors。
+2. warnings 是否都能解释。
+3. 用户数、memory 数、API key 数是否在预期范围内。
+
+然后做 shared DB 校验：
+
+```sql
+SELECT COUNT(*) AS routed_users FROM mem_user_registry;
+SELECT user_id, db_name FROM mem_user_registry ORDER BY updated_at DESC LIMIT 20;
+```
+
+再抽样检查几个重要老用户，把 `db_name` 拿出来后，直接看用户库：
+
+```sql
+SELECT COUNT(*) AS memories FROM `<db_name-from-registry>`.mem_memories WHERE is_active = 1;
+SELECT COUNT(*) AS branches FROM `<db_name-from-registry>`.mem_branches;
+SELECT COUNT(*) AS snapshots FROM `<db_name-from-registry>`.mem_snapshots;
+```
+
+如果这一步就发现数据量明显不对，不要启动新服务；先保留现场，排查迁移报告和源库。
+
+#### Step 6. 启动 multi-db 新服务
+
+确认 Step 5 没问题后，再启动新版本：
+
+```bash
+export DATABASE_URL="$SHARED_DB_URL"
+export MEMORIA_MULTI_DB=1
+export MEMORIA_SHARED_DATABASE_URL="$SHARED_DB_URL"
+
+export EMBEDDING_PROVIDER='openai'
+export EMBEDDING_BASE_URL='<embedding-endpoint>'
+export EMBEDDING_API_KEY='<embedding-secret>'
+export EMBEDDING_MODEL='<embedding-model>'
+export EMBEDDING_DIM="$EMBEDDING_DIM"
+
+export LLM_BASE_URL='<llm-endpoint>'
+export LLM_API_KEY='<llm-secret>'
+export LLM_MODEL='<llm-model>'
+
+memoria serve \
+  --db-url "$DATABASE_URL" \
+  --port "$PORT" \
+  --master-key "$MASTER_KEY"
+```
+
+起服务后先只做基础存活检查：
+
+```bash
+curl -sf "http://127.0.0.1:${PORT}/health"
+```
+
+只有 health 正常后，才进入 API 烟测。
+
+#### Step 7. 先验老用户，再验新用户
+
+先用一个 **已迁移老用户的现有 API key** 验证读写：
+
+```bash
+export OLD_USER_KEY='sk-...'
+
+curl -s "http://127.0.0.1:${PORT}/v1/memories?limit=3" \
+  -H "Authorization: Bearer ${OLD_USER_KEY}"
+
+curl -s -X POST "http://127.0.0.1:${PORT}/v1/memories/search" \
+  -H "Authorization: Bearer ${OLD_USER_KEY}" \
+  -H "Content-Type: application/json" \
+  -d '{"query":"smoke test","top_k":3}'
+```
+
+再做一个 **新用户** 烟测。最稳妥的方式是直接通过 master key 创建一把全新的 user key：
+
+```bash
+export NEW_USER_ID="cutover-smoke-$(date +%s)"
+
+curl -s -X POST "http://127.0.0.1:${PORT}/auth/keys" \
+  -H "Authorization: Bearer ${MASTER_KEY}" \
+  -H "Content-Type: application/json" \
+  -d "{\"user_id\":\"${NEW_USER_ID}\",\"name\":\"smoke\"}"
+```
+
+从返回结果里拿到 `raw_key` 后，执行一次确定性的写入：
+
+```bash
+export NEW_USER_KEY='sk-...'
+
+curl -s -X POST "http://127.0.0.1:${PORT}/v1/memories" \
+  -H "Authorization: Bearer ${NEW_USER_KEY}" \
+  -H "Content-Type: application/json" \
+  -d '{"content":"cutover smoke memory","memory_type":"semantic"}'
+```
+
+然后确认 shared DB 里出现了新路由，新用户库也真的落了数据：
+
+```sql
+SELECT user_id, db_name FROM mem_user_registry WHERE user_id = '<NEW_USER_ID>';
+SELECT COUNT(*) FROM `<db_name-from-registry>`.mem_memories WHERE is_active = 1;
+```
+
+如果你线上还有 website backend，再做一次 website 侧烟测：
+
+1. 把 website backend 的 `memoria.api_url` 改到新 Memoria URL。
+2. 确认 `memoria.master_key` 与新服务一致。
+3. 重启 website backend。
+4. 验证 `/api/me`、`/api/keys`、`/api/memories`、`/api/chat`。
+
+#### Step 8. 全部验证通过后再恢复流量
+
+恢复顺序建议是：
+
+1. 先恢复 website backend / 代理层。
+2. 再恢复直接调用 Memoria 的 agent / job。
+3. 最后恢复全部外部流量。
+
+恢复后，持续盯这几类指标：
+
+1. `/health` 是否稳定。
+2. `/admin/users`、`/admin/stats`、`/metrics` 是否正常。
+3. 新写入是否持续落到正确的 `mem_u_*`。
+4. `/mcp` 的 `tools/call` 是否能正常写入和检索。
+
+#### Step 9. 回滚步骤
+
+如果 Step 6-8 任一阶段出现阻断问题，回滚顺序应该固定：
+
+1. 停掉新 multi-db 服务。
+2. 恢复旧 single-db 服务配置：
+   - `DATABASE_URL` 指回 legacy DB
+   - 关闭 `MEMORIA_MULTI_DB`
+3. 如果 website backend 已切到新服务，把它的 `memoria.api_url` / `memoria.master_key` 改回旧值并重启。
+4. 重新开放旧流量。
+5. 保留 `REPORT_PLAN`、`REPORT_RUN`、新 shared DB、所有 `mem_u_*` 现场用于排障。
+
+只有在确认问题已经定位后，才去处理目标库；不要在第一次故障现场里边切边删。
+
+#### Step 10. 这个 runbook 何时不够用
+
+这份 runbook 的边界也要说清楚：
+
+1. 如果你要求 **零写停机**，当前方案不够用；因为它没有 dual-write 和增量 catch-up。
+2. 如果 legacy 和 target 不在同一个 MatrixOne account，内置的 pre-execute account snapshot 只能覆盖它所在的 account；这时需要额外做源侧备份。
+3. 如果 website 之外还有隐藏写入口，没有一起断流，迁移后的数据就会天然分叉。
 
 ---
 
-## 11. 风险与缓解
+## 7. 新服务镜像重启时必须设置的环境变量
 
-| 风险 | 影响 | 概率 | 缓解措施 |
-|------|------|------|----------|
-| `USE {db}` 连接池并发安全 | 数据串用到其他用户 | 中 | 使用独占连接（acquire 后整个请求持有），不 release 回池直到请求结束 |
-| 大量 DB 导致 MO 元数据膨胀 | DDL 性能下降 | 中 | 监控 DB 数量；设置上限（如 10000）；定期清理 deleted 用户 |
-| Admin 跨库聚合查询慢 | 管理体验差 | 高 | 异步后台聚合 + 缓存；metrics 延长 TTL；注册表增加聚合字段 |
-| 迁移期间数据不一致 | 数据丢失/重复 | 低 | 先 dry-run，再 offline execute；execute 前冻结写流量，目标侧先 reset 再纯 INSERT 复制；保留旧 DB 作备份 |
-| 控制元数据被 restore 回退 | orphan snapshot、quota 失真、branch 漂移 | 中 | 明确 restore 白名单只含业务数据表；restore 后执行 snapshot/branch 对账；禁止用户 restore shared DB |
-| Snapshot 配额问题 | 用户操作失败 | 中 | Database 级 snapshot 配额独立管理；保留 safety snapshot 清理逻辑 |
-| 首次访问 DB 创建延迟 | 首请求 latency 高 | 中 | 异步预创建；或接受 ~100ms 首次延迟 |
-| embedded CLI 模式兼容性 | 单用户场景退化 | 低 | 保留 legacy 模式作为默认；embedded 可自动创建单用户 DB |
-| execute 前 account snapshot 创建失败 | 无法安全回滚 | 中 | execute 必须先成功创建 account safety snapshot；失败则直接终止，不进入目标库 reset / copy |
-| legacy active snapshot 无法自动物化为 per-user snapshot | 旧快照能力丢失 | 中 | execute 前 fail fast；运维先清理旧快照，或 cutover 后按需要重新创建用户级 snapshot |
-| 跳过运行态 shared 表 | 锁/异步任务状态丢失 | 低 | `mem_distributed_locks`、`mem_async_tasks` 在新集群启动后重建；迁移必须在停写窗口执行 |
+这一节只讨论 **`memoria serve`** 的运行时环境变量，不包括测试变量、CLI 初始化变量、开发机专用变量。
+
+### 7.1 迁移后重启的最小必需集合
+
+如果你只是要让新版 multi-db 服务正常启动并工作，最小集合是：
+
+```bash
+DATABASE_URL=<shared-db-url>
+MEMORIA_MULTI_DB=1
+MEMORIA_SHARED_DATABASE_URL=<shared-db-url>
+
+EMBEDDING_PROVIDER=openai
+EMBEDDING_BASE_URL=<your-embedding-endpoint>
+EMBEDDING_API_KEY=<secret>
+EMBEDDING_MODEL=<your-model>
+EMBEDDING_DIM=<must-match-schema>
+```
+
+### 7.2 每个变量的作用
+
+| 变量 | 是否迁移后重启必需 | 说明 |
+|---|---|---|
+| `DATABASE_URL` | 是 | multi-db 模式下应指向 shared DB |
+| `MEMORIA_MULTI_DB` | 是 | 置为 `1` / `true` 打开新架构 |
+| `MEMORIA_SHARED_DATABASE_URL` | 是 | 显式告诉服务 shared DB 在哪；**不要依赖默认推导** |
+| `EMBEDDING_PROVIDER` | 基本必需 | 不设会退回默认 `mock`，检索语义会变掉 |
+| `EMBEDDING_BASE_URL` | 基本必需 | HTTP embedding 服务地址 |
+| `EMBEDDING_API_KEY` | 基本必需 | embedding 鉴权 |
+| `EMBEDDING_MODEL` | 基本必需 | 例如 `BAAI/bge-m3` |
+| `EMBEDDING_DIM` | 基本必需 | 必须和库里向量维度一致 |
+
+### 7.3 为什么 `MEMORIA_SHARED_DATABASE_URL` 不能省
+
+代码在没拿到这个变量时，会尝试把 `DATABASE_URL` 的库名替换成固定的 `memoria_shared`。
+
+这只在一种情况下安全：
+
+1. 你的 shared DB 真的就叫 `memoria_shared`
+
+但现实部署里，shared DB 往往会带环境后缀，例如：
+
+- `memoria_shared_200u`
+- `memoria_shared_prod`
+- `memoria_shared_staging`
+
+这种情况下，如果不显式设置 `MEMORIA_SHARED_DATABASE_URL`，服务就会猜错。
+
+### 7.4 LLM 相关变量：不是启动必需，但可能是功能必需
+
+如果你还要保留 reflect / entity extraction / episodic summary 等能力，需要再设置：
+
+```bash
+LLM_API_KEY=<secret>
+LLM_BASE_URL=<llm-endpoint>
+LLM_MODEL=<model-name>
+```
+
+如果这些功能不需要，可以不设；服务仍能启动，只是相关能力不可用或降级。
+
+### 7.5 不是 cutover 必需的变量（可选调优）
+
+下面这些不是“迁移后必须设”，而是部署调优项：
+
+| 变量 | 用途 |
+|---|---|
+| `MEMORIA_GLOBAL_USER_POOL_MAX` | global user pool 大小 |
+| `MEMORIA_AUTH_POOL_MAX_CONNECTIONS` | auth 专用连接池大小 |
+| `MEMORIA_AUTH_POOL_ACQUIRE_TIMEOUT_SECS` | auth 池获取超时 |
+| `DB_MAX_LIFETIME_SECS` | DB 连接最大生命周期 |
+| `ENTITY_QUEUE_SIZE` / `ENTITY_POOL_SIZE` / `ENTITY_WORKER_COUNT` | entity worker 调优 |
+| `GRAPH_POOL_SIZE` | graph 检索隔离池大小 |
+| `GOVERNANCE_POOL_SIZE` | 治理任务并发池 |
+| `MEMORIA_METRICS_CACHE_TTL_SECS` | `/metrics` 缓存 TTL |
+| `MEMORIA_RATE_LIMIT_AUTH_KEYS` | auth key rate limit |
+| `MEMORIA_GOVERNANCE_ENABLED` | 治理开关 |
+| `MEMORIA_GOVERNANCE_PLUGIN_BINDING` / `SUBJECT` / `DIR` | 治理插件配置 |
+| `MEMORIA_INSTANCE_ID` | 分布式锁实例标识 |
+| `MEMORIA_LOCK_TTL_SECS` | 分布式锁 TTL |
+| `MEMORIA_SANDBOX_ENABLED` | pipeline sandbox 开关 |
+| `EMBED_MAX_CONCURRENT` / `EMBED_SEMAPHORE_TIMEOUT_SECS` | embedding 并发限制 |
+
+### 7.6 不是环境变量的启动参数
+
+下面两个不是 env，而是启动参数：
+
+```bash
+memoria serve \
+  --db-url "$DATABASE_URL" \
+  --port 8116 \
+  --master-key <master-key>
+```
+
+也就是说：
+
+1. `port` 不是环境变量。
+2. `master key` 不是环境变量。
+
+### 7.7 一个完整但最小的 multi-db 启动示例
+
+```bash
+export DATABASE_URL='mysql://user:pass@host:6001/memoria_shared_prod'
+export MEMORIA_MULTI_DB=1
+export MEMORIA_SHARED_DATABASE_URL="$DATABASE_URL"
+
+export EMBEDDING_PROVIDER='openai'
+export EMBEDDING_BASE_URL='https://api.siliconflow.cn/v1'
+export EMBEDDING_API_KEY='***'
+export EMBEDDING_MODEL='BAAI/bge-m3'
+export EMBEDDING_DIM=1024
+
+export LLM_BASE_URL='https://api.openai.com/v1'
+export LLM_API_KEY='***'
+export LLM_MODEL='gpt-4o-mini'
+
+memoria serve \
+  --db-url "$DATABASE_URL" \
+  --port 8116 \
+  --master-key '<master-key>'
+```
+
+> 所有第三方密钥都属于运行时 secret，**必须由部署系统注入**，不能提交到仓库。
 
 ---
 
-## 12. MatrixOne 待验证项
+## 8. 当前实现里的关键工程取舍
 
-> 已确认: MatrixOne 支持 `CREATE SNAPSHOT FOR DATABASE` 和 `FOR TABLE` 级别的快照。
+### 8.1 保留 `user_id` 列
 
-| # | 验证项 | 重要性 | 状态 |
-|---|--------|--------|------|
-| 1 | `CREATE SNAPSHOT FOR DATABASE {db}` | P0 | 已确认支持 |
-| 2 | Database 级 snapshot 的 `{SNAPSHOT = 'x'}` 时间旅行 | P0 | 待验证 |
-| 3 | `DROP SNAPSHOT` 是否需 database 限定 | P0 | 待验证 |
-| 4 | `data branch create table db1.t from db1.s` 全限定名 | P0 | 待验证 |
-| 5 | `data branch diff db1.t against db1.s` 全限定名 | P1 | 待验证 |
-| 6 | `data branch merge db1.t into db1.s` 全限定名 | P1 | 待验证 |
-| 7 | `USE {db}` 在 sqlx 连接池的行为 | P1 | 待验证 |
-| 8 | 跨库 SELECT (`SELECT * FROM shared_db.table`) | P1 | 待验证 |
-| 9 | 每 account 最大 database 数量 | P2 | 待验证 |
-| 10 | 大量 DB (>1000) 时 `SHOW DATABASES` 性能 | P2 | 待验证 |
-| 11 | `SHOW SNAPSHOTS` / `list_snapshots()` 是否能稳定过滤到当前 `user_db` | P1 | 待验证 |
-| 12 | `SHOW TABLES LIKE 'br_%'` / `information_schema` 是否适合做 branch 对账 | P1 | 待验证 |
+当前 per-user DB 里多数表仍保留 `user_id` 列。这不是因为物理隔离不够，而是为了：
+
+1. 降低迁移和回退风险。
+2. 保持部分逻辑与旧模型兼容。
+3. 让迁移后的校验、审计和补救脚本更简单。
+
+代价是 schema 还没有达到最简状态，但这是有意接受的 Phase 1 取舍。
+
+### 8.2 shared 表永远不能被用户 restore
+
+这是最重要的安全边界之一。  
+如果用户 restore 能影响 shared DB，那么 API key、分布式锁、任务状态、用户路由都会被回滚，整个系统会从“用户级恢复”退化回“系统级破坏”。
+
+### 8.3 全局聚合不再是单条 SQL 的问题
+
+`/admin/stats`、`/metrics`、治理遍历等能力，在 per-user DB 时代必须经过：
+
+1. `mem_user_registry`
+2. 路由到用户库
+3. 聚合结果
+
+这会比单库时代更重，但这是物理隔离的正常代价。
 
 ---
 
-## 附录 A: 改造收益总结
+## 9. 当前已经验证过什么
 
-| 维度 | 改造前 | 改造后 |
-|------|--------|--------|
-| **数据隔离** | 行级 (WHERE user_id) | 物理级（独立 DB） |
-| **Rollback 安全性** | 摧毁所有用户 | 仅影响当前用户 |
-| **Snapshot 粒度** | Account 级 | Database 级 |
-| **Branch 命名** | UUID 前缀防冲突 | 天然隔离 |
-| **用户删除** | 多表 DELETE WHERE | `DROP DATABASE` |
-| **审计合规** | 逻辑隔离 | 物理隔离（更强） |
-| **备份恢复** | 全量或逐行 | 按用户库独立 |
-| **查询性能** | 大表 + index 过滤 | 小表精准查询 |
-| **Git-for-Data** | 需小心使用 | 安全开箱即用 |
+这套架构已经在真实 drill 中完成过：
 
-## 附录 B: 代码位置速查
+1. legacy single-db -> shared + per-user DB 迁移
+2. 老用户迁移后登录、读写、检索、MCP 调用
+3. 新用户 cutover 后自动建库与正常使用
+4. branch / snapshot / rollback / merge 等全链路语义验证
+5. website 代理链路与 MCP 链路验证
 
-| 组件 | 文件 | 关键行号 |
-|------|------|---------|
-| SqlMemoryStore | `memoria-storage/src/store.rs` | L447-628 (struct + connect) |
-| active_table() | `memoria-storage/src/store.rs` | L1530-1571 |
-| Safety snapshot | `memoria-storage/src/store.rs` | L1348-1406 |
-| Schema migration | `memoria-storage/src/store.rs` | L662-1200 |
-| Graph store | `memoria-storage/src/graph/store.rs` | L67-154 |
-| GitForDataService | `memoria-git/src/service.rs` | L46-283 |
-| Snapshot create | `memoria-git/src/service.rs` | L65-75 |
-| Restore (rollback) | `memoria-git/src/service.rs` | L114-147 |
-| Branch operations | `memoria-git/src/service.rs` | L151-264 |
-| MCP git tools | `memoria-mcp/src/git_tools.rs` | L304+ (dispatch) |
-| memory_rollback | `memoria-mcp/src/git_tools.rs` | L414-427 |
-| memory_branch | `memoria-mcp/src/git_tools.rs` | L429-503 |
-| memory_merge | `memoria-mcp/src/git_tools.rs` | L552-713 |
-| MCP core tools | `memoria-mcp/src/tools.rs` | L151-1166 |
-| MCP dispatch | `memoria-mcp/src/server.rs` | L230-291 |
-| REST routes | `memoria-api/src/routes/*.rs` | various |
-| Metrics | `memoria-api/src/routes/metrics.rs` | L1-301 |
-| Admin | `memoria-api/src/routes/admin.rs` | L1-360 |
-| Auth | `memoria-api/src/routes/auth.rs` | L1-327 |
-| Config | `memoria-service/src/config.rs` | L32-144 |
-| Governance scheduler | `memoria-service/src/governance.rs` | L332-454 |
-| MemoryService init | `memoria-service/src/service.rs` | L377-475 |
-| EditLogBuffer | `memoria-service/src/service.rs` | L95-267 |
-| CLI entry | `memoria-cli/src/main.rs` | L2898-3024 |
-| CLI serve | `memoria-cli/src/main.rs` | L354-409 |
-| CLI mcp | `memoria-cli/src/main.rs` | L413-522 |
-| CLI init | `memoria-cli/src/main.rs` | L2204-2258 |
+因此，这份文档不再是“候选方案说明”，而是 **当前实现 + 运维执行方式说明**。
+
+---
+
+## 10. PR / 部署边界说明
+
+这次 per-user-per-db 改造本身发生在 **Memoria** 仓库。  
+website 仓库里若有本地 debug 登录补丁，那只是 drill 辅助工具，不属于本架构变更的一部分。
+
+---
+
+## 11. 一句话运维原则
+
+如果只记一条：
+
+> **迁移后重启 multi-db 服务时，必须显式告诉它 shared DB 是谁；shared DB 只管控制平面，用户 rollback 只回退用户业务数据。**

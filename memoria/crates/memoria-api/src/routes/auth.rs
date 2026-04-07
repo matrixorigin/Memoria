@@ -211,7 +211,7 @@ pub async fn rotate_key(
 
     // Invalidate cache before DB update
     if let Ok(key_hash) = old.try_get::<String, _>("key_hash") {
-        state.api_key_cache.invalidate(&key_hash).await;
+        state.api_key_cache.invalidate(&key_hash);
     }
 
     // Deactivate old
@@ -272,7 +272,7 @@ pub async fn revoke_key(
 
     // Invalidate cache before DB update
     if let Ok(key_hash) = row.try_get::<String, _>("key_hash") {
-        state.api_key_cache.invalidate(&key_hash).await;
+        state.api_key_cache.invalidate(&key_hash);
     }
 
     sqlx::query("UPDATE mem_api_keys SET is_active = 0 WHERE key_id = ?")

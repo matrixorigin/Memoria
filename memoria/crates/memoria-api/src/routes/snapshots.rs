@@ -209,8 +209,9 @@ async fn snapshot_summary_value(
     snapshot: &memoria_mcp::git_tools::VisibleSnapshot,
 ) -> Result<Value, (StatusCode, String)> {
     let snapshot_name = validate_snapshot_identifier(&snapshot.internal_name)?.to_string();
+    let table = sql.t("mem_memories");
     let count_sql = format!(
-        "SELECT COUNT(*) as cnt FROM mem_memories {{SNAPSHOT = '{snapshot_name}'}} WHERE user_id = ? AND is_active > 0"
+        "SELECT COUNT(*) as cnt FROM {table} {{SNAPSHOT = '{snapshot_name}'}} WHERE user_id = ? AND is_active > 0"
     );
     let memory_count: i64 = sqlx::query_scalar(&count_sql)
         .bind(user_id)
@@ -393,7 +394,7 @@ pub async fn get_snapshot(
 
     // Total count via time-travel
     let count_sql = format!(
-        "SELECT COUNT(*) as cnt FROM `{table}` {{SNAPSHOT = '{snap_name}'}} WHERE user_id = ? AND is_active > 0"
+        "SELECT COUNT(*) as cnt FROM {table} {{SNAPSHOT = '{snap_name}'}} WHERE user_id = ? AND is_active > 0"
     );
     let total: i64 = sqlx::query_scalar(&count_sql)
         .bind(&user_id)
@@ -403,7 +404,7 @@ pub async fn get_snapshot(
 
     // Type distribution
     let type_sql = format!(
-        "SELECT memory_type, COUNT(*) as cnt FROM `{table}` {{SNAPSHOT = '{snap_name}'}} \
+        "SELECT memory_type, COUNT(*) as cnt FROM {table} {{SNAPSHOT = '{snap_name}'}} \
          WHERE user_id = ? AND is_active > 0 GROUP BY memory_type"
     );
     let type_rows = sqlx::query(&type_sql)
@@ -427,7 +428,7 @@ pub async fn get_snapshot(
         _ => 80,
     };
     let mem_sql = format!(
-        "SELECT memory_id, user_id, content, memory_type, trust_tier, initial_confidence, is_active, session_id, observed_at, created_at FROM `{table}` {{SNAPSHOT = '{snap_name}'}} \
+        "SELECT memory_id, user_id, content, memory_type, trust_tier, initial_confidence, is_active, session_id, observed_at, created_at FROM {table} {{SNAPSHOT = '{snap_name}'}} \
           WHERE user_id = ? AND is_active > 0 ORDER BY observed_at DESC LIMIT ? OFFSET ?"
     );
     let rows = sqlx::query(&mem_sql)
@@ -506,11 +507,11 @@ pub async fn diff_snapshot(
 
     // Counts
     let snap_count: i64 = sqlx::query_scalar(&format!(
-        "SELECT COUNT(*) FROM `{table}` {{SNAPSHOT = '{snap_name}'}} WHERE user_id = ? AND is_active > 0"
+        "SELECT COUNT(*) FROM {table} {{SNAPSHOT = '{snap_name}'}} WHERE user_id = ? AND is_active > 0"
     )).bind(&user_id).fetch_one(pool).await.map_err(api_err)?;
 
     let curr_count: i64 = sqlx::query_scalar(&format!(
-        "SELECT COUNT(*) FROM `{table}` WHERE user_id = ? AND is_active > 0"
+        "SELECT COUNT(*) FROM {table} WHERE user_id = ? AND is_active > 0"
     ))
     .bind(&user_id)
     .fetch_one(pool)
@@ -519,8 +520,8 @@ pub async fn diff_snapshot(
 
     // Added (in current but not in snapshot)
     let added_sql = format!(
-        "SELECT c.memory_id, c.content, c.memory_type, c.trust_tier FROM `{table}` c \
-          LEFT JOIN `{table}` {{SNAPSHOT = '{snap_name}'}} s ON c.memory_id = s.memory_id AND s.is_active > 0 \
+        "SELECT c.memory_id, c.content, c.memory_type, c.trust_tier FROM {table} c \
+          LEFT JOIN {table} {{SNAPSHOT = '{snap_name}'}} s ON c.memory_id = s.memory_id AND s.is_active > 0 \
           WHERE c.user_id = ? AND c.is_active > 0 AND s.memory_id IS NULL LIMIT ?"
     );
     let added_rows = sqlx::query(&added_sql)
@@ -532,8 +533,8 @@ pub async fn diff_snapshot(
 
     // Removed (in snapshot but not in current)
     let removed_sql = format!(
-        "SELECT s.memory_id, s.content, s.memory_type, s.trust_tier FROM `{table}` {{SNAPSHOT = '{snap_name}'}} s \
-          LEFT JOIN `{table}` c ON s.memory_id = c.memory_id AND c.is_active > 0 \
+        "SELECT s.memory_id, s.content, s.memory_type, s.trust_tier FROM {table} {{SNAPSHOT = '{snap_name}'}} s \
+          LEFT JOIN {table} c ON s.memory_id = c.memory_id AND c.is_active > 0 \
           WHERE s.user_id = ? AND s.is_active > 0 AND c.memory_id IS NULL LIMIT ?"
     );
     let removed_rows = sqlx::query(&removed_sql)
@@ -610,9 +611,10 @@ pub async fn list_branches(
         .await
         .map_err(api_err)?;
     let active_table = sql.active_table(&user_id).await.map_err(api_err)?;
+    let main_table = sql.t("mem_memories");
     let mut branches = vec![json!({
         "name": "main",
-        "active": active_table == "mem_memories",
+        "active": active_table == "mem_memories" || active_table == main_table,
     })];
     for (name, table_name) in sql.list_branches(&user_id).await.map_err(api_err)? {
         branches.push(json!({

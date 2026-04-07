@@ -41,7 +41,7 @@ subtle = "2.6"
 base64 = "0.22"
 async-trait = { workspace = true }
 tempfile = "3.14"
-moka = { version = "0.12", features = ["future"] }
+moka = { version = "0.12", features = ["future", "sync"] }
 
 [dev-dependencies]
 tokio = { workspace = true }
