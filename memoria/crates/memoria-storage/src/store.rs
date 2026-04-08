@@ -950,6 +950,7 @@ impl SqlMemoryStore {
                 updated_at      DATETIME(6),
                 INDEX idx_user_active (user_id, is_active, memory_type),
                 INDEX idx_user_session (user_id, session_id),
+                INDEX idx_memories_user_observed (user_id, observed_at),
                 FULLTEXT INDEX ft_content (content) WITH PARSER ngram -- MO#23861: breaks on concurrent snapshot restore
             )"#,
             dim = self.embedding_dim
@@ -1071,7 +1072,9 @@ impl SqlMemoryStore {
                 context     TEXT         DEFAULT NULL,
                 created_at  DATETIME(6)  NOT NULL,
                 INDEX idx_feedback_user (user_id, created_at),
-                INDEX idx_feedback_memory (memory_id)
+                INDEX idx_feedback_memory (memory_id),
+                INDEX idx_feedback_memory_user (user_id, memory_id),
+                INDEX idx_feedback_created_at (created_at)
             )"#,
         )
         .execute(pool)
