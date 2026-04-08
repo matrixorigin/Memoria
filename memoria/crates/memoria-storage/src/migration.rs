@@ -233,7 +233,7 @@ async fn run_legacy_single_db_to_multi_db(
         // avoids Send + 'static lifetime constraints on async fns).
         use futures::stream::{self, StreamExt};
 
-        let results: Vec<Result<UserMigrationReport, MemoriaError>> =
+        let results: Vec<(&str, Result<UserMigrationReport, MemoriaError>)> =
             stream::iter(selected_users.iter())
                 .map(|user_id| {
                     let pool = &legacy_pool;
@@ -244,14 +244,16 @@ async fn run_legacy_single_db_to_multi_db(
                         if execute {
                             println!("Migrating user {user_id}");
                         }
-                        migrate_user(pool, db_name, router_ref, user_id, execute).await
+                        let res =
+                            migrate_user(pool, db_name, router_ref, user_id, execute).await;
+                        (user_id.as_str(), res)
                     }
                 })
                 .buffer_unordered(concurrency)
                 .collect()
                 .await;
 
-        for (user_id, result) in selected_users.iter().zip(results) {
+        for (user_id, result) in results {
             match result {
                 Ok(report) => users.push(report),
                 Err(e) => {
