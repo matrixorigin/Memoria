@@ -5,6 +5,7 @@ use moka::sync::Cache;
 use sha2::{Digest, Sha256};
 use sqlx::{mysql::MySqlPoolOptions, MySqlPool, Row};
 use std::sync::Arc;
+use tokio::sync::Semaphore;
 
 fn db_err(e: sqlx::Error) -> MemoriaError {
     MemoriaError::Database(e.to_string())
@@ -21,8 +22,11 @@ fn is_duplicate_key_error(e: &sqlx::Error) -> bool {
 
 const USER_DB_CACHE_MAX_CAPACITY: u64 = 10_000;
 const USER_STORE_CACHE_MAX_CAPACITY: u64 = 10_000;
+const USER_SCHEMA_CACHE_MAX_CAPACITY: u64 = 10_000;
 const USER_STORE_CACHE_IDLE_SECS: u64 = 600;
-const GLOBAL_USER_POOL_MAX_CONNECTIONS: u32 = 120;
+const SHARED_POOL_MAX_CONNECTIONS: u32 = 16;
+const GLOBAL_USER_POOL_MAX_CONNECTIONS: u32 = 72;
+const POOL_MAX_CONNECTIONS_UPPER: u32 = 256;
 
 #[derive(Debug, Clone)]
 pub struct UserDatabaseRecord {
@@ -44,7 +48,9 @@ pub struct DbRouter {
     embedding_dim: usize,
     instance_id: String,
     user_db_cache: Cache<String, String>,
+    user_schema_cache: Cache<String, bool>,
     user_store_cache: Cache<String, Arc<SqlMemoryStore>>,
+    user_init_semaphore: Arc<Semaphore>,
 }
 
 impl DbRouter {
@@ -53,22 +59,32 @@ impl DbRouter {
         embedding_dim: usize,
         instance_id: String,
     ) -> Result<Self, MemoriaError> {
-        create_database_if_missing(shared_db_url).await?;
+        create_database_if_missing_from_url(shared_db_url).await?;
+        let shared_max = configured_pool_max_connections(
+            "MEMORIA_SHARED_POOL_MAX_CONNECTIONS",
+            SHARED_POOL_MAX_CONNECTIONS,
+            POOL_MAX_CONNECTIONS_UPPER,
+        );
         let pool = MySqlPoolOptions::new()
-            .max_connections(16)
+            .max_connections(shared_max)
             .max_lifetime(std::time::Duration::from_secs(3600))
             .idle_timeout(std::time::Duration::from_secs(300))
             .acquire_timeout(std::time::Duration::from_secs(10))
             .connect(shared_db_url)
             .await
             .map_err(db_err)?;
+        tracing::info!(
+            max_connections = shared_max,
+            "Shared routing pool initialized"
+        );
 
         // Global pool for all per-user DB queries.
         // statement_cache_capacity=0 prevents prepared-statement cross-DB pollution.
-        let global_max: u32 = std::env::var("MEMORIA_GLOBAL_USER_POOL_MAX")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(GLOBAL_USER_POOL_MAX_CONNECTIONS);
+        let global_max = configured_pool_max_connections(
+            "MEMORIA_GLOBAL_USER_POOL_MAX",
+            GLOBAL_USER_POOL_MAX_CONNECTIONS,
+            POOL_MAX_CONNECTIONS_UPPER,
+        );
         let global_url = append_url_param(shared_db_url, "statement_cache_capacity=0");
         let global_user_pool = MySqlPoolOptions::new()
             .max_connections(global_max)
@@ -86,6 +102,11 @@ impl DbRouter {
 
         let shared_db_name = parse_db_name(shared_db_url)
             .ok_or_else(|| MemoriaError::Internal("invalid shared_db_url".into()))?;
+        let user_init_max: usize = std::env::var("MEMORIA_USER_SCHEMA_INIT_MAX_CONCURRENCY")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(2)
+            .clamp(1, 64);
         let router = Self {
             shared_pool: pool,
             global_user_pool,
@@ -97,10 +118,14 @@ impl DbRouter {
                 .max_capacity(USER_DB_CACHE_MAX_CAPACITY)
                 .time_to_live(std::time::Duration::from_secs(300))
                 .build(),
+            user_schema_cache: Cache::builder()
+                .max_capacity(USER_SCHEMA_CACHE_MAX_CAPACITY)
+                .build(),
             user_store_cache: Cache::builder()
                 .max_capacity(USER_STORE_CACHE_MAX_CAPACITY)
                 .time_to_idle(std::time::Duration::from_secs(USER_STORE_CACHE_IDLE_SECS))
                 .build(),
+            user_init_semaphore: Arc::new(Semaphore::new(user_init_max)),
         };
         router.ensure_user_registry_table().await?;
         Ok(router)
@@ -208,7 +233,6 @@ impl DbRouter {
         // Avoid moka single-flight here: its init future makes upstream callers
         // fail Send bounds under axum handlers and tokio::spawn.
         let shared_pool = self.shared_pool.clone();
-        let shared_db_url = self.shared_db_url.clone();
         let user_id_owned = user_id.to_string();
         let row = sqlx::query(
             "SELECT db_name FROM mem_user_registry WHERE user_id = ? AND status = 'active'",
@@ -219,9 +243,7 @@ impl DbRouter {
         .map_err(db_err)?;
         let db_name = match row {
             Some(row) => row.try_get("db_name").map_err(db_err)?,
-            None => {
-                provision_user_db_with_pool(&shared_pool, &shared_db_url, &user_id_owned).await?
-            }
+            None => provision_user_db_with_pool(&shared_pool, &user_id_owned).await?,
         };
         self.user_db_cache.insert(user_id_owned, db_name.clone());
         Ok(db_name)
@@ -240,6 +262,8 @@ impl DbRouter {
         let embedding_dim = self.embedding_dim;
         let instance_id = self.instance_id.clone();
         let user_db_cache = self.user_db_cache.clone();
+        let user_schema_cache = self.user_schema_cache.clone();
+        let user_init_semaphore = self.user_init_semaphore.clone();
         let user_id_owned = user_id.to_string();
         let existing = sqlx::query(
             "SELECT db_name FROM mem_user_registry WHERE user_id = ? AND status = 'active'",
@@ -251,27 +275,41 @@ impl DbRouter {
         let (db_name, needs_init) = match existing {
             Some(row) => (row.try_get("db_name").map_err(db_err)?, false),
             None => (
-                provision_user_db_with_pool(&shared_pool, &shared_db_url, &user_id_owned).await?,
+                provision_user_db_with_pool(&shared_pool, &user_id_owned).await?,
                 true,
             ),
         };
-        let db_url = user_db_url_from_shared(&shared_db_url, &db_name)?;
-        let init_result =
-            match SqlMemoryStore::connect_routed(&db_url, embedding_dim, instance_id.clone()).await
-            {
-                Ok(init_store) => init_store.migrate_user().await,
-                Err(err) => Err(err),
-            };
-        if let Err(err) = init_result {
-            if needs_init {
-                let _ =
-                    sqlx::query("DELETE FROM mem_user_registry WHERE user_id = ? AND db_name = ?")
+        if user_schema_cache.get(&user_id_owned).is_none() {
+            let _permit = user_init_semaphore
+                .acquire_owned()
+                .await
+                .map_err(|_| MemoriaError::Internal("user schema init semaphore closed".into()))?;
+            if user_schema_cache.get(&user_id_owned).is_none() {
+                let db_url = user_db_url_from_shared(&shared_db_url, &db_name)?;
+                let init_result = match SqlMemoryStore::connect_routed(
+                    &db_url,
+                    embedding_dim,
+                    instance_id.clone(),
+                )
+                .await
+                {
+                    Ok(init_store) => init_store.migrate_user().await,
+                    Err(err) => Err(err),
+                };
+                if let Err(err) = init_result {
+                    if needs_init {
+                        let _ = sqlx::query(
+                            "DELETE FROM mem_user_registry WHERE user_id = ? AND db_name = ?",
+                        )
                         .bind(&user_id_owned)
                         .bind(&db_name)
                         .execute(&shared_pool)
                         .await;
+                    }
+                    return Err(err);
+                }
+                user_schema_cache.insert(user_id_owned.clone(), true);
             }
-            return Err(err);
         }
         user_db_cache.insert(user_id_owned.clone(), db_name.clone());
         let store = Arc::new(build_routed_store(
@@ -302,6 +340,7 @@ impl DbRouter {
 
     pub async fn invalidate_user(&self, user_id: &str) {
         self.user_db_cache.invalidate(user_id);
+        self.user_schema_cache.invalidate(user_id);
         self.user_store_cache.invalidate(user_id);
     }
 
@@ -344,12 +383,10 @@ fn build_routed_store(
 
 async fn provision_user_db_with_pool(
     shared_pool: &MySqlPool,
-    shared_db_url: &str,
     user_id: &str,
 ) -> Result<String, MemoriaError> {
     let db_name = DbRouter::user_db_name_for_id(user_id);
-    let db_url = user_db_url_from_shared(shared_db_url, &db_name)?;
-    create_database_if_missing(&db_url).await?;
+    create_database_if_missing(shared_pool, &db_name).await?;
     let now = Utc::now().naive_utc();
     let insert = sqlx::query(
         r#"INSERT INTO mem_user_registry (user_id, db_name, status, created_at, updated_at)
@@ -399,7 +436,21 @@ async fn provision_user_db_with_pool(
     }
 }
 
-async fn create_database_if_missing(database_url: &str) -> Result<(), MemoriaError> {
+async fn create_database_if_missing(
+    shared_pool: &MySqlPool,
+    db_name: &str,
+) -> Result<(), MemoriaError> {
+    sqlx::raw_sql(&format!(
+        "CREATE DATABASE IF NOT EXISTS {}",
+        quote_ident(db_name)
+    ))
+    .execute(shared_pool)
+    .await
+    .map_err(db_err)?;
+    Ok(())
+}
+
+async fn create_database_if_missing_from_url(database_url: &str) -> Result<(), MemoriaError> {
     let Some((base_url, db_name, _suffix)) = split_database_url(database_url) else {
         return Err(MemoriaError::Internal(
             "database_url missing db name".into(),
@@ -410,14 +461,7 @@ async fn create_database_if_missing(database_url: &str) -> Result<(), MemoriaErr
         .connect(base_url)
         .await
         .map_err(db_err)?;
-    sqlx::raw_sql(&format!(
-        "CREATE DATABASE IF NOT EXISTS {}",
-        quote_ident(db_name)
-    ))
-    .execute(&base_pool)
-    .await
-    .map_err(db_err)?;
-    Ok(())
+    create_database_if_missing(&base_pool, db_name).await
 }
 
 fn parse_db_name(database_url: &str) -> Option<String> {
@@ -449,4 +493,12 @@ fn append_url_param(url: &str, param: &str) -> String {
     } else {
         format!("{url}?{param}")
     }
+}
+
+fn configured_pool_max_connections(env_name: &str, default: u32, upper: u32) -> u32 {
+    std::env::var(env_name)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default)
+        .clamp(1, upper)
 }

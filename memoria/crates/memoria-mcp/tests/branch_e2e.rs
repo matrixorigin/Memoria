@@ -516,6 +516,12 @@ async fn test_active_branch_resets_on_delete() {
     )
     .await;
 
+    let active_branch = sql.active_branch_name(&uid).await.unwrap();
+    assert_eq!(
+        active_branch, "main",
+        "stored active branch should reset to main after delete"
+    );
+
     // Should auto-reset to main
     let active = sql.active_table(&uid).await.unwrap();
     assert_eq!(

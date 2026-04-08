@@ -201,6 +201,16 @@ pub async fn delete_user(
     .execute(user_store.pool())
     .await
     .map_err(db_err)?;
+    if let Err(e) = state
+        .mark_metrics_dirty(&user_id, crate::metrics_summary::DirtyMask::FULL)
+        .await
+    {
+        tracing::warn!(
+            user_id = user_id,
+            error = %e,
+            "failed to mark metrics summary dirty after admin delete_user"
+        );
+    }
     Ok(Json(
         serde_json::json!({"status": "ok", "user_id": user_id}),
     ))

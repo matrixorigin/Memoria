@@ -76,6 +76,42 @@ fn tracking_path(method: &str, params: Option<&serde_json::Value>) -> String {
     format!("/mcp/{sanitized}")
 }
 
+fn mcp_tool_dirty_mask(tool: &str) -> Option<crate::metrics_summary::DirtyMask> {
+    use crate::metrics_summary::DirtyMask;
+    match tool {
+        "memory_store" | "memory_correct" | "memory_purge" | "memory_observe" => {
+            Some(DirtyMask::MEMORY)
+        }
+        "memory_governance"
+        | "memory_consolidate"
+        | "memory_reflect"
+        | "memory_extract_entities"
+        | "memory_link_entities" => Some(DirtyMask::MEMORY | DirtyMask::GRAPH),
+        "memory_feedback" => Some(DirtyMask::FEEDBACK),
+        "memory_snapshot" | "memory_snapshot_delete" => Some(DirtyMask::SNAPSHOT),
+        "memory_rollback" => Some(DirtyMask::FULL),
+        "memory_branch" | "memory_branch_delete" => Some(DirtyMask::BRANCH),
+        "memory_checkout" | "memory_merge" => Some(DirtyMask::FULL),
+        _ => None,
+    }
+}
+
+fn spawn_metrics_dirty_mark(
+    state: AppState,
+    user_id: String,
+    mask: crate::metrics_summary::DirtyMask,
+) {
+    tokio::spawn(async move {
+        if let Err(e) = state.mark_metrics_dirty(&user_id, mask).await {
+            tracing::warn!(
+                user_id = user_id,
+                error = %e,
+                "failed to mark metrics summary dirty after mcp mutation"
+            );
+        }
+    });
+}
+
 pub async fn mcp_handler(
     State(state): State<AppState>,
     auth: AuthUser,
@@ -159,10 +195,9 @@ pub async fn mcp_handler(
     } else {
         None
     };
+    let user_id = auth.user_id.clone();
     if let Some(tool) = tracked_tool.clone() {
-        state
-            .tool_usage_batcher
-            .mark_used(auth.user_id.clone(), tool);
+        state.tool_usage_batcher.mark_used(user_id.clone(), tool);
     }
 
     // JSON-RPC 2.0: a Notification is a *valid* Request without an "id" member.
@@ -173,15 +208,20 @@ pub async fn mcp_handler(
             params,
             state.service.clone(),
             state.git.clone(),
-            auth.user_id.clone(),
+            user_id.clone(),
         )
         .await;
         let rpc = match &dispatch_result {
             Ok(_) => RpcMeta::ok(),
             Err(e) => RpcMeta::err(e.code),
         };
+        if dispatch_result.is_ok() {
+            if let Some(mask) = tracked_tool.as_deref().and_then(mcp_tool_dirty_mask) {
+                spawn_metrics_dirty_mark(state.clone(), user_id.clone(), mask);
+            }
+        }
         state.call_log_batcher.record_rpc(
-            auth.user_id,
+            user_id,
             "POST".to_string(),
             track_path,
             204, // HTTP 204 No Content — correct for notifications
@@ -200,7 +240,7 @@ pub async fn mcp_handler(
         params,
         state.service.clone(),
         state.git.clone(),
-        auth.user_id.clone(),
+        user_id.clone(),
     )
     .await
     {
@@ -222,8 +262,14 @@ pub async fn mcp_handler(
         ),
     };
 
+    if rpc.success {
+        if let Some(mask) = tracked_tool.as_deref().and_then(mcp_tool_dirty_mask) {
+            spawn_metrics_dirty_mark(state.clone(), user_id.clone(), mask);
+        }
+    }
+
     state.call_log_batcher.record_rpc(
-        auth.user_id,
+        user_id,
         "POST".to_string(),
         track_path,
         200, // HTTP 200 — always correct for JSON-RPC responses
@@ -236,7 +282,7 @@ pub async fn mcp_handler(
 
 #[cfg(test)]
 mod tests {
-    use super::tracking_path;
+    use super::{mcp_tool_dirty_mask, tracking_path};
     use serde_json::json;
 
     // ── tools/call — happy path ───────────────────────────────────────────────
@@ -263,6 +309,15 @@ mod tests {
                 "unexpected path for tool {name}"
             );
         }
+    }
+
+    #[test]
+    fn mutating_tool_classification_matches_write_tools() {
+        assert!(mcp_tool_dirty_mask("memory_store").is_some());
+        assert!(mcp_tool_dirty_mask("memory_snapshot").is_some());
+        assert!(mcp_tool_dirty_mask("memory_merge").is_some());
+        assert!(mcp_tool_dirty_mask("memory_search").is_none());
+        assert!(mcp_tool_dirty_mask("memory_branches").is_none());
     }
 
     // ── tools/call — missing / malformed name ─────────────────────────────────

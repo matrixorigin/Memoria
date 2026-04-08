@@ -152,6 +152,47 @@ async fn test_active_table_fallback_when_branch_deleted() {
     println!("✅ active_table falls back to mem_memories after branch deleted");
 }
 
+#[tokio::test]
+async fn test_active_table_fallback_when_branch_deleted_qualifies_main_for_routed_store() {
+    let mut store = setup().await;
+    let user = uid();
+    let branch_name = format!("br_{}", &uid()[5..]);
+    let table_name = format!("mem_br_{}", &uid()[5..]);
+    let db_name = db_url()
+        .rsplit('/')
+        .next()
+        .unwrap_or("memoria_test")
+        .split('?')
+        .next()
+        .unwrap_or("memoria_test")
+        .to_string();
+    store.set_db_name(db_name);
+
+    store
+        .register_branch(&user, &branch_name, &table_name)
+        .await
+        .expect("register");
+    store
+        .set_active_branch(&user, &branch_name)
+        .await
+        .expect("set_active");
+    store
+        .deregister_branch(&user, &branch_name)
+        .await
+        .expect("deregister");
+
+    let table = store.active_table(&user).await.expect("active_table");
+    assert_eq!(
+        store
+            .active_branch_name(&user)
+            .await
+            .expect("active branch"),
+        "main"
+    );
+    assert_eq!(table, store.t("mem_memories"));
+    println!("✅ active_table falls back to qualified main table after branch deleted");
+}
+
 // ── 4. list_branches returns only active branches ────────────────────────────
 
 #[tokio::test]

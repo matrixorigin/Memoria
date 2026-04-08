@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod instrumented_embedder;
 pub mod metrics;
+pub mod metrics_summary;
 pub mod models;
 pub mod otel;
 pub mod rate_limit;
@@ -52,11 +53,6 @@ async fn call_log_mw(
         .and_then(|v| v.to_str().ok())
         .is_some_and(|v| v.eq_ignore_ascii_case("dashboard"));
 
-    if is_dashboard {
-        return next.run(req).await;
-    }
-    // ─────────────────────────────────────────────────────────────────────────
-
     let t = std::time::Instant::now();
     let method = req.method().as_str().to_string();
     let path = req.uri().path().to_string();
@@ -72,13 +68,96 @@ async fn call_log_mw(
 
     if let Ok(guard) = ctx.0.lock() {
         if let Some(uid) = guard.as_ref() {
-            state
-                .call_log_batcher
-                .record(uid.clone(), method, path, status_code, latency_ms);
+            if !is_dashboard {
+                state.call_log_batcher.record(
+                    uid.clone(),
+                    method.clone(),
+                    path.clone(),
+                    status_code,
+                    latency_ms,
+                );
+            }
+            if let Some(mask) = should_mark_metrics_dirty(&method, &path, status_code) {
+                let state = state.clone();
+                let user_id = uid.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = state.mark_metrics_dirty(&user_id, mask).await {
+                        tracing::warn!(
+                            user_id = user_id,
+                            error = %e,
+                            "failed to mark metrics summary dirty"
+                        );
+                    }
+                });
+            }
         }
     }
 
     response
+}
+
+fn should_mark_metrics_dirty(
+    method: &str,
+    path: &str,
+    status_code: u16,
+) -> Option<metrics_summary::DirtyMask> {
+    use metrics_summary::DirtyMask;
+
+    if status_code >= 400 {
+        return None;
+    }
+
+    // Fixed-path POST routes
+    if method == "POST" {
+        return match path {
+            "/v1/memories"
+            | "/v1/memories/batch"
+            | "/v1/memories/correct"
+            | "/v1/memories/purge"
+            | "/v1/observe"
+            | "/v1/pipeline/run" => Some(DirtyMask::MEMORY),
+            "/v1/governance"
+            | "/v1/consolidate"
+            | "/v1/reflect"
+            | "/v1/extract-entities"
+            | "/v1/extract-entities/link" => Some(DirtyMask::MEMORY | DirtyMask::GRAPH),
+            "/v1/snapshots" | "/v1/snapshots/delete" => Some(DirtyMask::SNAPSHOT),
+            "/v1/branches" => Some(DirtyMask::BRANCH),
+            _ => {
+                // Dynamic path patterns
+                if path.starts_with("/v1/memories/") && path.ends_with("/feedback") {
+                    Some(DirtyMask::FEEDBACK)
+                } else if path.starts_with("/v1/snapshots/") && path.ends_with("/rollback")
+                    || path.starts_with("/v1/branches/") && path.ends_with("/checkout")
+                    || path.starts_with("/v1/branches/") && path.ends_with("/merge")
+                {
+                    Some(DirtyMask::FULL)
+                } else if path.starts_with("/v1/sessions/") && path.ends_with("/summary") {
+                    Some(DirtyMask::MEMORY)
+                } else {
+                    None
+                }
+            }
+        };
+    }
+
+    if method == "DELETE" {
+        if path.starts_with("/v1/memories/") {
+            return Some(DirtyMask::MEMORY);
+        }
+        if path.starts_with("/v1/snapshots/") {
+            return Some(DirtyMask::SNAPSHOT);
+        }
+        if path.starts_with("/v1/branches/") {
+            return Some(DirtyMask::BRANCH);
+        }
+    }
+
+    if method == "PUT" && path.starts_with("/v1/memories/") && path.ends_with("/correct") {
+        return Some(DirtyMask::MEMORY);
+    }
+
+    None
 }
 
 /// Build the full API router with all routes.
@@ -336,4 +415,55 @@ pub fn build_router(state: AppState) -> Router {
                 (StatusCode::INTERNAL_SERVER_ERROR, Json(body)).into_response()
             },
         ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_mark_metrics_dirty;
+    use crate::metrics_summary::DirtyMask;
+
+    #[test]
+    fn marks_summary_dirty_for_mutating_v1_routes() {
+        assert!(should_mark_metrics_dirty("POST", "/v1/memories", 200).is_some());
+        assert!(should_mark_metrics_dirty("POST", "/v1/snapshots/demo/rollback", 200).is_some());
+        assert!(should_mark_metrics_dirty("DELETE", "/v1/branches/demo", 204).is_some());
+        assert!(should_mark_metrics_dirty("POST", "/v1/sessions/abc/summary", 200).is_some());
+    }
+
+    #[test]
+    fn skips_summary_dirty_mark_for_reads_and_failures() {
+        assert!(should_mark_metrics_dirty("GET", "/v1/memories", 200).is_none());
+        assert!(should_mark_metrics_dirty("POST", "/v1/memories/retrieve", 200).is_none());
+        assert!(should_mark_metrics_dirty("POST", "/v1/memories", 500).is_none());
+    }
+
+    #[test]
+    fn correct_dirty_bits_for_operations() {
+        // Memory operations → MEMORY bit
+        let m = should_mark_metrics_dirty("POST", "/v1/memories", 200).unwrap();
+        assert!(m.contains(DirtyMask::MEMORY));
+        assert!(!m.contains(DirtyMask::GRAPH));
+
+        // Feedback → FEEDBACK bit
+        let m = should_mark_metrics_dirty("POST", "/v1/memories/abc/feedback", 200).unwrap();
+        assert!(m.contains(DirtyMask::FEEDBACK));
+        assert!(!m.contains(DirtyMask::MEMORY));
+
+        // Governance → MEMORY + GRAPH
+        let m = should_mark_metrics_dirty("POST", "/v1/governance", 200).unwrap();
+        assert!(m.contains(DirtyMask::MEMORY));
+        assert!(m.contains(DirtyMask::GRAPH));
+
+        // Rollback → FULL
+        let m = should_mark_metrics_dirty("POST", "/v1/snapshots/s1/rollback", 200).unwrap();
+        assert_eq!(m, DirtyMask::FULL);
+
+        // Snapshot → SNAPSHOT
+        let m = should_mark_metrics_dirty("POST", "/v1/snapshots", 200).unwrap();
+        assert!(m.contains(DirtyMask::SNAPSHOT));
+
+        // Branch → BRANCH
+        let m = should_mark_metrics_dirty("POST", "/v1/branches", 200).unwrap();
+        assert!(m.contains(DirtyMask::BRANCH));
+    }
 }

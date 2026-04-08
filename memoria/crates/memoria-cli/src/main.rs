@@ -388,12 +388,38 @@ enum MigrationCommands {
 // ── Serve (API server) ────────────────────────────────────────────────────────
 
 #[cfg(feature = "server-runtime")]
+fn configured_server_pool_size(env_name: &str, default: u32, upper: u32) -> u32 {
+    std::env::var(env_name)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default)
+        .clamp(1, upper)
+}
+
+#[cfg(feature = "server-runtime")]
+async fn connect_git_pool(database_url: &str, multi_db: bool) -> Result<sqlx::MySqlPool> {
+    use sqlx::mysql::MySqlPoolOptions;
+
+    let default_max = if multi_db { 8 } else { 10 };
+    let max_connections =
+        configured_server_pool_size("MEMORIA_GIT_POOL_MAX_CONNECTIONS", default_max, 64);
+    let pool = MySqlPoolOptions::new()
+        .max_connections(max_connections)
+        .max_lifetime(std::time::Duration::from_secs(3600))
+        .idle_timeout(std::time::Duration::from_secs(300))
+        .acquire_timeout(std::time::Duration::from_secs(10))
+        .connect(database_url)
+        .await?;
+    tracing::info!(max_connections, "Git-for-data connection pool initialized");
+    Ok(pool)
+}
+
+#[cfg(feature = "server-runtime")]
 async fn cmd_serve(db_url: Option<String>, port: u16, master_key: String) -> Result<()> {
     use memoria_api::{build_router, AppState};
     use memoria_git::GitForDataService;
     use memoria_service::{shutdown_signal, Config, MemoryService};
     use memoria_storage::{DbRouter, SqlMemoryStore};
-    use sqlx::mysql::MySqlPool;
     use tower_http::trace::TraceLayer;
 
     memoria_api::otel::init_tracing();
@@ -428,7 +454,7 @@ async fn cmd_serve(db_url: Option<String>, port: u16, master_key: String) -> Res
             )
             .await?,
         );
-        let mut store = SqlMemoryStore::connect(
+        let mut store = SqlMemoryStore::connect_shared(
             &cfg.shared_db_url,
             cfg.embedding_dim,
             cfg.instance_id.clone(),
@@ -445,7 +471,7 @@ async fn cmd_serve(db_url: Option<String>, port: u16, master_key: String) -> Res
         (Arc::new(store), None, cfg.db_url.clone())
     };
 
-    let pool = MySqlPool::connect(&git_db_url).await?;
+    let pool = connect_git_pool(&git_db_url, cfg.multi_db).await?;
     let git_db_name = parse_db_name(&git_db_url).unwrap_or_else(|| cfg.db_name.clone());
     let git = Arc::new(GitForDataService::new(pool, git_db_name));
 
@@ -526,7 +552,6 @@ async fn cmd_mcp(
     use memoria_git::GitForDataService;
     use memoria_service::{Config, MemoryService};
     use memoria_storage::{DbRouter, SqlMemoryStore};
-    use sqlx::mysql::MySqlPool;
 
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
@@ -600,7 +625,7 @@ async fn cmd_mcp(
             )
             .await?,
         );
-        let mut store = SqlMemoryStore::connect(
+        let mut store = SqlMemoryStore::connect_shared(
             &cfg.shared_db_url,
             cfg.embedding_dim,
             cfg.instance_id.clone(),
@@ -617,7 +642,7 @@ async fn cmd_mcp(
         (Arc::new(store), None, cfg.db_url.clone())
     };
 
-    let pool = MySqlPool::connect(&git_db_url).await?;
+    let pool = connect_git_pool(&git_db_url, cfg.multi_db).await?;
     let git_db_name = parse_db_name(&git_db_url).unwrap_or_else(|| cfg.db_name.clone());
     let git = Arc::new(GitForDataService::new(pool, git_db_name));
 

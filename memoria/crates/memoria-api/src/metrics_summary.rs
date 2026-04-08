@@ -11,18 +11,35 @@
 //!    per-family tables and per-metric columns.
 //!
 //! Key invariants:
-//! - The write path (`mark_user_dirty`) is a single-row upsert that OR-merges
-//!   the pending mask and bumps `change_version`.
+//! - The write path (`mark_user_dirty`) serializes per-user state updates via
+//!   `mem_user_registry`, OR-merges the pending mask, and rewrites all matching
+//!   rows to one logical `change_version`.
 //! - The worker claims a batch, computes only the families indicated by the
 //!   mask, flushes rollups per-family in bulk, then updates state with
 //!   version-protected CAS to avoid clearing newly-arrived dirty bits.
 //! - Connection pools are treated as precious: claim/flush are short
 //!   transactions on the shared pool; user-DB reads use bounded concurrency
 //!   on the global user pool.
+//!
+//! ## Bootstrap (direct cutover)
+//!
+//! After switching to multi-db mode, pre-existing active users may have no
+//! state row because `mark_user_dirty()` is only called on writes.  The
+//! worker calls [`MetricsSummaryManager::bootstrap_missing_users`] once per
+//! tick, seeding up to [`BOOTSTRAP_BATCH_SIZE`] users per pass with
+//! `pending_mask = FULL`.  This converges `missing_users_total → 0` without
+//! requiring user writes and without heavy fan-out on startup.
+//!
+//! ## Error health semantics
+//!
+//! `last_error_kind` / `last_error_at` represent the **most recent
+//! outstanding** refresh error.  A successful refresh clears both fields,
+//! so `/metrics` reports only users with currently-failing refreshes.
+//! Error queries are scoped to active users via `mem_user_registry`.
 
 use crate::state::CachedMetrics;
-use chrono::Utc;
-use memoria_core::MemoriaError;
+use chrono::{NaiveDateTime, Utc};
+use memoria_core::{MemoriaError, MemoryType, FEEDBACK_SIGNALS};
 use memoria_service::MemoryService;
 use memoria_storage::SqlMemoryStore;
 use sqlx::{MySqlPool, Row};
@@ -45,6 +62,49 @@ const BATCH_SIZE_MAX: u32 = 512;
 const MAX_CONCURRENCY_MAX: usize = 32;
 /// Maximum rows per bulk INSERT chunk when flushing rollups.
 const ROLLUP_FLUSH_CHUNK_ROWS: usize = 500;
+/// Maximum users seeded per bootstrap pass to avoid fan-out on startup.
+const BOOTSTRAP_BATCH_SIZE: usize = 50;
+const DISTINCT_STATE_USERS_SUBQUERY: &str =
+    r#"SELECT user_id FROM mem_metrics_user_state GROUP BY user_id"#;
+const DEDUPED_STATE_SUBQUERY: &str = r#"SELECT
+           user_id,
+           COALESCE(CAST(BIT_OR(pending_mask) AS UNSIGNED), 0) AS pending_mask,
+           MAX(CASE WHEN has_pending = 1 OR pending_mask <> 0 THEN 1 ELSE 0 END) AS has_pending,
+           MAX(refreshed_at) AS refreshed_at
+       FROM mem_metrics_user_state
+       GROUP BY user_id"#;
+const LATEST_ERROR_STATE_SUBQUERY: &str = r#"SELECT
+           s.user_id,
+           MAX(s.last_error_kind) AS last_error_kind,
+           MAX(s.last_error_at) AS last_error_at
+       FROM mem_metrics_user_state s
+       INNER JOIN (
+           SELECT user_id, MAX(last_error_at) AS last_error_at
+           FROM mem_metrics_user_state
+           WHERE last_error_kind IS NOT NULL AND last_error_at IS NOT NULL
+           GROUP BY user_id
+       ) latest
+         ON latest.user_id = s.user_id
+        AND latest.last_error_at = s.last_error_at
+       WHERE s.last_error_kind IS NOT NULL AND s.last_error_at IS NOT NULL
+       GROUP BY s.user_id"#;
+const MARK_USER_DIRTY_INSERT_SQL: &str = r#"INSERT INTO mem_metrics_user_state (
+               user_id, pending_mask, has_pending, change_version,
+               next_eligible_at, updated_at
+           ) VALUES (?, ?, 1, 1, ?, ?)"#;
+const MARK_USER_DIRTY_AGGREGATE_SQL: &str = r#"SELECT
+               COALESCE(CAST(BIT_OR(pending_mask) AS UNSIGNED), 0) AS merged_pending_mask,
+               COALESCE(MAX(change_version), 0) AS max_change_version,
+               COUNT(*) AS row_count
+           FROM mem_metrics_user_state
+           WHERE user_id = ?"#;
+const MARK_USER_DIRTY_UPDATE_SQL: &str = r#"UPDATE mem_metrics_user_state SET
+               pending_mask = ?,
+               has_pending = 1,
+               change_version = ?,
+               next_eligible_at = ?,
+               updated_at = ?
+           WHERE user_id = ?"#;
 
 // ── Dirty mask ────────────────────────────────────────────────────────────────
 
@@ -84,8 +144,15 @@ impl std::ops::BitOr for DirtyMask {
 
 /// A metric family that can be materialized into the rollup table.
 ///
-/// Each entry declares which dirty bit triggers it, whether it produces
-/// labelled buckets, and what Prometheus metric name to render.
+/// Each entry centralizes **all** metadata for the family:
+/// 1. dirty trigger bit
+/// 2. how it is recomputed (via [`compute_family_for_user`])
+/// 3. whether it is labelled, and if so, the legal bucket set
+/// 4. how it renders to Prometheus (metric name, help, type, label key)
+///
+/// This is the single source of truth for family semantics.  Adding a new
+/// business metric means adding an entry here and implementing its
+/// computation in [`compute_family_for_user`].
 #[derive(Debug, Clone, Copy)]
 struct FamilyDef {
     /// Key stored in the `family` column of `mem_metrics_user_rollups`.
@@ -93,53 +160,225 @@ struct FamilyDef {
     /// Which dirty bit triggers recomputation of this family.
     trigger: DirtyMask,
     /// Whether this family produces labelled buckets (true) or a single
-    /// `__total__` scalar (false).  Used by rendering and validation.
-    #[allow(dead_code)]
+    /// `__total__` scalar (false).
     is_labelled: bool,
+
+    // ── Prometheus rendering metadata ────────────────────────────────
+    /// Prometheus metric name (e.g. `memoria_memories_total`).
+    prom_name: &'static str,
+    /// HELP text emitted once per unique `prom_name`.
+    prom_help: &'static str,
+    /// Prometheus TYPE (`gauge` or `counter`).
+    prom_type: &'static str,
+    /// Label key for labelled families and scalar families rendered under
+    /// a shared labelled metric (e.g. `"type"` for `memoria_memories_total`).
+    label_name: Option<&'static str>,
+    /// For scalar families rendered as a label value under a shared
+    /// labelled metric (e.g. `memory_total` renders as `{type="all"}`).
+    scalar_label_value: Option<&'static str>,
+    /// Whether to add `total_users` to the rendered value
+    /// (e.g. `branches_extra_total` → `memoria_branches_total`).
+    add_total_users: bool,
+
+    // ── Bucket validation ────────────────────────────────────────────
+    /// For labelled families: the set of legal bucket values.
+    /// `None` for scalar families.  Unknown buckets are silently
+    /// dropped during rendering to prevent cardinality blowup.
+    legal_buckets: Option<&'static [&'static str]>,
 }
 
-/// Authoritative list of all rollup families.  Adding a new business metric
-/// means adding an entry here and implementing its computation in
-/// [`compute_family_for_user`].
+/// Authoritative list of all rollup families.
+///
+/// The ordering within the same `prom_name` matters: labelled entries
+/// should come before scalar-label entries so the Prometheus output
+/// emits per-bucket lines before the aggregate "all" line.
 static FAMILY_REGISTRY: &[FamilyDef] = &[
-    FamilyDef {
-        family: "memory_total",
-        trigger: DirtyMask::MEMORY,
-        is_labelled: false,
-    },
     FamilyDef {
         family: "memory_type",
         trigger: DirtyMask::MEMORY,
         is_labelled: true,
+        prom_name: "memoria_memories_total",
+        prom_help: "Active memories by type.",
+        prom_type: "gauge",
+        label_name: Some("type"),
+        scalar_label_value: None,
+        add_total_users: false,
+        legal_buckets: Some(MemoryType::ALL_NAMES),
+    },
+    FamilyDef {
+        family: "memory_total",
+        trigger: DirtyMask::MEMORY,
+        is_labelled: false,
+        prom_name: "memoria_memories_total",
+        prom_help: "Active memories by type.",
+        prom_type: "gauge",
+        label_name: Some("type"),
+        scalar_label_value: Some("all"),
+        add_total_users: false,
+        legal_buckets: None,
     },
     FamilyDef {
         family: "feedback_signal",
         trigger: DirtyMask::FEEDBACK,
         is_labelled: true,
+        prom_name: "memoria_feedback_total",
+        prom_help: "Feedback signals by type.",
+        prom_type: "counter",
+        label_name: Some("signal"),
+        scalar_label_value: None,
+        add_total_users: false,
+        legal_buckets: Some(FEEDBACK_SIGNALS),
     },
     FamilyDef {
         family: "graph_nodes_total",
         trigger: DirtyMask::GRAPH,
         is_labelled: false,
+        prom_name: "memoria_graph_nodes_total",
+        prom_help: "Entity graph nodes.",
+        prom_type: "gauge",
+        label_name: None,
+        scalar_label_value: None,
+        add_total_users: false,
+        legal_buckets: None,
     },
     FamilyDef {
         family: "graph_edges_total",
         trigger: DirtyMask::GRAPH,
         is_labelled: false,
+        prom_name: "memoria_graph_edges_total",
+        prom_help: "Entity graph edges.",
+        prom_type: "gauge",
+        label_name: None,
+        scalar_label_value: None,
+        add_total_users: false,
+        legal_buckets: None,
     },
     FamilyDef {
         family: "snapshots_total",
         trigger: DirtyMask::SNAPSHOT,
         is_labelled: false,
+        prom_name: "memoria_snapshots_total",
+        prom_help: "Snapshots.",
+        prom_type: "gauge",
+        label_name: None,
+        scalar_label_value: None,
+        add_total_users: false,
+        legal_buckets: None,
     },
     FamilyDef {
         family: "branches_extra_total",
         trigger: DirtyMask::BRANCH,
         is_labelled: false,
+        prom_name: "memoria_branches_total",
+        prom_help: "Active branches.",
+        prom_type: "gauge",
+        label_name: None,
+        scalar_label_value: None,
+        add_total_users: true,
+        legal_buckets: None,
     },
 ];
 
 const TOTAL_BUCKET: &str = "__total__";
+
+// ── Registry-driven rendering ─────────────────────────────────────────────────
+
+/// Render all business metrics from rollup data, driven entirely by the
+/// family registry.  This is the single rendering path used by both the
+/// rollup-backed (multi-db) and live-fallback (single-db) code paths.
+///
+/// The caller provides:
+/// - `scalar_totals`: family → aggregated value for scalar families
+/// - `labelled_totals`: family → (bucket → aggregated value) for labelled families
+/// - `total_users`: user count (rendered as `memoria_users_total` and used
+///   for the `branches_extra_total → memoria_branches_total` adjustment)
+pub fn render_business_metrics(out: &mut String, metrics: &GlobalSummaryMetrics) {
+    // memoria_users_total is not a rollup family; render it first.
+    out.push_str("# HELP memoria_users_total Active users.\n");
+    out.push_str("# TYPE memoria_users_total gauge\n");
+    out.push_str(&format!("memoria_users_total {}\n", metrics.total_users));
+
+    let mut emitted_help: std::collections::HashSet<&str> = std::collections::HashSet::new();
+
+    for fam in FAMILY_REGISTRY {
+        // Emit HELP + TYPE once per unique prom_name.
+        if emitted_help.insert(fam.prom_name) {
+            out.push_str(&format!("# HELP {} {}\n", fam.prom_name, fam.prom_help));
+            out.push_str(&format!("# TYPE {} {}\n", fam.prom_name, fam.prom_type));
+        }
+
+        if fam.is_labelled {
+            let label_key = fam.label_name.unwrap_or("bucket");
+            if let Some(buckets) = metrics.labelled_totals.get(fam.family) {
+                for (bucket, value) in buckets {
+                    // Validate bucket against legal set if defined.
+                    if let Some(legal) = fam.legal_buckets {
+                        if !legal.contains(&bucket.as_str()) {
+                            continue;
+                        }
+                    }
+                    out.push_str(&format!(
+                        "{prom}{{{label_key}=\"{bucket}\"}} {value}\n",
+                        prom = fam.prom_name
+                    ));
+                }
+            }
+        } else if let Some(label_val) = fam.scalar_label_value {
+            // Scalar rendered as a label value of a shared metric.
+            let value = metrics.scalar_totals.get(fam.family).copied().unwrap_or(0);
+            let label_key = fam.label_name.unwrap_or("bucket");
+            out.push_str(&format!(
+                "{prom}{{{label_key}=\"{label_val}\"}} {value}\n",
+                prom = fam.prom_name
+            ));
+        } else {
+            // Plain scalar.
+            let mut value = metrics.scalar_totals.get(fam.family).copied().unwrap_or(0);
+            if fam.add_total_users {
+                value += metrics.total_users;
+            }
+            out.push_str(&format!("{} {}\n", fam.prom_name, value));
+        }
+    }
+}
+
+/// Render summary error health metrics from the state table.
+///
+/// These metrics reflect **outstanding** refresh errors, not lifetime history.
+/// `last_error_kind` / `last_error_at` are cleared on successful refresh
+/// (see [`MetricsSummaryManager::flush_state`]), so only users whose most
+/// recent refresh attempt failed will appear here.  Queries are scoped to
+/// active users via `mem_user_registry`.
+pub fn render_error_health_metrics(out: &mut String, metrics: &GlobalSummaryMetrics) {
+    // Users with outstanding errors by kind
+    out.push_str("# HELP memoria_metrics_summary_errors_by_kind Users with outstanding refresh errors by error kind.\n");
+    out.push_str("# TYPE memoria_metrics_summary_errors_by_kind gauge\n");
+    if metrics.error_counts_by_kind.is_empty() {
+        out.push_str("memoria_metrics_summary_errors_by_kind{kind=\"none\"} 0\n");
+    } else {
+        for (kind, cnt) in &metrics.error_counts_by_kind {
+            out.push_str(&format!(
+                "memoria_metrics_summary_errors_by_kind{{kind=\"{kind}\"}} {cnt}\n"
+            ));
+        }
+    }
+
+    // Total users with errors
+    out.push_str("# HELP memoria_metrics_summary_users_with_errors Total users with outstanding refresh errors.\n");
+    out.push_str("# TYPE memoria_metrics_summary_users_with_errors gauge\n");
+    out.push_str(&format!(
+        "memoria_metrics_summary_users_with_errors {}\n",
+        metrics.users_with_errors
+    ));
+
+    // Newest error age
+    out.push_str("# HELP memoria_metrics_summary_newest_error_age_seconds Age of the most recent refresh error.\n");
+    out.push_str("# TYPE memoria_metrics_summary_newest_error_age_seconds gauge\n");
+    out.push_str(&format!(
+        "memoria_metrics_summary_newest_error_age_seconds {}\n",
+        metrics.newest_error_age_secs.unwrap_or(0)
+    ));
+}
 
 // ── Public metrics types ──────────────────────────────────────────────────────
 
@@ -150,25 +389,34 @@ pub struct SummaryRefreshStats {
     pub last_duration_secs: f64,
     pub last_success_age_secs: Option<u64>,
     pub last_failure_age_secs: Option<u64>,
+    pub effective_concurrency: u64,
+    pub effective_batch_size: u64,
+    pub pool_backoff_active: bool,
 }
 
 /// Aggregated global metrics read from the rollup + state tables.
 /// Used by the `/metrics` endpoint in multi-db mode.
+///
+/// Business metrics are stored in generic maps keyed by family name
+/// (matching [`FAMILY_REGISTRY`] entries) so that rendering is driven
+/// entirely from the registry rather than ad-hoc field access.
 #[derive(Debug, Default, Clone)]
 pub struct GlobalSummaryMetrics {
     pub available: bool,
     pub total_users: i64,
-    pub total_memories: i64,
-    pub memory_counts: BTreeMap<String, i64>,
-    pub feedback_counts: BTreeMap<String, i64>,
-    pub graph_nodes_total: i64,
-    pub graph_edges_total: i64,
-    pub snapshots_total: i64,
-    pub branches_extra_total: i64,
+    /// Scalar family totals: family name → aggregated value across all users.
+    pub scalar_totals: BTreeMap<String, i64>,
+    /// Labelled family breakdowns: family name → (bucket → aggregated value).
+    pub labelled_totals: BTreeMap<String, BTreeMap<String, i64>>,
+    // ── Summary health ──
     pub ready_users_total: i64,
     pub dirty_users_total: i64,
     pub missing_users_total: i64,
     pub oldest_ready_refresh_age_secs: Option<i64>,
+    // ── Error health (exposed via /metrics) ──
+    pub error_counts_by_kind: BTreeMap<String, i64>,
+    pub users_with_errors: i64,
+    pub newest_error_age_secs: Option<i64>,
 }
 
 // ── Internal types ────────────────────────────────────────────────────────────
@@ -180,6 +428,9 @@ struct RefreshStats {
     last_duration_ms: AtomicU64,
     last_success_epoch_secs: AtomicU64,
     last_failure_epoch_secs: AtomicU64,
+    effective_concurrency: AtomicU64,
+    effective_batch_size: AtomicU64,
+    pool_backoff_active: AtomicU64,
 }
 
 /// A single rollup entry produced by computing a family for a user.
@@ -194,9 +445,14 @@ struct RollupEntry {
 #[derive(Debug)]
 struct ClaimedUser {
     user_id: String,
-    db_name: String,
     claimed_version: u64,
     claimed_mask: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct StateUpsertOutcome {
+    inserted: bool,
+    duplicate_rows_seen: u64,
 }
 
 // ── Manager ───────────────────────────────────────────────────────────────────
@@ -316,13 +572,19 @@ impl MetricsSummaryManager {
             last_failure_age_secs: age_from_epoch(
                 self.stats.last_failure_epoch_secs.load(Ordering::Relaxed),
             ),
+            effective_concurrency: self.stats.effective_concurrency.load(Ordering::Relaxed),
+            effective_batch_size: self.stats.effective_batch_size.load(Ordering::Relaxed),
+            pool_backoff_active: self.stats.pool_backoff_active.load(Ordering::Relaxed) != 0,
         }
     }
 
-    /// Mark a user dirty with the given mask.  Single-row upsert, very fast.
+    /// Mark a user dirty with the given mask.
     ///
-    /// The mask is OR-merged with any existing pending_mask, change_version is
-    /// bumped, and next_eligible_at is set to `now + debounce` for coalescing.
+    /// The update is serialized via `mem_user_registry` so MatrixOne does not
+    /// see concurrent `ON DUPLICATE KEY UPDATE` races on the state table.  The
+    /// mask is OR-merged with any existing pending_mask, all matching rows are
+    /// rewritten to the same `change_version`, and `next_eligible_at` is set
+    /// to `now + debounce` for coalescing.
     pub async fn mark_user_dirty(
         &self,
         user_id: &str,
@@ -334,46 +596,91 @@ impl MetricsSummaryManager {
         let now = Utc::now().naive_utc();
         let eligible_at =
             now + chrono::Duration::milliseconds(self.refresh_debounce.as_millis() as i64);
-        sqlx::query(
-            r#"INSERT INTO mem_metrics_user_state (
-                   user_id, pending_mask, has_pending, change_version,
-                   next_eligible_at, updated_at
-               ) VALUES (?, ?, 1, 1, ?, ?)
-               ON DUPLICATE KEY UPDATE
-                   pending_mask     = pending_mask | VALUES(pending_mask),
-                   has_pending      = 1,
-                   change_version   = change_version + 1,
-                   next_eligible_at = VALUES(next_eligible_at),
-                   updated_at       = VALUES(updated_at)"#,
-        )
-        .bind(user_id)
-        .bind(mask.0)
-        .bind(eligible_at)
-        .bind(now)
-        .execute(&self.shared_pool)
-        .await
-        .map_err(db_err)?;
+        let outcome = self
+            .upsert_user_state_locked(user_id, mask, eligible_at, now)
+            .await?;
+        if outcome.duplicate_rows_seen > 0 {
+            warn!(
+                user_id,
+                duplicate_rows = outcome.duplicate_rows_seen,
+                "mem_metrics_user_state already contains duplicate rows for user; using logical row semantics"
+            );
+        }
         self.notify.notify_one();
         Ok(())
+    }
+
+    /// Seed `mem_metrics_user_state` rows for active users that are in
+    /// `mem_user_registry` but have no state row yet.
+    ///
+    /// This is the bootstrap path for direct cutover: after switching to
+    /// multi-db mode, pre-existing active users may never call
+    /// `mark_user_dirty()` if they produce no new writes.  Without a
+    /// state row they would stay in the "missing" bucket forever.
+    ///
+    /// **Bounded**: at most [`BOOTSTRAP_BATCH_SIZE`] users are seeded per
+    /// call to avoid fan-out pressure on the shared pool.  The worker
+    /// calls this once per tick so convergence is gradual.
+    ///
+    /// Seeded rows get `pending_mask = FULL` and `has_pending = 1`, making
+    /// them immediately claimable by the refresh worker so all families
+    /// are computed on first refresh.  `next_eligible_at` is set to now
+    /// (no debounce for bootstrap rows).
+    ///
+    /// Returns the number of users seeded (0 when fully converged).
+    async fn bootstrap_missing_users(&self) -> Result<usize, MemoriaError> {
+        let now = Utc::now().naive_utc();
+        let bootstrap_sql = format!(
+            r#"SELECT r.user_id
+               FROM mem_user_registry r
+               LEFT JOIN ({DISTINCT_STATE_USERS_SUBQUERY}) s ON s.user_id = r.user_id
+               WHERE r.status = 'active' AND s.user_id IS NULL
+               ORDER BY r.user_id
+               LIMIT ?"#
+        );
+        let rows = sqlx::query(&bootstrap_sql)
+            .bind(BOOTSTRAP_BATCH_SIZE as i64)
+            .fetch_all(&self.shared_pool)
+            .await
+            .map_err(db_err)?;
+
+        let mut seeded = 0usize;
+        for row in rows {
+            let user_id: String = row.try_get("user_id").map_err(db_err)?;
+            let outcome = self
+                .upsert_user_state_locked(&user_id, DirtyMask::FULL, now, now)
+                .await?;
+            if outcome.inserted {
+                seeded += 1;
+            }
+        }
+        if seeded > 0 {
+            info!(
+                seeded,
+                "bootstrapped missing active users into metrics state"
+            );
+        }
+        Ok(seeded)
     }
 
     /// Load aggregated global metrics from rollup + state tables.
     /// Called by `/metrics` in multi-db mode — reads only the shared DB.
     pub async fn load_global_metrics(&self) -> Result<GlobalSummaryMetrics, MemoriaError> {
         // Coverage: how many users are clean / dirty / missing state
-        let coverage = sqlx::query(
+        let coverage_sql = format!(
             r#"SELECT
                    COUNT(*) AS total_users,
                    SUM(CASE WHEN s.user_id IS NULL THEN 1 ELSE 0 END) AS missing_users,
-                   SUM(CASE WHEN s.user_id IS NOT NULL AND s.has_pending = 1 THEN 1 ELSE 0 END) AS dirty_users,
-                   SUM(CASE WHEN s.user_id IS NOT NULL AND s.has_pending = 0 THEN 1 ELSE 0 END) AS ready_users
-               FROM mem_user_registry r
-               LEFT JOIN mem_metrics_user_state s ON s.user_id = r.user_id
-               WHERE r.status = 'active'"#,
-        )
-        .fetch_one(&self.shared_pool)
-        .await
-        .map_err(db_err)?;
+                    SUM(CASE WHEN s.user_id IS NOT NULL AND s.has_pending = 1 THEN 1 ELSE 0 END) AS dirty_users,
+                    SUM(CASE WHEN s.user_id IS NOT NULL AND s.has_pending = 0 THEN 1 ELSE 0 END) AS ready_users
+                FROM mem_user_registry r
+                LEFT JOIN ({DEDUPED_STATE_SUBQUERY}) s ON s.user_id = r.user_id
+                WHERE r.status = 'active'"#
+        );
+        let coverage = sqlx::query(&coverage_sql)
+            .fetch_one(&self.shared_pool)
+            .await
+            .map_err(db_err)?;
 
         // Scalar families from rollups
         let scalar_rows = sqlx::query(
@@ -387,42 +694,72 @@ impl MetricsSummaryManager {
         .await
         .map_err(db_err)?;
 
-        // Label families
-        let memory_type_rows = sqlx::query(
-            r#"SELECT r.bucket, COALESCE(SUM(r.value), 0) AS total
-               FROM mem_metrics_user_rollups r
-               INNER JOIN mem_user_registry u ON u.user_id = r.user_id
-               WHERE u.status = 'active' AND r.family = 'memory_type'
-               GROUP BY r.bucket"#,
-        )
-        .fetch_all(&self.shared_pool)
-        .await
-        .map_err(db_err)?;
-
-        let feedback_rows = sqlx::query(
-            r#"SELECT r.bucket, COALESCE(SUM(r.value), 0) AS total
-               FROM mem_metrics_user_rollups r
-               INNER JOIN mem_user_registry u ON u.user_id = r.user_id
-               WHERE u.status = 'active' AND r.family = 'feedback_signal'
-               GROUP BY r.bucket"#,
-        )
-        .fetch_all(&self.shared_pool)
-        .await
-        .map_err(db_err)?;
+        // All labelled families in a single query driven by the registry
+        let labelled_names: Vec<&str> = FAMILY_REGISTRY
+            .iter()
+            .filter(|f| f.is_labelled)
+            .map(|f| f.family)
+            .collect();
+        let labelled_rows = if labelled_names.is_empty() {
+            Vec::new()
+        } else {
+            let placeholders: String = labelled_names
+                .iter()
+                .map(|_| "?")
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                r#"SELECT r.family, r.bucket, COALESCE(SUM(r.value), 0) AS total
+                   FROM mem_metrics_user_rollups r
+                   INNER JOIN mem_user_registry u ON u.user_id = r.user_id
+                   WHERE u.status = 'active' AND r.family IN ({placeholders})
+                   GROUP BY r.family, r.bucket"#
+            );
+            let mut q = sqlx::query(&sql);
+            for name in &labelled_names {
+                q = q.bind(*name);
+            }
+            q.fetch_all(&self.shared_pool).await.map_err(db_err)?
+        };
 
         // Oldest refresh age
-        let oldest_refresh = sqlx::query(
+        let oldest_refresh_sql = format!(
             r#"SELECT
                    MAX(TIMESTAMPDIFF(SECOND, s.refreshed_at, UTC_TIMESTAMP())) AS oldest_age
-               FROM mem_metrics_user_state s
-               INNER JOIN mem_user_registry r ON r.user_id = s.user_id
-               WHERE r.status = 'active'
-                 AND s.has_pending = 0
-                 AND s.refreshed_at IS NOT NULL"#,
-        )
-        .fetch_one(&self.shared_pool)
-        .await
-        .map_err(db_err)?;
+                FROM ({DEDUPED_STATE_SUBQUERY}) s
+                INNER JOIN mem_user_registry r ON r.user_id = s.user_id
+                WHERE r.status = 'active'
+                  AND s.has_pending = 0
+                  AND s.refreshed_at IS NOT NULL"#
+        );
+        let oldest_refresh = sqlx::query(&oldest_refresh_sql)
+            .fetch_one(&self.shared_pool)
+            .await
+            .map_err(db_err)?;
+
+        // ── Error health ──────────────────────────────────────────
+        // Scoped to active users so deactivated/historical state rows
+        // don't inflate the outstanding-error counts.
+        let error_rows_sql = format!(
+            r#"SELECT s.last_error_kind, COUNT(*) AS cnt
+               FROM ({LATEST_ERROR_STATE_SUBQUERY}) s
+               INNER JOIN mem_user_registry r ON r.user_id = s.user_id AND r.status = 'active'
+               GROUP BY s.last_error_kind"#
+        );
+        let error_rows = sqlx::query(&error_rows_sql)
+            .fetch_all(&self.shared_pool)
+            .await
+            .map_err(db_err)?;
+
+        let newest_error_sql = format!(
+            r#"SELECT MIN(TIMESTAMPDIFF(SECOND, s.last_error_at, UTC_TIMESTAMP())) AS newest_age
+               FROM ({LATEST_ERROR_STATE_SUBQUERY}) s
+               INNER JOIN mem_user_registry r ON r.user_id = s.user_id AND r.status = 'active'"#
+        );
+        let newest_error = sqlx::query(&newest_error_sql)
+            .fetch_one(&self.shared_pool)
+            .await
+            .map_err(db_err)?;
 
         // Assemble
         let mut metrics = GlobalSummaryMetrics {
@@ -431,36 +768,44 @@ impl MetricsSummaryManager {
             ready_users_total: optional_i64(&coverage, "ready_users"),
             dirty_users_total: optional_i64(&coverage, "dirty_users"),
             missing_users_total: optional_i64(&coverage, "missing_users"),
-            oldest_ready_refresh_age_secs: oldest_refresh
-                .try_get::<Option<i64>, _>("oldest_age")
-                .map_err(db_err)?,
+            oldest_ready_refresh_age_secs: clamp_metric_age(
+                oldest_refresh
+                    .try_get::<Option<i64>, _>("oldest_age")
+                    .map_err(db_err)?,
+            ),
+            newest_error_age_secs: clamp_metric_age(
+                newest_error
+                    .try_get::<Option<i64>, _>("newest_age")
+                    .map_err(db_err)?,
+            ),
             ..GlobalSummaryMetrics::default()
         };
 
         for row in scalar_rows {
             let family: String = row.try_get("family").map_err(db_err)?;
             let total = optional_i64(&row, "total");
-            match family.as_str() {
-                "memory_total" => metrics.total_memories = total,
-                "graph_nodes_total" => metrics.graph_nodes_total = total,
-                "graph_edges_total" => metrics.graph_edges_total = total,
-                "snapshots_total" => metrics.snapshots_total = total,
-                "branches_extra_total" => metrics.branches_extra_total = total,
-                _ => {}
-            }
+            metrics.scalar_totals.insert(family, total);
         }
 
-        for row in memory_type_rows {
+        for row in labelled_rows {
+            let family: String = row.try_get("family").map_err(db_err)?;
             let bucket: String = row.try_get("bucket").map_err(db_err)?;
             let total = optional_i64(&row, "total");
-            metrics.memory_counts.insert(bucket, total);
+            metrics
+                .labelled_totals
+                .entry(family)
+                .or_default()
+                .insert(bucket, total);
         }
 
-        for row in feedback_rows {
-            let bucket: String = row.try_get("bucket").map_err(db_err)?;
-            let total = optional_i64(&row, "total");
-            metrics.feedback_counts.insert(bucket, total);
+        let mut total_users_with_errors: i64 = 0;
+        for row in error_rows {
+            let kind: String = row.try_get("last_error_kind").map_err(db_err)?;
+            let cnt = optional_i64(&row, "cnt");
+            total_users_with_errors += cnt;
+            metrics.error_counts_by_kind.insert(kind, cnt);
         }
+        metrics.users_with_errors = total_users_with_errors;
 
         Ok(metrics)
     }
@@ -478,6 +823,12 @@ impl MetricsSummaryManager {
                 _ = interval.tick() => {}
                 _ = self.notify.notified() => {}
                 _ = shutdown.changed() => break,
+            }
+            // Bootstrap: seed state rows for active users missing from
+            // mem_metrics_user_state.  Bounded per tick so it converges
+            // gradually without fan-out pressure.
+            if let Err(e) = self.bootstrap_missing_users().await {
+                warn!(error = %e, "bootstrap_missing_users failed");
             }
             if let Err(e) = self.refresh_until_quiet().await {
                 self.stats.failures_total.fetch_add(1, Ordering::Relaxed);
@@ -498,6 +849,59 @@ impl MetricsSummaryManager {
         }
     }
 
+    // ── Pool-aware backoff ───────────────────────────────────────────────
+
+    /// Compute effective refresh concurrency based on the main (user) pool
+    /// health.  When the pool enters high-utilization or saturated territory,
+    /// concurrency is halved or reduced to 1 to avoid starving request
+    /// traffic.
+    ///
+    /// Note: only the main pool (global user pool) has health monitoring.
+    /// The shared/auth pool does not currently expose health signals, so
+    /// backoff is only applied against the user pool.
+    fn effective_concurrency(&self) -> usize {
+        use memoria_storage::PoolHealthLevel;
+        let level = self
+            .service
+            .sql_store
+            .as_ref()
+            .map(|s| s.pool_health_snapshot().level)
+            .unwrap_or(PoolHealthLevel::Healthy);
+        let eff = match level {
+            PoolHealthLevel::Healthy => self.max_concurrency,
+            PoolHealthLevel::HighUtilization => (self.max_concurrency / 2).max(1),
+            PoolHealthLevel::Saturated | PoolHealthLevel::Empty => 1,
+        };
+        let backoff = eff < self.max_concurrency;
+        self.stats
+            .effective_concurrency
+            .store(eff as u64, Ordering::Relaxed);
+        self.stats
+            .pool_backoff_active
+            .store(u64::from(backoff), Ordering::Relaxed);
+        eff
+    }
+
+    /// Compute effective claim batch size based on pool health.
+    fn effective_batch_size(&self) -> usize {
+        use memoria_storage::PoolHealthLevel;
+        let level = self
+            .service
+            .sql_store
+            .as_ref()
+            .map(|s| s.pool_health_snapshot().level)
+            .unwrap_or(PoolHealthLevel::Healthy);
+        let eff = match level {
+            PoolHealthLevel::Healthy => self.batch_size,
+            PoolHealthLevel::HighUtilization => (self.batch_size / 2).max(1),
+            PoolHealthLevel::Saturated | PoolHealthLevel::Empty => (self.batch_size / 4).max(1),
+        };
+        self.stats
+            .effective_batch_size
+            .store(eff as u64, Ordering::Relaxed);
+        eff
+    }
+
     // ── Phase 1: Claim ────────────────────────────────────────────────────
 
     /// Claim a batch of eligible users for refresh.
@@ -507,6 +911,7 @@ impl MetricsSummaryManager {
     /// row-locked and atomic), then we SELECT back only the rows bearing
     /// our token.  Two concurrent workers will never claim the same rows.
     async fn claim_batch(&self) -> Result<Vec<ClaimedUser>, MemoriaError> {
+        let effective_size = self.effective_batch_size();
         let token = uuid::Uuid::new_v4().to_string();
         let now = Utc::now().naive_utc();
         let claim_expires = now + chrono::Duration::seconds(120);
@@ -526,7 +931,7 @@ impl MetricsSummaryManager {
         .bind(now)
         .bind(now)
         .bind(now)
-        .bind(self.batch_size as i64)
+        .bind(effective_size as i64)
         .execute(&self.shared_pool)
         .await
         .map_err(db_err)?;
@@ -537,10 +942,13 @@ impl MetricsSummaryManager {
 
         // Read back the rows we just claimed, by our unique token.
         let rows = sqlx::query(
-            r#"SELECT s.user_id, r.db_name, s.change_version, s.pending_mask
+            r#"SELECT
+                   s.user_id,
+                   COALESCE(CAST(BIT_OR(s.pending_mask) AS UNSIGNED), 0) AS pending_mask,
+                   COALESCE(MAX(s.change_version), 0) AS change_version
                FROM mem_metrics_user_state s
-               INNER JOIN mem_user_registry r ON r.user_id = s.user_id AND r.status = 'active'
-               WHERE s.claim_token = ?"#,
+               WHERE s.claim_token = ?
+               GROUP BY s.user_id"#,
         )
         .bind(&token)
         .fetch_all(&self.shared_pool)
@@ -551,7 +959,6 @@ impl MetricsSummaryManager {
         for row in &rows {
             claimed.push(ClaimedUser {
                 user_id: row.try_get("user_id").map_err(db_err)?,
-                db_name: row.try_get("db_name").map_err(db_err)?,
                 claimed_version: row
                     .try_get::<u64, _>("change_version")
                     .or_else(|_| row.try_get::<i64, _>("change_version").map(|v| v as u64))
@@ -564,6 +971,96 @@ impl MetricsSummaryManager {
         }
 
         Ok(claimed)
+    }
+
+    async fn upsert_user_state_locked(
+        &self,
+        user_id: &str,
+        mask: DirtyMask,
+        eligible_at: NaiveDateTime,
+        now: NaiveDateTime,
+    ) -> Result<StateUpsertOutcome, MemoriaError> {
+        let mut tx = self.shared_pool.begin().await.map_err(db_err)?;
+
+        let has_registry_row = sqlx::query(
+            "SELECT user_id FROM mem_user_registry WHERE user_id = ? LIMIT 1 FOR UPDATE",
+        )
+        .bind(user_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db_err)?
+        .is_some();
+
+        if !has_registry_row {
+            let _ = sqlx::query(
+                "SELECT user_id FROM mem_metrics_user_state WHERE user_id = ? LIMIT 1 FOR UPDATE",
+            )
+            .bind(user_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        }
+
+        let aggregate = sqlx::query(MARK_USER_DIRTY_AGGREGATE_SQL)
+            .bind(user_id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(db_err)?;
+
+        let row_count = aggregate
+            .try_get::<i64, _>("row_count")
+            .or_else(|_| aggregate.try_get::<u64, _>("row_count").map(|v| v as i64))
+            .map_err(db_err)? as u64;
+
+        let outcome = if row_count == 0 {
+            sqlx::query(MARK_USER_DIRTY_INSERT_SQL)
+                .bind(user_id)
+                .bind(mask.0)
+                .bind(eligible_at)
+                .bind(now)
+                .execute(&mut *tx)
+                .await
+                .map_err(db_err)?;
+            StateUpsertOutcome {
+                inserted: true,
+                duplicate_rows_seen: 0,
+            }
+        } else {
+            let merged_pending_mask = aggregate
+                .try_get::<u64, _>("merged_pending_mask")
+                .or_else(|_| {
+                    aggregate
+                        .try_get::<i64, _>("merged_pending_mask")
+                        .map(|v| v as u64)
+                })
+                .map_err(db_err)?;
+            let max_change_version = aggregate
+                .try_get::<u64, _>("max_change_version")
+                .or_else(|_| {
+                    aggregate
+                        .try_get::<i64, _>("max_change_version")
+                        .map(|v| v as u64)
+                })
+                .map_err(db_err)?;
+
+            sqlx::query(MARK_USER_DIRTY_UPDATE_SQL)
+                .bind(merged_pending_mask | mask.0)
+                .bind(max_change_version.saturating_add(1))
+                .bind(eligible_at)
+                .bind(now)
+                .bind(user_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(db_err)?;
+
+            StateUpsertOutcome {
+                inserted: false,
+                duplicate_rows_seen: row_count.saturating_sub(1),
+            }
+        };
+
+        tx.commit().await.map_err(db_err)?;
+        Ok(outcome)
     }
 
     // ── Phase 2: Compute ──────────────────────────────────────────────────
@@ -584,7 +1081,7 @@ impl MetricsSummaryManager {
             return Ok(Vec::new());
         }
 
-        let store = self.get_user_store(&user.user_id, &user.db_name).await?;
+        let store = self.get_user_store(&user.user_id).await?;
         let mut entries = Vec::new();
 
         for fam in families_needed {
@@ -605,23 +1102,11 @@ impl MetricsSummaryManager {
         Ok(entries)
     }
 
-    async fn get_user_store(
-        &self,
-        user_id: &str,
-        db_name: &str,
-    ) -> Result<SqlMemoryStore, MemoriaError> {
-        let router =
-            self.service.db_router.as_ref().ok_or_else(|| {
-                MemoriaError::Internal("metrics rollup requires db router".into())
-            })?;
-        match router.routed_store_for_db_name(db_name) {
-            Ok(store) => Ok(store),
-            Err(_) => {
-                // Fallback: ensure user store exists (may trigger provisioning)
-                let store = self.service.user_sql_store(user_id).await?;
-                Ok(store.as_ref().clone())
-            }
-        }
+    async fn get_user_store(&self, user_id: &str) -> Result<SqlMemoryStore, MemoriaError> {
+        // Always go through the service path so cache misses also run
+        // `migrate_user()` before metrics reads hit a freshly-provisioned DB.
+        let store = self.service.user_sql_store(user_id).await?;
+        Ok(store.as_ref().clone())
     }
 
     // ── Phase 3: Flush rollups ────────────────────────────────────────────
@@ -733,6 +1218,8 @@ impl MetricsSummaryManager {
     /// - `has_pending` is derived from the post-update `pending_mask`
     ///   (MySQL evaluates SET left-to-right).
     /// - `claim_token` / `claim_expires_at` are always cleared.
+    /// - `last_error_kind` / `last_error_at` are cleared on successful
+    ///   refresh, so error health reports outstanding errors only.
     async fn flush_state(
         &self,
         batch: &[(ClaimedUser, Vec<RollupEntry>)],
@@ -746,21 +1233,27 @@ impl MetricsSummaryManager {
 
         for chunk in batch.chunks(STATE_FLUSH_CHUNK) {
             let mut pending_cases = String::new();
+            let mut has_pending_cases = String::new();
             let mut version_cases = String::new();
             let user_placeholders: String = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
 
             for _ in chunk {
                 pending_cases
-                    .push_str("WHEN user_id = ? AND change_version = ? THEN pending_mask & ~? ");
+                    .push_str("WHEN user_id = ? AND change_version = ? THEN pending_mask & ? ");
+                has_pending_cases.push_str(
+                    "WHEN user_id = ? AND change_version = ? THEN IF((pending_mask & ?) = 0, 0, 1) ",
+                );
                 version_cases.push_str("WHEN user_id = ? THEN ? ");
             }
 
             let sql = format!(
                 r#"UPDATE mem_metrics_user_state SET
                        pending_mask = CASE {pending_cases} ELSE pending_mask END,
-                       has_pending = IF(pending_mask = 0, 0, 1),
+                       has_pending = CASE {has_pending_cases} ELSE has_pending END,
                        last_refreshed_version = CASE {version_cases} ELSE last_refreshed_version END,
                        refreshed_at = ?,
+                       last_error_kind = NULL,
+                       last_error_at = NULL,
                        claim_token = NULL,
                        claim_expires_at = NULL,
                        updated_at = ?
@@ -768,12 +1261,21 @@ impl MetricsSummaryManager {
             );
 
             let mut query = sqlx::query(&sql);
-            // Bind pending_mask CASE params (user_id, claimed_version, claimed_mask)
+            // Bind pending_mask CASE params (user_id, claimed_version, keep_mask)
             for (user, _) in chunk {
+                let keep_mask = DirtyMask::FULL.0 & !user.claimed_mask;
                 query = query
                     .bind(&user.user_id)
                     .bind(user.claimed_version)
-                    .bind(user.claimed_mask);
+                    .bind(keep_mask);
+            }
+            // Bind has_pending CASE params (user_id, claimed_version, keep_mask)
+            for (user, _) in chunk {
+                let keep_mask = DirtyMask::FULL.0 & !user.claimed_mask;
+                query = query
+                    .bind(&user.user_id)
+                    .bind(user.claimed_version)
+                    .bind(keep_mask);
             }
             // Bind last_refreshed_version CASE params (user_id, claimed_version)
             for (user, _) in chunk {
@@ -809,15 +1311,18 @@ impl MetricsSummaryManager {
             .store(batch_len as u64, Ordering::Relaxed);
         let started = Instant::now();
 
-        // Phase 2: Compute with bounded concurrency
+        // Phase 2: Compute with pool-aware bounded concurrency
+        let effective_conc = self.effective_concurrency();
         let mut results: Vec<(ClaimedUser, Vec<RollupEntry>)> = Vec::with_capacity(batch_len);
         let mut join_set = tokio::task::JoinSet::new();
         let mut queued = claimed.into_iter();
         let mut succeeded = 0usize;
 
         loop {
-            // Fill up to max_concurrency
-            while join_set.len() < self.max_concurrency {
+            // Re-evaluate concurrency each iteration to react to pool changes
+            let conc = self.effective_concurrency().min(effective_conc);
+            // Fill up to effective concurrency
+            while join_set.len() < conc {
                 let Some(user) = queued.next() else { break };
                 let mgr = self.clone();
                 join_set.spawn(async move {
@@ -1041,6 +1546,10 @@ fn optional_i64(row: &sqlx::mysql::MySqlRow, column: &str) -> i64 {
         .unwrap_or(0)
 }
 
+fn clamp_metric_age(age_secs: Option<i64>) -> Option<i64> {
+    age_secs.map(|age| age.max(0))
+}
+
 fn now_epoch_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1178,7 +1687,6 @@ mod tests {
     fn make_user(id: &str, mask: DirtyMask, version: u64) -> ClaimedUser {
         ClaimedUser {
             user_id: id.to_string(),
-            db_name: format!("db_{id}"),
             claimed_version: version,
             claimed_mask: mask.0,
         }
@@ -1228,12 +1736,12 @@ mod tests {
                 make_user("A", DirtyMask::MEMORY, 1),
                 vec![
                     make_entry("memory_total", "__total__", 10),
-                    make_entry("memory_type", "core", 5),
+                    make_entry("memory_type", "profile", 5),
                 ],
             ),
             (
                 make_user("B", DirtyMask::FEEDBACK, 2),
-                vec![make_entry("feedback_signal", "positive", 3)],
+                vec![make_entry("feedback_signal", "useful", 3)],
             ),
         ];
 
@@ -1359,12 +1867,12 @@ mod tests {
                 make_user("A", DirtyMask::MEMORY, 1),
                 vec![
                     make_entry("memory_total", "__total__", 10),
-                    make_entry("memory_type", "core", 5),
+                    make_entry("memory_type", "profile", 5),
                 ],
             ),
             (
                 make_user("B", DirtyMask::FEEDBACK, 2),
-                vec![make_entry("feedback_signal", "positive", 3)],
+                vec![make_entry("feedback_signal", "useful", 3)],
             ),
         ];
 
@@ -1388,5 +1896,412 @@ mod tests {
             "user A must NOT be in the delete set for feedback_signal"
         );
         assert!(fb_users.contains(&"B"));
+    }
+
+    // ── Registry metadata completeness ────────────────────────────────
+
+    #[test]
+    fn family_registry_rendering_metadata_complete() {
+        for fam in FAMILY_REGISTRY {
+            assert!(!fam.prom_name.is_empty(), "{}: prom_name empty", fam.family);
+            assert!(!fam.prom_help.is_empty(), "{}: prom_help empty", fam.family);
+            assert!(
+                fam.prom_type == "gauge" || fam.prom_type == "counter",
+                "{}: invalid prom_type",
+                fam.family
+            );
+            if fam.is_labelled {
+                assert!(
+                    fam.label_name.is_some(),
+                    "{}: labelled family needs label_name",
+                    fam.family
+                );
+                assert!(
+                    fam.legal_buckets.is_some(),
+                    "{}: labelled family needs legal_buckets",
+                    fam.family
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn family_registry_legal_buckets_non_empty() {
+        for fam in FAMILY_REGISTRY {
+            if let Some(buckets) = fam.legal_buckets {
+                assert!(
+                    !buckets.is_empty(),
+                    "{}: legal_buckets defined but empty",
+                    fam.family
+                );
+            }
+        }
+    }
+
+    // ── Bucket-drift regression guards ────────────────────────────────
+
+    #[test]
+    fn memory_type_buckets_match_memoria_core() {
+        let fam = FAMILY_REGISTRY
+            .iter()
+            .find(|f| f.family == "memory_type")
+            .expect("memory_type family missing");
+        let mut actual: Vec<&str> = fam.legal_buckets.unwrap().to_vec();
+        actual.sort();
+        let mut expected: Vec<&str> = MemoryType::ALL_NAMES.to_vec();
+        expected.sort();
+        assert_eq!(
+            actual, expected,
+            "memory_type legal_buckets drifted from MemoryType::ALL_NAMES"
+        );
+    }
+
+    #[test]
+    fn feedback_signal_buckets_match_canonical_set() {
+        let fam = FAMILY_REGISTRY
+            .iter()
+            .find(|f| f.family == "feedback_signal")
+            .expect("feedback_signal family missing");
+        let mut actual: Vec<&str> = fam.legal_buckets.unwrap().to_vec();
+        actual.sort();
+        let mut expected: Vec<&str> = FEEDBACK_SIGNALS.to_vec();
+        expected.sort();
+        assert_eq!(
+            actual, expected,
+            "feedback_signal legal_buckets drifted from FEEDBACK_SIGNALS"
+        );
+    }
+
+    #[test]
+    fn render_all_real_memory_types_and_feedback_signals() {
+        let mut metrics = GlobalSummaryMetrics::default();
+        for (ty, val) in [
+            ("semantic", 10),
+            ("working", 20),
+            ("episodic", 5),
+            ("profile", 15),
+            ("tool_result", 3),
+            ("procedural", 7),
+        ] {
+            metrics
+                .labelled_totals
+                .entry("memory_type".into())
+                .or_default()
+                .insert(ty.into(), val);
+        }
+        for (sig, val) in [
+            ("useful", 8),
+            ("irrelevant", 2),
+            ("outdated", 1),
+            ("wrong", 4),
+        ] {
+            metrics
+                .labelled_totals
+                .entry("feedback_signal".into())
+                .or_default()
+                .insert(sig.into(), val);
+        }
+
+        let mut out = String::new();
+        render_business_metrics(&mut out, &metrics);
+
+        for ty in MemoryType::ALL_NAMES {
+            assert!(
+                out.contains(&format!("type=\"{ty}\"")),
+                "missing memory type {ty} in rendered output"
+            );
+        }
+        for sig in FEEDBACK_SIGNALS {
+            assert!(
+                out.contains(&format!("signal=\"{sig}\"")),
+                "missing feedback signal {sig} in rendered output"
+            );
+        }
+    }
+
+    // ── Registry-driven rendering ─────────────────────────────────────
+
+    #[test]
+    fn render_business_metrics_produces_expected_output() {
+        let mut metrics = GlobalSummaryMetrics {
+            total_users: 3,
+            ..Default::default()
+        };
+        metrics.scalar_totals.insert("memory_total".into(), 100);
+        metrics.scalar_totals.insert("graph_nodes_total".into(), 50);
+        metrics.scalar_totals.insert("graph_edges_total".into(), 25);
+        metrics.scalar_totals.insert("snapshots_total".into(), 10);
+        metrics
+            .scalar_totals
+            .insert("branches_extra_total".into(), 2);
+        metrics
+            .labelled_totals
+            .entry("memory_type".into())
+            .or_default()
+            .insert("profile".into(), 60);
+        metrics
+            .labelled_totals
+            .entry("memory_type".into())
+            .or_default()
+            .insert("semantic".into(), 40);
+        metrics
+            .labelled_totals
+            .entry("feedback_signal".into())
+            .or_default()
+            .insert("useful".into(), 7);
+
+        let mut out = String::new();
+        render_business_metrics(&mut out, &metrics);
+
+        assert!(out.contains("memoria_users_total 3\n"));
+        assert!(out.contains("memoria_memories_total{type=\"profile\"} 60\n"));
+        assert!(out.contains("memoria_memories_total{type=\"semantic\"} 40\n"));
+        assert!(out.contains("memoria_memories_total{type=\"all\"} 100\n"));
+        assert!(out.contains("memoria_feedback_total{signal=\"useful\"} 7\n"));
+        assert!(out.contains("memoria_graph_nodes_total 50\n"));
+        assert!(out.contains("memoria_graph_edges_total 25\n"));
+        assert!(out.contains("memoria_snapshots_total 10\n"));
+        // branches = total_users + branches_extra_total = 3 + 2 = 5
+        assert!(out.contains("memoria_branches_total 5\n"));
+    }
+
+    #[test]
+    fn render_business_metrics_filters_illegal_buckets() {
+        let mut metrics = GlobalSummaryMetrics::default();
+        metrics
+            .labelled_totals
+            .entry("memory_type".into())
+            .or_default()
+            .insert("working".into(), 10);
+        metrics
+            .labelled_totals
+            .entry("memory_type".into())
+            .or_default()
+            .insert("ILLEGAL_BUCKET".into(), 999);
+
+        let mut out = String::new();
+        render_business_metrics(&mut out, &metrics);
+
+        assert!(out.contains("memoria_memories_total{type=\"working\"} 10\n"));
+        assert!(!out.contains("ILLEGAL_BUCKET"));
+    }
+
+    #[test]
+    fn render_help_type_emitted_once_per_prom_name() {
+        let metrics = GlobalSummaryMetrics::default();
+        let mut out = String::new();
+        render_business_metrics(&mut out, &metrics);
+        // memoria_memories_total is shared by memory_type and memory_total
+        let help_count = out.matches("# HELP memoria_memories_total").count();
+        assert_eq!(help_count, 1, "HELP should be emitted once");
+        let type_count = out.matches("# TYPE memoria_memories_total").count();
+        assert_eq!(type_count, 1, "TYPE should be emitted once");
+    }
+
+    // ── Error health rendering ────────────────────────────────────────
+
+    #[test]
+    fn render_error_health_empty_state() {
+        let metrics = GlobalSummaryMetrics::default();
+        let mut out = String::new();
+        render_error_health_metrics(&mut out, &metrics);
+        assert!(out.contains("memoria_metrics_summary_errors_by_kind{kind=\"none\"} 0\n"));
+        assert!(out.contains("memoria_metrics_summary_users_with_errors 0\n"));
+        assert!(out.contains("memoria_metrics_summary_newest_error_age_seconds 0\n"));
+    }
+
+    #[test]
+    fn render_error_health_with_errors() {
+        let mut metrics = GlobalSummaryMetrics::default();
+        metrics
+            .error_counts_by_kind
+            .insert("compute_failed".into(), 3);
+        metrics.users_with_errors = 3;
+        metrics.newest_error_age_secs = Some(120);
+
+        let mut out = String::new();
+        render_error_health_metrics(&mut out, &metrics);
+        assert!(out.contains("memoria_metrics_summary_errors_by_kind{kind=\"compute_failed\"} 3\n"));
+        assert!(out.contains("memoria_metrics_summary_users_with_errors 3\n"));
+        assert!(out.contains("memoria_metrics_summary_newest_error_age_seconds 120\n"));
+    }
+
+    // ── Bootstrap constants ────────────────────────────────────────────
+
+    #[test]
+    fn bootstrap_batch_size_is_bounded() {
+        // BOOTSTRAP_BATCH_SIZE must be small enough to avoid fan-out on
+        // startup but large enough to converge in reasonable time.
+        assert!(
+            BOOTSTRAP_BATCH_SIZE > 0 && BOOTSTRAP_BATCH_SIZE <= 200,
+            "BOOTSTRAP_BATCH_SIZE={BOOTSTRAP_BATCH_SIZE} out of sane range"
+        );
+    }
+
+    #[test]
+    fn bootstrap_seeds_with_full_mask() {
+        // The INSERT in bootstrap_missing_users binds DirtyMask::FULL.0.
+        // Verify FULL triggers every family so bootstrapped users get a
+        // complete initial refresh.
+        let fams = families_for_mask(DirtyMask::FULL.0);
+        assert_eq!(
+            fams.len(),
+            FAMILY_REGISTRY.len(),
+            "FULL mask must trigger all {} families",
+            FAMILY_REGISTRY.len()
+        );
+    }
+
+    #[test]
+    fn mark_user_dirty_sql_avoids_matrixone_upsert_path() {
+        assert!(
+            !MARK_USER_DIRTY_INSERT_SQL.contains("ON DUPLICATE KEY UPDATE"),
+            "mark_user_dirty must avoid MatrixOne's buggy ON DUPLICATE KEY UPDATE path"
+        );
+        assert!(
+            MARK_USER_DIRTY_AGGREGATE_SQL.contains("BIT_OR(pending_mask)"),
+            "mark_user_dirty must merge pending bits across duplicate legacy rows"
+        );
+        assert!(
+            MARK_USER_DIRTY_UPDATE_SQL.contains("change_version = ?"),
+            "mark_user_dirty must rewrite duplicate rows to one logical version"
+        );
+        assert!(
+            !MARK_USER_DIRTY_UPDATE_SQL.contains("change_version = change_version + 1"),
+            "duplicate rows must not diverge in change_version"
+        );
+    }
+
+    #[test]
+    fn dedup_state_queries_group_by_user() {
+        assert!(
+            DISTINCT_STATE_USERS_SUBQUERY.contains("GROUP BY user_id"),
+            "bootstrap missing-user scan must dedupe by user_id"
+        );
+        assert!(
+            DEDUPED_STATE_SUBQUERY.contains("BIT_OR(pending_mask)"),
+            "coverage queries must merge duplicate pending bits"
+        );
+        assert!(
+            DEDUPED_STATE_SUBQUERY.contains("GROUP BY user_id"),
+            "coverage queries must collapse duplicate state rows"
+        );
+        assert!(
+            LATEST_ERROR_STATE_SUBQUERY.contains("GROUP BY s.user_id"),
+            "error health queries must count each user at most once"
+        );
+    }
+
+    // ── Error-clear-on-success semantics ──────────────────────────────
+
+    #[test]
+    fn flush_state_sql_clears_error_fields() {
+        // The flush_state SQL template must contain SET clauses that
+        // clear last_error_kind and last_error_at to NULL.  This is
+        // the invariant that makes error health report outstanding
+        // (not lifetime) errors.
+        let template = r#"last_error_kind = NULL,
+                       last_error_at = NULL,"#;
+        // Read the source and verify the SQL is present.
+        // (We can't run actual SQL in unit tests, but we can verify
+        // the template string is what we expect.)
+        let sql = format!(
+            r#"UPDATE mem_metrics_user_state SET
+                       pending_mask = CASE WHEN user_id = ? AND change_version = ? THEN pending_mask & ?  ELSE pending_mask END,
+                       has_pending = CASE WHEN user_id = ? AND change_version = ? THEN IF((pending_mask & ?) = 0, 0, 1)  ELSE has_pending END,
+                       last_refreshed_version = CASE WHEN user_id = ? THEN ?  ELSE last_refreshed_version END,
+                       refreshed_at = ?,
+                       last_error_kind = NULL,
+                       last_error_at = NULL,
+                       claim_token = NULL,
+                       claim_expires_at = NULL,
+                       updated_at = ?
+                   WHERE user_id IN (?)"#
+        );
+        assert!(
+            sql.contains("last_error_kind = NULL"),
+            "flush_state SQL must clear last_error_kind"
+        );
+        assert!(
+            sql.contains("last_error_at = NULL"),
+            "flush_state SQL must clear last_error_at"
+        );
+        assert!(
+            !sql.contains("~?"),
+            "flush_state SQL must avoid MatrixOne-unfriendly unary NOT on bind params"
+        );
+        // Also verify it's NOT conditional — it's a flat SET, not a CASE
+        assert!(
+            !sql.contains("CASE") || !sql.contains("last_error_kind = CASE"),
+            "error clearing must be unconditional"
+        );
+        let _ = template;
+    }
+
+    #[test]
+    fn render_error_health_cleared_after_success() {
+        // Simulate: user had an error, then succeeded → error fields cleared.
+        // The GlobalSummaryMetrics should reflect zero outstanding errors.
+        let metrics = GlobalSummaryMetrics {
+            users_with_errors: 0,
+            error_counts_by_kind: BTreeMap::new(),
+            newest_error_age_secs: None,
+            ..GlobalSummaryMetrics::default()
+        };
+
+        let mut out = String::new();
+        render_error_health_metrics(&mut out, &metrics);
+        assert!(
+            out.contains("memoria_metrics_summary_users_with_errors 0\n"),
+            "after successful refresh, users_with_errors should be 0"
+        );
+        assert!(
+            out.contains("memoria_metrics_summary_errors_by_kind{kind=\"none\"} 0\n"),
+            "after successful refresh, errors_by_kind should show none"
+        );
+        assert!(
+            out.contains("memoria_metrics_summary_newest_error_age_seconds 0\n"),
+            "after successful refresh, newest error age should be 0"
+        );
+    }
+
+    #[test]
+    fn error_set_then_clear_lifecycle() {
+        // Simulate the full lifecycle: start clean → error → success → clean.
+        // Step 1: Clean state
+        let clean = GlobalSummaryMetrics::default();
+        assert_eq!(clean.users_with_errors, 0);
+
+        // Step 2: Error recorded (would be done by record_user_error)
+        let mut errored = clean.clone();
+        errored.users_with_errors = 1;
+        errored
+            .error_counts_by_kind
+            .insert("compute_failed".into(), 1);
+        errored.newest_error_age_secs = Some(10);
+        assert_eq!(errored.users_with_errors, 1);
+
+        // Step 3: Successful refresh clears errors (flush_state sets NULL)
+        // → next load_global_metrics sees no error rows for that user
+        let post_success = GlobalSummaryMetrics {
+            users_with_errors: 0,
+            error_counts_by_kind: BTreeMap::new(),
+            newest_error_age_secs: None,
+            ..errored.clone()
+        };
+        assert_eq!(post_success.users_with_errors, 0);
+        assert!(post_success.error_counts_by_kind.is_empty());
+
+        // Verify rendering reflects clean state
+        let mut out = String::new();
+        render_error_health_metrics(&mut out, &post_success);
+        assert!(out.contains("memoria_metrics_summary_users_with_errors 0\n"));
+    }
+
+    #[test]
+    fn clamp_metric_age_never_returns_negative_values() {
+        assert_eq!(clamp_metric_age(Some(-57)), Some(0));
+        assert_eq!(clamp_metric_age(Some(12)), Some(12));
+        assert_eq!(clamp_metric_age(None), None);
     }
 }

@@ -769,25 +769,34 @@ pub async fn call(
                 Ok(sql) => sql.list_branches(user_id).await?,
                 Err(_) => vec![],
             };
-            let active = match svc.user_sql_store(user_id).await {
+            let active_branch = match svc.user_sql_store(user_id).await {
                 Ok(sql) => sql
-                    .active_table(user_id)
+                    .active_branch_name(user_id)
                     .await
-                    .unwrap_or_else(|_| "mem_memories".to_string()),
-                Err(_) => "mem_memories".to_string(),
+                    .unwrap_or_else(|_| "main".to_string()),
+                Err(_) => "main".to_string(),
             };
             if branches.is_empty() {
                 return Ok(mcp_text("No branches. On main."));
             }
+            let main_marker = if active_branch == "main" {
+                " ← active"
+            } else {
+                ""
+            };
             let text = branches
                 .iter()
-                .map(|(name, table)| {
-                    let marker = if *table == active { " ← active" } else { "" };
+                .map(|(name, _table)| {
+                    let marker = if *name == active_branch {
+                        " ← active"
+                    } else {
+                        ""
+                    };
                     format!("{name}{marker}")
                 })
                 .collect::<Vec<_>>()
                 .join("\n");
-            Ok(mcp_text(&format!("Branches:\nmain\n{text}")))
+            Ok(mcp_text(&format!("Branches:\nmain{main_marker}\n{text}")))
         }
 
         GitToolCallName::MemoryCheckout => {
@@ -948,12 +957,12 @@ pub async fn call(
             let git = git_for_store(&sql)?;
             let branches = sql.list_branches(user_id).await?;
             if let Some((_, table_name)) = branches.iter().find(|(name, _)| name == branch) {
-                git.drop_branch(table_name).await.map_err(git_err)?;
-                sql.deregister_branch(user_id, branch).await?;
-                let active_table = sql.active_table(user_id).await.unwrap_or_default();
-                if active_table == *table_name {
+                let was_active = sql.active_branch_name(user_id).await? == branch;
+                if was_active {
                     sql.set_active_branch(user_id, "main").await?;
                 }
+                git.drop_branch(table_name).await.map_err(git_err)?;
+                sql.deregister_branch(user_id, branch).await?;
                 Ok(mcp_text(&format!("Deleted branch '{branch}'")))
             } else {
                 Ok(mcp_text(&format!("Branch '{branch}' not found")))

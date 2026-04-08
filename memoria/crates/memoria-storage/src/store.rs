@@ -52,6 +52,66 @@ async fn query_has_rows(pool: &MySqlPool, sql: &str) -> bool {
         > 0
 }
 
+async fn is_fresh_database(pool: &MySqlPool) -> Result<bool, MemoriaError> {
+    sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE()",
+    )
+    .fetch_one(pool)
+    .await
+    .map(|count| count == 0)
+    .map_err(db_err)
+}
+
+/// Bump whenever user-DB schema expectations change, including tables created
+/// by `bootstrap_user_schema()`, graph schema bootstrapping, or any compat
+/// migration handled by `apply_user_compat_migrations()`.
+pub const CURRENT_USER_SCHEMA_VERSION: i64 = 1;
+const USER_SCHEMA_META_KEY: &str = "user_schema";
+
+async fn ensure_user_schema_meta_table(pool: &MySqlPool) -> Result<(), MemoriaError> {
+    sqlx::query(
+        r#"CREATE TABLE IF NOT EXISTS mem_schema_meta (
+            schema_key     VARCHAR(64) PRIMARY KEY,
+            schema_version BIGINT      NOT NULL,
+            updated_at     DATETIME(6) NOT NULL
+        )"#,
+    )
+    .execute(pool)
+    .await
+    .map_err(db_err)?;
+    Ok(())
+}
+
+async fn load_user_schema_version(pool: &MySqlPool) -> Result<Option<i64>, MemoriaError> {
+    let row =
+        sqlx::query("SELECT schema_version FROM mem_schema_meta WHERE schema_key = ? LIMIT 1")
+            .bind(USER_SCHEMA_META_KEY)
+            .fetch_optional(pool)
+            .await
+            .map_err(db_err)?;
+
+    row.map(|r| r.try_get::<i64, _>("schema_version").map_err(db_err))
+        .transpose()
+}
+
+async fn store_user_schema_version(pool: &MySqlPool, version: i64) -> Result<(), MemoriaError> {
+    let now = Utc::now().naive_utc();
+    sqlx::query(
+        r#"INSERT INTO mem_schema_meta (schema_key, schema_version, updated_at)
+           VALUES (?, ?, ?)
+           ON DUPLICATE KEY UPDATE
+               schema_version = VALUES(schema_version),
+               updated_at = VALUES(updated_at)"#,
+    )
+    .bind(USER_SCHEMA_META_KEY)
+    .bind(version)
+    .bind(now)
+    .execute(pool)
+    .await
+    .map_err(db_err)?;
+    Ok(())
+}
+
 const POOL_MONITOR_INTERVAL_SECS: u64 = 30;
 const POOL_MONITOR_REPEAT_AFTER_TICKS: u32 = 10;
 const POOL_ANOMALY_RECENT_WINDOW_SECS: u64 = 600;
@@ -218,12 +278,20 @@ impl PoolHealthSnapshot {
     }
 }
 
-fn classify_pool_health(size: u32, idle: u32) -> PoolHealthLevel {
+fn classify_pool_health(
+    size: u32,
+    idle: u32,
+    configured_max_connections: Option<u32>,
+) -> PoolHealthLevel {
     if size == 0 {
         PoolHealthLevel::Empty
-    } else if idle == 0 {
+    } else if idle == 0
+        && configured_max_connections
+            .map(|max| max > 0 && size >= max)
+            .unwrap_or(false)
+    {
         PoolHealthLevel::Saturated
-    } else if idle < size / 10 + 1 {
+    } else if idle == 0 || idle < size / 10 + 1 {
         PoolHealthLevel::HighUtilization
     } else {
         PoolHealthLevel::Healthy
@@ -255,7 +323,7 @@ pub fn spawn_pool_monitor(
             let size = pool.size();
             let idle = pool.num_idle();
             let active = size.saturating_sub(idle as u32);
-            let level = classify_pool_health(size, idle as u32);
+            let level = classify_pool_health(size, idle as u32, configured_max_connections);
             let anomaly = connection_anomaly_snapshot();
 
             let mut guard = health.lock().unwrap();
@@ -357,20 +425,33 @@ pub fn spawn_pool_monitor(
                         state = level.as_str(),
                         state_duration_secs = guard.since.elapsed().as_secs(),
                         consecutive_observations = guard.consecutive_observations,
-                        "connection pool saturated — all established connections are busy"
+                        "connection pool saturated — pool is at configured max and all established connections are busy"
                     );
                 }
                 PoolHealthLevel::HighUtilization => {
-                    tracing::warn!(
-                        pool_size = size,
-                        pool_active = active,
-                        pool_idle = idle,
-                        configured_max_connections,
-                        state = level.as_str(),
-                        state_duration_secs = guard.since.elapsed().as_secs(),
-                        consecutive_observations = guard.consecutive_observations,
-                        "connection pool high utilization"
-                    );
+                    if idle == 0 {
+                        tracing::warn!(
+                            pool_size = size,
+                            pool_active = active,
+                            pool_idle = idle,
+                            configured_max_connections,
+                            state = level.as_str(),
+                            state_duration_secs = guard.since.elapsed().as_secs(),
+                            consecutive_observations = guard.consecutive_observations,
+                            "connection pool has no idle connections; pool can still expand"
+                        );
+                    } else {
+                        tracing::warn!(
+                            pool_size = size,
+                            pool_active = active,
+                            pool_idle = idle,
+                            configured_max_connections,
+                            state = level.as_str(),
+                            state_duration_secs = guard.since.elapsed().as_secs(),
+                            consecutive_observations = guard.consecutive_observations,
+                            "connection pool high utilization"
+                        );
+                    }
                 }
             }
         }
@@ -700,8 +781,37 @@ impl SqlMemoryStore {
         const DB_MAX_CONNECTIONS_UPPER: u32 = 512;
         let max_conns =
             configured_max_connections("DB_MAX_CONNECTIONS", 64, DB_MAX_CONNECTIONS_UPPER);
-        Self::connect_with_pool_limit(database_url, embedding_dim, instance_id, max_conns, true)
-            .await
+        Self::connect_with_pool_limit(
+            database_url,
+            embedding_dim,
+            instance_id,
+            max_conns,
+            true,
+            true,
+        )
+        .await
+    }
+
+    pub async fn connect_shared(
+        database_url: &str,
+        embedding_dim: usize,
+        instance_id: String,
+    ) -> Result<Self, MemoriaError> {
+        const SHARED_DB_MAX_CONNECTIONS_UPPER: u32 = 128;
+        let max_conns = configured_max_connections(
+            "MEMORIA_SHARED_MAIN_POOL_MAX_CONNECTIONS",
+            12,
+            SHARED_DB_MAX_CONNECTIONS_UPPER,
+        );
+        Self::connect_with_pool_limit(
+            database_url,
+            embedding_dim,
+            instance_id,
+            max_conns,
+            true,
+            true,
+        )
+        .await
     }
 
     pub async fn connect_routed(
@@ -712,11 +822,18 @@ impl SqlMemoryStore {
         const ROUTED_DB_MAX_CONNECTIONS_UPPER: u32 = 64;
         let max_conns = configured_max_connections(
             "MEMORIA_ROUTED_DB_MAX_CONNECTIONS",
-            4,
+            1,
             ROUTED_DB_MAX_CONNECTIONS_UPPER,
         );
-        Self::connect_with_pool_limit(database_url, embedding_dim, instance_id, max_conns, false)
-            .await
+        Self::connect_with_pool_limit(
+            database_url,
+            embedding_dim,
+            instance_id,
+            max_conns,
+            false,
+            false,
+        )
+        .await
     }
 
     async fn connect_with_pool_limit(
@@ -725,20 +842,23 @@ impl SqlMemoryStore {
         instance_id: String,
         max_conns: u32,
         log_info: bool,
+        ensure_database_exists: bool,
     ) -> Result<Self, MemoriaError> {
-        // Auto-create database if it doesn't exist
-        if let Some((base_url, db_name, _suffix)) = split_database_url(database_url) {
-            let base_pool = sqlx::mysql::MySqlPoolOptions::new()
-                .max_connections(1)
-                .connect(base_url)
-                .await;
-            if let Ok(base_pool) = base_pool {
-                let _ = sqlx::raw_sql(&format!(
-                    "CREATE DATABASE IF NOT EXISTS {}",
-                    quote_ident(db_name)
-                ))
-                .execute(&base_pool)
-                .await;
+        if ensure_database_exists {
+            // Auto-create database if it doesn't exist
+            if let Some((base_url, db_name, _suffix)) = split_database_url(database_url) {
+                let base_pool = sqlx::mysql::MySqlPoolOptions::new()
+                    .max_connections(1)
+                    .connect(base_url)
+                    .await;
+                if let Ok(base_pool) = base_pool {
+                    let _ = sqlx::raw_sql(&format!(
+                        "CREATE DATABASE IF NOT EXISTS {}",
+                        quote_ident(db_name)
+                    ))
+                    .execute(&base_pool)
+                    .await;
+                }
             }
         }
         let max_lifetime_secs: u64 = std::env::var("DB_MAX_LIFETIME_SECS")
@@ -810,9 +930,7 @@ impl SqlMemoryStore {
         Ok(())
     }
 
-    pub async fn migrate_user(&self) -> Result<(), MemoriaError> {
-        let pool = self.direct_pool().await?;
-        // mem_memories
+    async fn bootstrap_user_schema(&self, pool: &MySqlPool) -> Result<(), MemoriaError> {
         let sql = format!(
             r#"CREATE TABLE IF NOT EXISTS mem_memories (
                 memory_id       VARCHAR(64)  PRIMARY KEY,
@@ -836,9 +954,8 @@ impl SqlMemoryStore {
             )"#,
             dim = self.embedding_dim
         );
-        sqlx::query(&sql).execute(&pool).await.map_err(db_err)?;
+        sqlx::query(&sql).execute(pool).await.map_err(db_err)?;
 
-        // mem_user_state — active branch per user
         sqlx::query(
             r#"CREATE TABLE IF NOT EXISTS mem_user_state (
                 user_id       VARCHAR(64)  PRIMARY KEY,
@@ -846,11 +963,10 @@ impl SqlMemoryStore {
                 updated_at    DATETIME(6)
             )"#,
         )
-        .execute(&pool)
+        .execute(pool)
         .await
         .map_err(db_err)?;
 
-        // mem_branches — branch registry
         sqlx::query(
             r#"CREATE TABLE IF NOT EXISTS mem_branches (
                 id          VARCHAR(64)  PRIMARY KEY,
@@ -862,11 +978,10 @@ impl SqlMemoryStore {
                 INDEX idx_user_name (user_id, name)
             )"#,
         )
-        .execute(&pool)
+        .execute(pool)
         .await
         .map_err(db_err)?;
 
-        // mem_snapshots — user snapshot registry
         sqlx::query(
             r#"CREATE TABLE IF NOT EXISTS mem_snapshots (
                 id             VARCHAR(64)  PRIMARY KEY,
@@ -879,11 +994,10 @@ impl SqlMemoryStore {
                 INDEX idx_user_snapshot_internal (user_id, snapshot_name, status)
             )"#,
         )
-        .execute(&pool)
+        .execute(pool)
         .await
         .map_err(db_err)?;
 
-        // mem_governance_cooldown — per-user cooldown tracking
         sqlx::query(
             r#"CREATE TABLE IF NOT EXISTS mem_governance_cooldown (
                 user_id     VARCHAR(64)  NOT NULL,
@@ -892,11 +1006,10 @@ impl SqlMemoryStore {
                 PRIMARY KEY (user_id, operation)
             )"#,
         )
-        .execute(&pool)
+        .execute(pool)
         .await
         .map_err(db_err)?;
 
-        // mem_entity_links — entity graph (lightweight, no graph tables)
         sqlx::query(
             r#"CREATE TABLE IF NOT EXISTS mem_entity_links (
                 id          VARCHAR(64)  PRIMARY KEY,
@@ -910,11 +1023,10 @@ impl SqlMemoryStore {
                 INDEX idx_user_entity (user_id, entity_name)
             )"#,
         )
-        .execute(&pool)
+        .execute(pool)
         .await
         .map_err(db_err)?;
 
-        // mem_memories_stats — access_count + feedback tracking (separated to reduce write contention)
         sqlx::query(
             r#"CREATE TABLE IF NOT EXISTS mem_memories_stats (
                 memory_id        VARCHAR(64)  PRIMARY KEY,
@@ -927,37 +1039,10 @@ impl SqlMemoryStore {
                 last_feedback_at DATETIME(6)
             )"#,
         )
-        .execute(&pool)
+        .execute(pool)
         .await
         .map_err(db_err)?;
 
-        // Migration: add feedback columns to existing mem_memories_stats
-        let _ = sqlx::query(
-            "ALTER TABLE mem_memories_stats ADD COLUMN feedback_useful INT NOT NULL DEFAULT 0",
-        )
-        .execute(&pool)
-        .await;
-        let _ = sqlx::query(
-            "ALTER TABLE mem_memories_stats ADD COLUMN feedback_irrelevant INT NOT NULL DEFAULT 0",
-        )
-        .execute(&pool)
-        .await;
-        let _ = sqlx::query(
-            "ALTER TABLE mem_memories_stats ADD COLUMN feedback_outdated INT NOT NULL DEFAULT 0",
-        )
-        .execute(&pool)
-        .await;
-        let _ = sqlx::query(
-            "ALTER TABLE mem_memories_stats ADD COLUMN feedback_wrong INT NOT NULL DEFAULT 0",
-        )
-        .execute(&pool)
-        .await;
-        let _ =
-            sqlx::query("ALTER TABLE mem_memories_stats ADD COLUMN last_feedback_at DATETIME(6)")
-                .execute(&pool)
-                .await;
-
-        // mem_edit_log — append-only audit log for inject/correct/purge/governance
         sqlx::query(
             r#"CREATE TABLE IF NOT EXISTS mem_edit_log (
                 edit_id         VARCHAR(64)  NOT NULL,
@@ -973,91 +1058,10 @@ impl SqlMemoryStore {
                 INDEX idx_memory_time (memory_id, created_at)
             ) CLUSTER BY (created_at, user_id)"#,
         )
-        .execute(&pool)
+        .execute(pool)
         .await
         .map_err(db_err)?;
 
-        // Migration: add memory_id column to existing mem_edit_log tables
-        let _ =
-            sqlx::query("ALTER TABLE mem_edit_log ADD COLUMN memory_id VARCHAR(64) DEFAULT NULL")
-                .execute(&pool)
-                .await;
-
-        // Migration: add payload column to existing mem_edit_log tables
-        let _ = sqlx::query("ALTER TABLE mem_edit_log ADD COLUMN payload JSON DEFAULT NULL")
-            .execute(&pool)
-            .await;
-
-        // Graph DDL uses its own store/pool.
-        self.graph_store().migrate().await?;
-
-        // Backfill extra_metadata column for existing deployments (ignore if already exists)
-        let _ = sqlx::query(
-            "ALTER TABLE mem_memories ADD COLUMN extra_metadata JSON AFTER source_event_ids",
-        )
-        .execute(&pool)
-        .await;
-
-        // Migrate idx_user_active to include memory_type (idempotent)
-        let needs_upgrade: bool = sqlx::query_scalar(
-            "SELECT COUNT(*) = 0 FROM information_schema.statistics \
-             WHERE table_schema = DATABASE() AND table_name = 'mem_memories' \
-             AND index_name = 'idx_user_active' AND column_name = 'memory_type'",
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap_or(false);
-        if needs_upgrade {
-            let _ = sqlx::query("ALTER TABLE mem_memories DROP INDEX idx_user_active")
-                .execute(&pool)
-                .await;
-            let _ = sqlx::query("ALTER TABLE mem_memories ADD INDEX idx_user_active (user_id, is_active, memory_type)")
-                .execute(&pool).await;
-        }
-
-        // Migration: mem_branches may lack table_name column (old schema)
-        let has_table_name = query_has_rows(
-            &pool,
-            "SELECT COUNT(*) FROM information_schema.columns \
-             WHERE table_schema = DATABASE() AND table_name = 'mem_branches' AND column_name = 'table_name'"
-        )
-        .await;
-        if !has_table_name {
-            let _ = sqlx::query(
-                "ALTER TABLE mem_branches ADD COLUMN table_name VARCHAR(100) NOT NULL DEFAULT ''",
-            )
-            .execute(&pool)
-            .await;
-        }
-
-        // Migration: mem_branches old schema used branch_id/branch_db — recreate with new schema
-        let has_id = query_has_rows(
-            &pool,
-            "SELECT COUNT(*) FROM information_schema.columns \
-             WHERE table_schema = DATABASE() AND table_name = 'mem_branches' AND column_name = 'id'"
-        )
-        .await;
-        if !has_id {
-            let _ = sqlx::query("DROP TABLE IF EXISTS mem_branches")
-                .execute(&pool)
-                .await;
-            sqlx::query(
-                r#"CREATE TABLE IF NOT EXISTS mem_branches (
-                    id          VARCHAR(64)  PRIMARY KEY,
-                    user_id     VARCHAR(64)  NOT NULL,
-                    name        VARCHAR(100) NOT NULL,
-                    table_name  VARCHAR(100) NOT NULL,
-                    status      VARCHAR(20)  NOT NULL DEFAULT 'active',
-                    created_at  DATETIME(6)  NOT NULL,
-                    INDEX idx_user_name (user_id, name)
-                )"#,
-            )
-            .execute(&pool)
-            .await
-            .map_err(db_err)?;
-        }
-
-        // mem_retrieval_feedback — explicit relevance feedback for adaptive tuning
         sqlx::query(
             r#"CREATE TABLE IF NOT EXISTS mem_retrieval_feedback (
                 id          VARCHAR(64)  PRIMARY KEY,
@@ -1070,11 +1074,10 @@ impl SqlMemoryStore {
                 INDEX idx_feedback_memory (memory_id)
             )"#,
         )
-        .execute(&pool)
+        .execute(pool)
         .await
         .map_err(db_err)?;
 
-        // mem_user_retrieval_params — per-user adaptive scoring parameters
         sqlx::query(
             r#"CREATE TABLE IF NOT EXISTS mem_user_retrieval_params (
                 user_id              VARCHAR(64)  PRIMARY KEY,
@@ -1084,11 +1087,10 @@ impl SqlMemoryStore {
                 updated_at           DATETIME(6)  NOT NULL
             )"#,
         )
-        .execute(&pool)
+        .execute(pool)
         .await
         .map_err(db_err)?;
 
-        // mem_tool_usage — per-user tool access timestamps (batched from API layer)
         sqlx::query(
             r#"CREATE TABLE IF NOT EXISTS mem_tool_usage (
                 user_id      VARCHAR(64)  NOT NULL,
@@ -1097,18 +1099,10 @@ impl SqlMemoryStore {
                 PRIMARY KEY (user_id, tool_name)
             )"#,
         )
-        .execute(&pool)
+        .execute(pool)
         .await
         .map_err(db_err)?;
 
-        // mem_api_call_log — per-user API call statistics for the Monitor dashboard.
-        // Records every authenticated request from two entry points:
-        //   - /v1/* REST endpoints: HTTP status_code reflects the real outcome;
-        //     rpc_success = 1 and rpc_error_code = NULL (not applicable).
-        //   - /mcp  JSON-RPC endpoint: HTTP status_code is 200 for standard requests
-        //     and 204 for notifications (no-reply per JSON-RPC 2.0 §4);
-        //     rpc_success / rpc_error_code carry the business-level result.
-        // Insertions are batched (every 5 s) to avoid per-request DB pressure.
         sqlx::query(
             r#"CREATE TABLE IF NOT EXISTS mem_api_call_log (
                 id              BIGINT       NOT NULL AUTO_INCREMENT,
@@ -1124,45 +1118,133 @@ impl SqlMemoryStore {
                 INDEX idx_user_called (user_id, called_at)
             )"#,
         )
-        .execute(&pool)
+        .execute(pool)
         .await
         .map_err(db_err)?;
 
-        // Migration: add `method` for tables created before this column existed.
-        // MatrixOne / some MySQL forks do not reliably support
-        // `ADD COLUMN IF NOT EXISTS ... AFTER ...`; use information_schema + plain ALTER.
+        self.graph_store().migrate().await?;
+        Ok(())
+    }
+
+    async fn apply_user_compat_migrations(&self, pool: &MySqlPool) -> Result<(), MemoriaError> {
+        let _ = sqlx::query(
+            "ALTER TABLE mem_memories_stats ADD COLUMN feedback_useful INT NOT NULL DEFAULT 0",
+        )
+        .execute(pool)
+        .await;
+        let _ = sqlx::query(
+            "ALTER TABLE mem_memories_stats ADD COLUMN feedback_irrelevant INT NOT NULL DEFAULT 0",
+        )
+        .execute(pool)
+        .await;
+        let _ = sqlx::query(
+            "ALTER TABLE mem_memories_stats ADD COLUMN feedback_outdated INT NOT NULL DEFAULT 0",
+        )
+        .execute(pool)
+        .await;
+        let _ = sqlx::query(
+            "ALTER TABLE mem_memories_stats ADD COLUMN feedback_wrong INT NOT NULL DEFAULT 0",
+        )
+        .execute(pool)
+        .await;
+        let _ =
+            sqlx::query("ALTER TABLE mem_memories_stats ADD COLUMN last_feedback_at DATETIME(6)")
+                .execute(pool)
+                .await;
+
+        let _ =
+            sqlx::query("ALTER TABLE mem_edit_log ADD COLUMN memory_id VARCHAR(64) DEFAULT NULL")
+                .execute(pool)
+                .await;
+        let _ = sqlx::query("ALTER TABLE mem_edit_log ADD COLUMN payload JSON DEFAULT NULL")
+            .execute(pool)
+            .await;
+
+        let _ = sqlx::query(
+            "ALTER TABLE mem_memories ADD COLUMN extra_metadata JSON AFTER source_event_ids",
+        )
+        .execute(pool)
+        .await;
+
+        let needs_upgrade: bool = sqlx::query_scalar(
+            "SELECT COUNT(*) = 0 FROM information_schema.statistics \
+             WHERE table_schema = DATABASE() AND table_name = 'mem_memories' \
+             AND index_name = 'idx_user_active' AND column_name = 'memory_type'",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap_or(false);
+        if needs_upgrade {
+            let _ = sqlx::query("ALTER TABLE mem_memories DROP INDEX idx_user_active")
+                .execute(pool)
+                .await;
+            let _ = sqlx::query(
+                "ALTER TABLE mem_memories ADD INDEX idx_user_active (user_id, is_active, memory_type)",
+            )
+            .execute(pool)
+            .await;
+        }
+
+        let has_table_name = query_has_rows(
+            pool,
+            "SELECT COUNT(*) FROM information_schema.columns \
+             WHERE table_schema = DATABASE() AND table_name = 'mem_branches' AND column_name = 'table_name'",
+        )
+        .await;
+        if !has_table_name {
+            let _ = sqlx::query(
+                "ALTER TABLE mem_branches ADD COLUMN table_name VARCHAR(100) NOT NULL DEFAULT ''",
+            )
+            .execute(pool)
+            .await;
+        }
+
+        let has_id = query_has_rows(
+            pool,
+            "SELECT COUNT(*) FROM information_schema.columns \
+             WHERE table_schema = DATABASE() AND table_name = 'mem_branches' AND column_name = 'id'",
+        )
+        .await;
+        if !has_id {
+            let _ = sqlx::query("DROP TABLE IF EXISTS mem_branches")
+                .execute(pool)
+                .await;
+            sqlx::query(
+                r#"CREATE TABLE IF NOT EXISTS mem_branches (
+                    id          VARCHAR(64)  PRIMARY KEY,
+                    user_id     VARCHAR(64)  NOT NULL,
+                    name        VARCHAR(100) NOT NULL,
+                    table_name  VARCHAR(100) NOT NULL,
+                    status      VARCHAR(20)  NOT NULL DEFAULT 'active',
+                    created_at  DATETIME(6)  NOT NULL,
+                    INDEX idx_user_name (user_id, name)
+                )"#,
+            )
+            .execute(pool)
+            .await
+            .map_err(db_err)?;
+        }
+
         let has_method_col = query_has_rows(
-            &pool,
+            pool,
             "SELECT COUNT(*) FROM information_schema.columns \
              WHERE table_schema = DATABASE() AND table_name = 'mem_api_call_log' \
              AND column_name = 'method'",
         )
         .await;
         if !has_method_col {
-            // No `AFTER` — better compatibility with MatrixOne; INSERT lists columns explicitly.
             let _ = sqlx::query(
                 "ALTER TABLE mem_api_call_log ADD COLUMN method VARCHAR(10) NOT NULL DEFAULT ''",
             )
-            .execute(&pool)
+            .execute(pool)
             .await;
         }
 
-        // Migration: add rpc_success / rpc_error_code columns for Streamable HTTP MCP tracking.
-        // These separate HTTP-level status from JSON-RPC business errors so Monitor stats
-        // remain accurate for both /v1/* REST calls and /mcp JSON-RPC calls.
-        //
-        // We always attempt the ALTER TABLE rather than relying solely on information_schema,
-        // because some DB engines (e.g. MatrixOne) have a delay before newly-created columns
-        // appear in information_schema.columns, which would cause a false-negative check and
-        // a redundant (but harmless) ALTER.  MySQL error 1060 means "duplicate column name"
-        // (the column already exists), which is the desired idempotent outcome and is not fatal.
-        // Any other error is treated as startup-fatal because the call-log writer unconditionally
-        // inserts these columns; without them every flush would fail with "unknown column".
         let add_rpc_success = sqlx::query(
             "ALTER TABLE mem_api_call_log \
              ADD COLUMN rpc_success TINYINT(1) NOT NULL DEFAULT 1",
         )
-        .execute(&pool)
+        .execute(pool)
         .await;
         if let Err(e) = add_rpc_success {
             if !is_duplicate_column(&e) {
@@ -1176,14 +1258,13 @@ impl SqlMemoryStore {
                 );
                 return Err(db_err(e));
             }
-            // Column already exists — idempotent, safe to continue.
         }
 
         let add_rpc_error_code = sqlx::query(
             "ALTER TABLE mem_api_call_log \
              ADD COLUMN rpc_error_code INT NULL",
         )
-        .execute(&pool)
+        .execute(pool)
         .await;
         if let Err(e) = add_rpc_error_code {
             if !is_duplicate_column(&e) {
@@ -1196,14 +1277,10 @@ impl SqlMemoryStore {
                 );
                 return Err(db_err(e));
             }
-            // Column already exists — idempotent, safe to continue.
         }
 
-        // Migration: add composite index (user_id, memory_id) on mem_retrieval_feedback.
-        // The existing idx_feedback_user(user_id, created_at) does not cover the JOIN on
-        // memory_id used by get_feedback_by_tier(), causing a full-table scan on feedback.
         let has_feedback_memory_user_idx = query_has_rows(
-            &pool,
+            pool,
             "SELECT COUNT(*) FROM information_schema.statistics \
              WHERE table_schema = DATABASE() \
                AND table_name = 'mem_retrieval_feedback' \
@@ -1215,16 +1292,12 @@ impl SqlMemoryStore {
                 "ALTER TABLE mem_retrieval_feedback \
                  ADD INDEX idx_feedback_memory_user (user_id, memory_id)",
             )
-            .execute(&pool)
+            .execute(pool)
             .await;
         }
 
-        // Migration: add created_at index for feedback retention cleanup scans.
-        // cleanup_metrics_and_feedback() deletes old feedback rows with
-        // `created_at < DATE_SUB(NOW(), INTERVAL ? DAY)`, which benefits from
-        // a direct time index instead of scanning all rows.
         let has_feedback_created_at_idx = query_has_rows(
-            &pool,
+            pool,
             "SELECT COUNT(*) FROM information_schema.statistics \
              WHERE table_schema = DATABASE() \
                AND table_name = 'mem_retrieval_feedback' \
@@ -1236,18 +1309,12 @@ impl SqlMemoryStore {
                 "ALTER TABLE mem_retrieval_feedback \
                  ADD INDEX idx_feedback_created_at (created_at)",
             )
-            .execute(&pool)
+            .execute(pool)
             .await;
         }
 
-        // Migration: add (user_id, observed_at) index on mem_memories.
-        // Speeds up the monthly-growth-rate count in health_capacity() which uses
-        // `observed_at >= NOW() - INTERVAL 30 DAY` (direct range comparison).
-        // Note: TIMESTAMPDIFF-wrapped predicates (e.g. archive_stale_working) cannot
-        // use a B-tree range scan regardless of the index; they are covered by the
-        // existing idx_user_active (user_id, is_active, memory_type) instead.
         let has_memories_user_observed_idx = query_has_rows(
-            &pool,
+            pool,
             "SELECT COUNT(*) FROM information_schema.statistics \
              WHERE table_schema = DATABASE() \
                AND table_name = 'mem_memories' \
@@ -1259,13 +1326,12 @@ impl SqlMemoryStore {
                 "ALTER TABLE mem_memories \
                  ADD INDEX idx_memories_user_observed (user_id, observed_at)",
             )
-            .execute(&pool)
+            .execute(pool)
             .await;
         }
 
-        // Migration: drop idx_user_active_created — no longer needed, list now orders by PK.
         let has_user_active_created_idx = query_has_rows(
-            &pool,
+            pool,
             "SELECT COUNT(*) FROM information_schema.statistics \
              WHERE table_schema = DATABASE() \
                AND table_name = 'mem_memories' \
@@ -1274,15 +1340,12 @@ impl SqlMemoryStore {
         .await;
         if has_user_active_created_idx {
             let _ = sqlx::query("ALTER TABLE mem_memories DROP INDEX idx_user_active_created")
-                .execute(&pool)
+                .execute(pool)
                 .await;
         }
 
-        // Migration: MO#24001 — normalize empty-string NULLable VARCHAR columns to real NULL.
-        // MatrixOne PREPARE/EXECUTE stores Option<String>::None as '' instead of NULL.
-        // Effectively runs once: after fix, new writes use nullable_str() and never produce ''.
         let has_empty_superseded = query_has_rows(
-            &pool,
+            pool,
             "SELECT COUNT(*) FROM mem_memories WHERE superseded_by = ''",
         )
         .await;
@@ -1299,7 +1362,7 @@ impl SqlMemoryStore {
             ] {
                 if let Err(e) =
                     sqlx::query(&format!("UPDATE {tbl} SET {col} = NULL WHERE {col} = ''"))
-                        .execute(&pool)
+                        .execute(pool)
                         .await
                 {
                     tracing::warn!(table = tbl, column = col, error = %e, "MO#24001 migration: failed to normalize empty strings");
@@ -1307,16 +1370,34 @@ impl SqlMemoryStore {
             }
         }
 
-        // Migration: nullify zero-dimension embedding vectors.
-        // MatrixOne PREPARE/EXECUTE stores Option<Vec<f32>>::None as '[]' instead of NULL.
         let _ = sqlx::raw_sql(
             "UPDATE mem_memories SET embedding = NULL \
              WHERE embedding IS NOT NULL AND vector_dims(embedding) = 0",
         )
-        .execute(&pool)
+        .execute(pool)
         .await;
 
         Ok(())
+    }
+
+    pub async fn migrate_user(&self) -> Result<(), MemoriaError> {
+        let pool = self.direct_pool().await?;
+        let is_fresh = is_fresh_database(&pool).await?;
+        if is_fresh {
+            self.bootstrap_user_schema(&pool).await?;
+            ensure_user_schema_meta_table(&pool).await?;
+            store_user_schema_version(&pool, CURRENT_USER_SCHEMA_VERSION).await?;
+            return Ok(());
+        }
+
+        ensure_user_schema_meta_table(&pool).await?;
+        if load_user_schema_version(&pool).await? == Some(CURRENT_USER_SCHEMA_VERSION) {
+            return Ok(());
+        }
+
+        self.bootstrap_user_schema(&pool).await?;
+        self.apply_user_compat_migrations(&pool).await?;
+        store_user_schema_version(&pool, CURRENT_USER_SCHEMA_VERSION).await
     }
 
     pub async fn migrate_shared(&self) -> Result<(), MemoriaError> {
@@ -1829,12 +1910,7 @@ impl SqlMemoryStore {
 
     // ── Branch state ──────────────────────────────────────────────────────────
 
-    /// Returns the active table name for a user: "mem_memories" or branch table name.
-    pub async fn active_table(&self, user_id: &str) -> Result<String, MemoriaError> {
-        if let Some(cached) = self.active_table_cache.get(user_id) {
-            return Ok(cached);
-        }
-
+    pub async fn active_branch_name(&self, user_id: &str) -> Result<String, MemoriaError> {
         let user_state_table = self.t("mem_user_state");
         let row = sqlx::query(&format!(
             "SELECT active_branch FROM {user_state_table} WHERE user_id = ?"
@@ -1844,9 +1920,19 @@ impl SqlMemoryStore {
         .await
         .map_err(db_err)?;
 
-        let branch = row
+        Ok(row
             .and_then(|r| r.try_get::<String, _>("active_branch").ok())
-            .unwrap_or_else(|| "main".to_string());
+            .filter(|branch| !branch.trim().is_empty())
+            .unwrap_or_else(|| "main".to_string()))
+    }
+
+    /// Returns the active table name for a user: "mem_memories" or branch table name.
+    pub async fn active_table(&self, user_id: &str) -> Result<String, MemoriaError> {
+        if let Some(cached) = self.active_table_cache.get(user_id) {
+            return Ok(cached);
+        }
+
+        let branch = self.active_branch_name(user_id).await?;
 
         if branch == "main" {
             let table = self.t("mem_memories");
@@ -1874,7 +1960,10 @@ impl SqlMemoryStore {
             }
             None => {
                 self.set_active_branch(user_id, "main").await?;
-                Ok("mem_memories".to_string())
+                let table = self.t("mem_memories");
+                self.active_table_cache
+                    .insert(user_id.to_string(), table.clone());
+                Ok(table)
             }
         }
     }
@@ -1920,32 +2009,40 @@ impl SqlMemoryStore {
         name: &str,
         table_name: &str,
     ) -> Result<(), MemoriaError> {
-        let mut conn = self.conn().await?;
+        let branches_table = self.t("mem_branches");
         let now = Utc::now().naive_utc();
         let id = uuid::Uuid::new_v4().simple().to_string();
-        sqlx::query(
-            r#"INSERT INTO mem_branches (id, user_id, name, table_name, status, created_at)
-               VALUES (?, ?, ?, ?, 'active', ?)"#,
-        )
+        sqlx::query(&format!(
+            r#"INSERT INTO {branches_table} (id, user_id, name, table_name, status, created_at)
+               VALUES (?, ?, ?, ?, 'active', ?)"#
+        ))
         .bind(id)
         .bind(user_id)
         .bind(name)
         .bind(table_name)
         .bind(now)
-        .execute(&mut *conn)
+        .execute(&self.pool)
         .await
         .map_err(db_err)?;
         Ok(())
     }
 
     pub async fn deregister_branch(&self, user_id: &str, name: &str) -> Result<(), MemoriaError> {
-        let mut conn = self.conn().await?;
-        sqlx::query("UPDATE mem_branches SET status = 'deleted' WHERE user_id = ? AND name = ?")
-            .bind(user_id)
-            .bind(name)
-            .execute(&mut *conn)
-            .await
-            .map_err(db_err)?;
+        let was_active = self.active_branch_name(user_id).await? == name;
+        let branches_table = self.t("mem_branches");
+        sqlx::query(&format!(
+            "UPDATE {branches_table} SET status = 'deleted' WHERE user_id = ? AND name = ?"
+        ))
+        .bind(user_id)
+        .bind(name)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        if was_active {
+            self.set_active_branch(user_id, "main").await?;
+        } else {
+            self.active_table_cache.invalidate(user_id);
+        }
         Ok(())
     }
 
@@ -1953,12 +2050,12 @@ impl SqlMemoryStore {
         &self,
         user_id: &str,
     ) -> Result<Vec<(String, String)>, MemoriaError> {
-        let mut conn = self.conn().await?;
-        let rows = sqlx::query(
-            "SELECT name, table_name FROM mem_branches WHERE user_id = ? AND status = 'active'",
-        )
+        let branches_table = self.t("mem_branches");
+        let rows = sqlx::query(&format!(
+            "SELECT name, table_name FROM {branches_table} WHERE user_id = ? AND status = 'active'"
+        ))
         .bind(user_id)
-        .fetch_all(&mut *conn)
+        .fetch_all(&self.pool)
         .await
         .map_err(db_err)?;
         rows.iter()
@@ -1977,19 +2074,19 @@ impl SqlMemoryStore {
         name: &str,
         snapshot_name: &str,
     ) -> Result<(), MemoriaError> {
-        let mut conn = self.conn().await?;
+        let snapshots_table = self.t("mem_snapshots");
         let now = Utc::now().naive_utc();
         let id = uuid::Uuid::new_v4().simple().to_string();
-        sqlx::query(
-            r#"INSERT INTO mem_snapshots (id, user_id, name, snapshot_name, status, created_at)
-               VALUES (?, ?, ?, ?, 'active', ?)"#,
-        )
+        sqlx::query(&format!(
+            r#"INSERT INTO {snapshots_table} (id, user_id, name, snapshot_name, status, created_at)
+               VALUES (?, ?, ?, ?, 'active', ?)"#
+        ))
         .bind(id)
         .bind(user_id)
         .bind(name)
         .bind(snapshot_name)
         .bind(now)
-        .execute(&mut *conn)
+        .execute(&self.pool)
         .await
         .map_err(db_err)?;
         Ok(())
@@ -2000,16 +2097,16 @@ impl SqlMemoryStore {
         user_id: &str,
         name: &str,
     ) -> Result<Option<SnapshotRegistration>, MemoriaError> {
-        let mut conn = self.conn().await?;
-        let row = sqlx::query(
+        let snapshots_table = self.t("mem_snapshots");
+        let row = sqlx::query(&format!(
             "SELECT name, snapshot_name, created_at \
-             FROM mem_snapshots \
+             FROM {snapshots_table} \
              WHERE user_id = ? AND name = ? AND status = 'active' \
-             ORDER BY created_at DESC LIMIT 1",
-        )
+             ORDER BY created_at DESC LIMIT 1"
+        ))
         .bind(user_id)
         .bind(name)
-        .fetch_optional(&mut *conn)
+        .fetch_optional(&self.pool)
         .await
         .map_err(db_err)?;
 
@@ -2028,16 +2125,16 @@ impl SqlMemoryStore {
         user_id: &str,
         snapshot_name: &str,
     ) -> Result<Option<SnapshotRegistration>, MemoriaError> {
-        let mut conn = self.conn().await?;
-        let row = sqlx::query(
+        let snapshots_table = self.t("mem_snapshots");
+        let row = sqlx::query(&format!(
             "SELECT name, snapshot_name, created_at \
-             FROM mem_snapshots \
+             FROM {snapshots_table} \
              WHERE user_id = ? AND snapshot_name = ? AND status = 'active' \
-             ORDER BY created_at DESC LIMIT 1",
-        )
+             ORDER BY created_at DESC LIMIT 1"
+        ))
         .bind(user_id)
         .bind(snapshot_name)
-        .fetch_optional(&mut *conn)
+        .fetch_optional(&self.pool)
         .await
         .map_err(db_err)?;
 
@@ -2055,15 +2152,15 @@ impl SqlMemoryStore {
         &self,
         user_id: &str,
     ) -> Result<Vec<SnapshotRegistration>, MemoriaError> {
-        let mut conn = self.conn().await?;
-        let rows = sqlx::query(
+        let snapshots_table = self.t("mem_snapshots");
+        let rows = sqlx::query(&format!(
             "SELECT name, snapshot_name, created_at \
-             FROM mem_snapshots \
+             FROM {snapshots_table} \
              WHERE user_id = ? AND status = 'active' \
-             ORDER BY created_at DESC",
-        )
+             ORDER BY created_at DESC"
+        ))
         .bind(user_id)
-        .fetch_all(&mut *conn)
+        .fetch_all(&self.pool)
         .await
         .map_err(db_err)?;
 
@@ -2079,13 +2176,13 @@ impl SqlMemoryStore {
     }
 
     pub async fn deregister_snapshot(&self, user_id: &str, name: &str) -> Result<(), MemoriaError> {
-        let mut conn = self.conn().await?;
-        sqlx::query(
-            "UPDATE mem_snapshots SET status = 'deleted' WHERE user_id = ? AND name = ? AND status = 'active'",
-        )
+        let snapshots_table = self.t("mem_snapshots");
+        sqlx::query(&format!(
+            "UPDATE {snapshots_table} SET status = 'deleted' WHERE user_id = ? AND name = ? AND status = 'active'"
+        ))
         .bind(user_id)
         .bind(name)
-        .execute(&mut *conn)
+        .execute(&self.pool)
         .await
         .map_err(db_err)?;
         Ok(())
@@ -2096,14 +2193,14 @@ impl SqlMemoryStore {
         user_id: &str,
         snapshot_name: &str,
     ) -> Result<(), MemoriaError> {
-        let mut conn = self.conn().await?;
-        sqlx::query(
-            "UPDATE mem_snapshots SET status = 'deleted' \
-             WHERE user_id = ? AND snapshot_name = ? AND status = 'active'",
-        )
+        let snapshots_table = self.t("mem_snapshots");
+        sqlx::query(&format!(
+            "UPDATE {snapshots_table} SET status = 'deleted' \
+             WHERE user_id = ? AND snapshot_name = ? AND status = 'active'"
+        ))
         .bind(user_id)
         .bind(snapshot_name)
-        .execute(&mut *conn)
+        .execute(&self.pool)
         .await
         .map_err(db_err)?;
         Ok(())
@@ -3761,7 +3858,7 @@ impl SqlMemoryStore {
         &self,
         ids: &[String],
     ) -> Result<std::collections::HashMap<String, Memory>, MemoriaError> {
-        let mut conn = self.conn().await?;
+        let memories_table = self.t("mem_memories");
         if ids.is_empty() {
             return Ok(Default::default());
         }
@@ -3776,13 +3873,13 @@ impl SqlMemoryStore {
                  CAST(extra_metadata AS CHAR) AS extra_meta, \
                  is_active, superseded_by, trust_tier, initial_confidence, \
                  observed_at, created_at, updated_at \
-                 FROM mem_memories WHERE memory_id IN ({ph}) AND is_active = 1"
+                 FROM {memories_table} WHERE memory_id IN ({ph}) AND is_active = 1"
             );
             let mut q = sqlx::query(&sql);
             for id in chunk {
                 q = q.bind(id);
             }
-            let rows = q.fetch_all(&mut *conn).await.map_err(db_err)?;
+            let rows = q.fetch_all(&self.pool).await.map_err(db_err)?;
             for r in &rows {
                 let m = row_to_memory(r)?;
                 map.insert(m.memory_id.clone(), m);
@@ -3934,7 +4031,6 @@ impl SqlMemoryStore {
         table: &str,
         memory_id: &str,
     ) -> Result<Option<Memory>, MemoriaError> {
-        let mut conn = self.conn().await?;
         let row = sqlx::query(&format!(
             "SELECT memory_id, user_id, memory_type, content, \
              embedding AS emb_str, session_id, \
@@ -3945,7 +4041,7 @@ impl SqlMemoryStore {
              FROM {table} WHERE memory_id = ? AND is_active = 1"
         ))
         .bind(memory_id)
-        .fetch_optional(&mut *conn)
+        .fetch_optional(&self.pool)
         .await
         .map_err(db_err)?;
         row.map(|r| row_to_memory(&r)).transpose()
@@ -4803,14 +4899,28 @@ mod tests {
     }
 
     #[test]
-    fn classify_pool_health_distinguishes_empty_from_saturated() {
-        assert_eq!(classify_pool_health(0, 0), PoolHealthLevel::Empty);
-        assert_eq!(classify_pool_health(8, 0), PoolHealthLevel::Saturated);
+    fn classify_pool_health_reserves_saturated_for_maxed_pools() {
+        assert_eq!(classify_pool_health(0, 0, Some(8)), PoolHealthLevel::Empty);
         assert_eq!(
-            classify_pool_health(20, 1),
+            classify_pool_health(2, 0, Some(4)),
             PoolHealthLevel::HighUtilization
         );
-        assert_eq!(classify_pool_health(8, 3), PoolHealthLevel::Healthy);
+        assert_eq!(
+            classify_pool_health(4, 0, Some(4)),
+            PoolHealthLevel::Saturated
+        );
+        assert_eq!(
+            classify_pool_health(20, 1, Some(20)),
+            PoolHealthLevel::HighUtilization
+        );
+        assert_eq!(
+            classify_pool_health(8, 3, Some(8)),
+            PoolHealthLevel::Healthy
+        );
+        assert_eq!(
+            classify_pool_health(8, 0, None),
+            PoolHealthLevel::HighUtilization
+        );
     }
 
     #[test]

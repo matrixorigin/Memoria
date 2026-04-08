@@ -15,6 +15,6 @@ pub use migration::{
 };
 pub use router::{DbRouter, UserDatabaseRecord};
 pub use store::{
-    FeedbackStats, MemoryFeedback, OwnedEditLogEntry, SqlMemoryStore, TierFeedback,
-    UserRetrievalParams,
+    FeedbackStats, MemoryFeedback, OwnedEditLogEntry, PoolHealthLevel, PoolHealthSnapshot,
+    SqlMemoryStore, TierFeedback, UserRetrievalParams,
 };

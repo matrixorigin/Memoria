@@ -79,10 +79,11 @@ impl GovernanceScheduler {
 
         // Create an isolated pool for governance so long-running operations
         // (consolidation, cleanup, DDL rebuilds) do not starve request connections.
+        let default_governance_pool_size = if service.db_router.is_some() { 2 } else { 4 };
         let governance_pool_size: u32 = std::env::var("GOVERNANCE_POOL_SIZE")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(4)
+            .unwrap_or(default_governance_pool_size)
             .min(32);
         #[allow(clippy::type_complexity)]
         let (gov_store, gov_sql_store, lock): (

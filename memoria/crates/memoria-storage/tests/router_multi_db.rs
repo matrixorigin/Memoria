@@ -1,5 +1,6 @@
 use chrono::Utc;
 use memoria_core::{interfaces::MemoryStore, Memory, MemoryType, TrustTier};
+use memoria_storage::store::CURRENT_USER_SCHEMA_VERSION;
 use memoria_storage::DbRouter;
 use sqlx::Row;
 use uuid::Uuid;
@@ -110,4 +111,88 @@ async fn router_isolates_users_into_distinct_databases() {
             .try_get("cnt")
             .expect("registry count");
     assert_eq!(registry_count, 2);
+}
+
+#[tokio::test]
+async fn router_persists_and_repairs_user_schema_version_marker() {
+    let shared_url = shared_db_url();
+    let router = DbRouter::connect(&shared_url, test_dim(), Uuid::new_v4().to_string())
+        .await
+        .expect("connect router");
+
+    let user = format!("router_schema_{}", Uuid::new_v4().simple());
+    router.user_store(&user).await.expect("user store");
+
+    let db_name = router.user_db_name(&user).await.expect("user db");
+    let user_db_url = replace_db_name(&shared_url, &db_name);
+    let direct_pool = sqlx::mysql::MySqlPoolOptions::new()
+        .max_connections(1)
+        .connect(&user_db_url)
+        .await
+        .expect("connect user db");
+
+    let row =
+        sqlx::query("SELECT schema_version, updated_at FROM mem_schema_meta WHERE schema_key = ?")
+            .bind("user_schema")
+            .fetch_one(&direct_pool)
+            .await
+            .expect("fetch schema marker");
+    let initial_version: i64 = row.try_get("schema_version").expect("initial version");
+    let initial_updated_at = row
+        .try_get::<chrono::NaiveDateTime, _>("updated_at")
+        .expect("initial updated_at");
+    assert_eq!(initial_version, CURRENT_USER_SCHEMA_VERSION);
+
+    router.invalidate_user(&user).await;
+    router.user_store(&user).await.expect("user store reentry");
+
+    let row_after_skip =
+        sqlx::query("SELECT schema_version, updated_at FROM mem_schema_meta WHERE schema_key = ?")
+            .bind("user_schema")
+            .fetch_one(&direct_pool)
+            .await
+            .expect("fetch schema marker after skip");
+    let skipped_version: i64 = row_after_skip
+        .try_get("schema_version")
+        .expect("version after skip");
+    let skipped_updated_at = row_after_skip
+        .try_get::<chrono::NaiveDateTime, _>("updated_at")
+        .expect("updated_at after skip");
+    assert_eq!(skipped_version, CURRENT_USER_SCHEMA_VERSION);
+    assert_eq!(skipped_updated_at, initial_updated_at);
+
+    let stale_at = chrono::NaiveDate::from_ymd_opt(2000, 1, 1)
+        .expect("stale date")
+        .and_hms_micro_opt(0, 0, 0, 0)
+        .expect("stale datetime");
+    sqlx::query(
+        "UPDATE mem_schema_meta SET schema_version = ?, updated_at = ? WHERE schema_key = ?",
+    )
+    .bind(0_i64)
+    .bind(stale_at)
+    .bind("user_schema")
+    .execute(&direct_pool)
+    .await
+    .expect("set stale schema marker");
+
+    router.invalidate_user(&user).await;
+    router
+        .user_store(&user)
+        .await
+        .expect("user store repairs version");
+
+    let repaired_row =
+        sqlx::query("SELECT schema_version, updated_at FROM mem_schema_meta WHERE schema_key = ?")
+            .bind("user_schema")
+            .fetch_one(&direct_pool)
+            .await
+            .expect("fetch repaired schema marker");
+    let repaired_version: i64 = repaired_row
+        .try_get("schema_version")
+        .expect("repaired version");
+    let repaired_updated_at = repaired_row
+        .try_get::<chrono::NaiveDateTime, _>("updated_at")
+        .expect("repaired updated_at");
+    assert_eq!(repaired_version, CURRENT_USER_SCHEMA_VERSION);
+    assert!(repaired_updated_at > stale_at);
 }
