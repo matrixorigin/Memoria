@@ -462,54 +462,91 @@ impl MemoryService {
             }
         };
 
-        let entity_pool_size: u32 = std::env::var("ENTITY_POOL_SIZE")
+        let entity_pool_size_raw: Option<u32> = std::env::var("ENTITY_POOL_SIZE")
             .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(8)
-            .clamp(2, 32);
-        let entity_tx = match store.spawn_background_store(entity_pool_size).await {
-            Ok(entity_store) => {
+            .and_then(|s| s.parse().ok());
+        let entity_tx = if db_router.is_some() {
+            if entity_pool_size_raw == Some(0) {
+                info!("Entity extraction disabled in multi-db mode (ENTITY_POOL_SIZE=0)");
+                None
+            } else {
+                if let Some(raw) = entity_pool_size_raw {
+                    info!(
+                        entity_pool_size = raw,
+                        "ENTITY_POOL_SIZE ignored in multi-db mode; entity extraction uses routed user stores"
+                    );
+                } else {
+                    info!("Entity extraction uses routed user stores in multi-db mode");
+                }
                 let (entity_tx, entity_rx) = tokio::sync::mpsc::channel(entity_queue_size);
-                Self::spawn_entity_worker(entity_rx, entity_store, llm.clone());
-                tracing::info!(
-                    entity_queue_size,
-                    entity_pool_size,
-                    "entity extraction enabled"
-                );
+                Self::spawn_entity_worker(entity_rx, store.clone(), llm.clone());
+                tracing::info!(entity_queue_size, "entity extraction enabled");
                 Some(entity_tx)
             }
-            Err(e) => {
-                error!(
-                    error = %e,
-                    "entity extraction disabled because isolated pool initialization failed"
-                );
+        } else {
+            let entity_pool_size = entity_pool_size_raw.unwrap_or(8);
+            if entity_pool_size == 0 {
+                info!("Entity extraction disabled; ENTITY_POOL_SIZE=0");
                 None
+            } else {
+                let entity_pool_size = entity_pool_size.clamp(2, 32);
+                match store.spawn_background_store(entity_pool_size).await {
+                    Ok(entity_store) => {
+                        let (entity_tx, entity_rx) = tokio::sync::mpsc::channel(entity_queue_size);
+                        Self::spawn_entity_worker(entity_rx, entity_store, llm.clone());
+                        tracing::info!(
+                            entity_queue_size,
+                            entity_pool_size,
+                            "entity extraction enabled"
+                        );
+                        Some(entity_tx)
+                    }
+                    Err(e) => {
+                        error!(
+                            error = %e,
+                            "entity extraction disabled because isolated pool initialization failed"
+                        );
+                        None
+                    }
+                }
             }
         };
 
         // Isolated pool for graph retrieval (spreading activation, entity recall).
         // Keeps graph queries from competing with the main pool during retrieve.
-        let graph_pool_size: u32 = std::env::var("GRAPH_POOL_SIZE")
+        let graph_pool_size_raw: Option<u32> = std::env::var("GRAPH_POOL_SIZE")
             .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(8)
-            .min(32);
-        let graph_pool = if graph_pool_size == 0 {
-            info!("Graph retrieval isolated pool disabled; graph queries will use main pool");
+            .and_then(|s| s.parse().ok());
+        let graph_pool = if db_router.is_some() {
+            if let Some(raw) = graph_pool_size_raw.filter(|raw| *raw > 0) {
+                info!(
+                    graph_pool_size = raw,
+                    "GRAPH_POOL_SIZE ignored in multi-db mode; graph queries use the global user pool"
+                );
+            } else {
+                info!("Graph retrieval isolated pool skipped in multi-db mode");
+            }
             None
         } else {
-            match store.spawn_background_store(graph_pool_size).await {
-                Ok(gp) => {
-                    info!(graph_pool_size, "Graph retrieval using isolated pool");
-                    Some(gp)
-                }
-                Err(e) => {
-                    warn!(
-                        error = %e,
-                        graph_pool_size,
-                        "graph isolated pool failed, graph queries will use main pool"
-                    );
-                    None
+            let graph_pool_size = graph_pool_size_raw.unwrap_or(8);
+            if graph_pool_size == 0 {
+                info!("Graph retrieval isolated pool disabled; graph queries will use main pool");
+                None
+            } else {
+                let graph_pool_size = graph_pool_size.min(32);
+                match store.spawn_background_store(graph_pool_size).await {
+                    Ok(gp) => {
+                        info!(graph_pool_size, "Graph retrieval using isolated pool");
+                        Some(gp)
+                    }
+                    Err(e) => {
+                        warn!(
+                            error = %e,
+                            graph_pool_size,
+                            "graph isolated pool failed, graph queries will use main pool"
+                        );
+                        None
+                    }
                 }
             }
         };

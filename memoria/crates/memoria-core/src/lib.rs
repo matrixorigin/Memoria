@@ -5,7 +5,7 @@ pub mod types;
 
 pub use error::MemoriaError;
 pub use sensitivity::{check_sensitivity, SensitivityResult, SensitivityTier};
-pub use types::{Memory, MemoryType, TrustTier};
+pub use types::{Memory, MemoryType, TrustTier, FEEDBACK_SIGNALS};
 
 /// Workaround: MO#24001 — PREPARE/EXECUTE stores `Option<String>::None` as empty
 /// string `''` instead of SQL NULL for VARCHAR columns.  Normalize at both write

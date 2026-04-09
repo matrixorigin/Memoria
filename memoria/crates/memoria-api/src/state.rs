@@ -2,6 +2,7 @@ use crate::auth::{
     spawn_call_log_flusher, spawn_last_used_flusher, spawn_tool_usage_flusher, CallLogBatcher,
     LastUsedBatcher, ToolUsageBatcher,
 };
+use crate::metrics_summary::MetricsSummaryManager;
 use crate::rate_limit::RateLimiter;
 use memoria_core::MemoriaError;
 use memoria_git::GitForDataService;
@@ -97,6 +98,7 @@ pub struct AppState {
     /// Short-lived cache for Prometheus output to avoid repeated full-table scans.
     pub metrics_cache: Arc<RwLock<Option<CachedMetrics>>>,
     pub metrics_cache_ttl: Duration,
+    pub metrics_summary: Option<Arc<MetricsSummaryManager>>,
     /// Batched API call log writer (flushed every 5 s to mem_api_call_log).
     pub call_log_batcher: Arc<CallLogBatcher>,
     /// Shutdown signal + task handles for background flushers.
@@ -152,6 +154,7 @@ impl AppState {
             rate_limiter: crate::rate_limit::from_env(),
             metrics_cache: Arc::new(RwLock::new(None)),
             metrics_cache_ttl,
+            metrics_summary: None,
             flusher_state: Arc::new(std::sync::Mutex::new(FlusherState {
                 shutdown: None,
                 handles: Vec::new(),
@@ -220,15 +223,16 @@ impl AppState {
             pool.clone(),
             shutdown_rx.clone(),
         );
-        // In multi-db mode, eager rebuild would fan out across every user DB and can
-        // block startup for large tenants. Load per-user tool usage lazily instead.
-        if self
+        let multi_db_mode = self
             .service
             .sql_store
             .as_ref()
             .and_then(|sql| sql.db_router())
-            .is_some()
-        {
+            .is_some();
+
+        // In multi-db mode, eager rebuild would fan out across every user DB and can
+        // block startup for large tenants. Load per-user tool usage lazily instead.
+        if multi_db_mode {
             info!("Skipping eager tool-usage rebuild in multi-db mode");
         } else {
             self.tool_usage_batcher.rebuild_from_db(&self.service).await;
@@ -242,13 +246,26 @@ impl AppState {
         let h3 = spawn_call_log_flusher(
             self.call_log_batcher.clone(),
             self.service.clone(),
-            shutdown_rx,
+            shutdown_rx.clone(),
         );
+
+        let mut handles = vec![h1, h2, h3];
+        if multi_db_mode {
+            let manager = Arc::new(MetricsSummaryManager::new(
+                self.service.clone(),
+                pool.clone(),
+                self.metrics_cache.clone(),
+            ));
+            manager.ensure_schema().await?;
+            handles.push(manager.clone().spawn(shutdown_rx.clone()));
+            self.metrics_summary = Some(manager);
+            info!("Metrics summary refresher initialized for multi-db mode");
+        }
         self.auth_pool = Some(pool);
         {
             let mut fs = self.flusher_state.lock().unwrap();
             fs.shutdown = Some(shutdown_tx);
-            fs.handles = vec![h1, h2, h3];
+            fs.handles = handles;
         }
         Ok(self)
     }
@@ -256,6 +273,17 @@ impl AppState {
     pub fn with_instance_id(mut self, instance_id: String) -> Self {
         self.instance_id = instance_id;
         self
+    }
+
+    pub async fn mark_metrics_dirty(
+        &self,
+        user_id: &str,
+        mask: crate::metrics_summary::DirtyMask,
+    ) -> Result<(), MemoriaError> {
+        if let Some(summary) = &self.metrics_summary {
+            summary.mark_user_dirty(user_id, mask).await?;
+        }
+        Ok(())
     }
 
     /// Signal all background flushers to stop, wait for final flush to complete.

@@ -610,16 +610,15 @@ pub async fn list_branches(
         .user_sql_store(&user_id)
         .await
         .map_err(api_err)?;
-    let active_table = sql.active_table(&user_id).await.map_err(api_err)?;
-    let main_table = sql.t("mem_memories");
+    let active_branch = sql.active_branch_name(&user_id).await.map_err(api_err)?;
     let mut branches = vec![json!({
         "name": "main",
-        "active": active_table == "mem_memories" || active_table == main_table,
+        "active": active_branch == "main",
     })];
-    for (name, table_name) in sql.list_branches(&user_id).await.map_err(api_err)? {
+    for (name, _table_name) in sql.list_branches(&user_id).await.map_err(api_err)? {
         branches.push(json!({
             "name": name,
-            "active": table_name == active_table,
+            "active": name == active_branch,
         }));
     }
     if !branches
