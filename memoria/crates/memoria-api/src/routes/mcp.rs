@@ -132,6 +132,16 @@ pub async fn mcp_handler(
                 t.elapsed().as_millis() as u32,
                 RpcMeta::err($code),
             );
+            if let Some(reporter) = &state.stats_reporter {
+                reporter.report(
+                    memoria_service::stats_reporter::StatsEvent::ApiCallLogged {
+                        user_id: auth.user_id.clone(),
+                        path: $path.to_string(),
+                        is_mcp: true,
+                        is_success: false,
+                    },
+                );
+            }
             return Json($body).into_response();
         }};
     }
@@ -200,6 +210,23 @@ pub async fn mcp_handler(
         state.tool_usage_batcher.mark_used(user_id.clone(), tool);
     }
 
+    // Single reporting point for MCP call stats, shared by both the
+    // notification path and the regular-request path below.
+    let report_stats = {
+        let reporter = state.stats_reporter.clone();
+        let uid = user_id.clone();
+        move |path: &str, is_success: bool| {
+            if let Some(r) = &reporter {
+                r.report(memoria_service::stats_reporter::StatsEvent::ApiCallLogged {
+                    user_id: uid.clone(),
+                    path: path.to_string(),
+                    is_mcp: true,
+                    is_success,
+                });
+            }
+        }
+    };
+
     // JSON-RPC 2.0: a Notification is a *valid* Request without an "id" member.
     // The server MUST NOT reply to Notifications.
     if req.get("id").is_none() {
@@ -220,6 +247,9 @@ pub async fn mcp_handler(
                 spawn_metrics_dirty_mark(state.clone(), user_id.clone(), mask);
             }
         }
+        // Report accurate ops metrics using the real RPC path and success flag
+        // (JSON-RPC errors still return HTTP 200, so is_success must come from rpc.success).
+        report_stats(&track_path, rpc.success);
         state.call_log_batcher.record_rpc(
             user_id,
             "POST".to_string(),
@@ -268,6 +298,9 @@ pub async fn mcp_handler(
         }
     }
 
+    // Report accurate ops metrics using the real RPC path and success flag
+    // (JSON-RPC errors still return HTTP 200, so is_success must come from rpc.success).
+    report_stats(&track_path, rpc.success);
     state.call_log_batcher.record_rpc(
         user_id,
         "POST".to_string(),

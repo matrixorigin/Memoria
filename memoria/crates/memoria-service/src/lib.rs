@@ -9,11 +9,13 @@ pub mod rebuild_worker;
 pub mod scheduler;
 pub mod scoring;
 pub mod service;
+pub mod stats_reporter;
 pub mod strategy;
 pub mod strategy_domain;
 pub mod vector_index_monitor;
 pub use config::Config;
 pub use distributed::{AsyncTask, AsyncTaskStore, DistributedLock, NoopDistributedLock};
+pub use stats_reporter::StatsReporter;
 pub use governance::{
     DefaultGovernanceStrategy, GovernanceExecution, GovernancePlan, GovernanceRunSummary,
     GovernanceStore, GovernanceStrategy, GovernanceTask,

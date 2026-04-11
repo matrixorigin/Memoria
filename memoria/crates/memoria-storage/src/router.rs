@@ -411,6 +411,74 @@ impl DbRouter {
         .execute(&self.shared_pool)
         .await
         .map_err(db_err)?;
+
+        // ── Operational metrics tables (push-based aggregation for admin dashboard) ──
+        sqlx::query(
+            r#"CREATE TABLE IF NOT EXISTS srv_user_stats (
+                user_id           VARCHAR(64) NOT NULL PRIMARY KEY,
+                total_memories    BIGINT      NOT NULL DEFAULT 0,
+                active_memories   BIGINT      NOT NULL DEFAULT 0,
+                inactive_memories BIGINT      NOT NULL DEFAULT 0,
+                total_entities    BIGINT      NOT NULL DEFAULT 0,
+                total_edits       BIGINT      NOT NULL DEFAULT 0,
+                updated_at        DATETIME    NOT NULL DEFAULT CURRENT_TIMESTAMP
+                                  ON UPDATE CURRENT_TIMESTAMP
+            )"#,
+        )
+        .execute(&self.shared_pool)
+        .await
+        .map_err(db_err)?;
+
+        sqlx::query(
+            r#"CREATE TABLE IF NOT EXISTS srv_user_metric_detail (
+                user_id   VARCHAR(64)  NOT NULL,
+                metric    VARCHAR(64)  NOT NULL,
+                dim_key   VARCHAR(128) NOT NULL,
+                cnt       BIGINT       NOT NULL DEFAULT 0,
+                PRIMARY KEY (user_id, metric, dim_key)
+            )"#,
+        )
+        .execute(&self.shared_pool)
+        .await
+        .map_err(db_err)?;
+
+        sqlx::query(
+            r#"CREATE TABLE IF NOT EXISTS srv_daily_stats (
+                dt      DATE        NOT NULL,
+                metric  VARCHAR(64) NOT NULL,
+                cnt     BIGINT      NOT NULL DEFAULT 0,
+                PRIMARY KEY (dt, metric)
+            )"#,
+        )
+        .execute(&self.shared_pool)
+        .await
+        .map_err(db_err)?;
+
+        sqlx::query(
+            r#"CREATE TABLE IF NOT EXISTS srv_user_api_stats (
+                user_id        VARCHAR(64) NOT NULL PRIMARY KEY,
+                total_calls    BIGINT      NOT NULL DEFAULT 0,
+                mcp_calls      BIGINT      NOT NULL DEFAULT 0,
+                mcp_errors     BIGINT      NOT NULL DEFAULT 0,
+                first_mcp_call DATETIME    DEFAULT NULL,
+                updated_at     DATETIME    NOT NULL DEFAULT CURRENT_TIMESTAMP
+                               ON UPDATE CURRENT_TIMESTAMP
+            )"#,
+        )
+        .execute(&self.shared_pool)
+        .await
+        .map_err(db_err)?;
+
+        sqlx::query(
+            r#"CREATE TABLE IF NOT EXISTS srv_mcp_path_stats (
+                path  VARCHAR(128) NOT NULL PRIMARY KEY,
+                cnt   BIGINT       NOT NULL DEFAULT 0
+            )"#,
+        )
+        .execute(&self.shared_pool)
+        .await
+        .map_err(db_err)?;
+
         Ok(())
     }
 }

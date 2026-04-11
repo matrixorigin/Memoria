@@ -574,7 +574,7 @@ async fn cmd_serve(db_url: Option<String>, port: u16, master_key: String) -> Res
         .start();
     let state = AppState::new(service.clone(), git, master_key)
         .with_instance_id(cfg.instance_id.clone())
-        .init_auth_pool(cfg.effective_sql_url())
+        .init_auth_pool(cfg.effective_sql_url(), cfg.ops_metrics_enabled)
         .await?;
 
     let app = build_router(state.clone()).layer(TraceLayer::new_for_http());
@@ -3537,6 +3537,7 @@ mod tests {
             governance_plugin_dir: None,
             instance_id: "test-instance".to_string(),
             lock_ttl_secs: 120,
+            ops_metrics_enabled: false,
         }
     }
 

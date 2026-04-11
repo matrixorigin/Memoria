@@ -9,10 +9,12 @@ use memoria_embedding::LlmClient;
 use memoria_storage::{DbRouter, OwnedEditLogEntry, SqlMemoryStore};
 use moka::sync::Cache;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tracing::{error, info, warn};
 use uuid::Uuid;
+
+use crate::stats_reporter::{StatsEvent, StatsReporter};
 
 /// Incremented when entity extraction jobs are dropped (queue full or channel closed).
 pub static ENTITY_EXTRACTION_DROPS: AtomicU64 = AtomicU64::new(0);
@@ -390,6 +392,10 @@ pub struct MemoryService {
     /// Isolated pool for graph retrieval (spreading activation, entity recall)
     /// to avoid starving the main pool during heavy retrieve queries.
     graph_pool: Option<Arc<SqlMemoryStore>>,
+    /// Shared operational metrics reporter (None = disabled, zero overhead).
+    /// Wrapped in OnceLock so the entity background worker can also access it
+    /// after construction via `with_stats()`.
+    stats: Arc<OnceLock<Arc<StatsReporter>>>,
 }
 
 /// A pending entity-extraction job pushed from the write path.
@@ -428,6 +434,10 @@ impl MemoryService {
         // Create edit-log buffer early so background stores inherit the sender
         let edit_log = EditLogBuffer::new(store.clone());
         store.set_edit_log_tx(edit_log.entry_sender());
+
+        // Stats cell shared between MemoryService and background entity workers.
+        // Populated later via with_stats(); workers check it on each batch.
+        let stats_cell: Arc<OnceLock<Arc<StatsReporter>>> = Arc::new(OnceLock::new());
 
         let entity_queue_size: usize = std::env::var("ENTITY_QUEUE_SIZE")
             .ok()
@@ -479,7 +489,7 @@ impl MemoryService {
                     info!("Entity extraction uses routed user stores in multi-db mode");
                 }
                 let (entity_tx, entity_rx) = tokio::sync::mpsc::channel(entity_queue_size);
-                Self::spawn_entity_worker(entity_rx, store.clone(), llm.clone());
+                Self::spawn_entity_worker(entity_rx, store.clone(), llm.clone(), stats_cell.clone());
                 tracing::info!(entity_queue_size, "entity extraction enabled");
                 Some(entity_tx)
             }
@@ -493,7 +503,7 @@ impl MemoryService {
                 match store.spawn_background_store(entity_pool_size).await {
                     Ok(entity_store) => {
                         let (entity_tx, entity_rx) = tokio::sync::mpsc::channel(entity_queue_size);
-                        Self::spawn_entity_worker(entity_rx, entity_store, llm.clone());
+                        Self::spawn_entity_worker(entity_rx, entity_store, llm.clone(), stats_cell.clone());
                         tracing::info!(
                             entity_queue_size,
                             entity_pool_size,
@@ -572,6 +582,7 @@ impl MemoryService {
                 .build(),
             vector_monitor,
             graph_pool,
+            stats: stats_cell,
         }
     }
 
@@ -609,6 +620,7 @@ impl MemoryService {
                 .build(),
             vector_monitor: None,
             graph_pool: None,
+            stats: Arc::new(OnceLock::new()),
         }
     }
 
@@ -638,9 +650,31 @@ impl MemoryService {
                     .build(),
                 vector_monitor: None,
                 graph_pool: None,
+                stats: Arc::new(OnceLock::new()),
             },
             entries,
         )
+    }
+
+    /// Attach a `StatsReporter` after construction.
+    /// Must be called before the service receives any requests.
+    /// No-op if called more than once (OnceLock semantics).
+    pub fn with_stats(self, reporter: Arc<StatsReporter>) -> Self {
+        let _ = self.stats.set(reporter);
+        self
+    }
+
+    /// Initialize the stats reporter from an external caller (e.g., AppState::init_auth_pool).
+    /// Safe to call concurrently; OnceLock guarantees only the first call wins.
+    pub fn init_stats(&self, reporter: Arc<StatsReporter>) {
+        let _ = self.stats.set(reporter);
+    }
+
+    #[inline]
+    fn report(&self, event: StatsEvent) {
+        if let Some(r) = self.stats.get() {
+            r.report(event);
+        }
     }
 
     /// Force-flush all buffered edit-log entries to the store.
@@ -694,6 +728,10 @@ impl MemoryService {
                 snapshot_before,
             );
         }
+        self.report(StatsEvent::EditLogged {
+            user_id: user_id.to_string(),
+            operation: operation.to_string(),
+        });
     }
 
     /// Best-effort cleanup of graph node + entity links for a deactivated memory.
@@ -760,6 +798,7 @@ impl MemoryService {
         rx: tokio::sync::mpsc::Receiver<EntityJob>,
         store: Arc<SqlMemoryStore>,
         llm: Option<Arc<LlmClient>>,
+        stats_cell: Arc<OnceLock<Arc<StatsReporter>>>,
     ) {
         let worker_count: usize = std::env::var("ENTITY_WORKER_COUNT")
             .ok()
@@ -797,9 +836,10 @@ impl MemoryService {
                     };
                     let store = Arc::clone(&store);
                     let llm = llm.clone();
+                    let stats = stats_cell.get().cloned();
                     tokio::spawn(async move {
                         let _permit = permit;
-                        Self::process_entity_batch(store, llm, user_id, jobs).await;
+                        Self::process_entity_batch(store, llm, stats, user_id, jobs).await;
                     });
                 }
 
@@ -817,6 +857,7 @@ impl MemoryService {
     async fn process_entity_batch(
         store: Arc<SqlMemoryStore>,
         llm: Option<Arc<LlmClient>>,
+        stats: Option<Arc<StatsReporter>>,
         user_id: String,
         jobs: Vec<EntityJob>,
     ) {
@@ -884,7 +925,18 @@ impl MemoryService {
                 .filter(|e| seen.insert(e.name.as_str()))
                 .map(|e| (e.name.as_str(), e.display.as_str(), e.entity_type.as_str()))
                 .collect();
+            let refs_len = refs.len() as u64;
             if let Ok(resolved) = graph.batch_upsert_entities(&user_id, &refs).await {
+                // Report approximate new-entity count (best-effort; refs_len may overcount
+                // if some entities already existed, which is acceptable for monitoring).
+                if refs_len > 0 {
+                    if let Some(r) = &stats {
+                        r.report(StatsEvent::EntitiesUpserted {
+                            user_id: user_id.clone(),
+                            count: refs_len,
+                        });
+                    }
+                }
                 // Build name→entity_id map
                 let id_map: std::collections::HashMap<&str, &str> = resolved
                     .iter()
@@ -1086,6 +1138,14 @@ impl MemoryService {
                             "store_memory:supersede",
                             None,
                         );
+                        self.report(StatsEvent::MemoryStored {
+                            user_id: user_id.to_string(),
+                            memory_type: memory.memory_type.to_string(),
+                            trust_tier: memory.trust_tier.to_string(),
+                        });
+                        self.report(StatsEvent::MemoryDeactivated {
+                            user_id: user_id.to_string(),
+                        });
                         self.enqueue_entity_extraction(user_id, &memory.memory_id, &memory.content)
                             .await;
                         if t0.elapsed().as_secs() >= 1 {
@@ -1123,6 +1183,11 @@ impl MemoryService {
                     "store_memory",
                     None,
                 );
+                self.report(StatsEvent::MemoryStored {
+                    user_id: user_id.to_string(),
+                    memory_type: memory.memory_type.to_string(),
+                    trust_tier: memory.trust_tier.to_string(),
+                });
                 self.enqueue_entity_extraction(user_id, &memory.memory_id, &memory.content)
                     .await;
                 if t0.elapsed().as_secs() >= 1 {
@@ -1145,6 +1210,11 @@ impl MemoryService {
                     "store_memory",
                     None,
                 );
+                self.report(StatsEvent::MemoryStored {
+                    user_id: user_id.to_string(),
+                    memory_type: memory.memory_type.to_string(),
+                    trust_tier: memory.trust_tier.to_string(),
+                });
                 self.enqueue_entity_extraction(user_id, &memory.memory_id, &memory.content)
                     .await;
                 if t0.elapsed().as_secs() >= 1 {
@@ -1633,6 +1703,15 @@ impl MemoryService {
             );
             sup_res?;
 
+            self.report(StatsEvent::MemoryStored {
+                user_id: user_id.to_string(),
+                memory_type: new_mem.memory_type.to_string(),
+                trust_tier: new_mem.trust_tier.to_string(),
+            });
+            self.report(StatsEvent::MemoryDeactivated {
+                user_id: user_id.to_string(),
+            });
+
             let payload = serde_json::json!({
                 "new_content": new_content,
                 "new_memory_id": &new_mem.memory_id,
@@ -1695,7 +1774,12 @@ impl MemoryService {
             let (snap, warning) = sql.create_safety_snapshot("purge").await;
             self.send_edit_log(user_id, "purge", Some(memory_id), None, "", snap.as_deref());
             let table = sql.active_table(user_id).await?;
-            sql.soft_delete_from(&table, memory_id).await?;
+            let deactivated = sql.soft_delete_from(&table, memory_id).await?;
+            if deactivated > 0 {
+                self.report(StatsEvent::MemoryDeactivated {
+                    user_id: user_id.to_string(),
+                });
+            }
             // Graph + entity link cleanup (best-effort, governance fallback covers crash)
             Self::cleanup_entity_data_for_memory(sql.as_ref(), memory_id, "purge").await;
             Ok(PurgeResult {
@@ -1724,8 +1808,13 @@ impl MemoryService {
             let (snap, warning) = sql.create_safety_snapshot("purge").await;
             let table = sql.active_table(user_id).await?;
             for id in ids {
-                sql.soft_delete_from(&table, id).await?;
+                let deactivated = sql.soft_delete_from(&table, id).await?;
                 self.send_edit_log(user_id, "purge", Some(id), None, "", snap.as_deref());
+                if deactivated > 0 {
+                    self.report(StatsEvent::MemoryDeactivated {
+                        user_id: user_id.to_string(),
+                    });
+                }
                 Self::cleanup_entity_data_for_memory(sql.as_ref(), id, "purge_batch").await;
             }
             Ok(PurgeResult {

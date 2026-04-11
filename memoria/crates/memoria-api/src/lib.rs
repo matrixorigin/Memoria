@@ -77,6 +77,23 @@ async fn call_log_mw(
                     latency_ms,
                 );
             }
+            // Push-based ops metrics (non-blocking, best-effort).
+            // Dashboard-originated calls are excluded to avoid inflating agent stats.
+            // MCP calls are skipped here: mcp_handler reports ApiCallLogged with the
+            // accurate track_path (e.g. /mcp/remember) and RPC-level success flag,
+            // which is necessary because JSON-RPC errors return HTTP 200.
+            if !is_dashboard && !path.starts_with("/v1/mcp") {
+                if let Some(reporter) = &state.stats_reporter {
+                    reporter.report(
+                        memoria_service::stats_reporter::StatsEvent::ApiCallLogged {
+                            user_id: uid.clone(),
+                            path: path.clone(),
+                            is_mcp: false,
+                            is_success: status_code < 400,
+                        },
+                    );
+                }
+            }
             if let Some(mask) = should_mark_metrics_dirty(&method, &path, status_code) {
                 let state = state.clone();
                 let user_id = uid.clone();

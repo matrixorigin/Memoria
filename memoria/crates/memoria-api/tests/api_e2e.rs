@@ -867,7 +867,7 @@ async fn spawn_server_with_master_key(master_key: &str) -> (String, reqwest::Cli
     let git = Arc::new(GitForDataService::new(pool, &cfg.db_name));
     let service = Arc::new(MemoryService::new_sql_with_llm(Arc::new(store), None, None).await);
     let state = memoria_api::AppState::new(service, git, master_key.to_string())
-        .init_auth_pool(&db)
+        .init_auth_pool(&db, false)
         .await
         .expect("init auth pool");
     let app = memoria_api::build_router(state);
@@ -5819,7 +5819,7 @@ async fn test_api_key_auth_uses_batcher_not_fire_and_forget() {
     let git = Arc::new(GitForDataService::new(pool, &cfg.db_name));
     let service = Arc::new(MemoryService::new_sql_with_llm(Arc::new(store), None, None).await);
     let state = memoria_api::AppState::new(service, git, mk.to_string())
-        .init_auth_pool(&db)
+        .init_auth_pool(&db, false)
         .await
         .expect("auth pool");
 

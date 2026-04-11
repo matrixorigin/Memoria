@@ -1400,6 +1400,7 @@ mod tests {
             governance_plugin_dir: None,
             instance_id: "test-instance".into(),
             lock_ttl_secs: 120,
+            ops_metrics_enabled: false,
         };
         let scheduler = tokio::runtime::Runtime::new()
             .unwrap()

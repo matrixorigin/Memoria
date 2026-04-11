@@ -1752,6 +1752,76 @@ impl SqlMemoryStore {
         .execute(&mut *conn)
         .await;
 
+        // ── Ops-metrics aggregate tables (push-based stats written by Memoria) ──
+        // Created here so they exist in both single-db and multi-db deployments.
+        // DbRouter::ensure_user_registry_table also creates these for multi-db
+        // startup — CREATE TABLE IF NOT EXISTS makes all paths idempotent.
+        sqlx::query(
+            r#"CREATE TABLE IF NOT EXISTS srv_user_stats (
+                user_id          VARCHAR(64)  NOT NULL PRIMARY KEY,
+                total_memories   BIGINT       NOT NULL DEFAULT 0,
+                active_memories  BIGINT       NOT NULL DEFAULT 0,
+                inactive_memories BIGINT      NOT NULL DEFAULT 0,
+                total_entities   BIGINT       NOT NULL DEFAULT 0,
+                total_edits      BIGINT       NOT NULL DEFAULT 0,
+                updated_at       DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP
+                                 ON UPDATE CURRENT_TIMESTAMP
+            )"#,
+        )
+        .execute(&mut *conn)
+        .await
+        .map_err(db_err)?;
+
+        sqlx::query(
+            r#"CREATE TABLE IF NOT EXISTS srv_user_metric_detail (
+                user_id  VARCHAR(64)  NOT NULL,
+                metric   VARCHAR(64)  NOT NULL,
+                dim_key  VARCHAR(128) NOT NULL,
+                cnt      BIGINT       NOT NULL DEFAULT 0,
+                PRIMARY KEY (user_id, metric, dim_key)
+            )"#,
+        )
+        .execute(&mut *conn)
+        .await
+        .map_err(db_err)?;
+
+        sqlx::query(
+            r#"CREATE TABLE IF NOT EXISTS srv_daily_stats (
+                dt      DATE         NOT NULL,
+                metric  VARCHAR(64)  NOT NULL,
+                cnt     BIGINT       NOT NULL DEFAULT 0,
+                PRIMARY KEY (dt, metric)
+            )"#,
+        )
+        .execute(&mut *conn)
+        .await
+        .map_err(db_err)?;
+
+        sqlx::query(
+            r#"CREATE TABLE IF NOT EXISTS srv_user_api_stats (
+                user_id        VARCHAR(64) NOT NULL PRIMARY KEY,
+                total_calls    BIGINT      NOT NULL DEFAULT 0,
+                mcp_calls      BIGINT      NOT NULL DEFAULT 0,
+                mcp_errors     BIGINT      NOT NULL DEFAULT 0,
+                first_mcp_call DATETIME    DEFAULT NULL,
+                updated_at     DATETIME    NOT NULL DEFAULT CURRENT_TIMESTAMP
+                               ON UPDATE CURRENT_TIMESTAMP
+            )"#,
+        )
+        .execute(&mut *conn)
+        .await
+        .map_err(db_err)?;
+
+        sqlx::query(
+            r#"CREATE TABLE IF NOT EXISTS srv_mcp_path_stats (
+                path  VARCHAR(128) NOT NULL PRIMARY KEY,
+                cnt   BIGINT       NOT NULL DEFAULT 0
+            )"#,
+        )
+        .execute(&mut *conn)
+        .await
+        .map_err(db_err)?;
+
         Ok(())
     }
 
@@ -4095,18 +4165,20 @@ impl SqlMemoryStore {
 
     /// Mark a memory as superseded by another.
     /// Branch-aware soft-delete: deactivate a memory in the given table.
-    pub async fn soft_delete_from(&self, table: &str, memory_id: &str) -> Result<(), MemoriaError> {
+    /// Returns the number of rows actually deactivated (0 means the memory
+    /// was already inactive or not found — idempotent, not an error).
+    pub async fn soft_delete_from(&self, table: &str, memory_id: &str) -> Result<u64, MemoriaError> {
         let mut conn = self.conn().await?;
         let now = Utc::now().naive_utc();
-        sqlx::query(&format!(
-            "UPDATE {table} SET is_active = 0, updated_at = ? WHERE memory_id = ?"
+        let res = sqlx::query(&format!(
+            "UPDATE {table} SET is_active = 0, updated_at = ? WHERE memory_id = ? AND is_active = 1"
         ))
         .bind(now)
         .bind(memory_id)
         .execute(&mut *conn)
         .await
         .map_err(db_err)?;
-        Ok(())
+        Ok(res.rows_affected())
     }
 
     /// Batch soft-delete: deactivate multiple memories in one round trip per chunk.

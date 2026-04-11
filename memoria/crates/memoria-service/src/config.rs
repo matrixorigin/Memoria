@@ -68,6 +68,11 @@ pub struct Config {
     pub instance_id: String,
     /// Lock TTL in seconds for distributed leader election. Default: 120.
     pub lock_ttl_secs: u64,
+
+    /// Enable writing operational metrics to the shared DB for admin dashboard.
+    /// Only aggregate counters are written — no user memory content is stored.
+    /// Env: MEMORIA_OPS_METRICS (default: true).
+    pub ops_metrics_enabled: bool,
 }
 
 impl Config {
@@ -151,6 +156,7 @@ impl Config {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(120),
+            ops_metrics_enabled: env_bool_default("MEMORIA_OPS_METRICS", true),
         }
     }
 
@@ -211,6 +217,20 @@ fn env_bool(name: &str) -> bool {
             .as_deref(),
         Some("1" | "true" | "yes" | "on")
     )
+}
+
+fn env_bool_default(name: &str, default: bool) -> bool {
+    match std::env::var(name)
+        .ok()
+        .as_deref()
+        .map(str::trim)
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("1" | "true" | "yes" | "on") => true,
+        Some("0" | "false" | "no" | "off") => false,
+        _ => default,
+    }
 }
 
 fn replace_db_name(database_url: &str, db_name: &str) -> Option<String> {
@@ -477,5 +497,52 @@ mod tests {
                 assert!(cfg.embedding_endpoints.is_empty());
             },
         );
+    }
+
+    // ── env_bool_default / ops_metrics_enabled tests ─────────────────────────
+
+    #[test]
+    fn ops_metrics_defaults_to_true_when_unset() {
+        with_env(&[("MEMORIA_OPS_METRICS", None)], || {
+            let cfg = Config::from_env();
+            assert!(cfg.ops_metrics_enabled, "should be enabled by default");
+        });
+    }
+
+    #[test]
+    fn ops_metrics_recognised_truthy_values() {
+        for val in &["1", "true", "True", "TRUE", "yes", "YES", "on", "ON"] {
+            with_env(&[("MEMORIA_OPS_METRICS", Some(val))], || {
+                let cfg = Config::from_env();
+                assert!(
+                    cfg.ops_metrics_enabled,
+                    "MEMORIA_OPS_METRICS={val:?} should be truthy"
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn ops_metrics_recognised_falsy_values() {
+        for val in &["0", "false", "False", "FALSE", "no", "NO", "off", "OFF"] {
+            with_env(&[("MEMORIA_OPS_METRICS", Some(val))], || {
+                let cfg = Config::from_env();
+                assert!(
+                    !cfg.ops_metrics_enabled,
+                    "MEMORIA_OPS_METRICS={val:?} should be falsy"
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn ops_metrics_unknown_value_falls_back_to_default() {
+        with_env(&[("MEMORIA_OPS_METRICS", Some("maybe"))], || {
+            let cfg = Config::from_env();
+            assert!(
+                cfg.ops_metrics_enabled,
+                "unrecognised value should fall back to the default (true)"
+            );
+        });
     }
 }

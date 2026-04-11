@@ -6,7 +6,7 @@ use crate::metrics_summary::MetricsSummaryManager;
 use crate::rate_limit::RateLimiter;
 use memoria_core::MemoriaError;
 use memoria_git::GitForDataService;
-use memoria_service::{AsyncTaskStore, MemoryService};
+use memoria_service::{AsyncTaskStore, MemoryService, StatsReporter};
 use memoria_storage::store::spawn_pool_monitor;
 use memoria_storage::PoolHealthSnapshot;
 use std::collections::HashMap;
@@ -103,6 +103,8 @@ pub struct AppState {
     pub metrics_summary: Option<Arc<MetricsSummaryManager>>,
     /// Batched API call log writer (flushed every 5 s to mem_api_call_log).
     pub call_log_batcher: Arc<CallLogBatcher>,
+    /// Push-based operational metrics reporter for admin dashboard.
+    pub stats_reporter: Option<Arc<StatsReporter>>,
     /// Shutdown signal + task handles for background flushers.
     /// Wrapped together so drain_flushers() can take ownership of the sender.
     flusher_state: Arc<std::sync::Mutex<FlusherState>>,
@@ -153,6 +155,7 @@ impl AppState {
             last_used_batcher: Arc::new(LastUsedBatcher::new()),
             tool_usage_batcher: Arc::new(ToolUsageBatcher::new()),
             call_log_batcher: Arc::new(CallLogBatcher::new()),
+            stats_reporter: None,
             rate_limiter: crate::rate_limit::from_env(),
             metrics_cache: Arc::new(RwLock::new(None)),
             metrics_cache_ttl,
@@ -169,7 +172,11 @@ impl AppState {
     ///
     /// This is strict on purpose: if the auth pool cannot be created, startup fails
     /// rather than letting auth traffic spill into the main business pool.
-    pub async fn init_auth_pool(mut self, database_url: &str) -> Result<Self, MemoriaError> {
+    pub async fn init_auth_pool(
+        mut self,
+        database_url: &str,
+        ops_metrics_enabled: bool,
+    ) -> Result<Self, MemoriaError> {
         let auth_max_connections = {
             let raw: u32 = std::env::var("MEMORIA_AUTH_POOL_MAX_CONNECTIONS")
                 .ok()
@@ -239,6 +246,16 @@ impl AppState {
             .as_ref()
             .and_then(|sql| sql.db_router())
             .is_some();
+
+        // Initialise push-based operational metrics reporter when enabled.
+        // Uses the same auth pool (shared DB) to write aggregate counters.
+        if ops_metrics_enabled {
+            let reporter = Arc::new(StatsReporter::new(pool.clone()));
+            // Inject into MemoryService so write-path hooks can report events.
+            self.service.init_stats(reporter.clone());
+            info!("Ops metrics reporter initialized");
+            self.stats_reporter = Some(reporter);
+        }
 
         // In multi-db mode, eager rebuild would fan out across every user DB and can
         // block startup for large tenants. Load per-user tool usage lazily instead.
