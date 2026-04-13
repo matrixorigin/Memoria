@@ -134,7 +134,14 @@ pub async fn detect_runtime_topology(
         Err(MemoriaError::Database(msg))
             if is_unknown_database_error_message(&msg, &legacy_db_name) =>
         {
-            return Ok(RuntimeTopology::FreshSingleDb);
+            let shared_users =
+                load_active_shared_registry_users_or_empty(shared_db_url, &shared_db_name).await?;
+            return Ok(classify_runtime_topology(
+                legacy_db_name,
+                shared_db_name,
+                vec![],
+                shared_users,
+            ));
         }
         Err(err) => return Err(err),
     };
@@ -622,7 +629,11 @@ fn classify_runtime_topology(
     legacy_users.sort();
     legacy_users.dedup();
     if legacy_users.is_empty() {
-        return RuntimeTopology::FreshSingleDb;
+        return if shared_users.is_empty() {
+            RuntimeTopology::FreshSingleDb
+        } else {
+            RuntimeTopology::MultiDbReady
+        };
     }
 
     let missing_users = legacy_users
@@ -1350,6 +1361,18 @@ mod tests {
             "memoria_shared".to_string(),
             vec!["bob".to_string(), "alice".to_string()],
             BTreeSet::from(["alice".to_string(), "bob".to_string()]),
+        );
+
+        assert_eq!(topology, RuntimeTopology::MultiDbReady);
+    }
+
+    #[test]
+    fn classify_runtime_topology_detects_multi_db_ready_without_legacy_users() {
+        let topology = classify_runtime_topology(
+            "memoria".to_string(),
+            "memoria_shared".to_string(),
+            vec![],
+            BTreeSet::from(["alice".to_string()]),
         );
 
         assert_eq!(topology, RuntimeTopology::MultiDbReady);
