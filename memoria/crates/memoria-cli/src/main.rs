@@ -415,6 +415,60 @@ async fn connect_git_pool(database_url: &str, multi_db: bool) -> Result<sqlx::My
 }
 
 #[cfg(feature = "server-runtime")]
+async fn bootstrap_runtime_topology(cfg: &mut memoria_service::Config) -> Result<()> {
+    use memoria_storage::{
+        detect_runtime_topology, execute_legacy_single_db_to_multi_db,
+        LegacyToMultiDbMigrationOptions, RuntimeTopology,
+    };
+
+    if cfg.multi_db {
+        return Ok(());
+    }
+
+    match detect_runtime_topology(&cfg.db_url, &cfg.shared_db_url).await? {
+        RuntimeTopology::FreshSingleDb => Ok(()),
+        RuntimeTopology::MultiDbReady => {
+            tracing::info!(
+                shared_db_url = %redact_url(&cfg.shared_db_url),
+                "Detected completed shared registry behind legacy config; continuing in multi-db mode"
+            );
+            enable_runtime_multi_db(cfg);
+            Ok(())
+        }
+        RuntimeTopology::PendingLegacyMigration(pending) => {
+            tracing::info!(
+                legacy_db_name = %pending.legacy_db_name,
+                shared_db_name = %pending.shared_db_name,
+                users = pending.legacy_users.len(),
+                missing_users = pending.missing_users.len(),
+                "Auto-migrating legacy single-db deployment before startup"
+            );
+            execute_legacy_single_db_to_multi_db(
+                &cfg.db_url,
+                &cfg.shared_db_url,
+                cfg.embedding_dim,
+                LegacyToMultiDbMigrationOptions::default(),
+            )
+            .await?;
+            enable_runtime_multi_db(cfg);
+            tracing::info!(
+                shared_db_url = %redact_url(&cfg.shared_db_url),
+                "Legacy migration completed; continuing startup in multi-db mode"
+            );
+            Ok(())
+        }
+    }
+}
+
+#[cfg(feature = "server-runtime")]
+fn enable_runtime_multi_db(cfg: &mut memoria_service::Config) {
+    cfg.multi_db = true;
+    if let Some(db_name) = parse_db_name(&cfg.shared_db_url) {
+        cfg.db_name = db_name;
+    }
+}
+
+#[cfg(feature = "server-runtime")]
 async fn cmd_serve(db_url: Option<String>, port: u16, master_key: String) -> Result<()> {
     use memoria_api::{build_router, AppState};
     use memoria_git::GitForDataService;
@@ -430,6 +484,7 @@ async fn cmd_serve(db_url: Option<String>, port: u16, master_key: String) -> Res
     }
 
     validate_embedding_config(&cfg)?;
+    bootstrap_runtime_topology(&mut cfg).await?;
     let redacted_db_url = redact_url(&cfg.db_url);
     let redacted_shared_db_url = redact_url(&cfg.shared_db_url);
 
@@ -602,6 +657,8 @@ async fn cmd_mcp(
     if let Some(v) = db_name {
         cfg.db_name = v;
     }
+    validate_embedding_config(&cfg)?;
+    bootstrap_runtime_topology(&mut cfg).await?;
     let redacted_db_url = redact_url(&cfg.db_url);
     let redacted_shared_db_url = redact_url(&cfg.shared_db_url);
 
@@ -3355,8 +3412,8 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        redact_url, run_with_edit_log_drain, validate_embedding_config, Cli, Commands,
-        MigrationCommands,
+        enable_runtime_multi_db, redact_url, run_with_edit_log_drain, validate_embedding_config,
+        Cli, Commands, MigrationCommands,
     };
     use async_trait::async_trait;
     use clap::Parser;
@@ -3572,6 +3629,17 @@ mod tests {
     }
 
     #[test]
+    fn enable_runtime_multi_db_switches_to_shared_db_name() {
+        let mut cfg = test_config();
+
+        enable_runtime_multi_db(&mut cfg);
+
+        assert!(cfg.multi_db);
+        assert_eq!(cfg.db_name, "memoria_shared");
+        assert_eq!(cfg.db_url, "mysql://root:111@localhost:6001/memoria");
+    }
+
+    #[test]
     fn mcp_entry_includes_auto_approve() {
         use super::mcp_entry;
 
@@ -3597,7 +3665,12 @@ mod tests {
             "autoApprove must contain at least one tool"
         );
         // Core tools that the issue specifically calls out
-        for tool in &["memory_store", "memory_retrieve", "memory_search", "memory_purge"] {
+        for tool in &[
+            "memory_store",
+            "memory_retrieve",
+            "memory_search",
+            "memory_purge",
+        ] {
             assert!(
                 approved.iter().any(|v| v.as_str() == Some(tool)),
                 "autoApprove is missing tool: {tool}"
