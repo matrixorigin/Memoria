@@ -207,14 +207,14 @@ async fn run_legacy_single_db_to_multi_db(
         None
     } else {
         let snapshot_name = create_required_account_snapshot(&legacy_pool, &legacy_db_name).await?;
-        println!("Created pre-execute account snapshot {snapshot_name}");
+        eprintln!("Created pre-execute account snapshot {snapshot_name}");
         Some(snapshot_name)
     };
 
     let shared_store = if dry_run {
         None
     } else {
-        println!("Resetting target shared database {shared_db_name}");
+        eprintln!("Resetting target shared database {shared_db_name}");
         reset_database(shared_db_url).await?;
         let shared_store =
             SqlMemoryStore::connect(shared_db_url, embedding_dim, MIGRATION_INSTANCE_ID.into())
@@ -238,7 +238,7 @@ async fn run_legacy_single_db_to_multi_db(
     let mut shared_tables = Vec::new();
     for table in SHARED_DURABLE_TABLES {
         if !dry_run {
-            println!("Copying shared table {table}");
+            eprintln!("Copying shared table {table}");
         }
         shared_tables.push(
             copy_shared_table(
@@ -261,7 +261,7 @@ async fn run_legacy_single_db_to_multi_db(
         // Serial path (original behavior)
         for user_id in &selected_users {
             if !dry_run {
-                println!("Migrating user {user_id}");
+                eprintln!("Migrating user {user_id}");
             }
             users.push(
                 migrate_user(
@@ -288,7 +288,7 @@ async fn run_legacy_single_db_to_multi_db(
                     let execute = !dry_run;
                     async move {
                         if execute {
-                            println!("Migrating user {user_id}");
+                            eprintln!("Migrating user {user_id}");
                         }
                         let res = migrate_user(pool, db_name, router_ref, user_id, execute).await;
                         (user_id.as_str(), res)
@@ -338,7 +338,7 @@ async fn migrate_user(
             .ok_or_else(|| MemoriaError::Internal("missing router for execute mode".into()))?;
         let target_db = DbRouter::user_db_name_for_id(user_id);
         let target_url = router.user_db_url(&target_db)?;
-        println!("  Resetting target user database {target_db}");
+        eprintln!("  Resetting target user database {target_db}");
         reset_database(&target_url).await?;
         router.invalidate_user(user_id).await;
         // Register user in shared DB so runtime can discover it later
@@ -375,7 +375,7 @@ async fn migrate_user(
             .filter(|table| !is_physical_branch_table(table))
             .collect::<Vec<_>>();
         for table in target_tables {
-            println!("  Copying user table {table}");
+            eprintln!("  Copying user table {table}");
             tables.push(
                 copy_user_scoped_table(
                     legacy_pool,
@@ -391,7 +391,7 @@ async fn migrate_user(
         }
 
         tables.push({
-            println!("  Copying user table mem_memories_stats");
+            eprintln!("  Copying user table mem_memories_stats");
             copy_memories_stats_table(
                 legacy_pool,
                 legacy_db_name,
@@ -405,7 +405,7 @@ async fn migrate_user(
 
         let branches = load_branch_records(legacy_pool, legacy_db_name, user_id).await?;
         for branch in branches {
-            println!("  Copying branch table {}", branch.table_name);
+            eprintln!("  Copying branch table {}", branch.table_name);
             let mut report = copy_branch_table(
                 legacy_pool,
                 legacy_db_name,
