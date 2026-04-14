@@ -6,6 +6,7 @@ use memoria_core::{
     TrustTier,
 };
 use sqlx::{mysql::MySqlPool, Row};
+use std::borrow::Cow;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
@@ -807,15 +808,21 @@ impl SqlMemoryStore {
         self.db_name.as_deref()
     }
 
-    fn current_schema_name(&self) -> Result<&str, MemoriaError> {
-        self.db_name
-            .as_deref()
-            .or_else(|| {
-                self.database_url
-                    .as_deref()
-                    .and_then(parse_db_name_from_url)
-            })
-            .ok_or_else(|| MemoriaError::Internal("store missing database name".into()))
+    async fn current_schema_name(&self) -> Result<Cow<'_, str>, MemoriaError> {
+        if let Some(schema_name) = self.db_name.as_deref().or_else(|| {
+            self.database_url
+                .as_deref()
+                .and_then(parse_db_name_from_url)
+        }) {
+            return Ok(Cow::Borrowed(schema_name));
+        }
+        let schema_name = sqlx::query_scalar::<_, Option<String>>("SELECT DATABASE()")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(db_err)?
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| MemoriaError::Internal("store missing database name".into()))?;
+        Ok(Cow::Owned(schema_name))
     }
 
     pub fn set_db_name(&mut self, name: String) {
@@ -1271,7 +1278,8 @@ impl SqlMemoryStore {
     }
 
     async fn apply_user_compat_migrations(&self, pool: &MySqlPool) -> Result<(), MemoriaError> {
-        let schema_name = self.current_schema_name()?;
+        let schema_name = self.current_schema_name().await?;
+        let schema_name = schema_name.as_ref();
         let memories_stats_table = self.t("mem_memories_stats");
         let edit_log_table = self.t("mem_edit_log");
         let memories_table = self.t("mem_memories");
@@ -1517,7 +1525,8 @@ impl SqlMemoryStore {
     pub async fn migrate_user(&self) -> Result<(), MemoriaError> {
         let pool = &self.pool;
         let meta_table = self.t("mem_schema_meta");
-        let schema_name = self.current_schema_name()?;
+        let schema_name = self.current_schema_name().await?;
+        let schema_name = schema_name.as_ref();
 
         let is_fresh = is_fresh_database(pool, schema_name).await?;
         if is_fresh {

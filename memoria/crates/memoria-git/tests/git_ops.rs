@@ -7,9 +7,35 @@ use uuid::Uuid;
 
 use memoria_storage::SqlMemoryStore;
 
+fn quote_ident(name: &str) -> String {
+    format!("`{}`", name.replace('`', "``"))
+}
+
+fn split_db_url(db_url: &str) -> (String, String) {
+    let suffix_start = db_url.find(['?', '#']).unwrap_or(db_url.len());
+    let (without_suffix, suffix) = db_url.split_at(suffix_start);
+    let (base_url, db_name) = without_suffix
+        .rsplit_once('/')
+        .expect("database URL should include a database name");
+    (format!("{base_url}{suffix}"), db_name.to_string())
+}
+
+async fn ensure_test_database(db_url: &str) {
+    let (base_url, db_name) = split_db_url(db_url);
+    let pool = MySqlPool::connect(&base_url).await.expect("connect base");
+    sqlx::raw_sql(&format!(
+        "CREATE DATABASE IF NOT EXISTS {}",
+        quote_ident(&db_name)
+    ))
+    .execute(&pool)
+    .await
+    .expect("create test database");
+}
+
 async fn setup() -> (GitForDataService, String) {
     let url = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "mysql://root:111@localhost:6001/memoria".to_string());
+    ensure_test_database(&url).await;
     let pool = MySqlPool::connect(&url).await.expect("connect");
     // Ensure full schema exists (branch/count tests need mem_memories)
     let dim: usize = std::env::var("EMBEDDING_DIM")
