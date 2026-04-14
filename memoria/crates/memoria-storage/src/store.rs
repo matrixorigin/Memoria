@@ -56,6 +56,66 @@ async fn query_has_rows(pool: &MySqlPool, sql: &str) -> bool {
         > 0
 }
 
+async fn info_schema_column_exists(
+    pool: &MySqlPool,
+    schema_name: &str,
+    table_name: &str,
+    column_name: &str,
+) -> bool {
+    sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM information_schema.columns \
+         WHERE table_schema = ? AND table_name = ? AND column_name = ?",
+    )
+    .bind(schema_name)
+    .bind(table_name)
+    .bind(column_name)
+    .fetch_one(pool)
+    .await
+    .unwrap_or(0)
+        > 0
+}
+
+async fn info_schema_index_exists(
+    pool: &MySqlPool,
+    schema_name: &str,
+    table_name: &str,
+    index_name: &str,
+) -> bool {
+    sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM information_schema.statistics \
+         WHERE table_schema = ? AND table_name = ? AND index_name = ?",
+    )
+    .bind(schema_name)
+    .bind(table_name)
+    .bind(index_name)
+    .fetch_one(pool)
+    .await
+    .unwrap_or(0)
+        > 0
+}
+
+async fn info_schema_index_column_exists(
+    pool: &MySqlPool,
+    schema_name: &str,
+    table_name: &str,
+    index_name: &str,
+    column_name: &str,
+) -> bool {
+    sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM information_schema.statistics \
+         WHERE table_schema = ? AND table_name = ? AND index_name = ? \
+         AND column_name = ?",
+    )
+    .bind(schema_name)
+    .bind(table_name)
+    .bind(index_name)
+    .bind(column_name)
+    .fetch_one(pool)
+    .await
+    .unwrap_or(0)
+        > 0
+}
+
 async fn is_fresh_database(pool: &MySqlPool, schema_name: &str) -> Result<bool, MemoriaError> {
     sqlx::query_scalar::<_, i64>(
         "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = ?",
@@ -1263,15 +1323,14 @@ impl SqlMemoryStore {
         .execute(pool)
         .await;
 
-        let needs_upgrade: bool = sqlx::query_scalar(
-            "SELECT COUNT(*) = 0 FROM information_schema.statistics \
-             WHERE table_schema = ? AND table_name = 'mem_memories' \
-             AND index_name = 'idx_user_active' AND column_name = 'memory_type'",
+        let needs_upgrade = !info_schema_index_column_exists(
+            pool,
+            schema_name,
+            "mem_memories",
+            "idx_user_active",
+            "memory_type",
         )
-        .bind(schema_name)
-        .fetch_one(pool)
-        .await
-        .unwrap_or(false);
+        .await;
         if needs_upgrade {
             let _ = sqlx::query(&format!(
                 "ALTER TABLE {memories_table} DROP INDEX idx_user_active"
@@ -1285,14 +1344,8 @@ impl SqlMemoryStore {
             .await;
         }
 
-        let has_table_name: bool = sqlx::query_scalar(
-            "SELECT COUNT(*) > 0 FROM information_schema.columns \
-             WHERE table_schema = ? AND table_name = 'mem_branches' AND column_name = 'table_name'",
-        )
-        .bind(schema_name)
-        .fetch_one(pool)
-        .await
-        .unwrap_or(false);
+        let has_table_name =
+            info_schema_column_exists(pool, schema_name, "mem_branches", "table_name").await;
         if !has_table_name {
             let _ = sqlx::query(&format!(
                 "ALTER TABLE {branches_table} ADD COLUMN table_name VARCHAR(100) NOT NULL DEFAULT ''"
@@ -1301,14 +1354,7 @@ impl SqlMemoryStore {
             .await;
         }
 
-        let has_id: bool = sqlx::query_scalar(
-            "SELECT COUNT(*) > 0 FROM information_schema.columns \
-             WHERE table_schema = ? AND table_name = 'mem_branches' AND column_name = 'id'",
-        )
-        .bind(schema_name)
-        .fetch_one(pool)
-        .await
-        .unwrap_or(false);
+        let has_id = info_schema_column_exists(pool, schema_name, "mem_branches", "id").await;
         if !has_id {
             let _ = sqlx::query(&format!("DROP TABLE IF EXISTS {branches_table}"))
                 .execute(pool)
@@ -1329,15 +1375,8 @@ impl SqlMemoryStore {
             .map_err(db_err)?;
         }
 
-        let has_method_col: bool = sqlx::query_scalar(
-            "SELECT COUNT(*) > 0 FROM information_schema.columns \
-             WHERE table_schema = ? AND table_name = 'mem_api_call_log' \
-             AND column_name = 'method'",
-        )
-        .bind(schema_name)
-        .fetch_one(pool)
-        .await
-        .unwrap_or(false);
+        let has_method_col =
+            info_schema_column_exists(pool, schema_name, "mem_api_call_log", "method").await;
         if !has_method_col {
             let _ = sqlx::query(&format!(
                 "ALTER TABLE {api_call_log_table} ADD COLUMN method VARCHAR(10) NOT NULL DEFAULT ''"
@@ -1383,16 +1422,13 @@ impl SqlMemoryStore {
             }
         }
 
-        let has_feedback_memory_user_idx: bool = sqlx::query_scalar(
-            "SELECT COUNT(*) > 0 FROM information_schema.statistics \
-             WHERE table_schema = ? \
-               AND table_name = 'mem_retrieval_feedback' \
-               AND index_name = 'idx_feedback_memory_user'",
+        let has_feedback_memory_user_idx = info_schema_index_exists(
+            pool,
+            schema_name,
+            "mem_retrieval_feedback",
+            "idx_feedback_memory_user",
         )
-        .bind(schema_name)
-        .fetch_one(pool)
-        .await
-        .unwrap_or(false);
+        .await;
         if !has_feedback_memory_user_idx {
             let _ = sqlx::query(&format!(
                 "ALTER TABLE {retrieval_feedback_table} ADD INDEX idx_feedback_memory_user (user_id, memory_id)"
@@ -1401,16 +1437,13 @@ impl SqlMemoryStore {
             .await;
         }
 
-        let has_feedback_created_at_idx: bool = sqlx::query_scalar(
-            "SELECT COUNT(*) > 0 FROM information_schema.statistics \
-             WHERE table_schema = ? \
-               AND table_name = 'mem_retrieval_feedback' \
-               AND index_name = 'idx_feedback_created_at'",
+        let has_feedback_created_at_idx = info_schema_index_exists(
+            pool,
+            schema_name,
+            "mem_retrieval_feedback",
+            "idx_feedback_created_at",
         )
-        .bind(schema_name)
-        .fetch_one(pool)
-        .await
-        .unwrap_or(false);
+        .await;
         if !has_feedback_created_at_idx {
             let _ = sqlx::query(&format!(
                 "ALTER TABLE {retrieval_feedback_table} ADD INDEX idx_feedback_created_at (created_at)"
@@ -1419,16 +1452,13 @@ impl SqlMemoryStore {
             .await;
         }
 
-        let has_memories_user_observed_idx: bool = sqlx::query_scalar(
-            "SELECT COUNT(*) > 0 FROM information_schema.statistics \
-             WHERE table_schema = ? \
-               AND table_name = 'mem_memories' \
-               AND index_name = 'idx_memories_user_observed'",
+        let has_memories_user_observed_idx = info_schema_index_exists(
+            pool,
+            schema_name,
+            "mem_memories",
+            "idx_memories_user_observed",
         )
-        .bind(schema_name)
-        .fetch_one(pool)
-        .await
-        .unwrap_or(false);
+        .await;
         if !has_memories_user_observed_idx {
             let _ = sqlx::query(&format!(
                 "ALTER TABLE {memories_table} ADD INDEX idx_memories_user_observed (user_id, observed_at)"
@@ -1437,16 +1467,9 @@ impl SqlMemoryStore {
             .await;
         }
 
-        let has_user_active_created_idx: bool = sqlx::query_scalar(
-            "SELECT COUNT(*) > 0 FROM information_schema.statistics \
-             WHERE table_schema = ? \
-               AND table_name = 'mem_memories' \
-               AND index_name = 'idx_user_active_created'",
-        )
-        .bind(schema_name)
-        .fetch_one(pool)
-        .await
-        .unwrap_or(false);
+        let has_user_active_created_idx =
+            info_schema_index_exists(pool, schema_name, "mem_memories", "idx_user_active_created")
+                .await;
         if has_user_active_created_idx {
             let _ = sqlx::query(&format!(
                 "ALTER TABLE {memories_table} DROP INDEX idx_user_active_created"

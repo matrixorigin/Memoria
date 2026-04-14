@@ -135,6 +135,23 @@ struct MigrationExecutionCache {
     user_target_tables: OnceLock<Vec<String>>,
 }
 
+struct TableCopyContext<'a> {
+    source_pool: &'a MySqlPool,
+    source_db: &'a str,
+    target_pool: &'a MySqlPool,
+    target_db: &'a str,
+    cache: &'a MigrationExecutionCache,
+}
+
+fn execute_row_count_note(context: Option<&str>) -> String {
+    const NOTE: &str = "execute mode reports copied rows for source_rows and target_rows; \
+         these are not independent source/target table row counts";
+    match context {
+        Some(context) => format!("{context}; {NOTE}"),
+        None => NOTE.to_string(),
+    }
+}
+
 impl MigrationExecutionCache {
     async fn source_table_exists(
         &self,
@@ -403,7 +420,6 @@ async fn run_legacy_single_db_to_multi_db(
                     let pool = &legacy_pool;
                     let db_name: &str = &legacy_db_name;
                     let router_ref = router.as_deref();
-                    let source_schema = source_schema;
                     let execute = !dry_run;
                     let cache = cache.clone();
                     async move {
@@ -515,21 +531,16 @@ async fn migrate_user(
         tmp_store.set_database_url(target_url.clone());
         tmp_store.migrate_user_fresh().await?;
         let target_tables = cache.user_target_tables(&target_pool, &target_db).await?;
+        let copy_ctx = TableCopyContext {
+            source_pool: legacy_pool,
+            source_db: legacy_db_name,
+            target_pool: &target_pool,
+            target_db: &target_db,
+            cache,
+        };
         for table in target_tables {
             eprintln!("  Copying user table {table}");
-            tables.push(
-                copy_user_scoped_table(
-                    legacy_pool,
-                    legacy_db_name,
-                    &target_pool,
-                    &target_db,
-                    &table,
-                    user_id,
-                    true,
-                    cache,
-                )
-                .await?,
-            );
+            tables.push(copy_user_scoped_table(&copy_ctx, &table, user_id, true).await?);
         }
 
         tables.push({
@@ -565,7 +576,11 @@ async fn migrate_user(
                 cache,
             )
             .await?;
-            report.note = Some(format!("branch '{}'", branch.name));
+            let branch_note = format!("branch '{}'", branch.name);
+            report.note = Some(match report.note.take() {
+                Some(note) => format!("{branch_note}; {note}"),
+                None => branch_note,
+            });
             branch_tables.push(report);
         }
 
@@ -590,20 +605,15 @@ async fn migrate_user(
         // one-shot pool still releases the connection without blocking cutover.
         drop(target_pool);
     } else {
+        let copy_ctx = TableCopyContext {
+            source_pool: legacy_pool,
+            source_db: legacy_db_name,
+            target_pool: legacy_pool,
+            target_db: &target_db,
+            cache,
+        };
         for table in list_source_user_scoped_tables(legacy_pool, legacy_db_name).await? {
-            tables.push(
-                copy_user_scoped_table(
-                    legacy_pool,
-                    legacy_db_name,
-                    legacy_pool,
-                    &target_db,
-                    &table,
-                    user_id,
-                    false,
-                    cache,
-                )
-                .await?,
-            );
+            tables.push(copy_user_scoped_table(&copy_ctx, &table, user_id, false).await?);
         }
         tables.push(
             copy_memories_stats_table(
@@ -1017,22 +1027,19 @@ async fn copy_shared_table(
         source_rows: rows_copied,
         target_rows: Some(rows_copied),
         status: "copied".to_string(),
-        note: None,
+        note: Some(execute_row_count_note(None)),
     })
 }
 
 async fn copy_user_scoped_table(
-    source_pool: &MySqlPool,
-    source_db: &str,
-    target_pool: &MySqlPool,
-    target_db: &str,
+    ctx: &TableCopyContext<'_>,
     table_name: &str,
     user_id: &str,
     execute: bool,
-    cache: &MigrationExecutionCache,
 ) -> Result<TableMigrationReport, MemoriaError> {
-    if !cache
-        .source_table_exists(source_pool, source_db, table_name)
+    if !ctx
+        .cache
+        .source_table_exists(ctx.source_pool, ctx.source_db, table_name)
         .await?
     {
         return Ok(TableMigrationReport {
@@ -1044,7 +1051,8 @@ async fn copy_user_scoped_table(
         });
     }
     if !execute {
-        let source_rows = count_rows_for_user(source_pool, source_db, table_name, user_id).await?;
+        let source_rows =
+            count_rows_for_user(ctx.source_pool, ctx.source_db, table_name, user_id).await?;
         return Ok(TableMigrationReport {
             table_name: table_name.to_string(),
             source_rows,
@@ -1054,18 +1062,25 @@ async fn copy_user_scoped_table(
         });
     }
 
-    let columns = cache
-        .copy_columns(source_pool, source_db, target_pool, target_db, table_name)
+    let columns = ctx
+        .cache
+        .copy_columns(
+            ctx.source_pool,
+            ctx.source_db,
+            ctx.target_pool,
+            ctx.target_db,
+            table_name,
+        )
         .await?;
     let quoted_user_id = quote_string_literal(user_id);
     let insert_sql = format!(
         "INSERT INTO {} ({cols}) SELECT {cols} FROM {} WHERE user_id = {quoted_user_id}",
-        qualified_table(target_db, table_name),
-        qualified_table(source_db, table_name),
+        qualified_table(ctx.target_db, table_name),
+        qualified_table(ctx.source_db, table_name),
         cols = column_list(&columns),
     );
     let rows_copied = sqlx::raw_sql(&insert_sql)
-        .execute(target_pool)
+        .execute(ctx.target_pool)
         .await
         .map_err(db_err)?
         .rows_affected() as i64;
@@ -1074,7 +1089,7 @@ async fn copy_user_scoped_table(
         source_rows: rows_copied,
         target_rows: Some(rows_copied),
         status: "copied".to_string(),
-        note: None,
+        note: Some(execute_row_count_note(Some("filtered by user_id"))),
     })
 }
 
@@ -1144,7 +1159,9 @@ async fn copy_memories_stats_table(
         source_rows: rows_copied,
         target_rows: Some(rows_copied),
         status: "copied".to_string(),
-        note: Some("matched by memory_id ownership".to_string()),
+        note: Some(execute_row_count_note(Some(
+            "matched by memory_id ownership",
+        ))),
     })
 }
 
@@ -1225,7 +1242,7 @@ async fn copy_branch_table(
         source_rows: rows_copied,
         target_rows: Some(rows_copied),
         status: "copied".to_string(),
-        note: None,
+        note: Some(execute_row_count_note(None)),
     })
 }
 

@@ -566,7 +566,8 @@ fn configured_shared_pool_plan() -> SharedPoolPlan {
     );
     let explicit_override = std::env::var(MERGED_SHARED_POOL_MAX_CONNECTIONS_ENV)
         .ok()
-        .and_then(|s| s.parse().ok());
+        .and_then(|s| s.parse::<u32>().ok())
+        .map(|max_connections| max_connections.clamp(1, POOL_MAX_CONNECTIONS_UPPER));
     let max_connections = explicit_override.unwrap_or_else(|| {
         routing_component_max_connections
             .saturating_add(shared_main_component_max_connections)
@@ -678,6 +679,30 @@ mod tests {
                     configured_shared_pool_plan(),
                     SharedPoolPlan {
                         max_connections: 40,
+                        routing_component_max_connections: 20,
+                        shared_main_component_max_connections: 10,
+                        git_component_max_connections: 6,
+                        explicit_override: true,
+                    }
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn shared_pool_plan_clamps_explicit_merged_override() {
+        with_env(
+            &[
+                ("MEMORIA_SHARED_POOL_MAX_CONNECTIONS", Some("20")),
+                ("MEMORIA_SHARED_MAIN_POOL_MAX_CONNECTIONS", Some("10")),
+                ("MEMORIA_GIT_POOL_MAX_CONNECTIONS", Some("6")),
+                (MERGED_SHARED_POOL_MAX_CONNECTIONS_ENV, Some("0")),
+            ],
+            || {
+                assert_eq!(
+                    configured_shared_pool_plan(),
+                    SharedPoolPlan {
+                        max_connections: 1,
                         routing_component_max_connections: 20,
                         shared_main_component_max_connections: 10,
                         git_component_max_connections: 6,
