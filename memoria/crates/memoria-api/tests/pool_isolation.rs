@@ -26,6 +26,7 @@ async fn spawn_tiny_pool_server() -> (String, reqwest::Client, sqlx::MySqlPool) 
     use sqlx::mysql::MySqlPool;
 
     let db = db_url();
+    memoria_test_utils::wait_for_mysql_ready(&db, std::time::Duration::from_secs(30)).await;
 
     // Create store with only 2 main pool connections
     let pool = sqlx::mysql::MySqlPoolOptions::new()
@@ -35,7 +36,14 @@ async fn spawn_tiny_pool_server() -> (String, reqwest::Client, sqlx::MySqlPool) 
         .await
         .expect("pool");
 
-    let store = SqlMemoryStore::new(pool.clone(), 1024, uuid::Uuid::new_v4().to_string());
+    let store = SqlMemoryStore::from_existing_pool(
+        pool.clone(),
+        1024,
+        uuid::Uuid::new_v4().to_string(),
+        Some(db.clone()),
+        Some(2),
+        "pool_isolation_test_pool",
+    );
     store.migrate().await.expect("migrate");
 
     let raw_pool = MySqlPool::connect(&db).await.expect("git pool");
