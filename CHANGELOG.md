@@ -2,27 +2,76 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [0.3.0] - 2026-04-13
 
-### ⚠️ Breaking Changes
+### ⚡ Performance
 
-- `MemoryService::new_sql()` and `new_sql_with_llm()` are now `async fn` — callers must `.await` the result.
-- Default `DB_MAX_CONNECTIONS` changed from 32 → 64. Set the env var explicitly if your database has a low connection limit.
+- Improve store (#151) ([3ef1e04](https://github.com/matrixorigin/Memoria/commit/3ef1e04199ccd6337c2616a86b01e29b7302cb13))
+- Improve memory list (#150) ([0fdd5bc](https://github.com/matrixorigin/Memoria/commit/0fdd5bc3c00b24603b6bc056412b436d9087a94e))
+- Optimize list memories again (#149) ([febb16f](https://github.com/matrixorigin/Memoria/commit/febb16f6a386b4fa380de215faec6479beb5efa8))
+- Optimize list (#148) ([a4d31f7](https://github.com/matrixorigin/Memoria/commit/a4d31f7092560710e860b84066de92b9f755d289))
+- Async batched edit-log writer with unified flush path (#134) ([e3718c2](https://github.com/matrixorigin/Memoria/commit/e3718c2604cef5c600e0db01ceab637db93082cc))
+- Optimize db pool usage (#83) ([53c0242](https://github.com/matrixorigin/Memoria/commit/53c024297b80cf933eb0a1ce5a9ee781c2b45b2c))
 
 ### 🐛 Bug Fixes
 
-- **pool exhaustion**: Add `max_lifetime` (default 1h via `DB_MAX_LIFETIME_SECS`) to prevent stale connections behind proxies.
-- **pool exhaustion**: Increase default pool size and isolate background workers (rebuild, entity extraction) into separate pools.
-- **entity extraction**: Use bounded queue (default 512, configurable via `ENTITY_QUEUE_SIZE`) with 30s backpressure instead of silent drop.
-- **strict isolation**: Dedicated auth pool no longer falls back to the main pool; startup now fails if auth isolation cannot be created.
-- **strict isolation**: Rebuild/entity workers are disabled if their isolated pools cannot be created, instead of sharing the main pool.
+- **runtime**: Harden multi-db rollout and metrics rollups (#173) ([fbd4d48](https://github.com/matrixorigin/Memoria/commit/fbd4d48fe43412211a980b74f4139bbc876d0545))
+- Finalize per-user DB isolation rollout (#172) ([b1917ef](https://github.com/matrixorigin/Memoria/commit/b1917ef25c3bac49b0e772933ed8b17af526d0e2))
+- Migration drops mem_branches on every startup + UTF-8 panic in diff preview (#171) ([e1eab73](https://github.com/matrixorigin/Memoria/commit/e1eab735ba1857af5db6a1e8f4f049a8fdba0a56))
+- **storage**: Use current tenant for account snapshots (#169) ([72802c1](https://github.com/matrixorigin/Memoria/commit/72802c1b24e2d5eb6d6c9429bad0452dcf7899cf))
+- **ci**: Fix npm publish workflow for Linux runners (#164) ([9f746ac](https://github.com/matrixorigin/Memoria/commit/9f746ac857f5a1c2acf3db6a737406982108473b))
+- **openclaw-plugin**: Pass OpenClaw security scan by isolating child_process usage (#163) ([49a6e4a](https://github.com/matrixorigin/Memoria/commit/49a6e4add4e81f15714a161c83ed6ced80387fb6))
+- Improve pool diagnostics and serialize db verification tests (#159) ([3c57be7](https://github.com/matrixorigin/Memoria/commit/3c57be736efc417a861dee3c7aa48b750bfdaf66))
+- No statistical data for the retrieval API called via MCP (#157) ([4aa7a00](https://github.com/matrixorigin/Memoria/commit/4aa7a007fa995c9a599c8e02ad12fcc3b97a3920))
+- Big purge (#154) ([17265aa](https://github.com/matrixorigin/Memoria/commit/17265aabad8ce873f3ac995933bf18124c55beb4))
+- Background governance (#152) ([c712384](https://github.com/matrixorigin/Memoria/commit/c712384fee1cb4bd966116226a2fea22de0f5b3a))
+- Null processing workaround due to matrixone 3.0.8 bug (#136) ([7c77de1](https://github.com/matrixorigin/Memoria/commit/7c77de191d14b886957d0e6600d6e93761b09e8f))
+- Multi-table DELETE+LIMIT syntax error and inaccurate index comment in cleanup_orphan_stats (#115) ([8553bf0](https://github.com/matrixorigin/Memoria/commit/8553bf027eba330dc3accb3bbc28a710aeb514af))
+- Isolate DB pools, drop-on-full entity queue, embedding concurren… (#112) ([fd92c54](https://github.com/matrixorigin/Memoria/commit/fd92c54004fecedf384ea84098a773b1130cb0db))
+- Enable user level metrics (#111) ([8f61732](https://github.com/matrixorigin/Memoria/commit/8f61732469f12ced4c1206cd65d0854a9f57b201))
+- Fail fast when local embedding support is unavailable (#103) ([4320764](https://github.com/matrixorigin/Memoria/commit/432076411a39bc74ae790d60716b9b450c8c2ff1))
+- **openclaw**: Fail fast for unsupported local embeddings (#85) ([0365491](https://github.com/matrixorigin/Memoria/commit/03654910b7a79bb92cf51ce268afa70e6c6abf91))
+- Code agent tool header (#96) ([2bb2e2f](https://github.com/matrixorigin/Memoria/commit/2bb2e2fa778e7506cebe9b1cd62955015ff7a78d))
+- Stop words (#77) ([1ce8be9](https://github.com/matrixorigin/Memoria/commit/1ce8be99591cfc3b5efc048da2e05f27dccf981a))
 
-### 📊 Observability
+### 👷 CI
 
-- New `/metrics` counters: `memoria_entity_extraction_backpressure_total`, `memoria_entity_extraction_drops_total`.
-- Pool monitor logs warning when idle connections reach 0 or fall below 10% of pool size.
-- Slow responses (≥ 2s) now logged at `warn` level.
+- **npm**: Auto-determine version from npm registry (#165) ([89e8281](https://github.com/matrixorigin/Memoria/commit/89e8281913b6d3547fe895c6bb81c902fa4b1309))
+- **Mergify**: Configuration update (#142) ([6e9f5c6](https://github.com/matrixorigin/Memoria/commit/6e9f5c693061a6a9a57fcd9e8ffc9a10ec9a069a))
+- **Mergify**: Configuration update (#143) ([bf2335e](https://github.com/matrixorigin/Memoria/commit/bf2335ec56ada9c978761240a8c4c88e7c36de65))
+- Add GitHub Actions workflow for npm publishing + update npm package version to 0.4.2 (#109) ([61cb0d2](https://github.com/matrixorigin/Memoria/commit/61cb0d280d4bd69aa7d119901d8f343eba2b378a))
+- **Mergify**: Configuration update (#107) ([a3c3c2a](https://github.com/matrixorigin/Memoria/commit/a3c3c2a901c6bb845666fa002306adbfcdc71d33))
+- **Mergify**: Configuration update (#105) ([c43a73d](https://github.com/matrixorigin/Memoria/commit/c43a73d9d46c0e36c29540aa80c77da2c0153d29))
 
+### 📚 Documentation
+
+- Update README  (#146) ([cbccd42](https://github.com/matrixorigin/Memoria/commit/cbccd42a3d993656e213513c0155af9aef6f0af4))
+- Prioritize Memoria Cloud, add Git-for-Memory tagline (#135) ([4b68e3b](https://github.com/matrixorigin/Memoria/commit/4b68e3be833e05f050b2a720982c7212a41646b1))
+- **clawhub**: Rename to thememoria + update for api mode (#102) ([89a6500](https://github.com/matrixorigin/Memoria/commit/89a65000c87bc09adf55f2be6cb51fb56936a776))
+
+### 📦 Miscellaneous
+
+- Enhance connection pool health monitoring, Prometheus metrics, and load test (#158) ([bcd20ab](https://github.com/matrixorigin/Memoria/commit/bcd20ab599daa63233bfee353c117bee0b02a2e0))
+- Add code owners (#147) ([10aff34](https://github.com/matrixorigin/Memoria/commit/10aff340d82f613cc08d282a3bda7ab1b49437e0))
+- **plugin**: Bump to v0.4.1 for npm republish (#104) ([f6ee2cc](https://github.com/matrixorigin/Memoria/commit/f6ee2ccbf2a79deb097034a8dd5223c294cb099d))
+- Cleanup python (#100) ([0333063](https://github.com/matrixorigin/Memoria/commit/0333063b003096a99ba7120ef9e19fee9823e206))
+
+### 🚀 Features
+
+- Auto-migrate legacy local startup (#178) ([0d71169](https://github.com/matrixorigin/Memoria/commit/0d711693744d6623cfef08d1aea0dc29c9d29652))
+- Support trace binary install count (#174) ([885140a](https://github.com/matrixorigin/Memoria/commit/885140ae561a7f377912240b221d59aa4e10020b))
+- Add autoApprove to generated MCP config (fixes #74) (#170) ([ceb97da](https://github.com/matrixorigin/Memoria/commit/ceb97da37f775042d1fcf13784849ec4ee52054d))
+- **storage**: Implement per-user DB isolation and migration tooling (#167) ([ac1470a](https://github.com/matrixorigin/Memoria/commit/ac1470a5cf21d88ae739f64de303769f39f5efe9))
+- Add user streamable http metrics (#145) ([24eda05](https://github.com/matrixorigin/Memoria/commit/24eda050e3b52a4366991a40ee071cb3101d86cf))
+- Streamable http mcp server (#140) ([9b70130](https://github.com/matrixorigin/Memoria/commit/9b70130562b7c96181fb1772ed850489dc1cd869))
+- Add Windows x86_64 binary build and PowerShell install script (#133) ([04ab5b1](https://github.com/matrixorigin/Memoria/commit/04ab5b1a7ae82f25442d8c6b181751e1791c4d7a))
+- Embedding metrics, Grafana dashboard overhaul & monitoring stack (#137) ([597a431](https://github.com/matrixorigin/Memoria/commit/597a431c039c579c1e6a317402ac4d06b553a730))
+- **openclaw**: Add X-Memoria-Tool header to API requests (#108) ([1d013ed](https://github.com/matrixorigin/Memoria/commit/1d013edcce5565a6f6db589130200db1cb7a876e))
+- Add gemini cli support (#87) ([8e79ced](https://github.com/matrixorigin/Memoria/commit/8e79ceda4eb306316c9b896490a1c63359698aa1))
+- **plugin**: Direct HTTP API mode + mem/content leak bug fix + rename to @matrixorigin/thememoria (#101) ([fe0e42c](https://github.com/matrixorigin/Memoria/commit/fe0e42c61e313f0db98c2cd781690cfc413c63fa))
+- Support multi embedding endpoints (#97) ([06f9862](https://github.com/matrixorigin/Memoria/commit/06f98627233ba0c96dea08ebedbc76111d51aae4))
+- Track per-user tool access times with in-memory cache and periodic DB flush (#94) ([bd18be6](https://github.com/matrixorigin/Memoria/commit/bd18be612b55307d2b4226bc3a78a331fded7266))
+- **openclaw**: Cloud/local connect command + fail-safe onboarding (#70) ([3b73268](https://github.com/matrixorigin/Memoria/commit/3b732684f828fc902369023c55df8e5ceb96e098))
 ## [0.2.3] - 2026-03-21
 
 ### ⚡ Performance
@@ -153,3 +202,4 @@ All notable changes to this project will be documented in this file.
 - Optimize MCP server startup and database configuration loading (#16) ([e908548](https://github.com/matrixorigin/Memoria/commit/e90854805ddcde4a1326d2560f6b3d7f582f75a0))
 - Enable offline mode for local embedding by default (#3) ([d446a13](https://github.com/matrixorigin/Memoria/commit/d446a1309f44de5b8b9d50a245876baefd88bee1))
 - L0/L1 tiered memory retrieval + redundancy compression + governance improvements (#2) ([9d99085](https://github.com/matrixorigin/Memoria/commit/9d9908572cf6d758dafff6d92a8cb8373b97d499))
+
