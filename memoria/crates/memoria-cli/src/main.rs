@@ -397,6 +397,25 @@ fn configured_server_pool_size(env_name: &str, default: u32, upper: u32) -> u32 
 }
 
 #[cfg(feature = "server-runtime")]
+const LEGACY_MIGRATION_MAX_CONCURRENCY_ENV: &str = "MEMORIA_LEGACY_MIGRATION_MAX_CONCURRENCY";
+#[cfg(feature = "server-runtime")]
+const LEGACY_MIGRATION_DEFAULT_CONCURRENCY: usize = 6;
+
+#[cfg(feature = "server-runtime")]
+fn configured_legacy_migration_concurrency() -> usize {
+    std::env::var(LEGACY_MIGRATION_MAX_CONCURRENCY_ENV)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .or_else(|| {
+            std::env::var("MEMORIA_USER_SCHEMA_INIT_MAX_CONCURRENCY")
+                .ok()
+                .and_then(|s| s.parse().ok())
+        })
+        .unwrap_or(LEGACY_MIGRATION_DEFAULT_CONCURRENCY)
+        .clamp(1, 64)
+}
+
+#[cfg(feature = "server-runtime")]
 async fn connect_git_pool(database_url: &str, multi_db: bool) -> Result<sqlx::MySqlPool> {
     use sqlx::mysql::MySqlPoolOptions;
 
@@ -436,18 +455,23 @@ async fn bootstrap_runtime_topology(cfg: &mut memoria_service::Config) -> Result
             Ok(())
         }
         RuntimeTopology::PendingLegacyMigration(pending) => {
+            let migration_concurrency = configured_legacy_migration_concurrency();
             tracing::info!(
                 legacy_db_name = %pending.legacy_db_name,
                 shared_db_name = %pending.shared_db_name,
                 users = pending.legacy_users.len(),
                 missing_users = pending.missing_users.len(),
+                migration_concurrency,
                 "Auto-migrating legacy single-db deployment before startup"
             );
             execute_legacy_single_db_to_multi_db(
                 &cfg.db_url,
                 &cfg.shared_db_url,
                 cfg.embedding_dim,
-                LegacyToMultiDbMigrationOptions::default(),
+                LegacyToMultiDbMigrationOptions {
+                    user_ids: Vec::new(),
+                    concurrency: migration_concurrency,
+                },
             )
             .await?;
             enable_runtime_multi_db(cfg);
@@ -500,7 +524,7 @@ async fn cmd_serve(db_url: Option<String>, port: u16, master_key: String) -> Res
         "Starting Memoria API server"
     );
 
-    let (store, db_router, git_db_url) = if cfg.multi_db {
+    let (store, db_router, git) = if cfg.multi_db {
         let router = Arc::new(
             DbRouter::connect(
                 &cfg.shared_db_url,
@@ -509,26 +533,37 @@ async fn cmd_serve(db_url: Option<String>, port: u16, master_key: String) -> Res
             )
             .await?,
         );
-        let mut store = SqlMemoryStore::connect_shared(
-            &cfg.shared_db_url,
+        let shared_pool = router.shared_pool().clone();
+        let shared_pool_max_connections = router.shared_pool_max_connections();
+        tracing::info!(
+            shared_pool_max_connections,
+            "Reusing shared database pool for shared store and git service"
+        );
+        let mut store = SqlMemoryStore::from_existing_pool(
+            shared_pool.clone(),
             cfg.embedding_dim,
             cfg.instance_id.clone(),
-        )
-        .await?;
+            Some(cfg.shared_db_url.clone()),
+            Some(shared_pool_max_connections),
+            "shared_db_merged_pool",
+        );
         store.migrate_shared().await?;
         store.set_db_router(router.clone());
-        (Arc::new(store), Some(router), cfg.shared_db_url.clone())
+        let git = Arc::new(GitForDataService::new(
+            shared_pool,
+            router.shared_db_name().to_string(),
+        ));
+        (Arc::new(store), Some(router), git)
     } else {
         let store =
             SqlMemoryStore::connect(&cfg.db_url, cfg.embedding_dim, cfg.instance_id.clone())
                 .await?;
         store.migrate().await?;
-        (Arc::new(store), None, cfg.db_url.clone())
+        let pool = connect_git_pool(&cfg.db_url, false).await?;
+        let git_db_name = parse_db_name(&cfg.db_url).unwrap_or_else(|| cfg.db_name.clone());
+        let git = Arc::new(GitForDataService::new(pool, git_db_name));
+        (Arc::new(store), None, git)
     };
-
-    let pool = connect_git_pool(&git_db_url, cfg.multi_db).await?;
-    let git_db_name = parse_db_name(&git_db_url).unwrap_or_else(|| cfg.db_name.clone());
-    let git = Arc::new(GitForDataService::new(pool, git_db_name));
 
     let embedder = build_embedder(&cfg);
     let llm = build_llm(&cfg);
@@ -673,7 +708,7 @@ async fn cmd_mcp(
         "Starting Memoria MCP (embedded mode)"
     );
 
-    let (store, db_router, git_db_url) = if cfg.multi_db {
+    let (store, db_router, git) = if cfg.multi_db {
         let router = Arc::new(
             DbRouter::connect(
                 &cfg.shared_db_url,
@@ -682,26 +717,37 @@ async fn cmd_mcp(
             )
             .await?,
         );
-        let mut store = SqlMemoryStore::connect_shared(
-            &cfg.shared_db_url,
+        let shared_pool = router.shared_pool().clone();
+        let shared_pool_max_connections = router.shared_pool_max_connections();
+        tracing::info!(
+            shared_pool_max_connections,
+            "Reusing shared database pool for shared store and git service"
+        );
+        let mut store = SqlMemoryStore::from_existing_pool(
+            shared_pool.clone(),
             cfg.embedding_dim,
             cfg.instance_id.clone(),
-        )
-        .await?;
+            Some(cfg.shared_db_url.clone()),
+            Some(shared_pool_max_connections),
+            "shared_db_merged_pool",
+        );
         store.migrate_shared().await?;
         store.set_db_router(router.clone());
-        (Arc::new(store), Some(router), cfg.shared_db_url.clone())
+        let git = Arc::new(GitForDataService::new(
+            shared_pool,
+            router.shared_db_name().to_string(),
+        ));
+        (Arc::new(store), Some(router), git)
     } else {
         let store =
             SqlMemoryStore::connect(&cfg.db_url, cfg.embedding_dim, cfg.instance_id.clone())
                 .await?;
         store.migrate().await?;
-        (Arc::new(store), None, cfg.db_url.clone())
+        let pool = connect_git_pool(&cfg.db_url, false).await?;
+        let git_db_name = parse_db_name(&cfg.db_url).unwrap_or_else(|| cfg.db_name.clone());
+        let git = Arc::new(GitForDataService::new(pool, git_db_name));
+        (Arc::new(store), None, git)
     };
-
-    let pool = connect_git_pool(&git_db_url, cfg.multi_db).await?;
-    let git_db_name = parse_db_name(&git_db_url).unwrap_or_else(|| cfg.db_name.clone());
-    let git = Arc::new(GitForDataService::new(pool, git_db_name));
 
     let embedder = build_embedder(&cfg);
     let llm = build_llm(&cfg);
@@ -3411,6 +3457,8 @@ fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "server-runtime")]
+    use super::{configured_legacy_migration_concurrency, LEGACY_MIGRATION_MAX_CONCURRENCY_ENV};
     use super::{
         enable_runtime_multi_db, redact_url, run_with_edit_log_drain, validate_embedding_config,
         Cli, Commands, MigrationCommands,
@@ -3420,6 +3468,8 @@ mod tests {
     use memoria_core::{interfaces::MemoryStore, MemoriaError, Memory};
     use memoria_service::{Config, MemoryService};
     use memoria_storage::OwnedEditLogEntry;
+    #[cfg(feature = "server-runtime")]
+    use std::sync::OnceLock;
     use std::sync::{Arc, Mutex};
 
     #[derive(Default)]
@@ -3488,6 +3538,73 @@ mod tests {
             instance_id: "test-instance".to_string(),
             lock_ttl_secs: 120,
         }
+    }
+
+    #[cfg(feature = "server-runtime")]
+    static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    #[cfg(feature = "server-runtime")]
+    fn with_env<F: FnOnce()>(vars: &[(&str, Option<&str>)], f: F) {
+        let _lock = ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        struct EnvGuard(Vec<(String, Option<std::ffi::OsString>)>);
+
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                for (key, old) in &self.0 {
+                    match old {
+                        Some(value) => unsafe { std::env::set_var(key, value) },
+                        None => unsafe { std::env::remove_var(key) },
+                    }
+                }
+            }
+        }
+
+        let _restore = EnvGuard(
+            vars.iter()
+                .map(|(key, value)| {
+                    let old = std::env::var_os(key);
+                    match value {
+                        Some(value) => unsafe { std::env::set_var(key, value) },
+                        None => unsafe { std::env::remove_var(key) },
+                    }
+                    (key.to_string(), old)
+                })
+                .collect(),
+        );
+
+        f();
+    }
+
+    #[cfg(feature = "server-runtime")]
+    #[test]
+    fn legacy_migration_concurrency_defaults_to_six() {
+        with_env(
+            &[
+                (LEGACY_MIGRATION_MAX_CONCURRENCY_ENV, None),
+                ("MEMORIA_USER_SCHEMA_INIT_MAX_CONCURRENCY", None),
+            ],
+            || {
+                assert_eq!(configured_legacy_migration_concurrency(), 6);
+            },
+        );
+    }
+
+    #[cfg(feature = "server-runtime")]
+    #[test]
+    fn legacy_migration_concurrency_prefers_dedicated_override() {
+        with_env(
+            &[
+                (LEGACY_MIGRATION_MAX_CONCURRENCY_ENV, Some("8")),
+                ("MEMORIA_USER_SCHEMA_INIT_MAX_CONCURRENCY", Some("5")),
+            ],
+            || {
+                assert_eq!(configured_legacy_migration_concurrency(), 8);
+            },
+        );
     }
 
     #[test]

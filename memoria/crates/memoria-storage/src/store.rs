@@ -35,16 +35,20 @@ fn is_duplicate_column(e: &sqlx::Error) -> bool {
         .unwrap_or(false)
 }
 
-async fn query_has_rows(pool: &MySqlPool, sql: &str) -> bool {
-    // Strip "> 0" suffix if present — MatrixOne returns bool for "COUNT(*) > 0"
-    // which sqlx cannot decode as i64. Use plain COUNT(*) and compare in Rust.
-    let sql = sql
-        .trim()
+fn normalized_count_sql(sql: &str) -> String {
+    sql.trim()
         .trim_end_matches(';')
         .trim()
         .strip_suffix("> 0")
         .map(|s| s.trim().to_string())
-        .unwrap_or_else(|| sql.to_string());
+        .unwrap_or_else(|| sql.to_string())
+}
+
+#[allow(dead_code)]
+async fn query_has_rows(pool: &MySqlPool, sql: &str) -> bool {
+    // Strip "> 0" suffix if present — MatrixOne returns bool for "COUNT(*) > 0"
+    // which sqlx cannot decode as i64. Use plain COUNT(*) and compare in Rust.
+    let sql = normalized_count_sql(sql);
     sqlx::query_scalar::<_, i64>(&sql)
         .fetch_one(pool)
         .await
@@ -52,10 +56,11 @@ async fn query_has_rows(pool: &MySqlPool, sql: &str) -> bool {
         > 0
 }
 
-async fn is_fresh_database(pool: &MySqlPool) -> Result<bool, MemoriaError> {
+async fn is_fresh_database(pool: &MySqlPool, schema_name: &str) -> Result<bool, MemoriaError> {
     sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE()",
+        "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = ?",
     )
+    .bind(schema_name)
     .fetch_one(pool)
     .await
     .map(|count| count == 0)
@@ -68,41 +73,49 @@ async fn is_fresh_database(pool: &MySqlPool) -> Result<bool, MemoriaError> {
 pub const CURRENT_USER_SCHEMA_VERSION: i64 = 1;
 const USER_SCHEMA_META_KEY: &str = "user_schema";
 
-async fn ensure_user_schema_meta_table(pool: &MySqlPool) -> Result<(), MemoriaError> {
-    sqlx::query(
-        r#"CREATE TABLE IF NOT EXISTS mem_schema_meta (
+async fn ensure_user_schema_meta_table(pool: &MySqlPool, table: &str) -> Result<(), MemoriaError> {
+    sqlx::query(&format!(
+        r#"CREATE TABLE IF NOT EXISTS {table} (
             schema_key     VARCHAR(64) PRIMARY KEY,
             schema_version BIGINT      NOT NULL,
             updated_at     DATETIME(6) NOT NULL
-        )"#,
-    )
+        )"#
+    ))
     .execute(pool)
     .await
     .map_err(db_err)?;
     Ok(())
 }
 
-async fn load_user_schema_version(pool: &MySqlPool) -> Result<Option<i64>, MemoriaError> {
-    let row =
-        sqlx::query("SELECT schema_version FROM mem_schema_meta WHERE schema_key = ? LIMIT 1")
-            .bind(USER_SCHEMA_META_KEY)
-            .fetch_optional(pool)
-            .await
-            .map_err(db_err)?;
+async fn load_user_schema_version(
+    pool: &MySqlPool,
+    table: &str,
+) -> Result<Option<i64>, MemoriaError> {
+    let row = sqlx::query(&format!(
+        "SELECT schema_version FROM {table} WHERE schema_key = ? LIMIT 1"
+    ))
+    .bind(USER_SCHEMA_META_KEY)
+    .fetch_optional(pool)
+    .await
+    .map_err(db_err)?;
 
     row.map(|r| r.try_get::<i64, _>("schema_version").map_err(db_err))
         .transpose()
 }
 
-async fn store_user_schema_version(pool: &MySqlPool, version: i64) -> Result<(), MemoriaError> {
+async fn store_user_schema_version(
+    pool: &MySqlPool,
+    table: &str,
+    version: i64,
+) -> Result<(), MemoriaError> {
     let now = Utc::now().naive_utc();
-    sqlx::query(
-        r#"INSERT INTO mem_schema_meta (schema_key, schema_version, updated_at)
+    sqlx::query(&format!(
+        r#"INSERT INTO {table} (schema_key, schema_version, updated_at)
            VALUES (?, ?, ?)
            ON DUPLICATE KEY UPDATE
                schema_version = VALUES(schema_version),
-               updated_at = VALUES(updated_at)"#,
-    )
+               updated_at = VALUES(updated_at)"#
+    ))
     .bind(USER_SCHEMA_META_KEY)
     .bind(version)
     .bind(now)
@@ -114,6 +127,7 @@ async fn store_user_schema_version(pool: &MySqlPool, version: i64) -> Result<(),
 
 const POOL_MONITOR_INTERVAL_SECS: u64 = 30;
 const POOL_MONITOR_REPEAT_AFTER_TICKS: u32 = 10;
+const POOL_SATURATED_LOG_DELAY_SECS: u64 = 300;
 const POOL_ANOMALY_RECENT_WINDOW_SECS: u64 = 600;
 const MAX_IDENTIFIER_LEN: usize = 64;
 const SAFETY_SNAPSHOT_SCOPE_MAX_LEN: usize = 21;
@@ -258,10 +272,11 @@ pub struct PoolHealthSnapshot {
     pub last_connection_anomaly_age_secs: Option<u64>,
     pub connection_anomalies_total: u64,
     pub pool_timeouts_total: u64,
+    pub saturated_warning_emitted: bool,
 }
 
 impl PoolHealthSnapshot {
-    fn new(configured_max_connections: Option<u32>) -> Self {
+    pub fn new(configured_max_connections: Option<u32>) -> Self {
         Self {
             configured_max_connections,
             size: 0,
@@ -274,6 +289,7 @@ impl PoolHealthSnapshot {
             last_connection_anomaly_age_secs: None,
             connection_anomalies_total: 0,
             pool_timeouts_total: 0,
+            saturated_warning_emitted: false,
         }
     }
 }
@@ -302,6 +318,10 @@ fn should_repeat_pool_log(consecutive_observations: u32) -> bool {
     consecutive_observations.checked_rem(POOL_MONITOR_REPEAT_AFTER_TICKS) == Some(0)
 }
 
+fn should_emit_saturated_warning(state_duration_secs: u64, warning_emitted: bool) -> bool {
+    state_duration_secs >= POOL_SATURATED_LOG_DELAY_SECS && !warning_emitted
+}
+
 /// Spawn a background task that periodically logs pool utilization.
 /// Warns when idle connections drop below 10% of pool size.
 /// Stops automatically when the pool is closed.
@@ -309,6 +329,7 @@ pub fn spawn_pool_monitor(
     pool: MySqlPool,
     configured_max_connections: Option<u32>,
     health: Arc<std::sync::Mutex<PoolHealthSnapshot>>,
+    pool_name: &'static str,
 ) {
     ::tokio::spawn(async move {
         let mut interval =
@@ -329,6 +350,7 @@ pub fn spawn_pool_monitor(
             let mut guard = health.lock().unwrap();
             let previous_level = guard.level;
             let previous_since = guard.since;
+            let previous_saturated_warning_emitted = guard.saturated_warning_emitted;
 
             if previous_level == level {
                 guard.consecutive_observations = guard.consecutive_observations.saturating_add(1);
@@ -336,6 +358,7 @@ pub fn spawn_pool_monitor(
                 guard.level = level;
                 guard.since = std::time::Instant::now();
                 guard.consecutive_observations = 1;
+                guard.saturated_warning_emitted = false;
             }
 
             guard.configured_max_connections = configured_max_connections;
@@ -351,9 +374,14 @@ pub fn spawn_pool_monitor(
                 .age_secs
                 .map(|age| age <= POOL_ANOMALY_RECENT_WINDOW_SECS)
                 .unwrap_or(false);
+            let state_duration_secs = guard.since.elapsed().as_secs();
 
             let should_log = match level {
-                PoolHealthLevel::Healthy => previous_level != PoolHealthLevel::Healthy,
+                PoolHealthLevel::Healthy => {
+                    previous_level != PoolHealthLevel::Healthy
+                        && (previous_level != PoolHealthLevel::Saturated
+                            || previous_saturated_warning_emitted)
+                }
                 PoolHealthLevel::Empty => {
                     if recent_anomaly {
                         previous_level != level
@@ -363,7 +391,11 @@ pub fn spawn_pool_monitor(
                         previous_level != level
                     }
                 }
-                _ => {
+                PoolHealthLevel::Saturated => should_emit_saturated_warning(
+                    state_duration_secs,
+                    guard.saturated_warning_emitted,
+                ),
+                PoolHealthLevel::HighUtilization => {
                     previous_level != level
                         || guard.consecutive_observations == 1
                         || should_repeat_pool_log(guard.consecutive_observations)
@@ -378,6 +410,7 @@ pub fn spawn_pool_monitor(
             match level {
                 PoolHealthLevel::Healthy => {
                     tracing::info!(
+                        pool_name,
                         previous_state = previous_level.as_str(),
                         previous_state_duration_secs = unhealthy_for_secs,
                         pool_size = size,
@@ -390,12 +423,13 @@ pub fn spawn_pool_monitor(
                 PoolHealthLevel::Empty => {
                     if recent_anomaly {
                         tracing::warn!(
+                            pool_name,
                             pool_size = size,
                             pool_active = active,
                             pool_idle = idle,
                             configured_max_connections,
                             state = level.as_str(),
-                            state_duration_secs = guard.since.elapsed().as_secs(),
+                            state_duration_secs,
                             consecutive_observations = guard.consecutive_observations,
                             last_connection_anomaly_kind = anomaly.kind.as_str(),
                             last_connection_anomaly_age_secs = anomaly.age_secs.unwrap_or_default(),
@@ -405,12 +439,13 @@ pub fn spawn_pool_monitor(
                         );
                     } else {
                         tracing::info!(
+                            pool_name,
                             pool_size = size,
                             pool_active = active,
                             pool_idle = idle,
                             configured_max_connections,
                             state = level.as_str(),
-                            state_duration_secs = guard.since.elapsed().as_secs(),
+                            state_duration_secs,
                             consecutive_observations = guard.consecutive_observations,
                             "connection pool currently has no established connections; this is expected when idle_timeout has drained the pool and no requests are using it"
                         );
@@ -418,36 +453,40 @@ pub fn spawn_pool_monitor(
                 }
                 PoolHealthLevel::Saturated => {
                     tracing::warn!(
+                        pool_name,
                         pool_size = size,
                         pool_active = active,
                         pool_idle = idle,
                         configured_max_connections,
                         state = level.as_str(),
-                        state_duration_secs = guard.since.elapsed().as_secs(),
+                        state_duration_secs,
                         consecutive_observations = guard.consecutive_observations,
                         "connection pool saturated — pool is at configured max and all established connections are busy"
                     );
+                    guard.saturated_warning_emitted = true;
                 }
                 PoolHealthLevel::HighUtilization => {
                     if idle == 0 {
                         tracing::warn!(
+                            pool_name,
                             pool_size = size,
                             pool_active = active,
                             pool_idle = idle,
                             configured_max_connections,
                             state = level.as_str(),
-                            state_duration_secs = guard.since.elapsed().as_secs(),
+                            state_duration_secs,
                             consecutive_observations = guard.consecutive_observations,
                             "connection pool has no idle connections; pool can still expand"
                         );
                     } else {
                         tracing::warn!(
+                            pool_name,
                             pool_size = size,
                             pool_active = active,
                             pool_idle = idle,
                             configured_max_connections,
                             state = level.as_str(),
-                            state_duration_secs = guard.since.elapsed().as_secs(),
+                            state_duration_secs,
                             consecutive_observations = guard.consecutive_observations,
                             "connection pool high utilization"
                         );
@@ -675,20 +714,10 @@ impl SqlMemoryStore {
     /// methods, use `self.t()` for qualified table names with `&self.pool`.
     #[allow(dead_code)]
     async fn conn(&self) -> Result<sqlx::pool::PoolConnection<sqlx::MySql>, MemoriaError> {
-        if self.db_name.is_some() {
-            if let Some(database_url) = &self.database_url {
-                let pool = sqlx::mysql::MySqlPoolOptions::new()
-                    .max_connections(1)
-                    .min_connections(0)
-                    .acquire_timeout(std::time::Duration::from_secs(10))
-                    .connect(database_url)
-                    .await
-                    .map_err(db_err)?;
-                return pool.acquire().await.map_err(db_err);
-            }
-        }
         let mut c = self.pool.acquire().await.map_err(db_err)?;
         if let Some(db) = &self.db_name {
+            // Routed stores reuse the global user pool. Every acquire explicitly
+            // switches the session database so we do not need per-user tiny pools.
             sqlx::query(&format!("USE `{}`", db.replace('`', "``")))
                 .execute(&mut *c)
                 .await
@@ -697,7 +726,8 @@ impl SqlMemoryStore {
         Ok(c)
     }
 
-    async fn direct_pool(&self) -> Result<MySqlPool, MemoriaError> {
+    #[allow(dead_code)]
+    async fn migration_pool(&self) -> Result<MySqlPool, MemoriaError> {
         if self.db_name.is_some() {
             let database_url = self.database_url.as_ref().ok_or_else(|| {
                 MemoriaError::Internal("routed store missing database_url".into())
@@ -715,6 +745,17 @@ impl SqlMemoryStore {
 
     pub fn db_name(&self) -> Option<&str> {
         self.db_name.as_deref()
+    }
+
+    fn current_schema_name(&self) -> Result<&str, MemoriaError> {
+        self.db_name
+            .as_deref()
+            .or_else(|| {
+                self.database_url
+                    .as_deref()
+                    .and_then(parse_db_name_from_url)
+            })
+            .ok_or_else(|| MemoriaError::Internal("store missing database name".into()))
     }
 
     pub fn set_db_name(&mut self, name: String) {
@@ -788,6 +829,7 @@ impl SqlMemoryStore {
             max_conns,
             true,
             true,
+            "main_sql_store",
         )
         .await
     }
@@ -810,6 +852,7 @@ impl SqlMemoryStore {
             max_conns,
             true,
             true,
+            "shared_sql_store",
         )
         .await
     }
@@ -832,8 +875,33 @@ impl SqlMemoryStore {
             max_conns,
             false,
             false,
+            "routed_sql_store",
         )
         .await
+    }
+
+    pub fn from_existing_pool(
+        pool: MySqlPool,
+        embedding_dim: usize,
+        instance_id: String,
+        database_url: Option<String>,
+        configured_max_connections: Option<u32>,
+        pool_name: &'static str,
+    ) -> Self {
+        let mut store = Self::new(pool.clone(), embedding_dim, instance_id);
+        store.database_url = database_url;
+        store.configured_max_connections = configured_max_connections;
+        {
+            let mut health = store.pool_health.lock().unwrap();
+            health.configured_max_connections = configured_max_connections;
+        }
+        spawn_pool_monitor(
+            pool,
+            configured_max_connections,
+            store.pool_health.clone(),
+            pool_name,
+        );
+        store
     }
 
     async fn connect_with_pool_limit(
@@ -843,6 +911,7 @@ impl SqlMemoryStore {
         max_conns: u32,
         log_info: bool,
         ensure_database_exists: bool,
+        pool_name: &'static str,
     ) -> Result<Self, MemoriaError> {
         if ensure_database_exists {
             // Auto-create database if it doesn't exist
@@ -880,15 +949,14 @@ impl SqlMemoryStore {
                 "Main connection pool initialized"
             );
         }
-        let mut store = Self::new(pool.clone(), embedding_dim, instance_id);
-        store.database_url = Some(database_url.to_string());
-        store.configured_max_connections = Some(max_conns);
-        {
-            let mut health = store.pool_health.lock().unwrap();
-            health.configured_max_connections = Some(max_conns);
-        }
-        spawn_pool_monitor(pool, Some(max_conns), store.pool_health.clone());
-        Ok(store)
+        Ok(Self::from_existing_pool(
+            pool,
+            embedding_dim,
+            instance_id,
+            Some(database_url.to_string()),
+            Some(max_conns),
+            pool_name,
+        ))
     }
 
     /// Create a small isolated pool for background tasks (DDL, maintenance).
@@ -931,8 +999,20 @@ impl SqlMemoryStore {
     }
 
     async fn bootstrap_user_schema(&self, pool: &MySqlPool) -> Result<(), MemoriaError> {
+        let memories_table = self.t("mem_memories");
+        let user_state_table = self.t("mem_user_state");
+        let branches_table = self.t("mem_branches");
+        let snapshots_table = self.t("mem_snapshots");
+        let cooldown_table = self.t("mem_governance_cooldown");
+        let entity_links_table = self.t("mem_entity_links");
+        let memories_stats_table = self.t("mem_memories_stats");
+        let edit_log_table = self.t("mem_edit_log");
+        let retrieval_feedback_table = self.t("mem_retrieval_feedback");
+        let retrieval_params_table = self.t("mem_user_retrieval_params");
+        let tool_usage_table = self.t("mem_tool_usage");
+        let api_call_log_table = self.t("mem_api_call_log");
         let sql = format!(
-            r#"CREATE TABLE IF NOT EXISTS mem_memories (
+            r#"CREATE TABLE IF NOT EXISTS {memories_table} (
                 memory_id       VARCHAR(64)  PRIMARY KEY,
                 user_id         VARCHAR(64)  NOT NULL,
                 memory_type     VARCHAR(20)  NOT NULL,
@@ -953,23 +1033,24 @@ impl SqlMemoryStore {
                 INDEX idx_memories_user_observed (user_id, observed_at),
                 FULLTEXT INDEX ft_content (content) WITH PARSER ngram -- MO#23861: breaks on concurrent snapshot restore
             )"#,
+            memories_table = memories_table,
             dim = self.embedding_dim
         );
         sqlx::query(&sql).execute(pool).await.map_err(db_err)?;
 
-        sqlx::query(
-            r#"CREATE TABLE IF NOT EXISTS mem_user_state (
+        sqlx::query(&format!(
+            r#"CREATE TABLE IF NOT EXISTS {user_state_table} (
                 user_id       VARCHAR(64)  PRIMARY KEY,
                 active_branch VARCHAR(100) NOT NULL DEFAULT 'main',
                 updated_at    DATETIME(6)
             )"#,
-        )
+        ))
         .execute(pool)
         .await
         .map_err(db_err)?;
 
-        sqlx::query(
-            r#"CREATE TABLE IF NOT EXISTS mem_branches (
+        sqlx::query(&format!(
+            r#"CREATE TABLE IF NOT EXISTS {branches_table} (
                 id          VARCHAR(64)  PRIMARY KEY,
                 user_id     VARCHAR(64)  NOT NULL,
                 name        VARCHAR(100) NOT NULL,
@@ -978,13 +1059,13 @@ impl SqlMemoryStore {
                 created_at  DATETIME(6)  NOT NULL,
                 INDEX idx_user_name (user_id, name)
             )"#,
-        )
+        ))
         .execute(pool)
         .await
         .map_err(db_err)?;
 
-        sqlx::query(
-            r#"CREATE TABLE IF NOT EXISTS mem_snapshots (
+        sqlx::query(&format!(
+            r#"CREATE TABLE IF NOT EXISTS {snapshots_table} (
                 id             VARCHAR(64)  PRIMARY KEY,
                 user_id        VARCHAR(64)  NOT NULL,
                 name           VARCHAR(100) NOT NULL,
@@ -994,25 +1075,25 @@ impl SqlMemoryStore {
                 INDEX idx_user_snapshot_name (user_id, name, status),
                 INDEX idx_user_snapshot_internal (user_id, snapshot_name, status)
             )"#,
-        )
+        ))
         .execute(pool)
         .await
         .map_err(db_err)?;
 
-        sqlx::query(
-            r#"CREATE TABLE IF NOT EXISTS mem_governance_cooldown (
+        sqlx::query(&format!(
+            r#"CREATE TABLE IF NOT EXISTS {cooldown_table} (
                 user_id     VARCHAR(64)  NOT NULL,
                 operation   VARCHAR(32)  NOT NULL,
                 last_run_at DATETIME(6)  NOT NULL,
                 PRIMARY KEY (user_id, operation)
             )"#,
-        )
+        ))
         .execute(pool)
         .await
         .map_err(db_err)?;
 
-        sqlx::query(
-            r#"CREATE TABLE IF NOT EXISTS mem_entity_links (
+        sqlx::query(&format!(
+            r#"CREATE TABLE IF NOT EXISTS {entity_links_table} (
                 id          VARCHAR(64)  PRIMARY KEY,
                 user_id     VARCHAR(64)  NOT NULL,
                 memory_id   VARCHAR(64)  NOT NULL,
@@ -1023,13 +1104,13 @@ impl SqlMemoryStore {
                 INDEX idx_user_memory (user_id, memory_id),
                 INDEX idx_user_entity (user_id, entity_name)
             )"#,
-        )
+        ))
         .execute(pool)
         .await
         .map_err(db_err)?;
 
-        sqlx::query(
-            r#"CREATE TABLE IF NOT EXISTS mem_memories_stats (
+        sqlx::query(&format!(
+            r#"CREATE TABLE IF NOT EXISTS {memories_stats_table} (
                 memory_id        VARCHAR(64)  PRIMARY KEY,
                 access_count     INT          NOT NULL DEFAULT 0,
                 last_accessed_at DATETIME(6),
@@ -1039,13 +1120,13 @@ impl SqlMemoryStore {
                 feedback_wrong   INT          NOT NULL DEFAULT 0,
                 last_feedback_at DATETIME(6)
             )"#,
-        )
+        ))
         .execute(pool)
         .await
         .map_err(db_err)?;
 
-        sqlx::query(
-            r#"CREATE TABLE IF NOT EXISTS mem_edit_log (
+        sqlx::query(&format!(
+            r#"CREATE TABLE IF NOT EXISTS {edit_log_table} (
                 edit_id         VARCHAR(64)  NOT NULL,
                 user_id         VARCHAR(64)  NOT NULL,
                 memory_id       VARCHAR(64)  DEFAULT NULL,
@@ -1058,13 +1139,13 @@ impl SqlMemoryStore {
                 INDEX idx_user_time (user_id, created_at),
                 INDEX idx_memory_time (memory_id, created_at)
             ) CLUSTER BY (created_at, user_id)"#,
-        )
+        ))
         .execute(pool)
         .await
         .map_err(db_err)?;
 
-        sqlx::query(
-            r#"CREATE TABLE IF NOT EXISTS mem_retrieval_feedback (
+        sqlx::query(&format!(
+            r#"CREATE TABLE IF NOT EXISTS {retrieval_feedback_table} (
                 id          VARCHAR(64)  PRIMARY KEY,
                 user_id     VARCHAR(64)  NOT NULL,
                 memory_id   VARCHAR(64)  NOT NULL,
@@ -1076,38 +1157,38 @@ impl SqlMemoryStore {
                 INDEX idx_feedback_memory_user (user_id, memory_id),
                 INDEX idx_feedback_created_at (created_at)
             )"#,
-        )
+        ))
         .execute(pool)
         .await
         .map_err(db_err)?;
 
-        sqlx::query(
-            r#"CREATE TABLE IF NOT EXISTS mem_user_retrieval_params (
+        sqlx::query(&format!(
+            r#"CREATE TABLE IF NOT EXISTS {retrieval_params_table} (
                 user_id              VARCHAR(64)  PRIMARY KEY,
                 feedback_weight      DOUBLE       NOT NULL DEFAULT 0.1,
                 temporal_decay_hours DOUBLE       NOT NULL DEFAULT 168.0,
                 confidence_weight    DOUBLE       NOT NULL DEFAULT 0.1,
                 updated_at           DATETIME(6)  NOT NULL
             )"#,
-        )
+        ))
         .execute(pool)
         .await
         .map_err(db_err)?;
 
-        sqlx::query(
-            r#"CREATE TABLE IF NOT EXISTS mem_tool_usage (
+        sqlx::query(&format!(
+            r#"CREATE TABLE IF NOT EXISTS {tool_usage_table} (
                 user_id      VARCHAR(64)  NOT NULL,
                 tool_name    VARCHAR(128) NOT NULL,
                 last_used_at DATETIME(6)  NOT NULL,
                 PRIMARY KEY (user_id, tool_name)
             )"#,
-        )
+        ))
         .execute(pool)
         .await
         .map_err(db_err)?;
 
-        sqlx::query(
-            r#"CREATE TABLE IF NOT EXISTS mem_api_call_log (
+        sqlx::query(&format!(
+            r#"CREATE TABLE IF NOT EXISTS {api_call_log_table} (
                 id              BIGINT       NOT NULL AUTO_INCREMENT,
                 user_id         VARCHAR(64)  NOT NULL,
                 method          VARCHAR(10)  NOT NULL DEFAULT '',
@@ -1120,7 +1201,7 @@ impl SqlMemoryStore {
                 PRIMARY KEY (id),
                 INDEX idx_user_called (user_id, called_at)
             )"#,
-        )
+        ))
         .execute(pool)
         .await
         .map_err(db_err)?;
@@ -1130,90 +1211,110 @@ impl SqlMemoryStore {
     }
 
     async fn apply_user_compat_migrations(&self, pool: &MySqlPool) -> Result<(), MemoriaError> {
-        let _ = sqlx::query(
-            "ALTER TABLE mem_memories_stats ADD COLUMN feedback_useful INT NOT NULL DEFAULT 0",
-        )
-        .execute(pool)
-        .await;
-        let _ = sqlx::query(
-            "ALTER TABLE mem_memories_stats ADD COLUMN feedback_irrelevant INT NOT NULL DEFAULT 0",
-        )
-        .execute(pool)
-        .await;
-        let _ = sqlx::query(
-            "ALTER TABLE mem_memories_stats ADD COLUMN feedback_outdated INT NOT NULL DEFAULT 0",
-        )
-        .execute(pool)
-        .await;
-        let _ = sqlx::query(
-            "ALTER TABLE mem_memories_stats ADD COLUMN feedback_wrong INT NOT NULL DEFAULT 0",
-        )
-        .execute(pool)
-        .await;
-        let _ =
-            sqlx::query("ALTER TABLE mem_memories_stats ADD COLUMN last_feedback_at DATETIME(6)")
-                .execute(pool)
-                .await;
+        let schema_name = self.current_schema_name()?;
+        let memories_stats_table = self.t("mem_memories_stats");
+        let edit_log_table = self.t("mem_edit_log");
+        let memories_table = self.t("mem_memories");
+        let branches_table = self.t("mem_branches");
+        let api_call_log_table = self.t("mem_api_call_log");
+        let retrieval_feedback_table = self.t("mem_retrieval_feedback");
+        let graph_nodes_table = self.t("memory_graph_nodes");
 
-        let _ =
-            sqlx::query("ALTER TABLE mem_edit_log ADD COLUMN memory_id VARCHAR(64) DEFAULT NULL")
-                .execute(pool)
-                .await;
-        let _ = sqlx::query("ALTER TABLE mem_edit_log ADD COLUMN payload JSON DEFAULT NULL")
-            .execute(pool)
-            .await;
+        let _ = sqlx::query(&format!(
+            "ALTER TABLE {memories_stats_table} ADD COLUMN feedback_useful INT NOT NULL DEFAULT 0"
+        ))
+        .execute(pool)
+        .await;
+        let _ = sqlx::query(&format!(
+            "ALTER TABLE {memories_stats_table} ADD COLUMN feedback_irrelevant INT NOT NULL DEFAULT 0"
+        ))
+        .execute(pool)
+        .await;
+        let _ = sqlx::query(&format!(
+            "ALTER TABLE {memories_stats_table} ADD COLUMN feedback_outdated INT NOT NULL DEFAULT 0"
+        ))
+        .execute(pool)
+        .await;
+        let _ = sqlx::query(&format!(
+            "ALTER TABLE {memories_stats_table} ADD COLUMN feedback_wrong INT NOT NULL DEFAULT 0"
+        ))
+        .execute(pool)
+        .await;
+        let _ = sqlx::query(&format!(
+            "ALTER TABLE {memories_stats_table} ADD COLUMN last_feedback_at DATETIME(6)"
+        ))
+        .execute(pool)
+        .await;
 
-        let _ = sqlx::query(
-            "ALTER TABLE mem_memories ADD COLUMN extra_metadata JSON AFTER source_event_ids",
-        )
+        let _ = sqlx::query(&format!(
+            "ALTER TABLE {edit_log_table} ADD COLUMN memory_id VARCHAR(64) DEFAULT NULL"
+        ))
+        .execute(pool)
+        .await;
+        let _ = sqlx::query(&format!(
+            "ALTER TABLE {edit_log_table} ADD COLUMN payload JSON DEFAULT NULL"
+        ))
+        .execute(pool)
+        .await;
+
+        let _ = sqlx::query(&format!(
+            "ALTER TABLE {memories_table} ADD COLUMN extra_metadata JSON AFTER source_event_ids"
+        ))
         .execute(pool)
         .await;
 
         let needs_upgrade: bool = sqlx::query_scalar(
             "SELECT COUNT(*) = 0 FROM information_schema.statistics \
-             WHERE table_schema = DATABASE() AND table_name = 'mem_memories' \
+             WHERE table_schema = ? AND table_name = 'mem_memories' \
              AND index_name = 'idx_user_active' AND column_name = 'memory_type'",
         )
+        .bind(schema_name)
         .fetch_one(pool)
         .await
         .unwrap_or(false);
         if needs_upgrade {
-            let _ = sqlx::query("ALTER TABLE mem_memories DROP INDEX idx_user_active")
-                .execute(pool)
-                .await;
-            let _ = sqlx::query(
-                "ALTER TABLE mem_memories ADD INDEX idx_user_active (user_id, is_active, memory_type)",
-            )
+            let _ = sqlx::query(&format!(
+                "ALTER TABLE {memories_table} DROP INDEX idx_user_active"
+            ))
+            .execute(pool)
+            .await;
+            let _ = sqlx::query(&format!(
+                "ALTER TABLE {memories_table} ADD INDEX idx_user_active (user_id, is_active, memory_type)"
+            ))
             .execute(pool)
             .await;
         }
 
-        let has_table_name = query_has_rows(
-            pool,
-            "SELECT COUNT(*) FROM information_schema.columns \
-             WHERE table_schema = DATABASE() AND table_name = 'mem_branches' AND column_name = 'table_name'",
+        let has_table_name: bool = sqlx::query_scalar(
+            "SELECT COUNT(*) > 0 FROM information_schema.columns \
+             WHERE table_schema = ? AND table_name = 'mem_branches' AND column_name = 'table_name'",
         )
-        .await;
+        .bind(schema_name)
+        .fetch_one(pool)
+        .await
+        .unwrap_or(false);
         if !has_table_name {
-            let _ = sqlx::query(
-                "ALTER TABLE mem_branches ADD COLUMN table_name VARCHAR(100) NOT NULL DEFAULT ''",
-            )
+            let _ = sqlx::query(&format!(
+                "ALTER TABLE {branches_table} ADD COLUMN table_name VARCHAR(100) NOT NULL DEFAULT ''"
+            ))
             .execute(pool)
             .await;
         }
 
-        let has_id = query_has_rows(
-            pool,
-            "SELECT COUNT(*) FROM information_schema.columns \
-             WHERE table_schema = DATABASE() AND table_name = 'mem_branches' AND column_name = 'id'",
+        let has_id: bool = sqlx::query_scalar(
+            "SELECT COUNT(*) > 0 FROM information_schema.columns \
+             WHERE table_schema = ? AND table_name = 'mem_branches' AND column_name = 'id'",
         )
-        .await;
+        .bind(schema_name)
+        .fetch_one(pool)
+        .await
+        .unwrap_or(false);
         if !has_id {
-            let _ = sqlx::query("DROP TABLE IF EXISTS mem_branches")
+            let _ = sqlx::query(&format!("DROP TABLE IF EXISTS {branches_table}"))
                 .execute(pool)
                 .await;
-            sqlx::query(
-                r#"CREATE TABLE IF NOT EXISTS mem_branches (
+            sqlx::query(&format!(
+                r#"CREATE TABLE IF NOT EXISTS {branches_table} (
                     id          VARCHAR(64)  PRIMARY KEY,
                     user_id     VARCHAR(64)  NOT NULL,
                     name        VARCHAR(100) NOT NULL,
@@ -1221,32 +1322,33 @@ impl SqlMemoryStore {
                     status      VARCHAR(20)  NOT NULL DEFAULT 'active',
                     created_at  DATETIME(6)  NOT NULL,
                     INDEX idx_user_name (user_id, name)
-                )"#,
-            )
+                )"#
+            ))
             .execute(pool)
             .await
             .map_err(db_err)?;
         }
 
-        let has_method_col = query_has_rows(
-            pool,
-            "SELECT COUNT(*) FROM information_schema.columns \
-             WHERE table_schema = DATABASE() AND table_name = 'mem_api_call_log' \
+        let has_method_col: bool = sqlx::query_scalar(
+            "SELECT COUNT(*) > 0 FROM information_schema.columns \
+             WHERE table_schema = ? AND table_name = 'mem_api_call_log' \
              AND column_name = 'method'",
         )
-        .await;
+        .bind(schema_name)
+        .fetch_one(pool)
+        .await
+        .unwrap_or(false);
         if !has_method_col {
-            let _ = sqlx::query(
-                "ALTER TABLE mem_api_call_log ADD COLUMN method VARCHAR(10) NOT NULL DEFAULT ''",
-            )
+            let _ = sqlx::query(&format!(
+                "ALTER TABLE {api_call_log_table} ADD COLUMN method VARCHAR(10) NOT NULL DEFAULT ''"
+            ))
             .execute(pool)
             .await;
         }
 
-        let add_rpc_success = sqlx::query(
-            "ALTER TABLE mem_api_call_log \
-             ADD COLUMN rpc_success TINYINT(1) NOT NULL DEFAULT 1",
-        )
+        let add_rpc_success = sqlx::query(&format!(
+            "ALTER TABLE {api_call_log_table} ADD COLUMN rpc_success TINYINT(1) NOT NULL DEFAULT 1"
+        ))
         .execute(pool)
         .await;
         if let Err(e) = add_rpc_success {
@@ -1263,10 +1365,9 @@ impl SqlMemoryStore {
             }
         }
 
-        let add_rpc_error_code = sqlx::query(
-            "ALTER TABLE mem_api_call_log \
-             ADD COLUMN rpc_error_code INT NULL",
-        )
+        let add_rpc_error_code = sqlx::query(&format!(
+            "ALTER TABLE {api_call_log_table} ADD COLUMN rpc_error_code INT NULL"
+        ))
         .execute(pool)
         .await;
         if let Err(e) = add_rpc_error_code {
@@ -1282,86 +1383,93 @@ impl SqlMemoryStore {
             }
         }
 
-        let has_feedback_memory_user_idx = query_has_rows(
-            pool,
-            "SELECT COUNT(*) FROM information_schema.statistics \
-             WHERE table_schema = DATABASE() \
+        let has_feedback_memory_user_idx: bool = sqlx::query_scalar(
+            "SELECT COUNT(*) > 0 FROM information_schema.statistics \
+             WHERE table_schema = ? \
                AND table_name = 'mem_retrieval_feedback' \
                AND index_name = 'idx_feedback_memory_user'",
         )
-        .await;
+        .bind(schema_name)
+        .fetch_one(pool)
+        .await
+        .unwrap_or(false);
         if !has_feedback_memory_user_idx {
-            let _ = sqlx::query(
-                "ALTER TABLE mem_retrieval_feedback \
-                 ADD INDEX idx_feedback_memory_user (user_id, memory_id)",
-            )
+            let _ = sqlx::query(&format!(
+                "ALTER TABLE {retrieval_feedback_table} ADD INDEX idx_feedback_memory_user (user_id, memory_id)"
+            ))
             .execute(pool)
             .await;
         }
 
-        let has_feedback_created_at_idx = query_has_rows(
-            pool,
-            "SELECT COUNT(*) FROM information_schema.statistics \
-             WHERE table_schema = DATABASE() \
+        let has_feedback_created_at_idx: bool = sqlx::query_scalar(
+            "SELECT COUNT(*) > 0 FROM information_schema.statistics \
+             WHERE table_schema = ? \
                AND table_name = 'mem_retrieval_feedback' \
                AND index_name = 'idx_feedback_created_at'",
         )
-        .await;
+        .bind(schema_name)
+        .fetch_one(pool)
+        .await
+        .unwrap_or(false);
         if !has_feedback_created_at_idx {
-            let _ = sqlx::query(
-                "ALTER TABLE mem_retrieval_feedback \
-                 ADD INDEX idx_feedback_created_at (created_at)",
-            )
+            let _ = sqlx::query(&format!(
+                "ALTER TABLE {retrieval_feedback_table} ADD INDEX idx_feedback_created_at (created_at)"
+            ))
             .execute(pool)
             .await;
         }
 
-        let has_memories_user_observed_idx = query_has_rows(
-            pool,
-            "SELECT COUNT(*) FROM information_schema.statistics \
-             WHERE table_schema = DATABASE() \
+        let has_memories_user_observed_idx: bool = sqlx::query_scalar(
+            "SELECT COUNT(*) > 0 FROM information_schema.statistics \
+             WHERE table_schema = ? \
                AND table_name = 'mem_memories' \
                AND index_name = 'idx_memories_user_observed'",
         )
-        .await;
+        .bind(schema_name)
+        .fetch_one(pool)
+        .await
+        .unwrap_or(false);
         if !has_memories_user_observed_idx {
-            let _ = sqlx::query(
-                "ALTER TABLE mem_memories \
-                 ADD INDEX idx_memories_user_observed (user_id, observed_at)",
-            )
+            let _ = sqlx::query(&format!(
+                "ALTER TABLE {memories_table} ADD INDEX idx_memories_user_observed (user_id, observed_at)"
+            ))
             .execute(pool)
             .await;
         }
 
-        let has_user_active_created_idx = query_has_rows(
-            pool,
-            "SELECT COUNT(*) FROM information_schema.statistics \
-             WHERE table_schema = DATABASE() \
+        let has_user_active_created_idx: bool = sqlx::query_scalar(
+            "SELECT COUNT(*) > 0 FROM information_schema.statistics \
+             WHERE table_schema = ? \
                AND table_name = 'mem_memories' \
                AND index_name = 'idx_user_active_created'",
         )
-        .await;
+        .bind(schema_name)
+        .fetch_one(pool)
+        .await
+        .unwrap_or(false);
         if has_user_active_created_idx {
-            let _ = sqlx::query("ALTER TABLE mem_memories DROP INDEX idx_user_active_created")
-                .execute(pool)
-                .await;
+            let _ = sqlx::query(&format!(
+                "ALTER TABLE {memories_table} DROP INDEX idx_user_active_created"
+            ))
+            .execute(pool)
+            .await;
         }
 
         let has_empty_superseded = query_has_rows(
             pool,
-            "SELECT COUNT(*) FROM mem_memories WHERE superseded_by = ''",
+            &format!("SELECT COUNT(*) FROM {memories_table} WHERE superseded_by = ''"),
         )
         .await;
         if has_empty_superseded {
             for (tbl, col) in [
-                ("mem_memories", "superseded_by"),
-                ("mem_memories", "session_id"),
-                ("memory_graph_nodes", "superseded_by"),
-                ("memory_graph_nodes", "session_id"),
-                ("memory_graph_nodes", "memory_id"),
-                ("memory_graph_nodes", "entity_type"),
-                ("memory_graph_nodes", "conflicts_with"),
-                ("memory_graph_nodes", "conflict_resolution"),
+                (memories_table.clone(), "superseded_by"),
+                (memories_table.clone(), "session_id"),
+                (graph_nodes_table.clone(), "superseded_by"),
+                (graph_nodes_table.clone(), "session_id"),
+                (graph_nodes_table.clone(), "memory_id"),
+                (graph_nodes_table.clone(), "entity_type"),
+                (graph_nodes_table.clone(), "conflicts_with"),
+                (graph_nodes_table.clone(), "conflict_resolution"),
             ] {
                 if let Err(e) =
                     sqlx::query(&format!("UPDATE {tbl} SET {col} = NULL WHERE {col} = ''"))
@@ -1373,10 +1481,10 @@ impl SqlMemoryStore {
             }
         }
 
-        let _ = sqlx::raw_sql(
-            "UPDATE mem_memories SET embedding = NULL \
-             WHERE embedding IS NOT NULL AND vector_dims(embedding) = 0",
-        )
+        let _ = sqlx::raw_sql(&format!(
+            "UPDATE {memories_table} SET embedding = NULL \
+             WHERE embedding IS NOT NULL AND vector_dims(embedding) = 0"
+        ))
         .execute(pool)
         .await;
 
@@ -1384,23 +1492,33 @@ impl SqlMemoryStore {
     }
 
     pub async fn migrate_user(&self) -> Result<(), MemoriaError> {
-        let pool = self.direct_pool().await?;
-        let is_fresh = is_fresh_database(&pool).await?;
+        let pool = &self.pool;
+        let meta_table = self.t("mem_schema_meta");
+        let schema_name = self.current_schema_name()?;
+
+        let is_fresh = is_fresh_database(pool, schema_name).await?;
         if is_fresh {
-            self.bootstrap_user_schema(&pool).await?;
-            ensure_user_schema_meta_table(&pool).await?;
-            store_user_schema_version(&pool, CURRENT_USER_SCHEMA_VERSION).await?;
+            return self.migrate_user_fresh().await;
+        }
+
+        ensure_user_schema_meta_table(pool, &meta_table).await?;
+        if load_user_schema_version(pool, &meta_table).await? == Some(CURRENT_USER_SCHEMA_VERSION) {
             return Ok(());
         }
 
-        ensure_user_schema_meta_table(&pool).await?;
-        if load_user_schema_version(&pool).await? == Some(CURRENT_USER_SCHEMA_VERSION) {
-            return Ok(());
-        }
+        self.bootstrap_user_schema(pool).await?;
+        self.apply_user_compat_migrations(pool).await?;
+        store_user_schema_version(pool, &meta_table, CURRENT_USER_SCHEMA_VERSION).await?;
+        Ok(())
+    }
 
-        self.bootstrap_user_schema(&pool).await?;
-        self.apply_user_compat_migrations(&pool).await?;
-        store_user_schema_version(&pool, CURRENT_USER_SCHEMA_VERSION).await
+    pub(crate) async fn migrate_user_fresh(&self) -> Result<(), MemoriaError> {
+        let pool = &self.pool;
+        let meta_table = self.t("mem_schema_meta");
+        self.bootstrap_user_schema(pool).await?;
+        ensure_user_schema_meta_table(pool, &meta_table).await?;
+        store_user_schema_version(pool, &meta_table, CURRENT_USER_SCHEMA_VERSION).await?;
+        Ok(())
     }
 
     pub async fn migrate_shared(&self) -> Result<(), MemoriaError> {
@@ -4783,14 +4901,35 @@ fn build_safety_snapshot_name(db_name: Option<&str>, operation: &str) -> String 
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_pool_health, detect_connection_anomaly, ConnectionAnomalyKind, OwnedEditLogEntry,
-        PoolHealthLevel, SqlMemoryStore,
+        classify_pool_health, detect_connection_anomaly, should_emit_saturated_warning,
+        ConnectionAnomalyKind, OwnedEditLogEntry, PoolHealthLevel, PoolHealthSnapshot,
+        SqlMemoryStore,
     };
     use sqlx::mysql::MySqlPoolOptions;
     use std::io::{self, Write};
     use std::sync::{Arc, Mutex, OnceLock};
 
     static LOG_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    #[test]
+    fn saturated_warning_requires_full_delay_and_only_emits_once() {
+        assert!(!should_emit_saturated_warning(299, false));
+        assert!(should_emit_saturated_warning(300, false));
+        assert!(!should_emit_saturated_warning(600, true));
+    }
+
+    #[test]
+    fn saturated_warning_rearms_after_relief() {
+        let mut snapshot = PoolHealthSnapshot::new(Some(20));
+        snapshot.saturated_warning_emitted = true;
+        snapshot.level = PoolHealthLevel::HighUtilization;
+        snapshot.saturated_warning_emitted = false;
+
+        assert!(should_emit_saturated_warning(
+            300,
+            snapshot.saturated_warning_emitted
+        ));
+    }
 
     #[derive(Clone)]
     struct SharedWriter(Arc<Mutex<Vec<u8>>>);

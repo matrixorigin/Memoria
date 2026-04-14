@@ -1,4 +1,5 @@
-use crate::SqlMemoryStore;
+use crate::store::spawn_pool_monitor;
+use crate::{PoolHealthSnapshot, SqlMemoryStore};
 use chrono::Utc;
 use memoria_core::MemoriaError;
 use moka::sync::Cache;
@@ -24,9 +25,22 @@ const USER_DB_CACHE_MAX_CAPACITY: u64 = 10_000;
 const USER_STORE_CACHE_MAX_CAPACITY: u64 = 10_000;
 const USER_SCHEMA_CACHE_MAX_CAPACITY: u64 = 10_000;
 const USER_STORE_CACHE_IDLE_SECS: u64 = 600;
-const SHARED_POOL_MAX_CONNECTIONS: u32 = 16;
-const GLOBAL_USER_POOL_MAX_CONNECTIONS: u32 = 72;
+const SHARED_POOL_MAX_CONNECTIONS: u32 = 8;
+const SHARED_MAIN_POOL_MAX_CONNECTIONS: u32 = 8;
+const GIT_POOL_MAX_CONNECTIONS: u32 = 4;
+const GLOBAL_USER_POOL_MAX_CONNECTIONS: u32 = 80;
+const USER_SCHEMA_INIT_POOL_MAX_CONNECTIONS: u32 = 12;
 const POOL_MAX_CONNECTIONS_UPPER: u32 = 256;
+const MERGED_SHARED_POOL_MAX_CONNECTIONS_ENV: &str = "MEMORIA_MERGED_SHARED_POOL_MAX_CONNECTIONS";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SharedPoolPlan {
+    max_connections: u32,
+    routing_component_max_connections: u32,
+    shared_main_component_max_connections: u32,
+    git_component_max_connections: u32,
+    explicit_override: bool,
+}
 
 #[derive(Debug, Clone)]
 pub struct UserDatabaseRecord {
@@ -38,11 +52,14 @@ pub struct UserDatabaseRecord {
 #[derive(Clone)]
 pub struct DbRouter {
     shared_pool: MySqlPool,
+    shared_pool_max_connections: u32,
     /// Global pool for all per-user DB queries. Connections are switched to
     /// the correct database via `USE` (conn() pattern) or fully-qualified
     /// table names (qualified_table() pattern). `statement_cache_capacity=0`
     /// prevents cross-database prepared-statement pollution.
     global_user_pool: MySqlPool,
+    global_user_pool_max_connections: u32,
+    user_init_pool: MySqlPool,
     shared_db_url: String,
     shared_db_name: String,
     embedding_dim: usize,
@@ -60,13 +77,9 @@ impl DbRouter {
         instance_id: String,
     ) -> Result<Self, MemoriaError> {
         create_database_if_missing_from_url(shared_db_url).await?;
-        let shared_max = configured_pool_max_connections(
-            "MEMORIA_SHARED_POOL_MAX_CONNECTIONS",
-            SHARED_POOL_MAX_CONNECTIONS,
-            POOL_MAX_CONNECTIONS_UPPER,
-        );
+        let shared_plan = configured_shared_pool_plan();
         let pool = MySqlPoolOptions::new()
-            .max_connections(shared_max)
+            .max_connections(shared_plan.max_connections)
             .max_lifetime(std::time::Duration::from_secs(3600))
             .idle_timeout(std::time::Duration::from_secs(300))
             .acquire_timeout(std::time::Duration::from_secs(10))
@@ -74,8 +87,13 @@ impl DbRouter {
             .await
             .map_err(db_err)?;
         tracing::info!(
-            max_connections = shared_max,
-            "Shared routing pool initialized"
+            max_connections = shared_plan.max_connections,
+            routing_component_max_connections = shared_plan.routing_component_max_connections,
+            shared_main_component_max_connections =
+                shared_plan.shared_main_component_max_connections,
+            git_component_max_connections = shared_plan.git_component_max_connections,
+            explicit_override = shared_plan.explicit_override,
+            "Shared database pool initialized"
         );
 
         // Global pool for all per-user DB queries.
@@ -99,17 +117,46 @@ impl DbRouter {
             max_connections = global_max,
             "Global user pool initialized (statement_cache=0)"
         );
+        spawn_pool_monitor(
+            global_user_pool.clone(),
+            Some(global_max),
+            Arc::new(std::sync::Mutex::new(PoolHealthSnapshot::new(Some(
+                global_max,
+            )))),
+            "global_user_pool",
+        );
+        let user_init_pool_max = configured_pool_max_connections(
+            "MEMORIA_USER_SCHEMA_INIT_POOL_MAX_CONNECTIONS",
+            USER_SCHEMA_INIT_POOL_MAX_CONNECTIONS,
+            64,
+        );
+        let user_init_pool = MySqlPoolOptions::new()
+            .max_connections(user_init_pool_max)
+            .min_connections(0)
+            .max_lifetime(std::time::Duration::from_secs(3600))
+            .idle_timeout(std::time::Duration::from_secs(300))
+            .acquire_timeout(std::time::Duration::from_secs(30))
+            .connect(&global_url)
+            .await
+            .map_err(db_err)?;
+        tracing::info!(
+            max_connections = user_init_pool_max,
+            "User schema init pool initialized (statement_cache=0)"
+        );
 
         let shared_db_name = parse_db_name(shared_db_url)
             .ok_or_else(|| MemoriaError::Internal("invalid shared_db_url".into()))?;
         let user_init_max: usize = std::env::var("MEMORIA_USER_SCHEMA_INIT_MAX_CONCURRENCY")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(2)
+            .unwrap_or(6)
             .clamp(1, 64);
         let router = Self {
             shared_pool: pool,
+            shared_pool_max_connections: shared_plan.max_connections,
             global_user_pool,
+            global_user_pool_max_connections: global_max,
+            user_init_pool,
             shared_db_url: shared_db_url.to_string(),
             shared_db_name,
             embedding_dim,
@@ -135,8 +182,16 @@ impl DbRouter {
         &self.shared_pool
     }
 
+    pub fn shared_pool_max_connections(&self) -> u32 {
+        self.shared_pool_max_connections
+    }
+
     pub fn global_user_pool(&self) -> &MySqlPool {
         &self.global_user_pool
+    }
+
+    pub fn global_user_pool_max_connections(&self) -> u32 {
+        self.global_user_pool_max_connections
     }
 
     pub fn shared_db_name(&self) -> &str {
@@ -258,6 +313,7 @@ impl DbRouter {
         // fail Send bounds under axum handlers and tokio::spawn.
         let shared_pool = self.shared_pool.clone();
         let global_user_pool = self.global_user_pool.clone();
+        let user_init_pool = self.user_init_pool.clone();
         let shared_db_url = self.shared_db_url.clone();
         let embedding_dim = self.embedding_dim;
         let instance_id = self.instance_id.clone();
@@ -285,17 +341,14 @@ impl DbRouter {
                 .await
                 .map_err(|_| MemoriaError::Internal("user schema init semaphore closed".into()))?;
             if user_schema_cache.get(&user_id_owned).is_none() {
-                let db_url = user_db_url_from_shared(&shared_db_url, &db_name)?;
-                let init_result = match SqlMemoryStore::connect_routed(
-                    &db_url,
+                let init_store = build_routed_store(
+                    user_init_pool.clone(),
+                    &shared_db_url,
                     embedding_dim,
-                    instance_id.clone(),
-                )
-                .await
-                {
-                    Ok(init_store) => init_store.migrate_user().await,
-                    Err(err) => Err(err),
-                };
+                    &instance_id,
+                    &db_name,
+                )?;
+                let init_result = init_store.migrate_user().await;
                 if let Err(err) = init_result {
                     if needs_init {
                         let _ = sqlx::query(
@@ -495,10 +548,187 @@ fn append_url_param(url: &str, param: &str) -> String {
     }
 }
 
+fn configured_shared_pool_plan() -> SharedPoolPlan {
+    let routing_component_max_connections = configured_pool_max_connections(
+        "MEMORIA_SHARED_POOL_MAX_CONNECTIONS",
+        SHARED_POOL_MAX_CONNECTIONS,
+        POOL_MAX_CONNECTIONS_UPPER,
+    );
+    let shared_main_component_max_connections = configured_pool_max_connections(
+        "MEMORIA_SHARED_MAIN_POOL_MAX_CONNECTIONS",
+        SHARED_MAIN_POOL_MAX_CONNECTIONS,
+        POOL_MAX_CONNECTIONS_UPPER,
+    );
+    let git_component_max_connections = configured_pool_max_connections(
+        "MEMORIA_GIT_POOL_MAX_CONNECTIONS",
+        GIT_POOL_MAX_CONNECTIONS,
+        64,
+    );
+    let explicit_override = std::env::var(MERGED_SHARED_POOL_MAX_CONNECTIONS_ENV)
+        .ok()
+        .and_then(|s| s.parse().ok());
+    let max_connections = explicit_override.unwrap_or_else(|| {
+        routing_component_max_connections
+            .saturating_add(shared_main_component_max_connections)
+            .saturating_add(git_component_max_connections)
+            .clamp(1, POOL_MAX_CONNECTIONS_UPPER)
+    });
+    SharedPoolPlan {
+        max_connections,
+        routing_component_max_connections,
+        shared_main_component_max_connections,
+        git_component_max_connections,
+        explicit_override: explicit_override.is_some(),
+    }
+}
+
 fn configured_pool_max_connections(env_name: &str, default: u32, upper: u32) -> u32 {
     std::env::var(env_name)
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(default)
         .clamp(1, upper)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        configured_pool_max_connections, configured_shared_pool_plan, SharedPoolPlan,
+        GIT_POOL_MAX_CONNECTIONS, GLOBAL_USER_POOL_MAX_CONNECTIONS,
+        MERGED_SHARED_POOL_MAX_CONNECTIONS_ENV, POOL_MAX_CONNECTIONS_UPPER,
+        SHARED_MAIN_POOL_MAX_CONNECTIONS, SHARED_POOL_MAX_CONNECTIONS,
+        USER_SCHEMA_INIT_POOL_MAX_CONNECTIONS,
+    };
+    use std::sync::{Mutex, OnceLock};
+
+    static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    fn with_env<F: FnOnce()>(vars: &[(&str, Option<&str>)], f: F) {
+        let _lock = ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        struct EnvGuard(Vec<(String, Option<std::ffi::OsString>)>);
+
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                for (key, old) in &self.0 {
+                    match old {
+                        Some(value) => unsafe { std::env::set_var(key, value) },
+                        None => unsafe { std::env::remove_var(key) },
+                    }
+                }
+            }
+        }
+
+        let _restore = EnvGuard(
+            vars.iter()
+                .map(|(key, value)| {
+                    let old = std::env::var_os(key);
+                    match value {
+                        Some(value) => unsafe { std::env::set_var(key, value) },
+                        None => unsafe { std::env::remove_var(key) },
+                    }
+                    (key.to_string(), old)
+                })
+                .collect(),
+        );
+
+        f();
+    }
+
+    #[test]
+    fn shared_pool_plan_defaults_merge_legacy_components() {
+        with_env(
+            &[
+                ("MEMORIA_SHARED_POOL_MAX_CONNECTIONS", None),
+                ("MEMORIA_SHARED_MAIN_POOL_MAX_CONNECTIONS", None),
+                ("MEMORIA_GIT_POOL_MAX_CONNECTIONS", None),
+                (MERGED_SHARED_POOL_MAX_CONNECTIONS_ENV, None),
+            ],
+            || {
+                assert_eq!(
+                    configured_shared_pool_plan(),
+                    SharedPoolPlan {
+                        max_connections: SHARED_POOL_MAX_CONNECTIONS
+                            + SHARED_MAIN_POOL_MAX_CONNECTIONS
+                            + GIT_POOL_MAX_CONNECTIONS,
+                        routing_component_max_connections: SHARED_POOL_MAX_CONNECTIONS,
+                        shared_main_component_max_connections: SHARED_MAIN_POOL_MAX_CONNECTIONS,
+                        git_component_max_connections: GIT_POOL_MAX_CONNECTIONS,
+                        explicit_override: false,
+                    }
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn shared_pool_plan_honors_explicit_merged_override() {
+        with_env(
+            &[
+                ("MEMORIA_SHARED_POOL_MAX_CONNECTIONS", Some("20")),
+                ("MEMORIA_SHARED_MAIN_POOL_MAX_CONNECTIONS", Some("10")),
+                ("MEMORIA_GIT_POOL_MAX_CONNECTIONS", Some("6")),
+                (MERGED_SHARED_POOL_MAX_CONNECTIONS_ENV, Some("40")),
+            ],
+            || {
+                assert_eq!(
+                    configured_shared_pool_plan(),
+                    SharedPoolPlan {
+                        max_connections: 40,
+                        routing_component_max_connections: 20,
+                        shared_main_component_max_connections: 10,
+                        git_component_max_connections: 6,
+                        explicit_override: true,
+                    }
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn user_pool_defaults_match_budget_split() {
+        with_env(
+            &[
+                ("MEMORIA_GLOBAL_USER_POOL_MAX", None),
+                ("MEMORIA_USER_SCHEMA_INIT_POOL_MAX_CONNECTIONS", None),
+            ],
+            || {
+                assert_eq!(
+                    configured_pool_max_connections(
+                        "MEMORIA_GLOBAL_USER_POOL_MAX",
+                        GLOBAL_USER_POOL_MAX_CONNECTIONS,
+                        POOL_MAX_CONNECTIONS_UPPER,
+                    ),
+                    GLOBAL_USER_POOL_MAX_CONNECTIONS
+                );
+                assert_eq!(
+                    configured_pool_max_connections(
+                        "MEMORIA_USER_SCHEMA_INIT_POOL_MAX_CONNECTIONS",
+                        USER_SCHEMA_INIT_POOL_MAX_CONNECTIONS,
+                        64,
+                    ),
+                    USER_SCHEMA_INIT_POOL_MAX_CONNECTIONS
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn user_schema_init_concurrency_defaults_to_six() {
+        with_env(
+            &[("MEMORIA_USER_SCHEMA_INIT_MAX_CONCURRENCY", None)],
+            || {
+                let user_init_max: usize =
+                    std::env::var("MEMORIA_USER_SCHEMA_INIT_MAX_CONCURRENCY")
+                        .ok()
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(6)
+                        .clamp(1, 64);
+                assert_eq!(user_init_max, 6);
+            },
+        );
+    }
 }

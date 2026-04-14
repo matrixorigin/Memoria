@@ -7,6 +7,8 @@ use crate::rate_limit::RateLimiter;
 use memoria_core::MemoriaError;
 use memoria_git::GitForDataService;
 use memoria_service::{AsyncTaskStore, MemoryService};
+use memoria_storage::store::spawn_pool_monitor;
+use memoria_storage::PoolHealthSnapshot;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -172,7 +174,7 @@ impl AppState {
             let raw: u32 = std::env::var("MEMORIA_AUTH_POOL_MAX_CONNECTIONS")
                 .ok()
                 .and_then(|s| s.parse().ok())
-                .unwrap_or(16);
+                .unwrap_or(12);
             let clamped = raw.clamp(1, AUTH_POOL_MAX_CONNECTIONS_UPPER);
             if clamped != raw {
                 warn!(
@@ -215,6 +217,14 @@ impl AppState {
             max_connections = auth_max_connections,
             acquire_timeout_secs = auth_acquire_timeout.as_secs(),
             "Dedicated auth connection pool initialized"
+        );
+        spawn_pool_monitor(
+            pool.clone(),
+            Some(auth_max_connections),
+            Arc::new(std::sync::Mutex::new(PoolHealthSnapshot::new(Some(
+                auth_max_connections,
+            )))),
+            "auth_pool",
         );
         // Start the batched last_used_at flusher using the auth pool
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());

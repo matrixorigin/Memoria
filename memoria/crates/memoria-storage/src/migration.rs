@@ -5,8 +5,8 @@ use sqlx::{
     mysql::{MySqlPool, MySqlPoolOptions},
     Row,
 };
-use std::collections::BTreeSet;
-use std::sync::Arc;
+use std::collections::{BTreeSet, HashMap};
+use std::sync::{Arc, Mutex, OnceLock};
 
 const MIGRATION_INSTANCE_ID: &str = "migration-cli";
 const MAX_IDENTIFIER_LEN: usize = 64;
@@ -30,6 +30,8 @@ const USER_DISCOVERY_SKIP_TABLES: &[&str] = &[
 ];
 const USER_MIGRATION_SKIP_TABLES: &[&str] =
     &["mem_api_keys", "mem_user_registry", "mem_async_tasks"];
+const DEFAULT_DISCOVERY_POOL_MAX_CONNECTIONS: u32 = 4;
+const MIGRATION_SOURCE_POOL_MAX_CONNECTIONS_UPPER: u32 = 64;
 
 #[derive(Debug, Clone, Default)]
 pub struct LegacyToMultiDbMigrationOptions {
@@ -99,6 +101,100 @@ struct BranchRecord {
     table_name: String,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct SourceSchemaAvailability {
+    has_snapshots: bool,
+    has_user_state: bool,
+    has_branches: bool,
+}
+
+impl SourceSchemaAvailability {
+    async fn load(
+        cache: &MigrationExecutionCache,
+        pool: &MySqlPool,
+        db_name: &str,
+    ) -> Result<Self, MemoriaError> {
+        Ok(Self {
+            has_snapshots: cache
+                .source_table_exists(pool, db_name, "mem_snapshots")
+                .await?,
+            has_user_state: cache
+                .source_table_exists(pool, db_name, "mem_user_state")
+                .await?,
+            has_branches: cache
+                .source_table_exists(pool, db_name, "mem_branches")
+                .await?,
+        })
+    }
+}
+
+#[derive(Debug, Default)]
+struct MigrationExecutionCache {
+    source_table_exists: Mutex<HashMap<String, bool>>,
+    copy_columns: Mutex<HashMap<String, Vec<String>>>,
+    user_target_tables: OnceLock<Vec<String>>,
+}
+
+impl MigrationExecutionCache {
+    async fn source_table_exists(
+        &self,
+        pool: &MySqlPool,
+        db_name: &str,
+        table_name: &str,
+    ) -> Result<bool, MemoriaError> {
+        if let Some(exists) = lock_or_recover(&self.source_table_exists)
+            .get(table_name)
+            .copied()
+        {
+            return Ok(exists);
+        }
+        let exists = table_exists(pool, db_name, table_name).await?;
+        lock_or_recover(&self.source_table_exists).insert(table_name.to_string(), exists);
+        Ok(exists)
+    }
+
+    async fn copy_columns(
+        &self,
+        source_pool: &MySqlPool,
+        source_db: &str,
+        target_pool: &MySqlPool,
+        target_db: &str,
+        table_name: &str,
+    ) -> Result<Vec<String>, MemoriaError> {
+        if let Some(columns) = lock_or_recover(&self.copy_columns).get(table_name).cloned() {
+            return Ok(columns);
+        }
+        let columns = copyable_columns(
+            &list_columns(source_pool, source_db, table_name).await?,
+            &list_columns(target_pool, target_db, table_name).await?,
+            table_name,
+        )?;
+        lock_or_recover(&self.copy_columns).insert(table_name.to_string(), columns.clone());
+        Ok(columns)
+    }
+
+    async fn user_target_tables(
+        &self,
+        target_pool: &MySqlPool,
+        target_db: &str,
+    ) -> Result<Vec<String>, MemoriaError> {
+        if let Some(tables) = self.user_target_tables.get() {
+            return Ok(tables.clone());
+        }
+        let tables = list_tables_with_user_id(target_pool, target_db)
+            .await?
+            .into_iter()
+            .filter(|table| !is_physical_branch_table(table))
+            .collect::<Vec<_>>();
+        let _ = self.user_target_tables.set(tables.clone());
+        Ok(self.user_target_tables.get().cloned().unwrap_or(tables))
+    }
+}
+
+fn lock_or_recover<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 pub async fn plan_legacy_single_db_to_multi_db(
     legacy_db_url: &str,
     shared_db_url: &str,
@@ -166,13 +262,18 @@ async fn run_legacy_single_db_to_multi_db(
 ) -> Result<LegacyToMultiDbMigrationReport, MemoriaError> {
     let legacy_db_name = parse_db_name(legacy_db_url)?;
     let shared_db_name = parse_db_name(shared_db_url)?;
+    let concurrency = options.concurrency.max(1);
     if legacy_db_name == shared_db_name {
         return Err(MemoriaError::Validation(
             "legacy_db_url and shared_db_url must point to different databases".into(),
         ));
     }
 
-    let legacy_pool = connect_pool(legacy_db_url).await?;
+    let legacy_pool = connect_pool_with_max(
+        legacy_db_url,
+        migration_source_pool_max_connections(concurrency),
+    )
+    .await?;
     let mut selected_users = if options.user_ids.is_empty() {
         discover_users(&legacy_pool, &legacy_db_name).await?
     } else {
@@ -180,6 +281,9 @@ async fn run_legacy_single_db_to_multi_db(
     };
     selected_users.sort();
     selected_users.dedup();
+    let cache = Arc::new(MigrationExecutionCache::default());
+    let source_schema =
+        SourceSchemaAvailability::load(cache.as_ref(), &legacy_pool, &legacy_db_name).await?;
 
     let mut warnings = Vec::new();
     if !options.user_ids.is_empty() {
@@ -189,8 +293,13 @@ async fn run_legacy_single_db_to_multi_db(
         );
     }
 
-    let snapshot_violations =
-        collect_active_snapshot_violations(&legacy_pool, &legacy_db_name, &selected_users).await?;
+    let snapshot_violations = collect_active_snapshot_violations(
+        &legacy_pool,
+        &legacy_db_name,
+        &selected_users,
+        source_schema.has_snapshots,
+    )
+    .await?;
     if !snapshot_violations.is_empty() && !dry_run {
         let details = snapshot_violations
             .iter()
@@ -255,12 +364,12 @@ async fn run_legacy_single_db_to_multi_db(
                 shared_db_name.as_str(),
                 table,
                 !dry_run,
+                cache.as_ref(),
             )
             .await?,
         );
     }
 
-    let concurrency = options.concurrency.max(1);
     let mut users = Vec::with_capacity(selected_users.len());
     let report_legacy_db_name = legacy_db_name.clone();
 
@@ -276,7 +385,9 @@ async fn run_legacy_single_db_to_multi_db(
                     &legacy_db_name,
                     router.as_deref(),
                     user_id,
+                    source_schema,
                     !dry_run,
+                    cache.as_ref(),
                 )
                 .await?,
             );
@@ -292,12 +403,23 @@ async fn run_legacy_single_db_to_multi_db(
                     let pool = &legacy_pool;
                     let db_name: &str = &legacy_db_name;
                     let router_ref = router.as_deref();
+                    let source_schema = source_schema;
                     let execute = !dry_run;
+                    let cache = cache.clone();
                     async move {
                         if execute {
                             eprintln!("Migrating user {user_id}");
                         }
-                        let res = migrate_user(pool, db_name, router_ref, user_id, execute).await;
+                        let res = migrate_user(
+                            pool,
+                            db_name,
+                            router_ref,
+                            user_id,
+                            source_schema,
+                            execute,
+                            &cache,
+                        )
+                        .await;
                         (user_id.as_str(), res)
                     }
                 })
@@ -316,6 +438,7 @@ async fn run_legacy_single_db_to_multi_db(
             }
         }
     }
+    users.sort_by(|a, b| a.user_id.cmp(&b.user_id));
 
     Ok(LegacyToMultiDbMigrationReport {
         dry_run,
@@ -338,7 +461,9 @@ async fn migrate_user(
     legacy_db_name: &str,
     router: Option<&DbRouter>,
     user_id: &str,
+    source_schema: SourceSchemaAvailability,
     execute: bool,
+    cache: &MigrationExecutionCache,
 ) -> Result<UserMigrationReport, MemoriaError> {
     let target_db = if execute {
         let router = router
@@ -358,9 +483,20 @@ async fn migrate_user(
     let mut tables = Vec::new();
     let mut branch_tables = Vec::new();
     let mut warnings = Vec::new();
-    let active_branch = fetch_optional_active_branch(legacy_pool, legacy_db_name, user_id).await?;
-    let active_snapshot_count =
-        count_active_snapshots(legacy_pool, legacy_db_name, user_id).await?;
+    let active_branch = fetch_optional_active_branch(
+        legacy_pool,
+        legacy_db_name,
+        user_id,
+        source_schema.has_user_state,
+    )
+    .await?;
+    let active_snapshot_count = count_active_snapshots(
+        legacy_pool,
+        legacy_db_name,
+        user_id,
+        source_schema.has_snapshots,
+    )
+    .await?;
 
     if execute {
         let router = router
@@ -370,17 +506,15 @@ async fn migrate_user(
         let target_url = router.user_db_url(&target_db)?;
         let target_pool = connect_migration_pool(&target_url).await?;
         // Run user-schema migration on the fresh database
-        let tmp_store = SqlMemoryStore::new(
+        let mut tmp_store = SqlMemoryStore::new(
             target_pool.clone(),
             router.embedding_dim(),
             MIGRATION_INSTANCE_ID.into(),
         );
-        tmp_store.migrate_user().await?;
-        let target_tables = list_tables_with_user_id(&target_pool, &target_db)
-            .await?
-            .into_iter()
-            .filter(|table| !is_physical_branch_table(table))
-            .collect::<Vec<_>>();
+        tmp_store.set_db_name(target_db.clone());
+        tmp_store.set_database_url(target_url.clone());
+        tmp_store.migrate_user_fresh().await?;
+        let target_tables = cache.user_target_tables(&target_pool, &target_db).await?;
         for table in target_tables {
             eprintln!("  Copying user table {table}");
             tables.push(
@@ -392,6 +526,7 @@ async fn migrate_user(
                     &table,
                     user_id,
                     true,
+                    cache,
                 )
                 .await?,
             );
@@ -406,11 +541,18 @@ async fn migrate_user(
                 &target_db,
                 user_id,
                 true,
+                cache,
             )
             .await?
         });
 
-        let branches = load_branch_records(legacy_pool, legacy_db_name, user_id).await?;
+        let branches = load_branch_records(
+            legacy_pool,
+            legacy_db_name,
+            user_id,
+            source_schema.has_branches,
+        )
+        .await?;
         for branch in branches {
             eprintln!("  Copying branch table {}", branch.table_name);
             let mut report = copy_branch_table(
@@ -420,6 +562,7 @@ async fn migrate_user(
                 &target_db,
                 &branch.table_name,
                 true,
+                cache,
             )
             .await?;
             report.note = Some(format!("branch '{}'", branch.name));
@@ -457,6 +600,7 @@ async fn migrate_user(
                     &table,
                     user_id,
                     false,
+                    cache,
                 )
                 .await?,
             );
@@ -469,10 +613,18 @@ async fn migrate_user(
                 &target_db,
                 user_id,
                 false,
+                cache,
             )
             .await?,
         );
-        for branch in load_branch_records(legacy_pool, legacy_db_name, user_id).await? {
+        for branch in load_branch_records(
+            legacy_pool,
+            legacy_db_name,
+            user_id,
+            source_schema.has_branches,
+        )
+        .await?
+        {
             branch_tables.push(TableMigrationReport {
                 table_name: branch.table_name.clone(),
                 source_rows: count_all_rows(legacy_pool, legacy_db_name, &branch.table_name)
@@ -495,9 +647,22 @@ async fn migrate_user(
     })
 }
 
+fn migration_source_pool_max_connections(concurrency: usize) -> u32 {
+    concurrency
+        .max(DEFAULT_DISCOVERY_POOL_MAX_CONNECTIONS as usize)
+        .min(MIGRATION_SOURCE_POOL_MAX_CONNECTIONS_UPPER as usize) as u32
+}
+
 async fn connect_pool(database_url: &str) -> Result<MySqlPool, MemoriaError> {
+    connect_pool_with_max(database_url, DEFAULT_DISCOVERY_POOL_MAX_CONNECTIONS).await
+}
+
+async fn connect_pool_with_max(
+    database_url: &str,
+    max_connections: u32,
+) -> Result<MySqlPool, MemoriaError> {
     MySqlPoolOptions::new()
-        .max_connections(4)
+        .max_connections(max_connections)
         .connect(database_url)
         .await
         .map_err(db_err)
@@ -715,13 +880,14 @@ async fn collect_active_snapshot_violations(
     pool: &MySqlPool,
     db_name: &str,
     users: &[String],
+    has_snapshots: bool,
 ) -> Result<Vec<(String, i64)>, MemoriaError> {
-    if users.is_empty() || !table_exists(pool, db_name, "mem_snapshots").await? {
+    if users.is_empty() || !has_snapshots {
         return Ok(vec![]);
     }
     let mut violations = Vec::new();
     for user_id in users {
-        let count = count_active_snapshots(pool, db_name, user_id).await?;
+        let count = count_active_snapshots(pool, db_name, user_id, true).await?;
         if count > 0 {
             violations.push((user_id.clone(), count));
         }
@@ -733,8 +899,9 @@ async fn fetch_optional_active_branch(
     pool: &MySqlPool,
     db_name: &str,
     user_id: &str,
+    has_user_state: bool,
 ) -> Result<Option<String>, MemoriaError> {
-    if !table_exists(pool, db_name, "mem_user_state").await? {
+    if !has_user_state {
         return Ok(None);
     }
     let sql = format!(
@@ -754,8 +921,9 @@ async fn count_active_snapshots(
     pool: &MySqlPool,
     db_name: &str,
     user_id: &str,
+    has_snapshots: bool,
 ) -> Result<i64, MemoriaError> {
-    if !table_exists(pool, db_name, "mem_snapshots").await? {
+    if !has_snapshots {
         return Ok(0);
     }
     let sql = format!(
@@ -773,8 +941,9 @@ async fn load_branch_records(
     pool: &MySqlPool,
     db_name: &str,
     user_id: &str,
+    has_branches: bool,
 ) -> Result<Vec<BranchRecord>, MemoriaError> {
-    if !table_exists(pool, db_name, "mem_branches").await? {
+    if !has_branches {
         return Ok(vec![]);
     }
     let sql = format!(
@@ -803,8 +972,12 @@ async fn copy_shared_table(
     target_db: &str,
     table_name: &str,
     execute: bool,
+    cache: &MigrationExecutionCache,
 ) -> Result<TableMigrationReport, MemoriaError> {
-    if !table_exists(source_pool, source_db, table_name).await? {
+    if !cache
+        .source_table_exists(source_pool, source_db, table_name)
+        .await?
+    {
         return Ok(TableMigrationReport {
             table_name: table_name.to_string(),
             source_rows: 0,
@@ -814,8 +987,8 @@ async fn copy_shared_table(
         });
     }
 
-    let source_rows = count_all_rows(source_pool, source_db, table_name).await?;
     if !execute {
+        let source_rows = count_all_rows(source_pool, source_db, table_name).await?;
         return Ok(TableMigrationReport {
             table_name: table_name.to_string(),
             source_rows,
@@ -825,28 +998,24 @@ async fn copy_shared_table(
         });
     }
 
-    let columns = copyable_columns(
-        &list_columns(source_pool, source_db, table_name).await?,
-        &list_columns(target_pool, target_db, table_name).await?,
-        table_name,
-    )?;
-    if source_rows > 0 {
-        let insert_sql = format!(
-            "INSERT INTO {} ({cols}) SELECT {cols} FROM {}",
-            qualified_table(target_db, table_name),
-            qualified_table(source_db, table_name),
-            cols = column_list(&columns),
-        );
-        sqlx::raw_sql(&insert_sql)
-            .execute(target_pool)
-            .await
-            .map_err(db_err)?;
-    }
-    let target_rows = count_all_rows(target_pool, target_db, table_name).await?;
+    let columns = cache
+        .copy_columns(source_pool, source_db, target_pool, target_db, table_name)
+        .await?;
+    let insert_sql = format!(
+        "INSERT INTO {} ({cols}) SELECT {cols} FROM {}",
+        qualified_table(target_db, table_name),
+        qualified_table(source_db, table_name),
+        cols = column_list(&columns),
+    );
+    let rows_copied = sqlx::raw_sql(&insert_sql)
+        .execute(target_pool)
+        .await
+        .map_err(db_err)?
+        .rows_affected() as i64;
     Ok(TableMigrationReport {
         table_name: table_name.to_string(),
-        source_rows,
-        target_rows: Some(target_rows),
+        source_rows: rows_copied,
+        target_rows: Some(rows_copied),
         status: "copied".to_string(),
         note: None,
     })
@@ -860,8 +1029,12 @@ async fn copy_user_scoped_table(
     table_name: &str,
     user_id: &str,
     execute: bool,
+    cache: &MigrationExecutionCache,
 ) -> Result<TableMigrationReport, MemoriaError> {
-    if !table_exists(source_pool, source_db, table_name).await? {
+    if !cache
+        .source_table_exists(source_pool, source_db, table_name)
+        .await?
+    {
         return Ok(TableMigrationReport {
             table_name: table_name.to_string(),
             source_rows: 0,
@@ -870,8 +1043,8 @@ async fn copy_user_scoped_table(
             note: Some("source table missing".to_string()),
         });
     }
-    let source_rows = count_rows_for_user(source_pool, source_db, table_name, user_id).await?;
     if !execute {
+        let source_rows = count_rows_for_user(source_pool, source_db, table_name, user_id).await?;
         return Ok(TableMigrationReport {
             table_name: table_name.to_string(),
             source_rows,
@@ -881,29 +1054,25 @@ async fn copy_user_scoped_table(
         });
     }
 
-    let columns = copyable_columns(
-        &list_columns(source_pool, source_db, table_name).await?,
-        &list_columns(target_pool, target_db, table_name).await?,
-        table_name,
-    )?;
-    if source_rows > 0 {
-        let quoted_user_id = quote_string_literal(user_id);
-        let insert_sql = format!(
-            "INSERT INTO {} ({cols}) SELECT {cols} FROM {} WHERE user_id = {quoted_user_id}",
-            qualified_table(target_db, table_name),
-            qualified_table(source_db, table_name),
-            cols = column_list(&columns),
-        );
-        sqlx::raw_sql(&insert_sql)
-            .execute(target_pool)
-            .await
-            .map_err(db_err)?;
-    }
-    let target_rows = count_rows_for_user(target_pool, target_db, table_name, user_id).await?;
+    let columns = cache
+        .copy_columns(source_pool, source_db, target_pool, target_db, table_name)
+        .await?;
+    let quoted_user_id = quote_string_literal(user_id);
+    let insert_sql = format!(
+        "INSERT INTO {} ({cols}) SELECT {cols} FROM {} WHERE user_id = {quoted_user_id}",
+        qualified_table(target_db, table_name),
+        qualified_table(source_db, table_name),
+        cols = column_list(&columns),
+    );
+    let rows_copied = sqlx::raw_sql(&insert_sql)
+        .execute(target_pool)
+        .await
+        .map_err(db_err)?
+        .rows_affected() as i64;
     Ok(TableMigrationReport {
         table_name: table_name.to_string(),
-        source_rows,
-        target_rows: Some(target_rows),
+        source_rows: rows_copied,
+        target_rows: Some(rows_copied),
         status: "copied".to_string(),
         note: None,
     })
@@ -916,22 +1085,33 @@ async fn copy_memories_stats_table(
     target_db: &str,
     user_id: &str,
     execute: bool,
+    cache: &MigrationExecutionCache,
 ) -> Result<TableMigrationReport, MemoriaError> {
     let table_name = "mem_memories_stats";
-    if !table_exists(source_pool, source_db, table_name).await?
-        || !table_exists(target_pool, target_db, table_name).await?
+    if !cache
+        .source_table_exists(source_pool, source_db, table_name)
+        .await?
     {
         return Ok(TableMigrationReport {
             table_name: table_name.to_string(),
             source_rows: 0,
             target_rows: None,
             status: "skipped".to_string(),
-            note: Some("source or target table missing".to_string()),
+            note: Some("source table missing".to_string()),
+        });
+    }
+    if !execute && !table_exists(target_pool, target_db, table_name).await? {
+        return Ok(TableMigrationReport {
+            table_name: table_name.to_string(),
+            source_rows: 0,
+            target_rows: None,
+            status: "skipped".to_string(),
+            note: Some("target table missing".to_string()),
         });
     }
 
-    let source_rows = count_memories_stats_rows(source_pool, source_db, user_id).await?;
     if !execute {
+        let source_rows = count_memories_stats_rows(source_pool, source_db, user_id).await?;
         return Ok(TableMigrationReport {
             table_name: table_name.to_string(),
             source_rows,
@@ -941,32 +1121,28 @@ async fn copy_memories_stats_table(
         });
     }
 
-    let columns = copyable_columns(
-        &list_columns(source_pool, source_db, table_name).await?,
-        &list_columns(target_pool, target_db, table_name).await?,
-        table_name,
-    )?;
-    if source_rows > 0 {
-        let quoted_user_id = quote_string_literal(user_id);
-        let insert_sql = format!(
-            "INSERT INTO {} ({cols}) \
-             SELECT {cols} FROM {} s \
-             WHERE EXISTS (SELECT 1 FROM {} m WHERE m.memory_id = s.memory_id AND m.user_id = {quoted_user_id})",
-            qualified_table(target_db, table_name),
-            qualified_table(source_db, table_name),
-            qualified_table(source_db, "mem_memories"),
-            cols = column_list(&columns),
-        );
-        sqlx::raw_sql(&insert_sql)
-            .execute(target_pool)
-            .await
-            .map_err(db_err)?;
-    }
-    let target_rows = count_memories_stats_rows(target_pool, target_db, user_id).await?;
+    let columns = cache
+        .copy_columns(source_pool, source_db, target_pool, target_db, table_name)
+        .await?;
+    let quoted_user_id = quote_string_literal(user_id);
+    let insert_sql = format!(
+        "INSERT INTO {} ({cols}) \
+         SELECT {cols} FROM {} s \
+         WHERE EXISTS (SELECT 1 FROM {} m WHERE m.memory_id = s.memory_id AND m.user_id = {quoted_user_id})",
+        qualified_table(target_db, table_name),
+        qualified_table(source_db, table_name),
+        qualified_table(source_db, "mem_memories"),
+        cols = column_list(&columns),
+    );
+    let rows_copied = sqlx::raw_sql(&insert_sql)
+        .execute(target_pool)
+        .await
+        .map_err(db_err)?
+        .rows_affected() as i64;
     Ok(TableMigrationReport {
         table_name: table_name.to_string(),
-        source_rows,
-        target_rows: Some(target_rows),
+        source_rows: rows_copied,
+        target_rows: Some(rows_copied),
         status: "copied".to_string(),
         note: Some("matched by memory_id ownership".to_string()),
     })
@@ -979,14 +1155,18 @@ async fn copy_branch_table(
     target_db: &str,
     table_name: &str,
     execute: bool,
+    cache: &MigrationExecutionCache,
 ) -> Result<TableMigrationReport, MemoriaError> {
-    if !table_exists(source_pool, source_db, table_name).await? {
+    if !cache
+        .source_table_exists(source_pool, source_db, table_name)
+        .await?
+    {
         return Err(MemoriaError::Validation(format!(
             "branch table '{table_name}' is registered but missing in source database"
         )));
     }
-    let source_rows = count_all_rows(source_pool, source_db, table_name).await?;
     if !execute {
+        let source_rows = count_all_rows(source_pool, source_db, table_name).await?;
         return Ok(TableMigrationReport {
             table_name: table_name.to_string(),
             source_rows,
@@ -1026,28 +1206,24 @@ async fn copy_branch_table(
             .map_err(db_err)?;
     }
 
-    let columns = copyable_columns(
-        &list_columns(source_pool, source_db, table_name).await?,
-        &list_columns(target_pool, target_db, table_name).await?,
-        table_name,
-    )?;
-    if source_rows > 0 {
-        let insert_sql = format!(
-            "INSERT INTO {} ({cols}) SELECT {cols} FROM {}",
-            qualified_table(target_db, table_name),
-            qualified_table(source_db, table_name),
-            cols = column_list(&columns),
-        );
-        sqlx::raw_sql(&insert_sql)
-            .execute(target_pool)
-            .await
-            .map_err(db_err)?;
-    }
-    let target_rows = count_all_rows(target_pool, target_db, table_name).await?;
+    let columns = cache
+        .copy_columns(source_pool, source_db, target_pool, target_db, table_name)
+        .await?;
+    let insert_sql = format!(
+        "INSERT INTO {} ({cols}) SELECT {cols} FROM {}",
+        qualified_table(target_db, table_name),
+        qualified_table(source_db, table_name),
+        cols = column_list(&columns),
+    );
+    let rows_copied = sqlx::raw_sql(&insert_sql)
+        .execute(target_pool)
+        .await
+        .map_err(db_err)?
+        .rows_affected() as i64;
     Ok(TableMigrationReport {
         table_name: table_name.to_string(),
-        source_rows,
-        target_rows: Some(target_rows),
+        source_rows: rows_copied,
+        target_rows: Some(rows_copied),
         status: "copied".to_string(),
         note: None,
     })
@@ -1273,10 +1449,11 @@ fn is_unknown_database_error_message(message: &str, db_name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_runtime_topology, copyable_columns, pre_execute_account_snapshot_name,
-        quote_ident, sanitize_identifier_fragment, ColumnSpec, PendingLegacyMultiDbMigration,
-        RuntimeTopology, MAX_IDENTIFIER_LEN, PRE_EXECUTE_ACCOUNT_SNAPSHOT_PREFIX,
-        PRE_EXECUTE_ACCOUNT_SNAPSHOT_SUFFIX_LEN,
+        classify_runtime_topology, copyable_columns, migration_source_pool_max_connections,
+        pre_execute_account_snapshot_name, quote_ident, sanitize_identifier_fragment, ColumnSpec,
+        PendingLegacyMultiDbMigration, RuntimeTopology, DEFAULT_DISCOVERY_POOL_MAX_CONNECTIONS,
+        MAX_IDENTIFIER_LEN, MIGRATION_SOURCE_POOL_MAX_CONNECTIONS_UPPER,
+        PRE_EXECUTE_ACCOUNT_SNAPSHOT_PREFIX, PRE_EXECUTE_ACCOUNT_SNAPSHOT_SUFFIX_LEN,
     };
     use std::collections::BTreeSet;
 
@@ -1394,5 +1571,18 @@ mod tests {
         assert!(name.starts_with(PRE_EXECUTE_ACCOUNT_SNAPSHOT_PREFIX));
         let suffix = name.rsplit('_').next().expect("snapshot suffix");
         assert_eq!(suffix.len(), PRE_EXECUTE_ACCOUNT_SNAPSHOT_SUFFIX_LEN);
+    }
+
+    #[test]
+    fn migration_source_pool_scales_with_concurrency() {
+        assert_eq!(
+            migration_source_pool_max_connections(1),
+            DEFAULT_DISCOVERY_POOL_MAX_CONNECTIONS
+        );
+        assert_eq!(migration_source_pool_max_connections(6), 6);
+        assert_eq!(
+            migration_source_pool_max_connections(256),
+            MIGRATION_SOURCE_POOL_MAX_CONNECTIONS_UPPER
+        );
     }
 }
