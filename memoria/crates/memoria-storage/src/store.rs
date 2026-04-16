@@ -583,12 +583,14 @@ fn uuid7_id() -> String {
 fn sanitize_sql_literal(s: &str) -> String {
     s.chars()
         .filter(|c| *c != '\0')
-        .map(|c| match c {
-            '\'' => ' ',
-            '\\' => ' ',
-            _ => c,
+        .fold(String::with_capacity(s.len()), |mut out, c| {
+            match c {
+                '\'' => out.push_str("''"),
+                '\\' => out.push_str("\\\\"),
+                _ => out.push(c),
+            }
+            out
         })
-        .collect()
 }
 
 /// Sanitize a string for use inside MATCH ... AGAINST('...' IN BOOLEAN MODE).
@@ -4574,11 +4576,11 @@ impl SqlMemoryStore {
                AND MATCH(content) AGAINST('{safe}' IN BOOLEAN MODE) \
              ORDER BY ft_score DESC LIMIT ?"
         );
-        let mut query = sqlx::query(&sql).bind(user_id);
+        let mut stmt = sqlx::query(&sql).bind(user_id);
         if let Some(session_id) = session_id {
-            query = query.bind(session_id);
+            stmt = stmt.bind(session_id);
         }
-        let rows = match query.bind(limit).fetch_all(&self.pool).await {
+        let rows = match stmt.bind(limit).fetch_all(&self.pool).await {
             Ok(rows) => rows,
             Err(e) => {
                 // MatrixOne returns 20101 when the search string tokenizes to an empty pattern
@@ -4640,6 +4642,7 @@ impl SqlMemoryStore {
     }
 
     /// Vector search with optional memory_type and strict session pre-filter.
+    #[allow(clippy::too_many_arguments)]
     pub async fn search_vector_from_filtered_scoped(
         &self,
         table: &str,
@@ -4773,6 +4776,7 @@ impl SqlMemoryStore {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn search_hybrid_from_scored_scoped(
         &self,
         table: &str,

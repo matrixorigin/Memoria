@@ -211,6 +211,13 @@ pub async fn retrieve(
     AuthUser { user_id, .. }: AuthUser,
     Json(req): Json<RetrieveRequest>,
 ) -> ApiResult<serde_json::Value> {
+    if req.session_id.is_none() && (req.filter_session == Some(true) || !req.include_cross_session)
+    {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "session_id is required for strict session retrieval".to_string(),
+        ));
+    }
     let top_k = req.top_k.clamp(1, 100);
     let level = memoria_service::ExplainLevel::from_str_or_bool(&req.explain);
     let retrieve_options = req.retrieve_options();

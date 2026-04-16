@@ -2555,7 +2555,7 @@ async fn spawn_server_with_custom_embedder_and_pool(
         .await
         .expect("connect");
     store.migrate().await.expect("migrate");
-    let pool = sqlx::MySqlPool::connect(&db).await.expect("pool");
+    let pool = store.pool().clone();
     let git = Arc::new(GitForDataService::new(pool.clone(), &cfg.db_name));
     let service =
         Arc::new(MemoryService::new_sql_with_llm(Arc::new(store), Some(embedder), None).await);
@@ -3309,6 +3309,38 @@ async fn test_retrieve_filter_session_prefilters_and_skips_graph() {
         Some(target_mid.as_str()),
         "legacy include_cross_session=false should keep strict session semantics",
     );
+}
+
+#[tokio::test]
+async fn test_retrieve_filter_session_requires_session_id() {
+    let (base, client) = spawn_server().await;
+    let user = uid();
+
+    let r = client
+        .post(format!("{base}/v1/memories/retrieve"))
+        .header("X-User-Id", &user)
+        .json(&json!({
+            "query": "strict session query",
+            "filter_session": true,
+            "top_k": 1
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 422);
+
+    let r = client
+        .post(format!("{base}/v1/memories/retrieve"))
+        .header("X-User-Id", &user)
+        .json(&json!({
+            "query": "strict session query",
+            "include_cross_session": false,
+            "top_k": 1
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 422);
 }
 
 #[tokio::test]

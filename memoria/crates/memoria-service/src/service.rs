@@ -63,11 +63,7 @@ impl RetrieveOptions {
         filter_session: Option<bool>,
         include_cross_session: Option<bool>,
     ) -> Self {
-        let strict_session = filter_session.unwrap_or_else(|| {
-            include_cross_session
-                .map(|include| !include)
-                .unwrap_or(false)
-        });
+        let strict_session = filter_session == Some(true) || include_cross_session == Some(false);
         Self {
             strict_session_id: session_id.filter(|_| strict_session).map(str::to_string),
         }

@@ -108,11 +108,17 @@ impl RemoteClient {
                     "session_id": args["session_id"],
                 });
                 if name == "memory_retrieve" {
-                    if let Some(filter_session) = args.get("filter_session") {
-                        payload["filter_session"] = filter_session.clone();
+                    if let Some(filter_session) = args
+                        .get("filter_session")
+                        .and_then(serde_json::Value::as_bool)
+                    {
+                        payload["filter_session"] = json!(filter_session);
                     }
-                    if let Some(include_cross_session) = args.get("include_cross_session") {
-                        payload["include_cross_session"] = include_cross_session.clone();
+                    if let Some(include_cross_session) = args
+                        .get("include_cross_session")
+                        .and_then(serde_json::Value::as_bool)
+                    {
+                        payload["include_cross_session"] = json!(include_cross_session);
                     }
                 }
                 let r = self
