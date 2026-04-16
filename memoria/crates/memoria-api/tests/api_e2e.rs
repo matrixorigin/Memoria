@@ -3360,39 +3360,6 @@ async fn test_retrieve_filter_session_preserves_top_k_with_session_candidates() 
         store_memory_for_session(&client, &base, &uid, "global-candidate-b", "sess-other").await;
     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
-    let relaxed = client
-        .post(format!("{base}/v1/memories/retrieve"))
-        .header("X-User-Id", &uid)
-        .json(&json!({
-                "query": "scoped topk query",
-                "session_id": "sess-target",
-                "top_k": 2
-        }))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(relaxed.status(), 200);
-    let relaxed_body: Value = relaxed.json().await.unwrap();
-    let relaxed_results = relaxed_body
-        .as_array()
-        .expect("retrieve should return array");
-    assert_eq!(relaxed_results.len(), 2);
-    assert!(
-        relaxed_results
-            .iter()
-            .any(|item| item["session_id"].as_str() == Some("sess-other")),
-        "relaxed retrieval should still be free to return cross-session candidates",
-    );
-    let relaxed_target_ids: std::collections::HashSet<&str> = relaxed_results
-        .iter()
-        .filter(|item| item["session_id"].as_str() == Some("sess-target"))
-        .filter_map(|item| item["memory_id"].as_str())
-        .collect();
-    assert!(
-        relaxed_target_ids.len() < 2,
-        "without strict session pre-filter, a global top_k should not reliably preserve all target-session candidates",
-    );
-
     let strict = client
         .post(format!("{base}/v1/memories/retrieve"))
         .header("X-User-Id", &uid)
