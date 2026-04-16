@@ -371,38 +371,51 @@ pub async fn purge_memories(
     AuthUser { user_id, is_master }: AuthUser,
     Json(req): Json<PurgeRequest>,
 ) -> ApiResult<PurgeResponse> {
-    let result = if let Some(ids) = &req.memory_ids {
-        if !is_master {
-            for id in ids {
-                let mem = state
-                    .service
-                    .get_for_user(&user_id, id)
-                    .await
-                    .map_err(api_err)?
-                    .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Memory not found: {id}")))?;
-                if mem.user_id != user_id {
-                    return Err((StatusCode::FORBIDDEN, format!("Not your memory: {id}")));
+    let selector = req
+        .selector()
+        .map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e))?;
+    let result = match selector {
+        PurgeSelector::MemoryIds(ids) => {
+            if !is_master {
+                for id in &ids {
+                    let mem = state
+                        .service
+                        .get_for_user(&user_id, id)
+                        .await
+                        .map_err(api_err)?
+                        .ok_or_else(|| {
+                            (StatusCode::NOT_FOUND, format!("Memory not found: {id}"))
+                        })?;
+                    if mem.user_id != user_id {
+                        return Err((StatusCode::FORBIDDEN, format!("Not your memory: {id}")));
+                    }
                 }
             }
+            let id_refs: Vec<&str> = ids.iter().map(|s| s.as_str()).collect();
+            state
+                .service
+                .purge_batch(&user_id, &id_refs)
+                .await
+                .map_err(api_err)?
         }
-        let id_refs: Vec<&str> = ids.iter().map(|s| s.as_str()).collect();
-        state
+        PurgeSelector::Topic(topic) => state
             .service
-            .purge_batch(&user_id, &id_refs)
+            .purge_by_topic(&user_id, &topic)
             .await
-            .map_err(api_err)?
-    } else if let Some(topic) = &req.topic {
-        state
+            .map_err(api_err)?,
+        PurgeSelector::Session {
+            session_id,
+            memory_types,
+        } => state
             .service
-            .purge_by_topic(&user_id, topic)
+            .purge_by_session_id(&user_id, &session_id, memory_types.as_deref())
             .await
-            .map_err(api_err)?
-    } else {
-        memoria_service::PurgeResult {
+            .map_err(api_err)?,
+        PurgeSelector::None => memoria_service::PurgeResult {
             purged: 0,
             snapshot_name: None,
             warning: None,
-        }
+        },
     };
     Ok(Json(PurgeResponse {
         purged: result.purged,

@@ -12,6 +12,13 @@ pub struct RemoteClient {
     user_id: String,
 }
 
+struct MemoryPurgeArgs {
+    memory_id: Option<String>,
+    topic: Option<String>,
+    session_id: Option<String>,
+    memory_types: Option<Vec<String>>,
+}
+
 impl RemoteClient {
     pub fn new(api_url: &str, token: Option<&str>, user_id: String, tool: Option<&str>) -> Self {
         let mut headers = reqwest::header::HeaderMap::new();
@@ -72,6 +79,57 @@ impl RemoteClient {
             body
         };
         anyhow::bail!("API error {status}: {msg}")
+    }
+
+    fn parse_memory_purge_args(args: &Value) -> Result<MemoryPurgeArgs> {
+        let memory_id = args["memory_id"]
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let topic = args["topic"]
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let session_id = args["session_id"]
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let memory_types = match args.get("memory_types") {
+            None | Some(Value::Null) => None,
+            Some(Value::Array(values)) => Some(
+                values
+                    .iter()
+                    .map(|value| {
+                        value
+                            .as_str()
+                            .map(str::to_string)
+                            .ok_or_else(|| anyhow::anyhow!("memory_types entries must be strings"))
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+            ),
+            Some(_) => return Err(anyhow::anyhow!("memory_types must be an array of strings")),
+        }
+        .filter(|types| !types.is_empty());
+        if memory_types.is_some() && session_id.is_none() {
+            return Err(anyhow::anyhow!("memory_types requires session_id"));
+        }
+        let selector_count = usize::from(memory_id.is_some())
+            + usize::from(topic.is_some())
+            + usize::from(session_id.is_some());
+        if selector_count > 1 {
+            return Err(anyhow::anyhow!(
+                "Provide only one of memory_id, topic, or session_id"
+            ));
+        }
+        Ok(MemoryPurgeArgs {
+            memory_id,
+            topic,
+            session_id,
+            memory_types,
+        })
     }
 
     pub async fn call(&self, name: &str, args: Value) -> Result<Value> {
@@ -176,9 +234,8 @@ impl RemoteClient {
             }
 
             "memory_purge" => {
-                let memory_id = args["memory_id"].as_str().unwrap_or("");
-                let topic = args["topic"].as_str().unwrap_or("");
-                if !memory_id.is_empty() {
+                let purge_args = Self::parse_memory_purge_args(&args)?;
+                if let Some(memory_id) = purge_args.memory_id {
                     let ids: Vec<&str> = memory_id
                         .split(',')
                         .map(str::trim)
@@ -196,7 +253,7 @@ impl RemoteClient {
                         "Purged {} memory(s)",
                         body["purged"].as_i64().unwrap_or(count as i64)
                     )))
-                } else if !topic.is_empty() {
+                } else if let Some(topic) = purge_args.topic {
                     let r = self
                         .client
                         .post(self.url("/v1/memories/purge"))
@@ -208,8 +265,24 @@ impl RemoteClient {
                         "Purged {} memory(s) matching '{topic}'",
                         body["purged"].as_i64().unwrap_or(0)
                     )))
+                } else if let Some(session_id) = purge_args.session_id {
+                    let r = self
+                        .client
+                        .post(self.url("/v1/memories/purge"))
+                        .json(&json!({
+                            "session_id": session_id,
+                            "memory_types": purge_args.memory_types,
+                        }))
+                        .send()
+                        .await?;
+                    let body = Self::parse_response(r).await?;
+                    Ok(Self::mcp_text(&format!(
+                        "Purged {} memory(s) for session '{}'",
+                        body["purged"].as_i64().unwrap_or(0),
+                        session_id
+                    )))
                 } else {
-                    Ok(Self::mcp_text("Provide memory_id or topic"))
+                    Ok(Self::mcp_text("Provide memory_id, topic, or session_id"))
                 }
             }
 

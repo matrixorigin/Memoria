@@ -396,6 +396,63 @@ async fn test_purge_topic() {
     println!("✅ purge topic 'rust': {t}");
 }
 
+// ── 12b. memory_purge: exact session cleanup with memory_types filter ─────────
+
+#[tokio::test]
+async fn test_purge_session_id_with_memory_types() {
+    let (svc, uid) = setup().await;
+    let target_session = format!("session:test-smp-{}", Uuid::new_v4().simple());
+    let other_session = format!("session:test-smp-{}", Uuid::new_v4().simple());
+
+    call(
+        "memory_store",
+        json!({"content": "local working alpha", "memory_type": "working", "session_id": target_session}),
+        &svc,
+        &uid,
+    )
+    .await;
+    call(
+        "memory_store",
+        json!({"content": "local working beta", "memory_type": "working", "session_id": target_session}),
+        &svc,
+        &uid,
+    )
+    .await;
+    call(
+        "memory_store",
+        json!({"content": "local semantic keep", "memory_type": "semantic", "session_id": target_session}),
+        &svc,
+        &uid,
+    )
+    .await;
+    call(
+        "memory_store",
+        json!({"content": "local other keep", "memory_type": "working", "session_id": other_session}),
+        &svc,
+        &uid,
+    )
+    .await;
+
+    let r = call(
+        "memory_purge",
+        json!({"session_id": target_session, "memory_types": ["working"]}),
+        &svc,
+        &uid,
+    )
+    .await;
+    let t = text(&r);
+    assert!(t.contains("Purged 2"), "{t}");
+
+    let active = svc.list_active(&uid, 10).await.unwrap();
+    let contents: Vec<&str> = active.iter().map(|m| m.content.as_str()).collect();
+    assert_eq!(active.len(), 2);
+    assert!(contents.contains(&"local semantic keep"));
+    assert!(contents.contains(&"local other keep"));
+    assert!(!contents.contains(&"local working alpha"));
+    assert!(!contents.contains(&"local working beta"));
+    println!("✅ purge session_id with memory_types: {t}");
+}
+
 // ── 13. memory_purge: no target returns error ─────────────────────────────────
 
 #[tokio::test]

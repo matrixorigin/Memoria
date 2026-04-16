@@ -1943,23 +1943,16 @@ impl MemoryService {
             let (snap, warning) = sql.create_safety_snapshot("purge").await;
             let table = sql.active_table(user_id).await?;
             let ids = sql.find_ids_by_topic(&table, user_id, topic).await?;
-            if !ids.is_empty() {
-                // Batch soft-delete in chunks
-                sql.soft_delete_batch_from(&table, &ids).await?;
-                // Batch entity cleanup
-                sql.cleanup_entity_data_batch(&ids).await;
-            }
             let reason = format!("topic:{topic}");
-            for id in &ids {
-                self.send_edit_log(
-                    user_id,
-                    "purge",
-                    Some(id.as_str()),
-                    None,
-                    &reason,
-                    snap.as_deref(),
-                );
-            }
+            self.purge_sql_ids(
+                user_id,
+                sql.as_ref(),
+                &table,
+                &ids,
+                &reason,
+                snap.as_deref(),
+            )
+            .await?;
             Ok(PurgeResult {
                 purged: ids.len(),
                 snapshot_name: snap,
@@ -1972,6 +1965,80 @@ impl MemoryService {
                 warning: None,
             })
         }
+    }
+
+    pub async fn purge_by_session_id(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        memory_types: Option<&[MemoryType]>,
+    ) -> Result<PurgeResult, MemoriaError> {
+        if self.sql_store.is_some() {
+            let sql = self.user_sql_store(user_id).await?;
+            let (snap, warning) = sql.create_safety_snapshot("purge").await;
+            let table = sql.active_table(user_id).await?;
+            let ids = sql
+                .find_ids_by_session_id(&table, user_id, session_id, memory_types)
+                .await?;
+            let reason = format!("session:{session_id}");
+            self.purge_sql_ids(
+                user_id,
+                sql.as_ref(),
+                &table,
+                &ids,
+                &reason,
+                snap.as_deref(),
+            )
+            .await?;
+            Ok(PurgeResult {
+                purged: ids.len(),
+                snapshot_name: snap,
+                warning,
+            })
+        } else {
+            let mut memories = self.store.list_active(user_id, 10_000).await?;
+            memories.retain(|memory| memory.session_id.as_deref() == Some(session_id));
+            if let Some(memory_types) = memory_types {
+                memories.retain(|memory| memory_types.contains(&memory.memory_type));
+            }
+            for memory in &memories {
+                self.store.soft_delete(&memory.memory_id).await?;
+            }
+            Ok(PurgeResult {
+                purged: memories.len(),
+                snapshot_name: None,
+                warning: None,
+            })
+        }
+    }
+
+    async fn purge_sql_ids(
+        &self,
+        user_id: &str,
+        sql: &SqlMemoryStore,
+        table: &str,
+        ids: &[String],
+        reason: &str,
+        snapshot_name: Option<&str>,
+    ) -> Result<(), MemoriaError> {
+        if !ids.is_empty() {
+            sql.soft_delete_batch_from(table, ids).await?;
+            sql.cleanup_entity_data_batch(ids).await;
+        }
+        for id in ids {
+            self.send_edit_log(
+                user_id,
+                "purge",
+                Some(id.as_str()),
+                None,
+                reason,
+                snapshot_name,
+            );
+            self.report(StatsEvent::MemoryDeactivated {
+                user_id: user_id.to_string(),
+            });
+        }
+        Ok(())
     }
 
     pub async fn get(&self, memory_id: &str) -> Result<Option<Memory>, MemoriaError> {

@@ -49,7 +49,7 @@ Do NOT call `memory_store` for:
 `working` memories are session-scoped temporary context. They **persist and will be retrieved in future sessions** unless explicitly cleaned up.
 
 **When to purge working memories:**
-- Task or debug session is complete → `memory_purge(topic="<task keyword>", reason="task complete")`
+- Task or debug session is complete → `memory_purge(session_id="<session_id>", memory_types=["working"], reason="task complete")`
 - You stored a working memory that turned out to be wrong → `memory_purge(memory_id="...", reason="incorrect conclusion")`
 - User says "start fresh", "forget what we tried", "let's try a different approach"
 - Only purge completed tasks — leave active task working memories for next session

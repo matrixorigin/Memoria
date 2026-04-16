@@ -2454,6 +2454,75 @@ async fn test_remote_purge_by_topic() {
     println!("✅ remote purge by topic: {t}");
 }
 
+#[tokio::test]
+async fn test_remote_purge_by_session_id() {
+    use memoria_mcp::remote::RemoteClient;
+    let (base, _) = spawn_api_for_remote().await;
+    let uid = uid();
+    let remote = RemoteClient::new(&base, None, uid.clone(), None);
+    let target_session = format!("session:test-smp-{}", uuid::Uuid::new_v4().simple());
+    let other_session = format!("session:test-smp-{}", uuid::Uuid::new_v4().simple());
+
+    remote
+        .call(
+            "memory_store",
+            json!({"content": "remote working alpha", "memory_type": "working", "session_id": target_session}),
+        )
+        .await
+        .unwrap();
+    remote
+        .call(
+            "memory_store",
+            json!({"content": "remote working beta", "memory_type": "working", "session_id": target_session}),
+        )
+        .await
+        .unwrap();
+    remote
+        .call(
+            "memory_store",
+            json!({"content": "remote semantic keep", "memory_type": "semantic", "session_id": target_session}),
+        )
+        .await
+        .unwrap();
+    remote
+        .call(
+            "memory_store",
+            json!({"content": "remote other keep", "memory_type": "working", "session_id": other_session}),
+        )
+        .await
+        .unwrap();
+
+    let r = remote
+        .call(
+            "memory_purge",
+            json!({"session_id": target_session, "memory_types": ["working"]}),
+        )
+        .await
+        .unwrap();
+    let t = r["content"][0]["text"].as_str().unwrap_or("");
+    assert!(t.contains("Purged 2"), "got: {t}");
+
+    let list = remote
+        .call("memory_list", json!({"limit": 10}))
+        .await
+        .unwrap();
+    let list_text = list["content"][0]["text"].as_str().unwrap_or("");
+    assert!(
+        list_text.contains("remote semantic keep"),
+        "got: {list_text}"
+    );
+    assert!(list_text.contains("remote other keep"), "got: {list_text}");
+    assert!(
+        !list_text.contains("remote working alpha"),
+        "got: {list_text}"
+    );
+    assert!(
+        !list_text.contains("remote working beta"),
+        "got: {list_text}"
+    );
+    println!("✅ remote purge by session_id: {t}");
+}
+
 // ── Episodic memory tests ─────────────────────────────────────────────────────
 
 #[tokio::test]

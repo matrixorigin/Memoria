@@ -5,7 +5,7 @@ use memoria_core::{
     interfaces::MemoryStore, nullable_str, nullable_str_from_row, MemoriaError, Memory, MemoryType,
     TrustTier,
 };
-use sqlx::{mysql::MySqlPool, Row};
+use sqlx::{mysql::MySqlPool, MySql, QueryBuilder, Row};
 use std::borrow::Cow;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
@@ -4530,6 +4530,37 @@ impl SqlMemoryStore {
             .await
             .map_err(db_err)?;
         Ok(rows.into_iter().map(|r| r.0).collect())
+    }
+
+    pub async fn find_ids_by_session_id(
+        &self,
+        table: &str,
+        user_id: &str,
+        session_id: &str,
+        memory_types: Option<&[MemoryType]>,
+    ) -> Result<Vec<String>, MemoriaError> {
+        let mut conn = self.conn().await?;
+        let mut query_builder: QueryBuilder<MySql> =
+            QueryBuilder::new(format!("SELECT memory_id FROM {table} WHERE user_id = "));
+        query_builder
+            .push_bind(user_id)
+            .push(" AND session_id = ")
+            .push_bind(session_id)
+            .push(" AND is_active = 1");
+        if let Some(memory_types) = memory_types.filter(|types| !types.is_empty()) {
+            query_builder.push(" AND memory_type IN (");
+            let mut separated = query_builder.separated(", ");
+            for memory_type in memory_types {
+                separated.push_bind(memory_type.to_string());
+            }
+            separated.push_unseparated(")");
+        }
+        let rows = query_builder
+            .build_query_as::<(String,)>()
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(db_err)?;
+        Ok(rows.into_iter().map(|row| row.0).collect())
     }
 
     #[tracing::instrument(skip(self))]

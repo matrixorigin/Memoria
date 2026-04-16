@@ -218,6 +218,51 @@ async fn test_list_active_excludes_deleted() {
 }
 
 #[tokio::test]
+async fn test_purge_by_session_id_filters_memory_type() {
+    let svc = make_service();
+    for (content, memory_type, session_id) in [
+        (
+            "remove working a",
+            MemoryType::Working,
+            Some("sess-target".to_string()),
+        ),
+        (
+            "remove working b",
+            MemoryType::Working,
+            Some("sess-target".to_string()),
+        ),
+        (
+            "keep semantic",
+            MemoryType::Semantic,
+            Some("sess-target".to_string()),
+        ),
+        (
+            "keep other session",
+            MemoryType::Working,
+            Some("sess-other".to_string()),
+        ),
+    ] {
+        svc.store_memory("u1", content, memory_type, session_id, None, None, None)
+            .await
+            .unwrap();
+    }
+
+    let memory_types = [MemoryType::Working];
+    let result = svc
+        .purge_by_session_id("u1", "sess-target", Some(&memory_types))
+        .await
+        .unwrap();
+    assert_eq!(result.purged, 2);
+
+    let list = svc.list_active("u1", 10).await.unwrap();
+    let contents: Vec<&str> = list.iter().map(|m| m.content.as_str()).collect();
+    assert_eq!(list.len(), 2);
+    assert!(contents.contains(&"keep semantic"));
+    assert!(contents.contains(&"keep other session"));
+    println!("✅ purge_by_session_id filters working memories only");
+}
+
+#[tokio::test]
 async fn test_memory_types() {
     let svc = make_service();
     for mt in [

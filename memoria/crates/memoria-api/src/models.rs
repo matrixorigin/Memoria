@@ -92,7 +92,69 @@ pub struct CorrectByQueryRequest {
 pub struct PurgeRequest {
     pub memory_ids: Option<Vec<String>>,
     pub topic: Option<String>,
+    pub session_id: Option<String>,
+    pub memory_types: Option<Vec<String>>,
     pub reason: Option<String>,
+}
+
+pub enum PurgeSelector {
+    MemoryIds(Vec<String>),
+    Topic(String),
+    Session {
+        session_id: String,
+        memory_types: Option<Vec<MemoryType>>,
+    },
+    None,
+}
+
+impl PurgeRequest {
+    pub fn selector(&self) -> Result<PurgeSelector, String> {
+        let topic = self
+            .topic
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let session_id = self
+            .session_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        if self.memory_types.is_some() && session_id.is_none() {
+            return Err("memory_types requires session_id".to_string());
+        }
+
+        let selector_count = usize::from(self.memory_ids.is_some())
+            + usize::from(topic.is_some())
+            + usize::from(session_id.is_some());
+        if selector_count > 1 {
+            return Err("provide only one of memory_ids, topic, or session_id".to_string());
+        }
+
+        if let Some(ids) = &self.memory_ids {
+            return Ok(PurgeSelector::MemoryIds(ids.clone()));
+        }
+        if let Some(topic) = topic {
+            return Ok(PurgeSelector::Topic(topic.to_string()));
+        }
+        if let Some(session_id) = session_id {
+            let memory_types = self
+                .memory_types
+                .as_ref()
+                .map(|types| {
+                    types
+                        .iter()
+                        .map(|memory_type| parse_memory_type(memory_type))
+                        .collect::<Result<Vec<_>, _>>()
+                })
+                .transpose()?
+                .filter(|types| !types.is_empty());
+            return Ok(PurgeSelector::Session {
+                session_id: session_id.to_string(),
+                memory_types,
+            });
+        }
+        Ok(PurgeSelector::None)
+    }
 }
 
 #[derive(Serialize)]

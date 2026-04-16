@@ -51,6 +51,13 @@ enum ToolCallName {
     Unknown(String),
 }
 
+struct MemoryPurgeArgs {
+    memory_id: Option<String>,
+    topic: Option<String>,
+    session_id: Option<String>,
+    memory_types: Option<Vec<MemoryType>>,
+}
+
 const MEMORY_STORE_DESCRIPTION: &str = concat!(
     "Store a new memory. Set trust_tier explicitly when certainty matters: ",
     "T1 for directly stated or explicitly confirmed facts/preferences/decisions, ",
@@ -66,6 +73,59 @@ const TRUST_TIER_DESCRIPTION: &str = concat!(
     "prefer T3 if unsure. ",
     "T4 = speculative, reflective, or otherwise unverified hypothesis."
 );
+
+fn parse_memory_purge_args(args: &Value) -> Result<MemoryPurgeArgs> {
+    let memory_id = args["memory_id"]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let topic = args["topic"]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let session_id = args["session_id"]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let memory_types = match args.get("memory_types") {
+        None | Some(Value::Null) => None,
+        Some(Value::Array(values)) => Some(
+            values
+                .iter()
+                .map(|value| {
+                    value
+                        .as_str()
+                        .ok_or_else(|| anyhow::anyhow!("memory_types entries must be strings"))
+                        .and_then(|value| {
+                            MemoryType::from_str(value).map_err(|e| anyhow::anyhow!("{e}"))
+                        })
+                })
+                .collect::<Result<Vec<_>>>()?,
+        ),
+        Some(_) => return Err(anyhow::anyhow!("memory_types must be an array of strings")),
+    }
+    .filter(|types| !types.is_empty());
+    if memory_types.is_some() && session_id.is_none() {
+        return Err(anyhow::anyhow!("memory_types requires session_id"));
+    }
+    let selector_count = usize::from(memory_id.is_some())
+        + usize::from(topic.is_some())
+        + usize::from(session_id.is_some());
+    if selector_count > 1 {
+        return Err(anyhow::anyhow!(
+            "Provide only one of memory_id, topic, or session_id"
+        ));
+    }
+    Ok(MemoryPurgeArgs {
+        memory_id,
+        topic,
+        session_id,
+        memory_types,
+    })
+}
 
 pub(crate) const MEMORY_CAPABILITIES_TEXT: &str = concat!(
     "Available tools: memory_store, memory_retrieve, memory_search, ",
@@ -145,12 +205,14 @@ pub fn list() -> Value {
         },
         {
             "name": "memory_purge",
-            "description": "Delete memories by ID (single or comma-separated batch) or by topic keyword",
+            "description": "Delete memories by ID, by topic keyword, or by exact session_id with optional memory type filtering",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "memory_id": {"type": "string", "description": "Single ID or comma-separated batch"},
                     "topic": {"type": "string", "description": "Keyword — bulk-delete all matching memories"},
+                    "session_id": {"type": "string", "description": "Exact session identifier — bulk-delete memories from that session"},
+                    "memory_types": {"type": "array", "items": {"type": "string", "enum": ["semantic", "working", "episodic", "profile", "tool_result", "procedural"]}, "description": "Optional memory type filter. Only valid with session_id"},
                     "reason": {"type": "string"}
                 }
             }
@@ -424,9 +486,8 @@ pub async fn call(
         }
 
         ToolCallName::MemoryPurge => {
-            let memory_id = args["memory_id"].as_str().unwrap_or("");
-            let topic = args["topic"].as_str().unwrap_or("");
-            if !memory_id.is_empty() {
+            let purge_args = parse_memory_purge_args(&args)?;
+            if let Some(memory_id) = purge_args.memory_id {
                 // Batch: comma-separated IDs
                 let ids: Vec<&str> = memory_id
                     .split(',')
@@ -438,15 +499,26 @@ pub async fn call(
                     &format!("Purged {} memory(s)", result.purged),
                     &result,
                 )))
-            } else if !topic.is_empty() {
+            } else if let Some(topic) = purge_args.topic {
                 // Bulk by keyword: exact text match then purge
-                let result = service.purge_by_topic(user_id, topic).await?;
+                let result = service.purge_by_topic(user_id, &topic).await?;
                 Ok(mcp_text(&format_purge_msg(
                     &format!("Purged {} memory(s) matching '{topic}'", result.purged),
                     &result,
                 )))
+            } else if let Some(session_id) = purge_args.session_id {
+                let result = service
+                    .purge_by_session_id(user_id, &session_id, purge_args.memory_types.as_deref())
+                    .await?;
+                Ok(mcp_text(&format_purge_msg(
+                    &format!(
+                        "Purged {} memory(s) for session '{session_id}'",
+                        result.purged
+                    ),
+                    &result,
+                )))
             } else {
-                Ok(mcp_text("Provide memory_id or topic"))
+                Ok(mcp_text("Provide memory_id, topic, or session_id"))
             }
         }
 

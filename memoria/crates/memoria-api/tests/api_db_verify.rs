@@ -572,6 +572,80 @@ async fn test_purge_by_topic_batch_perf_verify_db() {
     println!("✅ purge by topic batch: 10 memories purged in one call");
 }
 
+#[tokio::test]
+#[serial]
+async fn test_purge_by_session_id_with_memory_types_verify_db() {
+    let (base, client, pool) = spawn_server().await;
+    let uid = uid();
+    let target_session = format!("session:test-smp-{}", uuid::Uuid::new_v4().simple());
+    let other_session = format!("session:test-smp-{}", uuid::Uuid::new_v4().simple());
+
+    for (content, memory_type, session_id) in [
+        ("target working alpha", "working", target_session.as_str()),
+        ("target working beta", "working", target_session.as_str()),
+        ("target semantic keep", "semantic", target_session.as_str()),
+        ("other working keep", "working", other_session.as_str()),
+    ] {
+        client
+            .post(format!("{base}/v1/memories"))
+            .header("X-User-Id", &uid)
+            .json(&json!({
+                "content": content,
+                "memory_type": memory_type,
+                "session_id": session_id,
+            }))
+            .send()
+            .await
+            .unwrap();
+    }
+    assert_eq!(db_count_active(&pool, &uid).await, 4);
+
+    let r = client
+        .post(format!("{base}/v1/memories/purge"))
+        .header("X-User-Id", &uid)
+        .json(&json!({
+            "session_id": target_session,
+            "memory_types": ["working"],
+            "reason": "session complete"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let body: Value = r.json().await.unwrap();
+    assert_eq!(body["purged"], 2);
+
+    let rows = sqlx::query(
+        "SELECT content, memory_type, session_id FROM mem_memories \
+         WHERE user_id = ? AND is_active > 0 ORDER BY content ASC",
+    )
+    .bind(&uid)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    let remaining: Vec<(String, String, String)> = rows
+        .into_iter()
+        .map(|row| {
+            (
+                row.get("content"),
+                row.get("memory_type"),
+                row.get("session_id"),
+            )
+        })
+        .collect();
+    assert_eq!(remaining.len(), 2);
+    assert!(remaining.iter().any(|(content, memory_type, session_id)| {
+        content == "target semantic keep"
+            && memory_type == "semantic"
+            && session_id == &target_session
+    }));
+    assert!(remaining.iter().any(|(content, memory_type, session_id)| {
+        content == "other working keep" && memory_type == "working" && session_id == &other_session
+    }));
+
+    println!("✅ purge by session_id: working memories removed without touching other active rows");
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // 4. BATCH STORE — verify all rows in DB with correct types
 // ═══════════════════════════════════════════════════════════════════════════════
