@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.1] - 2026-04-16
+
+### ⚡ Performance
+
+- **storage**: Harden multi-db pools and speed legacy migration (#180) ([3a1c7a2](https://github.com/matrixorigin/Memoria/commit/3a1c7a2ecfbc6e2924d0baed7ceb34d9f14082be))
+
+### 🐛 Bug Fixes
+
+- **memory**: Enforce strict session retrieval semantics (#185) ([1f99f39](https://github.com/matrixorigin/Memoria/commit/1f99f396c345edd8fb0bd076334e2462aa078510))
+
+### 🚀 Features
+
+- **memory**: Add session-scoped purge (#186) ([07c0e7f](https://github.com/matrixorigin/Memoria/commit/07c0e7fae0aa2d4063b15362709a2986a8a2ab7d))
+- Add ops metrics (#177) ([897d6d5](https://github.com/matrixorigin/Memoria/commit/897d6d5475351a8f8ec4636fc714190bd1fb6808))
 ## [0.3.0] - 2026-04-13
 
 ### ⚡ Performance
