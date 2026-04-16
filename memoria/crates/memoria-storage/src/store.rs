@@ -4167,7 +4167,11 @@ impl SqlMemoryStore {
     /// Branch-aware soft-delete: deactivate a memory in the given table.
     /// Returns the number of rows actually deactivated (0 means the memory
     /// was already inactive or not found — idempotent, not an error).
-    pub async fn soft_delete_from(&self, table: &str, memory_id: &str) -> Result<u64, MemoriaError> {
+    pub async fn soft_delete_from(
+        &self,
+        table: &str,
+        memory_id: &str,
+    ) -> Result<u64, MemoriaError> {
         let mut conn = self.conn().await?;
         let now = Utc::now().naive_utc();
         let res = sqlx::query(&format!(
@@ -4534,10 +4538,27 @@ impl SqlMemoryStore {
         query: &str,
         limit: i64,
     ) -> Result<Vec<Memory>, MemoriaError> {
+        self.search_fulltext_from_scoped(table, user_id, query, limit, None)
+            .await
+    }
+
+    pub async fn search_fulltext_from_scoped(
+        &self,
+        table: &str,
+        user_id: &str,
+        query: &str,
+        limit: i64,
+        session_id: Option<&str>,
+    ) -> Result<Vec<Memory>, MemoriaError> {
         let safe = sanitize_fulltext_query(query);
         if safe.is_empty() {
             return Ok(vec![]);
         }
+        let session_clause = if session_id.is_some() {
+            " AND session_id = ?"
+        } else {
+            ""
+        };
         // Use OR semantics (no + prefix) — AND is too strict for natural language queries
         // because stopwords are removed from the index but +stopword still requires a match.
         let sql = format!(
@@ -4549,16 +4570,15 @@ impl SqlMemoryStore {
              observed_at, created_at, updated_at, \
              MATCH(content) AGAINST('{safe}' IN BOOLEAN MODE) AS ft_score \
              FROM {table} \
-             WHERE user_id = ? AND is_active = 1 \
+             WHERE user_id = ? AND is_active = 1{session_clause} \
                AND MATCH(content) AGAINST('{safe}' IN BOOLEAN MODE) \
              ORDER BY ft_score DESC LIMIT ?"
         );
-        let rows = match sqlx::query(&sql)
-            .bind(user_id)
-            .bind(limit)
-            .fetch_all(&self.pool)
-            .await
-        {
+        let mut query = sqlx::query(&sql).bind(user_id);
+        if let Some(session_id) = session_id {
+            query = query.bind(session_id);
+        }
+        let rows = match query.bind(limit).fetch_all(&self.pool).await {
             Ok(rows) => rows,
             Err(e) => {
                 // MatrixOne returns 20101 when the search string tokenizes to an empty pattern
@@ -4590,7 +4610,19 @@ impl SqlMemoryStore {
         embedding: &[f32],
         limit: i64,
     ) -> Result<Vec<Memory>, MemoriaError> {
-        self.search_vector_from_filtered(table, user_id, embedding, limit, None)
+        self.search_vector_from_scoped(table, user_id, embedding, limit, None)
+            .await
+    }
+
+    pub async fn search_vector_from_scoped(
+        &self,
+        table: &str,
+        user_id: &str,
+        embedding: &[f32],
+        limit: i64,
+        session_id: Option<&str>,
+    ) -> Result<Vec<Memory>, MemoriaError> {
+        self.search_vector_from_filtered_scoped(table, user_id, embedding, limit, None, session_id)
             .await
     }
 
@@ -4603,33 +4635,64 @@ impl SqlMemoryStore {
         limit: i64,
         memory_type: Option<&str>,
     ) -> Result<Vec<Memory>, MemoriaError> {
+        self.search_vector_from_filtered_scoped(table, user_id, embedding, limit, memory_type, None)
+            .await
+    }
+
+    /// Vector search with optional memory_type and strict session pre-filter.
+    pub async fn search_vector_from_filtered_scoped(
+        &self,
+        table: &str,
+        user_id: &str,
+        embedding: &[f32],
+        limit: i64,
+        memory_type: Option<&str>,
+        session_id: Option<&str>,
+    ) -> Result<Vec<Memory>, MemoriaError> {
         let vec_literal = vec_to_mo(embedding);
         let type_clause = match memory_type {
             Some(mt) => format!(" AND memory_type = '{}'", sanitize_sql_literal(mt)),
             None => String::new(),
         };
+        let session_clause = match session_id {
+            Some(session_id) => format!(" AND session_id = '{}'", sanitize_sql_literal(session_id)),
+            None => String::new(),
+        };
+        let rank_mode = if session_id.is_some() { "pre" } else { "post" };
+        let build_sql = |rank_mode: Option<&str>| {
+            let limit_clause = match rank_mode {
+                Some(mode) => format!("LIMIT {limit} by rank with option 'mode={mode}'"),
+                None => format!("LIMIT {limit}"),
+            };
+            format!(
+                "SELECT memory_id, user_id, memory_type, content, \
+                 session_id, \
+                 CAST(source_event_ids AS CHAR) AS src_ids, \
+                 CAST(extra_metadata AS CHAR) AS extra_meta, \
+                 is_active, superseded_by, trust_tier, initial_confidence, \
+                 observed_at, created_at, updated_at, \
+                 l2_distance(embedding, '{vec_literal}') AS l2_dist \
+                 FROM {table} \
+                 WHERE user_id = '{}' AND is_active = 1 AND embedding IS NOT NULL{type_clause}{session_clause} \
+                 ORDER BY l2_distance(embedding, '{vec_literal}') ASC \
+                 {limit_clause}",
+                sanitize_sql_literal(user_id),
+            )
+        };
         // MatrixOne bug workaround: prepared statement with l2_distance in ORDER BY returns 0 rows
         // Solution: inline all parameters instead of using bind()
-        let sql = format!(
-            "SELECT memory_id, user_id, memory_type, content, \
-             session_id, \
-             CAST(source_event_ids AS CHAR) AS src_ids, \
-             CAST(extra_metadata AS CHAR) AS extra_meta, \
-             is_active, superseded_by, trust_tier, initial_confidence, \
-             observed_at, created_at, updated_at, \
-             l2_distance(embedding, '{vec_literal}') AS l2_dist \
-             FROM {table} \
-             WHERE user_id = '{}' AND is_active = 1 AND embedding IS NOT NULL{type_clause} \
-             ORDER BY l2_distance(embedding, '{vec_literal}') ASC \
-             LIMIT {} by rank with option 'mode=post'",
-            sanitize_sql_literal(user_id),
-            limit
-        );
-
-        let rows = sqlx::query(&sql)
+        let mut rows = sqlx::query(&build_sql(Some(rank_mode)))
             .fetch_all(&self.pool)
             .await
             .map_err(db_err)?;
+        // Strict session retrieval must preserve session-scoped semantics even if
+        // MatrixOne's IVF pre-filter path under-fills top_k on a tiny candidate set.
+        if session_id.is_some() && rows.len() < limit as usize {
+            rows = sqlx::query(&build_sql(None))
+                .fetch_all(&self.pool)
+                .await
+                .map_err(db_err)?;
+        }
 
         rows.iter()
             .map(|r| {
@@ -4656,18 +4719,32 @@ impl SqlMemoryStore {
         query: &str,
         limit: i64,
     ) -> Result<Vec<Memory>, MemoriaError> {
+        self.search_hybrid_from_scoped(table, user_id, embedding, query, limit, None)
+            .await
+    }
+
+    pub async fn search_hybrid_from_scoped(
+        &self,
+        table: &str,
+        user_id: &str,
+        embedding: &[f32],
+        query: &str,
+        limit: i64,
+        session_id: Option<&str>,
+    ) -> Result<Vec<Memory>, MemoriaError> {
         let params = self
             .get_user_retrieval_params(user_id)
             .await
             .unwrap_or_default();
         let (mems, _) = self
-            .search_hybrid_from_scored(
+            .search_hybrid_from_scored_scoped(
                 table,
                 user_id,
                 embedding,
                 query,
                 limit,
                 params.feedback_weight,
+                session_id,
             )
             .await?;
         Ok(mems)
@@ -4684,10 +4761,32 @@ impl SqlMemoryStore {
         limit: i64,
         feedback_weight: f64,
     ) -> Result<(Vec<Memory>, Vec<(String, f64, f64, f64, f64, f64)>), MemoriaError> {
+        self.search_hybrid_from_scored_scoped(
+            table,
+            user_id,
+            embedding,
+            query,
+            limit,
+            feedback_weight,
+            None,
+        )
+        .await
+    }
+
+    pub async fn search_hybrid_from_scored_scoped(
+        &self,
+        table: &str,
+        user_id: &str,
+        embedding: &[f32],
+        query: &str,
+        limit: i64,
+        feedback_weight: f64,
+        session_id: Option<&str>,
+    ) -> Result<(Vec<Memory>, Vec<(String, f64, f64, f64, f64, f64)>), MemoriaError> {
         let fetch_k = (limit * 3).max(20);
         let (vec_results, ft_results) = tokio::join!(
-            self.search_vector_from(table, user_id, embedding, fetch_k),
-            self.search_fulltext_from(table, user_id, query, fetch_k)
+            self.search_vector_from_scoped(table, user_id, embedding, fetch_k, session_id),
+            self.search_fulltext_from_scoped(table, user_id, query, fetch_k, session_id)
         );
         let vec_results = vec_results?;
         let ft_results = ft_results.unwrap_or_default();

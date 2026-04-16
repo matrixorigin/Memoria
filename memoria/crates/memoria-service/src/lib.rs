@@ -15,7 +15,6 @@ pub mod strategy_domain;
 pub mod vector_index_monitor;
 pub use config::Config;
 pub use distributed::{AsyncTask, AsyncTaskStore, DistributedLock, NoopDistributedLock};
-pub use stats_reporter::StatsReporter;
 pub use governance::{
     DefaultGovernanceStrategy, GovernanceExecution, GovernancePlan, GovernanceRunSummary,
     GovernanceStore, GovernanceStrategy, GovernanceTask,
@@ -47,8 +46,9 @@ pub use scoring::{
 };
 pub use service::{
     CandidateScore, ExplainLevel, InMemoryFlusher, MemoryService, PurgeResult, RetrievalExplain,
-    ENTITY_EXTRACTION_DROPS,
+    RetrieveOptions, ENTITY_EXTRACTION_DROPS,
 };
+pub use stats_reporter::StatsReporter;
 
 /// Wait for SIGTERM or Ctrl-C. Shared across CLI, MCP, and API servers.
 pub async fn shutdown_signal() {

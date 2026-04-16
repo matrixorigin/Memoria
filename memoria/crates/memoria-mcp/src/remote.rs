@@ -102,14 +102,23 @@ impl RemoteClient {
                 } else {
                     "/v1/memories/retrieve"
                 };
+                let mut payload = json!({
+                    "query": args["query"],
+                    "top_k": args["top_k"].as_i64().unwrap_or(5),
+                    "session_id": args["session_id"],
+                });
+                if name == "memory_retrieve" {
+                    if let Some(filter_session) = args.get("filter_session") {
+                        payload["filter_session"] = filter_session.clone();
+                    }
+                    if let Some(include_cross_session) = args.get("include_cross_session") {
+                        payload["include_cross_session"] = include_cross_session.clone();
+                    }
+                }
                 let r = self
                     .client
                     .post(self.url(path))
-                    .json(&json!({
-                        "query": args["query"],
-                        "top_k": args["top_k"].as_i64().unwrap_or(5),
-                        "session_id": args["session_id"],
-                    }))
+                    .json(&payload)
                     .send()
                     .await?;
                 let body = Self::parse_response(r).await?;

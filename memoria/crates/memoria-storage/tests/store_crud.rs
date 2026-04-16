@@ -232,6 +232,117 @@ async fn test_search_vector_sets_retrieval_score() {
 }
 
 #[tokio::test]
+async fn test_search_vector_from_filtered_scoped_prefilters_by_session() {
+    let (store, uid) = setup().await;
+
+    sqlx::query("DELETE FROM mem_memories WHERE user_id = ?")
+        .bind(&uid)
+        .execute(store.pool())
+        .await
+        .unwrap();
+
+    let mut target = make_memory(&format!("vec-scope-1-{uid}"), "target session", &uid);
+    target.session_id = Some("sess-target".to_string());
+    target.embedding = Some(dim_vec(1, 1.0));
+
+    let mut other = make_memory(&format!("vec-scope-2-{uid}"), "other session", &uid);
+    other.session_id = Some("sess-other".to_string());
+    other.embedding = Some(dim_vec(0, 1.0));
+
+    store.insert(&target).await.unwrap();
+    store.insert(&other).await.unwrap();
+
+    let global = store
+        .search_vector_from_filtered_scoped("mem_memories", &uid, &dim_vec(0, 1.0), 1, None, None)
+        .await
+        .expect("global vector search");
+    assert_eq!(
+        global.first().map(|m| m.memory_id.as_str()),
+        Some(other.memory_id.as_str()),
+        "global search should return the nearest cross-session memory",
+    );
+
+    let scoped = store
+        .search_vector_from_filtered_scoped(
+            "mem_memories",
+            &uid,
+            &dim_vec(0, 1.0),
+            1,
+            None,
+            Some("sess-target"),
+        )
+        .await
+        .expect("session-scoped vector search");
+    assert_eq!(
+        scoped.len(),
+        1,
+        "strict session search should still return a candidate"
+    );
+    assert_eq!(
+        scoped.first().map(|m| m.memory_id.as_str()),
+        Some(target.memory_id.as_str()),
+        "strict session search should pre-filter candidates before ranking",
+    );
+}
+
+#[tokio::test]
+async fn test_search_vector_from_filtered_scoped_fills_limit_with_session_candidates() {
+    let (store, uid) = setup().await;
+
+    let mk_vec = |x: f32, y: f32| {
+        let mut v = vec![0.0; test_dim()];
+        v[0] = x;
+        v[1] = y;
+        v
+    };
+
+    let mut target_a = make_memory(&format!("vec-scope-fill-1-{uid}"), "scoped a", &uid);
+    target_a.session_id = Some("sess-target".to_string());
+    target_a.embedding = Some(mk_vec(0.7, 0.3));
+
+    let mut target_b = make_memory(&format!("vec-scope-fill-2-{uid}"), "scoped b", &uid);
+    target_b.session_id = Some("sess-target".to_string());
+    target_b.embedding = Some(mk_vec(0.65, 0.35));
+
+    let mut other_a = make_memory(&format!("vec-scope-fill-3-{uid}"), "global a", &uid);
+    other_a.session_id = Some("sess-other".to_string());
+    other_a.embedding = Some(mk_vec(1.0, 0.0));
+
+    let mut other_b = make_memory(&format!("vec-scope-fill-4-{uid}"), "global b", &uid);
+    other_b.session_id = Some("sess-other".to_string());
+    other_b.embedding = Some(mk_vec(0.97, 0.03));
+
+    store.insert(&target_a).await.unwrap();
+    store.insert(&target_b).await.unwrap();
+    store.insert(&other_a).await.unwrap();
+    store.insert(&other_b).await.unwrap();
+
+    let scoped = store
+        .search_vector_from_filtered_scoped(
+            "mem_memories",
+            &uid,
+            &mk_vec(1.0, 0.0),
+            2,
+            None,
+            Some("sess-target"),
+        )
+        .await
+        .expect("session-scoped vector search");
+    assert_eq!(
+        scoped.len(),
+        2,
+        "strict session search should fill top_k from the filtered session candidate set",
+    );
+    let scoped_ids: std::collections::HashSet<&str> =
+        scoped.iter().map(|m| m.memory_id.as_str()).collect();
+    assert_eq!(
+        scoped_ids,
+        std::collections::HashSet::from([target_a.memory_id.as_str(), target_b.memory_id.as_str()]),
+        "strict session vector search should return both session-local candidates",
+    );
+}
+
+#[tokio::test]
 async fn test_search_hybrid_access_count_stays_tiebreaker() {
     let (store, uid) = setup().await;
 

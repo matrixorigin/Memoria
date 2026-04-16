@@ -213,37 +213,31 @@ pub async fn retrieve(
 ) -> ApiResult<serde_json::Value> {
     let top_k = req.top_k.clamp(1, 100);
     let level = memoria_service::ExplainLevel::from_str_or_bool(&req.explain);
-    let filter_session = req
-        .session_id
-        .as_deref()
-        .filter(|_| !req.include_cross_session);
-
-    let apply_filter = |mut mems: Vec<memoria_core::Memory>| -> Vec<memoria_core::Memory> {
-        if let Some(sid) = filter_session {
-            mems.retain(|m| m.session_id.as_deref() == Some(sid));
-        }
-        mems
-    };
+    let retrieve_options = req.retrieve_options();
 
     if level != memoria_service::ExplainLevel::None {
         let (results, explain) = state
             .service
-            .retrieve_explain_level(&user_id, &req.query, top_k, level)
+            .retrieve_explain_level_with_options(
+                &user_id,
+                &req.query,
+                top_k,
+                level,
+                &retrieve_options,
+            )
             .await
             .map_err(api_err)?;
-        let items: Vec<MemoryResponse> =
-            apply_filter(results).into_iter().map(Into::into).collect();
+        let items: Vec<MemoryResponse> = results.into_iter().map(Into::into).collect();
         Ok(Json(
             serde_json::json!({"results": items, "explain": explain}),
         ))
     } else {
         let results = state
             .service
-            .retrieve(&user_id, &req.query, top_k)
+            .retrieve_with_options(&user_id, &req.query, top_k, &retrieve_options)
             .await
             .map_err(api_err)?;
-        let items: Vec<MemoryResponse> =
-            apply_filter(results).into_iter().map(Into::into).collect();
+        let items: Vec<MemoryResponse> = results.into_iter().map(Into::into).collect();
         Ok(Json(serde_json::json!(items)))
     }
 }

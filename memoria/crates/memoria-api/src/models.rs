@@ -33,6 +33,9 @@ pub struct RetrieveRequest {
     #[serde(default = "default_top_k")]
     pub top_k: i64,
     pub session_id: Option<String>,
+    /// Explicit strict session filter. Overrides include_cross_session when provided.
+    #[serde(default)]
+    pub filter_session: Option<bool>,
     /// When false and session_id is set, only return memories from that session.
     #[serde(default = "default_true")]
     pub include_cross_session: bool,
@@ -45,6 +48,16 @@ fn default_top_k() -> i64 {
 }
 fn default_true() -> bool {
     true
+}
+
+impl RetrieveRequest {
+    pub fn retrieve_options(&self) -> memoria_service::RetrieveOptions {
+        memoria_service::RetrieveOptions::from_session_scope(
+            self.session_id.as_deref(),
+            self.filter_session,
+            Some(self.include_cross_session),
+        )
+    }
 }
 
 fn deserialize_explain<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {

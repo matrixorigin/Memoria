@@ -109,6 +109,8 @@ pub fn list() -> Value {
                     "query": {"type": "string"},
                     "top_k": {"type": "integer", "default": 5},
                     "session_id": {"type": "string"},
+                    "filter_session": {"type": "boolean", "description": "When true, restrict retrieval to the given session_id and bypass cross-session graph retrieval"},
+                    "include_cross_session": {"type": "boolean", "default": true, "description": "Legacy flag. false is equivalent to filter_session=true when session_id is set"},
                     "explain": {"type": ["boolean", "string"], "default": false, "description": "Explain level: false/\"none\"=off, true/\"basic\"=timing+path, \"verbose\"=+per-candidate scores, \"analyze\"=full"}
                 },
                 "required": ["query"]
@@ -248,6 +250,7 @@ pub async fn call(
         "memory_observe" => ToolCallName::MemoryObserve,
         _ => ToolCallName::Unknown(name.to_string()),
     };
+    let is_memory_retrieve = matches!(tool, ToolCallName::MemoryRetrieve);
     match tool {
         ToolCallName::MemoryStore => {
             let content = args["content"].as_str().unwrap_or("").to_string();
@@ -333,6 +336,15 @@ pub async fn call(
         ToolCallName::MemoryRetrieve | ToolCallName::MemorySearch => {
             let query = args["query"].as_str().unwrap_or("").to_string();
             let top_k = args["top_k"].as_i64().unwrap_or(5);
+            let retrieve_options = if is_memory_retrieve {
+                memoria_service::RetrieveOptions::from_session_scope(
+                    args["session_id"].as_str(),
+                    args.get("filter_session").and_then(|v| v.as_bool()),
+                    args.get("include_cross_session").and_then(|v| v.as_bool()),
+                )
+            } else {
+                memoria_service::RetrieveOptions::default()
+            };
             // explain accepts bool or string: true/"basic"/"verbose"/"analyze"
             let explain_str = match &args["explain"] {
                 serde_json::Value::Bool(true) => "basic",
@@ -343,7 +355,13 @@ pub async fn call(
 
             if level != memoria_service::ExplainLevel::None {
                 let (results, stats) = service
-                    .retrieve_explain_level(user_id, &query, top_k, level)
+                    .retrieve_explain_level_with_options(
+                        user_id,
+                        &query,
+                        top_k,
+                        level,
+                        &retrieve_options,
+                    )
                     .await?;
                 if results.is_empty() {
                     let explain_json = serde_json::to_string_pretty(&stats).unwrap_or_default();
@@ -361,7 +379,9 @@ pub async fn call(
                     "{text}\n\n--- explain ---\n{explain_json}"
                 )))
             } else {
-                let results = service.retrieve(user_id, &query, top_k).await?;
+                let results = service
+                    .retrieve_with_options(user_id, &query, top_k, &retrieve_options)
+                    .await?;
                 if results.is_empty() {
                     return Ok(mcp_text("No relevant memories found."));
                 }

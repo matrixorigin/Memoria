@@ -49,6 +49,39 @@ impl ExplainLevel {
     }
 }
 
+/// Extra retrieval controls that must be threaded through the full retrieval pipeline.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RetrieveOptions {
+    strict_session_id: Option<String>,
+}
+
+impl RetrieveOptions {
+    /// `filter_session=true` takes precedence over `include_cross_session`.
+    /// When neither is provided, retrieval remains cross-session.
+    pub fn from_session_scope(
+        session_id: Option<&str>,
+        filter_session: Option<bool>,
+        include_cross_session: Option<bool>,
+    ) -> Self {
+        let strict_session = filter_session.unwrap_or_else(|| {
+            include_cross_session
+                .map(|include| !include)
+                .unwrap_or(false)
+        });
+        Self {
+            strict_session_id: session_id.filter(|_| strict_session).map(str::to_string),
+        }
+    }
+
+    pub fn strict_session_id(&self) -> Option<&str> {
+        self.strict_session_id.as_deref()
+    }
+
+    pub fn is_strict_session(&self) -> bool {
+        self.strict_session_id.is_some()
+    }
+}
+
 /// Per-candidate scoring breakdown — answers "why is this memory ranked here?"
 /// Only populated at Verbose/Analyze level.
 #[derive(Debug, serde::Serialize)]
@@ -489,7 +522,12 @@ impl MemoryService {
                     info!("Entity extraction uses routed user stores in multi-db mode");
                 }
                 let (entity_tx, entity_rx) = tokio::sync::mpsc::channel(entity_queue_size);
-                Self::spawn_entity_worker(entity_rx, store.clone(), llm.clone(), stats_cell.clone());
+                Self::spawn_entity_worker(
+                    entity_rx,
+                    store.clone(),
+                    llm.clone(),
+                    stats_cell.clone(),
+                );
                 tracing::info!(entity_queue_size, "entity extraction enabled");
                 Some(entity_tx)
             }
@@ -503,7 +541,12 @@ impl MemoryService {
                 match store.spawn_background_store(entity_pool_size).await {
                     Ok(entity_store) => {
                         let (entity_tx, entity_rx) = tokio::sync::mpsc::channel(entity_queue_size);
-                        Self::spawn_entity_worker(entity_rx, entity_store, llm.clone(), stats_cell.clone());
+                        Self::spawn_entity_worker(
+                            entity_rx,
+                            entity_store,
+                            llm.clone(),
+                            stats_cell.clone(),
+                        );
                         tracing::info!(
                             entity_queue_size,
                             entity_pool_size,
@@ -1296,8 +1339,19 @@ impl MemoryService {
         query: &str,
         top_k: i64,
     ) -> Result<Vec<Memory>, MemoriaError> {
+        self.retrieve_with_options(user_id, query, top_k, &RetrieveOptions::default())
+            .await
+    }
+
+    pub async fn retrieve_with_options(
+        &self,
+        user_id: &str,
+        query: &str,
+        top_k: i64,
+        options: &RetrieveOptions,
+    ) -> Result<Vec<Memory>, MemoriaError> {
         let (mems, _) = self
-            .retrieve_inner(user_id, query, top_k, ExplainLevel::None)
+            .retrieve_inner(user_id, query, top_k, ExplainLevel::None, options)
             .await?;
         self.bump_access_counts(&mems);
         Ok(mems)
@@ -1311,7 +1365,13 @@ impl MemoryService {
         top_k: i64,
     ) -> Result<(Vec<Memory>, RetrievalExplain), MemoriaError> {
         let (mems, explain) = self
-            .retrieve_inner(user_id, query, top_k, ExplainLevel::Basic)
+            .retrieve_inner(
+                user_id,
+                query,
+                top_k,
+                ExplainLevel::Basic,
+                &RetrieveOptions::default(),
+            )
             .await?;
         self.bump_access_counts(&mems);
         Ok((mems, explain))
@@ -1325,8 +1385,28 @@ impl MemoryService {
         top_k: i64,
         level: ExplainLevel,
     ) -> Result<(Vec<Memory>, RetrievalExplain), MemoriaError> {
+        self.retrieve_explain_level_with_options(
+            user_id,
+            query,
+            top_k,
+            level,
+            &RetrieveOptions::default(),
+        )
+        .await
+    }
+
+    pub async fn retrieve_explain_level_with_options(
+        &self,
+        user_id: &str,
+        query: &str,
+        top_k: i64,
+        level: ExplainLevel,
+        options: &RetrieveOptions,
+    ) -> Result<(Vec<Memory>, RetrievalExplain), MemoriaError> {
         let start = std::time::Instant::now();
-        let (mems, explain) = self.retrieve_inner(user_id, query, top_k, level).await?;
+        let (mems, explain) = self
+            .retrieve_inner(user_id, query, top_k, level, options)
+            .await?;
         self.bump_access_counts(&mems);
 
         // 记录查询到 vector monitor（轻量级，无阻塞）
@@ -1356,6 +1436,7 @@ impl MemoryService {
         query: &str,
         top_k: i64,
         level: ExplainLevel,
+        options: &RetrieveOptions,
     ) -> Result<(Vec<Memory>, RetrievalExplain), MemoriaError> {
         let total_start = std::time::Instant::now();
         let mut explain = RetrievalExplain {
@@ -1366,6 +1447,7 @@ impl MemoryService {
         if self.sql_store.is_some() {
             let sql = self.user_sql_store(user_id).await?;
             let table = sql.active_table(user_id).await?;
+            let strict_session_id = options.strict_session_id();
             // Load per-user feedback_weight lazily — only when needed for scoring
             // (avoids extra DB query when fulltext fallback has no feedback to apply)
 
@@ -1375,120 +1457,125 @@ impl MemoryService {
             explain.embedding_ms = p0_start.elapsed().as_secs_f64() * 1000.0;
 
             // Phase 1: graph retrieval (activation-based)
-            if let Some(ref embedding) = emb {
-                explain.graph_attempted = true;
-                let g_start = std::time::Instant::now();
-                // Use isolated graph pool to avoid starving main pool
-                let graph_sql = if self.db_router.is_some() {
-                    sql.as_ref()
-                } else {
-                    self.graph_pool.as_deref().unwrap_or(sql.as_ref())
-                };
-                let graph_store = graph_sql.graph_store();
-                let retriever = memoria_storage::graph::ActivationRetriever::new(&graph_store);
-                match retriever
-                    .retrieve(user_id, query, embedding, top_k, None)
-                    .await
-                {
-                    Ok(scored_nodes) if !scored_nodes.is_empty() => {
-                        explain.graph_ms = g_start.elapsed().as_secs_f64() * 1000.0;
-                        explain.graph_hit = true;
-                        explain.graph_candidates = scored_nodes.len();
+            if strict_session_id.is_none() {
+                if let Some(ref embedding) = emb {
+                    explain.graph_attempted = true;
+                    let g_start = std::time::Instant::now();
+                    // Use isolated graph pool to avoid starving main pool
+                    let graph_sql = if self.db_router.is_some() {
+                        sql.as_ref()
+                    } else {
+                        self.graph_pool.as_deref().unwrap_or(sql.as_ref())
+                    };
+                    let graph_store = graph_sql.graph_store();
+                    let retriever = memoria_storage::graph::ActivationRetriever::new(&graph_store);
+                    match retriever
+                        .retrieve(user_id, query, embedding, top_k, None)
+                        .await
+                    {
+                        Ok(scored_nodes) if !scored_nodes.is_empty() => {
+                            explain.graph_ms = g_start.elapsed().as_secs_f64() * 1000.0;
+                            explain.graph_hit = true;
+                            explain.graph_candidates = scored_nodes.len();
 
-                        // Convert graph nodes to Memory objects via batch fetch
-                        let memory_ids: Vec<String> = scored_nodes
-                            .iter()
-                            .filter_map(|(n, _)| n.memory_id.clone())
-                            .collect();
-                        let tabular = if !memory_ids.is_empty() {
-                            sql.get_by_ids(&memory_ids).await.unwrap_or_default()
-                        } else {
-                            Default::default()
-                        };
+                            // Convert graph nodes to Memory objects via batch fetch
+                            let memory_ids: Vec<String> = scored_nodes
+                                .iter()
+                                .filter_map(|(n, _)| n.memory_id.clone())
+                                .collect();
+                            let tabular = if !memory_ids.is_empty() {
+                                sql.get_by_ids(&memory_ids).await.unwrap_or_default()
+                            } else {
+                                Default::default()
+                            };
 
-                        let mut graph_memories: Vec<Memory> = Vec::new();
-                        let mut seen = std::collections::HashSet::new();
-                        for (node, score) in &scored_nodes {
-                            if let Some(ref mid) = node.memory_id {
-                                if seen.insert(mid.clone()) {
-                                    if let Some(mut mem) = tabular.get(mid).cloned() {
-                                        mem.retrieval_score = Some(*score as f64);
-                                        graph_memories.push(mem);
+                            let mut graph_memories: Vec<Memory> = Vec::new();
+                            let mut seen = std::collections::HashSet::new();
+                            for (node, score) in &scored_nodes {
+                                if let Some(ref mid) = node.memory_id {
+                                    if seen.insert(mid.clone()) {
+                                        if let Some(mut mem) = tabular.get(mid).cloned() {
+                                            mem.retrieval_score = Some(*score as f64);
+                                            graph_memories.push(mem);
+                                        }
                                     }
                                 }
                             }
-                        }
 
-                        if graph_memories.len() as i64 >= top_k {
+                            if graph_memories.len() as i64 >= top_k {
+                                graph_memories.truncate(top_k as usize);
+                                explain.path = "graph";
+                                explain.result_count = graph_memories.len();
+                                explain.total_ms = total_start.elapsed().as_secs_f64() * 1000.0;
+                                return Ok((graph_memories, explain));
+                            }
+
+                            // Graph insufficient — supplement with hybrid
+                            explain.vector_attempted = true;
+                            let vs_start = std::time::Instant::now();
+                            // Always use _scored directly with cached feedback_weight
+                            // to avoid redundant get_user_retrieval_params query
+                            let fw = self.get_feedback_weight(user_id).await?;
+                            let (vec_results, scores) = sql
+                                .search_hybrid_from_scored(
+                                    &table, user_id, embedding, query, top_k, fw,
+                                )
+                                .await?;
+                            explain.vector_ms = vs_start.elapsed().as_secs_f64() * 1000.0;
+                            explain.vector_hit = !vec_results.is_empty();
+
+                            // Merge: dedup (keep higher score), sort by score
+                            for m in vec_results {
+                                if seen.insert(m.memory_id.clone()) {
+                                    graph_memories.push(m);
+                                } else {
+                                    // Memory exists from graph — use higher score
+                                    if let Some(existing) = graph_memories
+                                        .iter_mut()
+                                        .find(|g| g.memory_id == m.memory_id)
+                                    {
+                                        if m.retrieval_score > existing.retrieval_score {
+                                            existing.retrieval_score = m.retrieval_score;
+                                        }
+                                    }
+                                }
+                            }
+
+                            graph_memories.sort_by(|a, b| {
+                                b.retrieval_score
+                                    .partial_cmp(&a.retrieval_score)
+                                    .unwrap_or(std::cmp::Ordering::Equal)
+                            });
                             graph_memories.truncate(top_k as usize);
-                            explain.path = "graph";
+
+                            if level.at_least(ExplainLevel::Verbose) {
+                                explain.candidate_scores = scores
+                                    .into_iter()
+                                    .enumerate()
+                                    .map(|(i, (id, vs, ks, ts, cs, fs))| CandidateScore {
+                                        memory_id: id,
+                                        rank: i + 1,
+                                        final_score: round4(fs),
+                                        vector_score: round4(vs),
+                                        keyword_score: round4(ks),
+                                        temporal_score: round4(ts),
+                                        confidence_score: round4(cs),
+                                    })
+                                    .collect();
+                            }
+                            explain.path = "graph+vector";
                             explain.result_count = graph_memories.len();
                             explain.total_ms = total_start.elapsed().as_secs_f64() * 1000.0;
                             return Ok((graph_memories, explain));
                         }
-
-                        // Graph insufficient — supplement with hybrid
-                        explain.vector_attempted = true;
-                        let vs_start = std::time::Instant::now();
-                        // Always use _scored directly with cached feedback_weight
-                        // to avoid redundant get_user_retrieval_params query
-                        let fw = self.get_feedback_weight(user_id).await?;
-                        let (vec_results, scores) = sql
-                            .search_hybrid_from_scored(&table, user_id, embedding, query, top_k, fw)
-                            .await?;
-                        explain.vector_ms = vs_start.elapsed().as_secs_f64() * 1000.0;
-                        explain.vector_hit = !vec_results.is_empty();
-
-                        // Merge: dedup (keep higher score), sort by score
-                        for m in vec_results {
-                            if seen.insert(m.memory_id.clone()) {
-                                graph_memories.push(m);
-                            } else {
-                                // Memory exists from graph — use higher score
-                                if let Some(existing) = graph_memories
-                                    .iter_mut()
-                                    .find(|g| g.memory_id == m.memory_id)
-                                {
-                                    if m.retrieval_score > existing.retrieval_score {
-                                        existing.retrieval_score = m.retrieval_score;
-                                    }
-                                }
-                            }
+                        Ok(_) => {
+                            explain.graph_ms = g_start.elapsed().as_secs_f64() * 1000.0;
+                            // Graph returned nothing — fall through to vector
                         }
-                        graph_memories.sort_by(|a, b| {
-                            b.retrieval_score
-                                .partial_cmp(&a.retrieval_score)
-                                .unwrap_or(std::cmp::Ordering::Equal)
-                        });
-                        graph_memories.truncate(top_k as usize);
-
-                        if level.at_least(ExplainLevel::Verbose) {
-                            explain.candidate_scores = scores
-                                .into_iter()
-                                .enumerate()
-                                .map(|(i, (id, vs, ks, ts, cs, fs))| CandidateScore {
-                                    memory_id: id,
-                                    rank: i + 1,
-                                    final_score: round4(fs),
-                                    vector_score: round4(vs),
-                                    keyword_score: round4(ks),
-                                    temporal_score: round4(ts),
-                                    confidence_score: round4(cs),
-                                })
-                                .collect();
+                        Err(_) => {
+                            explain.graph_ms = g_start.elapsed().as_secs_f64() * 1000.0;
+                            // Graph failed — fall through to vector
                         }
-                        explain.path = "graph+vector";
-                        explain.result_count = graph_memories.len();
-                        explain.total_ms = total_start.elapsed().as_secs_f64() * 1000.0;
-                        return Ok((graph_memories, explain));
-                    }
-                    Ok(_) => {
-                        explain.graph_ms = g_start.elapsed().as_secs_f64() * 1000.0;
-                        // Graph returned nothing — fall through to vector
-                    }
-                    Err(_) => {
-                        explain.graph_ms = g_start.elapsed().as_secs_f64() * 1000.0;
-                        // Graph failed — fall through to vector
                     }
                 }
             }
@@ -1499,7 +1586,15 @@ impl MemoryService {
                 let vs_start = std::time::Instant::now();
                 let fw = self.get_feedback_weight(user_id).await?;
                 let (results, scores) = sql
-                    .search_hybrid_from_scored(&table, user_id, embedding, query, top_k, fw)
+                    .search_hybrid_from_scored_scoped(
+                        &table,
+                        user_id,
+                        embedding,
+                        query,
+                        top_k,
+                        fw,
+                        strict_session_id,
+                    )
                     .await?;
                 explain.vector_ms = vs_start.elapsed().as_secs_f64() * 1000.0;
                 if !results.is_empty() {
@@ -1530,7 +1625,7 @@ impl MemoryService {
             explain.fulltext_attempted = true;
             let ft_start = std::time::Instant::now();
             let mut results = sql
-                .search_fulltext_from(&table, user_id, query, top_k)
+                .search_fulltext_from_scoped(&table, user_id, query, top_k, strict_session_id)
                 .await?;
             explain.fulltext_ms = ft_start.elapsed().as_secs_f64() * 1000.0;
             explain.fulltext_hit = !results.is_empty();
@@ -1630,8 +1725,14 @@ impl MemoryService {
         query: &str,
         top_k: i64,
     ) -> Result<(Vec<Memory>, RetrievalExplain), MemoriaError> {
-        self.retrieve_inner(user_id, query, top_k, ExplainLevel::Basic)
-            .await
+        self.retrieve_inner(
+            user_id,
+            query,
+            top_k,
+            ExplainLevel::Basic,
+            &RetrieveOptions::default(),
+        )
+        .await
     }
 
     pub async fn search_explain_level(
@@ -1641,7 +1742,8 @@ impl MemoryService {
         top_k: i64,
         level: ExplainLevel,
     ) -> Result<(Vec<Memory>, RetrievalExplain), MemoriaError> {
-        self.retrieve_inner(user_id, query, top_k, level).await
+        self.retrieve_inner(user_id, query, top_k, level, &RetrieveOptions::default())
+            .await
     }
 
     // TODO(concurrency): concurrent correct on same memory_id can create duplicate
