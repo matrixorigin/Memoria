@@ -263,6 +263,48 @@ async fn test_purge_by_session_id_filters_memory_type() {
 }
 
 #[tokio::test]
+async fn test_purge_by_session_id_fallback_is_not_capped() {
+    let svc = make_service();
+    let target_count = 10_005usize;
+    for index in 0..target_count {
+        svc.store_memory(
+            "u1",
+            &format!("target working {index}"),
+            MemoryType::Working,
+            Some("sess-target".to_string()),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    }
+    svc.store_memory(
+        "u1",
+        "keep semantic",
+        MemoryType::Semantic,
+        Some("sess-target".to_string()),
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let memory_types = [MemoryType::Working];
+    let result = svc
+        .purge_by_session_id("u1", "sess-target", Some(&memory_types))
+        .await
+        .unwrap();
+    assert_eq!(result.purged, target_count);
+
+    let list = svc.list_active("u1", i64::MAX).await.unwrap();
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0].content, "keep semantic");
+    println!("✅ purge_by_session_id fallback scans full active set");
+}
+
+#[tokio::test]
 async fn test_memory_types() {
     let svc = make_service();
     for mt in [

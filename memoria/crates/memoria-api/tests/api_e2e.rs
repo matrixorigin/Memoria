@@ -2523,6 +2523,22 @@ async fn test_remote_purge_by_session_id() {
     println!("✅ remote purge by session_id: {t}");
 }
 
+#[tokio::test]
+async fn test_remote_purge_rejects_invalid_memory_types_locally() {
+    use memoria_mcp::remote::RemoteClient;
+    let remote = RemoteClient::new("http://127.0.0.1:9", None, uid(), None);
+
+    let err = remote
+        .call(
+            "memory_purge",
+            json!({"session_id": "sess-target", "memory_types": ["not_a_real_type"]}),
+        )
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("Invalid memory type"), "{err}");
+    println!("✅ remote purge rejects invalid memory_types before API call");
+}
+
 // ── Episodic memory tests ─────────────────────────────────────────────────────
 
 #[tokio::test]

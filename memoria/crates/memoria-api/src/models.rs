@@ -109,6 +109,8 @@ pub enum PurgeSelector {
 
 impl PurgeRequest {
     pub fn selector(&self) -> Result<PurgeSelector, String> {
+        let memory_ids = self.memory_ids.as_ref().filter(|ids| !ids.is_empty());
+        let memory_types = self.memory_types.as_ref().filter(|types| !types.is_empty());
         let topic = self
             .topic
             .as_deref()
@@ -119,27 +121,25 @@ impl PurgeRequest {
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty());
-        if self.memory_types.is_some() && session_id.is_none() {
+        if memory_types.is_some() && session_id.is_none() {
             return Err("memory_types requires session_id".to_string());
         }
 
-        let selector_count = usize::from(self.memory_ids.is_some())
+        let selector_count = usize::from(memory_ids.is_some())
             + usize::from(topic.is_some())
             + usize::from(session_id.is_some());
         if selector_count > 1 {
             return Err("provide only one of memory_ids, topic, or session_id".to_string());
         }
 
-        if let Some(ids) = &self.memory_ids {
+        if let Some(ids) = memory_ids {
             return Ok(PurgeSelector::MemoryIds(ids.clone()));
         }
         if let Some(topic) = topic {
             return Ok(PurgeSelector::Topic(topic.to_string()));
         }
         if let Some(session_id) = session_id {
-            let memory_types = self
-                .memory_types
-                .as_ref()
+            let memory_types = memory_types
                 .map(|types| {
                     types
                         .iter()
@@ -292,4 +292,44 @@ pub fn parse_memory_type(s: &str) -> Result<MemoryType, String> {
 
 pub fn parse_trust_tier(s: &str) -> Result<TrustTier, String> {
     TrustTier::from_str(s).map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PurgeRequest, PurgeSelector};
+
+    #[test]
+    fn purge_selector_ignores_empty_arrays() {
+        let request = PurgeRequest {
+            memory_ids: Some(vec![]),
+            topic: None,
+            session_id: Some("sess-1".to_string()),
+            memory_types: Some(vec![]),
+            reason: None,
+        };
+
+        match request.selector().unwrap() {
+            PurgeSelector::Session {
+                session_id,
+                memory_types,
+            } => {
+                assert_eq!(session_id, "sess-1");
+                assert!(memory_types.is_none());
+            }
+            _ => panic!("expected session selector"),
+        }
+    }
+
+    #[test]
+    fn purge_selector_empty_memory_types_do_not_require_session() {
+        let request = PurgeRequest {
+            memory_ids: None,
+            topic: None,
+            session_id: None,
+            memory_types: Some(vec![]),
+            reason: None,
+        };
+
+        assert!(matches!(request.selector().unwrap(), PurgeSelector::None));
+    }
 }

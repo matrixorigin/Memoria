@@ -1,6 +1,7 @@
 //! Remote mode: proxy all MCP tool calls to a Memoria REST API server.
 //! Mirrors Python's HTTPBackend.
 
+use crate::purge_args::parse_memory_purge_args;
 use anyhow::Result;
 use reqwest::Client;
 use serde_json::{json, Value};
@@ -10,13 +11,6 @@ pub struct RemoteClient {
     base_url: String,
     #[allow(dead_code)]
     user_id: String,
-}
-
-struct MemoryPurgeArgs {
-    memory_id: Option<String>,
-    topic: Option<String>,
-    session_id: Option<String>,
-    memory_types: Option<Vec<String>>,
 }
 
 impl RemoteClient {
@@ -79,57 +73,6 @@ impl RemoteClient {
             body
         };
         anyhow::bail!("API error {status}: {msg}")
-    }
-
-    fn parse_memory_purge_args(args: &Value) -> Result<MemoryPurgeArgs> {
-        let memory_id = args["memory_id"]
-            .as_str()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string);
-        let topic = args["topic"]
-            .as_str()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string);
-        let session_id = args["session_id"]
-            .as_str()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string);
-        let memory_types = match args.get("memory_types") {
-            None | Some(Value::Null) => None,
-            Some(Value::Array(values)) => Some(
-                values
-                    .iter()
-                    .map(|value| {
-                        value
-                            .as_str()
-                            .map(str::to_string)
-                            .ok_or_else(|| anyhow::anyhow!("memory_types entries must be strings"))
-                    })
-                    .collect::<Result<Vec<_>>>()?,
-            ),
-            Some(_) => return Err(anyhow::anyhow!("memory_types must be an array of strings")),
-        }
-        .filter(|types| !types.is_empty());
-        if memory_types.is_some() && session_id.is_none() {
-            return Err(anyhow::anyhow!("memory_types requires session_id"));
-        }
-        let selector_count = usize::from(memory_id.is_some())
-            + usize::from(topic.is_some())
-            + usize::from(session_id.is_some());
-        if selector_count > 1 {
-            return Err(anyhow::anyhow!(
-                "Provide only one of memory_id, topic, or session_id"
-            ));
-        }
-        Ok(MemoryPurgeArgs {
-            memory_id,
-            topic,
-            session_id,
-            memory_types,
-        })
     }
 
     pub async fn call(&self, name: &str, args: Value) -> Result<Value> {
@@ -234,7 +177,7 @@ impl RemoteClient {
             }
 
             "memory_purge" => {
-                let purge_args = Self::parse_memory_purge_args(&args)?;
+                let purge_args = parse_memory_purge_args(&args)?;
                 if let Some(memory_id) = purge_args.memory_id {
                     let ids: Vec<&str> = memory_id
                         .split(',')
@@ -271,7 +214,12 @@ impl RemoteClient {
                         .post(self.url("/v1/memories/purge"))
                         .json(&json!({
                             "session_id": session_id,
-                            "memory_types": purge_args.memory_types,
+                            "memory_types": purge_args.memory_types.map(|memory_types| {
+                                memory_types
+                                    .into_iter()
+                                    .map(|memory_type| memory_type.to_string())
+                                    .collect::<Vec<_>>()
+                            }),
                         }))
                         .send()
                         .await?;

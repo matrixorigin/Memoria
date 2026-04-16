@@ -1996,7 +1996,9 @@ impl MemoryService {
                 warning,
             })
         } else {
-            let mut memories = self.store.list_active(user_id, 10_000).await?;
+            // Trait-only fallback used by tests: load the full active set so session purges
+            // stay exact instead of silently capping at an arbitrary slice.
+            let mut memories = self.store.list_active(user_id, i64::MAX).await?;
             memories.retain(|memory| memory.session_id.as_deref() == Some(session_id));
             if let Some(memory_types) = memory_types {
                 memories.retain(|memory| memory_types.contains(&memory.memory_type));
