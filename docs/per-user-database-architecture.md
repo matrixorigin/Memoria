@@ -603,6 +603,9 @@ SELECT COUNT(*) FROM `<db_name-from-registry>`.mem_memories WHERE is_active = 1;
 
 如果你只是要让新版 multi-db 服务正常启动并工作，最小集合是：
 
+> 最新运行时在**全新空环境**下，即使没显式设置 `MEMORIA_MULTI_DB`，也会自动按 multi-db 启动。
+> 但生产环境仍然建议把 `MEMORIA_MULTI_DB=1` 和 `MEMORIA_SHARED_DATABASE_URL` 明确写出来，避免歧义，也兼容旧版本节点。
+
 ```bash
 DATABASE_URL=<shared-db-url>
 MEMORIA_MULTI_DB=1
@@ -620,7 +623,7 @@ EMBEDDING_DIM=<must-match-schema>
 | 变量 | 是否迁移后重启必需 | 说明 |
 |---|---|---|
 | `DATABASE_URL` | 是 | multi-db 模式下应指向 shared DB |
-| `MEMORIA_MULTI_DB` | 是 | 置为 `1` / `true` 打开新架构 |
+| `MEMORIA_MULTI_DB` | 建议显式设置 | 置为 `1` / `true` 可强制打开新架构；最新运行时对 fresh empty 环境会自动切到 multi-db |
 | `MEMORIA_SHARED_DATABASE_URL` | 是 | 显式告诉服务 shared DB 在哪；**不要依赖默认推导** |
 | `EMBEDDING_PROVIDER` | 基本必需 | 不设会退回默认 `mock`，检索语义会变掉 |
 | `EMBEDDING_BASE_URL` | 基本必需 | HTTP embedding 服务地址 |
