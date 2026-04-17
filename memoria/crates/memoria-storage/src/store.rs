@@ -1585,11 +1585,11 @@ impl SqlMemoryStore {
         sqlx::query(
             r#"CREATE TABLE IF NOT EXISTS mem_governance_runtime_state (
                 strategy_key       VARCHAR(128) NOT NULL,
-                task               VARCHAR(32)  NOT NULL,
+                `task`             VARCHAR(32)  NOT NULL,
                 failure_count      INT          NOT NULL DEFAULT 0,
                 circuit_open_until DATETIME(6)  DEFAULT NULL,
                 updated_at         DATETIME(6)  NOT NULL,
-                PRIMARY KEY (strategy_key, task)
+                PRIMARY KEY (strategy_key, `task`)
             )"#,
         )
         .execute(&mut *conn)
@@ -2500,8 +2500,8 @@ impl SqlMemoryStore {
         let row = sqlx::query(&format!(
             "SELECT TIMESTAMPDIFF(SECOND, NOW(), circuit_open_until) AS remaining \
              FROM {runtime_table} \
-             WHERE strategy_key = ? AND task = ? \
-               AND circuit_open_until IS NOT NULL AND circuit_open_until > NOW()"
+             WHERE strategy_key = ? AND `task` = ? \
+                AND circuit_open_until IS NOT NULL AND circuit_open_until > NOW()"
         ))
         .bind(strategy_key)
         .bind(task)
@@ -2525,7 +2525,7 @@ impl SqlMemoryStore {
         let initial_failures = if open_on_insert { 0 } else { 1 };
         sqlx::query(&format!(
             "INSERT INTO {runtime_table} \
-                 (strategy_key, task, failure_count, circuit_open_until, updated_at) \
+                 (strategy_key, `task`, failure_count, circuit_open_until, updated_at) \
               VALUES (?, ?, ?, CASE WHEN ? THEN DATE_ADD(NOW(), INTERVAL ? SECOND) ELSE NULL END, NOW()) \
               ON DUPLICATE KEY UPDATE \
                  failure_count = CASE \
@@ -2565,7 +2565,7 @@ impl SqlMemoryStore {
         let runtime_table = self.t("mem_governance_runtime_state");
         sqlx::query(&format!(
             "INSERT INTO {runtime_table} \
-                 (strategy_key, task, failure_count, circuit_open_until, updated_at) \
+                 (strategy_key, `task`, failure_count, circuit_open_until, updated_at) \
               VALUES (?, ?, 0, NULL, NOW()) \
               ON DUPLICATE KEY UPDATE failure_count = 0, circuit_open_until = NULL, updated_at = NOW()"
         ))
@@ -3269,7 +3269,7 @@ impl SqlMemoryStore {
         // 1. 检查冷却
         let cooldown_check: Option<(chrono::NaiveDateTime,)> = sqlx::query_as(&format!(
             "SELECT circuit_open_until FROM {runtime_table} \
-             WHERE strategy_key = ? AND task = 'rebuild'"
+             WHERE strategy_key = ? AND `task` = 'rebuild'"
         ))
         .bind(&key)
         .fetch_optional(&mut *conn)
@@ -3295,7 +3295,7 @@ impl SqlMemoryStore {
         // 3. 查上次重建时的行数
         let last_rows: Option<(i32,)> = sqlx::query_as(&format!(
             "SELECT failure_count FROM {runtime_table} \
-             WHERE strategy_key = ? AND task = 'rebuild'"
+             WHERE strategy_key = ? AND `task` = 'rebuild'"
         ))
         .bind(&key)
         .fetch_optional(&mut *conn)
@@ -3334,7 +3334,7 @@ impl SqlMemoryStore {
 
         sqlx::query(&format!(
             "INSERT INTO {runtime_table} \
-             (strategy_key, task, failure_count, circuit_open_until, updated_at) \
+             (strategy_key, `task`, failure_count, circuit_open_until, updated_at) \
              VALUES (?, 'rebuild', ?, ?, NOW()) \
              ON DUPLICATE KEY UPDATE \
              failure_count = VALUES(failure_count), \
@@ -3365,7 +3365,7 @@ impl SqlMemoryStore {
         // 查询当前失败次数（存储在 failure_count 的负数）
         let current_failures: Option<(i32,)> = sqlx::query_as(&format!(
             "SELECT failure_count FROM {runtime_table} \
-             WHERE strategy_key = ? AND task = 'rebuild' AND failure_count < 0"
+             WHERE strategy_key = ? AND `task` = 'rebuild' AND failure_count < 0"
         ))
         .bind(&key)
         .fetch_optional(&mut *conn)
@@ -3386,7 +3386,7 @@ impl SqlMemoryStore {
 
         sqlx::query(&format!(
             "INSERT INTO {runtime_table} \
-             (strategy_key, task, failure_count, circuit_open_until, updated_at) \
+             (strategy_key, `task`, failure_count, circuit_open_until, updated_at) \
              VALUES (?, 'rebuild', ?, ?, NOW()) \
              ON DUPLICATE KEY UPDATE \
              failure_count = VALUES(failure_count), \

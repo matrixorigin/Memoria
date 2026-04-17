@@ -3,6 +3,8 @@ use serde_json::{json, Value};
 /// Requires DATABASE_URL env var.
 use std::sync::Arc;
 
+mod support;
+
 fn test_dim() -> usize {
     std::env::var("EMBEDDING_DIM")
         .ok()
@@ -106,50 +108,25 @@ fn try_embedding() -> Option<(String, String, String)> {
 }
 
 /// Spawn the API server on a random port, return (base_url, client).
-async fn spawn_server() -> (String, reqwest::Client) {
-    use memoria_git::GitForDataService;
-    use memoria_service::{Config, MemoryService};
-    use memoria_storage::SqlMemoryStore;
-    use sqlx::mysql::MySqlPool;
-
-    let cfg = Config::from_env();
-    let db = db_url();
-
-    let store = SqlMemoryStore::connect(&db, test_dim(), uuid::Uuid::new_v4().to_string())
-        .await
-        .expect("connect");
-    store.migrate().await.expect("migrate");
-    let pool = MySqlPool::connect(&db).await.expect("pool");
-    let git = Arc::new(GitForDataService::new(pool, &cfg.db_name));
-    let service = Arc::new(MemoryService::new_sql_with_llm(Arc::new(store), None, None).await);
-    let state = memoria_api::AppState::new(service, git, String::new());
-
-    let app = memoria_api::build_router(state);
-
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind");
-    let port = listener.local_addr().unwrap().port();
-    let handle = tokio::spawn(async move { axum::serve(listener, app).await });
-
-    tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
-    if handle.is_finished() {
-        panic!("Server task finished unexpectedly");
-    }
-
-    let client = reqwest::Client::builder()
-        .no_proxy()
-        .build()
-        .expect("client");
-    let base = format!("http://127.0.0.1:{port}");
-    (base, client)
+async fn spawn_server() -> (String, reqwest::Client, support::multi_db::ApiTestServer) {
+    let server = support::multi_db::spawn_api_server(
+        "api_e2e",
+        test_dim(),
+        String::new(),
+        None,
+        None,
+        None,
+        false,
+    )
+    .await;
+    (server.base.clone(), server.client.clone(), server)
 }
 
 // ── 1. health ─────────────────────────────────────────────────────────────────
 
 #[tokio::test]
 async fn test_api_health() {
-    let (base, client) = spawn_server().await;
+    let (base, client, _server) = spawn_server().await;
     let r = client
         .get(format!("{base}/health"))
         .send()
@@ -164,7 +141,7 @@ async fn test_api_health() {
 
 #[tokio::test]
 async fn test_api_store_and_list() {
-    let (base, client) = spawn_server().await;
+    let (base, client, _server) = spawn_server().await;
     let uid = uid();
 
     let r = client
@@ -210,7 +187,7 @@ async fn test_api_store_and_list() {
 
 #[tokio::test]
 async fn test_api_list_no_embedding_and_limit() {
-    let (base, client) = spawn_server().await;
+    let (base, client, _server) = spawn_server().await;
     let uid = uid();
 
     // Store 3 memories: 2 semantic + 1 profile, with small delays for distinct created_at
@@ -336,7 +313,7 @@ async fn test_api_list_no_embedding_and_limit() {
 
 #[tokio::test]
 async fn test_api_list_cursor_with_type_filter() {
-    let (base, client) = spawn_server().await;
+    let (base, client, _server) = spawn_server().await;
     let uid = uid();
 
     // Store 3 semantic + 1 profile
@@ -395,7 +372,7 @@ async fn test_api_list_cursor_with_type_filter() {
 
 #[tokio::test]
 async fn test_api_list_excludes_deleted() {
-    let (base, client) = spawn_server().await;
+    let (base, client, _server) = spawn_server().await;
     let uid = uid();
 
     // Store 2 memories
@@ -443,7 +420,7 @@ async fn test_api_list_excludes_deleted() {
 
 #[tokio::test]
 async fn test_api_list_empty() {
-    let (base, client) = spawn_server().await;
+    let (base, client, _server) = spawn_server().await;
     let uid = uid(); // fresh user, no memories
 
     let body: Value = client
@@ -464,7 +441,7 @@ async fn test_api_list_empty() {
 
 #[tokio::test]
 async fn test_api_list_limit_cap() {
-    let (base, client) = spawn_server().await;
+    let (base, client, _server) = spawn_server().await;
     let uid = uid();
 
     // Store 2 memories, request limit=9999 — should still work (capped internally)
@@ -498,7 +475,7 @@ async fn test_api_list_limit_cap() {
 
 #[tokio::test]
 async fn test_api_list_invalid_cursor() {
-    let (base, client) = spawn_server().await;
+    let (base, client, _server) = spawn_server().await;
     let uid = uid();
 
     // Store 1 memory so user exists
@@ -544,7 +521,7 @@ async fn test_api_list_invalid_cursor() {
 
 #[tokio::test]
 async fn test_api_list_user_isolation() {
-    let (base, client) = spawn_server().await;
+    let (base, client, _server) = spawn_server().await;
     let uid_a = uid();
     let uid_b = uid();
 
@@ -602,7 +579,7 @@ async fn test_api_list_user_isolation() {
 
 #[tokio::test]
 async fn test_api_list_default_limit() {
-    let (base, client) = spawn_server().await;
+    let (base, client, _server) = spawn_server().await;
     let uid = uid();
 
     // Store 3 memories, don't pass limit param
@@ -640,7 +617,7 @@ async fn test_api_list_default_limit() {
 
 #[tokio::test]
 async fn test_api_list_has_more_at_limit_boundary() {
-    let (base, client) = spawn_server().await;
+    let (base, client, _server) = spawn_server().await;
     let uid = uid();
 
     // Store 2 memories
@@ -700,7 +677,7 @@ async fn test_api_list_has_more_at_limit_boundary() {
 
 #[tokio::test]
 async fn test_api_batch_store() {
-    let (base, client) = spawn_server().await;
+    let (base, client, _server) = spawn_server().await;
     let uid = uid();
 
     let r = client
@@ -723,7 +700,7 @@ async fn test_api_batch_store() {
 
 #[tokio::test]
 async fn test_api_retrieve() {
-    let (base, client) = spawn_server().await;
+    let (base, client, _server) = spawn_server().await;
     let uid = uid();
 
     client
@@ -754,7 +731,7 @@ async fn test_api_retrieve() {
 
 #[tokio::test]
 async fn test_api_correct() {
-    let (base, client) = spawn_server().await;
+    let (base, client, _server) = spawn_server().await;
     let uid = uid();
 
     let r = client
@@ -786,7 +763,7 @@ async fn test_api_correct() {
 
 #[tokio::test]
 async fn test_api_delete() {
-    let (base, client) = spawn_server().await;
+    let (base, client, _server) = spawn_server().await;
     let uid = uid();
 
     let r = client
@@ -815,7 +792,7 @@ async fn test_api_delete() {
 
 #[tokio::test]
 async fn test_api_purge_bulk() {
-    let (base, client) = spawn_server().await;
+    let (base, client, _server) = spawn_server().await;
     let uid = uid();
 
     let mut ids = Vec::new();
@@ -852,7 +829,7 @@ async fn test_api_purge_bulk() {
 
 #[tokio::test]
 async fn test_api_profile() {
-    let (base, client) = spawn_server().await;
+    let (base, client, _server) = spawn_server().await;
     let uid = uid();
 
     client
@@ -879,7 +856,7 @@ async fn test_api_profile() {
 
 #[tokio::test]
 async fn test_api_governance() {
-    let (base, client) = spawn_server().await;
+    let (base, client, _server) = spawn_server().await;
     let uid = uid();
 
     let r = client
@@ -897,32 +874,20 @@ async fn test_api_governance() {
 
 // ── Helper: spawn server with master key ─────────────────────────────────────
 
-async fn spawn_server_with_master_key(master_key: &str) -> (String, reqwest::Client) {
-    use memoria_git::GitForDataService;
-    use memoria_service::{Config, MemoryService};
-    use memoria_storage::SqlMemoryStore;
-    use sqlx::mysql::MySqlPool;
-
-    let cfg = Config::from_env();
-    let db = db_url();
-    let store = SqlMemoryStore::connect(&db, test_dim(), uuid::Uuid::new_v4().to_string())
-        .await
-        .expect("connect");
-    store.migrate().await.expect("migrate");
-    let pool = MySqlPool::connect(&db).await.expect("pool");
-    let git = Arc::new(GitForDataService::new(pool, &cfg.db_name));
-    let service = Arc::new(MemoryService::new_sql_with_llm(Arc::new(store), None, None).await);
-    let state = memoria_api::AppState::new(service, git, master_key.to_string())
-        .init_auth_pool(&db, false)
-        .await
-        .expect("init auth pool");
-    let app = memoria_api::build_router(state);
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-    let client = reqwest::Client::builder().no_proxy().build().unwrap();
-    (format!("http://127.0.0.1:{port}"), client)
+async fn spawn_server_with_master_key(
+    master_key: &str,
+) -> (String, reqwest::Client, support::multi_db::ApiTestServer) {
+    let server = support::multi_db::spawn_api_server(
+        "api_e2e_master",
+        test_dim(),
+        master_key.to_string(),
+        None,
+        None,
+        None,
+        true,
+    )
+    .await;
+    (server.base.clone(), server.client.clone(), server)
 }
 
 async fn create_api_key_for_user(
@@ -951,7 +916,7 @@ async fn create_api_key_for_user(
 #[tokio::test]
 async fn test_api_auth_required() {
     let mk = "test-master-key-12345";
-    let (base, client) = spawn_server_with_master_key(mk).await;
+    let (base, client, _server) = spawn_server_with_master_key(mk).await;
 
     // No token → 401
     let r = client
@@ -990,7 +955,7 @@ async fn test_api_auth_required() {
 #[tokio::test]
 async fn test_api_key_crud() {
     let mk = "test-master-key-crud";
-    let (base, client) = spawn_server_with_master_key(mk).await;
+    let (base, client, _server) = spawn_server_with_master_key(mk).await;
     let auth = format!("Bearer {mk}");
     let uid = uid();
 
@@ -1121,7 +1086,7 @@ async fn test_api_key_crud() {
 #[tokio::test]
 async fn test_api_key_cannot_get_other_users_memory() {
     let mk = "test-master-key-memory-read";
-    let (base, client) = spawn_server_with_master_key(mk).await;
+    let (base, client, _server) = spawn_server_with_master_key(mk).await;
     let auth = format!("Bearer {mk}");
     let owner_id = uid();
     let attacker_id = uid();
@@ -1148,13 +1113,21 @@ async fn test_api_key_cannot_get_other_users_memory() {
         .send()
         .await
         .unwrap();
-    assert_eq!(r.status(), 403, "non-owner API key must get 403");
+    assert_eq!(
+        r.status(),
+        200,
+        "non-owner API key must see the same response as a missing memory"
+    );
+    assert!(
+        r.json::<Value>().await.unwrap().is_null(),
+        "foreign memory reads must not reveal existence"
+    );
 }
 
 #[tokio::test]
 async fn test_api_key_cannot_correct_other_users_memory() {
     let mk = "test-master-key-memory-correct";
-    let (base, client) = spawn_server_with_master_key(mk).await;
+    let (base, client, _server) = spawn_server_with_master_key(mk).await;
     let auth = format!("Bearer {mk}");
     let owner_id = uid();
     let attacker_id = uid();
@@ -1183,29 +1156,30 @@ async fn test_api_key_cannot_correct_other_users_memory() {
         .send()
         .await
         .unwrap();
-    assert_eq!(r.status(), 403, "non-owner API key must get 403");
+    assert_eq!(
+        r.status(),
+        404,
+        "non-owner API key must see the same response as a missing memory"
+    );
 }
 
 #[tokio::test]
 async fn test_api_key_cannot_get_other_users_task_status() {
     use memoria_service::AsyncTaskStore;
-    use memoria_storage::SqlMemoryStore;
 
     let mk = "test-master-key-task-status";
-    let (base, client) = spawn_server_with_master_key(mk).await;
+    let (base, client, server) = spawn_server_with_master_key(mk).await;
     let auth = format!("Bearer {mk}");
     let owner_id = uid();
     let attacker_id = uid();
     let attacker_key =
         create_api_key_for_user(&client, &base, &auth, &attacker_id, "attacker-task").await;
 
-    let store = SqlMemoryStore::connect(&db_url(), test_dim(), uuid::Uuid::new_v4().to_string())
-        .await
-        .expect("connect");
-    store.migrate().await.expect("migrate");
+    let store = server.shared_store();
 
     let task_id = format!("task_{}", uuid::Uuid::new_v4().simple());
     store
+        .as_ref()
         .create_task(&task_id, "instance_authz", &owner_id)
         .await
         .unwrap();
@@ -1224,7 +1198,7 @@ async fn test_api_key_cannot_get_other_users_task_status() {
 #[tokio::test]
 async fn test_api_key_cannot_delete_other_users_memory() {
     let mk = "test-master-key-memory-delete";
-    let (base, client) = spawn_server_with_master_key(mk).await;
+    let (base, client, _server) = spawn_server_with_master_key(mk).await;
     let auth = format!("Bearer {mk}");
     let owner_id = uid();
     let attacker_id = uid();
@@ -1253,7 +1227,11 @@ async fn test_api_key_cannot_delete_other_users_memory() {
         .send()
         .await
         .unwrap();
-    assert_eq!(r.status(), 403, "non-owner API key must get 403 on delete");
+    assert_eq!(
+        r.status(),
+        404,
+        "non-owner API key must see the same response as a missing memory on delete"
+    );
 }
 
 // ── 10b-5. cross-user list isolation ─────────────────────────────────────────
@@ -1261,7 +1239,7 @@ async fn test_api_key_cannot_delete_other_users_memory() {
 #[tokio::test]
 async fn test_api_key_list_only_own_memories() {
     let mk = "test-master-key-list-isolation";
-    let (base, client) = spawn_server_with_master_key(mk).await;
+    let (base, client, _server) = spawn_server_with_master_key(mk).await;
     let auth = format!("Bearer {mk}");
     let user_a = uid();
     let user_b = uid();
@@ -1302,7 +1280,7 @@ async fn test_api_key_list_only_own_memories() {
 #[tokio::test]
 async fn test_master_key_can_impersonate_and_access_any_user() {
     let mk = "test-master-key-impersonate";
-    let (base, client) = spawn_server_with_master_key(mk).await;
+    let (base, client, _server) = spawn_server_with_master_key(mk).await;
     let auth = format!("Bearer {mk}");
     let user_a = uid();
     let key_a = create_api_key_for_user(&client, &base, &auth, &user_a, "imp-a").await;
@@ -1359,12 +1337,91 @@ async fn test_master_key_can_impersonate_and_access_any_user() {
     assert_eq!(r.status(), 403, "API key must not access admin routes");
 }
 
+#[tokio::test]
+async fn test_non_master_cannot_probe_other_users_memory_ids() {
+    let mk = "test-master-key-tenant-isolation";
+    let (base, client, _server) = spawn_server_with_master_key(mk).await;
+    let auth = format!("Bearer {mk}");
+    let owner = uid();
+    let intruder = uid();
+    let owner_key = create_api_key_for_user(&client, &base, &auth, &owner, "owner-key").await;
+    let intruder_key =
+        create_api_key_for_user(&client, &base, &auth, &intruder, "intruder-key").await;
+
+    let r = client
+        .post(format!("{base}/v1/memories"))
+        .header("Authorization", format!("Bearer {owner_key}"))
+        .json(&json!({ "content": "owner private memory", "memory_type": "semantic" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 201);
+    let memory_id = r.json::<Value>().await.unwrap()["memory_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let r = client
+        .get(format!("{base}/v1/memories/{memory_id}"))
+        .header("Authorization", format!("Bearer {intruder_key}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        r.status(),
+        200,
+        "foreign GET must match missing-memory response"
+    );
+    assert!(r.json::<Value>().await.unwrap().is_null());
+
+    let r = client
+        .put(format!("{base}/v1/memories/{memory_id}/correct"))
+        .header("Authorization", format!("Bearer {intruder_key}"))
+        .json(&json!({ "new_content": "intruder overwrite" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        r.status(),
+        404,
+        "foreign correct must look like missing memory"
+    );
+
+    let r = client
+        .delete(format!("{base}/v1/memories/{memory_id}"))
+        .header("Authorization", format!("Bearer {intruder_key}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        r.status(),
+        404,
+        "foreign delete must look like missing memory"
+    );
+
+    let r = client
+        .get(format!("{base}/v1/memories/{memory_id}"))
+        .header("Authorization", format!("Bearer {owner_key}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        r.status(),
+        200,
+        "failed probes must not mutate owner memory"
+    );
+    assert_eq!(
+        r.json::<Value>().await.unwrap()["content"],
+        "owner private memory"
+    );
+}
+
 // ── 10b-7. revoked API key returns 401 ───────────────────────────────────────
 
 #[tokio::test]
 async fn test_revoked_api_key_returns_401() {
     let mk = "test-master-key-revoked";
-    let (base, client) = spawn_server_with_master_key(mk).await;
+    let (base, client, _server) = spawn_server_with_master_key(mk).await;
     let auth = format!("Bearer {mk}");
     let uid = uid();
 
@@ -1425,7 +1482,7 @@ async fn test_revoked_api_key_returns_401() {
 
 #[tokio::test]
 async fn test_api_observe_turn() {
-    let (base, client) = spawn_server().await;
+    let (base, client, _server) = spawn_server().await;
     let uid = uid();
 
     // Observe with assistant + user messages
@@ -1482,7 +1539,7 @@ async fn test_api_observe_turn() {
 
 #[tokio::test]
 async fn test_api_observe_empty_messages() {
-    let (base, client) = spawn_server().await;
+    let (base, client, _server) = spawn_server().await;
     let uid = uid();
 
     // Empty messages array → should return 200 with empty memories
@@ -1506,7 +1563,7 @@ async fn test_api_observe_empty_messages() {
 
 #[tokio::test]
 async fn test_api_retrieve_top_k_respected() {
-    let (base, client) = spawn_server().await;
+    let (base, client, _server) = spawn_server().await;
     let uid = uid();
 
     // Store 5 memories
@@ -1540,7 +1597,7 @@ async fn test_api_retrieve_top_k_respected() {
 
 #[tokio::test]
 async fn test_api_search_returns_fields() {
-    let (base, client) = spawn_server().await;
+    let (base, client, _server) = spawn_server().await;
     let uid = uid();
 
     client
@@ -1579,7 +1636,7 @@ async fn test_api_search_returns_fields() {
 
 #[tokio::test]
 async fn test_api_store_missing_content() {
-    let (base, client) = spawn_server().await;
+    let (base, client, _server) = spawn_server().await;
     let uid = uid();
 
     let r = client
@@ -1595,7 +1652,7 @@ async fn test_api_store_missing_content() {
 
 #[tokio::test]
 async fn test_api_delete_nonexistent() {
-    let (base, client) = spawn_server().await;
+    let (base, client, _server) = spawn_server().await;
     let uid = uid();
 
     let r = client
@@ -1611,7 +1668,7 @@ async fn test_api_delete_nonexistent() {
 
 #[tokio::test]
 async fn test_api_correct_nonexistent() {
-    let (base, client) = spawn_server().await;
+    let (base, client, _server) = spawn_server().await;
     let uid = uid();
 
     let r = client
@@ -1634,7 +1691,7 @@ async fn test_api_correct_nonexistent() {
 
 #[tokio::test]
 async fn test_api_memory_history() {
-    let (base, client) = spawn_server().await;
+    let (base, client, _server) = spawn_server().await;
     let uid = uid();
 
     // Store a memory
@@ -1691,7 +1748,7 @@ async fn test_api_memory_history() {
 
 #[tokio::test]
 async fn test_api_memory_history_not_found() {
-    let (base, client) = spawn_server().await;
+    let (base, client, _server) = spawn_server().await;
     let uid = uid();
 
     let r = client
@@ -1707,7 +1764,7 @@ async fn test_api_memory_history_not_found() {
 // ── Remote mode E2E tests ─────────────────────────────────────────────────────
 
 /// Spawn API server + test remote MCP client against it.
-async fn spawn_api_for_remote() -> (String, reqwest::Client) {
+async fn spawn_api_for_remote() -> (String, reqwest::Client, support::multi_db::ApiTestServer) {
     // Reuse spawn_server but return the base URL for RemoteClient
     spawn_server().await
 }
@@ -1716,7 +1773,7 @@ async fn spawn_api_for_remote() -> (String, reqwest::Client) {
 async fn test_remote_store_retrieve() {
     use memoria_mcp::remote::RemoteClient;
 
-    let (base, _) = spawn_api_for_remote().await;
+    let (base, _, _server) = spawn_api_for_remote().await;
     let uid = uid();
 
     let remote = RemoteClient::new(&base, None, uid.clone(), None);
@@ -1759,7 +1816,7 @@ async fn test_remote_store_retrieve() {
 async fn test_remote_correct_purge() {
     use memoria_mcp::remote::RemoteClient;
 
-    let (base, _) = spawn_api_for_remote().await;
+    let (base, _, _server) = spawn_api_for_remote().await;
     let uid = uid();
     let remote = RemoteClient::new(&base, None, uid.clone(), None);
 
@@ -1806,7 +1863,7 @@ async fn test_remote_correct_purge() {
 async fn test_remote_governance() {
     use memoria_mcp::remote::RemoteClient;
 
-    let (base, _) = spawn_api_for_remote().await;
+    let (base, _, _server) = spawn_api_for_remote().await;
     let uid = uid();
     let remote = RemoteClient::new(&base, None, uid.clone(), None);
 
@@ -1826,7 +1883,7 @@ async fn test_remote_governance() {
 async fn test_remote_capabilities() {
     use memoria_mcp::remote::RemoteClient;
 
-    let (base, _) = spawn_api_for_remote().await;
+    let (base, _, _server) = spawn_api_for_remote().await;
     let uid = uid();
     let remote = RemoteClient::new(&base, None, uid.clone(), None);
 
@@ -1845,7 +1902,7 @@ async fn test_remote_capabilities() {
 #[tokio::test]
 async fn test_remote_list_search_profile() {
     use memoria_mcp::remote::RemoteClient;
-    let (base, _) = spawn_api_for_remote().await;
+    let (base, _, _server) = spawn_api_for_remote().await;
     let uid = uid();
     let remote = RemoteClient::new(&base, None, uid.clone(), None);
 
@@ -1901,7 +1958,7 @@ async fn test_remote_list_search_profile() {
 #[tokio::test]
 async fn test_remote_snapshot_branch() {
     use memoria_mcp::remote::RemoteClient;
-    let (base, _) = spawn_api_for_remote().await;
+    let (base, _, _server) = spawn_api_for_remote().await;
     let uid = uid();
     let remote = RemoteClient::new(&base, None, uid.clone(), None);
 
@@ -2020,7 +2077,7 @@ async fn test_remote_snapshot_branch() {
 #[tokio::test]
 async fn test_remote_reflect_extract_entities() {
     use memoria_mcp::remote::RemoteClient;
-    let (base, _) = spawn_api_for_remote().await;
+    let (base, _, _server) = spawn_api_for_remote().await;
     let uid = uid();
     let remote = RemoteClient::new(&base, None, uid.clone(), None);
 
@@ -2097,7 +2154,7 @@ async fn test_remote_reflect_extract_entities() {
 #[tokio::test]
 async fn test_reflect_no_llm_falls_back_to_candidates() {
     // When LLM is not configured, mode=auto should return candidates (not error)
-    let (base, client) = spawn_server().await;
+    let (base, client, _server) = spawn_server().await;
     let uid = uid();
 
     client
@@ -2137,7 +2194,7 @@ async fn test_reflect_no_llm_falls_back_to_candidates() {
 
 #[tokio::test]
 async fn test_extract_entities_no_llm_falls_back_to_candidates() {
-    let (base, client) = spawn_server().await;
+    let (base, client, _server) = spawn_server().await;
     let uid = uid();
 
     client
@@ -2172,7 +2229,7 @@ async fn test_extract_entities_no_llm_falls_back_to_candidates() {
 
 #[tokio::test]
 async fn test_governance_pollution_detection() {
-    let (base, client) = spawn_server().await;
+    let (base, client, _server) = spawn_server().await;
     let uid = uid();
 
     // Store 3 memories then supersede 2 of them → ratio=2/5=0.4 > 0.3 → polluted
@@ -2223,17 +2280,10 @@ async fn test_governance_pollution_detection() {
 #[tokio::test]
 async fn test_reflect_with_llm() {
     let (llm, _shutdown) = spawn_fake_llm().await;
-    let (base, client) = spawn_server_with_llm(llm).await;
+    let (base, client, server) = spawn_server_with_llm(llm).await;
     let uid = uid();
 
-    let store = memoria_storage::SqlMemoryStore::connect(
-        &db_url(),
-        test_dim(),
-        uuid::Uuid::new_v4().to_string(),
-    )
-    .await
-    .expect("connect");
-    store.migrate().await.expect("migrate");
+    let store = server.user_store(&uid).await;
     let graph = store.graph_store();
     for (idx, content) in [
         "Project uses Rust for all backend services",
@@ -2318,7 +2368,7 @@ async fn test_reflect_with_llm() {
 #[tokio::test]
 async fn test_extract_entities_with_llm() {
     let (llm, _shutdown) = spawn_fake_llm().await;
-    let (base, client) = spawn_server_with_llm(llm).await;
+    let (base, client, _server) = spawn_server_with_llm(llm).await;
     let uid = uid();
 
     client
@@ -2379,7 +2429,7 @@ async fn test_extract_entities_with_llm() {
 #[tokio::test]
 async fn test_remote_consolidate() {
     use memoria_mcp::remote::RemoteClient;
-    let (base, _) = spawn_api_for_remote().await;
+    let (base, _, _server) = spawn_api_for_remote().await;
     let uid = uid();
     let remote = RemoteClient::new(&base, None, uid.clone(), None);
 
@@ -2398,7 +2448,7 @@ async fn test_remote_consolidate() {
 #[tokio::test]
 async fn test_remote_correct_by_query() {
     use memoria_mcp::remote::RemoteClient;
-    let (base, _) = spawn_api_for_remote().await;
+    let (base, _, _server) = spawn_api_for_remote().await;
     let uid = uid();
     let remote = RemoteClient::new(&base, None, uid.clone(), None);
 
@@ -2432,7 +2482,7 @@ async fn test_remote_correct_by_query() {
 #[tokio::test]
 async fn test_remote_purge_by_topic() {
     use memoria_mcp::remote::RemoteClient;
-    let (base, _) = spawn_api_for_remote().await;
+    let (base, _, _server) = spawn_api_for_remote().await;
     let uid = uid();
     let remote = RemoteClient::new(&base, None, uid.clone(), None);
 
@@ -2457,7 +2507,7 @@ async fn test_remote_purge_by_topic() {
 #[tokio::test]
 async fn test_remote_purge_by_session_id() {
     use memoria_mcp::remote::RemoteClient;
-    let (base, _) = spawn_api_for_remote().await;
+    let (base, _, _server) = spawn_api_for_remote().await;
     let uid = uid();
     let remote = RemoteClient::new(&base, None, uid.clone(), None);
     let target_session = format!("session:test-smp-{}", uuid::Uuid::new_v4().simple());
@@ -2543,7 +2593,7 @@ async fn test_remote_purge_rejects_invalid_memory_types_locally() {
 
 #[tokio::test]
 async fn test_episodic_no_llm_returns_503() {
-    let (base, client) = spawn_server().await;
+    let (base, client, _server) = spawn_server().await;
     let uid = uid();
 
     // Store some memories with a session_id
@@ -2569,89 +2619,55 @@ async fn test_episodic_no_llm_returns_503() {
 
 async fn spawn_server_with_llm(
     llm: Arc<memoria_embedding::LlmClient>,
-) -> (String, reqwest::Client) {
-    use memoria_git::GitForDataService;
-    use memoria_service::{Config, MemoryService};
-    use memoria_storage::SqlMemoryStore;
-    use sqlx::mysql::MySqlPool;
-
-    let cfg = Config::from_env();
-    let db = db_url();
-    let store = SqlMemoryStore::connect(&db, test_dim(), uuid::Uuid::new_v4().to_string())
-        .await
-        .expect("connect");
-    store.migrate().await.expect("migrate");
-    let pool = MySqlPool::connect(&db).await.expect("pool");
-    let git = Arc::new(GitForDataService::new(pool, &cfg.db_name));
-    let service = Arc::new(MemoryService::new_sql_with_llm(Arc::new(store), None, Some(llm)).await);
-    let state = memoria_api::AppState::new(service, git, String::new());
-    let app = memoria_api::build_router(state);
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-    let client = reqwest::Client::builder().no_proxy().build().unwrap();
-    (format!("http://127.0.0.1:{port}"), client)
+) -> (String, reqwest::Client, support::multi_db::ApiTestServer) {
+    let server = support::multi_db::spawn_api_server(
+        "api_e2e_llm",
+        test_dim(),
+        String::new(),
+        None,
+        Some(llm),
+        None,
+        false,
+    )
+    .await;
+    (server.base.clone(), server.client.clone(), server)
 }
 
 async fn spawn_server_with_embedding(
     emb_key: String,
     base_url: String,
     model: String,
-) -> (String, reqwest::Client) {
+) -> (String, reqwest::Client, support::multi_db::ApiTestServer) {
     use memoria_embedding::HttpEmbedder;
-    use memoria_git::GitForDataService;
-    use memoria_service::{Config, MemoryService};
-    use memoria_storage::SqlMemoryStore;
-    use sqlx::mysql::MySqlPool;
-
-    let cfg = Config::from_env();
-    let db = db_url();
-    let store = SqlMemoryStore::connect(&db, 1024, uuid::Uuid::new_v4().to_string())
-        .await
-        .expect("connect");
-    store.migrate().await.expect("migrate");
-    let pool = MySqlPool::connect(&db).await.expect("pool");
-    let git = Arc::new(GitForDataService::new(pool, &cfg.db_name));
     let embedder = Arc::new(HttpEmbedder::new(base_url, emb_key, model, 1024));
-    let service =
-        Arc::new(MemoryService::new_sql_with_llm(Arc::new(store), Some(embedder), None).await);
-    let state = memoria_api::AppState::new(service, git, String::new());
-    let app = memoria_api::build_router(state);
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
-    let client = reqwest::Client::builder().no_proxy().build().unwrap();
-    (format!("http://127.0.0.1:{port}"), client)
+    let server = support::multi_db::spawn_api_server(
+        "api_e2e_embedding",
+        1024,
+        String::new(),
+        Some(embedder),
+        None,
+        None,
+        false,
+    )
+    .await;
+    (server.base.clone(), server.client.clone(), server)
 }
 
 async fn spawn_server_with_custom_embedder_and_pool(
     embedder: Arc<dyn memoria_core::interfaces::EmbeddingProvider>,
     dim: usize,
-) -> (String, reqwest::Client, sqlx::MySqlPool) {
-    use memoria_git::GitForDataService;
-    use memoria_service::{Config, MemoryService};
-    use memoria_storage::SqlMemoryStore;
-
-    let cfg = Config::from_env();
-    let db = db_url();
-    let store = SqlMemoryStore::connect(&db, dim, uuid::Uuid::new_v4().to_string())
-        .await
-        .expect("connect");
-    store.migrate().await.expect("migrate");
-    let pool = store.pool().clone();
-    let git = Arc::new(GitForDataService::new(pool.clone(), &cfg.db_name));
-    let service =
-        Arc::new(MemoryService::new_sql_with_llm(Arc::new(store), Some(embedder), None).await);
-    let state = memoria_api::AppState::new(service, git, String::new());
-    let app = memoria_api::build_router(state);
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
-    let client = reqwest::Client::builder().no_proxy().build().unwrap();
-    (format!("http://127.0.0.1:{port}"), client, pool)
+) -> (String, reqwest::Client, support::multi_db::ApiTestServer) {
+    let server = support::multi_db::spawn_api_server(
+        "api_e2e_custom_embedder",
+        dim,
+        String::new(),
+        Some(embedder),
+        None,
+        None,
+        false,
+    )
+    .await;
+    (server.base.clone(), server.client.clone(), server)
 }
 
 async fn store_memory_for_session(
@@ -2678,7 +2694,7 @@ async fn store_memory_for_session(
 #[tokio::test]
 async fn test_episodic_no_memories_returns_error() {
     let (llm, _shutdown) = spawn_fake_llm().await;
-    let (base, client) = spawn_server_with_llm(llm).await;
+    let (base, client, _server) = spawn_server_with_llm(llm).await;
     let uid = uid();
 
     // No memories for this session → 500
@@ -2695,7 +2711,7 @@ async fn test_episodic_no_memories_returns_error() {
 
 #[tokio::test]
 async fn test_episodic_async_task_polling() {
-    let (base, client) = spawn_server().await;
+    let (base, client, _server) = spawn_server().await;
     let uid = uid();
 
     // Without LLM, async mode should still create a task (that will fail)
@@ -2715,7 +2731,7 @@ async fn test_episodic_async_task_polling() {
 #[tokio::test]
 async fn test_episodic_with_llm_sync() {
     let (llm, _shutdown) = spawn_fake_llm().await;
-    let (base, client) = spawn_server_with_llm(llm).await;
+    let (base, client, _server) = spawn_server_with_llm(llm).await;
     let uid = uid();
     let session_id = format!(
         "ep_sess_{}",
@@ -2776,7 +2792,7 @@ async fn test_episodic_with_llm_sync() {
 #[tokio::test]
 async fn test_episodic_with_llm_async() {
     let (llm, _shutdown) = spawn_fake_llm().await;
-    let (base, client) = spawn_server_with_llm(llm).await;
+    let (base, client, _server) = spawn_server_with_llm(llm).await;
     let uid = uid();
     let session_id = format!(
         "ep_async_{}",
@@ -2847,7 +2863,7 @@ async fn test_episodic_with_llm_async() {
 
 #[tokio::test]
 async fn test_admin_stats_and_users() {
-    let (base, client) = spawn_server().await;
+    let (base, client, _server) = spawn_server().await;
     let user = uid();
 
     // Store a memory first
@@ -2925,7 +2941,7 @@ async fn test_admin_stats_and_users() {
 
 #[tokio::test]
 async fn test_admin_trigger_governance() {
-    let (base, client) = spawn_server().await;
+    let (base, client, _server) = spawn_server().await;
     let user = uid();
 
     // Store a memory
@@ -2975,7 +2991,7 @@ async fn test_admin_trigger_governance() {
 
 #[tokio::test]
 async fn test_health_endpoints() {
-    let (base, client) = spawn_server().await;
+    let (base, client, _server) = spawn_server().await;
     let user = uid();
 
     // Store some memories
@@ -3053,7 +3069,7 @@ async fn test_health_endpoints() {
 #[tokio::test]
 async fn test_admin_health_hygiene_global() {
     let mk = "test-master-key-hygiene";
-    let (base, client) = spawn_server_with_master_key(mk).await;
+    let (base, client, _server) = spawn_server_with_master_key(mk).await;
     let auth = format!("Bearer {mk}");
 
     let r = client
@@ -3083,7 +3099,7 @@ async fn test_admin_health_hygiene_global() {
 
 #[tokio::test]
 async fn test_sandbox_validation() {
-    let (base, client) = spawn_server().await;
+    let (base, client, _server) = spawn_server().await;
     let user = uid();
 
     // Store some base memories
@@ -3117,7 +3133,7 @@ async fn test_sandbox_validation() {
 
 #[tokio::test]
 async fn test_retrieve_with_explain() {
-    let (base, client) = spawn_server().await;
+    let (base, client, _server) = spawn_server().await;
     let user = uid();
 
     client
@@ -3208,7 +3224,7 @@ async fn test_explain_verbose_candidate_scores() {
         println!("⏭️  test_explain_verbose_candidate_scores skipped (EMBEDDING_API_KEY not set)");
         return;
     };
-    let (base, client) = spawn_server_with_embedding(key, base_url, model).await;
+    let (base, client, _server) = spawn_server_with_embedding(key, base_url, model).await;
     let uid = uid();
 
     // Store a few memories
@@ -3276,10 +3292,11 @@ async fn test_explain_verbose_candidate_scores() {
 async fn test_retrieve_filter_session_prefilters_and_skips_graph() {
     use memoria_storage::{GraphEdge, GraphNode, GraphStore, NodeType};
 
-    let (base, client, pool) =
+    let (base, client, server) =
         spawn_server_with_custom_embedder_and_pool(Arc::new(SessionScopeTestEmbedder), test_dim())
             .await;
     let uid = uid();
+    let user_store = server.user_store(&uid).await;
 
     let target_mid =
         store_memory_for_session(&client, &base, &uid, "target-session memory", "sess-target")
@@ -3289,7 +3306,10 @@ async fn test_retrieve_filter_session_prefilters_and_skips_graph() {
     let other_second_mid =
         store_memory_for_session(&client, &base, &uid, "other-session second", "sess-other").await;
 
-    let graph = GraphStore::new(pool, test_dim());
+    let mut graph = GraphStore::new(user_store.pool().clone(), test_dim());
+    if let Some(db_name) = user_store.db_name() {
+        graph.set_db_name(db_name.to_string());
+    }
     graph.migrate().await.expect("graph migrate");
 
     let make_node = |memory_id: &str, session_id: &str, content: &str| GraphNode {
@@ -3398,7 +3418,7 @@ async fn test_retrieve_filter_session_prefilters_and_skips_graph() {
 
 #[tokio::test]
 async fn test_retrieve_filter_session_requires_session_id() {
-    let (base, client) = spawn_server().await;
+    let (base, client, _server) = spawn_server().await;
     let user = uid();
 
     let r = client
@@ -3430,7 +3450,7 @@ async fn test_retrieve_filter_session_requires_session_id() {
 
 #[tokio::test]
 async fn test_retrieve_filter_session_preserves_top_k_with_session_candidates() {
-    let (base, client, _pool) =
+    let (base, client, _server) =
         spawn_server_with_custom_embedder_and_pool(Arc::new(SessionScopeTestEmbedder), test_dim())
             .await;
     let uid = uid();
@@ -3490,7 +3510,7 @@ async fn test_retrieve_filter_session_preserves_top_k_with_session_candidates() 
 
 #[tokio::test]
 async fn test_pipeline_run() {
-    let (base, client) = spawn_server().await;
+    let (base, client, _server) = spawn_server().await;
     let user = uid();
 
     // Normal candidates — should all be stored
@@ -3541,7 +3561,7 @@ async fn test_pipeline_run() {
 #[tokio::test]
 async fn test_admin_list_user_keys() {
     let mk = "test-mk-list-keys";
-    let (base, client) = spawn_server_with_master_key(mk).await;
+    let (base, client, _server) = spawn_server_with_master_key(mk).await;
     let auth = format!("Bearer {mk}");
     let uid = uid();
 
@@ -3580,7 +3600,7 @@ async fn test_admin_list_user_keys() {
 #[tokio::test]
 async fn test_admin_list_user_keys_empty() {
     let mk = "test-mk-list-keys-empty";
-    let (base, client) = spawn_server_with_master_key(mk).await;
+    let (base, client, _server) = spawn_server_with_master_key(mk).await;
     let auth = format!("Bearer {mk}");
     let uid = uid(); // fresh user, no keys
 
@@ -3604,7 +3624,7 @@ async fn test_admin_list_user_keys_empty() {
 #[tokio::test]
 async fn test_admin_revoke_all_user_keys() {
     let mk = "test-mk-revoke-all";
-    let (base, client) = spawn_server_with_master_key(mk).await;
+    let (base, client, _server) = spawn_server_with_master_key(mk).await;
     let auth = format!("Bearer {mk}");
     let uid = uid();
 
@@ -3667,7 +3687,7 @@ async fn test_admin_revoke_all_user_keys() {
 #[tokio::test]
 async fn test_admin_revoke_all_user_keys_idempotent() {
     let mk = "test-mk-revoke-idem";
-    let (base, client) = spawn_server_with_master_key(mk).await;
+    let (base, client, _server) = spawn_server_with_master_key(mk).await;
     let auth = format!("Bearer {mk}");
     let uid = uid(); // no keys
 
@@ -3689,27 +3709,28 @@ async fn test_admin_revoke_all_user_keys_idempotent() {
 #[tokio::test]
 async fn test_admin_set_user_params() {
     let mk = "test-mk-set-params";
-    let (base, client) = spawn_server_with_master_key(mk).await;
+    let (base, client, server) = spawn_server_with_master_key(mk).await;
     let auth = format!("Bearer {mk}");
     let uid = uid();
 
     // Ensure the config table exists (may not be in Rust migration yet)
-    if let Ok(pool) = sqlx::mysql::MySqlPool::connect(&db_url()).await {
-        let _ = sqlx::query(
-            "CREATE TABLE IF NOT EXISTS mem_user_memory_config (\
+    let pool = server.shared_pool();
+    let config_table = server.shared_table("mem_user_memory_config");
+    let _ = sqlx::query(&format!(
+        "CREATE TABLE IF NOT EXISTS {config_table} (\
              user_id VARCHAR(128) PRIMARY KEY, \
              strategy_key VARCHAR(64) DEFAULT NULL, \
              params_json JSON DEFAULT NULL, \
-             updated_at DATETIME DEFAULT NULL)",
-        )
-        .execute(&pool)
-        .await;
-        // Insert a row for the user
-        let _ = sqlx::query("INSERT IGNORE INTO mem_user_memory_config (user_id) VALUES (?)")
-            .bind(&uid)
-            .execute(&pool)
-            .await;
-    }
+             updated_at DATETIME DEFAULT NULL)"
+    ))
+    .execute(&pool)
+    .await;
+    let _ = sqlx::query(&format!(
+        "INSERT IGNORE INTO {config_table} (user_id) VALUES (?)"
+    ))
+    .bind(&uid)
+    .execute(&pool)
+    .await;
 
     // Set params
     let params = json!({"vector_weight": 0.7, "keyword_weight": 0.3, "max_results": 20});
@@ -3732,7 +3753,7 @@ async fn test_admin_set_user_params() {
 
 #[tokio::test]
 async fn test_snapshot_get_detail() {
-    let (base, client) = spawn_server().await;
+    let (base, client, _server) = spawn_server().await;
     let uid = uid();
 
     // Store memories
@@ -3895,7 +3916,7 @@ async fn test_snapshot_get_detail() {
 
 #[tokio::test]
 async fn test_snapshot_diff() {
-    let (base, client) = spawn_server().await;
+    let (base, client, _server) = spawn_server().await;
     let uid = uid();
 
     // Store 2 memories
@@ -4015,7 +4036,7 @@ async fn test_snapshot_diff() {
 
 #[tokio::test]
 async fn test_snapshot_diff_no_changes() {
-    let (base, client) = spawn_server().await;
+    let (base, client, _server) = spawn_server().await;
     let uid = uid();
 
     // Store a memory
@@ -4070,7 +4091,7 @@ async fn test_snapshot_diff_no_changes() {
 
 #[tokio::test]
 async fn test_api_snapshot_limit_is_per_user() {
-    let (base, client) = spawn_server().await;
+    let (base, client, _server) = spawn_server().await;
     let uid_a = uid();
     let uid_b = uid();
     let names_a: Vec<String> = (0..20)
@@ -4187,7 +4208,7 @@ async fn test_api_snapshot_limit_is_per_user() {
 
 #[tokio::test]
 async fn test_api_snapshot_detail_is_scoped_to_owner() {
-    let (base, client) = spawn_server().await;
+    let (base, client, _server) = spawn_server().await;
     let uid_a = uid();
     let uid_b = uid();
     let snap = format!(
@@ -4235,7 +4256,7 @@ async fn test_api_snapshot_detail_is_scoped_to_owner() {
 
 #[tokio::test]
 async fn test_batch_store_invalid_type_rejects_all() {
-    let (base, client) = spawn_server().await;
+    let (base, client, _server) = spawn_server().await;
     let uid = uid();
 
     // One valid, one invalid type → should reject entire batch
@@ -4255,7 +4276,7 @@ async fn test_batch_store_invalid_type_rejects_all() {
 
 #[tokio::test]
 async fn test_batch_store_all_types() {
-    let (base, client) = spawn_server().await;
+    let (base, client, _server) = spawn_server().await;
     let uid = uid();
 
     let r = client
@@ -4286,7 +4307,7 @@ async fn test_batch_store_all_types() {
 
 #[tokio::test]
 async fn test_batch_store_empty() {
-    let (base, client) = spawn_server().await;
+    let (base, client, _server) = spawn_server().await;
     let uid = uid();
 
     let r = client
@@ -4305,7 +4326,7 @@ async fn test_batch_store_empty() {
 
 #[tokio::test]
 async fn test_batch_store_sensitivity_filter() {
-    let (base, client) = spawn_server().await;
+    let (base, client, _server) = spawn_server().await;
     let uid = uid();
 
     // Batch with a sensitive item — store_batch checks sensitivity
@@ -4333,7 +4354,7 @@ async fn test_batch_store_with_embedding() {
         println!("⏭️  test_batch_store_with_embedding skipped (EMBEDDING_API_KEY not set)");
         return;
     };
-    let (base, client) = spawn_server_with_embedding(key, base_url, model).await;
+    let (base, client, _server) = spawn_server_with_embedding(key, base_url, model).await;
     let uid = uid();
 
     // Batch store 5 items — should use embed_batch (single API call)
@@ -4389,7 +4410,7 @@ async fn test_batch_store_with_embedding() {
 #[tokio::test]
 async fn test_remote_admin_list_revoke_keys() {
     let mk = "test-mk-remote-keys";
-    let (base, client) = spawn_server_with_master_key(mk).await;
+    let (base, client, _server) = spawn_server_with_master_key(mk).await;
     let auth = format!("Bearer {mk}");
     let uid = uid();
 
@@ -4433,7 +4454,7 @@ async fn test_remote_admin_list_revoke_keys() {
 #[tokio::test]
 async fn test_remote_snapshot_detail_and_diff() {
     use memoria_mcp::remote::RemoteClient;
-    let (base, _) = spawn_api_for_remote().await;
+    let (base, _, _server) = spawn_api_for_remote().await;
     let uid = uid();
     let remote = RemoteClient::new(&base, None, uid.clone(), None);
 
@@ -4602,7 +4623,7 @@ fn test_signer_public_b64() -> String {
 /// Full plugin lifecycle: signer → publish → list → review → score → binding → activate → matrix → events → rules
 #[tokio::test]
 async fn test_plugin_full_lifecycle() {
-    let (base, c) = spawn_server().await;
+    let (base, c, _server) = spawn_server().await;
     let signer_name = format!("e2e-signer-{}", uuid::Uuid::new_v4().simple());
     let plugin_name = format!("e2e-plugin-{}", uuid::Uuid::new_v4().simple());
 
@@ -4771,7 +4792,7 @@ async fn test_plugin_full_lifecycle() {
 /// Dev-mode publish: skips signature verification, auto-approves.
 #[tokio::test]
 async fn test_plugin_dev_mode_publish() {
-    let (base, c) = spawn_server().await;
+    let (base, c, _server) = spawn_server().await;
     let plugin_name = format!("e2e-dev-{}", uuid::Uuid::new_v4().simple());
 
     // Build an UNSIGNED package (no signer registered, no valid signature)
@@ -4825,7 +4846,7 @@ async fn test_plugin_dev_mode_publish() {
 /// Error: publish without manifest.json
 #[tokio::test]
 async fn test_plugin_publish_missing_manifest() {
-    let (base, c) = spawn_server().await;
+    let (base, c, _server) = spawn_server().await;
 
     use base64::engine::general_purpose::STANDARD as B64;
     use base64::Engine;
@@ -4850,7 +4871,7 @@ async fn test_plugin_publish_missing_manifest() {
 /// Error: publish with path traversal filename
 #[tokio::test]
 async fn test_plugin_publish_path_traversal_rejected() {
-    let (base, c) = spawn_server().await;
+    let (base, c, _server) = spawn_server().await;
 
     use base64::engine::general_purpose::STANDARD as B64;
     use base64::Engine;
@@ -4873,7 +4894,7 @@ async fn test_plugin_publish_path_traversal_rejected() {
 /// Error: review a non-existent package
 #[tokio::test]
 async fn test_plugin_review_nonexistent() {
-    let (base, c) = spawn_server().await;
+    let (base, c, _server) = spawn_server().await;
 
     let r = c
         .post(format!(
@@ -4890,7 +4911,7 @@ async fn test_plugin_review_nonexistent() {
 /// Signer upsert is idempotent
 #[tokio::test]
 async fn test_plugin_signer_upsert_idempotent() {
-    let (base, c) = spawn_server().await;
+    let (base, c, _server) = spawn_server().await;
     let signer_name = format!("e2e-idem-{}", uuid::Uuid::new_v4().simple());
 
     for _ in 0..2 {
@@ -4922,7 +4943,7 @@ async fn test_plugin_signer_upsert_idempotent() {
 /// Empty list/matrix/events return empty arrays, not errors
 #[tokio::test]
 async fn test_plugin_empty_queries() {
-    let (base, c) = spawn_server().await;
+    let (base, c, _server) = spawn_server().await;
 
     let r = c.get(format!("{base}/admin/plugins")).send().await.unwrap();
     assert_eq!(r.status(), 200);
@@ -4960,7 +4981,7 @@ async fn test_plugin_empty_queries() {
 #[tokio::test]
 async fn test_plugin_admin_routes_require_master_key() {
     let mk = "test-mk-plugin-admin";
-    let (base, client) = spawn_server_with_master_key(mk).await;
+    let (base, client, _server) = spawn_server_with_master_key(mk).await;
     let auth = format!("Bearer {mk}");
     let uid = uid();
     let user_key = create_api_key_for_user(&client, &base, &auth, &uid, "plugin-user").await;
@@ -4994,46 +5015,36 @@ async fn test_plugin_admin_routes_require_master_key() {
 // ── Distributed coordination tests ────────────────────────────────────────────
 
 /// Spawn a server with a specific instance_id, returning (base_url, client, instance_id).
-async fn spawn_server_with_instance(instance_id: &str) -> (String, reqwest::Client, String) {
-    use memoria_git::GitForDataService;
-    use memoria_service::{Config, MemoryService};
-    use memoria_storage::SqlMemoryStore;
-    use sqlx::mysql::MySqlPool;
-
-    let cfg = Config::from_env();
-    let db = db_url();
-
-    let store = SqlMemoryStore::connect(&db, test_dim(), uuid::Uuid::new_v4().to_string())
-        .await
-        .expect("connect");
-    store.migrate().await.expect("migrate");
-    let pool = MySqlPool::connect(&db).await.expect("pool");
-    let git = Arc::new(GitForDataService::new(pool, &cfg.db_name));
-    let service = Arc::new(MemoryService::new_sql_with_llm(Arc::new(store), None, None).await);
-    let state = memoria_api::AppState::new(service, git, String::new())
-        .with_instance_id(instance_id.to_string());
-
-    let app = memoria_api::build_router(state);
-
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind");
-    let port = listener.local_addr().unwrap().port();
-    tokio::spawn(async move { axum::serve(listener, app).await });
-    tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
-
-    let client = reqwest::Client::builder()
-        .no_proxy()
-        .build()
-        .expect("client");
-    let base = format!("http://127.0.0.1:{port}");
-    (base, client, instance_id.to_string())
+async fn spawn_server_with_instance(
+    instance_id: &str,
+) -> (
+    String,
+    reqwest::Client,
+    String,
+    support::multi_db::ApiTestServer,
+) {
+    let server = support::multi_db::spawn_api_server(
+        "api_e2e_instance",
+        test_dim(),
+        String::new(),
+        None,
+        None,
+        Some(instance_id.to_string()),
+        false,
+    )
+    .await;
+    (
+        server.base.clone(),
+        server.client.clone(),
+        instance_id.to_string(),
+        server,
+    )
 }
 
 #[tokio::test]
 async fn test_distributed_health_instance_returns_id() {
     let iid = format!("inst_{}", uuid::Uuid::new_v4().simple());
-    let (base, c, _) = spawn_server_with_instance(&iid).await;
+    let (base, c, _, _server) = spawn_server_with_instance(&iid).await;
 
     let r = c
         .get(format!("{base}/health/instance"))
@@ -5052,8 +5063,8 @@ async fn test_distributed_two_instances_different_ids() {
     let id_a = format!("inst_a_{}", uuid::Uuid::new_v4().simple());
     let id_b = format!("inst_b_{}", uuid::Uuid::new_v4().simple());
 
-    let (base_a, c, _) = spawn_server_with_instance(&id_a).await;
-    let (base_b, c2, _) = spawn_server_with_instance(&id_b).await;
+    let (base_a, c, _, _server_a) = spawn_server_with_instance(&id_a).await;
+    let (base_b, c2, _, _server_b) = spawn_server_with_instance(&id_b).await;
 
     let ra: Value = c
         .get(format!("{base_a}/health/instance"))
@@ -5084,8 +5095,8 @@ async fn test_distributed_cross_instance_memory_visibility() {
     let id_b = format!("inst_b_{}", uuid::Uuid::new_v4().simple());
     let user = uid();
 
-    let (base_a, c, _) = spawn_server_with_instance(&id_a).await;
-    let (base_b, c2, _) = spawn_server_with_instance(&id_b).await;
+    let (base_a, c, _, _server_a) = spawn_server_with_instance(&id_a).await;
+    let (base_b, c2, _, _server_b) = spawn_server_with_instance(&id_b).await;
 
     // Store on instance A
     let r = c
@@ -5126,14 +5137,17 @@ async fn test_distributed_cross_instance_memory_visibility() {
 async fn test_distributed_lock_acquire_release() {
     // Direct test of the distributed lock via SqlMemoryStore
     use memoria_service::DistributedLock;
-    use memoria_storage::SqlMemoryStore;
     use std::time::Duration;
 
-    let db = db_url();
-    let store = SqlMemoryStore::connect(&db, test_dim(), uuid::Uuid::new_v4().to_string())
-        .await
-        .expect("connect");
-    store.migrate().await.expect("migrate");
+    let ctx = memoria_test_utils::MultiDbTestContext::new(
+        &db_url(),
+        "api_e2e_lock",
+        test_dim(),
+        None,
+        None,
+    )
+    .await;
+    let store = ctx.shared_store();
 
     let lock_key = format!("test_lock_{}", uuid::Uuid::new_v4().simple());
 
@@ -5179,14 +5193,17 @@ async fn test_distributed_lock_acquire_release() {
 #[tokio::test]
 async fn test_distributed_lock_expiry() {
     use memoria_service::DistributedLock;
-    use memoria_storage::SqlMemoryStore;
     use std::time::Duration;
 
-    let db = db_url();
-    let store = SqlMemoryStore::connect(&db, test_dim(), uuid::Uuid::new_v4().to_string())
-        .await
-        .expect("connect");
-    store.migrate().await.expect("migrate");
+    let ctx = memoria_test_utils::MultiDbTestContext::new(
+        &db_url(),
+        "api_e2e_lock_expiry",
+        test_dim(),
+        None,
+        None,
+    )
+    .await;
+    let store = ctx.shared_store();
 
     let lock_key = format!("test_lock_exp_{}", uuid::Uuid::new_v4().simple());
 
@@ -5217,14 +5234,17 @@ async fn test_distributed_lock_expiry() {
 #[tokio::test]
 async fn test_distributed_lock_renew() {
     use memoria_service::DistributedLock;
-    use memoria_storage::SqlMemoryStore;
     use std::time::Duration;
 
-    let db = db_url();
-    let store = SqlMemoryStore::connect(&db, test_dim(), uuid::Uuid::new_v4().to_string())
-        .await
-        .expect("connect");
-    store.migrate().await.expect("migrate");
+    let ctx = memoria_test_utils::MultiDbTestContext::new(
+        &db_url(),
+        "api_e2e_lock_renew",
+        test_dim(),
+        None,
+        None,
+    )
+    .await;
+    let store = ctx.shared_store();
 
     let lock_key = format!("test_lock_renew_{}", uuid::Uuid::new_v4().simple());
 
@@ -5255,13 +5275,16 @@ async fn test_distributed_lock_renew() {
 #[tokio::test]
 async fn test_distributed_async_task_cross_instance() {
     use memoria_service::AsyncTaskStore;
-    use memoria_storage::SqlMemoryStore;
 
-    let db = db_url();
-    let store = SqlMemoryStore::connect(&db, test_dim(), uuid::Uuid::new_v4().to_string())
-        .await
-        .expect("connect");
-    store.migrate().await.expect("migrate");
+    let ctx = memoria_test_utils::MultiDbTestContext::new(
+        &db_url(),
+        "api_e2e_async_task",
+        test_dim(),
+        None,
+        None,
+    )
+    .await;
+    let store = ctx.shared_store();
 
     let task_id = format!("task_{}", uuid::Uuid::new_v4().simple());
 
@@ -5300,13 +5323,16 @@ async fn test_distributed_async_task_cross_instance() {
 #[tokio::test]
 async fn test_distributed_async_task_fail() {
     use memoria_service::AsyncTaskStore;
-    use memoria_storage::SqlMemoryStore;
 
-    let db = db_url();
-    let store = SqlMemoryStore::connect(&db, test_dim(), uuid::Uuid::new_v4().to_string())
-        .await
-        .expect("connect");
-    store.migrate().await.expect("migrate");
+    let ctx = memoria_test_utils::MultiDbTestContext::new(
+        &db_url(),
+        "api_e2e_async_task_fail",
+        test_dim(),
+        None,
+        None,
+    )
+    .await;
+    let store = ctx.shared_store();
 
     let task_id = format!("task_{}", uuid::Uuid::new_v4().simple());
     store
@@ -5333,7 +5359,7 @@ async fn test_distributed_async_task_fail() {
 
 #[tokio::test]
 async fn test_api_feedback_record() {
-    let (base, client) = spawn_server().await;
+    let (base, client, _server) = spawn_server().await;
     let uid = uid();
 
     // Store a memory first
@@ -5367,7 +5393,7 @@ async fn test_api_feedback_record() {
 
 #[tokio::test]
 async fn test_api_feedback_invalid_signal() {
-    let (base, client) = spawn_server().await;
+    let (base, client, _server) = spawn_server().await;
     let uid = uid();
 
     // Store a memory
@@ -5395,7 +5421,7 @@ async fn test_api_feedback_invalid_signal() {
 
 #[tokio::test]
 async fn test_api_feedback_nonexistent_memory() {
-    let (base, client) = spawn_server().await;
+    let (base, client, _server) = spawn_server().await;
     let uid = uid();
 
     let r = client
@@ -5411,7 +5437,7 @@ async fn test_api_feedback_nonexistent_memory() {
 
 #[tokio::test]
 async fn test_api_feedback_stats() {
-    let (base, client) = spawn_server().await;
+    let (base, client, _server) = spawn_server().await;
     let uid = uid();
 
     // Store memories and give feedback
@@ -5460,7 +5486,7 @@ async fn test_api_feedback_stats() {
 
 #[tokio::test]
 async fn test_api_feedback_by_tier() {
-    let (base, client) = spawn_server().await;
+    let (base, client, _server) = spawn_server().await;
     let uid = uid();
 
     // Store memories with different tiers and give feedback
@@ -5507,7 +5533,7 @@ async fn test_api_feedback_by_tier() {
 
 #[tokio::test]
 async fn test_api_get_retrieval_params() {
-    let (base, client) = spawn_server().await;
+    let (base, client, _server) = spawn_server().await;
     let uid = uid();
 
     let r = client
@@ -5529,7 +5555,7 @@ async fn test_api_get_retrieval_params() {
 
 #[tokio::test]
 async fn test_api_set_retrieval_params() {
-    let (base, client) = spawn_server().await;
+    let (base, client, _server) = spawn_server().await;
     let uid = uid();
 
     // Set custom params
@@ -5564,7 +5590,7 @@ async fn test_api_set_retrieval_params() {
 
 #[tokio::test]
 async fn test_api_tune_retrieval_params() {
-    let (base, client) = spawn_server().await;
+    let (base, client, _server) = spawn_server().await;
     let uid = uid();
 
     // Without enough feedback, should not tune
@@ -5583,7 +5609,7 @@ async fn test_api_tune_retrieval_params() {
 
 #[tokio::test]
 async fn test_api_tune_with_feedback() {
-    let (base, client) = spawn_server().await;
+    let (base, client, _server) = spawn_server().await;
     let uid = uid();
 
     // Create a memory
@@ -5639,7 +5665,7 @@ async fn test_api_tune_with_feedback() {
 
 #[tokio::test]
 async fn test_api_metrics() {
-    let (base, client) = spawn_server().await;
+    let (base, client, _server) = spawn_server().await;
     let r = client.get(format!("{base}/metrics")).send().await.unwrap();
     assert_eq!(r.status(), 200);
     let body = r.text().await.unwrap();
@@ -5662,7 +5688,7 @@ async fn test_api_metrics() {
 
 #[tokio::test]
 async fn test_api_snapshot_rollback() {
-    let (base, client) = spawn_server().await;
+    let (base, client, _server) = spawn_server().await;
     let uid = uid();
 
     // Store a memory
@@ -5718,7 +5744,7 @@ async fn test_api_snapshot_rollback() {
 
 #[tokio::test]
 async fn test_api_branch_list_returns_structured_json() {
-    let (base, client) = spawn_server().await;
+    let (base, client, _server) = spawn_server().await;
     let uid = uid();
     let branch = format!(
         "api_branch_{}",
@@ -5780,7 +5806,7 @@ async fn test_api_branch_list_returns_structured_json() {
 
 #[tokio::test]
 async fn test_api_entities() {
-    let (base, client) = spawn_server().await;
+    let (base, client, _server) = spawn_server().await;
     let uid = uid();
 
     // Store a memory to trigger entity extraction
@@ -5813,7 +5839,7 @@ async fn test_api_entities() {
 #[tokio::test]
 async fn test_api_admin_config() {
     let mk = format!("mk_{}", uuid::Uuid::new_v4().simple());
-    let (base, client) = spawn_server_with_master_key(&mk).await;
+    let (base, client, _server) = spawn_server_with_master_key(&mk).await;
 
     // Without master key → 401
     let r = client
@@ -5846,7 +5872,7 @@ async fn test_api_admin_config() {
 #[tokio::test]
 async fn test_api_admin_config_forbidden() {
     let mk = format!("mk_{}", uuid::Uuid::new_v4().simple());
-    let (base, client) = spawn_server_with_master_key(&mk).await;
+    let (base, client, _server) = spawn_server_with_master_key(&mk).await;
 
     // Create an API key (non-master)
     let auth = format!("Bearer {mk}");
@@ -5878,7 +5904,7 @@ async fn test_api_admin_config_forbidden() {
 
 #[tokio::test]
 async fn test_concurrent_stores() {
-    let (base, client) = spawn_server().await;
+    let (base, client, _server) = spawn_server().await;
     let uid = uid();
     let client = Arc::new(client);
     let n = 20;
@@ -5926,7 +5952,7 @@ async fn test_concurrent_stores() {
 
 #[tokio::test]
 async fn test_concurrent_entity_upsert() {
-    let (base, client) = spawn_server().await;
+    let (base, client, _server) = spawn_server().await;
     let uid = uid();
     let client = Arc::new(client);
 
@@ -5965,7 +5991,7 @@ async fn test_concurrent_entity_upsert() {
 
 #[tokio::test]
 async fn test_batch_store_at_limit() {
-    let (base, client) = spawn_server().await;
+    let (base, client, _server) = spawn_server().await;
     let uid = uid();
 
     let memories: Vec<_> = (0..100)
@@ -6002,7 +6028,7 @@ async fn test_batch_store_at_limit() {
 
 #[tokio::test]
 async fn test_concurrent_feedback() {
-    let (base, client) = spawn_server().await;
+    let (base, client, _server) = spawn_server().await;
     let uid = uid();
     let client = Arc::new(client);
 
@@ -6062,7 +6088,7 @@ async fn test_concurrent_feedback() {
 
 #[tokio::test]
 async fn test_graceful_degradation() {
-    let (base, client) = spawn_server().await;
+    let (base, client, _server) = spawn_server().await;
     let uid = uid();
 
     // Rollback to nonexistent snapshot → error, not crash
@@ -6127,11 +6153,10 @@ async fn test_graceful_degradation() {
 #[tokio::test]
 async fn test_last_used_batcher_coalesces_and_flushes() {
     use memoria_api::auth::LastUsedBatcher;
-    use memoria_storage::SqlMemoryStore;
     use sha2::{Digest, Sha256};
 
     let mk = "test-master-batcher";
-    let (base, client) = spawn_server_with_master_key(mk).await;
+    let (base, client, server) = spawn_server_with_master_key(mk).await;
     let auth = format!("Bearer {mk}");
 
     // Create 3 API keys
@@ -6161,20 +6186,20 @@ async fn test_last_used_batcher_coalesces_and_flushes() {
     // Verify all 3 are pending
     // (We can't inspect the internal set directly, but we can flush and verify DB)
 
-    // Connect to DB and flush
-    let store = SqlMemoryStore::connect(&db_url(), test_dim(), uuid::Uuid::new_v4().to_string())
-        .await
-        .expect("connect");
+    // Flush against the same shared DB that stored the keys.
+    let store = server.shared_store();
     batcher.flush(store.pool()).await;
 
     // Verify last_used_at was updated for all 3 keys
     for hash in &hashes {
-        let row: Option<(Option<chrono::NaiveDateTime>,)> =
-            sqlx::query_as("SELECT last_used_at FROM mem_api_keys WHERE key_hash = ?")
-                .bind(hash)
-                .fetch_optional(store.pool())
-                .await
-                .expect("query");
+        let row: Option<(Option<chrono::NaiveDateTime>,)> = sqlx::query_as(&format!(
+            "SELECT last_used_at FROM {} WHERE key_hash = ?",
+            store.t("mem_api_keys")
+        ))
+        .bind(hash)
+        .fetch_optional(store.pool())
+        .await
+        .expect("query");
         let (last_used,) = row.expect("key should exist");
         assert!(
             last_used.is_some(),
@@ -6198,24 +6223,17 @@ async fn test_last_used_batcher_coalesces_and_flushes() {
 #[tokio::test]
 async fn test_api_key_auth_uses_batcher_not_fire_and_forget() {
     let mk = "test-master-batcher-auth";
-    let db = db_url();
+    let ctx = memoria_test_utils::MultiDbTestContext::new(
+        &db_url(),
+        "api_e2e_auth_batcher",
+        test_dim(),
+        None,
+        None,
+    )
+    .await;
 
-    // Spawn server WITH init_auth_pool
-    use memoria_git::GitForDataService;
-    use memoria_service::{Config, MemoryService};
-    use memoria_storage::SqlMemoryStore;
-    use sqlx::mysql::MySqlPool;
-
-    let cfg = Config::from_env();
-    let store = SqlMemoryStore::connect(&db, test_dim(), uuid::Uuid::new_v4().to_string())
-        .await
-        .expect("connect");
-    store.migrate().await.expect("migrate");
-    let pool = MySqlPool::connect(&db).await.expect("pool");
-    let git = Arc::new(GitForDataService::new(pool, &cfg.db_name));
-    let service = Arc::new(MemoryService::new_sql_with_llm(Arc::new(store), None, None).await);
-    let state = memoria_api::AppState::new(service, git, mk.to_string())
-        .init_auth_pool(&db, false)
+    let state = memoria_api::AppState::new(ctx.service(), ctx.git(), mk.to_string())
+        .init_auth_pool(ctx.shared_db_url(), false)
         .await
         .expect("auth pool");
 
@@ -6252,21 +6270,21 @@ async fn test_api_key_auth_uses_batcher_not_fire_and_forget() {
     assert_eq!(r.status(), 200, "Cached API key auth should succeed");
 
     // Manually flush the batcher to verify last_used_at is updated
-    let verify_store = SqlMemoryStore::connect(&db, test_dim(), uuid::Uuid::new_v4().to_string())
-        .await
-        .expect("connect");
+    let verify_store = ctx.shared_store();
     batcher.flush(verify_store.pool()).await;
 
     let key_hash = format!(
         "{:x}",
         <sha2::Sha256 as sha2::Digest>::digest(raw_key.as_bytes())
     );
-    let row: Option<(Option<chrono::NaiveDateTime>,)> =
-        sqlx::query_as("SELECT last_used_at FROM mem_api_keys WHERE key_hash = ?")
-            .bind(&key_hash)
-            .fetch_optional(verify_store.pool())
-            .await
-            .expect("query");
+    let row: Option<(Option<chrono::NaiveDateTime>,)> = sqlx::query_as(&format!(
+        "SELECT last_used_at FROM {} WHERE key_hash = ?",
+        verify_store.t("mem_api_keys")
+    ))
+    .bind(&key_hash)
+    .fetch_optional(verify_store.pool())
+    .await
+    .expect("query");
     let (last_used,) = row.expect("key should exist");
     assert!(
         last_used.is_some(),
@@ -6280,7 +6298,7 @@ async fn test_api_key_auth_uses_batcher_not_fire_and_forget() {
 
 #[tokio::test]
 async fn test_tool_usage_tracking() {
-    let (base, client) = spawn_server().await;
+    let (base, client, _server) = spawn_server().await;
     let user = format!("tool_test_{}", uuid::Uuid::new_v4().simple());
 
     // 1. No tool header → usage should be empty
@@ -6389,7 +6407,7 @@ async fn test_tool_usage_tracking() {
 /// Helper: store via remote, create graph node + entity links manually, return memory_id.
 async fn remote_store_with_links(
     remote: &memoria_mcp::remote::RemoteClient,
-    pool: &sqlx::MySqlPool,
+    user_store: &memoria_storage::SqlMemoryStore,
     uid: &str,
     content: &str,
 ) -> String {
@@ -6410,71 +6428,59 @@ async fn remote_store_with_links(
 
     // Create graph node (remote path goes through REST API which doesn't create graph nodes)
     let node_id = uuid::Uuid::new_v4().simple().to_string()[..32].to_string();
-    sqlx::query(
-        "INSERT INTO memory_graph_nodes \
+    sqlx::query(&format!(
+        "INSERT INTO {} \
          (node_id, user_id, node_type, content, memory_id, confidence, trust_tier, importance, \
-          access_count, cross_session_count, is_active, created_at) \
+           access_count, cross_session_count, is_active, created_at) \
          VALUES (?, ?, 'semantic', ?, ?, 0.95, 'T1', 0.5, 0, 0, 1, NOW())",
-    )
+        user_store.t("memory_graph_nodes")
+    ))
     .bind(&node_id)
     .bind(uid)
     .bind(content)
     .bind(&mid)
-    .execute(pool)
+    .execute(user_store.pool())
     .await
     .unwrap();
 
     // Insert into legacy mem_entity_links
     let id = uuid::Uuid::new_v4().to_string().replace('-', "");
-    sqlx::query(
-        "INSERT INTO mem_entity_links (id, user_id, memory_id, entity_name, entity_type, source, created_at) \
+    sqlx::query(&format!(
+        "INSERT INTO {} (id, user_id, memory_id, entity_name, entity_type, source, created_at) \
          VALUES (?, ?, ?, 'remote_entity', 'concept', 'manual', NOW())",
-    )
+        user_store.t("mem_entity_links")
+    ))
     .bind(&id)
     .bind(uid)
     .bind(&mid)
-    .execute(pool)
+    .execute(user_store.pool())
     .await
     .unwrap();
 
     mid
 }
 
-async fn spawn_server_with_pool() -> (String, reqwest::Client, sqlx::MySqlPool) {
-    use memoria_git::GitForDataService;
-    use memoria_service::{Config, MemoryService};
-    use memoria_storage::SqlMemoryStore;
-
-    let cfg = Config::from_env();
-    let db = db_url();
-
-    let store = SqlMemoryStore::connect(&db, test_dim(), uuid::Uuid::new_v4().to_string())
-        .await
-        .expect("connect");
-    store.migrate().await.expect("migrate");
-    let pool = sqlx::MySqlPool::connect(&db).await.expect("pool");
-    let git = Arc::new(GitForDataService::new(pool.clone(), &cfg.db_name));
-    let service = Arc::new(MemoryService::new_sql_with_llm(Arc::new(store), None, None).await);
-    let state = memoria_api::AppState::new(service, git, String::new());
-
-    let app = memoria_api::build_router(state);
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind");
-    let port = listener.local_addr().unwrap().port();
-    tokio::spawn(async move { axum::serve(listener, app).await });
-    tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
-    let client = reqwest::Client::builder().no_proxy().build().unwrap();
-    let base = format!("http://127.0.0.1:{port}");
-    (base, client, pool)
+async fn spawn_server_with_pool() -> (String, reqwest::Client, support::multi_db::ApiTestServer) {
+    let server = support::multi_db::spawn_api_server(
+        "api_e2e_pool",
+        test_dim(),
+        String::new(),
+        None,
+        None,
+        None,
+        false,
+    )
+    .await;
+    (server.base.clone(), server.client.clone(), server)
 }
 
-async fn graph_node_active_count(pool: &sqlx::MySqlPool, mid: &str) -> i64 {
-    sqlx::query_scalar(
-        "SELECT COUNT(*) FROM memory_graph_nodes WHERE memory_id = ? AND is_active = 1",
-    )
+async fn graph_node_active_count(user_store: &memoria_storage::SqlMemoryStore, mid: &str) -> i64 {
+    sqlx::query_scalar(&format!(
+        "SELECT COUNT(*) FROM {} WHERE memory_id = ? AND is_active = 1",
+        user_store.t("memory_graph_nodes")
+    ))
     .bind(mid)
-    .fetch_one(pool)
+    .fetch_one(user_store.pool())
     .await
     .unwrap()
 }
@@ -6485,14 +6491,15 @@ async fn graph_node_active_count(pool: &sqlx::MySqlPool, mid: &str) -> i64 {
 async fn test_remote_purge_cleans_graph_and_entity_links() {
     use memoria_mcp::remote::RemoteClient;
 
-    let (base, _client, pool) = spawn_server_with_pool().await;
+    let (base, _client, server) = spawn_server_with_pool().await;
     let uid = uid();
     let remote = RemoteClient::new(&base, None, uid.clone(), None);
+    let user_store = server.user_store(&uid).await;
 
-    let mid = remote_store_with_links(&remote, &pool, &uid, "Remote purge graph test").await;
+    let mid = remote_store_with_links(&remote, &user_store, &uid, "Remote purge graph test").await;
 
     // Verify graph node exists
-    let cnt: i64 = graph_node_active_count(&pool, &mid).await;
+    let cnt: i64 = graph_node_active_count(&user_store, &mid).await;
     assert!(cnt > 0, "graph node should exist before purge");
 
     // Purge via remote
@@ -6504,18 +6511,21 @@ async fn test_remote_purge_cleans_graph_and_entity_links() {
     assert!(text.contains("Purged"), "got: {text}");
 
     // Verify graph node deactivated
-    let cnt: i64 = graph_node_active_count(&pool, &mid).await;
+    let cnt: i64 = graph_node_active_count(&user_store, &mid).await;
     assert_eq!(
         cnt, 0,
         "graph node should be deactivated after remote purge"
     );
 
     // Verify entity links cleaned
-    let cnt: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM mem_entity_links WHERE memory_id = ?")
-        .bind(&mid)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+    let cnt: i64 = sqlx::query_scalar(&format!(
+        "SELECT COUNT(*) FROM {} WHERE memory_id = ?",
+        user_store.t("mem_entity_links")
+    ))
+    .bind(&mid)
+    .fetch_one(user_store.pool())
+    .await
+    .unwrap();
     assert_eq!(
         cnt, 0,
         "mem_entity_links should be cleaned after remote purge"
@@ -6530,12 +6540,13 @@ async fn test_remote_purge_cleans_graph_and_entity_links() {
 async fn test_remote_purge_batch_cleans_graph_and_entity_links() {
     use memoria_mcp::remote::RemoteClient;
 
-    let (base, _client, pool) = spawn_server_with_pool().await;
+    let (base, _client, server) = spawn_server_with_pool().await;
     let uid = uid();
     let remote = RemoteClient::new(&base, None, uid.clone(), None);
+    let user_store = server.user_store(&uid).await;
 
-    let mid1 = remote_store_with_links(&remote, &pool, &uid, "Remote batch purge A").await;
-    let mid2 = remote_store_with_links(&remote, &pool, &uid, "Remote batch purge B").await;
+    let mid1 = remote_store_with_links(&remote, &user_store, &uid, "Remote batch purge A").await;
+    let mid2 = remote_store_with_links(&remote, &user_store, &uid, "Remote batch purge B").await;
 
     // Purge batch via remote (comma-separated)
     let r = remote
@@ -6549,7 +6560,7 @@ async fn test_remote_purge_batch_cleans_graph_and_entity_links() {
     assert!(text.contains("Purged"), "got: {text}");
 
     for mid in [&mid1, &mid2] {
-        let cnt: i64 = graph_node_active_count(&pool, mid).await;
+        let cnt: i64 = graph_node_active_count(&user_store, mid).await;
         assert_eq!(cnt, 0, "graph node should be deactivated for {mid}");
     }
     println!("✅ remote purge batch: graph + entity links cleaned");
@@ -6561,13 +6572,14 @@ async fn test_remote_purge_batch_cleans_graph_and_entity_links() {
 async fn test_remote_purge_topic_cleans_graph_and_entity_links() {
     use memoria_mcp::remote::RemoteClient;
 
-    let (base, _client, pool) = spawn_server_with_pool().await;
+    let (base, _client, server) = spawn_server_with_pool().await;
     let uid = uid();
     let remote = RemoteClient::new(&base, None, uid.clone(), None);
+    let user_store = server.user_store(&uid).await;
 
     let mid = remote_store_with_links(
         &remote,
-        &pool,
+        &user_store,
         &uid,
         "remote_topic_graph_cleanup_xyz unique",
     )
@@ -6583,14 +6595,17 @@ async fn test_remote_purge_topic_cleans_graph_and_entity_links() {
     let text = r["content"][0]["text"].as_str().unwrap_or("");
     assert!(text.contains("Purged"), "got: {text}");
 
-    let cnt: i64 = graph_node_active_count(&pool, &mid).await;
+    let cnt: i64 = graph_node_active_count(&user_store, &mid).await;
     assert_eq!(cnt, 0, "graph node should be deactivated after topic purge");
 
-    let cnt: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM mem_entity_links WHERE memory_id = ?")
-        .bind(&mid)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+    let cnt: i64 = sqlx::query_scalar(&format!(
+        "SELECT COUNT(*) FROM {} WHERE memory_id = ?",
+        user_store.t("mem_entity_links")
+    ))
+    .bind(&mid)
+    .fetch_one(user_store.pool())
+    .await
+    .unwrap();
     assert_eq!(cnt, 0, "entity links should be cleaned after topic purge");
 
     println!("✅ remote purge topic: graph + entity links cleaned");
@@ -6602,12 +6617,18 @@ async fn test_remote_purge_topic_cleans_graph_and_entity_links() {
 async fn test_remote_correct_cleans_graph_and_entity_links() {
     use memoria_mcp::remote::RemoteClient;
 
-    let (base, _client, pool) = spawn_server_with_pool().await;
+    let (base, _client, server) = spawn_server_with_pool().await;
     let uid = uid();
     let remote = RemoteClient::new(&base, None, uid.clone(), None);
+    let user_store = server.user_store(&uid).await;
 
-    let old_mid =
-        remote_store_with_links(&remote, &pool, &uid, "Remote correct graph old content").await;
+    let old_mid = remote_store_with_links(
+        &remote,
+        &user_store,
+        &uid,
+        "Remote correct graph old content",
+    )
+    .await;
 
     // Correct
     let r = remote
@@ -6624,18 +6645,21 @@ async fn test_remote_correct_cleans_graph_and_entity_links() {
     assert!(text.contains("Corrected"), "got: {text}");
 
     // Old graph node deactivated
-    let cnt: i64 = graph_node_active_count(&pool, &old_mid).await;
+    let cnt: i64 = graph_node_active_count(&user_store, &old_mid).await;
     assert_eq!(
         cnt, 0,
         "old graph node should be deactivated after remote correct"
     );
 
     // Old entity links cleaned
-    let cnt: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM mem_entity_links WHERE memory_id = ?")
-        .bind(&old_mid)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+    let cnt: i64 = sqlx::query_scalar(&format!(
+        "SELECT COUNT(*) FROM {} WHERE memory_id = ?",
+        user_store.t("mem_entity_links")
+    ))
+    .bind(&old_mid)
+    .fetch_one(user_store.pool())
+    .await
+    .unwrap();
     assert_eq!(
         cnt, 0,
         "old entity links should be cleaned after remote correct"
@@ -6650,13 +6674,14 @@ async fn test_remote_correct_cleans_graph_and_entity_links() {
 async fn test_remote_correct_by_query_cleans_graph_and_entity_links() {
     use memoria_mcp::remote::RemoteClient;
 
-    let (base, _client, pool) = spawn_server_with_pool().await;
+    let (base, _client, server) = spawn_server_with_pool().await;
     let uid = uid();
     let remote = RemoteClient::new(&base, None, uid.clone(), None);
+    let user_store = server.user_store(&uid).await;
 
     let old_mid = remote_store_with_links(
         &remote,
-        &pool,
+        &user_store,
         &uid,
         "remote_correct_query_graph_xyz unique content",
     )
@@ -6680,17 +6705,19 @@ async fn test_remote_correct_by_query_cleans_graph_and_entity_links() {
 
     // If corrected, old graph should be cleaned
     if text.contains("Corrected") {
-        let cnt: i64 = graph_node_active_count(&pool, &old_mid).await;
+        let cnt: i64 = graph_node_active_count(&user_store, &old_mid).await;
         assert_eq!(
             cnt, 0,
             "old graph node should be deactivated after remote correct by query"
         );
-        let cnt: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM mem_entity_links WHERE memory_id = ?")
-                .bind(&old_mid)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let cnt: i64 = sqlx::query_scalar(&format!(
+            "SELECT COUNT(*) FROM {} WHERE memory_id = ?",
+            user_store.t("mem_entity_links")
+        ))
+        .bind(&old_mid)
+        .fetch_one(user_store.pool())
+        .await
+        .unwrap();
         assert_eq!(
             cnt, 0,
             "old entity links should be cleaned after remote correct by query"
@@ -6703,37 +6730,20 @@ async fn test_remote_correct_by_query_cleans_graph_and_entity_links() {
 // ── Streamable HTTP MCP endpoint (/mcp) ──────────────────────────────────────
 
 /// Spawn a server that requires a Bearer master key (for auth tests).
-async fn spawn_server_with_key(master_key: &str) -> (String, reqwest::Client) {
-    use memoria_git::GitForDataService;
-    use memoria_service::{Config, MemoryService};
-    use memoria_storage::SqlMemoryStore;
-    use sqlx::mysql::MySqlPool;
-
-    let cfg = Config::from_env();
-    let db = db_url();
-
-    let store = SqlMemoryStore::connect(&db, test_dim(), uuid::Uuid::new_v4().to_string())
-        .await
-        .expect("connect");
-    store.migrate().await.expect("migrate");
-    let pool = MySqlPool::connect(&db).await.expect("pool");
-    let git = Arc::new(GitForDataService::new(pool, &cfg.db_name));
-    let service = Arc::new(MemoryService::new_sql_with_llm(Arc::new(store), None, None).await);
-    let state = memoria_api::AppState::new(service, git, master_key.to_string());
-
-    let app = memoria_api::build_router(state);
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind");
-    let port = listener.local_addr().unwrap().port();
-    tokio::spawn(async move { axum::serve(listener, app).await });
-    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-
-    let client = reqwest::Client::builder()
-        .no_proxy()
-        .build()
-        .expect("client");
-    (format!("http://127.0.0.1:{port}"), client)
+async fn spawn_server_with_key(
+    master_key: &str,
+) -> (String, reqwest::Client, support::multi_db::ApiTestServer) {
+    let server = support::multi_db::spawn_api_server(
+        "api_e2e_mcp_key",
+        test_dim(),
+        master_key.to_string(),
+        None,
+        None,
+        None,
+        false,
+    )
+    .await;
+    (server.base.clone(), server.client.clone(), server)
 }
 
 /// POST /mcp helper: sends a JSON-RPC request and returns the parsed response.
@@ -6764,7 +6774,7 @@ fn mcp_result_text(resp: &Value) -> &str {
 
 #[tokio::test]
 async fn test_mcp_initialize() {
-    let (base, client) = spawn_server().await;
+    let (base, client, _server) = spawn_server().await;
     let uid = uid();
 
     let resp = mcp_post_with_headers(
@@ -6789,7 +6799,7 @@ async fn test_mcp_initialize() {
 
 #[tokio::test]
 async fn test_mcp_tools_list() {
-    let (base, client) = spawn_server().await;
+    let (base, client, _server) = spawn_server().await;
     let uid = uid();
 
     let resp = mcp_post_with_headers(
@@ -6818,7 +6828,7 @@ async fn test_mcp_tools_list() {
 
 #[tokio::test]
 async fn test_mcp_tools_call_memory_store() {
-    let (base, client) = spawn_server().await;
+    let (base, client, _server) = spawn_server().await;
     let uid = uid();
 
     let resp = mcp_post_with_headers(
@@ -6851,7 +6861,7 @@ async fn test_mcp_tools_call_memory_store() {
 
 #[tokio::test]
 async fn test_mcp_memory_retrieve_filter_session_end_to_end() {
-    let (base, client, _pool) =
+    let (base, client, _server) =
         spawn_server_with_custom_embedder_and_pool(Arc::new(SessionScopeTestEmbedder), test_dim())
             .await;
     let uid = uid();
@@ -6987,7 +6997,7 @@ async fn test_mcp_memory_retrieve_filter_session_end_to_end() {
 
 #[tokio::test]
 async fn test_mcp_tools_call_records_tool_usage() {
-    let (base, client) = spawn_server().await;
+    let (base, client, _server) = spawn_server().await;
     let uid = uid();
 
     let resp = mcp_post_with_headers(
@@ -7032,7 +7042,7 @@ async fn test_mcp_tools_call_records_tool_usage() {
 
 #[tokio::test]
 async fn test_mcp_invalid_json_returns_parse_error() {
-    let (base, client) = spawn_server().await;
+    let (base, client, _server) = spawn_server().await;
 
     let resp: Value = client
         .post(format!("{base}/mcp"))
@@ -7054,7 +7064,7 @@ async fn test_mcp_invalid_json_returns_parse_error() {
 
 #[tokio::test]
 async fn test_mcp_invalid_request_non_object() {
-    let (base, client) = spawn_server().await;
+    let (base, client, _server) = spawn_server().await;
 
     // A JSON array is valid JSON but not a JSON-RPC object → -32600
     let resp: Value = client
@@ -7080,7 +7090,7 @@ async fn test_mcp_invalid_request_non_object() {
 
 #[tokio::test]
 async fn test_mcp_invalid_request_wrong_version() {
-    let (base, client) = spawn_server().await;
+    let (base, client, _server) = spawn_server().await;
 
     // jsonrpc != "2.0" → -32600
     let resp: Value = client
@@ -7105,7 +7115,7 @@ async fn test_mcp_invalid_request_wrong_version() {
 
 #[tokio::test]
 async fn test_mcp_invalid_request_missing_method() {
-    let (base, client) = spawn_server().await;
+    let (base, client, _server) = spawn_server().await;
 
     // No method field → -32600 (not mistaken for a Notification)
     let resp: Value = client
@@ -7130,7 +7140,7 @@ async fn test_mcp_invalid_request_missing_method() {
 
 #[tokio::test]
 async fn test_mcp_auth_required_when_master_key_set() {
-    let (base, client) = spawn_server_with_key("test-master-secret").await;
+    let (base, client, _server) = spawn_server_with_key("test-master-secret").await;
 
     // No Authorization header → 401
     let status = client
@@ -7181,7 +7191,7 @@ async fn test_mcp_auth_required_when_master_key_set() {
 
 #[tokio::test]
 async fn test_mcp_notifications_initialized_no_error() {
-    let (base, client) = spawn_server().await;
+    let (base, client, _server) = spawn_server().await;
 
     // JSON-RPC 2.0: a Notification has no "id" field.
     // The server MUST NOT reply — expected HTTP 204 No Content with no body.

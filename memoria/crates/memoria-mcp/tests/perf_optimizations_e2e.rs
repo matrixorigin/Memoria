@@ -5,8 +5,11 @@
 ///
 /// Run: DATABASE_URL=mysql://root:111@localhost:6001/memoria \
 ///      cargo test -p memoria-mcp --test perf_optimizations_e2e -- --test-threads=1 --nocapture
+mod support;
+
 use memoria_storage::SqlMemoryStore;
 use serde_json::json;
+use sqlx::mysql::MySqlPool;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -16,10 +19,6 @@ fn test_dim() -> usize {
         .and_then(|s| s.parse().ok())
         .unwrap_or(1024)
 }
-fn db_url() -> String {
-    std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "mysql://root:111@localhost:6001/memoria".to_string())
-}
 fn uid() -> String {
     format!("perf_{}", &Uuid::new_v4().simple().to_string()[..8])
 }
@@ -27,16 +26,15 @@ fn uid() -> String {
 async fn setup() -> (
     Arc<memoria_service::MemoryService>,
     Arc<SqlMemoryStore>,
+    MySqlPool,
     String,
+    support::multi_db::McpTestContext,
 ) {
-    let store = SqlMemoryStore::connect(&db_url(), test_dim(), Uuid::new_v4().to_string())
-        .await
-        .expect("connect");
-    store.migrate().await.expect("migrate");
-    let store = Arc::new(store);
-    let svc =
-        Arc::new(memoria_service::MemoryService::new_sql_with_llm(store.clone(), None, None).await);
-    (svc, store, uid())
+    let ctx = support::multi_db::setup_mcp_context("perf_optimizations", test_dim(), None, None).await;
+    let uid = uid();
+    let store = ctx.user_store(&uid).await;
+    let pool = ctx.user_db_pool(&uid).await;
+    (ctx.service(), store, pool, uid, ctx)
 }
 
 async fn call(
@@ -57,15 +55,15 @@ fn text(v: &serde_json::Value) -> &str {
 
 #[tokio::test]
 async fn test_active_table_cache_hit_and_invalidation() {
-    let (_svc, store, uid) = setup().await;
+    let (_svc, store, pool, uid, _ctx) = setup().await;
 
     // First call: cache miss → DB lookup → should return "mem_memories"
     let t1 = store.active_table(&uid).await.expect("active_table 1");
-    assert_eq!(t1, "mem_memories", "default should be mem_memories");
+    assert_eq!(t1, store.t("mem_memories"), "default should be mem_memories");
 
     // Second call: should be cache hit (same result)
     let t2 = store.active_table(&uid).await.expect("active_table 2");
-    assert_eq!(t2, "mem_memories", "cached value should match");
+    assert_eq!(t2, store.t("mem_memories"), "cached value should match");
 
     // Switch to a branch
     let branch_name = format!("b_{}", &Uuid::new_v4().simple().to_string()[..6]);
@@ -74,7 +72,7 @@ async fn test_active_table_cache_hit_and_invalidation() {
     sqlx::query(&format!(
         "CREATE TABLE IF NOT EXISTS {table_name} LIKE mem_memories"
     ))
-    .execute(store.pool())
+    .execute(&pool)
     .await
     .expect("create branch table");
     // Use register_branch which handles the schema correctly
@@ -91,7 +89,7 @@ async fn test_active_table_cache_hit_and_invalidation() {
 
     // Now active_table should return the branch table
     let t3 = store.active_table(&uid).await.expect("active_table 3");
-    assert_eq!(t3, table_name, "should return branch table after switch");
+    assert_eq!(t3, store.t(&table_name), "should return branch table after switch");
 
     // Switch back to main
     store
@@ -100,21 +98,22 @@ async fn test_active_table_cache_hit_and_invalidation() {
         .expect("set_active_branch main");
     let t4 = store.active_table(&uid).await.expect("active_table 4");
     assert_eq!(
-        t4, "mem_memories",
+        t4,
+        store.t("mem_memories"),
         "should return mem_memories after switch back"
     );
 
     // Cleanup
     let _ = sqlx::query(&format!("DROP TABLE IF EXISTS {table_name}"))
-        .execute(store.pool())
+        .execute(&pool)
         .await;
     let _ = sqlx::query("DELETE FROM mem_branches WHERE user_id = ?")
         .bind(&uid)
-        .execute(store.pool())
+        .execute(&pool)
         .await;
     let _ = sqlx::query("DELETE FROM mem_user_state WHERE user_id = ?")
         .bind(&uid)
-        .execute(store.pool())
+        .execute(&pool)
         .await;
 
     println!("✅ active_table cache: hit + invalidation on branch switch");
@@ -124,7 +123,7 @@ async fn test_active_table_cache_hit_and_invalidation() {
 
 #[tokio::test]
 async fn test_cooldown_cache_fast_path() {
-    let (_svc, store, uid) = setup().await;
+    let (_svc, store, pool, uid, _ctx) = setup().await;
     let op = "test_governance";
     let cooldown_secs = 3600; // 1 hour
 
@@ -157,7 +156,7 @@ async fn test_cooldown_cache_fast_path() {
     )
     .bind(&uid)
     .bind(op)
-    .fetch_optional(store.pool())
+    .fetch_optional(&pool)
     .await
     .expect("query cooldown");
     assert!(db_row.is_some(), "cooldown should exist in DB");
@@ -167,7 +166,7 @@ async fn test_cooldown_cache_fast_path() {
     // Cleanup
     let _ = sqlx::query("DELETE FROM mem_governance_cooldown WHERE user_id = ?")
         .bind(&uid)
-        .execute(store.pool())
+        .execute(&pool)
         .await;
 
     println!("✅ cooldown cache: fast path + DB consistency");
@@ -176,7 +175,7 @@ async fn test_cooldown_cache_fast_path() {
 #[tokio::test]
 async fn test_cooldown_cache_db_fallback_on_cold_start() {
     // Simulate cross-instance scenario: set cooldown via raw DB, then check via cache
-    let (_svc, store, uid) = setup().await;
+    let (_svc, store, pool, uid, _ctx) = setup().await;
     let op = "test_consolidate";
     let cooldown_secs = 1800;
 
@@ -187,7 +186,7 @@ async fn test_cooldown_cache_db_fallback_on_cold_start() {
     )
     .bind(&uid)
     .bind(op)
-    .execute(store.pool())
+    .execute(&pool)
     .await
     .expect("insert cooldown");
 
@@ -213,7 +212,7 @@ async fn test_cooldown_cache_db_fallback_on_cold_start() {
     // Cleanup
     let _ = sqlx::query("DELETE FROM mem_governance_cooldown WHERE user_id = ?")
         .bind(&uid)
-        .execute(store.pool())
+        .execute(&pool)
         .await;
 
     println!("✅ cooldown cache: DB fallback on cold start + backfill");
@@ -223,7 +222,7 @@ async fn test_cooldown_cache_db_fallback_on_cold_start() {
 
 #[tokio::test]
 async fn test_node_count_cache_shared_across_graph_store_instances() {
-    let (_svc, store, uid) = setup().await;
+    let (_svc, store, pool, uid, _ctx) = setup().await;
     use memoria_storage::graph::types::{GraphNode, NodeType};
 
     let graph1 = store.graph_store();
@@ -298,7 +297,7 @@ async fn test_node_count_cache_shared_across_graph_store_instances() {
         "SELECT COUNT(*) FROM memory_graph_nodes WHERE user_id = ? AND is_active = 1",
     )
     .bind(&uid)
-    .fetch_one(store.pool())
+    .fetch_one(&pool)
     .await
     .expect("db count");
     assert_eq!(db_count, 6, "DB should have 6 nodes");
@@ -306,7 +305,7 @@ async fn test_node_count_cache_shared_across_graph_store_instances() {
     // Cleanup
     let _ = sqlx::query("DELETE FROM memory_graph_nodes WHERE user_id = ?")
         .bind(&uid)
-        .execute(store.pool())
+        .execute(&pool)
         .await;
 
     println!("✅ node_count_cache: shared across GraphStore instances from same SqlMemoryStore");
@@ -316,7 +315,7 @@ async fn test_node_count_cache_shared_across_graph_store_instances() {
 
 #[tokio::test]
 async fn test_get_stats_batch_returns_correct_values() {
-    let (svc, store, uid) = setup().await;
+    let (svc, store, pool, uid, _ctx) = setup().await;
 
     // Store two memories
     let r1 = call(
@@ -427,7 +426,7 @@ async fn test_get_stats_batch_returns_correct_values() {
 
 #[tokio::test]
 async fn test_batch_entity_methods() {
-    let (_svc, store, uid) = setup().await;
+    let (_svc, store, pool, uid, _ctx) = setup().await;
     let graph = store.graph_store();
     graph.migrate().await.expect("migrate");
 
@@ -465,8 +464,9 @@ async fn test_batch_entity_methods() {
         created_at: Some(chrono::Utc::now()),
         updated_at: None,
     };
+    let memories_table = store.t("mem_memories");
     store
-        .insert_into("mem_memories", &mem)
+        .insert_into(&memories_table, &mem)
         .await
         .expect("insert memory");
 
@@ -537,15 +537,15 @@ async fn test_batch_entity_methods() {
     // Cleanup
     let _ = sqlx::query("DELETE FROM mem_memory_entity_links WHERE user_id = ?")
         .bind(&uid)
-        .execute(store.pool())
+        .execute(&pool)
         .await;
     let _ = sqlx::query("DELETE FROM mem_entities WHERE user_id = ?")
         .bind(&uid)
-        .execute(store.pool())
+        .execute(&pool)
         .await;
     let _ = sqlx::query("DELETE FROM mem_memories WHERE user_id = ?")
         .bind(&uid)
-        .execute(store.pool())
+        .execute(&pool)
         .await;
 
     println!("✅ batch entity methods: find_entities_by_names + get_memories_by_entities");
@@ -555,7 +555,7 @@ async fn test_batch_entity_methods() {
 
 #[tokio::test]
 async fn test_find_near_duplicate_single_query_same_type_preference() {
-    let (_svc, store, uid) = setup().await;
+    let (_svc, store, pool, uid, _ctx) = setup().await;
     let dim = test_dim();
 
     // Create a base embedding
@@ -582,8 +582,9 @@ async fn test_find_near_duplicate_single_query_same_type_preference() {
         created_at: Some(chrono::Utc::now()),
         updated_at: None,
     };
+    let memories_table = store.t("mem_memories");
     store
-        .insert_into("mem_memories", &mem_a)
+        .insert_into(&memories_table, &mem_a)
         .await
         .expect("insert A");
 
@@ -610,7 +611,7 @@ async fn test_find_near_duplicate_single_query_same_type_preference() {
         updated_at: None,
     };
     store
-        .insert_into("mem_memories", &mem_b)
+        .insert_into(&memories_table, &mem_b)
         .await
         .expect("insert B");
 
@@ -669,7 +670,7 @@ async fn test_find_near_duplicate_single_query_same_type_preference() {
     // Cleanup
     let _ = sqlx::query("DELETE FROM mem_memories WHERE user_id = ?")
         .bind(&uid)
-        .execute(store.pool())
+        .execute(&pool)
         .await;
 
     println!("✅ find_near_duplicate: single query with same-type preference");
@@ -679,7 +680,7 @@ async fn test_find_near_duplicate_single_query_same_type_preference() {
 
 #[tokio::test]
 async fn test_feedback_created_at_index_exists() {
-    let (_svc, store, _uid) = setup().await;
+    let (_svc, store, pool, _uid, _ctx) = setup().await;
 
     let count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM information_schema.statistics \
@@ -687,7 +688,7 @@ async fn test_feedback_created_at_index_exists() {
            AND table_name = 'mem_retrieval_feedback' \
            AND index_name = 'idx_feedback_created_at'",
     )
-    .fetch_one(store.pool())
+    .fetch_one(&pool)
     .await
     .expect("check index");
 
@@ -702,7 +703,7 @@ async fn test_feedback_created_at_index_exists() {
 
 #[tokio::test]
 async fn test_hybrid_search_concurrent_correctness() {
-    let (svc, _store, uid) = setup().await;
+    let (svc, _store, _pool, uid, _ctx) = setup().await;
 
     // Store several memories with distinct content
     for i in 0..5 {
@@ -740,11 +741,10 @@ async fn test_hybrid_search_concurrent_correctness() {
 
 #[tokio::test]
 async fn test_graph_store_new_standalone_still_works() {
-    let pool = sqlx::MySqlPool::connect(&db_url()).await.expect("pool");
+    let (_svc, _store, pool, uid, _ctx) = setup().await;
     let graph = memoria_storage::GraphStore::new(pool, test_dim());
     graph.migrate().await.expect("migrate");
 
-    let uid = uid();
     // count_user_nodes should work (own cache, not shared)
     let count = graph.count_user_nodes(&uid).await.expect("count");
     assert_eq!(count, 0, "new user should have 0 nodes");

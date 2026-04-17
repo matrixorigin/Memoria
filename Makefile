@@ -1,7 +1,7 @@
 .PHONY: help check-env up down status logs logs-db \
         up-db down-db up-api down-api rebuild-api health \
         dev build build-local check \
-        test test-unit test-integration test-e2e bench dev-bench \
+        test test-unit test-integration test-e2e test-e2e-mcp bench dev-bench \
         new-key list-keys revoke-keys \
         clean reset
 
@@ -47,6 +47,7 @@ help:
 	@echo "  make test               All tests (needs DB)"
 	@echo "  make test-unit          Unit tests (no DB)"
 	@echo "  make test-e2e           E2E API tests (needs DB)"
+	@echo "  make test-e2e-mcp       E2E MCP tests (needs DB)"
 	@echo "  make bench              Run benchmark (needs: make up)"
 	@echo "  make dev-bench          Load test API (DURATION=60 USERS=10 SEED=20 RPS=0 SCENARIO=all)"
 	@echo ""
@@ -202,6 +203,89 @@ test-e2e:
 		LLM_BASE_URL=$${MEMORIA_LLM_BASE_URL:-} \
 		LLM_MODEL=$${MEMORIA_LLM_MODEL:-} \
 		cargo test -p memoria-api --test api_e2e
+
+test-e2e-mcp:
+	@cd memoria && DATABASE_URL=$(TEST_DB_URL) SQLX_OFFLINE=true \
+		EMBEDDING_API_KEY=$${MEMORIA_EMBEDDING_API_KEY:-} \
+		EMBEDDING_BASE_URL=$${MEMORIA_EMBEDDING_BASE_URL:-} \
+		EMBEDDING_MODEL=$${MEMORIA_EMBEDDING_MODEL:-BAAI/bge-m3} \
+		EMBEDDING_DIM=$${MEMORIA_EMBEDDING_DIM:-1024} \
+		LLM_API_KEY=$${MEMORIA_LLM_API_KEY:-} \
+		LLM_BASE_URL=$${MEMORIA_LLM_BASE_URL:-} \
+		LLM_MODEL=$${MEMORIA_LLM_MODEL:-} \
+		cargo test -p memoria-mcp --test mcp_e2e -- --test-threads=1
+	@cd memoria && DATABASE_URL=$(TEST_DB_URL) SQLX_OFFLINE=true \
+		EMBEDDING_API_KEY=$${MEMORIA_EMBEDDING_API_KEY:-} \
+		EMBEDDING_BASE_URL=$${MEMORIA_EMBEDDING_BASE_URL:-} \
+		EMBEDDING_MODEL=$${MEMORIA_EMBEDDING_MODEL:-BAAI/bge-m3} \
+		EMBEDDING_DIM=$${MEMORIA_EMBEDDING_DIM:-1024} \
+		LLM_API_KEY=$${MEMORIA_LLM_API_KEY:-} \
+		LLM_BASE_URL=$${MEMORIA_LLM_BASE_URL:-} \
+		LLM_MODEL=$${MEMORIA_LLM_MODEL:-} \
+		cargo test -p memoria-mcp --test core_tools_e2e -- --test-threads=1
+	@cd memoria && DATABASE_URL=$(TEST_DB_URL) SQLX_OFFLINE=true \
+		EMBEDDING_API_KEY=$${MEMORIA_EMBEDDING_API_KEY:-} \
+		EMBEDDING_BASE_URL=$${MEMORIA_EMBEDDING_BASE_URL:-} \
+		EMBEDDING_MODEL=$${MEMORIA_EMBEDDING_MODEL:-BAAI/bge-m3} \
+		EMBEDDING_DIM=$${MEMORIA_EMBEDDING_DIM:-1024} \
+		LLM_API_KEY=$${MEMORIA_LLM_API_KEY:-} \
+		LLM_BASE_URL=$${MEMORIA_LLM_BASE_URL:-} \
+		LLM_MODEL=$${MEMORIA_LLM_MODEL:-} \
+		cargo test -p memoria-mcp --test branch_e2e -- --test-threads=1
+	@cd memoria && DATABASE_URL=$(TEST_DB_URL) SQLX_OFFLINE=true \
+		EMBEDDING_API_KEY=$${MEMORIA_EMBEDDING_API_KEY:-} \
+		EMBEDDING_BASE_URL=$${MEMORIA_EMBEDDING_BASE_URL:-} \
+		EMBEDDING_MODEL=$${MEMORIA_EMBEDDING_MODEL:-BAAI/bge-m3} \
+		EMBEDDING_DIM=$${MEMORIA_EMBEDDING_DIM:-1024} \
+		LLM_API_KEY=$${MEMORIA_LLM_API_KEY:-} \
+		LLM_BASE_URL=$${MEMORIA_LLM_BASE_URL:-} \
+		LLM_MODEL=$${MEMORIA_LLM_MODEL:-} \
+		cargo test -p memoria-mcp --test feedback_e2e -- --test-threads=1
+	@cd memoria && DATABASE_URL=$(TEST_DB_URL) SQLX_OFFLINE=true \
+		EMBEDDING_API_KEY=$${MEMORIA_EMBEDDING_API_KEY:-} \
+		EMBEDDING_BASE_URL=$${MEMORIA_EMBEDDING_BASE_URL:-} \
+		EMBEDDING_MODEL=$${MEMORIA_EMBEDDING_MODEL:-BAAI/bge-m3} \
+		EMBEDDING_DIM=$${MEMORIA_EMBEDDING_DIM:-1024} \
+		LLM_API_KEY=$${MEMORIA_LLM_API_KEY:-} \
+		LLM_BASE_URL=$${MEMORIA_LLM_BASE_URL:-} \
+		LLM_MODEL=$${MEMORIA_LLM_MODEL:-} \
+		cargo test -p memoria-mcp --test integration_full -- --test-threads=1
+	@cd memoria && DATABASE_URL=$(TEST_DB_URL) SQLX_OFFLINE=true \
+		EMBEDDING_API_KEY=$${MEMORIA_EMBEDDING_API_KEY:-} \
+		EMBEDDING_BASE_URL=$${MEMORIA_EMBEDDING_BASE_URL:-} \
+		EMBEDDING_MODEL=$${MEMORIA_EMBEDDING_MODEL:-BAAI/bge-m3} \
+		EMBEDDING_DIM=$${MEMORIA_EMBEDDING_DIM:-1024} \
+		LLM_API_KEY=$${MEMORIA_LLM_API_KEY:-} \
+		LLM_BASE_URL=$${MEMORIA_LLM_BASE_URL:-} \
+		LLM_MODEL=$${MEMORIA_LLM_MODEL:-} \
+		cargo test -p memoria-mcp --test perf_optimizations_e2e -- --test-threads=1
+	@cd memoria && DATABASE_URL=$(TEST_DB_URL) SQLX_OFFLINE=true \
+		EMBEDDING_API_KEY=$${MEMORIA_EMBEDDING_API_KEY:-} \
+		EMBEDDING_BASE_URL=$${MEMORIA_EMBEDDING_BASE_URL:-} \
+		EMBEDDING_MODEL=$${MEMORIA_EMBEDDING_MODEL:-BAAI/bge-m3} \
+		EMBEDDING_DIM=$${MEMORIA_EMBEDDING_DIM:-1024} \
+		LLM_API_KEY=$${MEMORIA_LLM_API_KEY:-} \
+		LLM_BASE_URL=$${MEMORIA_LLM_BASE_URL:-} \
+		LLM_MODEL=$${MEMORIA_LLM_MODEL:-} \
+		cargo test -p memoria-mcp --test snapshot_e2e -- --test-threads=1
+	@cd memoria && DATABASE_URL=$(TEST_DB_URL) SQLX_OFFLINE=true \
+		EMBEDDING_API_KEY=$${MEMORIA_EMBEDDING_API_KEY:-} \
+		EMBEDDING_BASE_URL=$${MEMORIA_EMBEDDING_BASE_URL:-} \
+		EMBEDDING_MODEL=$${MEMORIA_EMBEDDING_MODEL:-BAAI/bge-m3} \
+		EMBEDDING_DIM=$${MEMORIA_EMBEDDING_DIM:-1024} \
+		LLM_API_KEY=$${MEMORIA_LLM_API_KEY:-} \
+		LLM_BASE_URL=$${MEMORIA_LLM_BASE_URL:-} \
+		LLM_MODEL=$${MEMORIA_LLM_MODEL:-} \
+		cargo test -p memoria-mcp --test edit_log_e2e -- --test-threads=1
+	@cd memoria && DATABASE_URL=$(TEST_DB_URL) SQLX_OFFLINE=true \
+		EMBEDDING_API_KEY=$${MEMORIA_EMBEDDING_API_KEY:-} \
+		EMBEDDING_BASE_URL=$${MEMORIA_EMBEDDING_BASE_URL:-} \
+		EMBEDDING_MODEL=$${MEMORIA_EMBEDDING_MODEL:-BAAI/bge-m3} \
+		EMBEDDING_DIM=$${MEMORIA_EMBEDDING_DIM:-1024} \
+		LLM_API_KEY=$${MEMORIA_LLM_API_KEY:-} \
+		LLM_BASE_URL=$${MEMORIA_LLM_BASE_URL:-} \
+		LLM_MODEL=$${MEMORIA_LLM_MODEL:-} \
+		cargo test -p memoria-mcp --test graph_e2e -- --test-threads=1
 
 # ── Benchmark ───────────────────────────────────────────────────────
 

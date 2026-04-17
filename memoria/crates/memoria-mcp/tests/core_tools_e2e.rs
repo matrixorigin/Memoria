@@ -5,8 +5,9 @@
 ///
 /// Run: DATABASE_URL=mysql://root:111@localhost:6001/memoria \
 ///      cargo test -p memoria-mcp --test core_tools_e2e -- --nocapture
+mod support;
+
 use memoria_service::MemoryService;
-use memoria_storage::SqlMemoryStore;
 use serde_json::{json, Value};
 use sqlx::Row;
 use std::sync::Arc;
@@ -17,10 +18,6 @@ fn test_dim() -> usize {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(1024)
-}
-fn db_url() -> String {
-    std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "mysql://root:111@localhost:6001/memoria".to_string())
 }
 fn uid() -> String {
     format!("ct_{}", &Uuid::new_v4().simple().to_string()[..8])
@@ -33,13 +30,9 @@ async fn spawn_fake_llm() -> (
     memoria_test_utils::spawn_fake_llm(vec![]).await
 }
 
-async fn setup() -> (Arc<MemoryService>, String) {
-    let store = SqlMemoryStore::connect(&db_url(), test_dim(), uuid::Uuid::new_v4().to_string())
-        .await
-        .expect("connect");
-    store.migrate().await.expect("migrate");
-    let svc = Arc::new(MemoryService::new_sql_with_llm(Arc::new(store), None, None).await);
-    (svc, uid())
+async fn setup() -> (Arc<MemoryService>, String, support::multi_db::McpTestContext) {
+    let ctx = support::multi_db::setup_mcp_context("core_tools_e2e", test_dim(), None, None).await;
+    (ctx.service(), uid(), ctx)
 }
 
 async fn call(name: &str, args: Value, svc: &Arc<MemoryService>, uid: &str) -> Value {
@@ -55,7 +48,7 @@ fn text(v: &Value) -> &str {
 
 #[tokio::test]
 async fn test_store_all_memory_types() {
-    let (svc, uid) = setup().await;
+    let (svc, uid, _ctx) = setup().await;
     for mt in &[
         "semantic",
         "profile",
@@ -86,7 +79,7 @@ async fn test_store_all_memory_types() {
 
 #[tokio::test]
 async fn test_store_session_and_trust_tier() {
-    let (svc, uid) = setup().await;
+    let (svc, uid, _ctx) = setup().await;
     let r = call(
         "memory_store",
         json!({"content": "session memory", "session_id": "sess-abc", "trust_tier": "T1"}),
@@ -97,7 +90,7 @@ async fn test_store_session_and_trust_tier() {
     let t = text(&r);
     assert!(t.contains("Stored"), "{t}");
     let mid = t.split_whitespace().nth(2).unwrap().trim_end_matches(':');
-    let m = svc.get(mid).await.unwrap().unwrap();
+    let m = svc.get_for_user(&uid, mid).await.unwrap().unwrap();
     assert_eq!(m.session_id.as_deref(), Some("sess-abc"));
     assert_eq!(m.trust_tier.to_string(), "T1");
     println!(
@@ -108,7 +101,7 @@ async fn test_store_session_and_trust_tier() {
 
 #[tokio::test]
 async fn test_store_rejects_invalid_trust_tier() {
-    let (svc, uid) = setup().await;
+    let (svc, uid, _ctx) = setup().await;
     let err = memoria_mcp::tools::call(
         "memory_store",
         json!({"content": "bad tier memory", "trust_tier": "verified"}),
@@ -130,7 +123,7 @@ async fn test_store_rejects_invalid_trust_tier() {
 
 #[tokio::test]
 async fn test_retrieve_finds_relevant() {
-    let (svc, uid) = setup().await;
+    let (svc, uid, _ctx) = setup().await;
     call(
         "memory_store",
         json!({"content": "rust ownership model"}),
@@ -161,7 +154,7 @@ async fn test_retrieve_finds_relevant() {
 
 #[tokio::test]
 async fn test_retrieve_empty() {
-    let (svc, uid) = setup().await;
+    let (svc, uid, _ctx) = setup().await;
     let r = call(
         "memory_retrieve",
         json!({"query": "nothing here"}),
@@ -177,7 +170,7 @@ async fn test_retrieve_empty() {
 
 #[tokio::test]
 async fn test_search_top_k() {
-    let (svc, uid) = setup().await;
+    let (svc, uid, _ctx) = setup().await;
     for i in 0..5 {
         call(
             "memory_store",
@@ -204,7 +197,7 @@ async fn test_search_top_k() {
 
 #[tokio::test]
 async fn test_correct_by_id() {
-    let (svc, uid) = setup().await;
+    let (svc, uid, _ctx) = setup().await;
     let stored = call(
         "memory_store",
         json!({"content": "old content"}),
@@ -239,12 +232,12 @@ async fn test_correct_by_id() {
     assert_ne!(new_mid, mid, "new memory should have different id");
 
     // New memory should have corrected content
-    let new = svc.get(new_mid).await.unwrap().unwrap();
+    let new = svc.get_for_user(&uid, new_mid).await.unwrap().unwrap();
     assert_eq!(new.content, "corrected content");
     assert!(new.is_active, "new memory should be active");
 
     // Old memory should be deactivated (get returns None for inactive)
-    let old = svc.get(&mid).await.unwrap();
+    let old = svc.get_for_user(&uid, &mid).await.unwrap();
     assert!(
         old.is_none(),
         "old memory should not be returned by get (deactivated)"
@@ -256,7 +249,7 @@ async fn test_correct_by_id() {
 
 #[tokio::test]
 async fn test_correct_by_query() {
-    let (svc, uid) = setup().await;
+    let (svc, uid, _ctx) = setup().await;
     call(
         "memory_store",
         json!({"content": "uses black for formatting"}),
@@ -276,7 +269,7 @@ async fn test_correct_by_query() {
 
 #[tokio::test]
 async fn test_correct_no_target() {
-    let (svc, uid) = setup().await;
+    let (svc, uid, _ctx) = setup().await;
     let r = call(
         "memory_correct",
         json!({"new_content": "something"}),
@@ -296,7 +289,7 @@ async fn test_correct_no_target() {
 
 #[tokio::test]
 async fn test_correct_no_content() {
-    let (svc, uid) = setup().await;
+    let (svc, uid, _ctx) = setup().await;
     let r = call(
         "memory_correct",
         json!({"memory_id": "some-id"}),
@@ -312,7 +305,7 @@ async fn test_correct_no_content() {
 
 #[tokio::test]
 async fn test_purge_single() {
-    let (svc, uid) = setup().await;
+    let (svc, uid, _ctx) = setup().await;
     let stored = call("memory_store", json!({"content": "to delete"}), &svc, &uid).await;
     let mid = text(&stored)
         .split_whitespace()
@@ -323,7 +316,7 @@ async fn test_purge_single() {
 
     let r = call("memory_purge", json!({"memory_id": mid}), &svc, &uid).await;
     assert!(text(&r).contains("1"), "{}", text(&r));
-    assert!(svc.get(&mid).await.unwrap().is_none());
+    assert!(svc.get_for_user(&uid, &mid).await.unwrap().is_none());
     println!("✅ purge single: {}", text(&r));
 }
 
@@ -331,7 +324,7 @@ async fn test_purge_single() {
 
 #[tokio::test]
 async fn test_purge_batch() {
-    let (svc, uid) = setup().await;
+    let (svc, uid, _ctx) = setup().await;
     let mut ids = vec![];
     for i in 0..3 {
         let r = call(
@@ -360,7 +353,7 @@ async fn test_purge_batch() {
 
 #[tokio::test]
 async fn test_purge_topic() {
-    let (svc, uid) = setup().await;
+    let (svc, uid, _ctx) = setup().await;
     call(
         "memory_store",
         json!({"content": "rust ownership rules"}),
@@ -400,7 +393,7 @@ async fn test_purge_topic() {
 
 #[tokio::test]
 async fn test_purge_session_id_with_memory_types() {
-    let (svc, uid) = setup().await;
+    let (svc, uid, _ctx) = setup().await;
     let target_session = format!("session:test-smp-{}", Uuid::new_v4().simple());
     let other_session = format!("session:test-smp-{}", Uuid::new_v4().simple());
 
@@ -457,7 +450,7 @@ async fn test_purge_session_id_with_memory_types() {
 
 #[tokio::test]
 async fn test_purge_no_target() {
-    let (svc, uid) = setup().await;
+    let (svc, uid, _ctx) = setup().await;
     let r = call("memory_purge", json!({}), &svc, &uid).await;
     assert!(
         text(&r).contains("memory_id") || text(&r).contains("topic"),
@@ -471,7 +464,7 @@ async fn test_purge_no_target() {
 
 #[tokio::test]
 async fn test_purge_short_topic() {
-    let (svc, uid) = setup().await;
+    let (svc, uid, _ctx) = setup().await;
     // 直接调用不会 panic 的版本
     let result = memoria_mcp::tools::call("memory_purge", json!({"topic": "ab"}), &svc, &uid).await;
     assert!(result.is_err(), "Should return error for short topic");
@@ -487,7 +480,7 @@ async fn test_purge_short_topic() {
 
 #[tokio::test]
 async fn test_profile() {
-    let (svc, uid) = setup().await;
+    let (svc, uid, _ctx) = setup().await;
     call(
         "memory_store",
         json!({"content": "prefers tabs", "memory_type": "profile"}),
@@ -525,7 +518,7 @@ async fn test_profile() {
 
 #[tokio::test]
 async fn test_profile_empty() {
-    let (svc, uid) = setup().await;
+    let (svc, uid, _ctx) = setup().await;
     let r = call("memory_profile", json!({}), &svc, &uid).await;
     assert!(text(&r).contains("No profile"), "{}", text(&r));
     println!("✅ profile empty: {}", text(&r));
@@ -535,7 +528,7 @@ async fn test_profile_empty() {
 
 #[tokio::test]
 async fn test_list_limit_and_fields() {
-    let (svc, uid) = setup().await;
+    let (svc, uid, _ctx) = setup().await;
     for i in 0..5 {
         call(
             "memory_store",
@@ -561,7 +554,7 @@ async fn test_list_limit_and_fields() {
 
 #[tokio::test]
 async fn test_capabilities() {
-    let (svc, uid) = setup().await;
+    let (svc, uid, _ctx) = setup().await;
     let r = call("memory_capabilities", json!({}), &svc, &uid).await;
     let t = text(&r);
     for tool in &[
@@ -606,7 +599,7 @@ async fn test_capabilities() {
 
 #[tokio::test]
 async fn test_unknown_tool_errors() {
-    let (svc, uid) = setup().await;
+    let (svc, uid, _ctx) = setup().await;
     let result = memoria_mcp::tools::call("nonexistent", json!({}), &svc, &uid).await;
     assert!(result.is_err());
     println!("✅ unknown tool → error");
@@ -616,11 +609,12 @@ async fn test_unknown_tool_errors() {
 
 #[tokio::test]
 async fn test_governance_quarantine_and_cooldown() {
-    let (svc, uid) = setup().await;
+    let (svc, uid, ctx) = setup().await;
 
     // Store a memory with very low initial_confidence (T4 = 0.4) and old observed_at
     // so effective_confidence = 0.4 * exp(-365/30) ≈ 0 < 0.2 threshold
-    let sql = svc.sql_store.as_ref().unwrap();
+    let _sql = ctx.user_store(&uid).await;
+    let pool = ctx.user_db_pool(&uid).await;
     let mid = format!("gov_{}", uuid::Uuid::new_v4().simple());
     sqlx::query(
         "INSERT INTO mem_memories (memory_id, user_id, memory_type, content, source_event_ids, \
@@ -630,7 +624,7 @@ async fn test_governance_quarantine_and_cooldown() {
     )
     .bind(&mid)
     .bind(&uid)
-    .execute(sql.pool())
+    .execute(&pool)
     .await
     .expect("insert old memory");
 
@@ -657,7 +651,7 @@ async fn test_governance_quarantine_and_cooldown() {
     let remaining: Vec<(String,)> =
         sqlx::query_as("SELECT memory_id FROM mem_memories WHERE memory_id = ?")
             .bind(&mid)
-            .fetch_all(sql.pool())
+            .fetch_all(&pool)
             .await
             .unwrap();
     assert!(
@@ -690,8 +684,9 @@ async fn test_governance_quarantine_and_cooldown() {
 
 #[tokio::test]
 async fn test_governance_cleanup_stale() {
-    let (svc, uid) = setup().await;
-    let sql = svc.sql_store.as_ref().unwrap();
+    let (svc, uid, ctx) = setup().await;
+    let _sql = ctx.user_store(&uid).await;
+    let pool = ctx.user_db_pool(&uid).await;
 
     // Insert a soft-deleted memory with very low confidence
     let mid = format!("stale_{}", uuid::Uuid::new_v4().simple());
@@ -703,7 +698,7 @@ async fn test_governance_cleanup_stale() {
     )
     .bind(&mid)
     .bind(&uid)
-    .execute(sql.pool())
+    .execute(&pool)
     .await
     .expect("insert stale");
 
@@ -718,7 +713,7 @@ async fn test_governance_cleanup_stale() {
     // Verify physically deleted
     let row = sqlx::query("SELECT COUNT(*) as cnt FROM mem_memories WHERE memory_id = ?")
         .bind(&mid)
-        .fetch_one(sql.pool())
+        .fetch_one(&pool)
         .await
         .expect("fetch");
     let cnt: i64 = row.try_get("cnt").unwrap_or(1);
@@ -730,7 +725,7 @@ async fn test_governance_cleanup_stale() {
 
 #[tokio::test]
 async fn test_consolidate_basic() {
-    let (svc, uid) = setup().await;
+    let (svc, uid, _ctx) = setup().await;
 
     // First run should succeed
     let r = call("memory_consolidate", json!({"force": true}), &svc, &uid).await;
@@ -750,7 +745,7 @@ async fn test_consolidate_basic() {
 
 #[tokio::test]
 async fn test_reflect_candidates() {
-    let (svc, uid) = setup().await;
+    let (svc, uid, _ctx) = setup().await;
 
     // Store a few memories first
     call(
@@ -781,7 +776,7 @@ async fn test_reflect_candidates() {
 
 #[tokio::test]
 async fn test_reflect_internal_unavailable() {
-    let (svc, uid) = setup().await;
+    let (svc, uid, _ctx) = setup().await;
     let r = call("memory_reflect", json!({"mode": "internal"}), &svc, &uid).await;
     let t = text(&r);
     assert!(
@@ -795,7 +790,7 @@ async fn test_reflect_internal_unavailable() {
 
 #[tokio::test]
 async fn test_extract_and_link_entities() {
-    let (svc, uid) = setup().await;
+    let (svc, uid, _ctx) = setup().await;
 
     // Store a memory
     let store_r = call(
@@ -878,7 +873,7 @@ async fn test_extract_and_link_entities() {
 
 #[tokio::test]
 async fn test_link_entities_invalid_json() {
-    let (svc, uid) = setup().await;
+    let (svc, uid, _ctx) = setup().await;
     let r = call(
         "memory_link_entities",
         json!({"entities": "not json"}),
@@ -897,20 +892,17 @@ async fn test_link_entities_invalid_json() {
 /// Helper: create service with explicit LLM client (for testing LLM paths).
 async fn setup_with_llm(
     llm: Option<Arc<memoria_embedding::LlmClient>>,
-) -> (Arc<MemoryService>, String) {
-    let store = SqlMemoryStore::connect(&db_url(), test_dim(), uuid::Uuid::new_v4().to_string())
-        .await
-        .expect("connect");
-    store.migrate().await.expect("migrate");
-    let svc = Arc::new(MemoryService::new_sql_with_llm(Arc::new(store), None, llm).await);
-    (svc, uid())
+) -> (Arc<MemoryService>, String, support::multi_db::McpTestContext) {
+    let ctx =
+        support::multi_db::setup_mcp_context("core_tools_e2e_llm", test_dim(), None, llm).await;
+    (ctx.service(), uid(), ctx)
 }
 
 // ── 26. reflect without LLM returns candidates (not error) ───────────────────
 
 #[tokio::test]
 async fn test_reflect_no_llm_returns_candidates() {
-    let (svc, uid) = setup_with_llm(None).await;
+    let (svc, uid, _ctx) = setup_with_llm(None).await;
 
     // Store memories in two different "sessions" to create clusters
     call(
@@ -970,7 +962,7 @@ async fn test_reflect_no_llm_returns_candidates() {
 
 #[tokio::test]
 async fn test_reflect_candidates_mode_no_llm_needed() {
-    let (svc, uid) = setup_with_llm(None).await;
+    let (svc, uid, _ctx) = setup_with_llm(None).await;
     call(
         "memory_store",
         json!({"content": "Test memory for candidates mode"}),
@@ -1005,7 +997,7 @@ async fn test_reflect_candidates_mode_no_llm_needed() {
 
 #[tokio::test]
 async fn test_reflect_internal_no_llm_returns_error() {
-    let (svc, uid) = setup_with_llm(None).await;
+    let (svc, uid, _ctx) = setup_with_llm(None).await;
     let r = call("memory_reflect", json!({"mode": "internal"}), &svc, &uid).await;
     let t = text(&r);
     assert!(
@@ -1019,7 +1011,7 @@ async fn test_reflect_internal_no_llm_returns_error() {
 
 #[tokio::test]
 async fn test_extract_entities_no_llm_returns_candidates() {
-    let (svc, uid) = setup_with_llm(None).await;
+    let (svc, uid, _ctx) = setup_with_llm(None).await;
     call(
         "memory_store",
         json!({"content": "Project uses Rust and MatrixOne"}),
@@ -1052,7 +1044,7 @@ async fn test_extract_entities_no_llm_returns_candidates() {
 
 #[tokio::test]
 async fn test_extract_entities_internal_no_llm_returns_error() {
-    let (svc, uid) = setup_with_llm(None).await;
+    let (svc, uid, _ctx) = setup_with_llm(None).await;
     let r = call(
         "memory_extract_entities",
         json!({"mode": "internal"}),
@@ -1073,9 +1065,10 @@ async fn test_extract_entities_internal_no_llm_returns_error() {
 #[tokio::test]
 async fn test_reflect_with_llm_if_configured() {
     let (llm, _shutdown) = spawn_fake_llm().await;
-    let (svc, uid) = setup_with_llm(Some(llm)).await;
+    let (svc, uid, ctx) = setup_with_llm(Some(llm)).await;
+    let pool = ctx.user_db_pool(&uid).await;
 
-    let sql = svc.sql_store.as_ref().expect("sql store");
+    let sql = ctx.user_store(&uid).await;
     let graph = sql.graph_store();
     for (idx, content) in [
         "Uses Rust for backend",
@@ -1129,7 +1122,7 @@ async fn test_reflect_with_llm_if_configured() {
 
     let rows = sqlx::query("SELECT content FROM mem_memories WHERE user_id = ? AND is_active = 1")
         .bind(&uid)
-        .fetch_all(sql.pool())
+        .fetch_all(&pool)
         .await
         .unwrap();
     let contents: Vec<String> = rows
@@ -1150,7 +1143,7 @@ async fn test_reflect_with_llm_if_configured() {
 #[tokio::test]
 async fn test_extract_entities_with_llm_if_configured() {
     let (llm, _shutdown) = spawn_fake_llm().await;
-    let (svc, uid) = setup_with_llm(Some(llm)).await;
+    let (svc, uid, ctx) = setup_with_llm(Some(llm)).await;
 
     call(
         "memory_store",
@@ -1178,7 +1171,7 @@ async fn test_extract_entities_with_llm_if_configured() {
         "fake LLM should create entities: {t}"
     );
 
-    let sql = svc.sql_store.as_ref().expect("sql store");
+    let sql = ctx.user_store(&uid).await;
     let graph = sql.graph_store();
     let entities = graph.get_user_entities(&uid).await.unwrap();
     let names: Vec<String> = entities.iter().map(|(name, _)| name.clone()).collect();
@@ -1194,7 +1187,7 @@ async fn test_extract_entities_with_llm_if_configured() {
 
 #[tokio::test]
 async fn test_retrieve_fulltext_fallback() {
-    let (svc, uid) = setup().await;
+    let (svc, uid, _ctx) = setup().await;
     // Store a memory with a unique keyword
     call(
         "memory_store",
@@ -1223,7 +1216,7 @@ async fn test_retrieve_fulltext_fallback() {
 
 #[tokio::test]
 async fn test_search_top_k_zero() {
-    let (svc, uid) = setup().await;
+    let (svc, uid, _ctx) = setup().await;
     call(
         "memory_store",
         json!({"content": "topk zero test"}),
@@ -1251,7 +1244,7 @@ async fn test_search_top_k_zero() {
 
 #[tokio::test]
 async fn test_store_with_session_id_retrievable() {
-    let (svc, uid) = setup().await;
+    let (svc, uid, _ctx) = setup().await;
     let sid = format!(
         "sess_{}",
         uuid::Uuid::new_v4().simple().to_string()[..8].to_string()
@@ -1282,7 +1275,7 @@ async fn test_store_with_session_id_retrievable() {
 
 #[tokio::test]
 async fn test_purge_topic_then_search_empty() {
-    let (svc, uid) = setup().await;
+    let (svc, uid, _ctx) = setup().await;
     let tag = format!(
         "purgetopic_{}",
         uuid::Uuid::new_v4().simple().to_string()[..6].to_string()
@@ -1325,7 +1318,7 @@ async fn test_purge_topic_then_search_empty() {
 
 #[tokio::test]
 async fn test_retrieve_explain_mode() {
-    let (svc, uid) = setup().await;
+    let (svc, uid, _ctx) = setup().await;
     call(
         "memory_store",
         json!({"content": "explain test memory alpha"}),
@@ -1356,7 +1349,7 @@ async fn test_retrieve_explain_mode() {
 
 #[tokio::test]
 async fn test_retrieve_explain_empty() {
-    let (svc, uid) = setup().await;
+    let (svc, uid, _ctx) = setup().await;
     let r = call(
         "memory_retrieve",
         json!({"query": "nonexistent_xyz_123", "top_k": 5, "explain": true}),
@@ -1378,7 +1371,7 @@ async fn test_retrieve_explain_empty() {
 
 #[tokio::test]
 async fn test_search_explain_mode() {
-    let (svc, uid) = setup().await;
+    let (svc, uid, _ctx) = setup().await;
     call(
         "memory_store",
         json!({"content": "search explain test beta"}),

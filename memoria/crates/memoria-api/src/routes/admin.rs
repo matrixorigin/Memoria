@@ -342,6 +342,46 @@ pub async fn health_hygiene_global(
         .sql_store
         .as_ref()
         .ok_or((StatusCode::SERVICE_UNAVAILABLE, "SQL store required".into()))?;
+    if let Some(router) = sql.db_router() {
+        let user_ids = router.list_active_users().await.map_err(api_err)?;
+        let mut inactive = 0i64;
+        let mut stale_working = 0i64;
+        let mut orphan_mel = 0i64;
+        let mut orphan_el = 0i64;
+        let mut orphan_graph_nodes = 0i64;
+        let mut orphan_stats = 0i64;
+
+        for user_id in user_ids {
+            let user_store = state.service.user_sql_store(&user_id).await.map_err(api_err)?;
+            let hygiene = user_store.health_hygiene(&user_id).await.map_err(db_err)?;
+            inactive += hygiene["inactive_memories"].as_i64().unwrap_or(0);
+            stale_working += hygiene["stale_working_memories"].as_i64().unwrap_or(0);
+            orphan_mel += hygiene["orphan_memory_entity_links"].as_i64().unwrap_or(0);
+            orphan_el += hygiene["orphan_entity_links"].as_i64().unwrap_or(0);
+            orphan_graph_nodes += hygiene["orphan_graph_nodes"].as_i64().unwrap_or(0);
+
+            let memory_stats_table = user_store.t("mem_memories_stats");
+            let memories_table = user_store.t("mem_memories");
+            let (user_orphan_stats,): (i64,) = sqlx::query_as(&format!(
+                "SELECT COUNT(*) FROM {memory_stats_table} s \
+                 LEFT JOIN {memories_table} m ON s.memory_id = m.memory_id \
+                 WHERE m.memory_id IS NULL"
+            ))
+            .fetch_one(user_store.pool())
+            .await
+            .map_err(db_err)?;
+            orphan_stats += user_orphan_stats;
+        }
+
+        return Ok(Json(serde_json::json!({
+            "inactive_memories": inactive,
+            "stale_working_memories": stale_working,
+            "orphan_memory_entity_links": orphan_mel,
+            "orphan_entity_links": orphan_el,
+            "orphan_graph_nodes": orphan_graph_nodes,
+            "orphan_stats": orphan_stats,
+        })));
+    }
     let result = sql.health_hygiene_global().await.map_err(db_err)?;
     Ok(Json(result))
 }

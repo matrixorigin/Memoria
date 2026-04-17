@@ -33,6 +33,36 @@ pub fn api_err_typed(e: memoria_core::MemoriaError) -> (StatusCode, String) {
     (status, e.to_string())
 }
 
+async fn find_memory_any_user(
+    state: &AppState,
+    memory_id: &str,
+) -> Result<Option<(String, memoria_core::Memory)>, (StatusCode, String)> {
+    let shared = state.service.shared_sql_store().map_err(api_err_typed)?;
+    let Some(router) = shared.db_router() else {
+        let memory = state.service.get(memory_id).await.map_err(api_err_typed)?;
+        return Ok(memory.map(|m| (m.user_id.clone(), m)));
+    };
+
+    let user_ids = router.list_active_users().await.map_err(api_err_typed)?;
+    for candidate in user_ids {
+        let sql = state
+            .service
+            .user_sql_store(&candidate)
+            .await
+            .map_err(api_err_typed)?;
+        let table = sql.active_table(&candidate).await.map_err(api_err_typed)?;
+        if let Some(memory) = sql
+            .get_from(&table, memory_id)
+            .await
+            .map_err(api_err_typed)?
+        {
+            return Ok(Some((candidate, memory)));
+        }
+    }
+
+    Ok(None)
+}
+
 #[derive(Deserialize, Default)]
 pub struct ListQuery {
     pub memory_type: Option<String>,
@@ -284,17 +314,24 @@ pub async fn get_memory(
     AuthUser { user_id, is_master }: AuthUser,
     Path(id): Path<String>,
 ) -> ApiResult<Option<MemoryResponse>> {
-    let m = state
+    let owned = state
         .service
         .get_for_user(&user_id, &id)
         .await
-        .map_err(api_err)?;
-    if let Some(ref mem) = m {
-        if !is_master && mem.user_id != user_id {
-            return Err((StatusCode::FORBIDDEN, "Not your memory".to_string()));
-        }
+        .map_err(api_err_typed)?;
+    if let Some(memory) = owned {
+        return Ok(Json(Some(memory.into())));
     }
-    Ok(Json(m.map(Into::into)))
+
+    if !is_master {
+        return Ok(Json(None));
+    }
+
+    if let Some((_, memory)) = find_memory_any_user(&state, &id).await? {
+        return Ok(Json(Some(memory.into())));
+    }
+
+    Ok(Json(None))
 }
 
 pub async fn correct_memory(
@@ -303,22 +340,28 @@ pub async fn correct_memory(
     Path(id): Path<String>,
     Json(req): Json<CorrectRequest>,
 ) -> ApiResult<MemoryResponse> {
-    if !is_master {
-        let existing = state
+    let effective_user_id = if is_master {
+        find_memory_any_user(&state, &id)
+            .await?
+            .map(|(owner_id, _)| owner_id)
+            .unwrap_or_else(|| user_id.clone())
+    } else {
+        if state
             .service
             .get_for_user(&user_id, &id)
             .await
-            .map_err(api_err)?
-            .ok_or_else(|| (StatusCode::NOT_FOUND, "Memory not found".to_string()))?;
-        if existing.user_id != user_id {
-            return Err((StatusCode::FORBIDDEN, "Not your memory".to_string()));
+            .map_err(api_err_typed)?
+            .is_none()
+        {
+            return Err((StatusCode::NOT_FOUND, "Memory not found".to_string()));
         }
-    }
+        user_id.clone()
+    };
     let m = state
         .service
-        .correct(&user_id, &id, &req.new_content)
+        .correct(&effective_user_id, &id, &req.new_content)
         .await
-        .map_err(api_err)?;
+        .map_err(api_err_typed)?;
     Ok(Json(m.into()))
 }
 
@@ -351,18 +394,28 @@ pub async fn delete_memory(
     AuthUser { user_id, is_master }: AuthUser,
     Path(id): Path<String>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    if !is_master {
-        let existing = state
+    let effective_user_id = if is_master {
+        find_memory_any_user(&state, &id)
+            .await?
+            .map(|(owner_id, _)| owner_id)
+            .unwrap_or_else(|| user_id.clone())
+    } else {
+        if state
             .service
             .get_for_user(&user_id, &id)
             .await
-            .map_err(api_err)?
-            .ok_or_else(|| (StatusCode::NOT_FOUND, "Memory not found".to_string()))?;
-        if existing.user_id != user_id {
-            return Err((StatusCode::FORBIDDEN, "Not your memory".to_string()));
+            .map_err(api_err_typed)?
+            .is_none()
+        {
+            return Err((StatusCode::NOT_FOUND, "Memory not found".to_string()));
         }
-    }
-    let _ = state.service.purge(&user_id, &id).await.map_err(api_err)?;
+        user_id.clone()
+    };
+    let _ = state
+        .service
+        .purge(&effective_user_id, &id)
+        .await
+        .map_err(api_err_typed)?;
     Ok(StatusCode::NO_CONTENT)
 }
 

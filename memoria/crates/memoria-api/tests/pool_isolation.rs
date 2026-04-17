@@ -6,75 +6,92 @@
 //!
 //! Run: DATABASE_URL="mysql://root:111@localhost:6001/memoria" cargo test --test pool_isolation -- --nocapture
 
-use serde_json::json;
-use std::sync::Arc;
+mod support;
 
-fn db_url() -> String {
-    std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "mysql://root:111@localhost:6001/memoria".to_string())
-}
+use serde_json::json;
+use std::{
+    future::Future,
+    sync::{Mutex, OnceLock},
+};
 
 fn uid() -> String {
     format!("pool_test_{}", uuid::Uuid::new_v4().simple())
 }
 
-/// Spawn server with a tiny main pool (2 connections) to make saturation easy.
-async fn spawn_tiny_pool_server() -> (String, reqwest::Client, sqlx::MySqlPool) {
-    use memoria_git::GitForDataService;
-    use memoria_service::MemoryService;
-    use memoria_storage::SqlMemoryStore;
-    use sqlx::mysql::MySqlPool;
+async fn with_env_async<F, Fut, T>(vars: &[(&str, Option<&str>)], f: F) -> T
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = T>,
+{
+    static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
-    let db = db_url();
-    memoria_test_utils::wait_for_mysql_ready(&db, std::time::Duration::from_secs(30)).await;
+    let _lock = ENV_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
 
-    // Create store with only 2 main pool connections
-    let pool = sqlx::mysql::MySqlPoolOptions::new()
-        .max_connections(2)
-        .acquire_timeout(std::time::Duration::from_secs(3))
-        .connect(&db)
-        .await
-        .expect("pool");
+    struct EnvGuard(Vec<(String, Option<std::ffi::OsString>)>);
 
-    let store = SqlMemoryStore::from_existing_pool(
-        pool.clone(),
-        1024,
-        uuid::Uuid::new_v4().to_string(),
-        Some(db.clone()),
-        Some(2),
-        "pool_isolation_test_pool",
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (key, old) in &self.0 {
+                match old {
+                    Some(value) => unsafe { std::env::set_var(key, value) },
+                    None => unsafe { std::env::remove_var(key) },
+                }
+            }
+        }
+    }
+
+    let _restore = EnvGuard(
+        vars.iter()
+            .map(|(key, value)| {
+                let old = std::env::var_os(key);
+                match value {
+                    Some(value) => unsafe { std::env::set_var(key, value) },
+                    None => unsafe { std::env::remove_var(key) },
+                }
+                (key.to_string(), old)
+            })
+            .collect(),
     );
-    store.migrate().await.expect("migrate");
 
-    let raw_pool = MySqlPool::connect(&db).await.expect("git pool");
-    let suffix_start = db.find(['?', '#']).unwrap_or(db.len());
-    let db_name = db[..suffix_start]
-        .rsplit_once('/')
-        .map(|(_, n)| n)
-        .unwrap_or("memoria");
-    let git = Arc::new(GitForDataService::new(raw_pool, db_name));
-    let service = Arc::new(MemoryService::new_sql_with_llm(Arc::new(store), None, None).await);
-    let state = memoria_api::AppState::new(service, git, String::new());
-    let app = memoria_api::build_router(state);
+    f().await
+}
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind");
-    let port = listener.local_addr().unwrap().port();
-    tokio::spawn(async move { axum::serve(listener, app).await });
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-
-    let client = reqwest::Client::builder()
-        .no_proxy()
-        .build()
-        .expect("client");
-    let base = format!("http://127.0.0.1:{port}");
-    (base, client, pool)
+/// Spawn server with a tiny routed user pool (2 connections) to make saturation easy.
+async fn spawn_tiny_pool_server() -> (
+    String,
+    reqwest::Client,
+    sqlx::MySqlPool,
+    support::multi_db::ApiTestServer,
+) {
+    with_env_async(
+        &[
+            ("MEMORIA_GLOBAL_USER_POOL_MAX", Some("2")),
+            ("MEMORIA_USER_SCHEMA_INIT_POOL_MAX_CONNECTIONS", Some("1")),
+        ],
+        || async {
+            let server = support::multi_db::spawn_api_server(
+                "pool_isolation",
+                1024,
+                String::new(),
+                None,
+                None,
+                None,
+                false,
+            )
+            .await;
+            let pool = server.router().global_user_pool().clone();
+            (server.base.clone(), server.client.clone(), pool, server)
+        },
+    )
+    .await
 }
 
 #[tokio::test]
 async fn test_api_survives_main_pool_saturation() {
-    let (base, client, pool) = spawn_tiny_pool_server().await;
+    let (base, client, pool, _server) = spawn_tiny_pool_server().await;
     let user = uid();
 
     // 1. First, store a memory while pool is healthy — should succeed
@@ -94,12 +111,13 @@ async fn test_api_survives_main_pool_saturation() {
         res.status()
     );
 
-    // 2. Saturate the main pool: hold all 2 connections with SLEEP queries
+    // 2. Saturate the routed user pool: hold all 2 connections long enough to exceed
+    // the pool's 15s acquire timeout.
     let mut blockers = Vec::new();
     for _ in 0..2 {
         let p = pool.clone();
         blockers.push(tokio::spawn(async move {
-            let _ = sqlx::query("SELECT SLEEP(4)").execute(&p).await;
+            let _ = sqlx::query("SELECT SLEEP(20)").execute(&p).await;
         }));
     }
     // Give blockers time to acquire connections
