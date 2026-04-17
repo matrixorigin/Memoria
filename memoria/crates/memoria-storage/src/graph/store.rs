@@ -24,7 +24,7 @@ const NODE_COLS_WITH_EMB: &str =
 
 pub struct GraphStore {
     pool: MySqlPool,
-    /// When Some, `conn()` executes `USE <db_name>` before returning.
+    /// When Some, table names are qualified with this database name.
     db_name: Option<String>,
     embedding_dim: usize,
     /// Cache: user_id → node count (TTL 2 min)
