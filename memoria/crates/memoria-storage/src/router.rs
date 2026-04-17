@@ -53,10 +53,10 @@ pub struct UserDatabaseRecord {
 pub struct DbRouter {
     shared_pool: MySqlPool,
     shared_pool_max_connections: u32,
-    /// Global pool for all per-user DB queries. Connections are switched to
-    /// the correct database via `USE` (conn() pattern) or fully-qualified
-    /// table names (qualified_table() pattern). `statement_cache_capacity=0`
-    /// prevents cross-database prepared-statement pollution.
+    /// Global pool for all per-user DB queries. Routed stores target the
+    /// correct database via fully-qualified table names, and
+    /// `statement_cache_capacity=0` prevents cross-database prepared-statement
+    /// pollution.
     global_user_pool: MySqlPool,
     global_user_pool_max_connections: u32,
     user_init_pool: MySqlPool,
