@@ -434,54 +434,76 @@ async fn connect_git_pool(database_url: &str, multi_db: bool) -> Result<sqlx::My
 }
 
 #[cfg(feature = "server-runtime")]
-async fn bootstrap_runtime_topology(cfg: &mut memoria_service::Config) -> Result<()> {
-    use memoria_storage::{
-        detect_runtime_topology, execute_legacy_single_db_to_multi_db,
-        LegacyToMultiDbMigrationOptions, RuntimeTopology,
-    };
+fn apply_detected_runtime_topology(
+    cfg: &mut memoria_service::Config,
+    topology: memoria_storage::RuntimeTopology,
+) -> Option<memoria_storage::PendingLegacyMultiDbMigration> {
+    use memoria_storage::RuntimeTopology;
 
-    if cfg.multi_db {
-        return Ok(());
-    }
-
-    match detect_runtime_topology(&cfg.db_url, &cfg.shared_db_url).await? {
-        RuntimeTopology::FreshSingleDb => Ok(()),
+    match topology {
+        RuntimeTopology::FreshSingleDb => {
+            tracing::info!(
+                shared_db_url = %redact_url(&cfg.shared_db_url),
+                "Detected fresh deployment; continuing startup in multi-db mode"
+            );
+            enable_runtime_multi_db(cfg);
+            None
+        }
         RuntimeTopology::MultiDbReady => {
             tracing::info!(
                 shared_db_url = %redact_url(&cfg.shared_db_url),
                 "Detected completed shared registry behind legacy config; continuing in multi-db mode"
             );
             enable_runtime_multi_db(cfg);
-            Ok(())
+            None
         }
-        RuntimeTopology::PendingLegacyMigration(pending) => {
-            let migration_concurrency = configured_legacy_migration_concurrency();
-            tracing::info!(
-                legacy_db_name = %pending.legacy_db_name,
-                shared_db_name = %pending.shared_db_name,
-                users = pending.legacy_users.len(),
-                missing_users = pending.missing_users.len(),
-                migration_concurrency,
-                "Auto-migrating legacy single-db deployment before startup"
-            );
-            execute_legacy_single_db_to_multi_db(
-                &cfg.db_url,
-                &cfg.shared_db_url,
-                cfg.embedding_dim,
-                LegacyToMultiDbMigrationOptions {
-                    user_ids: Vec::new(),
-                    concurrency: migration_concurrency,
-                },
-            )
-            .await?;
-            enable_runtime_multi_db(cfg);
-            tracing::info!(
-                shared_db_url = %redact_url(&cfg.shared_db_url),
-                "Legacy migration completed; continuing startup in multi-db mode"
-            );
-            Ok(())
-        }
+        RuntimeTopology::PendingLegacyMigration(pending) => Some(pending),
     }
+}
+
+#[cfg(feature = "server-runtime")]
+async fn bootstrap_runtime_topology(cfg: &mut memoria_service::Config) -> Result<()> {
+    use memoria_storage::{
+        detect_runtime_topology, execute_legacy_single_db_to_multi_db,
+        LegacyToMultiDbMigrationOptions,
+    };
+
+    if cfg.multi_db {
+        return Ok(());
+    }
+
+    let Some(pending) = apply_detected_runtime_topology(
+        cfg,
+        detect_runtime_topology(&cfg.db_url, &cfg.shared_db_url).await?,
+    ) else {
+        return Ok(());
+    };
+
+    let migration_concurrency = configured_legacy_migration_concurrency();
+    tracing::info!(
+        legacy_db_name = %pending.legacy_db_name,
+        shared_db_name = %pending.shared_db_name,
+        users = pending.legacy_users.len(),
+        missing_users = pending.missing_users.len(),
+        migration_concurrency,
+        "Auto-migrating legacy single-db deployment before startup"
+    );
+    execute_legacy_single_db_to_multi_db(
+        &cfg.db_url,
+        &cfg.shared_db_url,
+        cfg.embedding_dim,
+        LegacyToMultiDbMigrationOptions {
+            user_ids: Vec::new(),
+            concurrency: migration_concurrency,
+        },
+    )
+    .await?;
+    enable_runtime_multi_db(cfg);
+    tracing::info!(
+        shared_db_url = %redact_url(&cfg.shared_db_url),
+        "Legacy migration completed; continuing startup in multi-db mode"
+    );
+    Ok(())
 }
 
 #[cfg(feature = "server-runtime")]
@@ -3458,7 +3480,10 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     #[cfg(feature = "server-runtime")]
-    use super::{configured_legacy_migration_concurrency, LEGACY_MIGRATION_MAX_CONCURRENCY_ENV};
+    use super::{
+        apply_detected_runtime_topology, configured_legacy_migration_concurrency,
+        LEGACY_MIGRATION_MAX_CONCURRENCY_ENV,
+    };
     use super::{
         enable_runtime_multi_db, redact_url, run_with_edit_log_drain, validate_embedding_config,
         Cli, Commands, MigrationCommands,
@@ -3468,6 +3493,8 @@ mod tests {
     use memoria_core::{interfaces::MemoryStore, MemoriaError, Memory};
     use memoria_service::{Config, MemoryService};
     use memoria_storage::OwnedEditLogEntry;
+    #[cfg(feature = "server-runtime")]
+    use memoria_storage::{PendingLegacyMultiDbMigration, RuntimeTopology};
     #[cfg(feature = "server-runtime")]
     use std::sync::OnceLock;
     use std::sync::{Arc, Mutex};
@@ -3755,6 +3782,52 @@ mod tests {
         assert!(cfg.multi_db);
         assert_eq!(cfg.db_name, "memoria_shared");
         assert_eq!(cfg.db_url, "mysql://root:111@localhost:6001/memoria");
+    }
+
+    #[cfg(feature = "server-runtime")]
+    #[test]
+    fn fresh_topology_bootstrap_defaults_to_multi_db() {
+        let mut cfg = test_config();
+
+        let pending = apply_detected_runtime_topology(&mut cfg, RuntimeTopology::FreshSingleDb);
+
+        assert!(pending.is_none());
+        assert!(cfg.multi_db);
+        assert_eq!(cfg.db_name, "memoria_shared");
+        assert_eq!(cfg.db_url, "mysql://root:111@localhost:6001/memoria");
+    }
+
+    #[cfg(feature = "server-runtime")]
+    #[test]
+    fn multi_db_ready_bootstrap_keeps_multi_db_enabled() {
+        let mut cfg = test_config();
+
+        let pending = apply_detected_runtime_topology(&mut cfg, RuntimeTopology::MultiDbReady);
+
+        assert!(pending.is_none());
+        assert!(cfg.multi_db);
+        assert_eq!(cfg.db_name, "memoria_shared");
+    }
+
+    #[cfg(feature = "server-runtime")]
+    #[test]
+    fn pending_migration_bootstrap_waits_for_migration_before_switching() {
+        let mut cfg = test_config();
+        let pending = PendingLegacyMultiDbMigration {
+            legacy_db_name: "memoria".to_string(),
+            shared_db_name: "memoria_shared".to_string(),
+            legacy_users: vec!["alice".to_string(), "bob".to_string()],
+            missing_users: vec!["bob".to_string()],
+        };
+
+        let migration = apply_detected_runtime_topology(
+            &mut cfg,
+            RuntimeTopology::PendingLegacyMigration(pending.clone()),
+        );
+
+        assert_eq!(migration, Some(pending));
+        assert!(!cfg.multi_db);
+        assert_eq!(cfg.db_name, "memoria");
     }
 
     #[test]
