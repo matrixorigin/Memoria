@@ -1113,7 +1113,15 @@ async fn test_api_key_cannot_get_other_users_memory() {
         .send()
         .await
         .unwrap();
-    assert_eq!(r.status(), 403, "non-owner API key must get 403");
+    assert_eq!(
+        r.status(),
+        200,
+        "non-owner API key must see the same response as a missing memory"
+    );
+    assert!(
+        r.json::<Value>().await.unwrap().is_null(),
+        "foreign memory reads must not reveal existence"
+    );
 }
 
 #[tokio::test]
@@ -1148,7 +1156,11 @@ async fn test_api_key_cannot_correct_other_users_memory() {
         .send()
         .await
         .unwrap();
-    assert_eq!(r.status(), 403, "non-owner API key must get 403");
+    assert_eq!(
+        r.status(),
+        404,
+        "non-owner API key must see the same response as a missing memory"
+    );
 }
 
 #[tokio::test]
@@ -1215,7 +1227,11 @@ async fn test_api_key_cannot_delete_other_users_memory() {
         .send()
         .await
         .unwrap();
-    assert_eq!(r.status(), 403, "non-owner API key must get 403 on delete");
+    assert_eq!(
+        r.status(),
+        404,
+        "non-owner API key must see the same response as a missing memory on delete"
+    );
 }
 
 // ── 10b-5. cross-user list isolation ─────────────────────────────────────────
