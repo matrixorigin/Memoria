@@ -31,7 +31,7 @@ fn shared_db_url() -> String {
 async fn spawn_server_multi_db() -> (
     String,
     reqwest::Client,
-    tokio::task::JoinHandle<std::io::Result<()>>,
+    tokio::task::JoinHandle<()>,
 ) {
     use memoria_git::GitForDataService;
     use memoria_service::MemoryService;
@@ -67,7 +67,7 @@ async fn spawn_server_multi_db() -> (
         .await
         .expect("bind");
     let port = listener.local_addr().unwrap().port();
-    let handle = tokio::spawn(async move { axum::serve(listener, app).await });
+    let handle = tokio::spawn(async move { let _ = axum::serve(listener, app).await; });
 
     let client = reqwest::Client::builder()
         .no_proxy()
@@ -83,12 +83,15 @@ async fn spawn_server_multi_db() -> (
 }
 
 async fn wait_for_server(client: &reqwest::Client, base: &str, pool: &MySqlPool) {
+    let mut health_ok = false;
     for _ in 0..20 {
         if client.get(format!("{base}/health")).send().await.is_ok() {
+            health_ok = true;
             break;
         }
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
     }
+    assert!(health_ok, "server /health never became reachable");
     for _ in 0..20 {
         if sqlx::query("SELECT 1").execute(pool).await.is_ok() {
             return;
