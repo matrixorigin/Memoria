@@ -6,10 +6,11 @@
 ///
 /// Run: DATABASE_URL=mysql://root:111@localhost:6001/memoria \
 ///      cargo test -p memoria-mcp --test integration_full -- --test-threads=1 --nocapture
+mod support;
+
 use chrono::Utc;
 use memoria_git::GitForDataService;
 use memoria_service::MemoryService;
-use memoria_storage::SqlMemoryStore;
 use serde_json::{json, Value};
 use sqlx::mysql::MySqlPool;
 use sqlx::Row;
@@ -23,22 +24,15 @@ fn test_dim() -> usize {
         .unwrap_or(1024)
 }
 
-fn db_url() -> String {
-    std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "mysql://root:111@localhost:6001/memoria".to_string())
-}
-
-async fn setup() -> (Arc<MemoryService>, Arc<GitForDataService>, String) {
-    let pool = MySqlPool::connect(&db_url()).await.expect("pool");
-    let db_name = db_url().rsplit('/').next().unwrap_or("memoria").to_string();
-    let store = SqlMemoryStore::connect(&db_url(), test_dim(), uuid::Uuid::new_v4().to_string())
-        .await
-        .expect("store");
-    store.migrate().await.expect("migrate");
-    let git = Arc::new(GitForDataService::new(pool, &db_name));
-    let svc = Arc::new(MemoryService::new_sql_with_llm(Arc::new(store), None, None).await);
+async fn setup() -> (
+    Arc<MemoryService>,
+    Arc<GitForDataService>,
+    String,
+    support::multi_db::McpTestContext,
+) {
+    let ctx = support::multi_db::setup_mcp_context("integration_full", test_dim(), None, None).await;
     let uid = format!("integ_{}", &Uuid::new_v4().simple().to_string()[..8]);
-    (svc, git, uid)
+    (ctx.service(), ctx.git(), uid, ctx)
 }
 
 async fn tc(name: &str, args: Value, svc: &Arc<MemoryService>, uid: &str) -> Value {
@@ -133,8 +127,8 @@ fn extract_mid(store_response: &str) -> String {
 
 #[tokio::test]
 async fn test_full_stack_all_fields() {
-    let (svc, git, uid) = setup().await;
-    let pool = MySqlPool::connect(&db_url()).await.expect("pool");
+    let (svc, git, uid, ctx) = setup().await;
+    let pool = ctx.user_db_pool(&uid).await;
     let before = Utc::now();
 
     // ── Phase 1: Store memories with all variants ─────────────────────────────
@@ -374,7 +368,7 @@ async fn test_full_stack_all_fields() {
     let mid_branch = extract_mid(text(&r));
 
     // Verify branch memory is in branch table, not main
-    let sql_store = svc.sql_store.as_ref().unwrap();
+    let sql_store = ctx.user_store(&uid).await;
     let branches = sql_store.list_branches(&uid).await.unwrap();
     let branch_table = branches
         .iter()

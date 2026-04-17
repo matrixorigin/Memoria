@@ -2311,10 +2311,15 @@ name = "memoria-test-utils"
 version = "0.3.2"
 dependencies = [
  "axum",
+ "memoria-core",
  "memoria-embedding",
+ "memoria-git",
+ "memoria-service",
+ "memoria-storage",
  "serde_json",
  "sqlx",
  "tokio",
+ "uuid",
 ]
 
 [[package]]

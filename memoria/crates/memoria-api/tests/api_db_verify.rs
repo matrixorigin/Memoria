@@ -1,5 +1,7 @@
 /// Comprehensive API tests that verify DB state after every operation.
 /// Each test simulates real user workflows and checks all DB fields.
+mod support;
+
 use serde_json::{json, Value};
 use serial_test::serial;
 use sqlx::{MySqlPool, Row};
@@ -18,98 +20,58 @@ fn uid() -> String {
     format!("dbv_{}", uuid::Uuid::new_v4().simple())
 }
 
-async fn spawn_server() -> (String, reqwest::Client, MySqlPool) {
-    use memoria_git::GitForDataService;
-    use memoria_service::{Config, MemoryService};
-    use memoria_storage::SqlMemoryStore;
-    use std::sync::Arc;
-
-    let cfg = Config::from_env();
-    let db = db_url();
-    memoria_test_utils::wait_for_mysql_ready(&db, std::time::Duration::from_secs(30)).await;
-    let store = SqlMemoryStore::connect(&db, test_dim(), uuid::Uuid::new_v4().to_string())
-        .await
-        .expect("connect");
-    store.migrate().await.expect("migrate");
-    let pool = MySqlPool::connect(&db).await.expect("pool");
-    let git = Arc::new(GitForDataService::new(pool.clone(), &cfg.db_name));
-    let service = Arc::new(MemoryService::new_sql_with_llm(Arc::new(store), None, None).await);
-    let state = memoria_api::AppState::new(service, git, String::new());
-    let app = memoria_api::build_router(state);
-
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind");
-    let port = listener.local_addr().unwrap().port();
-    tokio::spawn(async move { axum::serve(listener, app).await });
-
-    let client = reqwest::Client::builder().no_proxy().build().unwrap();
-    let base = format!("http://127.0.0.1:{port}");
-    wait_for_server(&client, &base, &pool).await;
-    (base, client, pool)
+async fn spawn_server() -> (String, reqwest::Client, support::multi_db::ApiTestServer) {
+    let server = support::multi_db::spawn_api_server(
+        "api_db_verify",
+        test_dim(),
+        String::new(),
+        None,
+        None,
+        None,
+        false,
+    )
+    .await;
+    (server.base.clone(), server.client.clone(), server)
 }
 
-async fn spawn_server_with_master_key(master_key: &str) -> (String, reqwest::Client, MySqlPool) {
-    use memoria_git::GitForDataService;
-    use memoria_service::{Config, MemoryService};
-    use memoria_storage::SqlMemoryStore;
-    use std::sync::Arc;
-
-    let cfg = Config::from_env();
-    let db = db_url();
-    memoria_test_utils::wait_for_mysql_ready(&db, std::time::Duration::from_secs(30)).await;
-    let store = SqlMemoryStore::connect(&db, test_dim(), uuid::Uuid::new_v4().to_string())
-        .await
-        .expect("connect");
-    store.migrate().await.expect("migrate");
-    let pool = MySqlPool::connect(&db).await.expect("pool");
-    let git = Arc::new(GitForDataService::new(pool.clone(), &cfg.db_name));
-    let service = Arc::new(MemoryService::new_sql_with_llm(Arc::new(store), None, None).await);
-    let state = memoria_api::AppState::new(service, git, master_key.to_string());
-    let app = memoria_api::build_router(state);
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    let client = reqwest::Client::builder().no_proxy().build().unwrap();
-    let base = format!("http://127.0.0.1:{port}");
-    wait_for_server(&client, &base, &pool).await;
-    (base, client, pool)
-}
-
-async fn wait_for_server(client: &reqwest::Client, base: &str, pool: &MySqlPool) {
-    // Wait for axum to accept connections
-    for _ in 0..20 {
-        if client.get(format!("{base}/health")).send().await.is_ok() {
-            break;
-        }
-        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-    }
-    // Verify DB is reachable via the pool
-    for _ in 0..20 {
-        if sqlx::query("SELECT 1").execute(pool).await.is_ok() {
-            return;
-        }
-        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-    }
-    panic!("DB not ready after 1s");
+async fn spawn_server_with_master_key(
+    master_key: &str,
+) -> (String, reqwest::Client, support::multi_db::ApiTestServer) {
+    let server = support::multi_db::spawn_api_server(
+        "api_db_verify",
+        test_dim(),
+        master_key.to_string(),
+        None,
+        None,
+        None,
+        false,
+    )
+    .await;
+    (server.base.clone(), server.client.clone(), server)
 }
 
 /// Query a single memory row from DB by memory_id.
-async fn db_get_memory(pool: &MySqlPool, mid: &str) -> sqlx::mysql::MySqlRow {
+async fn db_get_memory(
+    server: &support::multi_db::ApiTestServer,
+    user_id: &str,
+    mid: &str,
+) -> sqlx::mysql::MySqlRow {
+    let pool = server.user_db_pool(user_id).await;
     sqlx::query("SELECT * FROM mem_memories WHERE memory_id = ?")
         .bind(mid)
-        .fetch_one(pool)
+        .fetch_one(&pool)
         .await
         .expect("db_get_memory")
 }
 
 /// Count active memories for a user.
-async fn db_count_active(pool: &MySqlPool, user_id: &str) -> i64 {
+async fn db_count_active(server: &support::multi_db::ApiTestServer, user_id: &str) -> i64 {
+    let pool = server.user_db_pool(user_id).await;
     sqlx::query_scalar::<_, i64>(
         "SELECT COUNT(*) FROM mem_memories WHERE user_id = ? AND is_active > 0",
     )
     .bind(user_id)
-    .fetch_one(pool)
+    .fetch_one(&pool)
     .await
     .unwrap()
 }
@@ -130,7 +92,7 @@ fn db_opt(row: &sqlx::mysql::MySqlRow, col: &str) -> Option<String> {
 #[tokio::test]
 #[serial]
 async fn test_store_verify_all_db_fields() {
-    let (base, client, pool) = spawn_server().await;
+    let (base, client, server) = spawn_server().await;
     let uid = uid();
 
     // Store with all optional fields
@@ -162,7 +124,7 @@ async fn test_store_verify_all_db_fields() {
     assert!(body["observed_at"].as_str().is_some());
 
     // Verify DB row — every column
-    let row = db_get_memory(&pool, mid).await;
+    let row = db_get_memory(&server, &uid, mid).await;
     assert_eq!(row.get::<String, _>("memory_id"), mid);
     assert_eq!(row.get::<String, _>("user_id"), uid);
     assert_eq!(row.get::<String, _>("memory_type"), "profile");
@@ -199,7 +161,7 @@ async fn test_store_verify_all_db_fields() {
 #[tokio::test]
 #[serial]
 async fn test_store_defaults() {
-    let (base, client, pool) = spawn_server().await;
+    let (base, client, server) = spawn_server().await;
     let uid = uid();
 
     // Store with minimal fields — check defaults
@@ -221,7 +183,7 @@ async fn test_store_defaults() {
     assert!(body["session_id"].is_null());
 
     // DB defaults
-    let row = db_get_memory(&pool, mid).await;
+    let row = db_get_memory(&server, &uid, mid).await;
     assert_eq!(row.get::<String, _>("memory_type"), "semantic");
     assert_eq!(
         row.get::<Option<String>, _>("trust_tier").as_deref(),
@@ -246,7 +208,7 @@ async fn test_store_defaults() {
 #[tokio::test]
 #[serial]
 async fn test_correct_by_id_verify_db() {
-    let (base, client, pool) = spawn_server().await;
+    let (base, client, server) = spawn_server().await;
     let uid = uid();
 
     // Store original
@@ -278,7 +240,7 @@ async fn test_correct_by_id_verify_db() {
     assert_eq!(body["memory_type"], "profile");
 
     // Verify OLD row in DB: deactivated, superseded_by points to new
-    let old_row = db_get_memory(&pool, &old_mid).await;
+    let old_row = db_get_memory(&server, &uid, &old_mid).await;
     assert_eq!(
         old_row.get::<i8, _>("is_active"),
         0,
@@ -296,7 +258,7 @@ async fn test_correct_by_id_verify_db() {
     );
 
     // Verify NEW row in DB: active, correct content, same type
-    let new_row = db_get_memory(&pool, new_mid).await;
+    let new_row = db_get_memory(&server, &uid, new_mid).await;
     assert_eq!(new_row.get::<i8, _>("is_active"), 1);
     assert_eq!(
         new_row.get::<String, _>("content"),
@@ -307,7 +269,7 @@ async fn test_correct_by_id_verify_db() {
     assert_eq!(db_opt(&new_row, "superseded_by"), None);
 
     // Active count should be 1 (old deactivated, new active)
-    assert_eq!(db_count_active(&pool, &uid).await, 1);
+    assert_eq!(db_count_active(&server, &uid).await, 1);
 
     println!("✅ correct: old deactivated, superseded_by={new_mid}, new row active");
 }
@@ -315,8 +277,9 @@ async fn test_correct_by_id_verify_db() {
 #[tokio::test]
 #[serial]
 async fn test_correct_by_query_verify_db() {
-    let (base, client, pool) = spawn_server().await;
+    let (base, client, server) = spawn_server().await;
     let uid = uid();
+    let pool = server.user_db_pool(&uid).await;
 
     client
         .post(format!("{base}/v1/memories"))
@@ -343,7 +306,7 @@ async fn test_correct_by_query_verify_db() {
     assert_eq!(body["content"], "Project uses MatrixOne database");
 
     // DB: only 1 active memory, content is the corrected one
-    assert_eq!(db_count_active(&pool, &uid).await, 1);
+    assert_eq!(db_count_active(&server, &uid).await, 1);
     let rows = sqlx::query("SELECT content FROM mem_memories WHERE user_id = ? AND is_active > 0")
         .bind(&uid)
         .fetch_all(&pool)
@@ -364,7 +327,7 @@ async fn test_correct_by_query_verify_db() {
 #[tokio::test]
 #[serial]
 async fn test_delete_single_verify_db() {
-    let (base, client, pool) = spawn_server().await;
+    let (base, client, server) = spawn_server().await;
     let uid = uid();
 
     let r = client
@@ -381,7 +344,7 @@ async fn test_delete_single_verify_db() {
 
     // Before delete: active
     assert_eq!(
-        db_get_memory(&pool, &mid).await.get::<i8, _>("is_active"),
+        db_get_memory(&server, &uid, &mid).await.get::<i8, _>("is_active"),
         1
     );
 
@@ -395,14 +358,14 @@ async fn test_delete_single_verify_db() {
     assert_eq!(r.status(), 204);
 
     // After delete: soft-deleted (is_active=0), row still exists
-    let row = db_get_memory(&pool, &mid).await;
+    let row = db_get_memory(&server, &uid, &mid).await;
     assert_eq!(row.get::<i8, _>("is_active"), 0, "should be soft-deleted");
     assert_eq!(
         row.get::<String, _>("content"),
         "to be deleted",
         "content preserved"
     );
-    assert_eq!(db_count_active(&pool, &uid).await, 0);
+    assert_eq!(db_count_active(&server, &uid).await, 0);
 
     println!("✅ delete: is_active=0, row preserved");
 }
@@ -410,7 +373,7 @@ async fn test_delete_single_verify_db() {
 #[tokio::test]
 #[serial]
 async fn test_purge_bulk_verify_db() {
-    let (base, client, pool) = spawn_server().await;
+    let (base, client, server) = spawn_server().await;
     let uid = uid();
 
     let mut ids = Vec::new();
@@ -429,7 +392,7 @@ async fn test_purge_bulk_verify_db() {
                 .to_string(),
         );
     }
-    assert_eq!(db_count_active(&pool, &uid).await, 4);
+    assert_eq!(db_count_active(&server, &uid).await, 4);
 
     // Purge first 3
     let r = client
@@ -445,15 +408,18 @@ async fn test_purge_bulk_verify_db() {
 
     // DB: 3 deactivated, 1 still active
     for mid in &ids[..3] {
-        assert_eq!(db_get_memory(&pool, mid).await.get::<i8, _>("is_active"), 0);
+        assert_eq!(
+            db_get_memory(&server, &uid, mid).await.get::<i8, _>("is_active"),
+            0
+        );
     }
     assert_eq!(
-        db_get_memory(&pool, &ids[3])
+        db_get_memory(&server, &uid, &ids[3])
             .await
             .get::<i8, _>("is_active"),
         1
     );
-    assert_eq!(db_count_active(&pool, &uid).await, 1);
+    assert_eq!(db_count_active(&server, &uid).await, 1);
 
     println!("✅ purge bulk: 3 deactivated, 1 remains active");
 }
@@ -461,8 +427,9 @@ async fn test_purge_bulk_verify_db() {
 #[tokio::test]
 #[serial]
 async fn test_purge_by_topic_verify_db() {
-    let (base, client, pool) = spawn_server().await;
+    let (base, client, server) = spawn_server().await;
     let uid = uid();
+    let pool = server.user_db_pool(&uid).await;
 
     // Store memories with a common keyword
     for content in ["topic_xyz alpha", "topic_xyz beta", "unrelated gamma"] {
@@ -474,7 +441,7 @@ async fn test_purge_by_topic_verify_db() {
             .await
             .unwrap();
     }
-    assert_eq!(db_count_active(&pool, &uid).await, 3);
+    assert_eq!(db_count_active(&server, &uid).await, 3);
 
     // Purge by topic
     let r = client
@@ -489,7 +456,7 @@ async fn test_purge_by_topic_verify_db() {
     assert_eq!(body["purged"], 2);
 
     // DB: 2 deactivated, "unrelated gamma" still active
-    assert_eq!(db_count_active(&pool, &uid).await, 1);
+    assert_eq!(db_count_active(&server, &uid).await, 1);
     let rows = sqlx::query("SELECT content FROM mem_memories WHERE user_id = ? AND is_active > 0")
         .bind(&uid)
         .fetch_all(&pool)
@@ -503,7 +470,7 @@ async fn test_purge_by_topic_verify_db() {
 #[tokio::test]
 #[serial]
 async fn test_purge_by_topic_special_chars_verify_db() {
-    let (base, client, pool) = spawn_server().await;
+    let (base, client, server) = spawn_server().await;
     let uid = uid();
 
     // Content with special chars that fulltext can't match — triggers LIKE fallback
@@ -520,7 +487,7 @@ async fn test_purge_by_topic_special_chars_verify_db() {
             .await
             .unwrap();
     }
-    assert_eq!(db_count_active(&pool, &uid).await, 3);
+    assert_eq!(db_count_active(&server, &uid).await, 3);
 
     // Purge with special char topic — sanitize strips [#, fulltext may miss,
     // LIKE fallback should find them
@@ -535,14 +502,14 @@ async fn test_purge_by_topic_special_chars_verify_db() {
     let body: Value = r.json().await.unwrap();
     assert_eq!(body["purged"], 1, "should purge the [#100] memory");
 
-    assert_eq!(db_count_active(&pool, &uid).await, 2);
+    assert_eq!(db_count_active(&server, &uid).await, 2);
     println!("✅ purge by topic with special chars: LIKE fallback works");
 }
 
 #[tokio::test]
 #[serial]
 async fn test_purge_by_topic_batch_perf_verify_db() {
-    let (base, client, pool) = spawn_server().await;
+    let (base, client, server) = spawn_server().await;
     let uid = uid();
 
     // Store 10 memories with same topic — verifies batch soft_delete
@@ -555,7 +522,7 @@ async fn test_purge_by_topic_batch_perf_verify_db() {
             .await
             .unwrap();
     }
-    assert_eq!(db_count_active(&pool, &uid).await, 10);
+    assert_eq!(db_count_active(&server, &uid).await, 10);
 
     let r = client
         .post(format!("{base}/v1/memories/purge"))
@@ -568,15 +535,16 @@ async fn test_purge_by_topic_batch_perf_verify_db() {
     let body: Value = r.json().await.unwrap();
     assert_eq!(body["purged"], 10, "should batch-purge all 10");
 
-    assert_eq!(db_count_active(&pool, &uid).await, 0);
+    assert_eq!(db_count_active(&server, &uid).await, 0);
     println!("✅ purge by topic batch: 10 memories purged in one call");
 }
 
 #[tokio::test]
 #[serial]
 async fn test_purge_by_session_id_with_memory_types_verify_db() {
-    let (base, client, pool) = spawn_server().await;
+    let (base, client, server) = spawn_server().await;
     let uid = uid();
+    let pool = server.user_db_pool(&uid).await;
     let target_session = format!("session:test-smp-{}", uuid::Uuid::new_v4().simple());
     let other_session = format!("session:test-smp-{}", uuid::Uuid::new_v4().simple());
 
@@ -598,7 +566,7 @@ async fn test_purge_by_session_id_with_memory_types_verify_db() {
             .await
             .unwrap();
     }
-    assert_eq!(db_count_active(&pool, &uid).await, 4);
+    assert_eq!(db_count_active(&server, &uid).await, 4);
 
     let r = client
         .post(format!("{base}/v1/memories/purge"))
@@ -653,7 +621,7 @@ async fn test_purge_by_session_id_with_memory_types_verify_db() {
 #[tokio::test]
 #[serial]
 async fn test_batch_store_verify_db() {
-    let (base, client, pool) = spawn_server().await;
+    let (base, client, server) = spawn_server().await;
     let uid = uid();
 
     let r = client.post(format!("{base}/v1/memories/batch"))
@@ -670,18 +638,18 @@ async fn test_batch_store_verify_db() {
 
     // Verify each row in DB
     let mid_a = body[0]["memory_id"].as_str().unwrap();
-    let row_a = db_get_memory(&pool, mid_a).await;
+    let row_a = db_get_memory(&server, &uid, mid_a).await;
     assert_eq!(row_a.get::<String, _>("content"), "batch A");
     assert_eq!(row_a.get::<String, _>("memory_type"), "semantic");
     // store_batch may or may not pass session_id through — check what DB has
     assert_eq!(row_a.get::<i8, _>("is_active"), 1);
 
     let mid_b = body[1]["memory_id"].as_str().unwrap();
-    let row_b = db_get_memory(&pool, mid_b).await;
+    let row_b = db_get_memory(&server, &uid, mid_b).await;
     assert_eq!(row_b.get::<String, _>("memory_type"), "profile");
 
     let mid_c = body[2]["memory_id"].as_str().unwrap();
-    let row_c = db_get_memory(&pool, mid_c).await;
+    let row_c = db_get_memory(&server, &uid, mid_c).await;
     assert_eq!(row_c.get::<String, _>("memory_type"), "procedural");
     assert_eq!(
         row_c.get::<Option<String>, _>("trust_tier").as_deref(),
@@ -694,7 +662,7 @@ async fn test_batch_store_verify_db() {
         "confidence should be in (0,1], got {conf}"
     );
 
-    assert_eq!(db_count_active(&pool, &uid).await, 3);
+    assert_eq!(db_count_active(&server, &uid).await, 3);
 
     println!("✅ batch store: 3 rows verified in DB with correct types/tiers/sessions");
 }
@@ -706,7 +674,7 @@ async fn test_batch_store_verify_db() {
 #[tokio::test]
 #[serial]
 async fn test_list_matches_db() {
-    let (base, client, pool) = spawn_server().await;
+    let (base, client, server) = spawn_server().await;
     let uid = uid();
 
     // Store 3, delete 1
@@ -756,7 +724,7 @@ async fn test_list_matches_db() {
     assert!(listed_ids.contains(&ids[2].as_str()));
 
     // Cross-check with DB
-    assert_eq!(db_count_active(&pool, &uid).await, 2);
+    assert_eq!(db_count_active(&server, &uid).await, 2);
 
     println!("✅ list: returns only active memories, matches DB count");
 }
@@ -764,7 +732,7 @@ async fn test_list_matches_db() {
 #[tokio::test]
 #[serial]
 async fn test_get_single_memory_all_fields() {
-    let (base, client, pool) = spawn_server().await;
+    let (base, client, server) = spawn_server().await;
     let uid = uid();
 
     let r = client
@@ -796,7 +764,7 @@ async fn test_get_single_memory_all_fields() {
     let body: Value = r.json().await.unwrap();
 
     // Verify every response field matches DB
-    let row = db_get_memory(&pool, &mid).await;
+    let row = db_get_memory(&server, &uid, &mid).await;
     assert_eq!(body["memory_id"], mid);
     assert_eq!(body["user_id"], uid);
     assert_eq!(body["content"], row.get::<String, _>("content"));
@@ -818,7 +786,7 @@ async fn test_get_single_memory_all_fields() {
 #[tokio::test]
 #[serial]
 async fn test_search_returns_correct_fields() {
-    let (base, client, pool) = spawn_server().await;
+    let (base, client, server) = spawn_server().await;
     let uid = uid();
 
     client
@@ -843,7 +811,7 @@ async fn test_search_returns_correct_fields() {
 
     // Verify against DB
     let mid = m["memory_id"].as_str().unwrap();
-    let row = db_get_memory(&pool, mid).await;
+    let row = db_get_memory(&server, &uid, mid).await;
     assert_eq!(m["content"], row.get::<String, _>("content"));
     assert_eq!(m["memory_type"], row.get::<String, _>("memory_type"));
     assert_eq!(m["user_id"], row.get::<String, _>("user_id"));
@@ -859,9 +827,10 @@ async fn test_search_returns_correct_fields() {
 #[serial]
 async fn test_api_key_lifecycle_verify_db() {
     let mk = "test-mk-db-verify";
-    let (base, client, pool) = spawn_server_with_master_key(mk).await;
+    let (base, client, server) = spawn_server_with_master_key(mk).await;
     let auth = format!("Bearer {mk}");
     let uid = uid();
+    let pool = server.shared_pool();
 
     // 1. Create key
     let r = client
@@ -964,7 +933,7 @@ async fn test_api_key_lifecycle_verify_db() {
 #[tokio::test]
 #[serial]
 async fn test_admin_stats_match_db() {
-    let (base, client, pool) = spawn_server().await;
+    let (base, client, server) = spawn_server().await;
     let uid = uid();
 
     // Store 3 memories
@@ -1006,7 +975,7 @@ async fn test_admin_stats_match_db() {
     assert_eq!(body["memory_count"].as_i64().unwrap(), 3);
 
     // Cross-check with DB
-    assert_eq!(db_count_active(&pool, &uid).await, 3);
+    assert_eq!(db_count_active(&server, &uid).await, 3);
 
     println!("✅ admin stats: user has 3 memories, totals consistent");
 }
@@ -1014,8 +983,9 @@ async fn test_admin_stats_match_db() {
 #[tokio::test]
 #[serial]
 async fn test_admin_delete_user_verify_db() {
-    let (base, client, pool) = spawn_server().await;
+    let (base, client, server) = spawn_server().await;
     let uid = uid();
+    let pool = server.user_db_pool(&uid).await;
 
     // Store memories
     for i in 0..3 {
@@ -1027,7 +997,7 @@ async fn test_admin_delete_user_verify_db() {
             .await
             .unwrap();
     }
-    assert_eq!(db_count_active(&pool, &uid).await, 3);
+    assert_eq!(db_count_active(&server, &uid).await, 3);
 
     // DELETE /admin/users/:id
     let r = client
@@ -1038,7 +1008,7 @@ async fn test_admin_delete_user_verify_db() {
     assert_eq!(r.status(), 200);
 
     // DB: all memories deactivated
-    assert_eq!(db_count_active(&pool, &uid).await, 0);
+    assert_eq!(db_count_active(&server, &uid).await, 0);
 
     // DB: rows still exist (soft delete)
     let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM mem_memories WHERE user_id = ?")
@@ -1064,9 +1034,10 @@ async fn test_admin_delete_user_verify_db() {
 #[serial]
 async fn test_admin_list_revoke_user_keys_verify_db() {
     let mk = "test-mk-admin-keys-db";
-    let (base, client, pool) = spawn_server_with_master_key(mk).await;
+    let (base, client, server) = spawn_server_with_master_key(mk).await;
     let auth = format!("Bearer {mk}");
     let uid = uid();
+    let pool = server.shared_pool();
 
     // Create 2 keys
     for i in 0..2 {
@@ -1128,8 +1099,9 @@ async fn test_admin_list_revoke_user_keys_verify_db() {
 #[tokio::test]
 #[serial]
 async fn test_governance_quarantine_verify_db() {
-    let (base, client, pool) = spawn_server().await;
+    let (base, client, server) = spawn_server().await;
     let uid = uid();
+    let pool = server.user_db_pool(&uid).await;
 
     // Store a low-confidence memory (should be quarantined)
     let r = client
@@ -1184,7 +1156,7 @@ async fn test_governance_quarantine_verify_db() {
 
     // Normal memory should still be active
     assert!(
-        db_count_active(&pool, &uid).await >= 1,
+        db_count_active(&server, &uid).await >= 1,
         "normal memory should survive"
     );
 }
@@ -1192,8 +1164,9 @@ async fn test_governance_quarantine_verify_db() {
 #[tokio::test]
 #[serial]
 async fn test_governance_cooldown_verify_db() {
-    let (base, client, pool) = spawn_server().await;
+    let (base, client, server) = spawn_server().await;
     let uid = uid();
+    let pool = server.user_db_pool(&uid).await;
 
     client
         .post(format!("{base}/v1/memories"))
@@ -1246,8 +1219,9 @@ async fn test_governance_cooldown_verify_db() {
 #[tokio::test]
 #[serial]
 async fn test_governance_orphan_graph_cleanup_verify_db() {
-    let (base, client, pool) = spawn_server().await;
+    let (base, client, server) = spawn_server().await;
     let uid = uid();
+    let pool = server.user_db_pool(&uid).await;
 
     // 1. Store a memory so we have a valid memory_id
     let r = client
@@ -1382,9 +1356,11 @@ async fn test_governance_orphan_graph_cleanup_verify_db() {
 #[serial]
 async fn test_admin_governance_orphan_graph_cleanup_verify_db() {
     let mk = "test-master-key-orphan-admin";
-    let (base, client, pool) = spawn_server_with_master_key(mk).await;
+    let (base, client, server) = spawn_server_with_master_key(mk).await;
     let uid = uid();
     let auth = format!("Bearer {mk}");
+    let _sql = server.user_store(&uid).await;
+    let pool = server.user_db_pool(&uid).await;
 
     // 1. Insert fake inactive memory + orphan rows
     let fake_mid = format!("{:032x}", uuid::Uuid::new_v4().as_u128());
@@ -1503,8 +1479,9 @@ async fn test_admin_governance_orphan_graph_cleanup_verify_db() {
 #[tokio::test]
 #[serial]
 async fn test_observe_verify_db() {
-    let (base, client, pool) = spawn_server().await;
+    let (base, client, server) = spawn_server().await;
     let uid = uid();
+    let pool = server.user_db_pool(&uid).await;
 
     let r = client
         .post(format!("{base}/v1/observe"))
@@ -1552,7 +1529,7 @@ async fn test_observe_verify_db() {
 #[tokio::test]
 #[serial]
 async fn test_history_chain_verify_db() {
-    let (base, client, pool) = spawn_server().await;
+    let (base, client, server) = spawn_server().await;
     let uid = uid();
 
     // Store v1
@@ -1595,27 +1572,27 @@ async fn test_history_chain_verify_db() {
         .to_string();
 
     // DB: verify superseded_by chain v1→v2→v3
-    let row_v1 = db_get_memory(&pool, &mid_v1).await;
+    let row_v1 = db_get_memory(&server, &uid, &mid_v1).await;
     assert_eq!(row_v1.get::<i8, _>("is_active"), 0);
     assert_eq!(
         db_opt(&row_v1, "superseded_by").as_deref(),
         Some(mid_v2.as_str())
     );
 
-    let row_v2 = db_get_memory(&pool, &mid_v2).await;
+    let row_v2 = db_get_memory(&server, &uid, &mid_v2).await;
     assert_eq!(row_v2.get::<i8, _>("is_active"), 0);
     assert_eq!(
         db_opt(&row_v2, "superseded_by").as_deref(),
         Some(mid_v3.as_str())
     );
 
-    let row_v3 = db_get_memory(&pool, &mid_v3).await;
+    let row_v3 = db_get_memory(&server, &uid, &mid_v3).await;
     assert_eq!(row_v3.get::<i8, _>("is_active"), 1);
     assert_eq!(db_opt(&row_v3, "superseded_by"), None);
     assert_eq!(row_v3.get::<String, _>("content"), "version 3");
 
     // Only 1 active
-    assert_eq!(db_count_active(&pool, &uid).await, 1);
+    assert_eq!(db_count_active(&server, &uid).await, 1);
 
     // GET history for v1 — should show the chain
     let r = client
@@ -1638,8 +1615,9 @@ async fn test_history_chain_verify_db() {
 #[tokio::test]
 #[serial]
 async fn test_branch_lifecycle_verify_db() {
-    let (base, client, pool) = spawn_server().await;
+    let (base, client, server) = spawn_server().await;
     let uid = uid();
+    let pool = server.user_db_pool(&uid).await;
 
     // Store on main
     client
@@ -1756,8 +1734,9 @@ async fn test_branch_lifecycle_verify_db() {
 #[tokio::test]
 #[serial]
 async fn test_pipeline_sensitivity_verify_db() {
-    let (base, client, pool) = spawn_server().await;
+    let (base, client, server) = spawn_server().await;
     let uid = uid();
+    let pool = server.user_db_pool(&uid).await;
 
     let r = client
         .post(format!("{base}/v1/pipeline/run"))
@@ -1778,7 +1757,7 @@ async fn test_pipeline_sensitivity_verify_db() {
     assert_eq!(body["memories_rejected"].as_i64().unwrap(), 1);
 
     // DB: only 2 safe memories stored
-    assert_eq!(db_count_active(&pool, &uid).await, 2);
+    assert_eq!(db_count_active(&server, &uid).await, 2);
 
     // DB: no memory contains the sensitive content
     let contents: Vec<String> =
@@ -1808,8 +1787,9 @@ async fn test_pipeline_sensitivity_verify_db() {
 #[tokio::test]
 #[serial]
 async fn test_entity_link_verify_db() {
-    let (base, client, pool) = spawn_server().await;
+    let (base, client, server) = spawn_server().await;
     let uid = uid();
+    let pool = server.user_db_pool(&uid).await;
 
     // Store a memory
     let r = client
@@ -1902,9 +1882,10 @@ async fn test_entity_link_verify_db() {
 #[serial]
 async fn test_auth_master_key_verify_db() {
     let mk = "test-mk-auth-flow";
-    let (base, client, pool) = spawn_server_with_master_key(mk).await;
+    let (base, client, server) = spawn_server_with_master_key(mk).await;
     let auth = format!("Bearer {mk}");
     let uid = uid();
+    let pool = server.shared_pool();
 
     // Master key → can store
     let r = client
@@ -1922,7 +1903,7 @@ async fn test_auth_master_key_verify_db() {
         .to_string();
 
     // DB: memory stored under correct user
-    let row = db_get_memory(&pool, &mid).await;
+    let row = db_get_memory(&server, &uid, &mid).await;
     assert_eq!(row.get::<String, _>("user_id"), uid);
 
     // Wrong key → 401
@@ -1976,8 +1957,9 @@ async fn test_auth_master_key_verify_db() {
 #[tokio::test]
 #[serial]
 async fn test_full_user_workflow() {
-    let (base, client, pool) = spawn_server().await;
+    let (base, client, server) = spawn_server().await;
     let uid = uid();
+    let pool = server.user_db_pool(&uid).await;
 
     // ── Session 1: User sets up preferences ──
     let r = client.post(format!("{base}/v1/memories"))
@@ -2000,7 +1982,7 @@ async fn test_full_user_workflow() {
         .json(&json!({"content": "Deploy with: make deploy", "memory_type": "procedural", "session_id": "s1"}))
         .send().await.unwrap();
 
-    assert_eq!(db_count_active(&pool, &uid).await, 3);
+    assert_eq!(db_count_active(&server, &uid).await, 3);
 
     // ── Session 2: User retrieves and corrects ──
     // Retrieve
@@ -2026,22 +2008,22 @@ async fn test_full_user_workflow() {
 
     // DB: old deactivated, new active, chain correct
     assert_eq!(
-        db_get_memory(&pool, &pref_mid)
+        db_get_memory(&server, &uid, &pref_mid)
             .await
             .get::<i8, _>("is_active"),
         0
     );
     assert_eq!(
-        db_opt(&db_get_memory(&pool, &pref_mid).await, "superseded_by").as_deref(),
+        db_opt(&db_get_memory(&server, &uid, &pref_mid).await, "superseded_by").as_deref(),
         Some(new_pref_mid.as_str())
     );
     assert_eq!(
-        db_get_memory(&pool, &new_pref_mid)
+        db_get_memory(&server, &uid, &new_pref_mid)
             .await
             .get::<i8, _>("is_active"),
         1
     );
-    assert_eq!(db_count_active(&pool, &uid).await, 3); // 3 active (1 replaced)
+    assert_eq!(db_count_active(&server, &uid).await, 3); // 3 active (1 replaced)
 
     // ── Session 3: Snapshot before risky change ──
     let snap = format!(
@@ -2065,11 +2047,11 @@ async fn test_full_user_workflow() {
         .as_str()
         .unwrap()
         .to_string();
-    assert_eq!(db_count_active(&pool, &uid).await, 4);
+    assert_eq!(db_count_active(&server, &uid).await, 4);
 
     // DB: working memory has correct type
     assert_eq!(
-        db_get_memory(&pool, &working_mid)
+        db_get_memory(&server, &uid, &working_mid)
             .await
             .get::<String, _>("memory_type"),
         "working"
@@ -2146,14 +2128,14 @@ async fn test_full_user_workflow() {
 
     // DB: working memory deactivated
     assert_eq!(
-        db_get_memory(&pool, &working_mid)
+        db_get_memory(&server, &uid, &working_mid)
             .await
             .get::<i8, _>("is_active"),
         0
     );
 
     // ── Final state check ──
-    let active = db_count_active(&pool, &uid).await;
+    let active = db_count_active(&server, &uid).await;
     assert!(
         active >= 4,
         "should have at least 4 active memories, got {active}"
@@ -2288,8 +2270,9 @@ async fn graph_node_active(pool: &MySqlPool, mid: &str) -> bool {
 #[tokio::test]
 #[serial]
 async fn test_delete_cleans_graph_and_entity_links() {
-    let (base, client, pool) = spawn_server().await;
+    let (base, client, server) = spawn_server().await;
     let uid = uid();
+    let pool = server.user_db_pool(&uid).await;
     let mid = store_with_entity_links(&base, &client, &pool, &uid, "REST delete graph test").await;
 
     // Verify graph node + entity links exist
@@ -2334,8 +2317,9 @@ async fn test_delete_cleans_graph_and_entity_links() {
 #[tokio::test]
 #[serial]
 async fn test_purge_bulk_cleans_graph_and_entity_links() {
-    let (base, client, pool) = spawn_server().await;
+    let (base, client, server) = spawn_server().await;
     let uid = uid();
+    let pool = server.user_db_pool(&uid).await;
     let mid1 =
         store_with_entity_links(&base, &client, &pool, &uid, "REST bulk purge graph A").await;
     let mid2 =
@@ -2377,8 +2361,9 @@ async fn test_purge_bulk_cleans_graph_and_entity_links() {
 #[tokio::test]
 #[serial]
 async fn test_purge_topic_cleans_graph_and_entity_links() {
-    let (base, client, pool) = spawn_server().await;
+    let (base, client, server) = spawn_server().await;
     let uid = uid();
+    let pool = server.user_db_pool(&uid).await;
     let mid = store_with_entity_links(
         &base,
         &client,
@@ -2418,8 +2403,9 @@ async fn test_purge_topic_cleans_graph_and_entity_links() {
 #[tokio::test]
 #[serial]
 async fn test_correct_by_id_cleans_graph_and_entity_links() {
-    let (base, client, pool) = spawn_server().await;
+    let (base, client, server) = spawn_server().await;
     let uid = uid();
+    let pool = server.user_db_pool(&uid).await;
     let old_mid = store_with_entity_links(
         &base,
         &client,
@@ -2465,8 +2451,9 @@ async fn test_correct_by_id_cleans_graph_and_entity_links() {
 #[tokio::test]
 #[serial]
 async fn test_correct_by_query_cleans_graph_and_entity_links() {
-    let (base, client, pool) = spawn_server().await;
+    let (base, client, server) = spawn_server().await;
     let uid = uid();
+    let pool = server.user_db_pool(&uid).await;
     let old_mid = store_with_entity_links(
         &base,
         &client,

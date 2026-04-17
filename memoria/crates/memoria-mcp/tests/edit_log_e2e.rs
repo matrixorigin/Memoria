@@ -4,9 +4,10 @@
 ///
 /// Run: DATABASE_URL=mysql://root:111@localhost:6001/memoria \
 ///      cargo test -p memoria-mcp --test edit_log_e2e -- --nocapture
+mod support;
+
 use memoria_git::GitForDataService;
 use memoria_service::{GovernanceStrategy, MemoryService};
-use memoria_storage::SqlMemoryStore;
 use serde_json::{json, Value};
 use serial_test::serial;
 use sqlx::mysql::MySqlPool;
@@ -22,27 +23,14 @@ fn test_dim() -> usize {
         .and_then(|s| s.parse().ok())
         .unwrap_or(1024)
 }
-fn db_url() -> String {
-    std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "mysql://root:111@localhost:6001/memoria".to_string())
-}
-fn test_db_name() -> String {
-    let db = db_url();
-    let suffix_start = db.find(['?', '#']).unwrap_or(db.len());
-    db[..suffix_start]
-        .rsplit('/')
-        .next()
-        .unwrap_or("memoria")
-        .to_string()
-}
 fn uid() -> String {
     format!("elog_{}", &Uuid::new_v4().simple().to_string()[..8])
 }
 
-fn safety_snapshot_prefix() -> String {
+fn safety_snapshot_prefix(db_name: &str) -> String {
     format!(
         "mem_snap_{}_pre_",
-        compact_identifier_fragment(&test_db_name(), 21)
+        compact_identifier_fragment(db_name, 21)
     )
 }
 
@@ -84,8 +72,8 @@ fn compact_identifier_fragment(value: &str, max_len: usize) -> String {
     format!("{head}_{tail}")
 }
 
-fn is_purge_safety_snapshot(name: &str) -> bool {
-    name.starts_with(&format!("{}purge_", safety_snapshot_prefix()))
+fn is_purge_safety_snapshot(db_name: &str, name: &str) -> bool {
+    name.starts_with(&format!("{}purge_", safety_snapshot_prefix(db_name)))
 }
 
 // ── Full edit-log row with ALL columns ────────────────────────────────────────
@@ -110,18 +98,15 @@ async fn setup() -> (
     Arc<GitForDataService>,
     MySqlPool,
     String,
+    String,
+    support::multi_db::McpTestContext,
 ) {
-    let pool = MySqlPool::connect(&db_url()).await.expect("pool");
-    let db_name = db_url().rsplit('/').next().unwrap_or("memoria").to_string();
-    let store = SqlMemoryStore::connect(&db_url(), test_dim(), Uuid::new_v4().to_string())
-        .await
-        .expect("store");
-    store.migrate().await.expect("migrate");
-    let git = Arc::new(GitForDataService::new(pool.clone(), &db_name));
-    let svc = Arc::new(MemoryService::new_sql_with_llm(Arc::new(store), None, None).await);
+    let ctx = support::multi_db::setup_mcp_context("edit_log", test_dim(), None, None).await;
     let user_id = uid();
-    cleanup(&pool, &user_id).await;
-    (svc, git, pool, user_id)
+    let db_name = ctx.user_db_name(&user_id).await;
+    let pool = ctx.user_db_pool(&user_id).await;
+    cleanup(&pool, &user_id, &db_name).await;
+    (ctx.service(), ctx.git(), pool, user_id, db_name, ctx)
 }
 
 /// Setup with real embedder. Returns None if EMBEDDING_* env vars not set.
@@ -130,6 +115,8 @@ async fn setup_with_embedder() -> Option<(
     Arc<GitForDataService>,
     MySqlPool,
     String,
+    String,
+    support::multi_db::McpTestContext,
 )> {
     let base_url = std::env::var("EMBEDDING_BASE_URL").unwrap_or_default();
     let api_key = std::env::var("EMBEDDING_API_KEY").unwrap_or_default();
@@ -141,21 +128,16 @@ async fn setup_with_embedder() -> Option<(
     let embedder: Arc<dyn EmbeddingProvider> =
         Arc::new(HttpEmbedder::new(&base_url, &api_key, &model, dim));
 
-    let pool = MySqlPool::connect(&db_url()).await.expect("pool");
-    let db_name = db_url().rsplit('/').next().unwrap_or("memoria").to_string();
-    let store = SqlMemoryStore::connect(&db_url(), dim, Uuid::new_v4().to_string())
-        .await
-        .expect("store");
-    store.migrate().await.expect("migrate");
-    let git = Arc::new(GitForDataService::new(pool.clone(), &db_name));
-    let svc =
-        Arc::new(MemoryService::new_sql_with_llm(Arc::new(store), Some(embedder), None).await);
+    let ctx =
+        support::multi_db::setup_mcp_context("edit_log_embedder", dim, Some(embedder), None).await;
     let user_id = uid();
-    cleanup(&pool, &user_id).await;
-    Some((svc, git, pool, user_id))
+    let db_name = ctx.user_db_name(&user_id).await;
+    let pool = ctx.user_db_pool(&user_id).await;
+    cleanup(&pool, &user_id, &db_name).await;
+    Some((ctx.service(), ctx.git(), pool, user_id, db_name, ctx))
 }
 
-async fn cleanup(pool: &MySqlPool, user_id: &str) {
+async fn cleanup(pool: &MySqlPool, user_id: &str, db_name: &str) {
     let _ = sqlx::query("DELETE FROM mem_edit_log WHERE user_id = ?")
         .bind(user_id)
         .execute(pool)
@@ -164,7 +146,7 @@ async fn cleanup(pool: &MySqlPool, user_id: &str) {
         .bind(user_id)
         .execute(pool)
         .await;
-    let prefix = safety_snapshot_prefix();
+    let prefix = safety_snapshot_prefix(db_name);
     let rows: Vec<(String,)> =
         sqlx::query_as("SELECT sname FROM mo_catalog.mo_snapshots WHERE prefix_eq(sname, ?)")
             .bind(prefix)
@@ -271,7 +253,7 @@ fn extract_mid(response: &Value) -> String {
 #[tokio::test]
 #[serial]
 async fn test_inject_all_fields() {
-    let (svc, _git, pool, uid) = setup().await;
+    let (svc, _git, pool, uid, db_name, _ctx) = setup().await;
 
     let r = call(
         "memory_store",
@@ -294,7 +276,7 @@ async fn test_inject_all_fields() {
     assert_eq!(row.reason.as_deref(), Some("store_memory"));
     assert!(row.snapshot_before.is_none());
 
-    cleanup(&pool, &uid).await;
+    cleanup(&pool, &uid, &db_name).await;
     println!("✅ inject: all fields verified");
 }
 
@@ -305,7 +287,7 @@ async fn test_inject_all_fields() {
 #[tokio::test]
 #[serial]
 async fn test_correct_all_fields() {
-    let (svc, _git, pool, uid) = setup().await;
+    let (svc, _git, pool, uid, db_name, _ctx) = setup().await;
 
     let r = call("memory_store", json!({"content": "uses black"}), &svc, &uid).await;
     let old_mid = extract_mid(&r);
@@ -333,7 +315,7 @@ async fn test_correct_all_fields() {
     assert_eq!(row.reason.as_deref(), Some(""));
     assert!(row.snapshot_before.is_none());
 
-    cleanup(&pool, &uid).await;
+    cleanup(&pool, &uid, &db_name).await;
     println!("✅ correct: all fields verified");
 }
 
@@ -344,7 +326,7 @@ async fn test_correct_all_fields() {
 #[tokio::test]
 #[serial]
 async fn test_purge_single_all_fields() {
-    let (svc, _git, pool, uid) = setup().await;
+    let (svc, _git, pool, uid, db_name, _ctx) = setup().await;
     ensure_snapshot_quota(&pool).await;
 
     let r = call("memory_store", json!({"content": "to delete"}), &svc, &uid).await;
@@ -372,7 +354,7 @@ async fn test_purge_single_all_fields() {
         .as_ref()
         .expect("snapshot_before should be set");
     assert!(
-        is_purge_safety_snapshot(snap),
+        is_purge_safety_snapshot(&db_name, snap),
         "unexpected snapshot name: {snap}"
     );
     let exists: Vec<(String,)> =
@@ -383,7 +365,7 @@ async fn test_purge_single_all_fields() {
             .unwrap();
     assert_eq!(exists.len(), 1, "safety snapshot should exist in DB");
 
-    cleanup(&pool, &uid).await;
+    cleanup(&pool, &uid, &db_name).await;
     println!("✅ purge single: all fields verified + snapshot exists");
 }
 
@@ -394,7 +376,7 @@ async fn test_purge_single_all_fields() {
 #[tokio::test]
 #[serial]
 async fn test_purge_batch_all_fields() {
-    let (svc, _git, pool, uid) = setup().await;
+    let (svc, _git, pool, uid, db_name, _ctx) = setup().await;
     ensure_snapshot_quota(&pool).await;
 
     let mut mids = vec![];
@@ -437,7 +419,7 @@ async fn test_purge_batch_all_fields() {
     }
     assert_eq!(edit_ids.len(), 3, "edit_ids should be unique");
 
-    cleanup(&pool, &uid).await;
+    cleanup(&pool, &uid, &db_name).await;
     println!("✅ purge batch: all fields verified");
 }
 
@@ -448,7 +430,7 @@ async fn test_purge_batch_all_fields() {
 #[tokio::test]
 #[serial]
 async fn test_purge_topic_all_fields() {
-    let (svc, _git, pool, uid) = setup().await;
+    let (svc, _git, pool, uid, db_name, _ctx) = setup().await;
     ensure_snapshot_quota(&pool).await;
 
     call(
@@ -492,7 +474,7 @@ async fn test_purge_topic_all_fields() {
         );
     }
 
-    cleanup(&pool, &uid).await;
+    cleanup(&pool, &uid, &db_name).await;
     println!("✅ purge topic: all fields verified");
 }
 
@@ -503,7 +485,7 @@ async fn test_purge_topic_all_fields() {
 #[tokio::test]
 #[serial]
 async fn test_store_batch_all_fields() {
-    let (svc, _git, pool, uid) = setup().await;
+    let (svc, _git, pool, uid, db_name, _ctx) = setup().await;
 
     let items = vec![
         (
@@ -547,7 +529,7 @@ async fn test_store_batch_all_fields() {
     assert!(log_types.contains(&"semantic".to_string()));
     assert!(log_types.contains(&"procedural".to_string()));
 
-    cleanup(&pool, &uid).await;
+    cleanup(&pool, &uid, &db_name).await;
     println!("✅ store_batch: all fields verified");
 }
 
@@ -558,7 +540,7 @@ async fn test_store_batch_all_fields() {
 #[tokio::test]
 #[serial]
 async fn test_full_audit_trail_chronological() {
-    let (svc, _git, pool, uid) = setup().await;
+    let (svc, _git, pool, uid, db_name, _ctx) = setup().await;
     ensure_snapshot_quota(&pool).await;
 
     let r = call(
@@ -618,7 +600,7 @@ async fn test_full_audit_trail_chronological() {
     let purge = logs.iter().find(|r| r.operation == "purge").unwrap();
     assert!(purge.snapshot_before.is_some());
 
-    cleanup(&pool, &uid).await;
+    cleanup(&pool, &uid, &db_name).await;
     println!("✅ full audit trail: chronological, all fields consistent");
 }
 
@@ -629,7 +611,7 @@ async fn test_full_audit_trail_chronological() {
 #[tokio::test]
 #[serial]
 async fn test_purge_rollback_restores_memory() {
-    let (svc, git, pool, uid) = setup().await;
+    let (svc, git, pool, uid, db_name, _ctx) = setup().await;
     ensure_snapshot_quota(&pool).await;
 
     let r = call(
@@ -679,7 +661,7 @@ async fn test_purge_rollback_restores_memory() {
     // correctly recorded by checking BEFORE rollback (already verified above
     // via the purge response containing the snapshot name).
 
-    cleanup(&pool, &uid).await;
+    cleanup(&pool, &uid, &db_name).await;
     println!("✅ rollback: memory restored, snapshot name verified");
 }
 
@@ -690,9 +672,11 @@ async fn test_purge_rollback_restores_memory() {
 #[tokio::test]
 #[serial]
 async fn test_user_isolation() {
-    let (svc, _git, pool, uid1) = setup().await;
+    let (svc, _git, pool, uid1, db_name, ctx) = setup().await;
     let uid2 = uid();
-    cleanup(&pool, &uid2).await;
+    let pool2 = ctx.user_db_pool(&uid2).await;
+    let db_name2 = ctx.user_db_name(&uid2).await;
+    cleanup(&pool2, &uid2, &db_name2).await;
 
     call(
         "memory_store",
@@ -711,7 +695,7 @@ async fn test_user_isolation() {
     svc.flush_edit_log().await;
 
     let logs1 = get_logs(&pool, &uid1).await;
-    let logs2 = get_logs(&pool, &uid2).await;
+    let logs2 = get_logs(&pool2, &uid2).await;
     assert_eq!(logs1.len(), 1);
     assert_eq!(logs2.len(), 1);
     for row in &logs1 {
@@ -723,8 +707,8 @@ async fn test_user_isolation() {
         assert_eq!(row.created_by, uid2);
     }
 
-    cleanup(&pool, &uid1).await;
-    cleanup(&pool, &uid2).await;
+    cleanup(&pool, &uid1, &db_name).await;
+    cleanup(&pool2, &uid2, &db_name2).await;
     println!("✅ isolation: users see only their own logs");
 }
 
@@ -735,7 +719,7 @@ async fn test_user_isolation() {
 #[tokio::test]
 #[serial]
 async fn test_governance_quarantine_edit_log() {
-    let (svc, _git, pool, uid) = setup().await;
+    let (svc, _git, pool, uid, db_name, _ctx) = setup().await;
 
     // T4 tier with initial_confidence=0.5, aged 60 days → confidence decays below 0.2 threshold
     let r = call(
@@ -791,7 +775,7 @@ async fn test_governance_quarantine_edit_log() {
         "memory should be physically deleted by quarantine"
     );
 
-    cleanup(&pool, &uid).await;
+    cleanup(&pool, &uid, &db_name).await;
     println!("✅ governance quarantine: all fields verified + DB state checked");
 }
 
@@ -802,7 +786,7 @@ async fn test_governance_quarantine_edit_log() {
 #[tokio::test]
 #[serial]
 async fn test_governance_cleanup_stale_edit_log() {
-    let (svc, _git, pool, uid) = setup().await;
+    let (svc, _git, pool, uid, db_name, _ctx) = setup().await;
 
     // Insert a memory and mark it inactive → cleanup_stale target
     let r = call("memory_store", json!({"content": "stale fact"}), &svc, &uid).await;
@@ -845,7 +829,7 @@ async fn test_governance_cleanup_stale_edit_log() {
         "stale memory should be deleted from DB"
     );
 
-    cleanup(&pool, &uid).await;
+    cleanup(&pool, &uid, &db_name).await;
     println!("✅ governance cleanup_stale: all fields verified + DB state checked");
 }
 
@@ -853,17 +837,15 @@ async fn test_governance_cleanup_stale_edit_log() {
 // 12. GOVERNANCE via REST API
 // ═══════════════════════════════════════════════════════════════════════════════
 
-async fn spawn_server() -> (String, reqwest::Client, MySqlPool, Arc<MemoryService>) {
-    let db = db_url();
-    let store = SqlMemoryStore::connect(&db, test_dim(), Uuid::new_v4().to_string())
-        .await
-        .expect("connect");
-    store.migrate().await.expect("migrate");
-    let pool = MySqlPool::connect(&db).await.expect("pool");
-    let db_name = db.rsplit('/').next().unwrap_or("memoria").to_string();
-    let git = Arc::new(GitForDataService::new(pool.clone(), &db_name));
-    let service = Arc::new(MemoryService::new_sql_with_llm(Arc::new(store), None, None).await);
-    let state = memoria_api::AppState::new(Arc::clone(&service), git, String::new());
+async fn spawn_server() -> (
+    String,
+    reqwest::Client,
+    Arc<MemoryService>,
+    support::multi_db::McpTestContext,
+) {
+    let ctx = support::multi_db::setup_mcp_context("edit_log_api", test_dim(), None, None).await;
+    let service = ctx.service();
+    let state = memoria_api::AppState::new(Arc::clone(&service), ctx.git(), String::new());
     let app = memoria_api::build_router(state);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -874,15 +856,17 @@ async fn spawn_server() -> (String, reqwest::Client, MySqlPool, Arc<MemoryServic
     tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
 
     let client = reqwest::Client::builder().no_proxy().build().unwrap();
-    (format!("http://127.0.0.1:{port}"), client, pool, service)
+    (format!("http://127.0.0.1:{port}"), client, service, ctx)
 }
 
 #[tokio::test]
 #[serial]
 async fn test_api_governance_quarantine_edit_log() {
-    let (base, client, pool, svc) = spawn_server().await;
+    let (base, client, svc, ctx) = spawn_server().await;
     let uid = uid();
-    cleanup(&pool, &uid).await;
+    let pool = ctx.user_db_pool(&uid).await;
+    let db_name = ctx.user_db_name(&uid).await;
+    cleanup(&pool, &uid, &db_name).await;
 
     // Store via API
     let r = client
@@ -927,7 +911,7 @@ async fn test_api_governance_quarantine_edit_log() {
     let payload: Value = serde_json::from_str(row.payload.as_ref().unwrap()).unwrap();
     assert!(payload["quarantined"].as_i64().unwrap() >= 1);
 
-    cleanup(&pool, &uid).await;
+    cleanup(&pool, &uid, &db_name).await;
     println!("✅ API governance quarantine: edit log verified");
 }
 
@@ -938,9 +922,11 @@ async fn test_api_governance_quarantine_edit_log() {
 #[tokio::test]
 #[serial]
 async fn test_api_purge_edit_log_all_fields() {
-    let (base, client, pool, svc) = spawn_server().await;
+    let (base, client, svc, ctx) = spawn_server().await;
     let uid = uid();
-    cleanup(&pool, &uid).await;
+    let pool = ctx.user_db_pool(&uid).await;
+    let db_name = ctx.user_db_name(&uid).await;
+    cleanup(&pool, &uid, &db_name).await;
     ensure_snapshot_quota(&pool).await;
 
     let r = client
@@ -967,7 +953,7 @@ async fn test_api_purge_edit_log_all_fields() {
     assert_eq!(body["purged"], 1);
     let snap = body["snapshot_name"].as_str().unwrap();
     assert!(
-        is_purge_safety_snapshot(snap),
+        is_purge_safety_snapshot(&db_name, snap),
         "unexpected snapshot name: {snap}"
     );
 
@@ -992,7 +978,7 @@ async fn test_api_purge_edit_log_all_fields() {
             .unwrap();
     assert_eq!(exists.len(), 1);
 
-    cleanup(&pool, &uid).await;
+    cleanup(&pool, &uid, &db_name).await;
     println!("✅ API purge: all edit log fields verified + snapshot exists");
 }
 
@@ -1003,9 +989,11 @@ async fn test_api_purge_edit_log_all_fields() {
 #[tokio::test]
 #[serial]
 async fn test_api_purge_topic_edit_log_all_fields() {
-    let (base, client, pool, svc) = spawn_server().await;
+    let (base, client, svc, ctx) = spawn_server().await;
     let uid = uid();
-    cleanup(&pool, &uid).await;
+    let pool = ctx.user_db_pool(&uid).await;
+    let db_name = ctx.user_db_name(&uid).await;
+    cleanup(&pool, &uid, &db_name).await;
     ensure_snapshot_quota(&pool).await;
 
     for c in ["topicZ alpha", "topicZ beta", "unrelated"] {
@@ -1045,7 +1033,7 @@ async fn test_api_purge_topic_edit_log_all_fields() {
         );
     }
 
-    cleanup(&pool, &uid).await;
+    cleanup(&pool, &uid, &db_name).await;
     println!("✅ API purge topic: all edit log fields verified");
 }
 
@@ -1056,7 +1044,7 @@ async fn test_api_purge_topic_edit_log_all_fields() {
 #[tokio::test]
 #[serial]
 async fn test_edit_id_globally_unique() {
-    let (svc, _git, pool, uid) = setup().await;
+    let (svc, _git, pool, uid, db_name, _ctx) = setup().await;
     ensure_snapshot_quota(&pool).await;
 
     // inject
@@ -1108,7 +1096,7 @@ async fn test_edit_id_globally_unique() {
         assert!(row.edit_id.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
-    cleanup(&pool, &uid).await;
+    cleanup(&pool, &uid, &db_name).await;
     println!("✅ edit_id globally unique across all operation types");
 }
 
@@ -1119,7 +1107,7 @@ async fn test_edit_id_globally_unique() {
 #[tokio::test]
 #[serial]
 async fn test_inject_supersede_all_fields() {
-    let Some((svc, _git, pool, uid)) = setup_with_embedder().await else {
+    let Some((svc, _git, pool, uid, db_name, _ctx)) = setup_with_embedder().await else {
         println!("⚠️  skipped: EMBEDDING_BASE_URL / EMBEDDING_API_KEY not set");
         return;
     };
@@ -1158,7 +1146,7 @@ async fn test_inject_supersede_all_fields() {
             "⚠️  supersede not triggered (embeddings not close enough), verifying normal inject"
         );
         assert!(logs.len() >= 2);
-        cleanup(&pool, &uid).await;
+        cleanup(&pool, &uid, &db_name).await;
         return;
     }
 
@@ -1186,7 +1174,7 @@ async fn test_inject_supersede_all_fields() {
         "superseded_by should point to new"
     );
 
-    cleanup(&pool, &uid).await;
+    cleanup(&pool, &uid, &db_name).await;
     println!("✅ inject supersede: all fields verified + old memory superseded in DB");
 }
 
@@ -1197,7 +1185,7 @@ async fn test_inject_supersede_all_fields() {
 #[tokio::test]
 #[serial]
 async fn test_governance_archive_working_edit_log() {
-    let (svc, _git, pool, uid) = setup().await;
+    let (svc, _git, pool, uid, db_name, ctx) = setup().await;
 
     // Store a working memory and age it beyond the 72h threshold
     let r = call(
@@ -1221,13 +1209,12 @@ async fn test_governance_archive_working_edit_log() {
         .unwrap();
 
     // Run full governance via the scheduler strategy
-    let store = SqlMemoryStore::connect(&db_url(), test_dim(), Uuid::new_v4().to_string())
-        .await
-        .expect("store");
+    let store = ctx.shared_store();
     let strategy = memoria_service::DefaultGovernanceStrategy;
     let _ = strategy
-        .run(&store, memoria_service::GovernanceTask::Hourly)
+        .run(store.as_ref(), memoria_service::GovernanceTask::Hourly)
         .await;
+    svc.flush_edit_log().await;
 
     let logs = get_logs_by_op(&pool, &uid, "governance:archive_working").await;
     assert!(!logs.is_empty(), "should have archive_working edit log");
@@ -1247,7 +1234,7 @@ async fn test_governance_archive_working_edit_log() {
             .unwrap();
     assert_eq!(active[0].0, 0, "working memory should be archived");
 
-    cleanup(&pool, &uid).await;
+    cleanup(&pool, &uid, &db_name).await;
     println!("✅ governance archive_working: all fields verified + DB state checked");
 }
 
@@ -1258,7 +1245,7 @@ async fn test_governance_archive_working_edit_log() {
 #[tokio::test]
 #[serial]
 async fn test_governance_cleanup_orphaned_edit_log() {
-    let (svc, _git, pool, uid) = setup().await;
+    let (svc, _git, pool, uid, db_name, ctx) = setup().await;
 
     // Store a memory, then supersede it manually to create an orphan
     let r = call("memory_store", json!({"content": "original"}), &svc, &uid).await;
@@ -1281,12 +1268,10 @@ async fn test_governance_cleanup_orphaned_edit_log() {
         .await
         .unwrap();
 
-    let store = SqlMemoryStore::connect(&db_url(), test_dim(), Uuid::new_v4().to_string())
-        .await
-        .expect("store");
+    let store = ctx.user_store(&uid).await;
     let strategy = memoria_service::DefaultGovernanceStrategy;
     let _ = strategy
-        .run(&store, memoria_service::GovernanceTask::Daily)
+        .run(store.as_ref(), memoria_service::GovernanceTask::Daily)
         .await;
 
     let logs = get_logs_by_op(&pool, &uid, "governance:cleanup_orphaned_incrementals").await;
@@ -1302,5 +1287,5 @@ async fn test_governance_cleanup_orphaned_edit_log() {
         println!("⚠️  governance cleanup_orphaned: not triggered (orphan criteria not met)");
     }
 
-    cleanup(&pool, &uid).await;
+    cleanup(&pool, &uid, &db_name).await;
 }

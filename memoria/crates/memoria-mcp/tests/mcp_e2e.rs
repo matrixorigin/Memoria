@@ -3,26 +3,20 @@
 ///
 /// Run: DATABASE_URL=... EMBEDDING_BASE_URL=... EMBEDDING_API_KEY=... \
 ///      SQLX_OFFLINE=true cargo test -p memoria-mcp --test mcp_e2e -- --nocapture
+mod support;
+
 use memoria_core::interfaces::EmbeddingProvider;
 use memoria_embedding::HttpEmbedder;
 use memoria_service::MemoryService;
-use memoria_storage::SqlMemoryStore;
 use serde_json::{json, Value};
 use std::sync::Arc;
 use uuid::Uuid;
 
-async fn make_service() -> (Arc<MemoryService>, String) {
-    let db_url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "mysql://root:111@localhost:6001/memoria".to_string());
+async fn make_service() -> (Arc<MemoryService>, String, support::multi_db::McpTestContext) {
     let dim: usize = std::env::var("EMBEDDING_DIM")
         .unwrap_or_else(|_| "1024".to_string())
         .parse()
         .unwrap_or(1024);
-
-    let store = SqlMemoryStore::connect(&db_url, dim, uuid::Uuid::new_v4().to_string())
-        .await
-        .expect("connect");
-    store.migrate().await.expect("migrate");
 
     let embedder: Option<Arc<dyn EmbeddingProvider>> = {
         let base_url = std::env::var("EMBEDDING_BASE_URL").unwrap_or_default();
@@ -39,9 +33,8 @@ async fn make_service() -> (Arc<MemoryService>, String) {
     };
 
     let user_id = format!("e2e_{}", Uuid::new_v4().simple());
-    let store = Arc::new(store);
-    let svc = Arc::new(MemoryService::new(store.clone(), embedder, Some(store)));
-    (svc, user_id)
+    let ctx = support::multi_db::setup_mcp_context("mcp_e2e", dim, embedder, None).await;
+    (ctx.service(), user_id, ctx)
 }
 
 async fn call_tool(name: &str, args: Value, svc: &Arc<MemoryService>, uid: &str) -> Value {
@@ -56,7 +49,7 @@ fn text(v: &Value) -> &str {
 
 #[tokio::test]
 async fn test_e2e_store_retrieve() {
-    let (svc, uid) = make_service().await;
+    let (svc, uid, _ctx) = make_service().await;
 
     // Store
     let r = call_tool(
@@ -87,7 +80,7 @@ async fn test_e2e_store_retrieve() {
 
 #[tokio::test]
 async fn test_e2e_correct_purge() {
-    let (svc, uid) = make_service().await;
+    let (svc, uid, _ctx) = make_service().await;
 
     // Store
     let r = call_tool(
@@ -124,7 +117,7 @@ async fn test_e2e_correct_purge() {
 
 #[tokio::test]
 async fn test_e2e_list_profile() {
-    let (svc, uid) = make_service().await;
+    let (svc, uid, _ctx) = make_service().await;
 
     call_tool(
         "memory_store",
@@ -181,18 +174,12 @@ async fn make_git_service() -> (
     Arc<MemoryService>,
     Arc<memoria_git::GitForDataService>,
     String,
+    support::multi_db::McpTestContext,
 ) {
-    let db_url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "mysql://root:111@localhost:6001/memoria".to_string());
     let dim: usize = std::env::var("EMBEDDING_DIM")
         .unwrap_or_else(|_| "1024".to_string())
         .parse()
         .unwrap_or(1024);
-
-    let store = SqlMemoryStore::connect(&db_url, dim, uuid::Uuid::new_v4().to_string())
-        .await
-        .expect("connect");
-    store.migrate().await.expect("migrate");
 
     let embedder: Option<Arc<dyn EmbeddingProvider>> = {
         let base_url = std::env::var("EMBEDDING_BASE_URL").unwrap_or_default();
@@ -207,19 +194,16 @@ async fn make_git_service() -> (
         }
     };
 
-    let pool = sqlx::mysql::MySqlPool::connect(&db_url)
-        .await
-        .expect("pool");
-    let db_name = db_url.rsplit('/').next().unwrap_or("memoria");
-    let git = Arc::new(memoria_git::GitForDataService::new(pool, db_name));
-    let svc = Arc::new(MemoryService::new_sql_with_llm(Arc::new(store), embedder, None).await);
+    let ctx = support::multi_db::setup_mcp_context("mcp_e2e_git", dim, embedder, None).await;
+    let git = ctx.git();
+    let svc = ctx.service();
     let uid = format!("e2e_{}", Uuid::new_v4().simple());
-    (svc, git, uid)
+    (svc, git, uid, ctx)
 }
 
 #[tokio::test]
 async fn test_e2e_branch_store_merge() {
-    let (svc, git, uid) = make_git_service().await;
+    let (svc, git, uid, _ctx) = make_git_service().await;
     let branch = format!("test_br_{}", &uid[5..13]);
 
     // 1. Store a memory on main

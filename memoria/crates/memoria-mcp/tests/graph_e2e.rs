@@ -1,7 +1,15 @@
+mod support;
+
+use memoria_service::MemoryService;
 use memoria_storage::graph::types::{edge_type, GraphEdge, GraphNode, NodeType};
 /// Graph E2E tests: GraphStore CRUD, consolidation, entity extraction/linking.
 /// Requires real DB. Run with --test-threads=1 (rollback is account-level).
-use memoria_storage::{GraphConsolidator, GraphStore};
+use memoria_storage::{GraphConsolidator, GraphStore, SqlMemoryStore};
+use sqlx::mysql::MySqlPool;
+use std::sync::Arc;
+use uuid::Uuid;
+
+const TEST_DB_PREFIX: &str = "graph_e2e";
 
 fn test_dim() -> usize {
     std::env::var("EMBEDDING_DIM")
@@ -10,14 +18,57 @@ fn test_dim() -> usize {
         .unwrap_or(1024)
 }
 
-async fn setup_graph() -> (GraphStore, String) {
-    let db_url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "mysql://root:111@localhost:6001/memoria".to_string());
-    let pool = sqlx::MySqlPool::connect(&db_url).await.expect("connect");
-    let store = GraphStore::new(pool, test_dim()); // dim=4 for tests
-    store.migrate().await.expect("migrate");
-    let uid = format!("graph_test_{}", uuid::Uuid::new_v4().simple());
-    (store, uid)
+async fn setup_user(
+    uid_prefix: &str,
+) -> (
+    support::multi_db::McpTestContext,
+    Arc<SqlMemoryStore>,
+    MySqlPool,
+    String,
+) {
+    let ctx = support::multi_db::setup_mcp_context(TEST_DB_PREFIX, test_dim(), None, None).await;
+    let uid = format!("{uid_prefix}_{}", Uuid::new_v4().simple());
+    let sql = ctx.user_store(&uid).await;
+    let pool = ctx.user_db_pool(&uid).await;
+    (ctx, sql, pool, uid)
+}
+
+async fn setup_graph() -> (GraphStore, String, support::multi_db::McpTestContext) {
+    let (ctx, sql, _pool, uid) = setup_user("graph_test").await;
+    (sql.graph_store(), uid, ctx)
+}
+
+async fn setup_sql(
+    uid_prefix: &str,
+) -> (
+    Arc<SqlMemoryStore>,
+    MySqlPool,
+    String,
+    support::multi_db::McpTestContext,
+) {
+    let (ctx, sql, pool, uid) = setup_user(uid_prefix).await;
+    (sql, pool, uid, ctx)
+}
+
+async fn setup_service(
+    uid_prefix: &str,
+) -> (
+    Arc<MemoryService>,
+    Arc<SqlMemoryStore>,
+    MySqlPool,
+    String,
+    support::multi_db::McpTestContext,
+) {
+    let (ctx, sql, pool, uid) = setup_user(uid_prefix).await;
+    (ctx.service(), sql, pool, uid, ctx)
+}
+
+fn extract_memory_id(text: &str) -> String {
+    text.split_whitespace()
+        .nth(2)
+        .unwrap_or("")
+        .trim_end_matches(':')
+        .to_string()
 }
 
 fn make_node(
@@ -53,7 +104,7 @@ fn make_node(
 
 #[tokio::test]
 async fn test_graph_create_and_get_node() {
-    let (store, uid) = setup_graph().await;
+    let (store, uid, _ctx) = setup_graph().await;
     let node = make_node(
         &uid,
         NodeType::Semantic,
@@ -79,7 +130,7 @@ async fn test_graph_create_and_get_node() {
 
 #[tokio::test]
 async fn test_graph_get_by_memory_id() {
-    let (store, uid) = setup_graph().await;
+    let (store, uid, _ctx) = setup_graph().await;
     let mid = format!("mem_{}", uuid::Uuid::new_v4().simple());
     let node = make_node(&uid, NodeType::Semantic, "test content", Some(&mid));
     store.create_node(&node).await.expect("create");
@@ -97,7 +148,7 @@ async fn test_graph_get_by_memory_id() {
 
 #[tokio::test]
 async fn test_graph_get_user_nodes_by_type() {
-    let (store, uid) = setup_graph().await;
+    let (store, uid, _ctx) = setup_graph().await;
 
     let semantic = make_node(&uid, NodeType::Semantic, "semantic node", None);
     let scene = make_node(&uid, NodeType::Scene, "scene node", None);
@@ -130,7 +181,7 @@ async fn test_graph_get_user_nodes_by_type() {
 
 #[tokio::test]
 async fn test_graph_deactivate_node() {
-    let (store, uid) = setup_graph().await;
+    let (store, uid, _ctx) = setup_graph().await;
     let node = make_node(&uid, NodeType::Scene, "to be deactivated", None);
     let node_id = node.node_id.clone();
     store.create_node(&node).await.expect("create");
@@ -152,7 +203,7 @@ async fn test_graph_deactivate_node() {
 
 #[tokio::test]
 async fn test_graph_update_tier() {
-    let (store, uid) = setup_graph().await;
+    let (store, uid, _ctx) = setup_graph().await;
     let mut node = make_node(&uid, NodeType::Scene, "tier test", None);
     node.trust_tier = "T4".to_string();
     node.confidence = 0.6;
@@ -178,7 +229,7 @@ async fn test_graph_update_tier() {
 
 #[tokio::test]
 async fn test_graph_edge_and_conflict() {
-    let (store, uid) = setup_graph().await;
+    let (store, uid, _ctx) = setup_graph().await;
     let n1 = make_node(&uid, NodeType::Semantic, "node A", None);
     let n2 = make_node(&uid, NodeType::Semantic, "node B", None);
     let (id1, id2) = (n1.node_id.clone(), n2.node_id.clone());
@@ -216,7 +267,7 @@ async fn test_graph_edge_and_conflict() {
 
 #[tokio::test]
 async fn test_graph_entity_upsert() {
-    let (store, uid) = setup_graph().await;
+    let (store, uid, _ctx) = setup_graph().await;
 
     let (id1, is_new1) = store
         .upsert_entity(&uid, "rust", "Rust", "tech")
@@ -237,7 +288,7 @@ async fn test_graph_entity_upsert() {
 
 #[tokio::test]
 async fn test_graph_entity_link_idempotent() {
-    let (store, uid) = setup_graph().await;
+    let (store, uid, _ctx) = setup_graph().await;
     let (entity_id, _) = store
         .upsert_entity(&uid, "matrixone", "MatrixOne", "tech")
         .await
@@ -262,12 +313,10 @@ async fn test_graph_entity_link_idempotent() {
 
 #[tokio::test]
 async fn test_graph_unlinked_memories() {
-    let (store, uid) = setup_graph().await;
+    let (store, uid, ctx) = setup_graph().await;
 
     // Insert a memory directly into mem_memories
-    let db_url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "mysql://root:111@localhost:6001/memoria".to_string());
-    let pool = sqlx::MySqlPool::connect(&db_url).await.expect("connect");
+    let pool = ctx.user_db_pool(&uid).await;
     let mid = format!("mem_{}", uuid::Uuid::new_v4().simple());
     sqlx::query(
         "INSERT INTO mem_memories (memory_id, user_id, memory_type, content, source_event_ids, \
@@ -318,7 +367,7 @@ async fn test_graph_unlinked_memories() {
 
 #[tokio::test]
 async fn test_consolidator_trust_tier_lifecycle() {
-    let (store, uid) = setup_graph().await;
+    let (store, uid, _ctx) = setup_graph().await;
 
     // T4 scene with high confidence and old age (simulate by setting created_at far back)
     let mut scene = make_node(&uid, NodeType::Scene, "old high-confidence scene", None);
@@ -360,7 +409,7 @@ async fn test_consolidator_trust_tier_lifecycle() {
 
 #[tokio::test]
 async fn test_consolidator_orphaned_scene() {
-    let (store, uid) = setup_graph().await;
+    let (store, uid, _ctx) = setup_graph().await;
 
     // Scene with source_nodes pointing to non-existent nodes
     let mut scene = make_node(&uid, NodeType::Scene, "orphaned scene", None);
@@ -392,7 +441,7 @@ async fn test_consolidator_orphaned_scene() {
 
 #[tokio::test]
 async fn test_consolidator_t3_demotion() {
-    let (store, uid) = setup_graph().await;
+    let (store, uid, _ctx) = setup_graph().await;
 
     // T3 scene with low confidence and very old age
     let mut scene = make_node(&uid, NodeType::Scene, "stale T3 scene", None);
@@ -422,12 +471,10 @@ async fn test_consolidator_t3_demotion() {
 
 #[tokio::test]
 async fn test_graph_full_entity_workflow() {
-    let (store, uid) = setup_graph().await;
+    let (store, uid, ctx) = setup_graph().await;
 
     // Insert memory
-    let db_url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "mysql://root:111@localhost:6001/memoria".to_string());
-    let pool = sqlx::MySqlPool::connect(&db_url).await.expect("connect");
+    let pool = ctx.user_db_pool(&uid).await;
     let mid = format!("mem_{}", uuid::Uuid::new_v4().simple());
     sqlx::query(
         "INSERT INTO mem_memories (memory_id, user_id, memory_type, content, source_event_ids, \
@@ -494,18 +541,7 @@ async fn test_graph_full_entity_workflow() {
 
 #[tokio::test]
 async fn test_store_creates_graph_node() {
-    use memoria_service::MemoryService;
-    use memoria_storage::SqlMemoryStore;
-    use std::sync::Arc;
-
-    let db_url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "mysql://root:111@localhost:6001/memoria".to_string());
-    let sql = SqlMemoryStore::connect(&db_url, test_dim(), uuid::Uuid::new_v4().to_string())
-        .await
-        .expect("connect");
-    sql.migrate().await.expect("migrate");
-    let uid = format!("gsync_{}", uuid::Uuid::new_v4().simple());
-    let svc = Arc::new(MemoryService::new_sql_with_llm(Arc::new(sql.clone()), None, None).await);
+    let (svc, sql, _pool, uid, _ctx) = setup_service("gsync").await;
 
     // Call memory_store via tools
     let r = memoria_mcp::tools::call(
@@ -517,15 +553,11 @@ async fn test_store_creates_graph_node() {
     assert!(text.contains("Stored memory"), "got: {text}");
 
     // Extract memory_id from response
-    let mid = text
-        .split_whitespace()
-        .nth(2)
-        .unwrap_or("")
-        .trim_end_matches(':');
+    let mid = extract_memory_id(text);
 
     // Verify graph node was created
     let graph = sql.graph_store();
-    let node = graph.get_node_by_memory_id(mid).await.expect("query");
+    let node = graph.get_node_by_memory_id(&mid).await.expect("query");
     assert!(
         node.is_some(),
         "graph node should be created for memory {mid}"
@@ -552,18 +584,7 @@ async fn test_store_creates_graph_node() {
 
 #[tokio::test]
 async fn test_correct_updates_graph_node() {
-    use memoria_service::MemoryService;
-    use memoria_storage::SqlMemoryStore;
-    use std::sync::Arc;
-
-    let db_url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "mysql://root:111@localhost:6001/memoria".to_string());
-    let sql = SqlMemoryStore::connect(&db_url, test_dim(), uuid::Uuid::new_v4().to_string())
-        .await
-        .expect("connect");
-    sql.migrate().await.expect("migrate");
-    let uid = format!("gcorr_{}", uuid::Uuid::new_v4().simple());
-    let svc = Arc::new(MemoryService::new_sql_with_llm(Arc::new(sql.clone()), None, None).await);
+    let (svc, sql, _pool, uid, _ctx) = setup_service("gcorr").await;
 
     // Store
     let r = memoria_mcp::tools::call(
@@ -575,12 +596,7 @@ async fn test_correct_updates_graph_node() {
     .await
     .expect("store");
     let text = r["content"][0]["text"].as_str().unwrap_or("");
-    let mid = text
-        .split_whitespace()
-        .nth(2)
-        .unwrap_or("")
-        .trim_end_matches(':')
-        .to_string();
+    let mid = extract_memory_id(text);
 
     // Correct — creates new memory, deactivates old
     let cr = memoria_mcp::tools::call(
@@ -589,12 +605,7 @@ async fn test_correct_updates_graph_node() {
         &svc, &uid,
     ).await.expect("correct");
     let ct = cr["content"][0]["text"].as_str().unwrap_or("");
-    let new_mid = ct
-        .split_whitespace()
-        .nth(2)
-        .unwrap_or("")
-        .trim_end_matches(':')
-        .to_string();
+    let new_mid = extract_memory_id(ct);
 
     // Verify old graph node deactivated, new graph node has updated content
     let graph = sql.graph_store();
@@ -613,18 +624,7 @@ async fn test_correct_updates_graph_node() {
 
 #[tokio::test]
 async fn test_purge_deactivates_graph_node() {
-    use memoria_service::MemoryService;
-    use memoria_storage::SqlMemoryStore;
-    use std::sync::Arc;
-
-    let db_url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "mysql://root:111@localhost:6001/memoria".to_string());
-    let sql = SqlMemoryStore::connect(&db_url, test_dim(), uuid::Uuid::new_v4().to_string())
-        .await
-        .expect("connect");
-    sql.migrate().await.expect("migrate");
-    let uid = format!("gpurge_{}", uuid::Uuid::new_v4().simple());
-    let svc = Arc::new(MemoryService::new_sql_with_llm(Arc::new(sql.clone()), None, None).await);
+    let (svc, sql, _pool, uid, _ctx) = setup_service("gpurge").await;
 
     // Store
     let r = memoria_mcp::tools::call(
@@ -636,12 +636,7 @@ async fn test_purge_deactivates_graph_node() {
     .await
     .expect("store");
     let text = r["content"][0]["text"].as_str().unwrap_or("");
-    let mid = text
-        .split_whitespace()
-        .nth(2)
-        .unwrap_or("")
-        .trim_end_matches(':')
-        .to_string();
+    let mid = extract_memory_id(text);
 
     // Verify graph node exists
     let graph = sql.graph_store();
@@ -698,15 +693,7 @@ fn test_ner_extract_entities() {
 
 #[tokio::test]
 async fn test_entity_link_weights_by_source() {
-    use memoria_storage::SqlMemoryStore;
-
-    let db_url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "mysql://root:111@localhost:6001/memoria".to_string());
-    let sql = SqlMemoryStore::connect(&db_url, test_dim(), uuid::Uuid::new_v4().to_string())
-        .await
-        .expect("connect");
-    sql.migrate().await.expect("migrate");
-    let uid = format!("elw_{}", uuid::Uuid::new_v4().simple());
+    let (sql, _pool, uid, _ctx) = setup_sql("elw").await;
     let graph = sql.graph_store();
 
     // Create entity
@@ -734,11 +721,15 @@ async fn test_entity_link_weights_by_source() {
         .expect("link manual");
 
     // Verify weights
-    let rows = sqlx::query(
-        "SELECT memory_id, weight FROM mem_memory_entity_links WHERE entity_id = ? AND user_id = ? ORDER BY weight"
-    )
-    .bind(&eid).bind(&uid)
-    .fetch_all(sql.pool()).await.expect("query");
+    let links_table = graph.t("mem_memory_entity_links");
+    let rows = sqlx::query(&format!(
+        "SELECT memory_id, weight FROM {links_table} WHERE entity_id = ? AND user_id = ? ORDER BY weight"
+    ))
+    .bind(&eid)
+    .bind(&uid)
+    .fetch_all(graph.pool())
+    .await
+    .expect("query");
 
     use sqlx::Row;
     assert_eq!(rows.len(), 3);
@@ -776,7 +767,7 @@ async fn test_entity_link_weights_by_source() {
 
 #[tokio::test]
 async fn test_batch_upsert_entity_links_empty() {
-    let (store, uid) = setup_graph().await;
+    let (store, uid, _ctx) = setup_graph().await;
     store
         .batch_upsert_memory_entity_links(&uid, &[])
         .await
@@ -786,7 +777,7 @@ async fn test_batch_upsert_entity_links_empty() {
 
 #[tokio::test]
 async fn test_batch_upsert_entity_links_basic() {
-    let (store, uid) = setup_graph().await;
+    let (store, uid, _ctx) = setup_graph().await;
     let (eid1, _) = store
         .upsert_entity(&uid, "rust", "Rust", "tech")
         .await
@@ -801,11 +792,15 @@ async fn test_batch_upsert_entity_links_basic() {
         .expect("batch upsert");
 
     // Verify both links exist
-    let rows = sqlx::query(
-        "SELECT entity_id, source, weight FROM mem_memory_entity_links WHERE user_id = ? AND memory_id = ? ORDER BY weight"
-    )
-    .bind(&uid).bind(&mid)
-    .fetch_all(store.pool()).await.unwrap();
+    let links_table = store.t("mem_memory_entity_links");
+    let rows = sqlx::query(&format!(
+        "SELECT entity_id, source, weight FROM {links_table} WHERE user_id = ? AND memory_id = ? ORDER BY weight"
+    ))
+    .bind(&uid)
+    .bind(&mid)
+    .fetch_all(store.pool())
+    .await
+    .unwrap();
 
     use sqlx::Row;
     assert_eq!(rows.len(), 2);
@@ -818,7 +813,7 @@ async fn test_batch_upsert_entity_links_basic() {
 
 #[tokio::test]
 async fn test_batch_upsert_entity_links_idempotent() {
-    let (store, uid) = setup_graph().await;
+    let (store, uid, _ctx) = setup_graph().await;
     let (eid, _) = store
         .upsert_entity(&uid, "matrixone", "MatrixOne", "tech")
         .await
@@ -836,11 +831,16 @@ async fn test_batch_upsert_entity_links_idempotent() {
         .await
         .unwrap();
 
-    let rows = sqlx::query(
-        "SELECT COUNT(*) as cnt FROM mem_memory_entity_links WHERE user_id = ? AND memory_id = ? AND entity_id = ?"
-    )
-    .bind(&uid).bind(&mid).bind(&eid)
-    .fetch_one(store.pool()).await.unwrap();
+    let links_table = store.t("mem_memory_entity_links");
+    let rows = sqlx::query(&format!(
+        "SELECT COUNT(*) as cnt FROM {links_table} WHERE user_id = ? AND memory_id = ? AND entity_id = ?"
+    ))
+    .bind(&uid)
+    .bind(&mid)
+    .bind(&eid)
+    .fetch_one(store.pool())
+    .await
+    .unwrap();
     use sqlx::Row;
     let cnt: i64 = rows.get("cnt");
     assert_eq!(cnt, 1, "should still be exactly 1 link");
@@ -849,7 +849,7 @@ async fn test_batch_upsert_entity_links_idempotent() {
 
 #[tokio::test]
 async fn test_batch_upsert_entity_links_source_upgrade() {
-    let (store, uid) = setup_graph().await;
+    let (store, uid, _ctx) = setup_graph().await;
     let (eid, _) = store
         .upsert_entity(&uid, "tokio", "Tokio", "tech")
         .await
@@ -871,9 +871,10 @@ async fn test_batch_upsert_entity_links_source_upgrade() {
         .unwrap();
 
     use sqlx::Row;
-    let row = sqlx::query(
-        "SELECT source, weight FROM mem_memory_entity_links WHERE memory_id = ? AND entity_id = ?",
-    )
+    let links_table = store.t("mem_memory_entity_links");
+    let row = sqlx::query(&format!(
+        "SELECT source, weight FROM {links_table} WHERE memory_id = ? AND entity_id = ?"
+    ))
     .bind(&mid)
     .bind(&eid)
     .fetch_one(store.pool())
@@ -891,7 +892,7 @@ async fn test_batch_upsert_entity_links_source_upgrade() {
 
 #[tokio::test]
 async fn test_batch_upsert_entity_links_large_batch() {
-    let (store, uid) = setup_graph().await;
+    let (store, uid, _ctx) = setup_graph().await;
     // Create 80 entities and link them all to one memory
     let mut entity_ids = Vec::new();
     for i in 0..80 {
@@ -912,9 +913,10 @@ async fn test_batch_upsert_entity_links_large_batch() {
         .expect("large batch should succeed (chunked into 50+30)");
 
     use sqlx::Row;
-    let row = sqlx::query(
-        "SELECT COUNT(*) as cnt FROM mem_memory_entity_links WHERE user_id = ? AND memory_id = ?",
-    )
+    let links_table = store.t("mem_memory_entity_links");
+    let row = sqlx::query(&format!(
+        "SELECT COUNT(*) as cnt FROM {links_table} WHERE user_id = ? AND memory_id = ?"
+    ))
     .bind(&uid)
     .bind(&mid)
     .fetch_one(store.pool())
@@ -927,7 +929,7 @@ async fn test_batch_upsert_entity_links_large_batch() {
 
 #[tokio::test]
 async fn test_batch_upsert_entity_links_mixed_sources() {
-    let (store, uid) = setup_graph().await;
+    let (store, uid, _ctx) = setup_graph().await;
     let (eid1, _) = store.upsert_entity(&uid, "a", "A", "tech").await.unwrap();
     let (eid2, _) = store.upsert_entity(&uid, "b", "B", "tech").await.unwrap();
     let (eid3, _) = store.upsert_entity(&uid, "c", "C", "tech").await.unwrap();
@@ -944,11 +946,15 @@ async fn test_batch_upsert_entity_links_mixed_sources() {
         .unwrap();
 
     use sqlx::Row;
-    let rows = sqlx::query(
-        "SELECT source, weight FROM mem_memory_entity_links WHERE user_id = ? AND memory_id = ? ORDER BY weight"
-    )
-    .bind(&uid).bind(&mid)
-    .fetch_all(store.pool()).await.unwrap();
+    let links_table = store.t("mem_memory_entity_links");
+    let rows = sqlx::query(&format!(
+        "SELECT source, weight FROM {links_table} WHERE user_id = ? AND memory_id = ? ORDER BY weight"
+    ))
+    .bind(&uid)
+    .bind(&mid)
+    .fetch_all(store.pool())
+    .await
+    .unwrap();
     assert_eq!(rows.len(), 3);
     let sources: Vec<String> = rows.iter().map(|r| r.get("source")).collect();
     assert_eq!(sources, vec!["regex", "llm", "manual"]);
@@ -957,7 +963,7 @@ async fn test_batch_upsert_entity_links_mixed_sources() {
 
 #[tokio::test]
 async fn test_batch_upsert_entity_links_multiple_memories() {
-    let (store, uid) = setup_graph().await;
+    let (store, uid, _ctx) = setup_graph().await;
     let (eid, _) = store
         .upsert_entity(&uid, "shared_entity", "SharedEntity", "concept")
         .await
@@ -972,11 +978,15 @@ async fn test_batch_upsert_entity_links_multiple_memories() {
         .await
         .unwrap();
 
-    let rows = sqlx::query(
-        "SELECT memory_id, source FROM mem_memory_entity_links WHERE user_id = ? AND entity_id = ? ORDER BY memory_id"
-    )
-    .bind(&uid).bind(&eid)
-    .fetch_all(store.pool()).await.unwrap();
+    let links_table = store.t("mem_memory_entity_links");
+    let rows = sqlx::query(&format!(
+        "SELECT memory_id, source FROM {links_table} WHERE user_id = ? AND entity_id = ? ORDER BY memory_id"
+    ))
+    .bind(&uid)
+    .bind(&eid)
+    .fetch_all(store.pool())
+    .await
+    .unwrap();
     assert_eq!(rows.len(), 2, "entity should be linked to 2 memories");
     println!("✅ batch_upsert_memory_entity_links: one entity linked to multiple memories");
 }
@@ -985,7 +995,7 @@ async fn test_batch_upsert_entity_links_multiple_memories() {
 
 #[tokio::test]
 async fn test_batch_upsert_entities_empty() {
-    let (store, uid) = setup_graph().await;
+    let (store, uid, _ctx) = setup_graph().await;
     let result = store.batch_upsert_entities(&uid, &[]).await.unwrap();
     assert!(result.is_empty());
     println!("✅ batch_upsert_entities: empty input OK");
@@ -993,7 +1003,7 @@ async fn test_batch_upsert_entities_empty() {
 
 #[tokio::test]
 async fn test_batch_upsert_entities_basic() {
-    let (store, uid) = setup_graph().await;
+    let (store, uid, _ctx) = setup_graph().await;
     let entities: Vec<(&str, &str, &str)> = vec![
         ("rust", "Rust", "tech"),
         ("go", "Go", "tech"),
@@ -1017,7 +1027,7 @@ async fn test_batch_upsert_entities_basic() {
 
 #[tokio::test]
 async fn test_batch_upsert_entities_idempotent() {
-    let (store, uid) = setup_graph().await;
+    let (store, uid, _ctx) = setup_graph().await;
     let entities: Vec<(&str, &str, &str)> = vec![("rust", "Rust", "tech"), ("go", "Go", "tech")];
 
     let first = store.batch_upsert_entities(&uid, &entities).await.unwrap();
@@ -1039,7 +1049,7 @@ async fn test_batch_upsert_entities_idempotent() {
 
 #[tokio::test]
 async fn test_batch_upsert_entities_mixed_new_and_existing() {
-    let (store, uid) = setup_graph().await;
+    let (store, uid, _ctx) = setup_graph().await;
 
     // Pre-create one entity via single upsert
     let (existing_id, _) = store
@@ -1068,7 +1078,7 @@ async fn test_batch_upsert_entities_mixed_new_and_existing() {
 
 #[tokio::test]
 async fn test_batch_upsert_entities_duplicates_in_input() {
-    let (store, uid) = setup_graph().await;
+    let (store, uid, _ctx) = setup_graph().await;
 
     // Same entity name appears twice in one batch
     let entities: Vec<(&str, &str, &str)> =
@@ -1089,7 +1099,7 @@ async fn test_batch_upsert_entities_duplicates_in_input() {
 
 #[tokio::test]
 async fn test_batch_upsert_entities_large_batch() {
-    let (store, uid) = setup_graph().await;
+    let (store, uid, _ctx) = setup_graph().await;
 
     // 120 entities — exceeds chunk size of 50, tests multi-chunk INSERT
     let names: Vec<String> = (0..120).map(|i| format!("entity_{i}")).collect();
@@ -1109,12 +1119,13 @@ async fn test_batch_upsert_entities_large_batch() {
 
 #[tokio::test]
 async fn test_batch_upsert_entities_user_isolation() {
-    let (store, uid1) = setup_graph().await;
+    let (store, uid1, ctx) = setup_graph().await;
     let uid2 = format!("graph_test_{}", uuid::Uuid::new_v4().simple());
+    let store2 = ctx.user_store(&uid2).await.graph_store();
 
     let entities: Vec<(&str, &str, &str)> = vec![("rust", "Rust", "tech")];
     let r1 = store.batch_upsert_entities(&uid1, &entities).await.unwrap();
-    let r2 = store.batch_upsert_entities(&uid2, &entities).await.unwrap();
+    let r2 = store2.batch_upsert_entities(&uid2, &entities).await.unwrap();
 
     // Same name, different users → different entity_ids
     assert_ne!(
@@ -1126,7 +1137,7 @@ async fn test_batch_upsert_entities_user_isolation() {
 
 #[tokio::test]
 async fn test_batch_upsert_entities_end_to_end_with_links() {
-    let (store, uid) = setup_graph().await;
+    let (store, uid, _ctx) = setup_graph().await;
     let mid = format!("mem_{}", uuid::Uuid::new_v4().simple());
 
     // Simulate the full process_entity_batch flow
@@ -1149,9 +1160,10 @@ async fn test_batch_upsert_entities_end_to_end_with_links() {
         .unwrap();
 
     // Verify links exist
-    let rows = sqlx::query(
-        "SELECT entity_id FROM mem_memory_entity_links WHERE user_id = ? AND memory_id = ?",
-    )
+    let links_table = store.t("mem_memory_entity_links");
+    let rows = sqlx::query(&format!(
+        "SELECT entity_id FROM {links_table} WHERE user_id = ? AND memory_id = ?"
+    ))
     .bind(&uid)
     .bind(&mid)
     .fetch_all(store.pool())
@@ -1165,18 +1177,7 @@ async fn test_batch_upsert_entities_end_to_end_with_links() {
 
 #[tokio::test]
 async fn test_purge_cleans_entity_links() {
-    use memoria_service::MemoryService;
-    use memoria_storage::SqlMemoryStore;
-    use std::sync::Arc;
-
-    let db_url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "mysql://root:111@localhost:6001/memoria".to_string());
-    let sql = SqlMemoryStore::connect(&db_url, test_dim(), uuid::Uuid::new_v4().to_string())
-        .await
-        .expect("connect");
-    sql.migrate().await.expect("migrate");
-    let uid = format!("gpurge_el_{}", uuid::Uuid::new_v4().simple());
-    let svc = Arc::new(MemoryService::new_sql_with_llm(Arc::new(sql.clone()), None, None).await);
+    let (svc, sql, pool, uid, _ctx) = setup_service("gpurge_el").await;
 
     // Store a memory
     let r = memoria_mcp::tools::call(
@@ -1188,12 +1189,7 @@ async fn test_purge_cleans_entity_links() {
     .await
     .expect("store");
     let text = r["content"][0]["text"].as_str().unwrap_or("");
-    let mid = text
-        .split_whitespace()
-        .nth(2)
-        .unwrap_or("")
-        .trim_end_matches(':')
-        .to_string();
+    let mid = extract_memory_id(text);
     assert!(!mid.is_empty(), "should extract memory_id from response");
 
     // Wait for async entity extraction
@@ -1210,7 +1206,7 @@ async fn test_purge_cleans_entity_links() {
     )
     .bind(&uid)
     .bind(&mid)
-    .fetch_all(sql.pool())
+    .fetch_all(&pool)
     .await
     .unwrap();
     assert!(!rows.is_empty(), "entity links should exist before purge");
@@ -1238,7 +1234,7 @@ async fn test_purge_cleans_entity_links() {
     )
     .bind(&uid)
     .bind(&mid)
-    .fetch_all(sql.pool())
+    .fetch_all(&pool)
     .await
     .unwrap();
     assert!(
@@ -1247,12 +1243,14 @@ async fn test_purge_cleans_entity_links() {
     );
 
     // Verify mem_memory_entity_links cleaned
-    let rows: Vec<(String,)> =
-        sqlx::query_as("SELECT entity_id FROM mem_memory_entity_links WHERE memory_id = ?")
-            .bind(&mid)
-            .fetch_all(sql.pool())
-            .await
-            .unwrap();
+    let memory_entity_links_table = sql.graph_store().t("mem_memory_entity_links");
+    let rows: Vec<(String,)> = sqlx::query_as(&format!(
+        "SELECT entity_id FROM {memory_entity_links_table} WHERE memory_id = ?"
+    ))
+    .bind(&mid)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
     assert!(
         rows.is_empty(),
         "mem_memory_entity_links should be cleaned after purge"
@@ -1265,18 +1263,7 @@ async fn test_purge_cleans_entity_links() {
 
 #[tokio::test]
 async fn test_purge_batch_cleans_graph_and_entity_links() {
-    use memoria_service::MemoryService;
-    use memoria_storage::SqlMemoryStore;
-    use std::sync::Arc;
-
-    let db_url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "mysql://root:111@localhost:6001/memoria".to_string());
-    let sql = SqlMemoryStore::connect(&db_url, test_dim(), uuid::Uuid::new_v4().to_string())
-        .await
-        .expect("connect");
-    sql.migrate().await.expect("migrate");
-    let uid = format!("gbatch_{}", uuid::Uuid::new_v4().simple());
-    let svc = Arc::new(MemoryService::new_sql_with_llm(Arc::new(sql.clone()), None, None).await);
+    let (svc, sql, _pool, uid, _ctx) = setup_service("gbatch").await;
 
     // Store two memories
     let mut mids = Vec::new();
@@ -1290,12 +1277,7 @@ async fn test_purge_batch_cleans_graph_and_entity_links() {
         .await
         .expect("store");
         let text = r["content"][0]["text"].as_str().unwrap_or("");
-        let mid = text
-            .split_whitespace()
-            .nth(2)
-            .unwrap_or("")
-            .trim_end_matches(':')
-            .to_string();
+        let mid = extract_memory_id(text);
         mids.push(mid);
     }
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
@@ -1334,18 +1316,7 @@ async fn test_purge_batch_cleans_graph_and_entity_links() {
 
 #[tokio::test]
 async fn test_correct_cleans_old_graph_node_via_service() {
-    use memoria_service::MemoryService;
-    use memoria_storage::SqlMemoryStore;
-    use std::sync::Arc;
-
-    let db_url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "mysql://root:111@localhost:6001/memoria".to_string());
-    let sql = SqlMemoryStore::connect(&db_url, test_dim(), uuid::Uuid::new_v4().to_string())
-        .await
-        .expect("connect");
-    sql.migrate().await.expect("migrate");
-    let uid = format!("gcorrect_svc_{}", uuid::Uuid::new_v4().simple());
-    let svc = Arc::new(MemoryService::new_sql_with_llm(Arc::new(sql.clone()), None, None).await);
+    let (svc, sql, pool, uid, _ctx) = setup_service("gcorrect_svc").await;
 
     // Store
     let r = memoria_mcp::tools::call(
@@ -1357,12 +1328,7 @@ async fn test_correct_cleans_old_graph_node_via_service() {
     .await
     .expect("store");
     let text = r["content"][0]["text"].as_str().unwrap_or("");
-    let old_mid = text
-        .split_whitespace()
-        .nth(2)
-        .unwrap_or("")
-        .trim_end_matches(':')
-        .to_string();
+    let old_mid = extract_memory_id(text);
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
     // Verify old graph node exists
@@ -1393,7 +1359,7 @@ async fn test_correct_cleans_old_graph_node_via_service() {
     let rows: Vec<(String,)> =
         sqlx::query_as("SELECT entity_name FROM mem_entity_links WHERE memory_id = ?")
             .bind(&old_mid)
-            .fetch_all(sql.pool())
+            .fetch_all(&pool)
             .await
             .unwrap();
     assert!(
@@ -1411,15 +1377,7 @@ async fn test_correct_cleans_old_graph_node_via_service() {
 
 #[tokio::test]
 async fn test_governance_cleans_orphan_graph_data() {
-    use memoria_storage::SqlMemoryStore;
-
-    let db_url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "mysql://root:111@localhost:6001/memoria".to_string());
-    let sql = SqlMemoryStore::connect(&db_url, test_dim(), uuid::Uuid::new_v4().to_string())
-        .await
-        .expect("connect");
-    sql.migrate().await.expect("migrate");
-    let uid = format!("gorphan_{}", uuid::Uuid::new_v4().simple());
+    let (sql, pool, uid, _ctx) = setup_sql("gorphan").await;
 
     // Insert a memory, then soft-delete it (simulating a crash mid-purge)
     let mid = uuid::Uuid::new_v4().simple().to_string();
@@ -1442,7 +1400,8 @@ async fn test_governance_cleans_orphan_graph_data() {
         access_count: 0,
         retrieval_score: None,
     };
-    sql.insert_into("mem_memories", &mem).await.expect("insert");
+    let memories_table = sql.t("mem_memories");
+    sql.insert_into(&memories_table, &mem).await.expect("insert");
 
     // Create graph node + entity links pointing to this memory
     let graph = sql.graph_store();
@@ -1471,7 +1430,7 @@ async fn test_governance_cleans_orphan_graph_data() {
     let el_rows: Vec<(String,)> =
         sqlx::query_as("SELECT entity_name FROM mem_entity_links WHERE memory_id = ?")
             .bind(&mid)
-            .fetch_all(sql.pool())
+            .fetch_all(&pool)
             .await
             .unwrap();
     assert!(!el_rows.is_empty(), "orphan entity links should exist");
@@ -1492,7 +1451,7 @@ async fn test_governance_cleans_orphan_graph_data() {
     let el_rows: Vec<(String,)> =
         sqlx::query_as("SELECT entity_name FROM mem_entity_links WHERE memory_id = ?")
             .bind(&mid)
-            .fetch_all(sql.pool())
+            .fetch_all(&pool)
             .await
             .unwrap();
     assert!(el_rows.is_empty(), "orphan entity links should be cleaned");
