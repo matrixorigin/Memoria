@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.2] - 2026-04-17
+
+### 🐛 Bug Fixes
+
+- **multidb**: Default fresh deployments to multi-db (#188) ([de98df6](https://github.com/matrixorigin/Memoria/commit/de98df6b64fb692f2bf1711136783178ccefc3ce))
+- **storage**: Remove routed USE db dependency (#187) ([11603af](https://github.com/matrixorigin/Memoria/commit/11603afa9f7e11599a6f8a09db04c725133f6024))
 ## [0.3.1] - 2026-04-16
 
 ### ⚡ Performance
