@@ -4488,14 +4488,14 @@ impl SqlMemoryStore {
         if cursor.is_some() {
             inner.push_str(" AND memory_id < ?");
         }
-        inner.push_str(" ORDER BY created_at DESC, memory_id DESC LIMIT ?");
+        inner.push_str(" ORDER BY memory_id DESC LIMIT ?");
 
         let sql = format!(
             "SELECT memory_id, user_id, memory_type, content, \
              session_id, is_active, superseded_by, trust_tier, \
              initial_confidence, observed_at, created_at, updated_at \
              FROM {table} WHERE memory_id IN ({inner}) \
-             ORDER BY created_at DESC, memory_id DESC"
+             ORDER BY memory_id DESC"
         );
 
         let mut q = sqlx::query(&sql).bind(user_id);

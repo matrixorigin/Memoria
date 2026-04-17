@@ -1321,6 +1321,85 @@ async fn test_master_key_can_impersonate_and_access_any_user() {
     assert_eq!(r.status(), 403, "API key must not access admin routes");
 }
 
+#[tokio::test]
+async fn test_non_master_cannot_probe_other_users_memory_ids() {
+    let mk = "test-master-key-tenant-isolation";
+    let (base, client, _server) = spawn_server_with_master_key(mk).await;
+    let auth = format!("Bearer {mk}");
+    let owner = uid();
+    let intruder = uid();
+    let owner_key = create_api_key_for_user(&client, &base, &auth, &owner, "owner-key").await;
+    let intruder_key =
+        create_api_key_for_user(&client, &base, &auth, &intruder, "intruder-key").await;
+
+    let r = client
+        .post(format!("{base}/v1/memories"))
+        .header("Authorization", format!("Bearer {owner_key}"))
+        .json(&json!({ "content": "owner private memory", "memory_type": "semantic" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 201);
+    let memory_id = r.json::<Value>().await.unwrap()["memory_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let r = client
+        .get(format!("{base}/v1/memories/{memory_id}"))
+        .header("Authorization", format!("Bearer {intruder_key}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        r.status(),
+        200,
+        "foreign GET must match missing-memory response"
+    );
+    assert!(r.json::<Value>().await.unwrap().is_null());
+
+    let r = client
+        .put(format!("{base}/v1/memories/{memory_id}/correct"))
+        .header("Authorization", format!("Bearer {intruder_key}"))
+        .json(&json!({ "new_content": "intruder overwrite" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        r.status(),
+        404,
+        "foreign correct must look like missing memory"
+    );
+
+    let r = client
+        .delete(format!("{base}/v1/memories/{memory_id}"))
+        .header("Authorization", format!("Bearer {intruder_key}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        r.status(),
+        404,
+        "foreign delete must look like missing memory"
+    );
+
+    let r = client
+        .get(format!("{base}/v1/memories/{memory_id}"))
+        .header("Authorization", format!("Bearer {owner_key}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        r.status(),
+        200,
+        "failed probes must not mutate owner memory"
+    );
+    assert_eq!(
+        r.json::<Value>().await.unwrap()["content"],
+        "owner private memory"
+    );
+}
+
 // ── 10b-7. revoked API key returns 401 ───────────────────────────────────────
 
 #[tokio::test]
@@ -3622,7 +3701,7 @@ async fn test_admin_set_user_params() {
     let pool = server.shared_pool();
     let config_table = server.shared_table("mem_user_memory_config");
     let _ = sqlx::query(&format!(
-            "CREATE TABLE IF NOT EXISTS {config_table} (\
+        "CREATE TABLE IF NOT EXISTS {config_table} (\
              user_id VARCHAR(128) PRIMARY KEY, \
              strategy_key VARCHAR(64) DEFAULT NULL, \
              params_json JSON DEFAULT NULL, \
@@ -3630,10 +3709,12 @@ async fn test_admin_set_user_params() {
     ))
     .execute(&pool)
     .await;
-    let _ = sqlx::query(&format!("INSERT IGNORE INTO {config_table} (user_id) VALUES (?)"))
-        .bind(&uid)
-        .execute(&pool)
-        .await;
+    let _ = sqlx::query(&format!(
+        "INSERT IGNORE INTO {config_table} (user_id) VALUES (?)"
+    ))
+    .bind(&uid)
+    .execute(&pool)
+    .await;
 
     // Set params
     let params = json!({"vector_weight": 0.7, "keyword_weight": 0.3, "max_results": 20});
@@ -5042,9 +5123,14 @@ async fn test_distributed_lock_acquire_release() {
     use memoria_service::DistributedLock;
     use std::time::Duration;
 
-    let ctx =
-        memoria_test_utils::MultiDbTestContext::new(&db_url(), "api_e2e_lock", test_dim(), None, None)
-            .await;
+    let ctx = memoria_test_utils::MultiDbTestContext::new(
+        &db_url(),
+        "api_e2e_lock",
+        test_dim(),
+        None,
+        None,
+    )
+    .await;
     let store = ctx.shared_store();
 
     let lock_key = format!("test_lock_{}", uuid::Uuid::new_v4().simple());
@@ -6090,15 +6176,14 @@ async fn test_last_used_batcher_coalesces_and_flushes() {
 
     // Verify last_used_at was updated for all 3 keys
     for hash in &hashes {
-        let row: Option<(Option<chrono::NaiveDateTime>,)> =
-            sqlx::query_as(&format!(
-                "SELECT last_used_at FROM {} WHERE key_hash = ?",
-                store.t("mem_api_keys")
-            ))
-                .bind(hash)
-                .fetch_optional(store.pool())
-                .await
-                .expect("query");
+        let row: Option<(Option<chrono::NaiveDateTime>,)> = sqlx::query_as(&format!(
+            "SELECT last_used_at FROM {} WHERE key_hash = ?",
+            store.t("mem_api_keys")
+        ))
+        .bind(hash)
+        .fetch_optional(store.pool())
+        .await
+        .expect("query");
         let (last_used,) = row.expect("key should exist");
         assert!(
             last_used.is_some(),
@@ -6176,15 +6261,14 @@ async fn test_api_key_auth_uses_batcher_not_fire_and_forget() {
         "{:x}",
         <sha2::Sha256 as sha2::Digest>::digest(raw_key.as_bytes())
     );
-    let row: Option<(Option<chrono::NaiveDateTime>,)> =
-        sqlx::query_as(&format!(
-            "SELECT last_used_at FROM {} WHERE key_hash = ?",
-            verify_store.t("mem_api_keys")
-        ))
-            .bind(&key_hash)
-            .fetch_optional(verify_store.pool())
-            .await
-            .expect("query");
+    let row: Option<(Option<chrono::NaiveDateTime>,)> = sqlx::query_as(&format!(
+        "SELECT last_used_at FROM {} WHERE key_hash = ?",
+        verify_store.t("mem_api_keys")
+    ))
+    .bind(&key_hash)
+    .fetch_optional(verify_store.pool())
+    .await
+    .expect("query");
     let (last_used,) = row.expect("key should exist");
     assert!(
         last_used.is_some(),
@@ -6422,10 +6506,10 @@ async fn test_remote_purge_cleans_graph_and_entity_links() {
         "SELECT COUNT(*) FROM {} WHERE memory_id = ?",
         user_store.t("mem_entity_links")
     ))
-        .bind(&mid)
-        .fetch_one(user_store.pool())
-        .await
-        .unwrap();
+    .bind(&mid)
+    .fetch_one(user_store.pool())
+    .await
+    .unwrap();
     assert_eq!(
         cnt, 0,
         "mem_entity_links should be cleaned after remote purge"
@@ -6502,10 +6586,10 @@ async fn test_remote_purge_topic_cleans_graph_and_entity_links() {
         "SELECT COUNT(*) FROM {} WHERE memory_id = ?",
         user_store.t("mem_entity_links")
     ))
-        .bind(&mid)
-        .fetch_one(user_store.pool())
-        .await
-        .unwrap();
+    .bind(&mid)
+    .fetch_one(user_store.pool())
+    .await
+    .unwrap();
     assert_eq!(cnt, 0, "entity links should be cleaned after topic purge");
 
     println!("✅ remote purge topic: graph + entity links cleaned");
@@ -6522,9 +6606,13 @@ async fn test_remote_correct_cleans_graph_and_entity_links() {
     let remote = RemoteClient::new(&base, None, uid.clone(), None);
     let user_store = server.user_store(&uid).await;
 
-    let old_mid =
-        remote_store_with_links(&remote, &user_store, &uid, "Remote correct graph old content")
-            .await;
+    let old_mid = remote_store_with_links(
+        &remote,
+        &user_store,
+        &uid,
+        "Remote correct graph old content",
+    )
+    .await;
 
     // Correct
     let r = remote
@@ -6552,10 +6640,10 @@ async fn test_remote_correct_cleans_graph_and_entity_links() {
         "SELECT COUNT(*) FROM {} WHERE memory_id = ?",
         user_store.t("mem_entity_links")
     ))
-        .bind(&old_mid)
-        .fetch_one(user_store.pool())
-        .await
-        .unwrap();
+    .bind(&old_mid)
+    .fetch_one(user_store.pool())
+    .await
+    .unwrap();
     assert_eq!(
         cnt, 0,
         "old entity links should be cleaned after remote correct"
@@ -6606,15 +6694,14 @@ async fn test_remote_correct_by_query_cleans_graph_and_entity_links() {
             cnt, 0,
             "old graph node should be deactivated after remote correct by query"
         );
-        let cnt: i64 =
-            sqlx::query_scalar(&format!(
-                "SELECT COUNT(*) FROM {} WHERE memory_id = ?",
-                user_store.t("mem_entity_links")
-            ))
-                .bind(&old_mid)
-                .fetch_one(user_store.pool())
-                .await
-                .unwrap();
+        let cnt: i64 = sqlx::query_scalar(&format!(
+            "SELECT COUNT(*) FROM {} WHERE memory_id = ?",
+            user_store.t("mem_entity_links")
+        ))
+        .bind(&old_mid)
+        .fetch_one(user_store.pool())
+        .await
+        .unwrap();
         assert_eq!(
             cnt, 0,
             "old entity links should be cleaned after remote correct by query"

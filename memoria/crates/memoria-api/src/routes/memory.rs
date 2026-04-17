@@ -51,7 +51,11 @@ async fn find_memory_any_user(
             .await
             .map_err(api_err_typed)?;
         let table = sql.active_table(&candidate).await.map_err(api_err_typed)?;
-        if let Some(memory) = sql.get_from(&table, memory_id).await.map_err(api_err_typed)? {
+        if let Some(memory) = sql
+            .get_from(&table, memory_id)
+            .await
+            .map_err(api_err_typed)?
+        {
             return Ok(Some((candidate, memory)));
         }
     }
@@ -319,10 +323,11 @@ pub async fn get_memory(
         return Ok(Json(Some(memory.into())));
     }
 
-    if let Some((owner_id, memory)) = find_memory_any_user(&state, &id).await? {
-        if !is_master && owner_id != user_id {
-            return Err((StatusCode::FORBIDDEN, "Not your memory".to_string()));
-        }
+    if !is_master {
+        return Ok(Json(None));
+    }
+
+    if let Some((_, memory)) = find_memory_any_user(&state, &id).await? {
         return Ok(Json(Some(memory.into())));
     }
 
@@ -341,25 +346,16 @@ pub async fn correct_memory(
             .map(|(owner_id, _)| owner_id)
             .unwrap_or_else(|| user_id.clone())
     } else {
-        match state
+        if state
             .service
             .get_for_user(&user_id, &id)
             .await
             .map_err(api_err_typed)?
+            .is_none()
         {
-            Some(memory) => {
-                if memory.user_id != user_id {
-                    return Err((StatusCode::FORBIDDEN, "Not your memory".to_string()));
-                }
-                user_id.clone()
-            }
-            None => {
-                if find_memory_any_user(&state, &id).await?.is_some() {
-                    return Err((StatusCode::FORBIDDEN, "Not your memory".to_string()));
-                }
-                return Err((StatusCode::NOT_FOUND, "Memory not found".to_string()));
-            }
+            return Err((StatusCode::NOT_FOUND, "Memory not found".to_string()));
         }
+        user_id.clone()
     };
     let m = state
         .service
@@ -404,25 +400,16 @@ pub async fn delete_memory(
             .map(|(owner_id, _)| owner_id)
             .unwrap_or_else(|| user_id.clone())
     } else {
-        match state
+        if state
             .service
             .get_for_user(&user_id, &id)
             .await
             .map_err(api_err_typed)?
+            .is_none()
         {
-            Some(memory) => {
-                if memory.user_id != user_id {
-                    return Err((StatusCode::FORBIDDEN, "Not your memory".to_string()));
-                }
-                user_id.clone()
-            }
-            None => {
-                if find_memory_any_user(&state, &id).await?.is_some() {
-                    return Err((StatusCode::FORBIDDEN, "Not your memory".to_string()));
-                }
-                return Err((StatusCode::NOT_FOUND, "Memory not found".to_string()));
-            }
+            return Err((StatusCode::NOT_FOUND, "Memory not found".to_string()));
         }
+        user_id.clone()
     };
     let _ = state
         .service

@@ -9,9 +9,54 @@
 mod support;
 
 use serde_json::json;
+use std::{
+    future::Future,
+    sync::{Mutex, OnceLock},
+};
 
 fn uid() -> String {
     format!("pool_test_{}", uuid::Uuid::new_v4().simple())
+}
+
+async fn with_env_async<F, Fut, T>(vars: &[(&str, Option<&str>)], f: F) -> T
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = T>,
+{
+    static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    let _lock = ENV_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
+    struct EnvGuard(Vec<(String, Option<std::ffi::OsString>)>);
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (key, old) in &self.0 {
+                match old {
+                    Some(value) => unsafe { std::env::set_var(key, value) },
+                    None => unsafe { std::env::remove_var(key) },
+                }
+            }
+        }
+    }
+
+    let _restore = EnvGuard(
+        vars.iter()
+            .map(|(key, value)| {
+                let old = std::env::var_os(key);
+                match value {
+                    Some(value) => unsafe { std::env::set_var(key, value) },
+                    None => unsafe { std::env::remove_var(key) },
+                }
+                (key.to_string(), old)
+            })
+            .collect(),
+    );
+
+    f().await
 }
 
 /// Spawn server with a tiny routed user pool (2 connections) to make saturation easy.
@@ -21,16 +66,27 @@ async fn spawn_tiny_pool_server() -> (
     sqlx::MySqlPool,
     support::multi_db::ApiTestServer,
 ) {
-    unsafe {
-        std::env::set_var("MEMORIA_GLOBAL_USER_POOL_MAX", "2");
-        std::env::set_var("MEMORIA_USER_SCHEMA_INIT_POOL_MAX_CONNECTIONS", "1");
-    }
-
-    let server =
-        support::multi_db::spawn_api_server("pool_isolation", 1024, String::new(), None, None, None, false)
+    with_env_async(
+        &[
+            ("MEMORIA_GLOBAL_USER_POOL_MAX", Some("2")),
+            ("MEMORIA_USER_SCHEMA_INIT_POOL_MAX_CONNECTIONS", Some("1")),
+        ],
+        || async {
+            let server = support::multi_db::spawn_api_server(
+                "pool_isolation",
+                1024,
+                String::new(),
+                None,
+                None,
+                None,
+                false,
+            )
             .await;
-    let pool = server.router().global_user_pool().clone();
-    (server.base.clone(), server.client.clone(), pool, server)
+            let pool = server.router().global_user_pool().clone();
+            (server.base.clone(), server.client.clone(), pool, server)
+        },
+    )
+    .await
 }
 
 #[tokio::test]
