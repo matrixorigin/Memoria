@@ -1814,6 +1814,61 @@ async fn test_remote_store_retrieve() {
 }
 
 #[tokio::test]
+async fn test_remote_retrieve_session_scope_only_includes_unscoped() {
+    use memoria_mcp::remote::RemoteClient;
+
+    let (base, _, _server) =
+        spawn_server_with_custom_embedder_and_pool(Arc::new(SessionScopeTestEmbedder), test_dim())
+            .await;
+    let uid = uid();
+    let remote = RemoteClient::new(&base, None, uid.clone(), None);
+    let target_session = format!("session:test-retrieve-{}", uuid::Uuid::new_v4().simple());
+    let other_session = format!("session:test-retrieve-{}", uuid::Uuid::new_v4().simple());
+
+    remote
+        .call(
+            "memory_store",
+            json!({"content": "target-session memory", "session_id": target_session}),
+        )
+        .await
+        .unwrap();
+    remote
+        .call("memory_store", json!({"content": "global-unscoped top"}))
+        .await
+        .unwrap();
+    remote
+        .call(
+            "memory_store",
+            json!({"content": "other-session top", "session_id": other_session}),
+        )
+        .await
+        .unwrap();
+
+    let strict = remote
+        .call(
+            "memory_retrieve",
+            json!({
+                "query": "strict session query",
+                "session_id": target_session,
+                "session_scope": "only",
+                "top_k": 1
+            }),
+        )
+        .await
+        .unwrap();
+    let strict_text = strict["content"][0]["text"].as_str().unwrap_or("");
+    assert!(
+        strict_text.contains("global-unscoped top"),
+        "strict remote retrieve should include unscoped memory: {strict_text}"
+    );
+    assert!(
+        !strict_text.contains("other-session top"),
+        "strict remote retrieve should exclude other scoped sessions: {strict_text}"
+    );
+    println!("✅ remote retrieve session_scope=only includes unscoped");
+}
+
+#[tokio::test]
 async fn test_remote_correct_purge() {
     use memoria_mcp::remote::RemoteClient;
 
@@ -1954,6 +2009,61 @@ async fn test_remote_list_search_profile() {
         "profile: {t}"
     );
     println!("✅ remote profile: {t}");
+}
+
+#[tokio::test]
+async fn test_remote_search_session_scope_only_includes_unscoped() {
+    use memoria_mcp::remote::RemoteClient;
+
+    let (base, _, _server) =
+        spawn_server_with_custom_embedder_and_pool(Arc::new(SessionScopeTestEmbedder), test_dim())
+            .await;
+    let uid = uid();
+    let remote = RemoteClient::new(&base, None, uid.clone(), None);
+    let target_session = format!("session:test-search-{}", uuid::Uuid::new_v4().simple());
+    let other_session = format!("session:test-search-{}", uuid::Uuid::new_v4().simple());
+
+    remote
+        .call(
+            "memory_store",
+            json!({"content": "target-session memory", "session_id": target_session}),
+        )
+        .await
+        .unwrap();
+    remote
+        .call("memory_store", json!({"content": "global-unscoped top"}))
+        .await
+        .unwrap();
+    remote
+        .call(
+            "memory_store",
+            json!({"content": "other-session top", "session_id": other_session}),
+        )
+        .await
+        .unwrap();
+
+    let strict = remote
+        .call(
+            "memory_search",
+            json!({
+                "query": "strict session query",
+                "session_id": target_session,
+                "session_scope": "only",
+                "top_k": 1
+            }),
+        )
+        .await
+        .unwrap();
+    let strict_text = strict["content"][0]["text"].as_str().unwrap_or("");
+    assert!(
+        strict_text.contains("global-unscoped top"),
+        "strict remote search should include unscoped memory: {strict_text}"
+    );
+    assert!(
+        !strict_text.contains("other-session top"),
+        "strict remote search should exclude other scoped sessions: {strict_text}"
+    );
+    println!("✅ remote search session_scope=only includes unscoped");
 }
 
 #[tokio::test]
@@ -2620,6 +2730,13 @@ async fn test_remote_list_session_id_filter() {
         )
         .await
         .unwrap();
+    remote
+        .call(
+            "memory_store",
+            json!({"content": "remote global list gamma"}),
+        )
+        .await
+        .unwrap();
 
     let list = remote
         .call(
@@ -2636,6 +2753,10 @@ async fn test_remote_list_session_id_filter() {
     assert!(
         !list_text.contains("remote other list beta"),
         "got: {list_text}"
+    );
+    assert!(
+        !list_text.contains("remote global list gamma"),
+        "exact session filter should exclude unscoped memories: {list_text}"
     );
     println!("✅ remote list session_id filter");
 }
@@ -7024,6 +7145,30 @@ async fn test_mcp_memory_retrieve_session_scope_end_to_end() {
         );
     }
 
+    let global_resp = mcp_post_with_headers(
+        &client,
+        &base,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 131,
+            "method": "tools/call",
+            "params": {
+                "name": "memory_store",
+                "arguments": {
+                    "content": "global-unscoped top",
+                    "memory_type": "semantic"
+                }
+            }
+        }),
+        &headers,
+    )
+    .await;
+    assert!(
+        global_resp["error"].is_null(),
+        "unexpected unscoped store error: {}",
+        global_resp["error"]
+    );
+
     let relaxed = mcp_post_with_headers(
         &client,
         &base,
@@ -7081,8 +7226,8 @@ async fn test_mcp_memory_retrieve_session_scope_end_to_end() {
     );
     let strict_text = mcp_result_text(&strict);
     assert!(
-        strict_text.contains("target-session memory"),
-        "strict MCP retrieve should return the target-session memory: {strict_text}"
+        strict_text.contains("global-unscoped top"),
+        "strict MCP retrieve should include unscoped memory: {strict_text}"
     );
     assert!(
         !strict_text.contains("other-session top"),
@@ -7128,6 +7273,30 @@ async fn test_mcp_memory_search_session_scope_end_to_end() {
             resp["error"]
         );
     }
+
+    let global_resp = mcp_post_with_headers(
+        &client,
+        &base,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 231,
+            "method": "tools/call",
+            "params": {
+                "name": "memory_store",
+                "arguments": {
+                    "content": "global-unscoped top",
+                    "memory_type": "semantic"
+                }
+            }
+        }),
+        &headers,
+    )
+    .await;
+    assert!(
+        global_resp["error"].is_null(),
+        "unexpected unscoped store error: {}",
+        global_resp["error"]
+    );
 
     let relaxed = mcp_post_with_headers(
         &client,
@@ -7186,8 +7355,8 @@ async fn test_mcp_memory_search_session_scope_end_to_end() {
     );
     let strict_text = mcp_result_text(&strict);
     assert!(
-        strict_text.contains("target-session memory"),
-        "strict MCP search should return the target-session memory: {strict_text}"
+        strict_text.contains("global-unscoped top"),
+        "strict MCP search should include unscoped memory: {strict_text}"
     );
     assert!(
         !strict_text.contains("other-session top"),

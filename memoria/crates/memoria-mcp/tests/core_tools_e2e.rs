@@ -170,6 +170,51 @@ async fn test_retrieve_empty() {
     println!("✅ retrieve empty: {}", text(&r));
 }
 
+#[tokio::test]
+async fn test_retrieve_session_scope_only() {
+    let (svc, uid, _ctx) = setup().await;
+    let target_session = format!("session:test-retrieve-{}", Uuid::new_v4().simple());
+    let other_session = format!("session:test-retrieve-{}", Uuid::new_v4().simple());
+
+    call(
+        "memory_store",
+        json!({"content": "shared retrieve token target", "session_id": target_session}),
+        &svc,
+        &uid,
+    )
+    .await;
+    call(
+        "memory_store",
+        json!({"content": "shared retrieve token other", "session_id": other_session}),
+        &svc,
+        &uid,
+    )
+    .await;
+    call(
+        "memory_store",
+        json!({"content": "shared retrieve token global"}),
+        &svc,
+        &uid,
+    )
+    .await;
+
+    let r = call(
+        "memory_retrieve",
+        json!({"query": "shared retrieve token", "session_id": target_session, "session_scope": "only", "top_k": 5}),
+        &svc,
+        &uid,
+    )
+    .await;
+    let t = text(&r);
+    assert!(t.contains("shared retrieve token target"), "got: {t}");
+    assert!(t.contains("shared retrieve token global"), "got: {t}");
+    assert!(
+        !t.contains("shared retrieve token other"),
+        "session_scope=only should exclude other scoped sessions: {t}"
+    );
+    println!("✅ retrieve session_scope=only");
+}
+
 // ── 5. memory_search: top_k respected ────────────────────────────────────────
 
 #[tokio::test]
@@ -702,6 +747,13 @@ async fn test_list_session_id_filter() {
         &uid,
     )
     .await;
+    call(
+        "memory_store",
+        json!({"content": "list global gamma"}),
+        &svc,
+        &uid,
+    )
+    .await;
 
     let r = call(
         "memory_list",
@@ -713,6 +765,10 @@ async fn test_list_session_id_filter() {
     let t = text(&r);
     assert!(t.contains("list target alpha"), "got: {t}");
     assert!(!t.contains("list other beta"), "got: {t}");
+    assert!(
+        !t.contains("list global gamma"),
+        "exact session list should exclude unscoped memories: {t}"
+    );
     println!("✅ list exact session filter");
 }
 
