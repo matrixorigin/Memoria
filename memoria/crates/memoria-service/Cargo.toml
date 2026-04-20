@@ -32,6 +32,7 @@ dashmap = "6"
 tokio = { workspace = true }
 async-trait = { workspace = true }
 memoria-core = { workspace = true }
+memoria-test-utils = { workspace = true }
 
 [build-dependencies]
 tonic-build = "0.12"
