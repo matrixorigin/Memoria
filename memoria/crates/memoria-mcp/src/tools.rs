@@ -38,6 +38,22 @@ fn parse_session_scope_arg(args: &Value) -> Result<Option<memoria_service::Sessi
         .map_err(|e| anyhow::anyhow!("{e}"))
 }
 
+fn parse_retrieve_options_arg(args: &Value) -> Result<memoria_service::RetrieveOptions> {
+    let session_id = args
+        .get("session_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty());
+    let session_scope = parse_session_scope_arg(args)?;
+    if session_scope.is_some() && session_id.is_none() {
+        anyhow::bail!("session_id is required when session_scope is set");
+    }
+    Ok(memoria_service::RetrieveOptions::from_session_scope(
+        session_id,
+        session_scope,
+    ))
+}
+
 enum ToolCallName {
     MemoryStore,
     MemoryRetrieve,
@@ -118,7 +134,7 @@ pub fn list() -> Value {
                     "query": {"type": "string"},
                     "top_k": {"type": "integer", "default": 5},
                     "session_id": {"type": "string"},
-                    "session_scope": {"type": "string", "enum": ["prefer", "only"], "description": "How to use session_id: prefer=session-aware retrieval that may still return cross-session memories; only=strictly filter to that session"},
+                    "session_scope": {"type": "string", "enum": ["prefer", "only"], "description": "How to use session_id: prefer=non-strict retrieval using the provided session_id as context; only=strictly filter to that session"},
                     "explain": {"type": ["boolean", "string"], "default": false, "description": "Explain level: false/\"none\"=off, true/\"basic\"=timing+path, \"verbose\"=+per-candidate scores, \"analyze\"=full"}
                 },
                 "required": ["query"]
@@ -133,7 +149,7 @@ pub fn list() -> Value {
                     "query": {"type": "string"},
                     "top_k": {"type": "integer", "default": 10},
                     "session_id": {"type": "string"},
-                    "session_scope": {"type": "string", "enum": ["prefer", "only"], "description": "How to use session_id: prefer=session-aware search that may still return cross-session memories; only=strictly filter to that session"},
+                    "session_scope": {"type": "string", "enum": ["prefer", "only"], "description": "How to use session_id: prefer=non-strict search using the provided session_id as context; only=strictly filter to that session"},
                     "explain": {"type": ["boolean", "string"], "default": false, "description": "Explain level: false/\"none\"=off, true/\"basic\"=timing+path, \"verbose\"=+per-candidate scores, \"analyze\"=full"}
                 },
                 "required": ["query"]
@@ -149,7 +165,7 @@ pub fn list() -> Value {
                     "query": {"type": "string", "description": "Semantic search to find memory to correct"},
                     "new_content": {"type": "string"},
                     "session_id": {"type": "string", "description": "Optional session to use when resolving query-based correction"},
-                    "session_scope": {"type": "string", "enum": ["prefer", "only"], "description": "Only used with query-based correction. prefer=session-aware lookup; only=restrict lookup to the given session"},
+                    "session_scope": {"type": "string", "enum": ["prefer", "only"], "description": "Only used with query-based correction. prefer=non-strict lookup using the provided session_id as context; only=restrict lookup to the given session"},
                     "reason": {"type": "string"}
                 },
                 "required": ["new_content"]
@@ -355,10 +371,7 @@ pub async fn call(
             } else {
                 args["top_k"].as_i64().unwrap_or(5)
             };
-            let retrieve_options = memoria_service::RetrieveOptions::from_session_scope(
-                args["session_id"].as_str(),
-                parse_session_scope_arg(&args)?,
-            );
+            let retrieve_options = parse_retrieve_options_arg(&args)?;
             // explain accepts bool or string: true/"basic"/"verbose"/"analyze"
             let explain_str = match &args["explain"] {
                 serde_json::Value::Bool(true) => "basic",
@@ -420,10 +433,7 @@ pub async fn call(
             let old_mid = if !memory_id.is_empty() {
                 memory_id.to_string()
             } else if !query.is_empty() {
-                let retrieve_options = memoria_service::RetrieveOptions::from_session_scope(
-                    args["session_id"].as_str(),
-                    parse_session_scope_arg(&args)?,
-                );
+                let retrieve_options = parse_retrieve_options_arg(&args)?;
                 let results = service
                     .retrieve_with_options(user_id, query, 1, &retrieve_options)
                     .await?;

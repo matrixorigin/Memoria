@@ -234,6 +234,22 @@ async fn test_search_session_scope_only() {
     println!("✅ search session_scope=only");
 }
 
+#[tokio::test]
+async fn test_search_session_scope_requires_session_id() {
+    let (svc, uid, _ctx) = setup().await;
+    let r = call(
+        "memory_search",
+        json!({"query": "shared search token", "session_scope": "only", "top_k": 5}),
+        &svc,
+        &uid,
+    )
+    .await;
+    assert_eq!(
+        text(&r),
+        "session_id is required when session_scope is set"
+    );
+}
+
 // ── 6. memory_correct by memory_id ───────────────────────────────────────────
 
 #[tokio::test]
@@ -348,6 +364,27 @@ async fn test_correct_by_query_session_scope_only() {
     assert!(contents.contains(&"formatting target uses ruff"));
     assert!(contents.contains(&"formatting other uses black"));
     println!("✅ correct by query session_scope=only");
+}
+
+#[tokio::test]
+async fn test_correct_by_query_session_scope_requires_session_id() {
+    let (svc, uid, _ctx) = setup().await;
+    let r = call(
+        "memory_correct",
+        json!({
+            "query": "formatting uses black",
+            "session_scope": "only",
+            "new_content": "formatting target uses ruff",
+            "reason": "switched"
+        }),
+        &svc,
+        &uid,
+    )
+    .await;
+    assert_eq!(
+        text(&r),
+        "session_id is required when session_scope is set"
+    );
 }
 
 // ── 8. memory_correct: no target returns error ───────────────────────────────
