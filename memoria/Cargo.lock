@@ -2268,6 +2268,7 @@ dependencies = [
  "memoria-embedding",
  "memoria-git",
  "memoria-storage",
+ "memoria-test-utils",
  "moka",
  "prost",
  "protoc-bin-vendored",

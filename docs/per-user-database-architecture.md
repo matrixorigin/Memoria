@@ -665,14 +665,15 @@ LLM_MODEL=<model-name>
 
 | 变量 | 用途 |
 |---|---|
+| `MEMORIA_MULTI_DB_POOL_BUDGET` | multi-db 连接池默认预算基线；默认 `512`，上限 `2048`；未显式配置的池按 `global/shared/auth/init/governance = 60/20/10/5/5` 推导 |
 | `MEMORIA_GLOBAL_USER_POOL_MAX` | global user pool 大小 |
 | `MEMORIA_LEGACY_MIGRATION_MAX_CONCURRENCY` | 启动期 legacy -> multi-db 自动迁移的用户并发上限 |
 | `MEMORIA_USER_SCHEMA_INIT_POOL_MAX_CONNECTIONS` | 首次用户 schema init / compat migration 专用池大小 |
 | `MEMORIA_USER_SCHEMA_INIT_MAX_CONCURRENCY` | 首次用户 schema init 并发上限 |
-| `MEMORIA_SHARED_POOL_MAX_CONNECTIONS` | shared router 组件默认配额 |
-| `MEMORIA_SHARED_MAIN_POOL_MAX_CONNECTIONS` | shared store 组件默认配额 |
-| `MEMORIA_GIT_POOL_MAX_CONNECTIONS` | git 组件默认配额 |
-| `MEMORIA_MERGED_SHARED_POOL_MAX_CONNECTIONS` | 显式覆盖合并后 shared DB 固定池大小 |
+| `MEMORIA_SHARED_POOL_MAX_CONNECTIONS` | 兼容旧配置的 shared router 组件配额；仅在显式设置时参与 merged shared pool 计算 |
+| `MEMORIA_SHARED_MAIN_POOL_MAX_CONNECTIONS` | 兼容旧配置的 shared store 组件配额；仅在显式设置时参与 merged shared pool 计算 |
+| `MEMORIA_GIT_POOL_MAX_CONNECTIONS` | 兼容旧配置的 git 组件配额；仅在显式设置时参与 merged shared pool 计算 |
+| `MEMORIA_MERGED_SHARED_POOL_MAX_CONNECTIONS` | 显式覆盖 merged shared pool 大小；优先级高于 budget 推导 |
 | `MEMORIA_AUTH_POOL_MAX_CONNECTIONS` | auth 专用连接池大小 |
 | `MEMORIA_AUTH_POOL_ACQUIRE_TIMEOUT_SECS` | auth 池获取超时 |
 | `DB_MAX_LIFETIME_SECS` | DB 连接最大生命周期 |
