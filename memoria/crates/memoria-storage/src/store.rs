@@ -1043,6 +1043,11 @@ impl SqlMemoryStore {
                 );
                 let mut s = Self::new(pool, self.embedding_dim, self.instance_id.clone());
                 s.database_url = self.database_url.clone();
+                s.configured_max_connections = Some(max_connections);
+                {
+                    let mut health = s.pool_health.lock().unwrap();
+                    health.configured_max_connections = Some(max_connections);
+                }
                 // Share the same edit_log_tx Arc so clear_edit_log_tx drains all stores at once
                 s.edit_log_tx = self.edit_log_tx.clone();
                 s.db_router = self.db_router.clone();

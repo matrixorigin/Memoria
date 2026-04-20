@@ -10,7 +10,7 @@
 
 use std::sync::Arc;
 
-use memoria_storage::SqlMemoryStore;
+use memoria_storage::{configured_multi_db_pool_size, MultiDbPoolKind, SqlMemoryStore};
 use tokio::time::{interval, Duration};
 use tracing::{error, info, warn};
 
@@ -42,6 +42,7 @@ pub struct GovernanceScheduler {
     lock: Arc<dyn DistributedLock>,
     instance_id: String,
     lock_ttl: Duration,
+    isolated_pool_max_connections: Option<u32>,
 }
 
 #[derive(Clone)]
@@ -79,17 +80,26 @@ impl GovernanceScheduler {
 
         // Create an isolated pool for governance so long-running operations
         // (consolidation, cleanup, DDL rebuilds) do not starve request connections.
-        let default_governance_pool_size = if service.db_router.is_some() { 2 } else { 4 };
-        let governance_pool_size: u32 = std::env::var("GOVERNANCE_POOL_SIZE")
+        let governance_pool_size = match std::env::var("GOVERNANCE_POOL_SIZE")
             .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(default_governance_pool_size)
-            .min(32);
+            .and_then(|s| s.parse::<u32>().ok())
+        {
+            Some(0) => 0,
+            Some(raw) => raw.clamp(
+                1,
+                memoria_storage::multi_db_pool_max_size(MultiDbPoolKind::Governance),
+            ),
+            None if service.db_router.is_some() => {
+                configured_multi_db_pool_size("GOVERNANCE_POOL_SIZE", MultiDbPoolKind::Governance)
+            }
+            None => 4,
+        };
         #[allow(clippy::type_complexity)]
-        let (gov_store, gov_sql_store, lock): (
+        let (gov_store, gov_sql_store, lock, isolated_pool_max_connections): (
             Option<Arc<dyn GovernanceStore>>,
             Option<Arc<SqlMemoryStore>>,
             Arc<dyn DistributedLock>,
+            Option<u32>,
         ) = match &service.sql_store {
             Some(store) => {
                 if governance_pool_size == 0 {
@@ -98,6 +108,7 @@ impl GovernanceScheduler {
                         Some(store.clone() as Arc<dyn GovernanceStore>),
                         Some(store.clone()),
                         store.clone() as Arc<dyn DistributedLock>,
+                        None,
                     )
                 } else {
                     match store.spawn_background_store(governance_pool_size).await {
@@ -110,6 +121,7 @@ impl GovernanceScheduler {
                                 Some(bg.clone() as Arc<dyn GovernanceStore>),
                                 Some(bg.clone()),
                                 bg as Arc<dyn DistributedLock>,
+                                Some(governance_pool_size),
                             )
                         }
                         Err(e) => {
@@ -122,6 +134,7 @@ impl GovernanceScheduler {
                                 Some(store.clone() as Arc<dyn GovernanceStore>),
                                 Some(store.clone()),
                                 store.clone() as Arc<dyn DistributedLock>,
+                                None,
                             )
                         }
                     }
@@ -131,6 +144,7 @@ impl GovernanceScheduler {
                 None,
                 None,
                 Arc::new(crate::distributed::NoopDistributedLock) as Arc<dyn DistributedLock>,
+                None,
             ),
         };
 
@@ -138,7 +152,7 @@ impl GovernanceScheduler {
         let build = |strategy: Arc<dyn GovernanceStrategy>,
                      fallback: Arc<dyn GovernanceStrategy>,
                      plugin: Option<ObservedPlugin>| {
-            Self::new_with_components(
+            let mut scheduler = Self::new_with_components(
                 gov_store.clone(),
                 gov_sql_store.clone(),
                 strategy,
@@ -148,7 +162,9 @@ impl GovernanceScheduler {
                 lock.clone(),
                 instance_id.clone(),
                 lock_ttl,
-            )
+            );
+            scheduler.isolated_pool_max_connections = isolated_pool_max_connections;
+            scheduler
         };
 
         // Dev mode: load plugin directly from local filesystem (hot-reload friendly)
@@ -328,6 +344,7 @@ impl GovernanceScheduler {
             lock,
             instance_id,
             lock_ttl,
+            isolated_pool_max_connections: None,
         }
     }
 
@@ -337,6 +354,16 @@ impl GovernanceScheduler {
 
     pub fn fallback_strategy_key(&self) -> &str {
         self.fallback_strategy.strategy_key()
+    }
+
+    pub fn isolated_pool_max_connections(&self) -> Option<u32> {
+        self.isolated_pool_max_connections
+    }
+
+    pub fn sql_store_configured_max_connections(&self) -> Option<u32> {
+        self.sql_store
+            .as_ref()
+            .and_then(|store| store.configured_max_connections())
     }
 
     /// Spawn background tasks. Returns immediately; tasks run in background.

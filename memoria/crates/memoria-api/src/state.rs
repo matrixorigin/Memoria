@@ -9,6 +9,7 @@ use memoria_git::GitForDataService;
 use memoria_service::{AsyncTaskStore, MemoryService, StatsReporter};
 use memoria_storage::store::spawn_pool_monitor;
 use memoria_storage::PoolHealthSnapshot;
+use memoria_storage::{configured_multi_db_pool_size, multi_db_pool_max_size, MultiDbPoolKind};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -17,7 +18,6 @@ use tracing::{info, warn};
 
 /// Hard upper bounds to prevent misconfiguration.
 const METRICS_CACHE_TTL_MAX_SECS: u64 = 300; // 5 min
-const AUTH_POOL_MAX_CONNECTIONS_UPPER: u32 = 64;
 const AUTH_POOL_ACQUIRE_TIMEOUT_MAX_SECS: u64 = 30;
 
 pub struct CachedMetrics {
@@ -91,6 +91,7 @@ pub struct AppState {
     pub api_key_cache: ApiKeyCache,
     /// Dedicated connection pool for auth queries (isolated from business queries)
     pub auth_pool: Option<sqlx::MySqlPool>,
+    auth_pool_max_connections: Option<u32>,
     /// Batched last_used_at updater
     pub last_used_batcher: Arc<LastUsedBatcher>,
     /// Batched per-user tool usage tracker (flushed every 10 min)
@@ -152,6 +153,7 @@ impl AppState {
             instance_id: "single".into(),
             api_key_cache: ApiKeyCache::new(Duration::from_secs(300)),
             auth_pool: None,
+            auth_pool_max_connections: None,
             last_used_batcher: Arc::new(LastUsedBatcher::new()),
             tool_usage_batcher: Arc::new(ToolUsageBatcher::new()),
             call_log_batcher: Arc::new(CallLogBatcher::new()),
@@ -177,17 +179,21 @@ impl AppState {
         database_url: &str,
         ops_metrics_enabled: bool,
     ) -> Result<Self, MemoriaError> {
+        let auth_pool_max_connections_upper = multi_db_pool_max_size(MultiDbPoolKind::Auth);
         let auth_max_connections = {
             let raw: u32 = std::env::var("MEMORIA_AUTH_POOL_MAX_CONNECTIONS")
                 .ok()
                 .and_then(|s| s.parse().ok())
-                .unwrap_or(12);
-            let clamped = raw.clamp(1, AUTH_POOL_MAX_CONNECTIONS_UPPER);
+                .unwrap_or(configured_multi_db_pool_size(
+                    "MEMORIA_AUTH_POOL_MAX_CONNECTIONS",
+                    MultiDbPoolKind::Auth,
+                ));
+            let clamped = raw.clamp(1, auth_pool_max_connections_upper);
             if clamped != raw {
                 warn!(
                     raw = raw,
                     clamped = clamped,
-                    max = AUTH_POOL_MAX_CONNECTIONS_UPPER,
+                    max = auth_pool_max_connections_upper,
                     "MEMORIA_AUTH_POOL_MAX_CONNECTIONS clamped to bounds"
                 );
             }
@@ -289,6 +295,7 @@ impl AppState {
             info!("Metrics summary refresher initialized for multi-db mode");
         }
         self.auth_pool = Some(pool);
+        self.auth_pool_max_connections = Some(auth_max_connections);
         {
             let mut fs = self.flusher_state.lock().unwrap();
             fs.shutdown = Some(shutdown_tx);
@@ -300,6 +307,10 @@ impl AppState {
     pub fn with_instance_id(mut self, instance_id: String) -> Self {
         self.instance_id = instance_id;
         self
+    }
+
+    pub fn auth_pool_max_connections(&self) -> Option<u32> {
+        self.auth_pool_max_connections
     }
 
     pub async fn mark_metrics_dirty(
@@ -421,12 +432,13 @@ mod tests {
         assert_eq!(5u64.clamp(1, METRICS_CACHE_TTL_MAX_SECS), 5);
 
         // auth pool max_connections clamping
-        assert_eq!(0u32.clamp(1, AUTH_POOL_MAX_CONNECTIONS_UPPER), 1);
+        let auth_pool_max_connections_upper = multi_db_pool_max_size(MultiDbPoolKind::Auth);
+        assert_eq!(0u32.clamp(1, auth_pool_max_connections_upper), 1);
         assert_eq!(
-            200u32.clamp(1, AUTH_POOL_MAX_CONNECTIONS_UPPER),
-            AUTH_POOL_MAX_CONNECTIONS_UPPER
+            999u32.clamp(1, auth_pool_max_connections_upper),
+            auth_pool_max_connections_upper
         );
-        assert_eq!(8u32.clamp(1, AUTH_POOL_MAX_CONNECTIONS_UPPER), 8);
+        assert_eq!(8u32.clamp(1, auth_pool_max_connections_upper), 8);
 
         // auth pool acquire_timeout clamping
         assert_eq!(0u64.clamp(1, AUTH_POOL_ACQUIRE_TIMEOUT_MAX_SECS), 1);
