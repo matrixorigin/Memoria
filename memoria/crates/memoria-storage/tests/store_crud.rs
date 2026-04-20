@@ -241,23 +241,33 @@ async fn test_search_vector_from_filtered_scoped_prefilters_by_session() {
         .await
         .unwrap();
 
+    // Keep cross-session fixtures far apart: store.insert() dedups per user,
+    // not per session.
+    let mk_vec = |x: f32, y: f32, z: f32| {
+        let mut v = vec![0.0; test_dim()];
+        v[0] = x;
+        v[1] = y;
+        v[2] = z;
+        v
+    };
+
     let mut target = make_memory(&format!("vec-scope-1-{uid}"), "target session", &uid);
     target.session_id = Some("sess-target".to_string());
-    target.embedding = Some(dim_vec(1, 1.0));
+    target.embedding = Some(mk_vec(0.0, 1.0, 0.0));
 
     let mut other = make_memory(&format!("vec-scope-2-{uid}"), "other session", &uid);
     other.session_id = Some("sess-other".to_string());
-    other.embedding = Some(dim_vec(0, 1.0));
+    other.embedding = Some(mk_vec(1.0, 0.0, 0.0));
 
     let mut global_mem = make_memory(&format!("vec-scope-3-{uid}"), "global session", &uid);
-    global_mem.embedding = Some(dim_vec(0, 0.95));
+    global_mem.embedding = Some(mk_vec(0.7, 0.0, 0.7));
 
     store.insert(&target).await.unwrap();
     store.insert(&other).await.unwrap();
     store.insert(&global_mem).await.unwrap();
 
     let global_results = store
-        .search_vector_from_filtered_scoped("mem_memories", &uid, &dim_vec(0, 1.0), 1, None, None)
+        .search_vector_from_filtered_scoped("mem_memories", &uid, &mk_vec(1.0, 0.0, 0.0), 1, None, None)
         .await
         .expect("global vector search");
     assert_eq!(
@@ -270,7 +280,7 @@ async fn test_search_vector_from_filtered_scoped_prefilters_by_session() {
         .search_vector_from_filtered_scoped(
             "mem_memories",
             &uid,
-            &dim_vec(0, 1.0),
+            &mk_vec(1.0, 0.0, 0.0),
             1,
             None,
             Some("sess-target"),
@@ -293,31 +303,34 @@ async fn test_search_vector_from_filtered_scoped_prefilters_by_session() {
 async fn test_search_vector_from_filtered_scoped_fills_limit_with_session_candidates() {
     let (store, uid) = setup().await;
 
-    let mk_vec = |x: f32, y: f32| {
+    // Keep strict-scope candidates distinct enough to avoid user-global
+    // near-duplicate suppression across sessions.
+    let mk_vec = |x: f32, y: f32, z: f32| {
         let mut v = vec![0.0; test_dim()];
         v[0] = x;
         v[1] = y;
+        v[2] = z;
         v
     };
 
     let mut target_a = make_memory(&format!("vec-scope-fill-1-{uid}"), "scoped a", &uid);
     target_a.session_id = Some("sess-target".to_string());
-    target_a.embedding = Some(mk_vec(0.7, 0.3));
+    target_a.embedding = Some(mk_vec(0.95, 0.2, 0.0));
 
     let mut target_b = make_memory(&format!("vec-scope-fill-2-{uid}"), "scoped b", &uid);
     target_b.session_id = Some("sess-target".to_string());
-    target_b.embedding = Some(mk_vec(0.65, 0.35));
+    target_b.embedding = Some(mk_vec(0.7, 0.7, 0.0));
 
     let mut other_a = make_memory(&format!("vec-scope-fill-3-{uid}"), "global a", &uid);
     other_a.session_id = Some("sess-other".to_string());
-    other_a.embedding = Some(mk_vec(1.0, 0.0));
+    other_a.embedding = Some(mk_vec(0.0, 1.0, 0.0));
 
     let mut other_b = make_memory(&format!("vec-scope-fill-4-{uid}"), "global b", &uid);
     other_b.session_id = Some("sess-other".to_string());
-    other_b.embedding = Some(mk_vec(0.97, 0.03));
+    other_b.embedding = Some(mk_vec(0.0, 0.0, 1.0));
 
     let mut global = make_memory(&format!("vec-scope-fill-5-{uid}"), "unscoped shared", &uid);
-    global.embedding = Some(mk_vec(0.9, 0.1));
+    global.embedding = Some(mk_vec(0.6, 0.0, 0.8));
 
     store.insert(&target_a).await.unwrap();
     store.insert(&target_b).await.unwrap();
@@ -329,7 +342,7 @@ async fn test_search_vector_from_filtered_scoped_fills_limit_with_session_candid
         .search_vector_from_filtered_scoped(
             "mem_memories",
             &uid,
-            &mk_vec(1.0, 0.0),
+            &mk_vec(1.0, 0.0, 0.0),
             3,
             None,
             Some("sess-target"),
