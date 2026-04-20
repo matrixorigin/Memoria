@@ -249,15 +249,19 @@ async fn test_search_vector_from_filtered_scoped_prefilters_by_session() {
     other.session_id = Some("sess-other".to_string());
     other.embedding = Some(dim_vec(0, 1.0));
 
+    let mut global_mem = make_memory(&format!("vec-scope-3-{uid}"), "global session", &uid);
+    global_mem.embedding = Some(dim_vec(0, 0.95));
+
     store.insert(&target).await.unwrap();
     store.insert(&other).await.unwrap();
+    store.insert(&global_mem).await.unwrap();
 
-    let global = store
+    let global_results = store
         .search_vector_from_filtered_scoped("mem_memories", &uid, &dim_vec(0, 1.0), 1, None, None)
         .await
         .expect("global vector search");
     assert_eq!(
-        global.first().map(|m| m.memory_id.as_str()),
+        global_results.first().map(|m| m.memory_id.as_str()),
         Some(other.memory_id.as_str()),
         "global search should return the nearest cross-session memory",
     );
@@ -280,8 +284,8 @@ async fn test_search_vector_from_filtered_scoped_prefilters_by_session() {
     );
     assert_eq!(
         scoped.first().map(|m| m.memory_id.as_str()),
-        Some(target.memory_id.as_str()),
-        "strict session search should pre-filter candidates before ranking",
+        Some(global_mem.memory_id.as_str()),
+        "strict session search should rank within the target-session plus unscoped candidate set",
     );
 }
 
@@ -312,17 +316,21 @@ async fn test_search_vector_from_filtered_scoped_fills_limit_with_session_candid
     other_b.session_id = Some("sess-other".to_string());
     other_b.embedding = Some(mk_vec(0.97, 0.03));
 
+    let mut global = make_memory(&format!("vec-scope-fill-5-{uid}"), "unscoped shared", &uid);
+    global.embedding = Some(mk_vec(0.9, 0.1));
+
     store.insert(&target_a).await.unwrap();
     store.insert(&target_b).await.unwrap();
     store.insert(&other_a).await.unwrap();
     store.insert(&other_b).await.unwrap();
+    store.insert(&global).await.unwrap();
 
     let scoped = store
         .search_vector_from_filtered_scoped(
             "mem_memories",
             &uid,
             &mk_vec(1.0, 0.0),
-            2,
+            3,
             None,
             Some("sess-target"),
         )
@@ -330,15 +338,19 @@ async fn test_search_vector_from_filtered_scoped_fills_limit_with_session_candid
         .expect("session-scoped vector search");
     assert_eq!(
         scoped.len(),
-        2,
-        "strict session search should fill top_k from the filtered session candidate set",
+        3,
+        "strict session search should fill top_k from the target-session plus unscoped candidate set",
     );
     let scoped_ids: std::collections::HashSet<&str> =
         scoped.iter().map(|m| m.memory_id.as_str()).collect();
     assert_eq!(
         scoped_ids,
-        std::collections::HashSet::from([target_a.memory_id.as_str(), target_b.memory_id.as_str()]),
-        "strict session vector search should return both session-local candidates",
+        std::collections::HashSet::from([
+            target_a.memory_id.as_str(),
+            target_b.memory_id.as_str(),
+            global.memory_id.as_str(),
+        ]),
+        "strict session vector search should return session-local plus unscoped candidates",
     );
 }
 

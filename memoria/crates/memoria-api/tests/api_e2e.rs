@@ -57,6 +57,7 @@ impl SessionScopeTestEmbedder {
         let mut v = vec![0.0; test_dim()];
         match text {
             "strict session query" | "other-session top" => v[0] = 1.0,
+            "global-unscoped top" => v[0] = 0.99,
             "scoped topk query" | "global-candidate-a" => v[0] = 1.0,
             "other-session second" => {
                 v[0] = 0.98;
@@ -2757,6 +2758,26 @@ async fn store_memory_for_session(
         .to_string()
 }
 
+async fn store_memory_unscoped(
+    client: &reqwest::Client,
+    base: &str,
+    user_id: &str,
+    content: &str,
+) -> String {
+    let r = client
+        .post(format!("{base}/v1/memories"))
+        .header("X-User-Id", user_id)
+        .json(&json!({"content": content}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 201);
+    r.json::<Value>().await.unwrap()["memory_id"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
 #[tokio::test]
 async fn test_episodic_no_memories_returns_error() {
     let (llm, _shutdown) = spawn_fake_llm().await;
@@ -3367,6 +3388,8 @@ async fn test_retrieve_session_scope_only_prefilters_and_skips_graph() {
     let target_mid =
         store_memory_for_session(&client, &base, &uid, "target-session memory", "sess-target")
             .await;
+    let global_mid =
+        store_memory_unscoped(&client, &base, &uid, "global-unscoped top").await;
     let other_mid =
         store_memory_for_session(&client, &base, &uid, "other-session top", "sess-other").await;
     let other_second_mid =
@@ -3457,8 +3480,13 @@ async fn test_retrieve_session_scope_only_prefilters_and_skips_graph() {
     assert_ne!(strict_body["explain"]["path"], "graph");
     assert_eq!(
         strict_body["results"][0]["memory_id"].as_str(),
-        Some(target_mid.as_str()),
-        "strict session retrieval should pre-filter tabular candidates before ranking",
+        Some(global_mid.as_str()),
+        "strict session retrieval should rank within the requested session plus unscoped memories",
+    );
+    assert_ne!(
+        strict_body["results"][0]["memory_id"].as_str(),
+        Some(other_mid.as_str()),
+        "strict session retrieval should still exclude other scoped sessions",
     );
 }
 
@@ -3505,6 +3533,8 @@ async fn test_retrieve_session_scope_only_preserves_top_k_with_session_candidate
         store_memory_for_session(&client, &base, &uid, "scoped-candidate-a", "sess-target").await;
     let target_second =
         store_memory_for_session(&client, &base, &uid, "scoped-candidate-b", "sess-target").await;
+    let global_shared =
+        store_memory_unscoped(&client, &base, &uid, "global-candidate-b").await;
     let _other_first =
         store_memory_for_session(&client, &base, &uid, "global-candidate-a", "sess-other").await;
     let _other_second =
@@ -3518,7 +3548,7 @@ async fn test_retrieve_session_scope_only_preserves_top_k_with_session_candidate
             "query": "scoped topk query",
             "session_id": "sess-target",
             "session_scope": "only",
-            "top_k": 2
+            "top_k": 3
         }))
         .send()
         .await
@@ -3530,18 +3560,12 @@ async fn test_retrieve_session_scope_only_preserves_top_k_with_session_candidate
         .expect("retrieve should return array");
     assert_eq!(
         strict_results.len(),
-        2,
-        "strict session retrieval should still fill top_k from session-local candidates",
+        3,
+        "strict session retrieval should still fill top_k from session-local plus unscoped candidates",
     );
-    assert_eq!(
-        strict_results[0]["session_id"].as_str(),
-        Some("sess-target"),
-        "strict session retrieval must only return target-session memories",
-    );
-    assert_eq!(
-        strict_results[1]["session_id"].as_str(),
-        Some("sess-target"),
-        "strict session retrieval must only return target-session memories",
+    assert!(
+        strict_results.iter().all(|item| item["session_id"].as_str() != Some("sess-other")),
+        "strict session retrieval must still exclude other scoped sessions",
     );
     let strict_ids: std::collections::HashSet<&str> = strict_results
         .iter()
@@ -3549,8 +3573,12 @@ async fn test_retrieve_session_scope_only_preserves_top_k_with_session_candidate
         .collect();
     assert_eq!(
         strict_ids,
-        std::collections::HashSet::from([target_first.as_str(), target_second.as_str()]),
-        "strict retrieval should pre-filter before ranking instead of post-filtering a global top_k",
+        std::collections::HashSet::from([
+            target_first.as_str(),
+            target_second.as_str(),
+            global_shared.as_str(),
+        ]),
+        "strict retrieval should rank within the requested session plus unscoped memories",
     );
 }
 
@@ -3562,6 +3590,7 @@ async fn test_search_session_scope_only_respects_session() {
     let uid = uid();
 
     store_memory_for_session(&client, &base, &uid, "target-session memory", "sess-target").await;
+    store_memory_unscoped(&client, &base, &uid, "global-unscoped top").await;
     store_memory_for_session(&client, &base, &uid, "other-session top", "sess-other").await;
     store_memory_for_session(&client, &base, &uid, "other-session second", "sess-other").await;
 
@@ -3600,8 +3629,8 @@ async fn test_search_session_scope_only_respects_session() {
     let strict_body: Value = strict.json().await.unwrap();
     assert_eq!(
         strict_body[0]["session_id"].as_str(),
-        Some("sess-target"),
-        "session_scope=only should keep search inside the requested session",
+        None,
+        "session_scope=only should still include unscoped memories",
     );
 }
 

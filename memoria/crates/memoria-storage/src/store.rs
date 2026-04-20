@@ -4632,7 +4632,7 @@ impl SqlMemoryStore {
             return Ok(vec![]);
         }
         let session_clause = if session_id.is_some() {
-            " AND session_id = ?"
+            " AND (session_id = ? OR session_id IS NULL)"
         } else {
             ""
         };
@@ -4717,6 +4717,8 @@ impl SqlMemoryStore {
     }
 
     /// Vector search with optional memory_type and strict session pre-filter.
+    /// When session_id is provided, the candidate set includes that session plus
+    /// unscoped memories (session_id IS NULL).
     #[allow(clippy::too_many_arguments)]
     pub async fn search_vector_from_filtered_scoped(
         &self,
@@ -4733,7 +4735,10 @@ impl SqlMemoryStore {
             None => String::new(),
         };
         let session_clause = match session_id {
-            Some(session_id) => format!(" AND session_id = '{}'", sanitize_sql_literal(session_id)),
+            Some(session_id) => format!(
+                " AND (session_id = '{}' OR session_id IS NULL)",
+                sanitize_sql_literal(session_id)
+            ),
             None => String::new(),
         };
         let rank_mode = if session_id.is_some() { "pre" } else { "post" };

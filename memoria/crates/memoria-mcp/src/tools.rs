@@ -134,7 +134,7 @@ pub fn list() -> Value {
                     "query": {"type": "string"},
                     "top_k": {"type": "integer", "default": 5},
                     "session_id": {"type": "string"},
-                    "session_scope": {"type": "string", "enum": ["prefer", "only"], "description": "How to use session_id: prefer=non-strict retrieval using the provided session_id as context; only=strictly filter to that session"},
+                    "session_scope": {"type": "string", "enum": ["prefer", "only"], "description": "How to use session_id: prefer=non-strict retrieval using the provided session_id as context; only=limit results to that session plus unscoped memories"},
                     "explain": {"type": ["boolean", "string"], "default": false, "description": "Explain level: false/\"none\"=off, true/\"basic\"=timing+path, \"verbose\"=+per-candidate scores, \"analyze\"=full"}
                 },
                 "required": ["query"]
@@ -149,7 +149,7 @@ pub fn list() -> Value {
                     "query": {"type": "string"},
                     "top_k": {"type": "integer", "default": 10},
                     "session_id": {"type": "string"},
-                    "session_scope": {"type": "string", "enum": ["prefer", "only"], "description": "How to use session_id: prefer=non-strict search using the provided session_id as context; only=strictly filter to that session"},
+                    "session_scope": {"type": "string", "enum": ["prefer", "only"], "description": "How to use session_id: prefer=non-strict search using the provided session_id as context; only=limit results to that session plus unscoped memories"},
                     "explain": {"type": ["boolean", "string"], "default": false, "description": "Explain level: false/\"none\"=off, true/\"basic\"=timing+path, \"verbose\"=+per-candidate scores, \"analyze\"=full"}
                 },
                 "required": ["query"]
@@ -165,7 +165,7 @@ pub fn list() -> Value {
                     "query": {"type": "string", "description": "Semantic search to find memory to correct"},
                     "new_content": {"type": "string"},
                     "session_id": {"type": "string", "description": "Optional session to use when resolving query-based correction"},
-                    "session_scope": {"type": "string", "enum": ["prefer", "only"], "description": "Only used with query-based correction. prefer=non-strict lookup using the provided session_id as context; only=restrict lookup to the given session"},
+                    "session_scope": {"type": "string", "enum": ["prefer", "only"], "description": "Only used with query-based correction. prefer=non-strict lookup using the provided session_id as context; only=restrict lookup to the given session plus unscoped memories"},
                     "reason": {"type": "string"}
                 },
                 "required": ["new_content"]

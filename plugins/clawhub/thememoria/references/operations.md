@@ -13,7 +13,7 @@ Retrieve first when:
 
 Preferred order:
 
-1. `memory_retrieve` for prompt-relevant context (`session_scope="prefer"` for the default non-strict path with a session hint, `"only"` for strict session filtering)
+1. `memory_retrieve` for prompt-relevant context (`session_scope="prefer"` for the default non-strict path with a session hint, `"only"` for the requested session plus unscoped memories)
 2. `memory_search` for broader semantic lookup with the same optional session controls
 3. `memory_list` when the user wants a bounded inventory or an exact per-session listing
 

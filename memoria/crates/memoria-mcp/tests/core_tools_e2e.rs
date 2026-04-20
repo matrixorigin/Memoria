@@ -217,6 +217,13 @@ async fn test_search_session_scope_only() {
         &uid,
     )
     .await;
+    call(
+        "memory_store",
+        json!({"content": "shared search token global"}),
+        &svc,
+        &uid,
+    )
+    .await;
 
     let r = call(
         "memory_search",
@@ -227,9 +234,10 @@ async fn test_search_session_scope_only() {
     .await;
     let t = text(&r);
     assert!(t.contains("shared search token target"), "got: {t}");
+    assert!(t.contains("shared search token global"), "got: {t}");
     assert!(
         !t.contains("shared search token other"),
-        "session_scope=only should exclude other sessions: {t}"
+        "session_scope=only should exclude other scoped sessions: {t}"
     );
     println!("✅ search session_scope=only");
 }
