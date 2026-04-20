@@ -1,7 +1,7 @@
 use chrono::Utc;
 use memoria_core::{interfaces::MemoryStore, Memory, MemoryType, TrustTier};
 use memoria_storage::store::CURRENT_USER_SCHEMA_VERSION;
-use memoria_storage::DbRouter;
+use memoria_storage::{DbRouter, SqlMemoryStore};
 use sqlx::Row;
 use uuid::Uuid;
 
@@ -195,4 +195,30 @@ async fn router_persists_and_repairs_user_schema_version_marker() {
         .expect("repaired updated_at");
     assert_eq!(repaired_version, CURRENT_USER_SCHEMA_VERSION);
     assert!(repaired_updated_at > stale_at);
+}
+
+#[tokio::test]
+async fn shared_migrate_is_idempotent_for_async_task_user_id() {
+    let shared_url = shared_db_url();
+    let shared_store = SqlMemoryStore::connect(&shared_url, test_dim(), Uuid::new_v4().to_string())
+        .await
+        .expect("connect shared store");
+
+    shared_store
+        .migrate_shared()
+        .await
+        .expect("first shared migrate");
+    shared_store
+        .migrate_shared()
+        .await
+        .expect("second shared migrate");
+
+    let user_id_column_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM information_schema.columns \
+         WHERE table_schema = DATABASE() AND table_name = 'mem_async_tasks' AND column_name = 'user_id'",
+    )
+    .fetch_one(shared_store.pool())
+    .await
+    .expect("query async task user_id column count");
+    assert_eq!(user_id_column_count, 1);
 }

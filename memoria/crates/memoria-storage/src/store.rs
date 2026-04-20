@@ -1547,6 +1547,8 @@ impl SqlMemoryStore {
     }
 
     pub async fn migrate_shared(&self) -> Result<(), MemoriaError> {
+        let schema_name = self.current_schema_name().await?;
+        let schema_name = schema_name.as_ref();
         let mut conn = self.conn().await?;
         sqlx::query(
             r#"CREATE TABLE IF NOT EXISTS mem_user_registry (
@@ -1739,11 +1741,23 @@ impl SqlMemoryStore {
         .await
         .map_err(db_err)?;
 
-        let _ = sqlx::query(
-            "ALTER TABLE mem_async_tasks ADD COLUMN user_id VARCHAR(64) NOT NULL DEFAULT '' AFTER instance_id",
-        )
-        .execute(&mut *conn)
-        .await;
+        let has_async_task_user_id =
+            info_schema_column_exists(&self.pool, schema_name, "mem_async_tasks", "user_id").await;
+        if !has_async_task_user_id {
+            let add_async_task_user_id = sqlx::query(
+                "ALTER TABLE mem_async_tasks ADD COLUMN user_id VARCHAR(64) NOT NULL DEFAULT '' AFTER instance_id",
+            )
+            .execute(&mut *conn)
+            .await;
+            if let Err(e) = add_async_task_user_id {
+                if !is_duplicate_column(&e) {
+                    tracing::warn!(
+                        error = %e,
+                        "shared migration: failed to add mem_async_tasks.user_id compatibility column"
+                    );
+                }
+            }
+        }
 
         // ── Ops-metrics aggregate tables (push-based stats written by Memoria) ──
         // Created here so they exist in both single-db and multi-db deployments.
