@@ -56,29 +56,49 @@ impl SessionScopeTestEmbedder {
     fn vector_for(text: &str) -> Vec<f32> {
         let mut v = vec![0.0; test_dim()];
         match text {
-            "strict session query" | "other-session top" => v[0] = 1.0,
-            "global-unscoped top" => v[0] = 0.99,
-            "scoped topk query" | "global-candidate-a" => v[0] = 1.0,
+            "strict session query" => v[0] = 1.0,
+            "other-session top" => {
+                v[0] = 0.85;
+                v[1] = 0.52;
+            }
+            "global-unscoped top" => {
+                v[0] = 0.58;
+                v[1] = 0.78;
+            }
+            "scoped topk query" => v[2] = 1.0,
+            "global-candidate-a" => v[0] = 1.0,
             "other-session second" => {
-                v[0] = 0.98;
-                v[1] = 0.02;
+                v[0] = 0.72;
+                v[1] = 0.18;
+                v[2] = 0.67;
             }
             "global-candidate-b" => {
-                v[0] = 0.97;
-                v[1] = 0.03;
+                v[1] = 0.12;
+                v[2] = 0.90;
+                v[3] = 0.38;
             }
             "target-session memory" => v[1] = 1.0,
             "scoped-candidate-a" => {
-                v[0] = 0.6;
-                v[1] = 0.4;
+                v[0] = 0.32;
+                v[1] = 0.05;
+                v[2] = 0.88;
             }
             "target-session backup" => {
-                v[1] = 0.97;
-                v[2] = 0.03;
+                v[0] = 0.10;
+                v[1] = 0.94;
+                v[2] = 0.18;
+                v[3] = 0.28;
             }
             "scoped-candidate-b" => {
-                v[0] = 0.3;
-                v[1] = 0.7;
+                v[0] = 0.05;
+                v[1] = 0.32;
+                v[2] = 0.88;
+            }
+            "other-session decoy" => {
+                v[0] = 0.78;
+                v[1] = 0.44;
+                v[2] = 0.12;
+                v[3] = 0.18;
             }
             _ => v[2] = 1.0,
         }
