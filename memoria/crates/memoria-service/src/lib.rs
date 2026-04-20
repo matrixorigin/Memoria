@@ -46,7 +46,7 @@ pub use scoring::{
 };
 pub use service::{
     CandidateScore, ExplainLevel, InMemoryFlusher, MemoryService, PurgeResult, RetrievalExplain,
-    RetrieveOptions, ENTITY_EXTRACTION_DROPS,
+    RetrieveOptions, SessionScope, ENTITY_EXTRACTION_DROPS,
 };
 pub use stats_reporter::StatsReporter;
 

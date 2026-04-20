@@ -66,6 +66,7 @@ async fn find_memory_any_user(
 #[derive(Deserialize, Default)]
 pub struct ListQuery {
     pub memory_type: Option<String>,
+    pub session_id: Option<String>,
     #[serde(default = "default_limit")]
     pub limit: i64,
     pub cursor: Option<String>,
@@ -116,7 +117,13 @@ pub async fn list_memories(
     let fetch_limit = limit + 1;
     let mut memories = state
         .service
-        .list_active_paged(&user_id, fetch_limit, q.memory_type.as_deref(), cursor)
+        .list_active_paged(
+            &user_id,
+            fetch_limit,
+            q.memory_type.as_deref(),
+            q.session_id.as_deref(),
+            cursor,
+        )
         .await
         .map_err(api_err)?;
     let has_more = memories.len() > limit as usize;
@@ -241,16 +248,13 @@ pub async fn retrieve(
     AuthUser { user_id, .. }: AuthUser,
     Json(req): Json<RetrieveRequest>,
 ) -> ApiResult<serde_json::Value> {
-    if req.session_id.is_none() && (req.filter_session == Some(true) || !req.include_cross_session)
-    {
-        return Err((
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "session_id is required for strict session retrieval".to_string(),
-        ));
-    }
+    req.validate()
+        .map_err(|err| (StatusCode::UNPROCESSABLE_ENTITY, err))?;
     let top_k = req.top_k.clamp(1, 100);
     let level = memoria_service::ExplainLevel::from_str_or_bool(&req.explain);
-    let retrieve_options = req.retrieve_options();
+    let retrieve_options = req
+        .retrieve_options()
+        .map_err(|err| (StatusCode::UNPROCESSABLE_ENTITY, err))?;
 
     if level != memoria_service::ExplainLevel::None {
         let (results, explain) = state
@@ -282,14 +286,25 @@ pub async fn retrieve(
 pub async fn search(
     State(state): State<AppState>,
     AuthUser { user_id, .. }: AuthUser,
-    Json(req): Json<RetrieveRequest>,
+    Json(req): Json<SearchRequest>,
 ) -> ApiResult<serde_json::Value> {
+    req.validate()
+        .map_err(|err| (StatusCode::UNPROCESSABLE_ENTITY, err))?;
     let top_k = req.top_k.clamp(1, 100);
     let level = memoria_service::ExplainLevel::from_str_or_bool(&req.explain);
+    let retrieve_options = req
+        .retrieve_options()
+        .map_err(|err| (StatusCode::UNPROCESSABLE_ENTITY, err))?;
     if level != memoria_service::ExplainLevel::None {
         let (results, explain) = state
             .service
-            .search_explain_level(&user_id, &req.query, top_k, level)
+            .retrieve_explain_level_with_options(
+                &user_id,
+                &req.query,
+                top_k,
+                level,
+                &retrieve_options,
+            )
             .await
             .map_err(api_err)?;
         let items: Vec<MemoryResponse> = results.into_iter().map(Into::into).collect();
@@ -299,7 +314,7 @@ pub async fn search(
     } else {
         let results = state
             .service
-            .search(&user_id, &req.query, top_k)
+            .retrieve_with_options(&user_id, &req.query, top_k, &retrieve_options)
             .await
             .map_err(api_err)?;
         Ok(Json(serde_json::json!(results
@@ -370,9 +385,14 @@ pub async fn correct_by_query(
     AuthUser { user_id, .. }: AuthUser,
     Json(req): Json<CorrectByQueryRequest>,
 ) -> ApiResult<MemoryResponse> {
+    req.validate()
+        .map_err(|err| (StatusCode::UNPROCESSABLE_ENTITY, err))?;
+    let retrieve_options = req
+        .retrieve_options()
+        .map_err(|err| (StatusCode::UNPROCESSABLE_ENTITY, err))?;
     let results = state
         .service
-        .retrieve(&user_id, &req.query, 1)
+        .retrieve_with_options(&user_id, &req.query, 1, &retrieve_options)
         .await
         .map_err(api_err)?;
     let found = results.into_iter().next().ok_or_else(|| {

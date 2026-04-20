@@ -4474,6 +4474,7 @@ impl SqlMemoryStore {
         user_id: &str,
         limit: i64,
         memory_type: Option<&str>,
+        session_id: Option<&str>,
         cursor: Option<&str>,
     ) -> Result<Vec<Memory>, MemoriaError> {
         let table = self.t(table);
@@ -4484,6 +4485,9 @@ impl SqlMemoryStore {
             format!("SELECT memory_id FROM {table} WHERE user_id = ? AND is_active = 1");
         if memory_type.is_some() {
             inner.push_str(" AND memory_type = ?");
+        }
+        if session_id.is_some() {
+            inner.push_str(" AND session_id = ?");
         }
         if cursor.is_some() {
             inner.push_str(" AND memory_id < ?");
@@ -4501,6 +4505,9 @@ impl SqlMemoryStore {
         let mut q = sqlx::query(&sql).bind(user_id);
         if let Some(mt) = memory_type {
             q = q.bind(mt);
+        }
+        if let Some(session_id) = session_id {
+            q = q.bind(session_id);
         }
         if let Some(c) = cursor {
             q = q.bind(c);

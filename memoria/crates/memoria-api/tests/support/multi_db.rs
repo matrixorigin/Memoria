@@ -105,7 +105,7 @@ pub async fn spawn_api_server(
     }
 
     let app = memoria_api::build_router(state);
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+    let listener = tokio::net::TcpListener::bind("localhost:0")
         .await
         .expect("bind");
     let port = listener.local_addr().expect("local addr").port();
@@ -123,7 +123,7 @@ pub async fn spawn_api_server(
         .no_proxy()
         .build()
         .expect("client");
-    let base = format!("http://127.0.0.1:{port}");
+    let base = format!("http://localhost:{port}");
     wait_for_server(&client, &base, &context.shared_pool()).await;
 
     ApiTestServer {

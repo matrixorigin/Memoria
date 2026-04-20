@@ -2451,11 +2451,20 @@ async fn test_remote_correct_by_query() {
     let (base, _, _server) = spawn_api_for_remote().await;
     let uid = uid();
     let remote = RemoteClient::new(&base, None, uid.clone(), None);
+    let target_session = format!("session:test-correct-{}", uuid::Uuid::new_v4().simple());
+    let other_session = format!("session:test-correct-{}", uuid::Uuid::new_v4().simple());
 
     remote
         .call(
             "memory_store",
-            json!({"content": "Uses black for Python formatting"}),
+            json!({"content": "Uses black for Python formatting in target", "session_id": target_session}),
+        )
+        .await
+        .unwrap();
+    remote
+        .call(
+            "memory_store",
+            json!({"content": "Uses black for Python formatting in other", "session_id": other_session}),
         )
         .await
         .unwrap();
@@ -2465,16 +2474,30 @@ async fn test_remote_correct_by_query() {
             "memory_correct",
             json!({
                 "query": "black formatting",
-                "new_content": "Uses ruff for Python formatting",
+                "session_id": target_session,
+                "session_scope": "only",
+                "new_content": "Uses ruff for Python formatting in target",
                 "reason": "switched"
             }),
         )
         .await
         .unwrap();
     let t = r["content"][0]["text"].as_str().unwrap_or("");
+    assert!(t.contains("Corrected"), "got: {t}");
+    assert!(t.contains("target"), "got: {t}");
+
+    let list = remote
+        .call("memory_list", json!({"limit": 10}))
+        .await
+        .unwrap();
+    let list_text = list["content"][0]["text"].as_str().unwrap_or("");
     assert!(
-        t.contains("Corrected") || t.contains("No matching"),
-        "got: {t}"
+        list_text.contains("Uses ruff for Python formatting in target"),
+        "got: {list_text}"
+    );
+    assert!(
+        list_text.contains("Uses black for Python formatting in other"),
+        "got: {list_text}"
     );
     println!("✅ remote correct by query: {t}");
 }
@@ -2571,6 +2594,49 @@ async fn test_remote_purge_by_session_id() {
         "got: {list_text}"
     );
     println!("✅ remote purge by session_id: {t}");
+}
+
+#[tokio::test]
+async fn test_remote_list_session_id_filter() {
+    use memoria_mcp::remote::RemoteClient;
+    let (base, _, _server) = spawn_api_for_remote().await;
+    let uid = uid();
+    let remote = RemoteClient::new(&base, None, uid.clone(), None);
+    let target_session = format!("session:test-list-{}", uuid::Uuid::new_v4().simple());
+    let other_session = format!("session:test-list-{}", uuid::Uuid::new_v4().simple());
+
+    remote
+        .call(
+            "memory_store",
+            json!({"content": "remote target list alpha", "session_id": target_session}),
+        )
+        .await
+        .unwrap();
+    remote
+        .call(
+            "memory_store",
+            json!({"content": "remote other list beta", "session_id": other_session}),
+        )
+        .await
+        .unwrap();
+
+    let list = remote
+        .call(
+            "memory_list",
+            json!({"limit": 10, "session_id": target_session}),
+        )
+        .await
+        .unwrap();
+    let list_text = list["content"][0]["text"].as_str().unwrap_or("");
+    assert!(
+        list_text.contains("remote target list alpha"),
+        "got: {list_text}"
+    );
+    assert!(
+        !list_text.contains("remote other list beta"),
+        "got: {list_text}"
+    );
+    println!("✅ remote list session_id filter");
 }
 
 #[tokio::test]
@@ -3289,7 +3355,7 @@ async fn test_explain_verbose_candidate_scores() {
 }
 
 #[tokio::test]
-async fn test_retrieve_filter_session_prefilters_and_skips_graph() {
+async fn test_retrieve_session_scope_only_prefilters_and_skips_graph() {
     use memoria_storage::{GraphEdge, GraphNode, GraphStore, NodeType};
 
     let (base, client, server) =
@@ -3378,7 +3444,7 @@ async fn test_retrieve_filter_session_prefilters_and_skips_graph() {
         .json(&json!({
             "query": "strict session query",
             "session_id": "sess-target",
-            "filter_session": true,
+            "session_scope": "only",
             "top_k": 1,
             "explain": true
         }))
@@ -3394,30 +3460,10 @@ async fn test_retrieve_filter_session_prefilters_and_skips_graph() {
         Some(target_mid.as_str()),
         "strict session retrieval should pre-filter tabular candidates before ranking",
     );
-
-    let legacy = client
-        .post(format!("{base}/v1/memories/retrieve"))
-        .header("X-User-Id", &uid)
-        .json(&json!({
-            "query": "strict session query",
-            "session_id": "sess-target",
-            "include_cross_session": false,
-            "top_k": 1
-        }))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(legacy.status(), 200);
-    let legacy_body: Value = legacy.json().await.unwrap();
-    assert_eq!(
-        legacy_body[0]["memory_id"].as_str(),
-        Some(target_mid.as_str()),
-        "legacy include_cross_session=false should keep strict session semantics",
-    );
 }
 
 #[tokio::test]
-async fn test_retrieve_filter_session_requires_session_id() {
+async fn test_retrieve_session_scope_requires_session_id() {
     let (base, client, _server) = spawn_server().await;
     let user = uid();
 
@@ -3426,7 +3472,7 @@ async fn test_retrieve_filter_session_requires_session_id() {
         .header("X-User-Id", &user)
         .json(&json!({
             "query": "strict session query",
-            "filter_session": true,
+            "session_scope": "only",
             "top_k": 1
         }))
         .send()
@@ -3435,11 +3481,11 @@ async fn test_retrieve_filter_session_requires_session_id() {
     assert_eq!(r.status(), 422);
 
     let r = client
-        .post(format!("{base}/v1/memories/retrieve"))
+        .post(format!("{base}/v1/memories/search"))
         .header("X-User-Id", &user)
         .json(&json!({
             "query": "strict session query",
-            "include_cross_session": false,
+            "session_scope": "prefer",
             "top_k": 1
         }))
         .send()
@@ -3449,7 +3495,7 @@ async fn test_retrieve_filter_session_requires_session_id() {
 }
 
 #[tokio::test]
-async fn test_retrieve_filter_session_preserves_top_k_with_session_candidates() {
+async fn test_retrieve_session_scope_only_preserves_top_k_with_session_candidates() {
     let (base, client, _server) =
         spawn_server_with_custom_embedder_and_pool(Arc::new(SessionScopeTestEmbedder), test_dim())
             .await;
@@ -3471,7 +3517,7 @@ async fn test_retrieve_filter_session_preserves_top_k_with_session_candidates() 
         .json(&json!({
             "query": "scoped topk query",
             "session_id": "sess-target",
-            "filter_session": true,
+            "session_scope": "only",
             "top_k": 2
         }))
         .send()
@@ -3505,6 +3551,57 @@ async fn test_retrieve_filter_session_preserves_top_k_with_session_candidates() 
         strict_ids,
         std::collections::HashSet::from([target_first.as_str(), target_second.as_str()]),
         "strict retrieval should pre-filter before ranking instead of post-filtering a global top_k",
+    );
+}
+
+#[tokio::test]
+async fn test_search_session_scope_only_respects_session() {
+    let (base, client, _server) =
+        spawn_server_with_custom_embedder_and_pool(Arc::new(SessionScopeTestEmbedder), test_dim())
+            .await;
+    let uid = uid();
+
+    store_memory_for_session(&client, &base, &uid, "target-session memory", "sess-target").await;
+    store_memory_for_session(&client, &base, &uid, "other-session top", "sess-other").await;
+    store_memory_for_session(&client, &base, &uid, "other-session second", "sess-other").await;
+
+    let relaxed = client
+        .post(format!("{base}/v1/memories/search"))
+        .header("X-User-Id", &uid)
+        .json(&json!({
+            "query": "strict session query",
+            "session_id": "sess-target",
+            "top_k": 1
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(relaxed.status(), 200);
+    let relaxed_body: Value = relaxed.json().await.unwrap();
+    assert_eq!(
+        relaxed_body[0]["session_id"].as_str(),
+        Some("sess-other"),
+        "relaxed search should still be free to return another session",
+    );
+
+    let strict = client
+        .post(format!("{base}/v1/memories/search"))
+        .header("X-User-Id", &uid)
+        .json(&json!({
+            "query": "strict session query",
+            "session_id": "sess-target",
+            "session_scope": "only",
+            "top_k": 1
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(strict.status(), 200);
+    let strict_body: Value = strict.json().await.unwrap();
+    assert_eq!(
+        strict_body[0]["session_id"].as_str(),
+        Some("sess-target"),
+        "session_scope=only should keep search inside the requested session",
     );
 }
 
@@ -6860,7 +6957,7 @@ async fn test_mcp_tools_call_memory_store() {
 }
 
 #[tokio::test]
-async fn test_mcp_memory_retrieve_filter_session_end_to_end() {
+async fn test_mcp_memory_retrieve_session_scope_end_to_end() {
     let (base, client, _server) =
         spawn_server_with_custom_embedder_and_pool(Arc::new(SessionScopeTestEmbedder), test_dim())
             .await;
@@ -6940,7 +7037,7 @@ async fn test_mcp_memory_retrieve_filter_session_end_to_end() {
                 "arguments": {
                     "query": "strict session query",
                     "session_id": "sess-target",
-                    "filter_session": true,
+                    "session_scope": "only",
                     "top_k": 1
                 }
             }
@@ -6962,20 +7059,59 @@ async fn test_mcp_memory_retrieve_filter_session_end_to_end() {
         !strict_text.contains("other-session top"),
         "strict MCP retrieve should not leak cross-session memory: {strict_text}"
     );
+}
 
-    let legacy = mcp_post_with_headers(
+#[tokio::test]
+async fn test_mcp_memory_search_session_scope_end_to_end() {
+    let (base, client, _server) =
+        spawn_server_with_custom_embedder_and_pool(Arc::new(SessionScopeTestEmbedder), test_dim())
+            .await;
+    let uid = uid();
+    let headers = [("X-User-Id", uid.as_str())];
+
+    for (id, content, session_id) in [
+        (21, "target-session memory", "sess-target"),
+        (22, "other-session top", "sess-other"),
+        (23, "other-session second", "sess-other"),
+    ] {
+        let resp = mcp_post_with_headers(
+            &client,
+            &base,
+            json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "tools/call",
+                "params": {
+                    "name": "memory_store",
+                    "arguments": {
+                        "content": content,
+                        "memory_type": "semantic",
+                        "session_id": session_id
+                    }
+                }
+            }),
+            &headers,
+        )
+        .await;
+        assert!(
+            resp["error"].is_null(),
+            "unexpected store error: {}",
+            resp["error"]
+        );
+    }
+
+    let relaxed = mcp_post_with_headers(
         &client,
         &base,
         json!({
             "jsonrpc": "2.0",
-            "id": 16,
+            "id": 24,
             "method": "tools/call",
             "params": {
-                "name": "memory_retrieve",
+                "name": "memory_search",
                 "arguments": {
                     "query": "strict session query",
                     "session_id": "sess-target",
-                    "include_cross_session": false,
                     "top_k": 1
                 }
             }
@@ -6984,14 +7120,49 @@ async fn test_mcp_memory_retrieve_filter_session_end_to_end() {
     )
     .await;
     assert!(
-        legacy["error"].is_null(),
-        "unexpected legacy error: {}",
-        legacy["error"]
+        relaxed["error"].is_null(),
+        "unexpected relaxed error: {}",
+        relaxed["error"]
     );
-    let legacy_text = mcp_result_text(&legacy);
+    let relaxed_text = mcp_result_text(&relaxed);
     assert!(
-        legacy_text.contains("target-session memory"),
-        "legacy MCP retrieve flag should still enforce session scope: {legacy_text}"
+        relaxed_text.contains("other-session"),
+        "relaxed MCP search should still be free to return cross-session memory: {relaxed_text}"
+    );
+
+    let strict = mcp_post_with_headers(
+        &client,
+        &base,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 25,
+            "method": "tools/call",
+            "params": {
+                "name": "memory_search",
+                "arguments": {
+                    "query": "strict session query",
+                    "session_id": "sess-target",
+                    "session_scope": "only",
+                    "top_k": 1
+                }
+            }
+        }),
+        &headers,
+    )
+    .await;
+    assert!(
+        strict["error"].is_null(),
+        "unexpected strict error: {}",
+        strict["error"]
+    );
+    let strict_text = mcp_result_text(&strict);
+    assert!(
+        strict_text.contains("target-session memory"),
+        "strict MCP search should return the target-session memory: {strict_text}"
+    );
+    assert!(
+        !strict_text.contains("other-session top"),
+        "strict MCP search should not leak cross-session memory: {strict_text}"
     );
 }
 

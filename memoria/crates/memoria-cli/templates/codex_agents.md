@@ -78,16 +78,17 @@ Before storing a new memory, consider:
 | Tool | When to use | Key params |
 |------|-------------|------------|
 | `memory_store` | User shares a fact, preference, or decision | `content`, `memory_type` (default: semantic), `session_id` (optional) |
-| `memory_correct` | User says a stored memory is wrong | `memory_id` or `query` (one required), `new_content`, `reason` |
-| `memory_purge` | User asks to forget something | `memory_id` (single or comma-separated batch, e.g. `"id1,id2"`) or `topic` (bulk keyword match), `reason` |
+| `memory_correct` | User says a stored memory is wrong | `memory_id` or `query` (one required), `new_content`, `reason`; query mode also supports `session_id` + `session_scope` |
+| `memory_purge` | User asks to forget something | `memory_id` (single or comma-separated batch), `topic`, or exact `session_id`; `memory_types` only with `session_id` |
 
 `memory_purge` automatically creates a safety snapshot before deleting. The response includes the snapshot name — tell the user they can `memory_rollback` to undo. If the response contains a ⚠️ warning about snapshot quota, relay it and suggest `memory_snapshot_delete(prefix="pre_")`.
 
 ### Read tools
 | Tool | When to use | Key params |
 |------|-------------|------------|
-| `memory_retrieve` | Conversation start, or when context is needed | `query`, `top_k` (default 5), `session_id` (optional), `explain` (false = no debug, true = show timing) |
-| `memory_search` | User asks "what do you know about X" or you need to browse | `query`, `top_k` (default 10), `explain` (false = no debug, true = show timing) |
+| `memory_retrieve` | Conversation start, or when context is needed | `query`, `top_k` (default 5), optional `session_id`, optional `session_scope` (`prefer`/`only`), `explain` |
+| `memory_search` | User asks "what do you know about X" or you need to browse | `query`, `top_k` (default 10), optional `session_id`, optional `session_scope` (`prefer`/`only`), `explain` |
+| `memory_list` | User wants a bounded inventory or a session-specific listing | `limit`, optional `memory_type`, optional exact `session_id` |
 | `memory_profile` | User asks "what do you know about me" | — |
 | `memory_feedback` | After using a retrieved memory, record if it was helpful | `memory_id`, `signal` (useful/irrelevant/outdated/wrong), `context` (optional) |
 
@@ -108,9 +109,15 @@ Before storing a new memory, consider:
 **Impact**: Feedback accumulates over time. With default settings, a memory with 3 `useful` signals ranks ~30% higher in future retrievals. Don't call for every memory — only when you have clear signal.
 
 **`memory_retrieve` vs `memory_search`**: In MCP mode, both use the same retrieval pipeline (graph → hybrid vector+fulltext → fulltext fallback). The differences are:
-- `memory_retrieve` accepts `session_id` for session-scoped boosting; `memory_search` does not
+- Both accept optional `session_id` plus `session_scope`
+- `session_scope="prefer"` means "use this session as context, but cross-session results are still allowed" (default when `session_id` is present)
+- `session_scope="only"` means "strictly filter to this session"
 - `memory_retrieve` defaults to `top_k=5` (focused); `memory_search` defaults to `top_k=10` (broader)
-- Use `memory_retrieve` when you have a `session_id` or want focused results; use `memory_search` for broader exploration
+- Use `memory_retrieve` for prompt-relevant context; use `memory_search` for broader browsing over the same retrieval pipeline
+
+**`memory_list` session semantics**:
+- `session_id` on `memory_list` is an exact filter, not a preference hint
+- Use it to inspect one session before `memory_purge(session_id=...)` or after a session-scoped correction
 
 **Debug parameter:** `explain=true` shows execution timing and retrieval path. **ONLY use when user explicitly asks** to debug performance or investigate why certain memories were/weren't retrieved. **DO NOT use proactively** — it adds overhead and clutters output.
 

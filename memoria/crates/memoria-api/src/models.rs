@@ -33,12 +33,7 @@ pub struct RetrieveRequest {
     #[serde(default = "default_top_k")]
     pub top_k: i64,
     pub session_id: Option<String>,
-    /// Explicit strict session filter. Overrides include_cross_session when provided.
-    #[serde(default)]
-    pub filter_session: Option<bool>,
-    /// When false and session_id is set, only return memories from that session.
-    #[serde(default = "default_true")]
-    pub include_cross_session: bool,
+    pub session_scope: Option<String>,
     /// Explain level: false/"none" = off, true/"basic" = basic, "verbose" = per-candidate scores, "analyze" = full
     #[serde(default, deserialize_with = "deserialize_explain")]
     pub explain: String,
@@ -46,17 +41,65 @@ pub struct RetrieveRequest {
 fn default_top_k() -> i64 {
     5
 }
-fn default_true() -> bool {
-    true
+fn default_search_top_k() -> i64 {
+    10
+}
+fn parse_session_scope(
+    value: Option<&str>,
+) -> Result<Option<memoria_service::SessionScope>, String> {
+    value
+        .map(memoria_service::SessionScope::from_str)
+        .transpose()
 }
 
 impl RetrieveRequest {
-    pub fn retrieve_options(&self) -> memoria_service::RetrieveOptions {
-        memoria_service::RetrieveOptions::from_session_scope(
+    pub fn session_scope(&self) -> Result<Option<memoria_service::SessionScope>, String> {
+        parse_session_scope(self.session_scope.as_deref())
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.session_scope.is_some() && self.session_id.is_none() {
+            return Err("session_id is required when session_scope is set".to_string());
+        }
+        Ok(())
+    }
+
+    pub fn retrieve_options(&self) -> Result<memoria_service::RetrieveOptions, String> {
+        Ok(memoria_service::RetrieveOptions::from_session_scope(
             self.session_id.as_deref(),
-            self.filter_session,
-            Some(self.include_cross_session),
-        )
+            self.session_scope()?,
+        ))
+    }
+}
+
+#[derive(Deserialize)]
+pub struct SearchRequest {
+    pub query: String,
+    #[serde(default = "default_search_top_k")]
+    pub top_k: i64,
+    pub session_id: Option<String>,
+    pub session_scope: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_explain")]
+    pub explain: String,
+}
+
+impl SearchRequest {
+    pub fn session_scope(&self) -> Result<Option<memoria_service::SessionScope>, String> {
+        parse_session_scope(self.session_scope.as_deref())
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.session_scope.is_some() && self.session_id.is_none() {
+            return Err("session_id is required when session_scope is set".to_string());
+        }
+        Ok(())
+    }
+
+    pub fn retrieve_options(&self) -> Result<memoria_service::RetrieveOptions, String> {
+        Ok(memoria_service::RetrieveOptions::from_session_scope(
+            self.session_id.as_deref(),
+            self.session_scope()?,
+        ))
     }
 }
 
@@ -85,7 +128,25 @@ pub struct CorrectRequest {
 pub struct CorrectByQueryRequest {
     pub query: String,
     pub new_content: String,
+    pub session_id: Option<String>,
+    pub session_scope: Option<String>,
     pub reason: Option<String>,
+}
+
+impl CorrectByQueryRequest {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.session_scope.is_some() && self.session_id.is_none() {
+            return Err("session_id is required when session_scope is set".to_string());
+        }
+        Ok(())
+    }
+
+    pub fn retrieve_options(&self) -> Result<memoria_service::RetrieveOptions, String> {
+        Ok(memoria_service::RetrieveOptions::from_session_scope(
+            self.session_id.as_deref(),
+            parse_session_scope(self.session_scope.as_deref())?,
+        ))
+    }
 }
 
 #[derive(Deserialize)]
