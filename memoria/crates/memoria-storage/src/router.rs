@@ -641,26 +641,27 @@ fn configured_shared_pool_plan() -> SharedPoolPlan {
             .unwrap_or_else(|| multi_db_pool_default_size(MultiDbPoolKind::SharedMerged)),
         &LEGACY_SHARED_COMPONENT_WEIGHTS,
     );
-    let routing_component_max_connections = std::env::var("MEMORIA_SHARED_POOL_MAX_CONNECTIONS")
+    let routing_component_override = std::env::var("MEMORIA_SHARED_POOL_MAX_CONNECTIONS")
         .ok()
         .and_then(|s| s.parse::<u32>().ok())
-        .map(|raw| raw.clamp(1, max_pool_size))
-        .unwrap_or(default_components.remove(0));
+        .map(|raw| raw.clamp(1, max_pool_size));
+    let routing_component_max_connections =
+        routing_component_override.unwrap_or(default_components.remove(0));
+    let shared_main_component_override = std::env::var("MEMORIA_SHARED_MAIN_POOL_MAX_CONNECTIONS")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .map(|raw| raw.clamp(1, max_pool_size));
     let shared_main_component_max_connections =
-        std::env::var("MEMORIA_SHARED_MAIN_POOL_MAX_CONNECTIONS")
-            .ok()
-            .and_then(|s| s.parse::<u32>().ok())
-            .map(|raw| raw.clamp(1, max_pool_size))
-            .unwrap_or(default_components.remove(0));
-    let git_component_max_connections = std::env::var("MEMORIA_GIT_POOL_MAX_CONNECTIONS")
+        shared_main_component_override.unwrap_or(default_components.remove(0));
+    let git_component_override = std::env::var("MEMORIA_GIT_POOL_MAX_CONNECTIONS")
         .ok()
         .and_then(|s| s.parse::<u32>().ok())
-        .map(|raw| raw.clamp(1, max_pool_size))
-        .unwrap_or(default_components.remove(0));
-    let legacy_component_override = std::env::var_os("MEMORIA_SHARED_POOL_MAX_CONNECTIONS")
-        .is_some()
-        || std::env::var_os("MEMORIA_SHARED_MAIN_POOL_MAX_CONNECTIONS").is_some()
-        || std::env::var_os("MEMORIA_GIT_POOL_MAX_CONNECTIONS").is_some();
+        .map(|raw| raw.clamp(1, max_pool_size));
+    let git_component_max_connections =
+        git_component_override.unwrap_or(default_components.remove(0));
+    let legacy_component_override = routing_component_override.is_some()
+        || shared_main_component_override.is_some()
+        || git_component_override.is_some();
     let max_connections = explicit_override.unwrap_or_else(|| {
         if legacy_component_override {
             routing_component_max_connections
@@ -796,6 +797,31 @@ mod tests {
                         shared_main_component_max_connections: 10,
                         git_component_max_connections: 6,
                         explicit_override: true,
+                    }
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn shared_pool_plan_ignores_blank_legacy_component_envs() {
+        with_env(
+            &[
+                ("MEMORIA_MULTI_DB_POOL_BUDGET", Some("512")),
+                ("MEMORIA_SHARED_POOL_MAX_CONNECTIONS", Some("")),
+                ("MEMORIA_SHARED_MAIN_POOL_MAX_CONNECTIONS", Some("")),
+                ("MEMORIA_GIT_POOL_MAX_CONNECTIONS", Some("")),
+                (MERGED_SHARED_POOL_MAX_CONNECTIONS_ENV, None),
+            ],
+            || {
+                assert_eq!(
+                    configured_shared_pool_plan(),
+                    SharedPoolPlan {
+                        max_connections: 102,
+                        routing_component_max_connections: 41,
+                        shared_main_component_max_connections: 41,
+                        git_component_max_connections: 20,
+                        explicit_override: false,
                     }
                 );
             },
