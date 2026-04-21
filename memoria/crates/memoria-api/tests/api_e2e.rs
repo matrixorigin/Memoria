@@ -6451,6 +6451,69 @@ async fn test_api_branch_pick_retrieve_validation_error() {
 }
 
 #[tokio::test]
+async fn test_api_branch_pick_retrieve_min_score_validation_error() {
+    let (base, client, _server) = spawn_server().await;
+    let uid = uid();
+    let branch = format!(
+        "api_pick_min_score_{}",
+        &uuid::Uuid::new_v4().simple().to_string()[..6]
+    );
+
+    client
+        .post(format!("{base}/v1/branches"))
+        .header("X-User-Id", &uid)
+        .json(&json!({ "name": branch }))
+        .send()
+        .await
+        .unwrap();
+
+    let r = client
+        .post(format!("{base}/v1/branches/{branch}/pick"))
+        .header("X-User-Id", &uid)
+        .json(&json!({
+            "selector": {"type": "retrieve", "query": "anything", "top_k": 1, "min_score": -1},
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 422);
+    let body = r.text().await.unwrap();
+    assert!(body.contains("min_score"), "body: {body}");
+}
+
+#[tokio::test]
+async fn test_api_branch_pick_dry_run_limit_validation_error() {
+    let (base, client, _server) = spawn_server().await;
+    let uid = uid();
+    let branch = format!(
+        "api_pick_limit_{}",
+        &uuid::Uuid::new_v4().simple().to_string()[..6]
+    );
+
+    client
+        .post(format!("{base}/v1/branches"))
+        .header("X-User-Id", &uid)
+        .json(&json!({ "name": branch }))
+        .send()
+        .await
+        .unwrap();
+
+    let r = client
+        .post(format!("{base}/v1/branches/{branch}/pick"))
+        .header("X-User-Id", &uid)
+        .json(&json!({
+            "selector": {"type": "key_list", "keys": ["abc"]},
+            "dry_run": {"limit": 0}
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 422);
+    let body = r.text().await.unwrap();
+    assert!(body.contains("dry_run.limit"), "body: {body}");
+}
+
+#[tokio::test]
 async fn test_api_branch_pick_conflict_returns_409() {
     let (base, client, server) = spawn_server().await;
     let uid = uid();

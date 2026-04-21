@@ -871,6 +871,88 @@ async fn test_pick_fail_and_skip_conflicts() {
     );
 }
 
+#[tokio::test]
+async fn test_pick_dry_run_fail_conflict_sets_would_abort() {
+    let (svc, git, pool, uid, ctx) = setup_with_mock_embedder().await;
+    let branch = bname("pick_conflict_preview");
+
+    store_mem("shared conflict seed", &svc, &uid).await;
+    let original = svc
+        .list_active(&uid, 10)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|memory| memory.content == "shared conflict seed")
+        .expect("original");
+    gc("memory_branch", json!({"name": branch}), &git, &svc, &uid).await;
+    let branch_table = ctx
+        .user_store(&uid)
+        .await
+        .list_branches(&uid)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|(name, _)| name == &branch)
+        .map(|(_, table)| table)
+        .expect("branch table");
+
+    sqlx::query(&format!(
+        "UPDATE {branch_table} SET content = ? WHERE memory_id = ?"
+    ))
+    .bind("branch conflict content")
+    .bind(&original.memory_id)
+    .execute(&pool)
+    .await
+    .expect("update branch");
+    sqlx::query("UPDATE mem_memories SET content = ? WHERE memory_id = ?")
+        .bind("main conflict content")
+        .bind(&original.memory_id)
+        .execute(&pool)
+        .await
+        .expect("update main");
+
+    let Some(r) = pick_result_or_skip(
+        memoria_mcp::git_tools::call(
+            "memory_pick",
+            json!({
+                "source": branch,
+                "strategy": "fail",
+                "selector": {"type": "key_list", "keys": [original.memory_id.clone()]},
+                "dry_run": {
+                    "limit": 1,
+                    "include_content_preview": true,
+                    "include_scores": true
+                }
+            }),
+            &git,
+            &svc,
+            &uid,
+        )
+        .await,
+        "test_pick_dry_run_fail_conflict_sets_would_abort",
+    ) else {
+        return;
+    };
+    let body = text_json(&r);
+    assert_eq!(body["dry_run"].as_bool(), Some(true), "{body}");
+    assert_eq!(
+        body["summary"]["conflict_count"].as_u64(),
+        Some(1),
+        "{body}"
+    );
+    assert_eq!(
+        body["summary"]["would_abort"].as_bool(),
+        Some(true),
+        "{body}"
+    );
+    assert_eq!(body["summary"]["would_apply"].as_u64(), Some(0), "{body}");
+    assert_eq!(
+        body["candidates"][0]["status"].as_str(),
+        Some("conflict"),
+        "{body}"
+    );
+}
+
 // ── 4. Cannot delete main ─────────────────────────────────────────────────────
 
 #[tokio::test]
