@@ -1,4 +1,4 @@
-use memoria_core::interfaces::EmbeddingProvider;
+use memoria_core::{interfaces::EmbeddingProvider, MemoriaError};
 use memoria_embedding::MockEmbedder;
 /// Branch end-to-end tests — from the user's perspective.
 /// Covers: create, checkout, store, merge, diff, delete, limits, from_snapshot,
@@ -110,6 +110,24 @@ async fn store_mem(content: &str, svc: &Arc<MemoryService>, uid: &str) {
 }
 fn text(v: &Value) -> &str {
     v["content"][0]["text"].as_str().unwrap_or("")
+}
+
+fn is_pick_not_supported_message(body: &str) -> bool {
+    let lower = body.to_lowercase();
+    lower.contains("sql parser error")
+        && (lower.contains("data branch pick")
+            || (lower.contains("near \" pick") && lower.contains("when conflict")))
+}
+
+fn pick_result_or_skip(result: Result<Value, MemoriaError>, test_name: &str) -> Option<Value> {
+    match result {
+        Ok(value) => Some(value),
+        Err(err) if is_pick_not_supported_message(&err.to_string()) => {
+            eprintln!("⚠️ DATA BRANCH PICK not supported, skipping {test_name}");
+            None
+        }
+        Err(err) => panic!("{test_name}: {err:?}"),
+    }
 }
 
 // ── 1. Basic workflow: create → checkout → store → checkout main → merge ──────
@@ -356,17 +374,22 @@ async fn test_pick_key_list_into_main() {
         .clone();
 
     gc("memory_checkout", json!({"name": "main"}), &git, &svc, &uid).await;
-    let r = gc(
-        "memory_pick",
-        json!({
-            "source": branch,
-            "selector": {"type": "key_list", "keys": [alpha_id]},
-        }),
-        &git,
-        &svc,
-        &uid,
-    )
-    .await;
+    let Some(r) = pick_result_or_skip(
+        memoria_mcp::git_tools::call(
+            "memory_pick",
+            json!({
+                "source": branch,
+                "selector": {"type": "key_list", "keys": [alpha_id]},
+            }),
+            &git,
+            &svc,
+            &uid,
+        )
+        .await,
+        "test_pick_key_list_into_main",
+    ) else {
+        return;
+    };
     assert!(text(&r).contains("Picked 1 change"), "{}", text(&r));
 
     let main_memories = svc.list_active(&uid, 10).await.unwrap();
@@ -400,18 +423,23 @@ async fn test_pick_key_list_into_target_branch() {
     gc("memory_checkout", json!({"name": "main"}), &git, &svc, &uid).await;
     gc("memory_branch", json!({"name": target}), &git, &svc, &uid).await;
 
-    let r = gc(
-        "memory_pick",
-        json!({
-            "source": source,
-            "target": target,
-            "selector": {"type": "key_list", "keys": [source_only_id]},
-        }),
-        &git,
-        &svc,
-        &uid,
-    )
-    .await;
+    let Some(r) = pick_result_or_skip(
+        memoria_mcp::git_tools::call(
+            "memory_pick",
+            json!({
+                "source": source,
+                "target": target,
+                "selector": {"type": "key_list", "keys": [source_only_id]},
+            }),
+            &git,
+            &svc,
+            &uid,
+        )
+        .await,
+        "test_pick_key_list_into_target_branch",
+    ) else {
+        return;
+    };
     assert!(text(&r).contains("into '"), "{}", text(&r));
 
     gc("memory_checkout", json!({"name": target}), &git, &svc, &uid).await;
@@ -470,21 +498,26 @@ async fn test_pick_snapshot_range_into_main() {
     .await;
     gc("memory_checkout", json!({"name": "main"}), &git, &svc, &uid).await;
 
-    let r = gc(
-        "memory_pick",
-        json!({
-            "source": branch,
-            "selector": {
-                "type": "snapshot_range",
-                "from_snapshot": snap_before,
-                "to_snapshot": snap_after
-            },
-        }),
-        &git,
-        &svc,
-        &uid,
-    )
-    .await;
+    let Some(r) = pick_result_or_skip(
+        memoria_mcp::git_tools::call(
+            "memory_pick",
+            json!({
+                "source": branch,
+                "selector": {
+                    "type": "snapshot_range",
+                    "from_snapshot": snap_before,
+                    "to_snapshot": snap_after
+                },
+            }),
+            &git,
+            &svc,
+            &uid,
+        )
+        .await,
+        "test_pick_snapshot_range_into_main",
+    ) else {
+        return;
+    };
     assert!(text(&r).contains("snapshot range"), "{}", text(&r));
     assert!(svc
         .list_active(&uid, 10)
@@ -506,17 +539,22 @@ async fn test_pick_retrieve_top_k_on_changed_rows() {
     store_mem("beta branch memory", &svc, &uid).await;
     gc("memory_checkout", json!({"name": "main"}), &git, &svc, &uid).await;
 
-    let r = gc(
-        "memory_pick",
-        json!({
-            "source": branch,
-            "selector": {"type": "retrieve", "query": "alpha query", "top_k": 1},
-        }),
-        &git,
-        &svc,
-        &uid,
-    )
-    .await;
+    let Some(r) = pick_result_or_skip(
+        memoria_mcp::git_tools::call(
+            "memory_pick",
+            json!({
+                "source": branch,
+                "selector": {"type": "retrieve", "query": "alpha query", "top_k": 1},
+            }),
+            &git,
+            &svc,
+            &uid,
+        )
+        .await,
+        "test_pick_retrieve_top_k_on_changed_rows",
+    ) else {
+        return;
+    };
     assert!(text(&r).contains("top 1"), "{}", text(&r));
 
     let main_memories = svc.list_active(&uid, 10).await.unwrap();
@@ -580,20 +618,33 @@ async fn test_pick_fail_and_skip_conflicts() {
         &uid,
     )
     .await;
+    if fail
+        .as_ref()
+        .err()
+        .is_some_and(|err| is_pick_not_supported_message(&err.to_string()))
+    {
+        eprintln!("⚠️ DATA BRANCH PICK not supported, skipping test_pick_fail_and_skip_conflicts");
+        return;
+    }
     assert!(fail.is_err(), "fail strategy should reject conflicts");
 
-    let skip = gc(
-        "memory_pick",
-        json!({
-            "source": branch,
-            "strategy": "skip",
-            "selector": {"type": "key_list", "keys": [original.memory_id.clone()]},
-        }),
-        &git,
-        &svc,
-        &uid,
-    )
-    .await;
+    let Some(skip) = pick_result_or_skip(
+        memoria_mcp::git_tools::call(
+            "memory_pick",
+            json!({
+                "source": branch,
+                "strategy": "skip",
+                "selector": {"type": "key_list", "keys": [original.memory_id.clone()]},
+            }),
+            &git,
+            &svc,
+            &uid,
+        )
+        .await,
+        "test_pick_fail_and_skip_conflicts",
+    ) else {
+        return;
+    };
     assert!(text(&skip).contains("1 skipped"), "{}", text(&skip));
 
     let row = sqlx::query("SELECT content FROM mem_memories WHERE memory_id = ?")
