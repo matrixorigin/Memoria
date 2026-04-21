@@ -1,5 +1,8 @@
+#![allow(dead_code)]
+
 use std::sync::Arc;
 
+use memoria_api::AppState;
 use memoria_core::interfaces::EmbeddingProvider;
 use memoria_embedding::LlmClient;
 use memoria_git::GitForDataService;
@@ -12,6 +15,7 @@ pub struct ApiTestServer {
     pub base: String,
     pub client: reqwest::Client,
     context: Option<MultiDbTestContext>,
+    state: Option<AppState>,
     shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
     server_handle: Option<tokio::task::JoinHandle<()>>,
 }
@@ -27,6 +31,10 @@ impl ApiTestServer {
 
     pub fn router(&self) -> Arc<DbRouter> {
         self.context.as_ref().expect("context").router()
+    }
+
+    pub fn state(&self) -> &AppState {
+        self.state.as_ref().expect("state")
     }
 
     pub fn shared_pool(&self) -> MySqlPool {
@@ -46,19 +54,35 @@ impl ApiTestServer {
     }
 
     pub async fn user_store(&self, user_id: &str) -> Arc<SqlMemoryStore> {
-        self.context.as_ref().expect("context").user_store(user_id).await
+        self.context
+            .as_ref()
+            .expect("context")
+            .user_store(user_id)
+            .await
     }
 
     pub async fn user_table(&self, user_id: &str, table: &str) -> String {
-        self.context.as_ref().expect("context").user_table(user_id, table).await
+        self.context
+            .as_ref()
+            .expect("context")
+            .user_table(user_id, table)
+            .await
     }
 
     pub async fn user_db_name(&self, user_id: &str) -> String {
-        self.context.as_ref().expect("context").user_db_name(user_id).await
+        self.context
+            .as_ref()
+            .expect("context")
+            .user_db_name(user_id)
+            .await
     }
 
     pub async fn user_db_pool(&self, user_id: &str) -> MySqlPool {
-        self.context.as_ref().expect("context").user_db_pool(user_id).await
+        self.context
+            .as_ref()
+            .expect("context")
+            .user_db_pool(user_id)
+            .await
     }
 }
 
@@ -67,6 +91,7 @@ impl Drop for ApiTestServer {
         let shutdown_tx = self.shutdown_tx.take();
         let server_handle = self.server_handle.take();
         let context = self.context.take();
+        let state = self.state.take();
 
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
@@ -75,6 +100,9 @@ impl Drop for ApiTestServer {
                 }
                 if let Some(server_handle) = server_handle {
                     let _ = server_handle.await;
+                }
+                if let Some(state) = state {
+                    state.drain_flushers().await;
                 }
                 drop(context);
             });
@@ -104,6 +132,7 @@ pub async fn spawn_api_server(
             .expect("init auth pool");
     }
 
+    let test_state = state.clone();
     let app = memoria_api::build_router(state);
     let listener = tokio::net::TcpListener::bind("localhost:0")
         .await
@@ -130,6 +159,7 @@ pub async fn spawn_api_server(
         base,
         client,
         context: Some(context),
+        state: Some(test_state),
         shutdown_tx: Some(shutdown_tx),
         server_handle: Some(server_handle),
     }

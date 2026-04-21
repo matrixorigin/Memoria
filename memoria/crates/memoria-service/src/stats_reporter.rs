@@ -226,8 +226,10 @@ async fn flush_batch(events: &[StatsEvent], pool: &MySqlPool) {
         qb.push(
             " ON DUPLICATE KEY UPDATE \
                total_memories    = total_memories    + VALUES(total_memories), \
-               active_memories   = GREATEST(0, active_memories   + VALUES(active_memories)), \
-               inactive_memories = GREATEST(0, inactive_memories + VALUES(inactive_memories)), \
+               active_memories   = CASE WHEN active_memories   + VALUES(active_memories) < 0 THEN 0 \
+                                        ELSE active_memories   + VALUES(active_memories) END, \
+               inactive_memories = CASE WHEN inactive_memories + VALUES(inactive_memories) < 0 THEN 0 \
+                                        ELSE inactive_memories + VALUES(inactive_memories) END, \
                total_entities    = total_entities    + VALUES(total_entities), \
                total_edits       = total_edits       + VALUES(total_edits), \
                updated_at        = VALUES(updated_at)",

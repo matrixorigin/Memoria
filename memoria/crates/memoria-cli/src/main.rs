@@ -93,9 +93,10 @@ enum Commands {
     /// Start MCP server (embedded or remote mode)
     #[cfg(feature = "server-runtime")]
     Mcp {
-        /// AI tool that launched this MCP server (sent as X-Memoria-Tool header)
+        /// AI tool that launched this MCP server (sent as X-Memoria-Tool header).
+        /// Accepts any string (e.g. kiro, cursor, opencode, my-agent).
         #[arg(long, env = "MEMORIA_TOOL")]
-        tool: Option<ToolName>,
+        tool: Option<String>,
         /// Remote Memoria API URL (remote mode)
         #[arg(long, env = "MEMORIA_API_URL")]
         api_url: Option<String>,
@@ -638,6 +639,24 @@ fn redact_url(url: &str) -> String {
         "***"
     };
     format!("{scheme}://{redacted_userinfo}@{host}")
+}
+
+fn normalize_tool_name(tool: Option<String>) -> Option<String> {
+    tool.and_then(|raw| {
+        // Normalize to the same format the dashboard uses:
+        // trim, lowercase, collapse whitespace runs into a single hyphen.
+        // "My Agent" → "my-agent", "cursor" → "cursor".
+        let lower = raw.trim().to_ascii_lowercase();
+        let normalized = lower
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join("-");
+        if normalized.is_empty() {
+            None
+        } else {
+            Some(normalized)
+        }
+    })
 }
 
 // ── MCP server ────────────────────────────────────────────────────────────────
@@ -3381,11 +3400,12 @@ fn main() -> Result<()> {
             transport,
             mcp_port,
         } => {
+            let tool = normalize_tool_name(tool);
             tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?
                 .block_on(cmd_mcp(
-                    tool.map(|t| t.to_string()),
+                    tool,
                     api_url,
                     token,
                     db_url,
@@ -3485,8 +3505,8 @@ mod tests {
         LEGACY_MIGRATION_MAX_CONCURRENCY_ENV,
     };
     use super::{
-        enable_runtime_multi_db, redact_url, run_with_edit_log_drain, validate_embedding_config,
-        Cli, Commands, MigrationCommands,
+        enable_runtime_multi_db, normalize_tool_name, redact_url, run_with_edit_log_drain,
+        validate_embedding_config, Cli, Commands, MigrationCommands,
     };
     use async_trait::async_trait;
     use clap::Parser;
@@ -3771,6 +3791,26 @@ mod tests {
             redact_url("mysql://localhost:6001/memoria"),
             "mysql://localhost:6001/memoria"
         );
+    }
+
+    #[test]
+    fn normalize_tool_name_trims_lowercases_and_filters_empty() {
+        assert_eq!(
+            normalize_tool_name(Some("  CuRsOr-Agent  ".to_string())),
+            Some("cursor-agent".to_string())
+        );
+        // spaces (and multiple spaces) are collapsed into hyphens,
+        // matching the dashboard's sanitizeAgentName behaviour
+        assert_eq!(
+            normalize_tool_name(Some("My  Agent".to_string())),
+            Some("my-agent".to_string())
+        );
+        assert_eq!(
+            normalize_tool_name(Some("  Claude Code  ".to_string())),
+            Some("claude-code".to_string())
+        );
+        assert_eq!(normalize_tool_name(Some("   ".to_string())), None);
+        assert_eq!(normalize_tool_name(None), None);
     }
 
     #[test]

@@ -1,3 +1,7 @@
+use crate::pool_config::{
+    configured_multi_db_pool_budget, configured_multi_db_pool_size, multi_db_pool_default_size,
+    multi_db_pool_max_size, split_pool_budget, MultiDbPoolKind, MULTI_DB_POOL_BUDGET_MAX,
+};
 use crate::store::spawn_pool_monitor;
 use crate::{PoolHealthSnapshot, SqlMemoryStore};
 use chrono::Utc;
@@ -25,13 +29,8 @@ const USER_DB_CACHE_MAX_CAPACITY: u64 = 10_000;
 const USER_STORE_CACHE_MAX_CAPACITY: u64 = 10_000;
 const USER_SCHEMA_CACHE_MAX_CAPACITY: u64 = 10_000;
 const USER_STORE_CACHE_IDLE_SECS: u64 = 600;
-const SHARED_POOL_MAX_CONNECTIONS: u32 = 8;
-const SHARED_MAIN_POOL_MAX_CONNECTIONS: u32 = 8;
-const GIT_POOL_MAX_CONNECTIONS: u32 = 4;
-const GLOBAL_USER_POOL_MAX_CONNECTIONS: u32 = 80;
-const USER_SCHEMA_INIT_POOL_MAX_CONNECTIONS: u32 = 12;
-const POOL_MAX_CONNECTIONS_UPPER: u32 = 256;
 const MERGED_SHARED_POOL_MAX_CONNECTIONS_ENV: &str = "MEMORIA_MERGED_SHARED_POOL_MAX_CONNECTIONS";
+const LEGACY_SHARED_COMPONENT_WEIGHTS: [u32; 3] = [40, 40, 20];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SharedPoolPlan {
@@ -60,6 +59,7 @@ pub struct DbRouter {
     global_user_pool: MySqlPool,
     global_user_pool_max_connections: u32,
     user_init_pool: MySqlPool,
+    user_init_pool_max_connections: u32,
     shared_db_url: String,
     shared_db_name: String,
     embedding_dim: usize,
@@ -77,6 +77,17 @@ impl DbRouter {
         instance_id: String,
     ) -> Result<Self, MemoriaError> {
         create_database_if_missing_from_url(shared_db_url).await?;
+        let pool_budget = configured_multi_db_pool_budget();
+        tracing::info!(
+            pool_budget,
+            pool_budget_max = MULTI_DB_POOL_BUDGET_MAX,
+            shared_merged_default = multi_db_pool_default_size(MultiDbPoolKind::SharedMerged),
+            global_user_default = multi_db_pool_default_size(MultiDbPoolKind::GlobalUser),
+            auth_default = multi_db_pool_default_size(MultiDbPoolKind::Auth),
+            user_init_default = multi_db_pool_default_size(MultiDbPoolKind::UserInit),
+            governance_default = multi_db_pool_default_size(MultiDbPoolKind::Governance),
+            "Multi-db pool budget resolved"
+        );
         let shared_plan = configured_shared_pool_plan();
         let pool = MySqlPoolOptions::new()
             .max_connections(shared_plan.max_connections)
@@ -98,15 +109,14 @@ impl DbRouter {
 
         // Global pool for all per-user DB queries.
         // statement_cache_capacity=0 prevents prepared-statement cross-DB pollution.
-        let global_max = configured_pool_max_connections(
+        let global_max = configured_multi_db_pool_size(
             "MEMORIA_GLOBAL_USER_POOL_MAX",
-            GLOBAL_USER_POOL_MAX_CONNECTIONS,
-            POOL_MAX_CONNECTIONS_UPPER,
+            MultiDbPoolKind::GlobalUser,
         );
         let global_url = append_url_param(shared_db_url, "statement_cache_capacity=0");
         let global_user_pool = MySqlPoolOptions::new()
             .max_connections(global_max)
-            .min_connections(2)
+            .min_connections(global_max.min(2))
             .max_lifetime(std::time::Duration::from_secs(3600))
             .idle_timeout(std::time::Duration::from_secs(300))
             .acquire_timeout(std::time::Duration::from_secs(15))
@@ -125,10 +135,9 @@ impl DbRouter {
             )))),
             "global_user_pool",
         );
-        let user_init_pool_max = configured_pool_max_connections(
+        let user_init_pool_max = configured_multi_db_pool_size(
             "MEMORIA_USER_SCHEMA_INIT_POOL_MAX_CONNECTIONS",
-            USER_SCHEMA_INIT_POOL_MAX_CONNECTIONS,
-            64,
+            MultiDbPoolKind::UserInit,
         );
         let user_init_pool = MySqlPoolOptions::new()
             .max_connections(user_init_pool_max)
@@ -157,6 +166,7 @@ impl DbRouter {
             global_user_pool,
             global_user_pool_max_connections: global_max,
             user_init_pool,
+            user_init_pool_max_connections: user_init_pool_max,
             shared_db_url: shared_db_url.to_string(),
             shared_db_name,
             embedding_dim,
@@ -192,6 +202,10 @@ impl DbRouter {
 
     pub fn global_user_pool_max_connections(&self) -> u32 {
         self.global_user_pool_max_connections
+    }
+
+    pub fn user_init_pool_max_connections(&self) -> u32 {
+        self.user_init_pool_max_connections
     }
 
     pub fn shared_db_name(&self) -> &str {
@@ -617,56 +631,63 @@ fn append_url_param(url: &str, param: &str) -> String {
 }
 
 fn configured_shared_pool_plan() -> SharedPoolPlan {
-    let routing_component_max_connections = configured_pool_max_connections(
-        "MEMORIA_SHARED_POOL_MAX_CONNECTIONS",
-        SHARED_POOL_MAX_CONNECTIONS,
-        POOL_MAX_CONNECTIONS_UPPER,
-    );
-    let shared_main_component_max_connections = configured_pool_max_connections(
-        "MEMORIA_SHARED_MAIN_POOL_MAX_CONNECTIONS",
-        SHARED_MAIN_POOL_MAX_CONNECTIONS,
-        POOL_MAX_CONNECTIONS_UPPER,
-    );
-    let git_component_max_connections = configured_pool_max_connections(
-        "MEMORIA_GIT_POOL_MAX_CONNECTIONS",
-        GIT_POOL_MAX_CONNECTIONS,
-        64,
-    );
+    let max_pool_size = multi_db_pool_max_size(MultiDbPoolKind::SharedMerged);
     let explicit_override = std::env::var(MERGED_SHARED_POOL_MAX_CONNECTIONS_ENV)
         .ok()
         .and_then(|s| s.parse::<u32>().ok())
-        .map(|max_connections| max_connections.clamp(1, POOL_MAX_CONNECTIONS_UPPER));
+        .map(|max_connections| max_connections.clamp(1, max_pool_size));
+    let mut default_components = split_pool_budget(
+        explicit_override
+            .unwrap_or_else(|| multi_db_pool_default_size(MultiDbPoolKind::SharedMerged)),
+        &LEGACY_SHARED_COMPONENT_WEIGHTS,
+    );
+    let routing_component_override = std::env::var("MEMORIA_SHARED_POOL_MAX_CONNECTIONS")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .map(|raw| raw.clamp(1, max_pool_size));
+    let routing_component_max_connections =
+        routing_component_override.unwrap_or(default_components.remove(0));
+    let shared_main_component_override = std::env::var("MEMORIA_SHARED_MAIN_POOL_MAX_CONNECTIONS")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .map(|raw| raw.clamp(1, max_pool_size));
+    let shared_main_component_max_connections =
+        shared_main_component_override.unwrap_or(default_components.remove(0));
+    let git_component_override = std::env::var("MEMORIA_GIT_POOL_MAX_CONNECTIONS")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .map(|raw| raw.clamp(1, max_pool_size));
+    let git_component_max_connections =
+        git_component_override.unwrap_or(default_components.remove(0));
+    let legacy_component_override = routing_component_override.is_some()
+        || shared_main_component_override.is_some()
+        || git_component_override.is_some();
     let max_connections = explicit_override.unwrap_or_else(|| {
-        routing_component_max_connections
-            .saturating_add(shared_main_component_max_connections)
-            .saturating_add(git_component_max_connections)
-            .clamp(1, POOL_MAX_CONNECTIONS_UPPER)
+        if legacy_component_override {
+            routing_component_max_connections
+                .saturating_add(shared_main_component_max_connections)
+                .saturating_add(git_component_max_connections)
+                .clamp(1, max_pool_size)
+        } else {
+            multi_db_pool_default_size(MultiDbPoolKind::SharedMerged)
+        }
     });
     SharedPoolPlan {
         max_connections,
         routing_component_max_connections,
         shared_main_component_max_connections,
         git_component_max_connections,
-        explicit_override: explicit_override.is_some(),
+        explicit_override: explicit_override.is_some() || legacy_component_override,
     }
-}
-
-fn configured_pool_max_connections(env_name: &str, default: u32, upper: u32) -> u32 {
-    std::env::var(env_name)
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(default)
-        .clamp(1, upper)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        configured_pool_max_connections, configured_shared_pool_plan, SharedPoolPlan,
-        GIT_POOL_MAX_CONNECTIONS, GLOBAL_USER_POOL_MAX_CONNECTIONS,
-        MERGED_SHARED_POOL_MAX_CONNECTIONS_ENV, POOL_MAX_CONNECTIONS_UPPER,
-        SHARED_MAIN_POOL_MAX_CONNECTIONS, SHARED_POOL_MAX_CONNECTIONS,
-        USER_SCHEMA_INIT_POOL_MAX_CONNECTIONS,
+        configured_shared_pool_plan, SharedPoolPlan, MERGED_SHARED_POOL_MAX_CONNECTIONS_ENV,
+    };
+    use crate::pool_config::{
+        configured_multi_db_pool_size, multi_db_pool_default_size, MultiDbPoolKind,
     };
     use std::sync::{Mutex, OnceLock};
 
@@ -711,6 +732,7 @@ mod tests {
     fn shared_pool_plan_defaults_merge_legacy_components() {
         with_env(
             &[
+                ("MEMORIA_MULTI_DB_POOL_BUDGET", None),
                 ("MEMORIA_SHARED_POOL_MAX_CONNECTIONS", None),
                 ("MEMORIA_SHARED_MAIN_POOL_MAX_CONNECTIONS", None),
                 ("MEMORIA_GIT_POOL_MAX_CONNECTIONS", None),
@@ -720,12 +742,10 @@ mod tests {
                 assert_eq!(
                     configured_shared_pool_plan(),
                     SharedPoolPlan {
-                        max_connections: SHARED_POOL_MAX_CONNECTIONS
-                            + SHARED_MAIN_POOL_MAX_CONNECTIONS
-                            + GIT_POOL_MAX_CONNECTIONS,
-                        routing_component_max_connections: SHARED_POOL_MAX_CONNECTIONS,
-                        shared_main_component_max_connections: SHARED_MAIN_POOL_MAX_CONNECTIONS,
-                        git_component_max_connections: GIT_POOL_MAX_CONNECTIONS,
+                        max_connections: 102,
+                        routing_component_max_connections: 41,
+                        shared_main_component_max_connections: 41,
+                        git_component_max_connections: 20,
                         explicit_override: false,
                     }
                 );
@@ -737,6 +757,7 @@ mod tests {
     fn shared_pool_plan_honors_explicit_merged_override() {
         with_env(
             &[
+                ("MEMORIA_MULTI_DB_POOL_BUDGET", Some("512")),
                 ("MEMORIA_SHARED_POOL_MAX_CONNECTIONS", Some("20")),
                 ("MEMORIA_SHARED_MAIN_POOL_MAX_CONNECTIONS", Some("10")),
                 ("MEMORIA_GIT_POOL_MAX_CONNECTIONS", Some("6")),
@@ -761,6 +782,7 @@ mod tests {
     fn shared_pool_plan_clamps_explicit_merged_override() {
         with_env(
             &[
+                ("MEMORIA_MULTI_DB_POOL_BUDGET", Some("512")),
                 ("MEMORIA_SHARED_POOL_MAX_CONNECTIONS", Some("20")),
                 ("MEMORIA_SHARED_MAIN_POOL_MAX_CONNECTIONS", Some("10")),
                 ("MEMORIA_GIT_POOL_MAX_CONNECTIONS", Some("6")),
@@ -782,28 +804,77 @@ mod tests {
     }
 
     #[test]
+    fn shared_pool_plan_ignores_blank_legacy_component_envs() {
+        with_env(
+            &[
+                ("MEMORIA_MULTI_DB_POOL_BUDGET", Some("512")),
+                ("MEMORIA_SHARED_POOL_MAX_CONNECTIONS", Some("")),
+                ("MEMORIA_SHARED_MAIN_POOL_MAX_CONNECTIONS", Some("")),
+                ("MEMORIA_GIT_POOL_MAX_CONNECTIONS", Some("")),
+                (MERGED_SHARED_POOL_MAX_CONNECTIONS_ENV, None),
+            ],
+            || {
+                assert_eq!(
+                    configured_shared_pool_plan(),
+                    SharedPoolPlan {
+                        max_connections: 102,
+                        routing_component_max_connections: 41,
+                        shared_main_component_max_connections: 41,
+                        git_component_max_connections: 20,
+                        explicit_override: false,
+                    }
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn shared_pool_plan_splits_explicit_merged_override_without_legacy_components() {
+        with_env(
+            &[
+                ("MEMORIA_MULTI_DB_POOL_BUDGET", Some("512")),
+                ("MEMORIA_SHARED_POOL_MAX_CONNECTIONS", None),
+                ("MEMORIA_SHARED_MAIN_POOL_MAX_CONNECTIONS", None),
+                ("MEMORIA_GIT_POOL_MAX_CONNECTIONS", None),
+                (MERGED_SHARED_POOL_MAX_CONNECTIONS_ENV, Some("3")),
+            ],
+            || {
+                assert_eq!(
+                    configured_shared_pool_plan(),
+                    SharedPoolPlan {
+                        max_connections: 3,
+                        routing_component_max_connections: 1,
+                        shared_main_component_max_connections: 1,
+                        git_component_max_connections: 1,
+                        explicit_override: true,
+                    }
+                );
+            },
+        );
+    }
+
+    #[test]
     fn user_pool_defaults_match_budget_split() {
         with_env(
             &[
+                ("MEMORIA_MULTI_DB_POOL_BUDGET", None),
                 ("MEMORIA_GLOBAL_USER_POOL_MAX", None),
                 ("MEMORIA_USER_SCHEMA_INIT_POOL_MAX_CONNECTIONS", None),
             ],
             || {
                 assert_eq!(
-                    configured_pool_max_connections(
+                    configured_multi_db_pool_size(
                         "MEMORIA_GLOBAL_USER_POOL_MAX",
-                        GLOBAL_USER_POOL_MAX_CONNECTIONS,
-                        POOL_MAX_CONNECTIONS_UPPER,
+                        MultiDbPoolKind::GlobalUser,
                     ),
-                    GLOBAL_USER_POOL_MAX_CONNECTIONS
+                    multi_db_pool_default_size(MultiDbPoolKind::GlobalUser)
                 );
                 assert_eq!(
-                    configured_pool_max_connections(
+                    configured_multi_db_pool_size(
                         "MEMORIA_USER_SCHEMA_INIT_POOL_MAX_CONNECTIONS",
-                        USER_SCHEMA_INIT_POOL_MAX_CONNECTIONS,
-                        64,
+                        MultiDbPoolKind::UserInit,
                     ),
-                    USER_SCHEMA_INIT_POOL_MAX_CONNECTIONS
+                    multi_db_pool_default_size(MultiDbPoolKind::UserInit)
                 );
             },
         );
