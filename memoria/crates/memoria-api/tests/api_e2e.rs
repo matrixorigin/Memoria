@@ -6583,6 +6583,10 @@ async fn test_api_branch_pick_conflict_returns_409() {
         .unwrap();
     assert_eq!(r.status(), 409);
     let body = r.text().await.unwrap();
+    if is_pick_not_supported_message(&body) {
+        eprintln!("⚠️ DATA BRANCH PICK not supported, skipping test_api_branch_pick_fail_conflict_returns_409");
+        return;
+    }
     assert!(body.contains("Conflict:"), "body: {body}");
 }
 
@@ -7504,7 +7508,7 @@ async fn test_remote_pick_fail_conflict_returns_error() {
         .await
         .unwrap();
 
-    let err = remote
+    let err = match remote
         .call(
             "memory_pick",
             json!({
@@ -7514,7 +7518,16 @@ async fn test_remote_pick_fail_conflict_returns_error() {
             }),
         )
         .await
-        .expect_err("fail conflict should return error");
+    {
+        Ok(value) => panic!("fail conflict should return error: {value:?}"),
+        Err(err) if is_pick_not_supported_message(&err.to_string()) => {
+            eprintln!(
+                "⚠️ DATA BRANCH PICK not supported, skipping test_remote_pick_fail_conflict_returns_error"
+            );
+            return;
+        }
+        Err(err) => err,
+    };
     assert!(err.to_string().contains("Conflict:"), "{err:?}");
 }
 
