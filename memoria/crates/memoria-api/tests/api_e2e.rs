@@ -21,7 +21,10 @@ fn uid() -> String {
 }
 
 fn is_pick_not_supported_message(body: &str) -> bool {
-    body.contains("SQL parser error") && body.contains("data branch pick")
+    let lower = body.to_lowercase();
+    lower.contains("sql parser error")
+        && (lower.contains("data branch pick")
+            || (lower.contains("near \" pick") && lower.contains("when conflict")))
 }
 
 async fn pick_response_json_or_skip(response: reqwest::Response, test_name: &str) -> Option<Value> {
