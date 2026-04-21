@@ -595,6 +595,82 @@ async fn test_pick_snapshot_range_into_main() {
 }
 
 #[tokio::test]
+async fn test_pick_snapshot_range_dry_run_returns_preview() {
+    let (svc, git, uid, _ctx) = setup().await;
+    let branch = bname("pick_snap_preview");
+    let snap_before = format!("pick_before_{}", &Uuid::new_v4().simple().to_string()[..6]);
+    let snap_after = format!("pick_after_{}", &Uuid::new_v4().simple().to_string()[..6]);
+
+    store_mem("main seed", &svc, &uid).await;
+    gc("memory_branch", json!({"name": branch}), &git, &svc, &uid).await;
+    gc("memory_checkout", json!({"name": branch}), &git, &svc, &uid).await;
+    gc(
+        "memory_snapshot",
+        json!({"name": snap_before}),
+        &git,
+        &svc,
+        &uid,
+    )
+    .await;
+    store_mem("snapshot-ranged memory", &svc, &uid).await;
+    gc(
+        "memory_snapshot",
+        json!({"name": snap_after}),
+        &git,
+        &svc,
+        &uid,
+    )
+    .await;
+    gc("memory_checkout", json!({"name": "main"}), &git, &svc, &uid).await;
+
+    let Some(r) = pick_result_or_skip(
+        memoria_mcp::git_tools::call(
+            "memory_pick",
+            json!({
+                "source": branch,
+                "selector": {
+                    "type": "snapshot_range",
+                    "from_snapshot": snap_before,
+                    "to_snapshot": snap_after
+                },
+                "dry_run": {
+                    "limit": 1,
+                    "include_content_preview": true,
+                    "include_scores": true
+                }
+            }),
+            &git,
+            &svc,
+            &uid,
+        )
+        .await,
+        "test_pick_snapshot_range_dry_run_returns_preview",
+    ) else {
+        return;
+    };
+    let body = text_json(&r);
+    assert_eq!(body["dry_run"].as_bool(), Some(true), "{body}");
+    assert_eq!(
+        body["summary"]["candidate_count"].as_u64(),
+        Some(1),
+        "{body}"
+    );
+    let candidate = &body["candidates"][0];
+    assert_eq!(
+        candidate["content_preview"].as_str(),
+        Some("snapshot-ranged memory"),
+        "{body}"
+    );
+    assert!(candidate.get("score").is_none(), "{body}");
+    assert!(candidate.get("embedding").is_none(), "{body}");
+
+    let active = svc.list_active(&uid, 10).await.unwrap();
+    assert!(!active
+        .iter()
+        .any(|memory| memory.content == "snapshot-ranged memory"));
+}
+
+#[tokio::test]
 async fn test_pick_retrieve_top_k_on_changed_rows() {
     let (svc, git, uid, _ctx) = setup_with_pick_embedder().await;
     let branch = bname("pick_retrieve");
