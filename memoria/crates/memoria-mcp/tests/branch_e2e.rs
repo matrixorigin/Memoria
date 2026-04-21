@@ -112,6 +112,10 @@ fn text(v: &Value) -> &str {
     v["content"][0]["text"].as_str().unwrap_or("")
 }
 
+fn text_json(v: &Value) -> Value {
+    serde_json::from_str(text(v)).expect("json text")
+}
+
 fn is_pick_not_supported_message(body: &str) -> bool {
     let lower = body.to_lowercase();
     lower.contains("sql parser error")
@@ -559,6 +563,76 @@ async fn test_pick_retrieve_top_k_on_changed_rows() {
 
     let main_memories = svc.list_active(&uid, 10).await.unwrap();
     assert!(main_memories
+        .iter()
+        .any(|memory| memory.content == "alpha branch memory"));
+    assert!(!main_memories
+        .iter()
+        .any(|memory| memory.content == "beta branch memory"));
+}
+
+#[tokio::test]
+async fn test_pick_retrieve_dry_run_respects_min_score() {
+    let (svc, git, uid, _ctx) = setup_with_pick_embedder().await;
+    let branch = bname("pick_preview");
+
+    store_mem("main seed", &svc, &uid).await;
+    gc("memory_branch", json!({"name": branch}), &git, &svc, &uid).await;
+    gc("memory_checkout", json!({"name": branch}), &git, &svc, &uid).await;
+    store_mem("alpha branch memory", &svc, &uid).await;
+    store_mem("beta branch memory", &svc, &uid).await;
+    gc("memory_checkout", json!({"name": "main"}), &git, &svc, &uid).await;
+
+    let Some(r) = pick_result_or_skip(
+        memoria_mcp::git_tools::call(
+            "memory_pick",
+            json!({
+                "source": branch,
+                "selector": {
+                    "type": "retrieve",
+                    "query": "alpha query",
+                    "top_k": 2,
+                    "min_score": 0.6
+                },
+                "dry_run": {
+                    "limit": 1,
+                    "include_content_preview": true,
+                    "include_scores": true
+                }
+            }),
+            &git,
+            &svc,
+            &uid,
+        )
+        .await,
+        "test_pick_retrieve_dry_run_respects_min_score",
+    ) else {
+        return;
+    };
+    let body = text_json(&r);
+    assert_eq!(
+        body["dry_run"].as_bool(),
+        Some(true),
+        "dry_run body: {body}"
+    );
+    assert_eq!(
+        body["summary"]["candidate_count"].as_u64(),
+        Some(1),
+        "{body}"
+    );
+    assert_eq!(body["summary"]["shown_count"].as_u64(), Some(1), "{body}");
+    assert_eq!(body["summary"]["would_apply"].as_u64(), Some(1), "{body}");
+    assert_eq!(body["page"]["has_more"].as_bool(), Some(false), "{body}");
+    let candidate = &body["candidates"][0];
+    assert_eq!(
+        candidate["content_preview"].as_str(),
+        Some("alpha branch memory"),
+        "{body}"
+    );
+    assert!(candidate.get("score").is_some(), "{body}");
+    assert!(candidate.get("embedding").is_none(), "{body}");
+
+    let main_memories = svc.list_active(&uid, 10).await.unwrap();
+    assert!(!main_memories
         .iter()
         .any(|memory| memory.content == "alpha branch memory"));
     assert!(!main_memories

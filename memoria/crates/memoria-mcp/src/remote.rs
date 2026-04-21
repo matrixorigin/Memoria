@@ -579,11 +579,16 @@ impl RemoteClient {
                         "target": target,
                         "strategy": strategy,
                         "selector": args["selector"],
+                        "dry_run": args.get("dry_run").cloned().unwrap_or(Value::Null),
                     }))
                     .send()
                     .await?;
                 let body = Self::parse_response(r).await?;
-                Ok(Self::mcp_text(body["result"].as_str().unwrap_or("")))
+                if body["dry_run"].as_bool().unwrap_or(false) {
+                    Ok(Self::mcp_json(&body))
+                } else {
+                    Ok(Self::mcp_text(body["result"].as_str().unwrap_or("")))
+                }
             }
 
             "memory_diff" => {

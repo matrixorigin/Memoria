@@ -84,7 +84,7 @@ async fn git_call_pick(
         .as_str()
         .unwrap_or("")
         .to_string();
-    Ok(json!({ "result": text }))
+    Ok(serde_json::from_str(&text).unwrap_or_else(|_| json!({ "result": text })))
 }
 
 async fn user_snapshot_store(
@@ -708,6 +708,20 @@ pub async fn diff_branch(
     Ok(Json(r))
 }
 
+/// POST /v1/branches/:name/pick
+///
+/// Request body:
+/// - target: optional target branch, defaults to main
+/// - strategy: optional conflict strategy, defaults to fail
+/// - selector:
+///   - key_list { keys[] }
+///   - snapshot_range { from_snapshot, to_snapshot }
+///   - retrieve { query, top_k, min_score? }
+/// - dry_run: optional preview output shaping { limit, offset, include_content_preview, include_scores }
+///
+/// Response:
+/// - normal execution: { "result": "Picked ..." }
+/// - dry_run preview: structured JSON summary + paginated candidates (never includes embeddings)
 pub async fn pick_branch(
     State(state): State<AppState>,
     AuthUser { user_id, .. }: AuthUser,
@@ -722,6 +736,7 @@ pub async fn pick_branch(
             "target": req.target,
             "strategy": req.strategy,
             "selector": req.selector,
+            "dry_run": req.dry_run,
         }),
     )
     .await?;

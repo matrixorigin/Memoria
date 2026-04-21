@@ -49,6 +49,10 @@ fn remote_pick_or_skip(result: anyhow::Result<Value>, test_name: &str) -> Option
     }
 }
 
+fn mcp_text_json(v: &Value) -> Value {
+    serde_json::from_str(v["content"][0]["text"].as_str().unwrap_or("")).expect("mcp json text")
+}
+
 fn episodic_rules() -> Vec<memoria_test_utils::PromptRule> {
     vec![
         (
@@ -1839,6 +1843,13 @@ async fn test_api_memory_history_not_found() {
 async fn spawn_api_for_remote() -> (String, reqwest::Client, support::multi_db::ApiTestServer) {
     // Reuse spawn_server but return the base URL for RemoteClient
     spawn_server().await
+}
+
+async fn spawn_api_for_remote_with_embedder(
+    embedder: Arc<dyn memoria_core::interfaces::EmbeddingProvider>,
+    dim: usize,
+) -> (String, reqwest::Client, support::multi_db::ApiTestServer) {
+    spawn_server_with_custom_embedder_and_pool(embedder, dim).await
 }
 
 #[tokio::test]
@@ -6621,6 +6632,103 @@ async fn test_api_branch_pick_retrieve_returns_ranked_result() {
 }
 
 #[tokio::test]
+async fn test_api_branch_pick_retrieve_dry_run_limits_preview() {
+    let (base, client, server) =
+        spawn_server_with_custom_embedder_and_pool(Arc::new(PickTestEmbedder), test_dim()).await;
+    let uid = uid();
+    let branch = format!(
+        "api_pick_preview_{}",
+        &uuid::Uuid::new_v4().simple().to_string()[..6]
+    );
+
+    client
+        .post(format!("{base}/v1/memories"))
+        .header("X-User-Id", &uid)
+        .json(&json!({"content": "main seed"}))
+        .send()
+        .await
+        .unwrap();
+    client
+        .post(format!("{base}/v1/branches"))
+        .header("X-User-Id", &uid)
+        .json(&json!({ "name": branch }))
+        .send()
+        .await
+        .unwrap();
+    client
+        .post(format!("{base}/v1/branches/{branch}/checkout"))
+        .header("X-User-Id", &uid)
+        .send()
+        .await
+        .unwrap();
+    client
+        .post(format!("{base}/v1/memories"))
+        .header("X-User-Id", &uid)
+        .json(&json!({"content": "alpha branch memory"}))
+        .send()
+        .await
+        .unwrap();
+    client
+        .post(format!("{base}/v1/memories"))
+        .header("X-User-Id", &uid)
+        .json(&json!({"content": "beta branch memory"}))
+        .send()
+        .await
+        .unwrap();
+    client
+        .post(format!("{base}/v1/branches/main/checkout"))
+        .header("X-User-Id", &uid)
+        .send()
+        .await
+        .unwrap();
+
+    let r = client
+        .post(format!("{base}/v1/branches/{branch}/pick"))
+        .header("X-User-Id", &uid)
+        .json(&json!({
+            "selector": {"type": "retrieve", "query": "alpha query", "top_k": 2},
+            "dry_run": {
+                "limit": 1,
+                "offset": 0,
+                "include_content_preview": true,
+                "include_scores": false
+            }
+        }))
+        .send()
+        .await
+        .unwrap();
+    let Some(body) =
+        pick_response_json_or_skip(r, "test_api_branch_pick_retrieve_dry_run_limits_preview").await
+    else {
+        return;
+    };
+    assert_eq!(
+        body["dry_run"].as_bool(),
+        Some(true),
+        "preview body: {body}"
+    );
+    assert_eq!(
+        body["summary"]["candidate_count"].as_u64(),
+        Some(2),
+        "{body}"
+    );
+    assert_eq!(body["summary"]["shown_count"].as_u64(), Some(1), "{body}");
+    assert_eq!(body["page"]["has_more"].as_bool(), Some(true), "{body}");
+    let candidate = &body["candidates"][0];
+    assert!(candidate.get("content_preview").is_some(), "{body}");
+    assert!(candidate.get("score").is_none(), "{body}");
+    assert!(candidate.get("embedding").is_none(), "{body}");
+
+    let active = server.service().list_active(&uid, 10).await.unwrap();
+    assert!(!active
+        .iter()
+        .any(|memory| memory.content == "alpha branch memory"));
+    assert!(!active
+        .iter()
+        .any(|memory| memory.content == "beta branch memory"));
+}
+
+#[tokio::test]
 async fn test_api_branch_pick_key_list_into_target_branch_returns_result() {
     let (base, client, server) = spawn_server().await;
     let uid = uid();
@@ -6960,6 +7068,93 @@ async fn test_remote_pick_key_list_into_target_branch() {
     assert!(target_active
         .iter()
         .any(|memory| memory.content == "remote target branch memory"));
+}
+
+#[tokio::test]
+async fn test_remote_pick_retrieve_dry_run_returns_preview_json() {
+    use memoria_mcp::remote::RemoteClient;
+    let (base, _, server) =
+        spawn_api_for_remote_with_embedder(Arc::new(PickTestEmbedder), test_dim()).await;
+    let uid = uid();
+    let remote = RemoteClient::new(&base, None, uid.clone(), None);
+    let branch = format!(
+        "remote_pick_preview_{}",
+        &uuid::Uuid::new_v4().simple().to_string()[..6]
+    );
+
+    remote
+        .call("memory_store", json!({"content": "remote main seed"}))
+        .await
+        .unwrap();
+    remote
+        .call("memory_branch", json!({"name": branch}))
+        .await
+        .unwrap();
+    remote
+        .call("memory_checkout", json!({"name": branch}))
+        .await
+        .unwrap();
+    remote
+        .call("memory_store", json!({"content": "alpha branch memory"}))
+        .await
+        .unwrap();
+    remote
+        .call("memory_store", json!({"content": "beta branch memory"}))
+        .await
+        .unwrap();
+    remote
+        .call("memory_checkout", json!({"name": "main"}))
+        .await
+        .unwrap();
+
+    let Some(r) = remote_pick_or_skip(
+        remote
+            .call(
+                "memory_pick",
+                json!({
+                    "source": branch,
+                    "selector": {
+                        "type": "retrieve",
+                        "query": "alpha query",
+                        "top_k": 2,
+                        "min_score": 0.6
+                    },
+                    "dry_run": {
+                        "limit": 1,
+                        "include_content_preview": true,
+                        "include_scores": true
+                    }
+                }),
+            )
+            .await,
+        "test_remote_pick_retrieve_dry_run_returns_preview_json",
+    ) else {
+        return;
+    };
+    let body = mcp_text_json(&r);
+    assert_eq!(
+        body["dry_run"].as_bool(),
+        Some(true),
+        "remote preview: {body}"
+    );
+    assert_eq!(
+        body["summary"]["candidate_count"].as_u64(),
+        Some(1),
+        "{body}"
+    );
+    let candidate = &body["candidates"][0];
+    assert_eq!(
+        candidate["content_preview"].as_str(),
+        Some("alpha branch memory"),
+        "{body}"
+    );
+    assert!(candidate.get("score").is_some(), "{body}");
+    assert!(candidate.get("embedding").is_none(), "{body}");
+
+    let active = server.service().list_active(&uid, 10).await.unwrap();
+    assert!(!active
+        .iter()
+        .any(|memory| memory.content == "alpha branch memory"));
 }
 
 // ── Entity list ───────────────────────────────────────────────────────────────

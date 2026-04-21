@@ -15,7 +15,7 @@ use chrono::NaiveDateTime;
 use memoria_core::MemoriaError;
 use memoria_git::{service::DiffRow, GitForDataService};
 use memoria_service::MemoryService;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sqlx::{MySql, QueryBuilder, Row};
 use std::collections::{HashMap, HashSet};
@@ -53,7 +53,9 @@ const SAFETY_SCOPE_MAX_LEN: usize = 21;
 const DEFAULT_PICK_TARGET: &str = "main";
 const DEFAULT_PICK_STRATEGY: &str = "fail";
 const DEFAULT_PICK_TOP_K: i64 = 5;
+const DEFAULT_PICK_PREVIEW_LIMIT: i64 = 10;
 const MAX_PICK_TOP_K: i64 = 100;
+const MAX_PICK_PREVIEW_LIMIT: i64 = 100;
 const MAX_PICK_KEYS: usize = 1000;
 
 fn safety_prefix(db_name: Option<&str>) -> String {
@@ -206,6 +208,15 @@ struct PickCandidate {
     memory_id: String,
     content: String,
     memory_type: String,
+    target_exists: bool,
+}
+
+#[derive(Debug, Clone)]
+struct RankedPickCandidate {
+    memory_id: String,
+    content: String,
+    score: Option<f64>,
+    target_exists: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -216,6 +227,7 @@ struct MemoryPickArgs {
     #[serde(default = "default_pick_strategy")]
     strategy: String,
     selector: PickSelector,
+    dry_run: Option<PickDryRunOptions>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -232,6 +244,7 @@ enum PickSelector {
         query: String,
         #[serde(default = "default_pick_top_k")]
         top_k: i64,
+        min_score: Option<f64>,
     },
 }
 
@@ -245,6 +258,58 @@ fn default_pick_strategy() -> String {
 
 fn default_pick_top_k() -> i64 {
     DEFAULT_PICK_TOP_K
+}
+
+fn default_pick_preview_limit() -> i64 {
+    DEFAULT_PICK_PREVIEW_LIMIT
+}
+
+fn default_pick_include_content_preview() -> bool {
+    true
+}
+
+fn default_pick_include_scores() -> bool {
+    true
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct PickDryRunOptions {
+    #[serde(default = "default_pick_preview_limit")]
+    limit: i64,
+    #[serde(default)]
+    offset: i64,
+    #[serde(default = "default_pick_include_content_preview")]
+    include_content_preview: bool,
+    #[serde(default = "default_pick_include_scores")]
+    include_scores: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct PickPreviewSummary {
+    candidate_count: usize,
+    shown_count: usize,
+    would_apply: usize,
+    would_skip: usize,
+    conflict_count: usize,
+    would_abort: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct PickPreviewPage {
+    limit: usize,
+    offset: usize,
+    has_more: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct PickPreviewCandidate {
+    memory_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content_preview: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    score: Option<f64>,
+    status: &'static str,
+    reason: &'static str,
 }
 
 fn milestone_internal(name: &str) -> Option<String> {
@@ -494,7 +559,7 @@ pub fn list() -> Value {
         },
         {
             "name": "memory_pick",
-            "description": "Selectively apply changes from a source branch into a target branch (default main) using selector.type=key_list|snapshot_range|retrieve.",
+            "description": "Selectively apply branch changes into a target branch (default main). key_list picks explicit memory_ids, snapshot_range picks changes between two named snapshots, and retrieve ranks changed rows by query before applying them. Set dry_run to preview candidates without modifying the database.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -535,11 +600,22 @@ pub fn list() -> Value {
                                 "properties": {
                                     "type": {"const": "retrieve"},
                                     "query": {"type": "string", "description": "Natural-language query used to rank changed source memories."},
-                                    "top_k": {"type": "integer", "default": 5, "description": "Only valid for retrieve; picks the top-k relevant changed memories."}
+                                    "top_k": {"type": "integer", "default": 5, "description": "Only valid for retrieve; keeps at most the top-k ranked changed memories."},
+                                    "min_score": {"type": "number", "description": "Optional retrieve-only score threshold. Candidates below this score are excluded from both dry_run previews and the final apply set."}
                                 },
                                 "required": ["type", "query"]
                             }
                         ]
+                    },
+                    "dry_run": {
+                        "type": "object",
+                        "description": "Preview the candidate set without applying it. limit/offset only shape the preview output; they do not change which memories would be picked.",
+                        "properties": {
+                            "limit": {"type": "integer", "default": 10, "description": "Maximum number of preview candidates to return."},
+                            "offset": {"type": "integer", "default": 0, "description": "Preview pagination offset."},
+                            "include_content_preview": {"type": "boolean", "default": true, "description": "When true, include a short content_preview for each candidate. Embeddings are never returned."},
+                            "include_scores": {"type": "boolean", "default": true, "description": "When true, include retrieve scores when available. Non-retrieve selectors omit scores."}
+                        }
                     }
                 },
                 "required": ["source", "selector"]
@@ -1056,7 +1132,7 @@ pub async fn call(
         }
 
         GitToolCallName::MemoryPick => {
-            let pick_args: MemoryPickArgs = serde_json::from_value(args)
+            let pick_args: MemoryPickArgs = serde_json::from_value(args.clone())
                 .map_err(|e| MemoriaError::Validation(e.to_string()))?;
             let strategy = normalize_pick_strategy(&pick_args.strategy)?;
             if pick_args.source == pick_args.target {
@@ -1073,6 +1149,8 @@ pub async fn call(
                 resolve_branch_table_name(&sql, user_id, &pick_args.target, true).await?;
             let source_table = sql.t(&source_table_name);
             let target_table = sql.t(&target_table_name);
+            let dry_run = normalize_pick_dry_run(pick_args.dry_run.clone())?;
+            let selector_value = args["selector"].clone();
 
             match pick_args.selector {
                 PickSelector::KeyList { keys } => {
@@ -1090,7 +1168,26 @@ pub async fn call(
                         .iter()
                         .map(|candidate| candidate.memory_id.clone())
                         .collect();
+                    let ranked = candidates
+                        .iter()
+                        .map(|candidate| RankedPickCandidate {
+                            memory_id: candidate.memory_id.clone(),
+                            content: candidate.content.clone(),
+                            score: None,
+                            target_exists: candidate.target_exists,
+                        })
+                        .collect::<Vec<_>>();
                     let ignored = requested.len().saturating_sub(pick_keys.len());
+                    if let Some(dry_run) = dry_run.as_ref() {
+                        return Ok(mcp_json(&build_pick_preview_response(
+                            &pick_args.source,
+                            &pick_args.target,
+                            strategy,
+                            selector_value.clone(),
+                            dry_run,
+                            &ranked,
+                        )));
+                    }
                     if pick_keys.is_empty() {
                         return Ok(mcp_text(&format!(
                             "No pickable changes found in branch '{}' for the selected keys.",
@@ -1154,9 +1251,47 @@ pub async fn call(
                             MemoriaError::NotFound(format!("Snapshot '{to_snapshot}'"))
                         })?;
                     if from_internal == to_internal {
+                        if let Some(dry_run) = dry_run.as_ref() {
+                            return Ok(mcp_json(&build_pick_preview_response(
+                                &pick_args.source,
+                                &pick_args.target,
+                                strategy,
+                                selector_value.clone(),
+                                dry_run,
+                                &[],
+                            )));
+                        }
                         return Ok(mcp_text(&format!(
                             "No pickable changes found in branch '{}' between snapshots '{}' and '{}'.",
                             pick_args.source, from_snapshot, to_snapshot
+                        )));
+                    }
+                    if let Some(dry_run) = dry_run.as_ref() {
+                        let candidates = load_snapshot_range_pick_candidates(
+                            &sql,
+                            user_id,
+                            &source_table,
+                            &target_table,
+                            &from_internal,
+                            &to_internal,
+                        )
+                        .await?;
+                        let ranked = candidates
+                            .into_iter()
+                            .map(|candidate| RankedPickCandidate {
+                                memory_id: candidate.memory_id,
+                                content: candidate.content,
+                                score: None,
+                                target_exists: candidate.target_exists,
+                            })
+                            .collect::<Vec<_>>();
+                        return Ok(mcp_json(&build_pick_preview_response(
+                            &pick_args.source,
+                            &pick_args.target,
+                            strategy,
+                            selector_value.clone(),
+                            dry_run,
+                            &ranked,
                         )));
                     }
                     if let Err(err) = git
@@ -1176,7 +1311,11 @@ pub async fn call(
                         from_snapshot, to_snapshot, pick_args.source, pick_args.target
                     )))
                 }
-                PickSelector::Retrieve { query, top_k } => {
+                PickSelector::Retrieve {
+                    query,
+                    top_k,
+                    min_score,
+                } => {
                     if top_k <= 0 || top_k > MAX_PICK_TOP_K {
                         return Err(MemoriaError::Validation(format!(
                             "retrieve top_k must be between 1 and {MAX_PICK_TOP_K}"
@@ -1198,9 +1337,29 @@ pub async fn call(
                         source_table: &source_table,
                         target_table: &target_table,
                     };
-                    let selected =
-                        select_retrieved_pick_keys(&select_ctx, &query, top_k, candidates).await?;
-                    if selected.is_empty() {
+                    let selected = select_retrieved_pick_candidates(
+                        &select_ctx,
+                        &query,
+                        top_k,
+                        min_score,
+                        candidates,
+                    )
+                    .await?;
+                    if let Some(dry_run) = dry_run.as_ref() {
+                        return Ok(mcp_json(&build_pick_preview_response(
+                            &pick_args.source,
+                            &pick_args.target,
+                            strategy,
+                            selector_value.clone(),
+                            dry_run,
+                            &selected,
+                        )));
+                    }
+                    let selected_keys = selected
+                        .iter()
+                        .map(|candidate| candidate.memory_id.clone())
+                        .collect::<Vec<_>>();
+                    if selected_keys.is_empty() {
                         return Ok(mcp_text(&format!(
                             "No pickable changes matched query '{}' in branch '{}'.",
                             query, pick_args.source
@@ -1210,7 +1369,7 @@ pub async fn call(
                         .pick_branch_keys(
                             &source_table_name,
                             &target_table_name,
-                            &selected,
+                            &selected_keys,
                             strategy,
                         )
                         .await
@@ -1219,7 +1378,7 @@ pub async fn call(
                             err,
                             &pick_args.source,
                             &pick_args.target,
-                            Some(selected.len()),
+                            Some(selected_keys.len()),
                         );
                     }
                     let remaining = count_pick_candidates(
@@ -1227,10 +1386,10 @@ pub async fn call(
                         user_id,
                         &source_table,
                         &target_table,
-                        Some(&selected),
+                        Some(&selected_keys),
                     )
                     .await?;
-                    let applied = selected.len().saturating_sub(remaining as usize);
+                    let applied = selected_keys.len().saturating_sub(remaining as usize);
                     let skipped = if strategy == "skip" {
                         remaining.max(0) as usize
                     } else {
@@ -1517,6 +1676,137 @@ fn normalize_keys(keys: Vec<String>) -> Result<Vec<String>, MemoriaError> {
     Ok(out)
 }
 
+#[derive(Debug, Clone)]
+struct NormalizedPickDryRunOptions {
+    limit: usize,
+    offset: usize,
+    include_content_preview: bool,
+    include_scores: bool,
+}
+
+fn normalize_pick_dry_run(
+    dry_run: Option<PickDryRunOptions>,
+) -> Result<Option<NormalizedPickDryRunOptions>, MemoriaError> {
+    let Some(dry_run) = dry_run else {
+        return Ok(None);
+    };
+    if dry_run.limit <= 0 || dry_run.limit > MAX_PICK_PREVIEW_LIMIT {
+        return Err(MemoriaError::Validation(format!(
+            "dry_run.limit must be between 1 and {MAX_PICK_PREVIEW_LIMIT}"
+        )));
+    }
+    if dry_run.offset < 0 {
+        return Err(MemoriaError::Validation(
+            "dry_run.offset must be greater than or equal to 0".into(),
+        ));
+    }
+    Ok(Some(NormalizedPickDryRunOptions {
+        limit: dry_run.limit as usize,
+        offset: dry_run.offset as usize,
+        include_content_preview: dry_run.include_content_preview,
+        include_scores: dry_run.include_scores,
+    }))
+}
+
+fn preview_content(text: &str) -> String {
+    const MAX_PREVIEW_CHARS: usize = 160;
+    let mut out = String::new();
+    for (idx, ch) in text.chars().enumerate() {
+        if idx >= MAX_PREVIEW_CHARS {
+            out.push_str("...");
+            break;
+        }
+        out.push(ch);
+    }
+    out
+}
+
+fn preview_status(strategy: &str, target_exists: bool) -> (&'static str, &'static str) {
+    if !target_exists {
+        return ("would_apply", "new_or_updated_row");
+    }
+    match strategy {
+        "skip" => ("would_skip", "conflict_skip"),
+        "accept" => ("would_apply", "conflict_accept"),
+        _ => ("conflict", "conflict_fail"),
+    }
+}
+
+fn build_pick_preview_response(
+    source: &str,
+    target: &str,
+    strategy: &str,
+    selector: Value,
+    dry_run: &NormalizedPickDryRunOptions,
+    ranked: &[RankedPickCandidate],
+) -> Value {
+    let candidate_count = ranked.len();
+    let conflict_count = ranked
+        .iter()
+        .filter(|candidate| candidate.target_exists)
+        .count();
+    let would_abort = strategy == "fail" && conflict_count > 0;
+    let would_skip = if strategy == "skip" {
+        conflict_count
+    } else {
+        0
+    };
+    let would_apply = if would_abort {
+        0
+    } else if strategy == "skip" {
+        candidate_count.saturating_sub(conflict_count)
+    } else {
+        candidate_count
+    };
+    let shown: Vec<_> = ranked
+        .iter()
+        .skip(dry_run.offset)
+        .take(dry_run.limit)
+        .map(|candidate| {
+            let (status, reason) = preview_status(strategy, candidate.target_exists);
+            PickPreviewCandidate {
+                memory_id: candidate.memory_id.clone(),
+                content_preview: dry_run
+                    .include_content_preview
+                    .then(|| preview_content(&candidate.content)),
+                score: if dry_run.include_scores {
+                    candidate.score
+                } else {
+                    None
+                },
+                status,
+                reason,
+            }
+        })
+        .collect();
+    let shown_count = shown.len();
+    let has_more = dry_run.offset.saturating_add(shown_count) < candidate_count;
+    json!({
+        "dry_run": true,
+        "result": format!(
+            "Previewed {candidate_count} candidate change(s) from branch '{source}' into '{target}'. Showing {shown_count}."
+        ),
+        "source": source,
+        "target": target,
+        "strategy": strategy,
+        "selector": selector,
+        "summary": PickPreviewSummary {
+            candidate_count,
+            shown_count,
+            would_apply,
+            would_skip,
+            conflict_count,
+            would_abort,
+        },
+        "page": PickPreviewPage {
+            limit: dry_run.limit,
+            offset: dry_run.offset,
+            has_more,
+        },
+        "candidates": shown,
+    })
+}
+
 struct PickSelectionContext<'a> {
     svc: &'a Arc<MemoryService>,
     sql: &'a Arc<memoria_storage::SqlMemoryStore>,
@@ -1561,7 +1851,8 @@ async fn load_pick_candidates(
     let diff_clause = pickable_diff_clause("s", "t");
     let mut qb: QueryBuilder<MySql> = QueryBuilder::new(format!(
         "SELECT s.memory_id, COALESCE(s.content, '') AS content, \
-         COALESCE(s.memory_type, 'semantic') AS memory_type \
+         COALESCE(s.memory_type, 'semantic') AS memory_type, \
+         CASE WHEN t.memory_id IS NULL THEN 0 ELSE 1 END AS target_exists \
          FROM {source_table} s \
          LEFT JOIN {target_table} t ON t.memory_id = s.memory_id \
          WHERE s.user_id = "
@@ -1595,6 +1886,50 @@ async fn load_pick_candidates(
                 memory_type: row
                     .try_get("memory_type")
                     .unwrap_or_else(|_| "semantic".to_string()),
+                target_exists: row.try_get::<i64, _>("target_exists").unwrap_or(0) != 0,
+            })
+        })
+        .collect()
+}
+
+async fn load_snapshot_range_pick_candidates(
+    sql: &Arc<memoria_storage::SqlMemoryStore>,
+    user_id: &str,
+    source_table: &str,
+    target_table: &str,
+    from_snapshot: &str,
+    to_snapshot: &str,
+) -> Result<Vec<PickCandidate>, MemoriaError> {
+    let diff_clause = pickable_diff_clause("s_to", "s_from");
+    let mut qb: QueryBuilder<MySql> = QueryBuilder::new(format!(
+        "SELECT s_to.memory_id, COALESCE(s_to.content, '') AS content, \
+         COALESCE(s_to.memory_type, 'semantic') AS memory_type, \
+         CASE WHEN t.memory_id IS NULL THEN 0 ELSE 1 END AS target_exists \
+         FROM {source_table} {{SNAPSHOT = '"
+    ));
+    qb.push(to_snapshot);
+    qb.push("'}} s_to ");
+    qb.push(format!(
+        "LEFT JOIN {source_table} {{SNAPSHOT = '{from_snapshot}'}} s_from ON s_from.memory_id = s_to.memory_id "
+    ));
+    qb.push(format!(
+        "LEFT JOIN {target_table} t ON t.memory_id = s_to.memory_id WHERE s_to.user_id = "
+    ));
+    qb.push_bind(user_id);
+    qb.push(" AND (");
+    qb.push(&diff_clause);
+    qb.push(") ORDER BY s_to.updated_at DESC, s_to.created_at DESC");
+
+    let rows = qb.build().fetch_all(sql.pool()).await.map_err(db_err)?;
+    rows.into_iter()
+        .map(|row| {
+            Ok(PickCandidate {
+                memory_id: row.try_get("memory_id").map_err(db_err)?,
+                content: row.try_get("content").unwrap_or_default(),
+                memory_type: row
+                    .try_get("memory_type")
+                    .unwrap_or_else(|_| "semantic".to_string()),
+                target_exists: row.try_get::<i64, _>("target_exists").unwrap_or(0) != 0,
             })
         })
         .collect()
@@ -1672,20 +2007,22 @@ fn vec_to_mo(v: &[f32]) -> String {
     )
 }
 
-async fn select_retrieved_pick_keys(
+async fn select_retrieved_pick_candidates(
     ctx: &PickSelectionContext<'_>,
     query: &str,
     top_k: i64,
+    min_score: Option<f64>,
     candidates: Vec<PickCandidate>,
-) -> Result<Vec<String>, MemoriaError> {
+) -> Result<Vec<RankedPickCandidate>, MemoriaError> {
+    if let Some(min_score) = min_score {
+        if !min_score.is_finite() || min_score < 0.0 {
+            return Err(MemoriaError::Validation(
+                "retrieve min_score must be a finite number greater than or equal to 0".into(),
+            ));
+        }
+    }
     if candidates.is_empty() {
         return Ok(vec![]);
-    }
-    if candidates.len() <= top_k as usize {
-        return Ok(candidates
-            .into_iter()
-            .map(|candidate| candidate.memory_id)
-            .collect());
     }
 
     let fetch_k = (top_k * 3).max(20);
@@ -1787,16 +2124,26 @@ async fn select_retrieved_pick_keys(
                 .copied()
                 .unwrap_or(lexical_overlap)
                 + type_bias;
-            (candidate.memory_id, score)
+            RankedPickCandidate {
+                memory_id: candidate.memory_id,
+                content: candidate.content,
+                score: Some(score),
+                target_exists: candidate.target_exists,
+            }
         })
         .collect::<Vec<_>>();
     ranked.sort_by(|a, b| {
-        b.1.partial_cmp(&a.1)
+        b.score
+            .unwrap_or(0.0)
+            .partial_cmp(&a.score.unwrap_or(0.0))
             .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.0.cmp(&b.0))
+            .then_with(|| a.memory_id.cmp(&b.memory_id))
     });
+    if let Some(min_score) = min_score {
+        ranked.retain(|candidate| candidate.score.unwrap_or(0.0) >= min_score);
+    }
     ranked.truncate(top_k as usize);
-    Ok(ranked.into_iter().map(|(memory_id, _)| memory_id).collect())
+    Ok(ranked)
 }
 
 fn map_pick_conflict(
@@ -1819,6 +2166,10 @@ fn map_pick_conflict(
 
 fn mcp_text(text: &str) -> Value {
     json!({"content": [{"type": "text", "text": text}]})
+}
+
+fn mcp_json(value: &Value) -> Value {
+    mcp_text(&serde_json::to_string_pretty(value).unwrap_or_default())
 }
 
 #[cfg(test)]
