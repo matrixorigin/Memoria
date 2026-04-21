@@ -20,6 +20,32 @@ fn uid() -> String {
     format!("api_test_{}", uuid::Uuid::new_v4().simple())
 }
 
+fn is_pick_not_supported_message(body: &str) -> bool {
+    body.contains("SQL parser error") && body.contains("data branch pick")
+}
+
+async fn pick_response_json_or_skip(response: reqwest::Response, test_name: &str) -> Option<Value> {
+    let status = response.status();
+    let body = response.text().await.unwrap();
+    if status == reqwest::StatusCode::CONFLICT && is_pick_not_supported_message(&body) {
+        eprintln!("⚠️ DATA BRANCH PICK not supported, skipping {test_name}");
+        return None;
+    }
+    assert_eq!(status, 200, "body: {body}");
+    Some(serde_json::from_str(&body).expect("pick response json"))
+}
+
+fn remote_pick_or_skip(result: anyhow::Result<Value>, test_name: &str) -> Option<Value> {
+    match result {
+        Ok(value) => Some(value),
+        Err(err) if is_pick_not_supported_message(&err.to_string()) => {
+            eprintln!("⚠️ DATA BRANCH PICK not supported, skipping {test_name}");
+            None
+        }
+        Err(err) => panic!("{err:?}"),
+    }
+}
+
 fn episodic_rules() -> Vec<memoria_test_utils::PromptRule> {
     vec![
         (
@@ -6268,8 +6294,11 @@ async fn test_api_branch_pick_key_list_returns_result() {
         .send()
         .await
         .unwrap();
-    assert_eq!(r.status(), 200);
-    let body: Value = r.json().await.unwrap();
+    let Some(body) =
+        pick_response_json_or_skip(r, "test_api_branch_pick_key_list_returns_result").await
+    else {
+        return;
+    };
     assert!(
         body["result"]
             .as_str()
@@ -6482,8 +6511,11 @@ async fn test_api_branch_pick_snapshot_range_returns_result() {
         .send()
         .await
         .unwrap();
-    assert_eq!(r.status(), 200);
-    let body: Value = r.json().await.unwrap();
+    let Some(body) =
+        pick_response_json_or_skip(r, "test_api_branch_pick_snapshot_range_returns_result").await
+    else {
+        return;
+    };
     assert!(
         body["result"]
             .as_str()
@@ -6566,8 +6598,11 @@ async fn test_api_branch_pick_retrieve_returns_ranked_result() {
         .send()
         .await
         .unwrap();
-    assert_eq!(r.status(), 200);
-    let body: Value = r.json().await.unwrap();
+    let Some(body) =
+        pick_response_json_or_skip(r, "test_api_branch_pick_retrieve_returns_ranked_result").await
+    else {
+        return;
+    };
     assert!(
         body["result"].as_str().unwrap_or("").contains("top 1"),
         "pick result: {body}"
@@ -6661,8 +6696,14 @@ async fn test_api_branch_pick_key_list_into_target_branch_returns_result() {
         .send()
         .await
         .unwrap();
-    assert_eq!(r.status(), 200);
-    let body: Value = r.json().await.unwrap();
+    let Some(body) = pick_response_json_or_skip(
+        r,
+        "test_api_branch_pick_key_list_into_target_branch_returns_result",
+    )
+    .await
+    else {
+        return;
+    };
     assert!(
         body["result"]
             .as_str()
@@ -6753,8 +6794,11 @@ async fn test_api_branch_pick_accept_replaces_conflict() {
         .send()
         .await
         .unwrap();
-    assert_eq!(r.status(), 200);
-    let body: Value = r.json().await.unwrap();
+    let Some(body) =
+        pick_response_json_or_skip(r, "test_api_branch_pick_accept_replaces_conflict").await
+    else {
+        return;
+    };
     assert!(
         body["result"]
             .as_str()
@@ -6816,16 +6860,20 @@ async fn test_remote_pick_key_list() {
         .call("memory_checkout", json!({"name": "main"}))
         .await
         .unwrap();
-    let r = remote
-        .call(
-            "memory_pick",
-            json!({
-                "source": branch,
-                "selector": {"type": "key_list", "keys": [branch_memory_id]},
-            }),
-        )
-        .await
-        .unwrap();
+    let Some(r) = remote_pick_or_skip(
+        remote
+            .call(
+                "memory_pick",
+                json!({
+                    "source": branch,
+                    "selector": {"type": "key_list", "keys": [branch_memory_id]},
+                }),
+            )
+            .await,
+        "test_remote_pick_key_list",
+    ) else {
+        return;
+    };
     let t = r["content"][0]["text"].as_str().unwrap_or("");
     assert!(t.contains("Picked 1 change"), "remote pick: {t}");
 }
@@ -6883,17 +6931,21 @@ async fn test_remote_pick_key_list_into_target_branch() {
         .call("memory_checkout", json!({"name": "main"}))
         .await
         .unwrap();
-    let r = remote
-        .call(
-            "memory_pick",
-            json!({
-                "source": source,
-                "target": target,
-                "selector": {"type": "key_list", "keys": [branch_memory_id]},
-            }),
-        )
-        .await
-        .unwrap();
+    let Some(r) = remote_pick_or_skip(
+        remote
+            .call(
+                "memory_pick",
+                json!({
+                    "source": source,
+                    "target": target,
+                    "selector": {"type": "key_list", "keys": [branch_memory_id]},
+                }),
+            )
+            .await,
+        "test_remote_pick_key_list_into_target_branch",
+    ) else {
+        return;
+    };
     let t = r["content"][0]["text"].as_str().unwrap_or("");
     assert!(t.contains("into"), "remote pick: {t}");
 
