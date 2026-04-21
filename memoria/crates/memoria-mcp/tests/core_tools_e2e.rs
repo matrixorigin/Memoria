@@ -30,7 +30,11 @@ async fn spawn_fake_llm() -> (
     memoria_test_utils::spawn_fake_llm(vec![]).await
 }
 
-async fn setup() -> (Arc<MemoryService>, String, support::multi_db::McpTestContext) {
+async fn setup() -> (
+    Arc<MemoryService>,
+    String,
+    support::multi_db::McpTestContext,
+) {
     let ctx = support::multi_db::setup_mcp_context("core_tools_e2e", test_dim(), None, None).await;
     (ctx.service(), uid(), ctx)
 }
@@ -166,6 +170,51 @@ async fn test_retrieve_empty() {
     println!("✅ retrieve empty: {}", text(&r));
 }
 
+#[tokio::test]
+async fn test_retrieve_session_scope_only() {
+    let (svc, uid, _ctx) = setup().await;
+    let target_session = format!("session:test-retrieve-{}", Uuid::new_v4().simple());
+    let other_session = format!("session:test-retrieve-{}", Uuid::new_v4().simple());
+
+    call(
+        "memory_store",
+        json!({"content": "shared retrieve token target", "session_id": target_session}),
+        &svc,
+        &uid,
+    )
+    .await;
+    call(
+        "memory_store",
+        json!({"content": "shared retrieve token other", "session_id": other_session}),
+        &svc,
+        &uid,
+    )
+    .await;
+    call(
+        "memory_store",
+        json!({"content": "shared retrieve token global"}),
+        &svc,
+        &uid,
+    )
+    .await;
+
+    let r = call(
+        "memory_retrieve",
+        json!({"query": "shared retrieve token", "session_id": target_session, "session_scope": "only", "top_k": 5}),
+        &svc,
+        &uid,
+    )
+    .await;
+    let t = text(&r);
+    assert!(t.contains("shared retrieve token target"), "got: {t}");
+    assert!(t.contains("shared retrieve token global"), "got: {t}");
+    assert!(
+        !t.contains("shared retrieve token other"),
+        "session_scope=only should exclude other scoped sessions: {t}"
+    );
+    println!("✅ retrieve session_scope=only");
+}
+
 // ── 5. memory_search: top_k respected ────────────────────────────────────────
 
 #[tokio::test]
@@ -191,6 +240,68 @@ async fn test_search_top_k() {
     let count = t.lines().count();
     assert!(count <= 3, "expected ≤3 results, got {count}: {t}");
     println!("✅ search top_k=3: {count} results");
+}
+
+#[tokio::test]
+async fn test_search_session_scope_only() {
+    let (svc, uid, _ctx) = setup().await;
+    let target_session = format!("session:test-search-{}", Uuid::new_v4().simple());
+    let other_session = format!("session:test-search-{}", Uuid::new_v4().simple());
+
+    call(
+        "memory_store",
+        json!({"content": "shared search token target", "session_id": target_session}),
+        &svc,
+        &uid,
+    )
+    .await;
+    call(
+        "memory_store",
+        json!({"content": "shared search token other", "session_id": other_session}),
+        &svc,
+        &uid,
+    )
+    .await;
+    call(
+        "memory_store",
+        json!({"content": "shared search token global"}),
+        &svc,
+        &uid,
+    )
+    .await;
+
+    let r = call(
+        "memory_search",
+        json!({"query": "shared search token", "session_id": target_session, "session_scope": "only", "top_k": 5}),
+        &svc,
+        &uid,
+    )
+    .await;
+    let t = text(&r);
+    assert!(t.contains("shared search token target"), "got: {t}");
+    assert!(t.contains("shared search token global"), "got: {t}");
+    assert!(
+        !t.contains("shared search token other"),
+        "session_scope=only should exclude other scoped sessions: {t}"
+    );
+    println!("✅ search session_scope=only");
+}
+
+#[tokio::test]
+async fn test_search_session_scope_requires_session_id() {
+    let (svc, uid, _ctx) = setup().await;
+    let err = memoria_mcp::tools::call(
+        "memory_search",
+        json!({"query": "shared search token", "session_scope": "only", "top_k": 5}),
+        &svc,
+        &uid,
+    )
+    .await
+    .expect_err("missing session_id should be rejected");
+    assert_eq!(
+        err.to_string(),
+        "session_id is required when session_scope is set"
+    );
 }
 
 // ── 6. memory_correct by memory_id ───────────────────────────────────────────
@@ -263,6 +374,72 @@ async fn test_correct_by_query() {
         &svc, &uid).await;
     assert!(text(&r).contains("ruff"), "got: {}", text(&r));
     println!("✅ correct by query: {}", text(&r));
+}
+
+#[tokio::test]
+async fn test_correct_by_query_session_scope_only() {
+    let (svc, uid, _ctx) = setup().await;
+    let target_session = format!("session:test-correct-{}", Uuid::new_v4().simple());
+    let other_session = format!("session:test-correct-{}", Uuid::new_v4().simple());
+
+    call(
+        "memory_store",
+        json!({"content": "formatting target uses black", "session_id": target_session}),
+        &svc,
+        &uid,
+    )
+    .await;
+    call(
+        "memory_store",
+        json!({"content": "formatting other uses black", "session_id": other_session}),
+        &svc,
+        &uid,
+    )
+    .await;
+
+    let r = call(
+        "memory_correct",
+        json!({
+            "query": "formatting uses black",
+            "session_id": target_session,
+            "session_scope": "only",
+            "new_content": "formatting target uses ruff",
+            "reason": "switched"
+        }),
+        &svc,
+        &uid,
+    )
+    .await;
+    let t = text(&r);
+    assert!(t.contains("formatting target uses ruff"), "got: {t}");
+
+    let active = svc.list_active(&uid, 10).await.unwrap();
+    let contents: Vec<&str> = active.iter().map(|m| m.content.as_str()).collect();
+    assert!(contents.contains(&"formatting target uses ruff"));
+    assert!(contents.contains(&"formatting other uses black"));
+    println!("✅ correct by query session_scope=only");
+}
+
+#[tokio::test]
+async fn test_correct_by_query_session_scope_requires_session_id() {
+    let (svc, uid, _ctx) = setup().await;
+    let err = memoria_mcp::tools::call(
+        "memory_correct",
+        json!({
+            "query": "formatting uses black",
+            "session_scope": "only",
+            "new_content": "formatting target uses ruff",
+            "reason": "switched"
+        }),
+        &svc,
+        &uid,
+    )
+    .await
+    .expect_err("missing session_id should be rejected");
+    assert_eq!(
+        err.to_string(),
+        "session_id is required when session_scope is set"
+    );
 }
 
 // ── 8. memory_correct: no target returns error ───────────────────────────────
@@ -548,6 +725,51 @@ async fn test_list_limit_and_fields() {
         assert!(line.contains('('), "missing type parens: {line}");
     }
     println!("✅ list limit=3: {count} items with id+type+content");
+}
+
+#[tokio::test]
+async fn test_list_session_id_filter() {
+    let (svc, uid, _ctx) = setup().await;
+    let target_session = format!("session:test-list-{}", Uuid::new_v4().simple());
+    let other_session = format!("session:test-list-{}", Uuid::new_v4().simple());
+
+    call(
+        "memory_store",
+        json!({"content": "list target alpha", "session_id": target_session}),
+        &svc,
+        &uid,
+    )
+    .await;
+    call(
+        "memory_store",
+        json!({"content": "list other beta", "session_id": other_session}),
+        &svc,
+        &uid,
+    )
+    .await;
+    call(
+        "memory_store",
+        json!({"content": "list global gamma"}),
+        &svc,
+        &uid,
+    )
+    .await;
+
+    let r = call(
+        "memory_list",
+        json!({"limit": 10, "session_id": target_session}),
+        &svc,
+        &uid,
+    )
+    .await;
+    let t = text(&r);
+    assert!(t.contains("list target alpha"), "got: {t}");
+    assert!(!t.contains("list other beta"), "got: {t}");
+    assert!(
+        !t.contains("list global gamma"),
+        "exact session list should exclude unscoped memories: {t}"
+    );
+    println!("✅ list exact session filter");
 }
 
 // ── 17. memory_capabilities: lists all tools ─────────────────────────────────
@@ -892,7 +1114,11 @@ async fn test_link_entities_invalid_json() {
 /// Helper: create service with explicit LLM client (for testing LLM paths).
 async fn setup_with_llm(
     llm: Option<Arc<memoria_embedding::LlmClient>>,
-) -> (Arc<MemoryService>, String, support::multi_db::McpTestContext) {
+) -> (
+    Arc<MemoryService>,
+    String,
+    support::multi_db::McpTestContext,
+) {
     let ctx =
         support::multi_db::setup_mcp_context("core_tools_e2e_llm", test_dim(), None, llm).await;
     (ctx.service(), uid(), ctx)

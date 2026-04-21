@@ -1552,6 +1552,8 @@ impl SqlMemoryStore {
     }
 
     pub async fn migrate_shared(&self) -> Result<(), MemoriaError> {
+        let schema_name = self.current_schema_name().await?;
+        let schema_name = schema_name.as_ref();
         let mut conn = self.conn().await?;
         sqlx::query(
             r#"CREATE TABLE IF NOT EXISTS mem_user_registry (
@@ -1744,11 +1746,23 @@ impl SqlMemoryStore {
         .await
         .map_err(db_err)?;
 
-        let _ = sqlx::query(
-            "ALTER TABLE mem_async_tasks ADD COLUMN user_id VARCHAR(64) NOT NULL DEFAULT '' AFTER instance_id",
-        )
-        .execute(&mut *conn)
-        .await;
+        let has_async_task_user_id =
+            info_schema_column_exists(&self.pool, schema_name, "mem_async_tasks", "user_id").await;
+        if !has_async_task_user_id {
+            let add_async_task_user_id = sqlx::query(
+                "ALTER TABLE mem_async_tasks ADD COLUMN user_id VARCHAR(64) NOT NULL DEFAULT '' AFTER instance_id",
+            )
+            .execute(&mut *conn)
+            .await;
+            if let Err(e) = add_async_task_user_id {
+                if !is_duplicate_column(&e) {
+                    tracing::warn!(
+                        error = %e,
+                        "shared migration: failed to add mem_async_tasks.user_id compatibility column"
+                    );
+                }
+            }
+        }
 
         // ── Ops-metrics aggregate tables (push-based stats written by Memoria) ──
         // Created here so they exist in both single-db and multi-db deployments.
@@ -4479,6 +4493,7 @@ impl SqlMemoryStore {
         user_id: &str,
         limit: i64,
         memory_type: Option<&str>,
+        session_id: Option<&str>,
         cursor: Option<&str>,
     ) -> Result<Vec<Memory>, MemoriaError> {
         let table = self.t(table);
@@ -4489,6 +4504,9 @@ impl SqlMemoryStore {
             format!("SELECT memory_id FROM {table} WHERE user_id = ? AND is_active = 1");
         if memory_type.is_some() {
             inner.push_str(" AND memory_type = ?");
+        }
+        if session_id.is_some() {
+            inner.push_str(" AND session_id = ?");
         }
         if cursor.is_some() {
             inner.push_str(" AND memory_id < ?");
@@ -4506,6 +4524,9 @@ impl SqlMemoryStore {
         let mut q = sqlx::query(&sql).bind(user_id);
         if let Some(mt) = memory_type {
             q = q.bind(mt);
+        }
+        if let Some(session_id) = session_id {
+            q = q.bind(session_id);
         }
         if let Some(c) = cursor {
             q = q.bind(c);
@@ -4630,7 +4651,7 @@ impl SqlMemoryStore {
             return Ok(vec![]);
         }
         let session_clause = if session_id.is_some() {
-            " AND session_id = ?"
+            " AND (session_id = ? OR session_id IS NULL)"
         } else {
             ""
         };
@@ -4715,6 +4736,8 @@ impl SqlMemoryStore {
     }
 
     /// Vector search with optional memory_type and strict session pre-filter.
+    /// When session_id is provided, the candidate set includes that session plus
+    /// unscoped memories (session_id IS NULL).
     #[allow(clippy::too_many_arguments)]
     pub async fn search_vector_from_filtered_scoped(
         &self,
@@ -4731,7 +4754,10 @@ impl SqlMemoryStore {
             None => String::new(),
         };
         let session_clause = match session_id {
-            Some(session_id) => format!(" AND session_id = '{}'", sanitize_sql_literal(session_id)),
+            Some(session_id) => format!(
+                " AND (session_id = '{}' OR session_id IS NULL)",
+                sanitize_sql_literal(session_id)
+            ),
             None => String::new(),
         };
         let rank_mode = if session_id.is_some() { "pre" } else { "post" };

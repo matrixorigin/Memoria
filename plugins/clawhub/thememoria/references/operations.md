@@ -13,9 +13,9 @@ Retrieve first when:
 
 Preferred order:
 
-1. `memory_retrieve` for prompt-relevant context
-2. `memory_search` for broader semantic lookup
-3. `memory_list` when the user wants a bounded inventory
+1. `memory_retrieve` for prompt-relevant context (`session_scope="prefer"` for the default non-strict path with a session hint, `"only"` for the requested session plus unscoped memories)
+2. `memory_search` for broader semantic lookup with the same optional session controls
+3. `memory_list` when the user wants a bounded inventory or an exact per-session listing
 
 ## What To Store
 
@@ -38,7 +38,7 @@ Do not store:
 
 - `memory_profile`: stable user traits and preferences
 - `memory_store`: general durable facts, procedures, lessons, decisions
-- `memory_correct`: fix a wrong memory
+- `memory_correct`: fix a wrong memory; query mode can use `session_id` + `session_scope`
 - `memory_forget` or `memory_purge`: remove memory that should no longer exist
 
 After important writes or repairs, verify with `memory_retrieve`, `memory_search`, or `memory_list`.

@@ -49,32 +49,74 @@ impl ExplainLevel {
     }
 }
 
-/// Extra retrieval controls that must be threaded through the full retrieval pipeline.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct RetrieveOptions {
-    strict_session_id: Option<String>,
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SessionScope {
+    #[default]
+    Prefer,
+    Only,
 }
 
-impl RetrieveOptions {
-    /// `filter_session=true` takes precedence over `include_cross_session`.
-    /// When neither is provided, retrieval remains cross-session.
-    pub fn from_session_scope(
-        session_id: Option<&str>,
-        filter_session: Option<bool>,
-        include_cross_session: Option<bool>,
-    ) -> Self {
-        let strict_session = filter_session == Some(true) || include_cross_session == Some(false);
-        Self {
-            strict_session_id: session_id.filter(|_| strict_session).map(str::to_string),
+impl SessionScope {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SessionScope::Prefer => "prefer",
+            SessionScope::Only => "only",
         }
     }
 
+    pub fn is_strict(self) -> bool {
+        matches!(self, SessionScope::Only)
+    }
+}
+
+impl std::str::FromStr for SessionScope {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "prefer" => Ok(SessionScope::Prefer),
+            "only" => Ok(SessionScope::Only),
+            other => Err(format!(
+                "Invalid session_scope '{other}'. Use 'prefer' or 'only'."
+            )),
+        }
+    }
+}
+
+/// Extra retrieval controls that must be threaded through the full retrieval pipeline.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RetrieveOptions {
+    session_id: Option<String>,
+    session_scope: SessionScope,
+}
+
+impl RetrieveOptions {
+    pub fn from_session_scope(
+        session_id: Option<&str>,
+        session_scope: Option<SessionScope>,
+    ) -> Self {
+        Self {
+            session_id: session_id.map(str::to_string),
+            session_scope: session_scope.unwrap_or(SessionScope::Prefer),
+        }
+    }
+
+    pub fn session_id(&self) -> Option<&str> {
+        self.session_id.as_deref()
+    }
+
+    pub fn session_scope(&self) -> SessionScope {
+        self.session_scope
+    }
+
     pub fn strict_session_id(&self) -> Option<&str> {
-        self.strict_session_id.as_deref()
+        self.session_id
+            .as_deref()
+            .filter(|_| self.session_scope.is_strict())
     }
 
     pub fn is_strict_session(&self) -> bool {
-        self.strict_session_id.is_some()
+        self.strict_session_id().is_some()
     }
 }
 
@@ -2067,14 +2109,8 @@ impl MemoryService {
         user_id: &str,
         limit: i64,
     ) -> Result<Vec<Memory>, MemoriaError> {
-        if self.sql_store.is_some() {
-            let sql = self.user_sql_store(user_id).await?;
-            let table = sql.active_table(user_id).await?;
-            return sql
-                .list_active_lite(&table, user_id, limit, None, None)
-                .await;
-        }
-        self.store.list_active(user_id, limit).await
+        self.list_active_filtered(user_id, limit, None, None, None)
+            .await
     }
 
     /// Paginated list with optional memory_type filter and cursor-based keyset pagination.
@@ -2083,13 +2119,26 @@ impl MemoryService {
         user_id: &str,
         limit: i64,
         memory_type: Option<&str>,
+        session_id: Option<&str>,
+        cursor: Option<&str>,
+    ) -> Result<Vec<Memory>, MemoriaError> {
+        self.list_active_filtered(user_id, limit, memory_type, session_id, cursor)
+            .await
+    }
+
+    pub async fn list_active_filtered(
+        &self,
+        user_id: &str,
+        limit: i64,
+        memory_type: Option<&str>,
+        session_id: Option<&str>,
         cursor: Option<&str>,
     ) -> Result<Vec<Memory>, MemoriaError> {
         if self.sql_store.is_some() {
             let sql = self.user_sql_store(user_id).await?;
             let table = sql.active_table(user_id).await?;
             return sql
-                .list_active_lite(&table, user_id, limit, memory_type, cursor)
+                .list_active_lite(&table, user_id, limit, memory_type, session_id, cursor)
                 .await;
         }
         // Fallback: trait path — no SQL store means no server-side filter/cursor.
@@ -2097,6 +2146,9 @@ impl MemoryService {
         let mut mems = self.store.list_active(user_id, limit).await?;
         if let Some(mt) = memory_type {
             mems.retain(|m| m.memory_type.to_string() == mt);
+        }
+        if let Some(session_id) = session_id {
+            mems.retain(|m| m.session_id.as_deref() == Some(session_id));
         }
         if let Some(cursor_id) = cursor {
             mems.retain(|m| m.memory_id.as_str() < cursor_id);

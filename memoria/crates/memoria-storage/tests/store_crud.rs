@@ -241,23 +241,36 @@ async fn test_search_vector_from_filtered_scoped_prefilters_by_session() {
         .await
         .unwrap();
 
+    let mk_vec = |x: f32, y: f32, z: f32| {
+        let mut v = vec![0.0; test_dim()];
+        v[0] = x;
+        v[1] = y;
+        v[2] = z;
+        v
+    };
+
     let mut target = make_memory(&format!("vec-scope-1-{uid}"), "target session", &uid);
     target.session_id = Some("sess-target".to_string());
-    target.embedding = Some(dim_vec(1, 1.0));
+    target.embedding = Some(mk_vec(0.0, 1.0, 0.0));
 
     let mut other = make_memory(&format!("vec-scope-2-{uid}"), "other session", &uid);
     other.session_id = Some("sess-other".to_string());
-    other.embedding = Some(dim_vec(0, 1.0));
+    other.embedding = Some(mk_vec(1.0, 0.0, 0.0));
+
+    let mut global_mem = make_memory(&format!("vec-scope-3-{uid}"), "global session", &uid);
+    global_mem.session_id = None;
+    global_mem.embedding = Some(mk_vec(0.7, 0.0, 0.7));
 
     store.insert(&target).await.unwrap();
     store.insert(&other).await.unwrap();
+    store.insert(&global_mem).await.unwrap();
 
-    let global = store
-        .search_vector_from_filtered_scoped("mem_memories", &uid, &dim_vec(0, 1.0), 1, None, None)
+    let global_results = store
+        .search_vector_from_filtered_scoped("mem_memories", &uid, &mk_vec(1.0, 0.0, 0.0), 1, None, None)
         .await
         .expect("global vector search");
     assert_eq!(
-        global.first().map(|m| m.memory_id.as_str()),
+        global_results.first().map(|m| m.memory_id.as_str()),
         Some(other.memory_id.as_str()),
         "global search should return the nearest cross-session memory",
     );
@@ -266,7 +279,7 @@ async fn test_search_vector_from_filtered_scoped_prefilters_by_session() {
         .search_vector_from_filtered_scoped(
             "mem_memories",
             &uid,
-            &dim_vec(0, 1.0),
+            &mk_vec(1.0, 0.0, 0.0),
             1,
             None,
             Some("sess-target"),
@@ -280,8 +293,8 @@ async fn test_search_vector_from_filtered_scoped_prefilters_by_session() {
     );
     assert_eq!(
         scoped.first().map(|m| m.memory_id.as_str()),
-        Some(target.memory_id.as_str()),
-        "strict session search should pre-filter candidates before ranking",
+        Some(global_mem.memory_id.as_str()),
+        "strict session search should rank within the target-session plus unscoped candidate set",
     );
 }
 
@@ -289,40 +302,46 @@ async fn test_search_vector_from_filtered_scoped_prefilters_by_session() {
 async fn test_search_vector_from_filtered_scoped_fills_limit_with_session_candidates() {
     let (store, uid) = setup().await;
 
-    let mk_vec = |x: f32, y: f32| {
+    let mk_vec = |x: f32, y: f32, z: f32| {
         let mut v = vec![0.0; test_dim()];
         v[0] = x;
         v[1] = y;
+        v[2] = z;
         v
     };
 
     let mut target_a = make_memory(&format!("vec-scope-fill-1-{uid}"), "scoped a", &uid);
     target_a.session_id = Some("sess-target".to_string());
-    target_a.embedding = Some(mk_vec(0.7, 0.3));
+    target_a.embedding = Some(mk_vec(0.95, 0.2, 0.0));
 
     let mut target_b = make_memory(&format!("vec-scope-fill-2-{uid}"), "scoped b", &uid);
     target_b.session_id = Some("sess-target".to_string());
-    target_b.embedding = Some(mk_vec(0.65, 0.35));
+    target_b.embedding = Some(mk_vec(0.7, 0.7, 0.0));
 
     let mut other_a = make_memory(&format!("vec-scope-fill-3-{uid}"), "global a", &uid);
     other_a.session_id = Some("sess-other".to_string());
-    other_a.embedding = Some(mk_vec(1.0, 0.0));
+    other_a.embedding = Some(mk_vec(0.0, 1.0, 0.0));
 
     let mut other_b = make_memory(&format!("vec-scope-fill-4-{uid}"), "global b", &uid);
     other_b.session_id = Some("sess-other".to_string());
-    other_b.embedding = Some(mk_vec(0.97, 0.03));
+    other_b.embedding = Some(mk_vec(0.0, 0.0, 1.0));
+
+    let mut global = make_memory(&format!("vec-scope-fill-5-{uid}"), "unscoped shared", &uid);
+    global.session_id = None;
+    global.embedding = Some(mk_vec(0.6, 0.0, 0.8));
 
     store.insert(&target_a).await.unwrap();
     store.insert(&target_b).await.unwrap();
     store.insert(&other_a).await.unwrap();
     store.insert(&other_b).await.unwrap();
+    store.insert(&global).await.unwrap();
 
     let scoped = store
         .search_vector_from_filtered_scoped(
             "mem_memories",
             &uid,
-            &mk_vec(1.0, 0.0),
-            2,
+            &mk_vec(1.0, 0.0, 0.0),
+            3,
             None,
             Some("sess-target"),
         )
@@ -330,15 +349,19 @@ async fn test_search_vector_from_filtered_scoped_fills_limit_with_session_candid
         .expect("session-scoped vector search");
     assert_eq!(
         scoped.len(),
-        2,
-        "strict session search should fill top_k from the filtered session candidate set",
+        3,
+        "strict session search should fill top_k from the target-session plus unscoped candidate set",
     );
     let scoped_ids: std::collections::HashSet<&str> =
         scoped.iter().map(|m| m.memory_id.as_str()).collect();
     assert_eq!(
         scoped_ids,
-        std::collections::HashSet::from([target_a.memory_id.as_str(), target_b.memory_id.as_str()]),
-        "strict session vector search should return both session-local candidates",
+        std::collections::HashSet::from([
+            target_a.memory_id.as_str(),
+            target_b.memory_id.as_str(),
+            global.memory_id.as_str(),
+        ]),
+        "strict session vector search should return session-local plus unscoped candidates",
     );
 }
 
@@ -691,7 +714,7 @@ async fn test_list_active_lite() {
         .expect("soft_delete");
 
     let results = store
-        .list_active_lite("mem_memories", &uid, 10, None, None)
+        .list_active_lite("mem_memories", &uid, 10, None, None, None)
         .await
         .expect("list_active_lite");
     assert_eq!(results.len(), 2, "should exclude soft-deleted");
@@ -725,14 +748,14 @@ async fn test_list_active_lite_limit_cap() {
     }
     // Request limit=2, should only get 2
     let results = store
-        .list_active_lite("mem_memories", &uid, 2, None, None)
+        .list_active_lite("mem_memories", &uid, 2, None, None, None)
         .await
         .expect("list_active_lite");
     assert_eq!(results.len(), 2, "should respect limit");
 
     // Request absurdly large limit — capped at 500 internally
     let results = store
-        .list_active_lite("mem_memories", &uid, 999999, None, None)
+        .list_active_lite("mem_memories", &uid, 999999, None, None, None)
         .await
         .expect("list_active_lite");
     assert!(results.len() <= 501, "should cap at 501");

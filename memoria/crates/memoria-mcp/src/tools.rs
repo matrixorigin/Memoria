@@ -30,6 +30,30 @@ fn git_for_store(sql: &Arc<SqlMemoryStore>) -> Option<GitForDataService> {
         .map(|db_name| GitForDataService::new(sql.pool().clone(), db_name.to_string()))
 }
 
+fn parse_session_scope_arg(args: &Value) -> Result<Option<memoria_service::SessionScope>> {
+    args.get("session_scope")
+        .and_then(Value::as_str)
+        .map(memoria_service::SessionScope::from_str)
+        .transpose()
+        .map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+fn parse_retrieve_options_arg(args: &Value) -> Result<memoria_service::RetrieveOptions> {
+    let session_id = args
+        .get("session_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty());
+    let session_scope = parse_session_scope_arg(args)?;
+    if session_scope.is_some() && session_id.is_none() {
+        anyhow::bail!("session_id is required when session_scope is set");
+    }
+    Ok(memoria_service::RetrieveOptions::from_session_scope(
+        session_id,
+        session_scope,
+    ))
+}
+
 enum ToolCallName {
     MemoryStore,
     MemoryRetrieve,
@@ -103,15 +127,14 @@ pub fn list() -> Value {
         },
         {
             "name": "memory_retrieve",
-            "description": "Retrieve relevant memories for a query",
+            "description": "Retrieve relevant memories for a query, optionally scoped to a session",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "query": {"type": "string"},
                     "top_k": {"type": "integer", "default": 5},
                     "session_id": {"type": "string"},
-                    "filter_session": {"type": "boolean", "description": "When true, restrict retrieval to the given session_id and bypass cross-session graph retrieval"},
-                    "include_cross_session": {"type": "boolean", "default": true, "description": "Legacy flag. false is equivalent to filter_session=true when session_id is set"},
+                    "session_scope": {"type": "string", "enum": ["prefer", "only"], "description": "How to use session_id: prefer=non-strict retrieval using the provided session_id as context; only=limit results to that session plus unscoped memories"},
                     "explain": {"type": ["boolean", "string"], "default": false, "description": "Explain level: false/\"none\"=off, true/\"basic\"=timing+path, \"verbose\"=+per-candidate scores, \"analyze\"=full"}
                 },
                 "required": ["query"]
@@ -119,12 +142,14 @@ pub fn list() -> Value {
         },
         {
             "name": "memory_search",
-            "description": "Semantic search across all memories",
+            "description": "Semantic search across memories, optionally scoped to a session",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "query": {"type": "string"},
                     "top_k": {"type": "integer", "default": 10},
+                    "session_id": {"type": "string"},
+                    "session_scope": {"type": "string", "enum": ["prefer", "only"], "description": "How to use session_id: prefer=non-strict search using the provided session_id as context; only=limit results to that session plus unscoped memories"},
                     "explain": {"type": ["boolean", "string"], "default": false, "description": "Explain level: false/\"none\"=off, true/\"basic\"=timing+path, \"verbose\"=+per-candidate scores, \"analyze\"=full"}
                 },
                 "required": ["query"]
@@ -139,6 +164,8 @@ pub fn list() -> Value {
                     "memory_id": {"type": "string"},
                     "query": {"type": "string", "description": "Semantic search to find memory to correct"},
                     "new_content": {"type": "string"},
+                    "session_id": {"type": "string", "description": "Optional session to use when resolving query-based correction"},
+                    "session_scope": {"type": "string", "enum": ["prefer", "only"], "description": "Only used with query-based correction. prefer=non-strict lookup using the provided session_id as context; only=restrict lookup to the given session plus unscoped memories"},
                     "reason": {"type": "string"}
                 },
                 "required": ["new_content"]
@@ -170,11 +197,13 @@ pub fn list() -> Value {
         },
         {
             "name": "memory_list",
-            "description": "List active memories for the user",
+            "description": "List active memories for the user, with optional exact session filtering",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "limit": {"type": "integer", "default": 20}
+                    "limit": {"type": "integer", "default": 20},
+                    "memory_type": {"type": "string"},
+                    "session_id": {"type": "string", "description": "Exact session identifier — only list memories from that session"}
                 }
             }
         },
@@ -253,7 +282,6 @@ pub async fn call(
         "memory_observe" => ToolCallName::MemoryObserve,
         _ => ToolCallName::Unknown(name.to_string()),
     };
-    let is_memory_retrieve = matches!(tool, ToolCallName::MemoryRetrieve);
     match tool {
         ToolCallName::MemoryStore => {
             let content = args["content"].as_str().unwrap_or("").to_string();
@@ -338,16 +366,12 @@ pub async fn call(
 
         ToolCallName::MemoryRetrieve | ToolCallName::MemorySearch => {
             let query = args["query"].as_str().unwrap_or("").to_string();
-            let top_k = args["top_k"].as_i64().unwrap_or(5);
-            let retrieve_options = if is_memory_retrieve {
-                memoria_service::RetrieveOptions::from_session_scope(
-                    args["session_id"].as_str(),
-                    args.get("filter_session").and_then(|v| v.as_bool()),
-                    args.get("include_cross_session").and_then(|v| v.as_bool()),
-                )
+            let top_k = if matches!(tool, ToolCallName::MemorySearch) {
+                args["top_k"].as_i64().unwrap_or(10)
             } else {
-                memoria_service::RetrieveOptions::default()
+                args["top_k"].as_i64().unwrap_or(5)
             };
+            let retrieve_options = parse_retrieve_options_arg(&args)?;
             // explain accepts bool or string: true/"basic"/"verbose"/"analyze"
             let explain_str = match &args["explain"] {
                 serde_json::Value::Bool(true) => "basic",
@@ -409,7 +433,10 @@ pub async fn call(
             let old_mid = if !memory_id.is_empty() {
                 memory_id.to_string()
             } else if !query.is_empty() {
-                let results = service.retrieve(user_id, query, 1).await?;
+                let retrieve_options = parse_retrieve_options_arg(&args)?;
+                let results = service
+                    .retrieve_with_options(user_id, query, 1, &retrieve_options)
+                    .await?;
                 match results.into_iter().next() {
                     Some(found) => found.memory_id,
                     None => return Ok(mcp_text("No matching memory found for query")),
@@ -482,7 +509,15 @@ pub async fn call(
 
         ToolCallName::MemoryList => {
             let limit = args["limit"].as_i64().unwrap_or(20);
-            let memories = service.list_active(user_id, limit).await?;
+            let memories = service
+                .list_active_filtered(
+                    user_id,
+                    limit,
+                    args.get("memory_type").and_then(Value::as_str),
+                    args.get("session_id").and_then(Value::as_str),
+                    None,
+                )
+                .await?;
             if memories.is_empty() {
                 return Ok(mcp_text("No memories found."));
             }

@@ -105,22 +105,18 @@ impl RemoteClient {
                 };
                 let mut payload = json!({
                     "query": args["query"],
-                    "top_k": args["top_k"].as_i64().unwrap_or(5),
+                    "top_k": if name == "memory_search" {
+                        args["top_k"].as_i64().unwrap_or(10)
+                    } else {
+                        args["top_k"].as_i64().unwrap_or(5)
+                    },
                     "session_id": args["session_id"],
                 });
-                if name == "memory_retrieve" {
-                    if let Some(filter_session) = args
-                        .get("filter_session")
-                        .and_then(serde_json::Value::as_bool)
-                    {
-                        payload["filter_session"] = json!(filter_session);
-                    }
-                    if let Some(include_cross_session) = args
-                        .get("include_cross_session")
-                        .and_then(serde_json::Value::as_bool)
-                    {
-                        payload["include_cross_session"] = json!(include_cross_session);
-                    }
+                if let Some(session_scope) = args
+                    .get("session_scope")
+                    .and_then(serde_json::Value::as_str)
+                {
+                    payload["session_scope"] = json!(session_scope);
                 }
                 let r = self
                     .client
@@ -159,9 +155,17 @@ impl RemoteClient {
                         .send()
                         .await?
                 } else {
-                    self.client.post(self.url("/v1/memories/correct"))
-                        .json(&json!({"query": query, "new_content": new_content, "reason": args["reason"]}))
-                        .send().await?
+                    self.client
+                        .post(self.url("/v1/memories/correct"))
+                        .json(&json!({
+                            "query": query,
+                            "new_content": new_content,
+                            "session_id": args["session_id"],
+                            "session_scope": args["session_scope"],
+                            "reason": args["reason"]
+                        }))
+                        .send()
+                        .await?
                 };
                 let body = Self::parse_response(r).await?;
                 if let Some(_err) = body.get("error") {
@@ -247,12 +251,19 @@ impl RemoteClient {
 
             "memory_list" => {
                 let limit = args["limit"].as_i64().unwrap_or(20);
-                let r = self
+                let memory_type = args.get("memory_type").and_then(Value::as_str);
+                let session_id = args.get("session_id").and_then(Value::as_str);
+                let mut req = self
                     .client
-                    .get(self.url(&format!("/v1/memories?limit={limit}")))
-                    .send()
-                    .await?;
-                let body = Self::parse_response(r).await?;
+                    .get(self.url("/v1/memories"))
+                    .query(&[("limit", limit)]);
+                if let Some(memory_type) = memory_type {
+                    req = req.query(&[("memory_type", memory_type)]);
+                }
+                if let Some(session_id) = session_id {
+                    req = req.query(&[("session_id", session_id)]);
+                }
+                let body = Self::parse_response(req.send().await?).await?;
                 let items = body["items"].as_array().cloned().unwrap_or_default();
                 if items.is_empty() {
                     return Ok(Self::mcp_text("No memories found."));
