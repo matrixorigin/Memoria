@@ -54,6 +54,7 @@ const DEFAULT_PICK_TARGET: &str = "main";
 const DEFAULT_PICK_STRATEGY: &str = "fail";
 const DEFAULT_PICK_TOP_K: i64 = 5;
 const MAX_PICK_TOP_K: i64 = 100;
+const MAX_PICK_KEYS: usize = 1000;
 
 fn safety_prefix(db_name: Option<&str>) -> String {
     match db_name {
@@ -1110,7 +1111,7 @@ pub async fn call(
                             err,
                             &pick_args.source,
                             &pick_args.target,
-                            pick_keys.len(),
+                            Some(pick_keys.len()),
                         );
                     }
 
@@ -1133,10 +1134,10 @@ pub async fn call(
                     } else {
                         String::new()
                     };
-                    return Ok(mcp_text(&format!(
+                    Ok(mcp_text(&format!(
                         "Picked {applied} change(s) from branch '{}' into '{}' ({skipped} skipped{ignored_suffix})",
                         pick_args.source, pick_args.target
-                    )));
+                    )))
                 }
                 PickSelector::SnapshotRange {
                     from_snapshot,
@@ -1168,12 +1169,12 @@ pub async fn call(
                         )
                         .await
                     {
-                        return map_pick_conflict(err, &pick_args.source, &pick_args.target, 0);
+                        return map_pick_conflict(err, &pick_args.source, &pick_args.target, None);
                     }
-                    return Ok(mcp_text(&format!(
+                    Ok(mcp_text(&format!(
                         "Picked snapshot range '{}'..'{}' from branch '{}' into '{}'.",
                         from_snapshot, to_snapshot, pick_args.source, pick_args.target
-                    )));
+                    )))
                 }
                 PickSelector::Retrieve { query, top_k } => {
                     if top_k <= 0 || top_k > MAX_PICK_TOP_K {
@@ -1187,20 +1188,18 @@ pub async fn call(
                         &source_table,
                         &target_table,
                         None,
-                        Some((top_k * 10).max(20)),
+                        None,
                     )
                     .await?;
-                    let selected = select_retrieved_pick_keys(
+                    let select_ctx = PickSelectionContext {
                         svc,
-                        &sql,
+                        sql: &sql,
                         user_id,
-                        &source_table,
-                        &target_table,
-                        &query,
-                        top_k,
-                        candidates,
-                    )
-                    .await?;
+                        source_table: &source_table,
+                        target_table: &target_table,
+                    };
+                    let selected =
+                        select_retrieved_pick_keys(&select_ctx, &query, top_k, candidates).await?;
                     if selected.is_empty() {
                         return Ok(mcp_text(&format!(
                             "No pickable changes matched query '{}' in branch '{}'.",
@@ -1220,7 +1219,7 @@ pub async fn call(
                             err,
                             &pick_args.source,
                             &pick_args.target,
-                            selected.len(),
+                            Some(selected.len()),
                         );
                     }
                     let remaining = count_pick_candidates(
@@ -1237,10 +1236,10 @@ pub async fn call(
                     } else {
                         0
                     };
-                    return Ok(mcp_text(&format!(
+                    Ok(mcp_text(&format!(
                         "Picked {applied} of top {top_k} retrieved change(s) from branch '{}' into '{}' ({skipped} skipped)",
                         pick_args.source, pick_args.target
-                    )));
+                    )))
                 }
             }
         }
@@ -1510,7 +1509,20 @@ fn normalize_keys(keys: Vec<String>) -> Result<Vec<String>, MemoriaError> {
             "key_list selector requires at least one non-empty key".into(),
         ));
     }
+    if out.len() > MAX_PICK_KEYS {
+        return Err(MemoriaError::Validation(format!(
+            "key_list selector supports at most {MAX_PICK_KEYS} unique keys"
+        )));
+    }
     Ok(out)
+}
+
+struct PickSelectionContext<'a> {
+    svc: &'a Arc<MemoryService>,
+    sql: &'a Arc<memoria_storage::SqlMemoryStore>,
+    user_id: &'a str,
+    source_table: &'a str,
+    target_table: &'a str,
 }
 
 async fn resolve_branch_table_name(
@@ -1661,11 +1673,7 @@ fn vec_to_mo(v: &[f32]) -> String {
 }
 
 async fn select_retrieved_pick_keys(
-    svc: &Arc<MemoryService>,
-    sql: &Arc<memoria_storage::SqlMemoryStore>,
-    user_id: &str,
-    source_table: &str,
-    target_table: &str,
+    ctx: &PickSelectionContext<'_>,
     query: &str,
     top_k: i64,
     candidates: Vec<PickCandidate>,
@@ -1683,22 +1691,25 @@ async fn select_retrieved_pick_keys(
     let fetch_k = (top_k * 3).max(20);
     let mut scores: HashMap<String, f64> = HashMap::new();
     let diff_clause = pickable_diff_clause("s", "t");
-    let safe_user_id = sanitize_sql_literal(user_id);
+    let safe_user_id = sanitize_sql_literal(ctx.user_id);
 
-    if let Some(embedding) = svc.embed(query).await? {
+    if let Some(embedding) = ctx.svc.embed(query).await? {
         let vec_literal = vec_to_mo(&embedding);
         let sql_text = format!(
             "SELECT s.memory_id, CAST(l2_distance(s.embedding, '{vec_literal}') AS DOUBLE) AS l2_dist \
              FROM {source_table} s \
              LEFT JOIN {target_table} t ON t.memory_id = s.memory_id \
-             WHERE s.user_id = '{safe_user_id}' AND s.is_active = 1 \
-               AND s.embedding IS NOT NULL AND vector_dims(s.embedding) > 0 \
-               AND ({diff_clause}) \
-             ORDER BY l2_distance(s.embedding, '{vec_literal}') ASC \
-             LIMIT {fetch_k} by rank with option 'mode=post'"
+              WHERE s.user_id = '{safe_user_id}' AND s.is_active = 1 \
+                AND s.embedding IS NOT NULL AND vector_dims(s.embedding) > 0 \
+                AND ({diff_clause}) \
+              ORDER BY l2_distance(s.embedding, '{vec_literal}') ASC \
+              LIMIT {fetch_k} by rank with option 'mode=post'"
+            ,
+            source_table = ctx.source_table,
+            target_table = ctx.target_table
         );
         let rows = sqlx::query(&sql_text)
-            .fetch_all(sql.pool())
+            .fetch_all(ctx.sql.pool())
             .await
             .map_err(db_err)?;
         for row in rows {
@@ -1715,14 +1726,17 @@ async fn select_retrieved_pick_keys(
              FROM {source_table} s \
              LEFT JOIN {target_table} t ON t.memory_id = s.memory_id \
              WHERE s.user_id = ? AND s.is_active = 1 \
-               AND MATCH(s.content) AGAINST('{safe_query}' IN BOOLEAN MODE) \
-               AND ({diff_clause}) \
-             ORDER BY ft_score DESC LIMIT ?"
+                AND MATCH(s.content) AGAINST('{safe_query}' IN BOOLEAN MODE) \
+                AND ({diff_clause}) \
+              ORDER BY ft_score DESC LIMIT ?"
+            ,
+            source_table = ctx.source_table,
+            target_table = ctx.target_table
         );
         let rows = match sqlx::query(&sql_text)
-            .bind(user_id)
+            .bind(ctx.user_id)
             .bind(fetch_k)
-            .fetch_all(sql.pool())
+            .fetch_all(ctx.sql.pool())
             .await
         {
             Ok(rows) => rows,
@@ -1789,12 +1803,15 @@ fn map_pick_conflict(
     err: MemoriaError,
     source: &str,
     target: &str,
-    selected: usize,
+    selected: Option<usize>,
 ) -> Result<Value, MemoriaError> {
     let message = err.to_string();
     if message.to_lowercase().contains("conflict") {
+        let selection_detail = selected
+            .map(|count| format!(" for {count} selected change(s)"))
+            .unwrap_or_default();
         return Err(MemoriaError::Validation(format!(
-            "Conflict: pick from branch '{source}' into '{target}' aborted for {selected} selected change(s): {message}"
+            "Conflict: pick from branch '{source}' into '{target}' aborted{selection_detail}: {message}"
         )));
     }
     Err(err)
@@ -1806,7 +1823,10 @@ fn mcp_text(text: &str) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use super::{safety_prefix, snap_internal, validate_identifier, MAX_IDENTIFIER_LEN};
+    use super::{
+        normalize_keys, safety_prefix, snap_internal, validate_identifier, MAX_IDENTIFIER_LEN,
+        MAX_PICK_KEYS,
+    };
 
     #[test]
     fn scoped_snapshot_internal_names_stay_within_matrixone_limit() {
@@ -1823,6 +1843,15 @@ mod tests {
             "memoria_shared_db_with_a_really_long_name_for_product_runs",
         ));
         assert!(prefix.len() < MAX_IDENTIFIER_LEN, "{prefix}");
+    }
+
+    #[test]
+    fn pick_key_list_rejects_too_many_keys() {
+        let keys = (0..=MAX_PICK_KEYS)
+            .map(|idx| format!("memory_{idx}"))
+            .collect::<Vec<_>>();
+        let err = normalize_keys(keys).expect_err("should reject oversized key lists");
+        assert!(err.to_string().contains("at most"), "{err}");
     }
 
     #[test]
