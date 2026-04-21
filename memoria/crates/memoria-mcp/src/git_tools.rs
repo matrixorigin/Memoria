@@ -1908,7 +1908,7 @@ async fn load_snapshot_range_pick_candidates(
          FROM {source_table} {{SNAPSHOT = '"
     ));
     qb.push(to_snapshot);
-    qb.push("'}} s_to ");
+    qb.push("'} s_to ");
     qb.push(format!(
         "LEFT JOIN {source_table} {{SNAPSHOT = '{from_snapshot}'}} s_from ON s_from.memory_id = s_to.memory_id "
     ));
