@@ -406,6 +406,69 @@ async fn test_pick_key_list_into_main() {
 }
 
 #[tokio::test]
+async fn test_pick_key_list_dry_run_returns_preview() {
+    let (svc, git, uid, _ctx) = setup().await;
+    let branch = bname("pick_keys_preview");
+
+    store_mem("main seed", &svc, &uid).await;
+    gc("memory_branch", json!({"name": branch}), &git, &svc, &uid).await;
+    gc("memory_checkout", json!({"name": branch}), &git, &svc, &uid).await;
+    store_mem("branch alpha", &svc, &uid).await;
+
+    let alpha_id = svc
+        .list_active(&uid, 10)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|memory| memory.content == "branch alpha")
+        .expect("alpha memory")
+        .memory_id;
+
+    gc("memory_checkout", json!({"name": "main"}), &git, &svc, &uid).await;
+    let Some(r) = pick_result_or_skip(
+        memoria_mcp::git_tools::call(
+            "memory_pick",
+            json!({
+                "source": branch,
+                "selector": {"type": "key_list", "keys": [alpha_id]},
+                "dry_run": {
+                    "limit": 1,
+                    "include_content_preview": true,
+                    "include_scores": true
+                }
+            }),
+            &git,
+            &svc,
+            &uid,
+        )
+        .await,
+        "test_pick_key_list_dry_run_returns_preview",
+    ) else {
+        return;
+    };
+    let body = text_json(&r);
+    assert_eq!(body["dry_run"].as_bool(), Some(true), "{body}");
+    assert_eq!(
+        body["summary"]["candidate_count"].as_u64(),
+        Some(1),
+        "{body}"
+    );
+    let candidate = &body["candidates"][0];
+    assert_eq!(
+        candidate["content_preview"].as_str(),
+        Some("branch alpha"),
+        "{body}"
+    );
+    assert!(candidate.get("score").is_none(), "{body}");
+    assert!(candidate.get("embedding").is_none(), "{body}");
+
+    let main_memories = svc.list_active(&uid, 10).await.unwrap();
+    assert!(!main_memories
+        .iter()
+        .any(|memory| memory.content == "branch alpha"));
+}
+
+#[tokio::test]
 async fn test_pick_key_list_into_target_branch() {
     let (svc, git, uid, ctx) = setup().await;
     let source = bname("pick_src");

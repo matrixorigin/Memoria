@@ -7071,6 +7071,169 @@ async fn test_remote_pick_key_list_into_target_branch() {
 }
 
 #[tokio::test]
+async fn test_remote_pick_snapshot_range() {
+    use memoria_mcp::remote::RemoteClient;
+    let (base, _, server) = spawn_api_for_remote().await;
+    let uid = uid();
+    let remote = RemoteClient::new(&base, None, uid.clone(), None);
+    let branch = format!(
+        "remote_pick_snap_{}",
+        &uuid::Uuid::new_v4().simple().to_string()[..6]
+    );
+    let snap_before = format!(
+        "remote_pick_before_{}",
+        &uuid::Uuid::new_v4().simple().to_string()[..6]
+    );
+    let snap_after = format!(
+        "remote_pick_after_{}",
+        &uuid::Uuid::new_v4().simple().to_string()[..6]
+    );
+
+    remote
+        .call("memory_store", json!({"content": "remote main seed"}))
+        .await
+        .unwrap();
+    remote
+        .call("memory_branch", json!({"name": branch}))
+        .await
+        .unwrap();
+    remote
+        .call("memory_checkout", json!({"name": branch}))
+        .await
+        .unwrap();
+    remote
+        .call("memory_snapshot", json!({"name": snap_before}))
+        .await
+        .unwrap();
+    remote
+        .call(
+            "memory_store",
+            json!({"content": "remote snapshot-ranged memory"}),
+        )
+        .await
+        .unwrap();
+    remote
+        .call("memory_snapshot", json!({"name": snap_after}))
+        .await
+        .unwrap();
+    remote
+        .call("memory_checkout", json!({"name": "main"}))
+        .await
+        .unwrap();
+
+    let Some(r) = remote_pick_or_skip(
+        remote
+            .call(
+                "memory_pick",
+                json!({
+                    "source": branch,
+                    "selector": {
+                        "type": "snapshot_range",
+                        "from_snapshot": snap_before,
+                        "to_snapshot": snap_after
+                    }
+                }),
+            )
+            .await,
+        "test_remote_pick_snapshot_range",
+    ) else {
+        return;
+    };
+    let t = r["content"][0]["text"].as_str().unwrap_or("");
+    assert!(t.contains("snapshot range"), "remote pick: {t}");
+
+    let active = server.service().list_active(&uid, 10).await.unwrap();
+    assert!(active
+        .iter()
+        .any(|memory| memory.content == "remote snapshot-ranged memory"));
+}
+
+#[tokio::test]
+async fn test_remote_pick_accept_replaces_conflict() {
+    use memoria_mcp::remote::RemoteClient;
+    let (base, _, server) = spawn_api_for_remote().await;
+    let uid = uid();
+    let remote = RemoteClient::new(&base, None, uid.clone(), None);
+    let branch = format!(
+        "remote_pick_accept_{}",
+        &uuid::Uuid::new_v4().simple().to_string()[..6]
+    );
+
+    remote
+        .call("memory_store", json!({"content": "remote shared accept"}))
+        .await
+        .unwrap();
+    let original_id = server
+        .service()
+        .list_active(&uid, 10)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|memory| memory.content == "remote shared accept")
+        .expect("original memory")
+        .memory_id;
+
+    remote
+        .call("memory_branch", json!({"name": branch}))
+        .await
+        .unwrap();
+    let branch_table = server
+        .user_store(&uid)
+        .await
+        .list_branches(&uid)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|(name, _)| name == &branch)
+        .map(|(_, table)| table)
+        .expect("branch table");
+    let pool = server.user_db_pool(&uid).await;
+
+    sqlx::query(&format!(
+        "UPDATE {branch_table} SET content = ? WHERE memory_id = ?"
+    ))
+    .bind("remote branch accepted")
+    .bind(&original_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE mem_memories SET content = ? WHERE memory_id = ?")
+        .bind("remote main stale")
+        .bind(&original_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let Some(r) = remote_pick_or_skip(
+        remote
+            .call(
+                "memory_pick",
+                json!({
+                    "source": branch,
+                    "strategy": "accept",
+                    "selector": {"type": "key_list", "keys": [original_id]},
+                }),
+            )
+            .await,
+        "test_remote_pick_accept_replaces_conflict",
+    ) else {
+        return;
+    };
+    let t = r["content"][0]["text"].as_str().unwrap_or("");
+    assert!(t.contains("Picked 1 change"), "remote pick: {t}");
+
+    let row = sqlx::query("SELECT content FROM mem_memories WHERE memory_id = ?")
+        .bind(&original_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        sqlx::Row::try_get::<String, _>(&row, "content").unwrap(),
+        "remote branch accepted"
+    );
+}
+
+#[tokio::test]
 async fn test_remote_pick_retrieve_dry_run_returns_preview_json() {
     use memoria_mcp::remote::RemoteClient;
     let (base, _, server) =
