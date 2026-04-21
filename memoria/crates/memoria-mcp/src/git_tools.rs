@@ -15,8 +15,9 @@ use chrono::NaiveDateTime;
 use memoria_core::MemoriaError;
 use memoria_git::{service::DiffRow, GitForDataService};
 use memoria_service::MemoryService;
+use serde::Deserialize;
 use serde_json::{json, Value};
-use sqlx::Row;
+use sqlx::{MySql, QueryBuilder, Row};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use uuid::Uuid;
@@ -49,6 +50,10 @@ const MILESTONE_PREFIX: &str = "mem_milestone_";
 const SAFETY_PREFIX: &str = "mem_snap_pre_";
 const SNAP_SCOPE_MAX_LEN: usize = MAX_IDENTIFIER_LEN - SNAP_PREFIX.len() - 2 - 2 - 40;
 const SAFETY_SCOPE_MAX_LEN: usize = 21;
+const DEFAULT_PICK_TARGET: &str = "main";
+const DEFAULT_PICK_STRATEGY: &str = "fail";
+const DEFAULT_PICK_TOP_K: i64 = 5;
+const MAX_PICK_TOP_K: i64 = 100;
 
 fn safety_prefix(db_name: Option<&str>) -> String {
     match db_name {
@@ -193,6 +198,52 @@ struct ReplaceCandidate {
     branch_memory_id: String,
     replacement_content: String,
     conflict_distance: f64,
+}
+
+#[derive(Debug, Clone)]
+struct PickCandidate {
+    memory_id: String,
+    content: String,
+    memory_type: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct MemoryPickArgs {
+    source: String,
+    #[serde(default = "default_pick_target")]
+    target: String,
+    #[serde(default = "default_pick_strategy")]
+    strategy: String,
+    selector: PickSelector,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum PickSelector {
+    KeyList {
+        keys: Vec<String>,
+    },
+    SnapshotRange {
+        from_snapshot: String,
+        to_snapshot: String,
+    },
+    Retrieve {
+        query: String,
+        #[serde(default = "default_pick_top_k")]
+        top_k: i64,
+    },
+}
+
+fn default_pick_target() -> String {
+    DEFAULT_PICK_TARGET.to_string()
+}
+
+fn default_pick_strategy() -> String {
+    DEFAULT_PICK_STRATEGY.to_string()
+}
+
+fn default_pick_top_k() -> i64 {
+    DEFAULT_PICK_TOP_K
 }
 
 fn milestone_internal(name: &str) -> Option<String> {
@@ -441,6 +492,59 @@ pub fn list() -> Value {
             }
         },
         {
+            "name": "memory_pick",
+            "description": "Selectively apply changes from a source branch into a target branch (default main) using selector.type=key_list|snapshot_range|retrieve.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "source": {"type": "string", "description": "Source branch name to pick from."},
+                    "target": {"type": "string", "default": "main", "description": "Target branch name. Defaults to main."},
+                    "strategy": {
+                        "type": "string",
+                        "default": "fail",
+                        "description": "Conflict strategy: fail | skip | accept"
+                    },
+                    "selector": {
+                        "type": "object",
+                        "description": "Choose specific rows by memory_id, by snapshot range, or by semantic retrieval over changed rows only.",
+                        "oneOf": [
+                            {
+                                "type": "object",
+                                "properties": {
+                                    "type": {"const": "key_list"},
+                                    "keys": {
+                                        "type": "array",
+                                        "items": {"type": "string"},
+                                        "description": "Specific memory_ids from the source branch to apply."
+                                    }
+                                },
+                                "required": ["type", "keys"]
+                            },
+                            {
+                                "type": "object",
+                                "properties": {
+                                    "type": {"const": "snapshot_range"},
+                                    "from_snapshot": {"type": "string"},
+                                    "to_snapshot": {"type": "string"}
+                                },
+                                "required": ["type", "from_snapshot", "to_snapshot"]
+                            },
+                            {
+                                "type": "object",
+                                "properties": {
+                                    "type": {"const": "retrieve"},
+                                    "query": {"type": "string", "description": "Natural-language query used to rank changed source memories."},
+                                    "top_k": {"type": "integer", "default": 5, "description": "Only valid for retrieve; picks the top-k relevant changed memories."}
+                                },
+                                "required": ["type", "query"]
+                            }
+                        ]
+                    }
+                },
+                "required": ["source", "selector"]
+            }
+        },
+        {
             "name": "memory_branch_delete",
             "description": "Delete a memory branch",
             "inputSchema": {
@@ -475,6 +579,7 @@ enum GitToolCallName {
     MemoryBranches,
     MemoryCheckout,
     MemoryMerge,
+    MemoryPick,
     MemoryBranchDelete,
     MemoryDiff,
     Unknown(String),
@@ -496,6 +601,7 @@ pub async fn call(
         "memory_branches" => GitToolCallName::MemoryBranches,
         "memory_checkout" => GitToolCallName::MemoryCheckout,
         "memory_merge" => GitToolCallName::MemoryMerge,
+        "memory_pick" => GitToolCallName::MemoryPick,
         "memory_branch_delete" => GitToolCallName::MemoryBranchDelete,
         "memory_diff" => GitToolCallName::MemoryDiff,
         _ => GitToolCallName::Unknown(name.to_string()),
@@ -948,6 +1054,197 @@ pub async fn call(
             )))
         }
 
+        GitToolCallName::MemoryPick => {
+            let pick_args: MemoryPickArgs = serde_json::from_value(args)
+                .map_err(|e| MemoriaError::Validation(e.to_string()))?;
+            let strategy = normalize_pick_strategy(&pick_args.strategy)?;
+            if pick_args.source == pick_args.target {
+                return Err(MemoriaError::Validation(
+                    "source and target must be different branches".into(),
+                ));
+            }
+
+            let sql = svc.user_sql_store(user_id).await?;
+            let git = git_for_store(&sql)?;
+            let source_table_name =
+                resolve_branch_table_name(&sql, user_id, &pick_args.source, false).await?;
+            let target_table_name =
+                resolve_branch_table_name(&sql, user_id, &pick_args.target, true).await?;
+            let source_table = sql.t(&source_table_name);
+            let target_table = sql.t(&target_table_name);
+
+            match pick_args.selector {
+                PickSelector::KeyList { keys } => {
+                    let requested = normalize_keys(keys)?;
+                    let candidates = load_pick_candidates(
+                        &sql,
+                        user_id,
+                        &source_table,
+                        &target_table,
+                        Some(&requested),
+                        None,
+                    )
+                    .await?;
+                    let pick_keys: Vec<String> = candidates
+                        .iter()
+                        .map(|candidate| candidate.memory_id.clone())
+                        .collect();
+                    let ignored = requested.len().saturating_sub(pick_keys.len());
+                    if pick_keys.is_empty() {
+                        return Ok(mcp_text(&format!(
+                            "No pickable changes found in branch '{}' for the selected keys.",
+                            pick_args.source
+                        )));
+                    }
+
+                    if let Err(err) = git
+                        .pick_branch_keys(
+                            &source_table_name,
+                            &target_table_name,
+                            &pick_keys,
+                            strategy,
+                        )
+                        .await
+                    {
+                        return map_pick_conflict(
+                            err,
+                            &pick_args.source,
+                            &pick_args.target,
+                            pick_keys.len(),
+                        );
+                    }
+
+                    let remaining = count_pick_candidates(
+                        &sql,
+                        user_id,
+                        &source_table,
+                        &target_table,
+                        Some(&pick_keys),
+                    )
+                    .await?;
+                    let applied = pick_keys.len().saturating_sub(remaining as usize);
+                    let skipped = if strategy == "skip" {
+                        remaining.max(0) as usize
+                    } else {
+                        0
+                    };
+                    let ignored_suffix = if ignored > 0 {
+                        format!(", {ignored} ignored")
+                    } else {
+                        String::new()
+                    };
+                    return Ok(mcp_text(&format!(
+                        "Picked {applied} change(s) from branch '{}' into '{}' ({skipped} skipped{ignored_suffix})",
+                        pick_args.source, pick_args.target
+                    )));
+                }
+                PickSelector::SnapshotRange {
+                    from_snapshot,
+                    to_snapshot,
+                } => {
+                    let from_internal = resolve_snapshot_for_user(svc, user_id, &from_snapshot)
+                        .await?
+                        .ok_or_else(|| {
+                            MemoriaError::NotFound(format!("Snapshot '{from_snapshot}'"))
+                        })?;
+                    let to_internal = resolve_snapshot_for_user(svc, user_id, &to_snapshot)
+                        .await?
+                        .ok_or_else(|| {
+                            MemoriaError::NotFound(format!("Snapshot '{to_snapshot}'"))
+                        })?;
+                    if from_internal == to_internal {
+                        return Ok(mcp_text(&format!(
+                            "No pickable changes found in branch '{}' between snapshots '{}' and '{}'.",
+                            pick_args.source, from_snapshot, to_snapshot
+                        )));
+                    }
+                    if let Err(err) = git
+                        .pick_branch_snapshot_range(
+                            &source_table_name,
+                            &target_table_name,
+                            &from_internal,
+                            &to_internal,
+                            strategy,
+                        )
+                        .await
+                    {
+                        return map_pick_conflict(err, &pick_args.source, &pick_args.target, 0);
+                    }
+                    return Ok(mcp_text(&format!(
+                        "Picked snapshot range '{}'..'{}' from branch '{}' into '{}'.",
+                        from_snapshot, to_snapshot, pick_args.source, pick_args.target
+                    )));
+                }
+                PickSelector::Retrieve { query, top_k } => {
+                    if top_k <= 0 || top_k > MAX_PICK_TOP_K {
+                        return Err(MemoriaError::Validation(format!(
+                            "retrieve top_k must be between 1 and {MAX_PICK_TOP_K}"
+                        )));
+                    }
+                    let candidates = load_pick_candidates(
+                        &sql,
+                        user_id,
+                        &source_table,
+                        &target_table,
+                        None,
+                        Some((top_k * 10).max(20)),
+                    )
+                    .await?;
+                    let selected = select_retrieved_pick_keys(
+                        svc,
+                        &sql,
+                        user_id,
+                        &source_table,
+                        &target_table,
+                        &query,
+                        top_k,
+                        candidates,
+                    )
+                    .await?;
+                    if selected.is_empty() {
+                        return Ok(mcp_text(&format!(
+                            "No pickable changes matched query '{}' in branch '{}'.",
+                            query, pick_args.source
+                        )));
+                    }
+                    if let Err(err) = git
+                        .pick_branch_keys(
+                            &source_table_name,
+                            &target_table_name,
+                            &selected,
+                            strategy,
+                        )
+                        .await
+                    {
+                        return map_pick_conflict(
+                            err,
+                            &pick_args.source,
+                            &pick_args.target,
+                            selected.len(),
+                        );
+                    }
+                    let remaining = count_pick_candidates(
+                        &sql,
+                        user_id,
+                        &source_table,
+                        &target_table,
+                        Some(&selected),
+                    )
+                    .await?;
+                    let applied = selected.len().saturating_sub(remaining as usize);
+                    let skipped = if strategy == "skip" {
+                        remaining.max(0) as usize
+                    } else {
+                        0
+                    };
+                    return Ok(mcp_text(&format!(
+                        "Picked {applied} of top {top_k} retrieved change(s) from branch '{}' into '{}' ({skipped} skipped)",
+                        pick_args.source, pick_args.target
+                    )));
+                }
+            }
+        }
+
         GitToolCallName::MemoryBranchDelete => {
             let branch = args["name"].as_str().unwrap_or("");
             if branch == "main" {
@@ -1089,7 +1386,9 @@ pub async fn call(
                     };
                     let preview = if r.content.len() > 80 {
                         let mut end = 80;
-                        while !r.content.is_char_boundary(end) { end -= 1; }
+                        while !r.content.is_char_boundary(end) {
+                            end -= 1;
+                        }
                         format!("{}...", &r.content[..end])
                     } else {
                         r.content.clone()
@@ -1183,6 +1482,322 @@ async fn collect_replace_candidates(
     let mut replacements = chosen.into_values().collect::<Vec<_>>();
     replacements.sort_by(|a, b| a.main_memory_id.cmp(&b.main_memory_id));
     Ok(replacements)
+}
+
+fn normalize_pick_strategy(strategy: &str) -> Result<&str, MemoriaError> {
+    match strategy {
+        "fail" | "skip" | "accept" => Ok(strategy),
+        other => Err(MemoriaError::Validation(format!(
+            "Unsupported pick strategy '{other}'. Use fail, skip, or accept."
+        ))),
+    }
+}
+
+fn normalize_keys(keys: Vec<String>) -> Result<Vec<String>, MemoriaError> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for key in keys {
+        let trimmed = key.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if seen.insert(trimmed.to_string()) {
+            out.push(trimmed.to_string());
+        }
+    }
+    if out.is_empty() {
+        return Err(MemoriaError::Validation(
+            "key_list selector requires at least one non-empty key".into(),
+        ));
+    }
+    Ok(out)
+}
+
+async fn resolve_branch_table_name(
+    sql: &Arc<memoria_storage::SqlMemoryStore>,
+    user_id: &str,
+    branch: &str,
+    allow_main: bool,
+) -> Result<String, MemoriaError> {
+    if allow_main && branch == "main" {
+        return Ok("mem_memories".to_string());
+    }
+    sql.list_branches(user_id)
+        .await?
+        .into_iter()
+        .find(|(name, _)| name == branch)
+        .map(|(_, table)| table)
+        .ok_or_else(|| MemoriaError::NotFound(format!("Branch '{branch}'")))
+}
+
+fn pickable_diff_clause(source_alias: &str, target_alias: &str) -> String {
+    format!(
+        "{target_alias}.memory_id IS NULL \
+         OR COALESCE({target_alias}.content, '') <> COALESCE({source_alias}.content, '') \
+         OR COALESCE({target_alias}.is_active, 0) <> COALESCE({source_alias}.is_active, 0)"
+    )
+}
+
+async fn load_pick_candidates(
+    sql: &Arc<memoria_storage::SqlMemoryStore>,
+    user_id: &str,
+    source_table: &str,
+    target_table: &str,
+    keys: Option<&[String]>,
+    limit: Option<i64>,
+) -> Result<Vec<PickCandidate>, MemoriaError> {
+    let diff_clause = pickable_diff_clause("s", "t");
+    let mut qb: QueryBuilder<MySql> = QueryBuilder::new(format!(
+        "SELECT s.memory_id, COALESCE(s.content, '') AS content, \
+         COALESCE(s.memory_type, 'semantic') AS memory_type \
+         FROM {source_table} s \
+         LEFT JOIN {target_table} t ON t.memory_id = s.memory_id \
+         WHERE s.user_id = "
+    ));
+    qb.push_bind(user_id);
+    qb.push(" AND (");
+    qb.push(&diff_clause);
+    qb.push(")");
+    if let Some(keys) = keys {
+        qb.push(" AND s.memory_id IN (");
+        {
+            let mut separated = qb.separated(", ");
+            for key in keys {
+                separated.push_bind(key);
+            }
+        }
+        qb.push(")");
+    }
+    qb.push(" ORDER BY s.updated_at DESC, s.created_at DESC");
+    if let Some(limit) = limit {
+        qb.push(" LIMIT ");
+        qb.push_bind(limit.max(1));
+    }
+
+    let rows = qb.build().fetch_all(sql.pool()).await.map_err(db_err)?;
+    rows.into_iter()
+        .map(|row| {
+            Ok(PickCandidate {
+                memory_id: row.try_get("memory_id").map_err(db_err)?,
+                content: row.try_get("content").unwrap_or_default(),
+                memory_type: row
+                    .try_get("memory_type")
+                    .unwrap_or_else(|_| "semantic".to_string()),
+            })
+        })
+        .collect()
+}
+
+async fn count_pick_candidates(
+    sql: &Arc<memoria_storage::SqlMemoryStore>,
+    user_id: &str,
+    source_table: &str,
+    target_table: &str,
+    keys: Option<&[String]>,
+) -> Result<i64, MemoriaError> {
+    let diff_clause = pickable_diff_clause("s", "t");
+    let mut qb: QueryBuilder<MySql> = QueryBuilder::new(format!(
+        "SELECT COUNT(*) AS cnt FROM {source_table} s \
+         LEFT JOIN {target_table} t ON t.memory_id = s.memory_id \
+         WHERE s.user_id = "
+    ));
+    qb.push_bind(user_id);
+    qb.push(" AND (");
+    qb.push(&diff_clause);
+    qb.push(")");
+    if let Some(keys) = keys {
+        qb.push(" AND s.memory_id IN (");
+        {
+            let mut separated = qb.separated(", ");
+            for key in keys {
+                separated.push_bind(key);
+            }
+        }
+        qb.push(")");
+    }
+    let row = qb.build().fetch_one(sql.pool()).await.map_err(db_err)?;
+    row.try_get::<i64, _>("cnt").map_err(db_err)
+}
+
+fn sanitize_sql_literal(value: &str) -> String {
+    value
+        .chars()
+        .filter(|c| *c != '\0')
+        .fold(String::with_capacity(value.len()), |mut out, c| {
+            match c {
+                '\'' => out.push_str("''"),
+                '\\' => out.push_str("\\\\"),
+                _ => out.push(c),
+            }
+            out
+        })
+}
+
+fn sanitize_fulltext_query(value: &str) -> String {
+    value
+        .chars()
+        .filter(|c| *c != '\0')
+        .map(|c| {
+            if c.is_alphanumeric() || c == '_' {
+                c
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn vec_to_mo(v: &[f32]) -> String {
+    format!(
+        "[{}]",
+        v.iter()
+            .map(|f| f.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    )
+}
+
+async fn select_retrieved_pick_keys(
+    svc: &Arc<MemoryService>,
+    sql: &Arc<memoria_storage::SqlMemoryStore>,
+    user_id: &str,
+    source_table: &str,
+    target_table: &str,
+    query: &str,
+    top_k: i64,
+    candidates: Vec<PickCandidate>,
+) -> Result<Vec<String>, MemoriaError> {
+    if candidates.is_empty() {
+        return Ok(vec![]);
+    }
+    if candidates.len() <= top_k as usize {
+        return Ok(candidates
+            .into_iter()
+            .map(|candidate| candidate.memory_id)
+            .collect());
+    }
+
+    let fetch_k = (top_k * 3).max(20);
+    let mut scores: HashMap<String, f64> = HashMap::new();
+    let diff_clause = pickable_diff_clause("s", "t");
+    let safe_user_id = sanitize_sql_literal(user_id);
+
+    if let Some(embedding) = svc.embed(query).await? {
+        let vec_literal = vec_to_mo(&embedding);
+        let sql_text = format!(
+            "SELECT s.memory_id, CAST(l2_distance(s.embedding, '{vec_literal}') AS DOUBLE) AS l2_dist \
+             FROM {source_table} s \
+             LEFT JOIN {target_table} t ON t.memory_id = s.memory_id \
+             WHERE s.user_id = '{safe_user_id}' AND s.is_active = 1 \
+               AND s.embedding IS NOT NULL AND vector_dims(s.embedding) > 0 \
+               AND ({diff_clause}) \
+             ORDER BY l2_distance(s.embedding, '{vec_literal}') ASC \
+             LIMIT {fetch_k} by rank with option 'mode=post'"
+        );
+        let rows = sqlx::query(&sql_text)
+            .fetch_all(sql.pool())
+            .await
+            .map_err(db_err)?;
+        for row in rows {
+            let memory_id: String = row.try_get("memory_id").map_err(db_err)?;
+            let l2_dist: f64 = row.try_get("l2_dist").map_err(db_err)?;
+            scores.insert(memory_id, 0.7 * (1.0 / (1.0 + l2_dist.max(0.0))));
+        }
+    }
+
+    let safe_query = sanitize_fulltext_query(query);
+    if !safe_query.is_empty() {
+        let sql_text = format!(
+            "SELECT s.memory_id, CAST(MATCH(s.content) AGAINST('{safe_query}' IN BOOLEAN MODE) AS DOUBLE) AS ft_score \
+             FROM {source_table} s \
+             LEFT JOIN {target_table} t ON t.memory_id = s.memory_id \
+             WHERE s.user_id = ? AND s.is_active = 1 \
+               AND MATCH(s.content) AGAINST('{safe_query}' IN BOOLEAN MODE) \
+               AND ({diff_clause}) \
+             ORDER BY ft_score DESC LIMIT ?"
+        );
+        let rows = match sqlx::query(&sql_text)
+            .bind(user_id)
+            .bind(fetch_k)
+            .fetch_all(sql.pool())
+            .await
+        {
+            Ok(rows) => rows,
+            Err(err) => {
+                let msg = err.to_string();
+                if (msg.contains("20101") && msg.contains("empty pattern"))
+                    || (msg.contains("20105") && msg.contains("not supported"))
+                {
+                    vec![]
+                } else {
+                    return Err(db_err(err));
+                }
+            }
+        };
+        for row in rows {
+            let memory_id: String = row.try_get("memory_id").map_err(db_err)?;
+            let ft_score: f64 = row.try_get("ft_score").unwrap_or(0.0);
+            scores
+                .entry(memory_id)
+                .and_modify(|score| *score += 0.3 * ft_score.max(0.0))
+                .or_insert(0.3 * ft_score.max(0.0));
+        }
+    }
+
+    let mut ranked = candidates
+        .into_iter()
+        .map(|candidate| {
+            let lexical_overlap = if safe_query.is_empty() {
+                0.0
+            } else {
+                safe_query
+                    .split_whitespace()
+                    .filter(|token| {
+                        candidate
+                            .content
+                            .to_lowercase()
+                            .contains(&token.to_lowercase())
+                    })
+                    .count() as f64
+            };
+            let type_bias = if candidate.memory_type == "semantic" {
+                0.001
+            } else {
+                0.0
+            };
+            let score = scores
+                .get(&candidate.memory_id)
+                .copied()
+                .unwrap_or(lexical_overlap)
+                + type_bias;
+            (candidate.memory_id, score)
+        })
+        .collect::<Vec<_>>();
+    ranked.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    ranked.truncate(top_k as usize);
+    Ok(ranked.into_iter().map(|(memory_id, _)| memory_id).collect())
+}
+
+fn map_pick_conflict(
+    err: MemoriaError,
+    source: &str,
+    target: &str,
+    selected: usize,
+) -> Result<Value, MemoriaError> {
+    let message = err.to_string();
+    if message.to_lowercase().contains("conflict") {
+        return Err(MemoriaError::Validation(format!(
+            "Conflict: pick from branch '{source}' into '{target}' aborted for {selected} selected change(s): {message}"
+        )));
+    }
+    Err(err)
 }
 
 fn mcp_text(text: &str) -> Value {

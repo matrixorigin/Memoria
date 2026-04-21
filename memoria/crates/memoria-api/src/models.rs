@@ -345,6 +345,44 @@ fn default_strategy() -> String {
     "accept".to_string()
 }
 
+#[derive(Debug, Deserialize, Serialize)]
+pub struct PickRequest {
+    #[serde(default = "default_pick_target")]
+    pub target: String,
+    #[serde(default = "default_pick_strategy")]
+    pub strategy: String,
+    pub selector: PickSelector,
+}
+
+fn default_pick_target() -> String {
+    "main".to_string()
+}
+
+fn default_pick_strategy() -> String {
+    "fail".to_string()
+}
+
+fn default_pick_top_k() -> i64 {
+    5
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum PickSelector {
+    KeyList {
+        keys: Vec<String>,
+    },
+    SnapshotRange {
+        from_snapshot: String,
+        to_snapshot: String,
+    },
+    Retrieve {
+        query: String,
+        #[serde(default = "default_pick_top_k")]
+        top_k: i64,
+    },
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 pub fn parse_memory_type(s: &str) -> Result<MemoryType, String> {

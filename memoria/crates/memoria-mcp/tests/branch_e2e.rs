@@ -32,6 +32,28 @@ fn bname(suffix: &str) -> String {
     format!("b{}_{suffix}", &Uuid::new_v4().simple().to_string()[..6])
 }
 
+struct PickTestEmbedder;
+
+#[async_trait::async_trait]
+impl EmbeddingProvider for PickTestEmbedder {
+    async fn embed(&self, text: &str) -> Result<Vec<f32>, memoria_core::MemoriaError> {
+        let mut v = vec![0.0; test_dim()];
+        match text {
+            "alpha query" | "alpha branch memory" => v[0] = 1.0,
+            "beta branch memory" => {
+                v[0] = 0.6;
+                v[1] = 0.4;
+            }
+            _ => v[2] = 1.0,
+        }
+        Ok(v)
+    }
+
+    fn dimension(&self) -> usize {
+        test_dim()
+    }
+}
+
 async fn setup() -> (
     Arc<MemoryService>,
     Arc<GitForDataService>,
@@ -56,6 +78,18 @@ async fn setup_with_mock_embedder() -> (
     let uid = uid();
     let pool = ctx.user_db_pool(&uid).await;
     (ctx.service(), ctx.git(), pool, uid, ctx)
+}
+
+async fn setup_with_pick_embedder() -> (
+    Arc<MemoryService>,
+    Arc<GitForDataService>,
+    String,
+    support::multi_db::McpTestContext,
+) {
+    let embedder: Option<Arc<dyn EmbeddingProvider>> = Some(Arc::new(PickTestEmbedder));
+    let ctx =
+        support::multi_db::setup_mcp_context("branch_e2e_pick", test_dim(), embedder, None).await;
+    (ctx.service(), ctx.git(), uid(), ctx)
 }
 
 async fn gc(
@@ -300,6 +334,277 @@ async fn test_diff_no_changes() {
         &uid,
     )
     .await;
+}
+
+#[tokio::test]
+async fn test_pick_key_list_into_main() {
+    let (svc, git, uid, _ctx) = setup().await;
+    let branch = bname("pick_keys");
+
+    store_mem("main seed", &svc, &uid).await;
+    gc("memory_branch", json!({"name": branch}), &git, &svc, &uid).await;
+    gc("memory_checkout", json!({"name": branch}), &git, &svc, &uid).await;
+    store_mem("branch alpha", &svc, &uid).await;
+    store_mem("branch beta", &svc, &uid).await;
+
+    let branch_memories = svc.list_active(&uid, 10).await.unwrap();
+    let alpha_id = branch_memories
+        .iter()
+        .find(|memory| memory.content == "branch alpha")
+        .expect("alpha memory")
+        .memory_id
+        .clone();
+
+    gc("memory_checkout", json!({"name": "main"}), &git, &svc, &uid).await;
+    let r = gc(
+        "memory_pick",
+        json!({
+            "source": branch,
+            "selector": {"type": "key_list", "keys": [alpha_id]},
+        }),
+        &git,
+        &svc,
+        &uid,
+    )
+    .await;
+    assert!(text(&r).contains("Picked 1 change"), "{}", text(&r));
+
+    let main_memories = svc.list_active(&uid, 10).await.unwrap();
+    assert!(main_memories
+        .iter()
+        .any(|memory| memory.content == "branch alpha"));
+    assert!(!main_memories
+        .iter()
+        .any(|memory| memory.content == "branch beta"));
+}
+
+#[tokio::test]
+async fn test_pick_key_list_into_target_branch() {
+    let (svc, git, uid, ctx) = setup().await;
+    let source = bname("pick_src");
+    let target = bname("pick_dst");
+
+    store_mem("main seed", &svc, &uid).await;
+    gc("memory_branch", json!({"name": source}), &git, &svc, &uid).await;
+    gc("memory_checkout", json!({"name": source}), &git, &svc, &uid).await;
+    store_mem("source only memory", &svc, &uid).await;
+    let source_only_id = svc
+        .list_active(&uid, 10)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|memory| memory.content == "source only memory")
+        .expect("source memory")
+        .memory_id;
+
+    gc("memory_checkout", json!({"name": "main"}), &git, &svc, &uid).await;
+    gc("memory_branch", json!({"name": target}), &git, &svc, &uid).await;
+
+    let r = gc(
+        "memory_pick",
+        json!({
+            "source": source,
+            "target": target,
+            "selector": {"type": "key_list", "keys": [source_only_id]},
+        }),
+        &git,
+        &svc,
+        &uid,
+    )
+    .await;
+    assert!(text(&r).contains("into '"), "{}", text(&r));
+
+    gc("memory_checkout", json!({"name": target}), &git, &svc, &uid).await;
+    assert!(svc
+        .list_active(&uid, 10)
+        .await
+        .unwrap()
+        .iter()
+        .any(|memory| memory.content == "source only memory"));
+
+    gc(
+        "memory_branch_delete",
+        json!({"name": target}),
+        &git,
+        &svc,
+        &uid,
+    )
+    .await;
+    gc(
+        "memory_branch_delete",
+        json!({"name": source}),
+        &git,
+        &svc,
+        &uid,
+    )
+    .await;
+    let _ = ctx;
+}
+
+#[tokio::test]
+async fn test_pick_snapshot_range_into_main() {
+    let (svc, git, uid, _ctx) = setup().await;
+    let branch = bname("pick_snap");
+    let snap_before = format!("pick_before_{}", &Uuid::new_v4().simple().to_string()[..6]);
+    let snap_after = format!("pick_after_{}", &Uuid::new_v4().simple().to_string()[..6]);
+
+    store_mem("main seed", &svc, &uid).await;
+    gc("memory_branch", json!({"name": branch}), &git, &svc, &uid).await;
+    gc("memory_checkout", json!({"name": branch}), &git, &svc, &uid).await;
+    gc(
+        "memory_snapshot",
+        json!({"name": snap_before}),
+        &git,
+        &svc,
+        &uid,
+    )
+    .await;
+    store_mem("snapshot-ranged memory", &svc, &uid).await;
+    gc(
+        "memory_snapshot",
+        json!({"name": snap_after}),
+        &git,
+        &svc,
+        &uid,
+    )
+    .await;
+    gc("memory_checkout", json!({"name": "main"}), &git, &svc, &uid).await;
+
+    let r = gc(
+        "memory_pick",
+        json!({
+            "source": branch,
+            "selector": {
+                "type": "snapshot_range",
+                "from_snapshot": snap_before,
+                "to_snapshot": snap_after
+            },
+        }),
+        &git,
+        &svc,
+        &uid,
+    )
+    .await;
+    assert!(text(&r).contains("snapshot range"), "{}", text(&r));
+    assert!(svc
+        .list_active(&uid, 10)
+        .await
+        .unwrap()
+        .iter()
+        .any(|memory| memory.content == "snapshot-ranged memory"));
+}
+
+#[tokio::test]
+async fn test_pick_retrieve_top_k_on_changed_rows() {
+    let (svc, git, uid, _ctx) = setup_with_pick_embedder().await;
+    let branch = bname("pick_retrieve");
+
+    store_mem("main seed", &svc, &uid).await;
+    gc("memory_branch", json!({"name": branch}), &git, &svc, &uid).await;
+    gc("memory_checkout", json!({"name": branch}), &git, &svc, &uid).await;
+    store_mem("alpha branch memory", &svc, &uid).await;
+    store_mem("beta branch memory", &svc, &uid).await;
+    gc("memory_checkout", json!({"name": "main"}), &git, &svc, &uid).await;
+
+    let r = gc(
+        "memory_pick",
+        json!({
+            "source": branch,
+            "selector": {"type": "retrieve", "query": "alpha query", "top_k": 1},
+        }),
+        &git,
+        &svc,
+        &uid,
+    )
+    .await;
+    assert!(text(&r).contains("top 1"), "{}", text(&r));
+
+    let main_memories = svc.list_active(&uid, 10).await.unwrap();
+    assert!(main_memories
+        .iter()
+        .any(|memory| memory.content == "alpha branch memory"));
+    assert!(!main_memories
+        .iter()
+        .any(|memory| memory.content == "beta branch memory"));
+}
+
+#[tokio::test]
+async fn test_pick_fail_and_skip_conflicts() {
+    let (svc, git, pool, uid, ctx) = setup_with_mock_embedder().await;
+    let branch = bname("pick_conflict");
+
+    store_mem("shared conflict seed", &svc, &uid).await;
+    let original = svc
+        .list_active(&uid, 10)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|memory| memory.content == "shared conflict seed")
+        .expect("original");
+    gc("memory_branch", json!({"name": branch}), &git, &svc, &uid).await;
+    let branch_table = ctx
+        .user_store(&uid)
+        .await
+        .list_branches(&uid)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|(name, _)| name == &branch)
+        .map(|(_, table)| table)
+        .expect("branch table");
+
+    sqlx::query(&format!(
+        "UPDATE {branch_table} SET content = ? WHERE memory_id = ?"
+    ))
+    .bind("branch conflict content")
+    .bind(&original.memory_id)
+    .execute(&pool)
+    .await
+    .expect("update branch");
+    sqlx::query("UPDATE mem_memories SET content = ? WHERE memory_id = ?")
+        .bind("main conflict content")
+        .bind(&original.memory_id)
+        .execute(&pool)
+        .await
+        .expect("update main");
+
+    let fail = memoria_mcp::git_tools::call(
+        "memory_pick",
+        json!({
+            "source": branch,
+            "strategy": "fail",
+            "selector": {"type": "key_list", "keys": [original.memory_id.clone()]},
+        }),
+        &git,
+        &svc,
+        &uid,
+    )
+    .await;
+    assert!(fail.is_err(), "fail strategy should reject conflicts");
+
+    let skip = gc(
+        "memory_pick",
+        json!({
+            "source": branch,
+            "strategy": "skip",
+            "selector": {"type": "key_list", "keys": [original.memory_id.clone()]},
+        }),
+        &git,
+        &svc,
+        &uid,
+    )
+    .await;
+    assert!(text(&skip).contains("1 skipped"), "{}", text(&skip));
+
+    let row = sqlx::query("SELECT content FROM mem_memories WHERE memory_id = ?")
+        .bind(&original.memory_id)
+        .fetch_one(&pool)
+        .await
+        .expect("main row");
+    assert_eq!(
+        row.try_get::<String, _>("content").unwrap(),
+        "main conflict content"
+    );
 }
 
 // ── 4. Cannot delete main ─────────────────────────────────────────────────────
@@ -795,9 +1100,7 @@ async fn test_diff_fields_complete() {
         .unwrap();
     let user_git = GitForDataService::new(
         sql.pool().clone(),
-        sql.database_name()
-            .expect("user db name")
-            .to_string(),
+        sql.database_name().expect("user db name").to_string(),
     );
 
     let rows = user_git
@@ -907,9 +1210,7 @@ async fn test_diff_native_count_vs_join_rows() {
         .unwrap();
     let user_git = GitForDataService::new(
         sql.pool().clone(),
-        sql.database_name()
-            .expect("user db name")
-            .to_string(),
+        sql.database_name().expect("user db name").to_string(),
     );
 
     // Native count: >= 1 (account-level, may include other users)

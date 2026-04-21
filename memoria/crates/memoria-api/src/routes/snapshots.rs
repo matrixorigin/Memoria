@@ -13,7 +13,7 @@ use crate::{
     routes::memory::{api_err, api_err_typed},
     state::AppState,
 };
-use memoria_core::TrustTier;
+use memoria_core::{MemoriaError, TrustTier};
 use memoria_git::GitForDataService;
 use std::sync::Arc;
 
@@ -63,6 +63,27 @@ async fn git_call(
     args: serde_json::Value,
 ) -> Result<serde_json::Value, (StatusCode, String)> {
     let text = git_call_text(state, user_id, tool, args).await?;
+    Ok(json!({ "result": text }))
+}
+
+async fn git_call_pick(
+    state: &AppState,
+    user_id: &str,
+    args: serde_json::Value,
+) -> Result<serde_json::Value, (StatusCode, String)> {
+    let result =
+        memoria_mcp::git_tools::call("memory_pick", args, &state.git, &state.service, user_id)
+            .await
+            .map_err(|e| match e {
+                MemoriaError::Validation(msg) if msg.starts_with("Conflict:") => {
+                    (StatusCode::CONFLICT, msg)
+                }
+                other => api_err_typed(other),
+            })?;
+    let text = result["content"][0]["text"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
     Ok(json!({ "result": text }))
 }
 
@@ -684,6 +705,26 @@ pub async fn diff_branch(
     Path(name): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let r = git_call(&state, &user_id, "memory_diff", json!({ "source": name })).await?;
+    Ok(Json(r))
+}
+
+pub async fn pick_branch(
+    State(state): State<AppState>,
+    AuthUser { user_id, .. }: AuthUser,
+    Path(name): Path<String>,
+    Json(req): Json<PickRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let r = git_call_pick(
+        &state,
+        &user_id,
+        json!({
+            "source": name,
+            "target": req.target,
+            "strategy": req.strategy,
+            "selector": req.selector,
+        }),
+    )
+    .await?;
     Ok(Json(r))
 }
 
