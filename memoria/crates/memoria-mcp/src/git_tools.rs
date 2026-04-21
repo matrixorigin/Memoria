@@ -219,6 +219,14 @@ struct RankedPickCandidate {
     target_exists: bool,
 }
 
+#[derive(Debug, Clone)]
+struct SnapshotPickRow {
+    memory_id: String,
+    content: String,
+    memory_type: String,
+    is_active: bool,
+}
+
 #[derive(Debug, Deserialize)]
 struct MemoryPickArgs {
     source: String,
@@ -1900,39 +1908,99 @@ async fn load_snapshot_range_pick_candidates(
     from_snapshot: &str,
     to_snapshot: &str,
 ) -> Result<Vec<PickCandidate>, MemoriaError> {
-    let diff_clause = pickable_diff_clause("s_to", "s_from");
+    let from_rows = load_snapshot_pick_rows(sql, user_id, source_table, from_snapshot).await?;
+    let from_map: HashMap<_, _> = from_rows
+        .into_iter()
+        .map(|row| (row.memory_id.clone(), row))
+        .collect();
+
+    let changed_rows: Vec<_> = load_snapshot_pick_rows(sql, user_id, source_table, to_snapshot)
+        .await?
+        .into_iter()
+        .filter(|row| {
+            from_map
+                .get(&row.memory_id)
+                .is_none_or(|prev| prev.content != row.content || prev.is_active != row.is_active)
+        })
+        .collect();
+
+    let candidate_ids = changed_rows
+        .iter()
+        .map(|row| row.memory_id.clone())
+        .collect::<Vec<_>>();
+    let target_existing =
+        load_target_memory_ids(sql, user_id, target_table, &candidate_ids).await?;
+
+    Ok(changed_rows
+        .into_iter()
+        .map(|row| PickCandidate {
+            target_exists: target_existing.contains(&row.memory_id),
+            memory_id: row.memory_id,
+            content: row.content,
+            memory_type: row.memory_type,
+        })
+        .collect())
+}
+
+async fn load_snapshot_pick_rows(
+    sql: &Arc<memoria_storage::SqlMemoryStore>,
+    user_id: &str,
+    source_table: &str,
+    snapshot: &str,
+) -> Result<Vec<SnapshotPickRow>, MemoriaError> {
     let mut qb: QueryBuilder<MySql> = QueryBuilder::new(format!(
-        "SELECT s_to.memory_id, COALESCE(s_to.content, '') AS content, \
-         COALESCE(s_to.memory_type, 'semantic') AS memory_type, \
-         CASE WHEN t.memory_id IS NULL THEN 0 ELSE 1 END AS target_exists \
+        "SELECT memory_id, COALESCE(content, '') AS content, \
+         COALESCE(memory_type, 'semantic') AS memory_type, COALESCE(is_active, 0) AS is_active \
          FROM {source_table} {{SNAPSHOT = '"
     ));
-    qb.push(to_snapshot);
-    qb.push("'} s_to ");
-    qb.push(format!(
-        "LEFT JOIN {source_table} {{SNAPSHOT = '{from_snapshot}'}} s_from ON s_from.memory_id = s_to.memory_id "
-    ));
-    qb.push(format!(
-        "LEFT JOIN {target_table} t ON t.memory_id = s_to.memory_id WHERE s_to.user_id = "
-    ));
+    qb.push(snapshot);
+    qb.push("'} WHERE user_id = ");
     qb.push_bind(user_id);
-    qb.push(" AND (");
-    qb.push(&diff_clause);
-    qb.push(") ORDER BY s_to.updated_at DESC, s_to.created_at DESC");
+    qb.push(" ORDER BY updated_at DESC, created_at DESC");
 
     let rows = qb.build().fetch_all(sql.pool()).await.map_err(db_err)?;
     rows.into_iter()
         .map(|row| {
-            Ok(PickCandidate {
+            Ok(SnapshotPickRow {
                 memory_id: row.try_get("memory_id").map_err(db_err)?,
                 content: row.try_get("content").unwrap_or_default(),
                 memory_type: row
                     .try_get("memory_type")
                     .unwrap_or_else(|_| "semantic".to_string()),
-                target_exists: row.try_get::<i64, _>("target_exists").unwrap_or(0) != 0,
+                is_active: row.try_get::<i64, _>("is_active").unwrap_or(0) != 0,
             })
         })
         .collect()
+}
+
+async fn load_target_memory_ids(
+    sql: &Arc<memoria_storage::SqlMemoryStore>,
+    user_id: &str,
+    target_table: &str,
+    memory_ids: &[String],
+) -> Result<HashSet<String>, MemoriaError> {
+    if memory_ids.is_empty() {
+        return Ok(HashSet::new());
+    }
+
+    let mut qb: QueryBuilder<MySql> = QueryBuilder::new(format!(
+        "SELECT memory_id FROM {target_table} WHERE user_id = "
+    ));
+    qb.push_bind(user_id);
+    qb.push(" AND memory_id IN (");
+    {
+        let mut separated = qb.separated(", ");
+        for memory_id in memory_ids {
+            separated.push_bind(memory_id);
+        }
+    }
+    qb.push(")");
+
+    let rows = qb.build().fetch_all(sql.pool()).await.map_err(db_err)?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|row| row.try_get::<String, _>("memory_id").ok())
+        .collect())
 }
 
 async fn count_pick_candidates(
