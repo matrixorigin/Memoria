@@ -227,6 +227,12 @@ struct SnapshotPickRow {
     is_active: bool,
 }
 
+#[derive(Debug, Clone)]
+struct TargetPickRow {
+    content: String,
+    is_active: bool,
+}
+
 #[derive(Debug, Deserialize)]
 struct MemoryPickArgs {
     source: String,
@@ -1928,16 +1934,23 @@ async fn load_snapshot_range_pick_candidates(
         .iter()
         .map(|row| row.memory_id.clone())
         .collect::<Vec<_>>();
-    let target_existing =
-        load_target_memory_ids(sql, user_id, target_table, &candidate_ids).await?;
+    let target_rows = load_target_pick_rows(sql, user_id, target_table, &candidate_ids).await?;
 
     Ok(changed_rows
         .into_iter()
-        .map(|row| PickCandidate {
-            target_exists: target_existing.contains(&row.memory_id),
-            memory_id: row.memory_id,
-            content: row.content,
-            memory_type: row.memory_type,
+        .filter_map(|row| {
+            let target_row = target_rows.get(&row.memory_id);
+            if target_row.is_some_and(|target| {
+                target.content == row.content && target.is_active == row.is_active
+            }) {
+                return None;
+            }
+            Some(PickCandidate {
+                target_exists: target_row.is_some(),
+                memory_id: row.memory_id,
+                content: row.content,
+                memory_type: row.memory_type,
+            })
         })
         .collect())
 }
@@ -1973,18 +1986,19 @@ async fn load_snapshot_pick_rows(
         .collect()
 }
 
-async fn load_target_memory_ids(
+async fn load_target_pick_rows(
     sql: &Arc<memoria_storage::SqlMemoryStore>,
     user_id: &str,
     target_table: &str,
     memory_ids: &[String],
-) -> Result<HashSet<String>, MemoriaError> {
+) -> Result<HashMap<String, TargetPickRow>, MemoriaError> {
     if memory_ids.is_empty() {
-        return Ok(HashSet::new());
+        return Ok(HashMap::new());
     }
 
     let mut qb: QueryBuilder<MySql> = QueryBuilder::new(format!(
-        "SELECT memory_id FROM {target_table} WHERE user_id = "
+        "SELECT memory_id, COALESCE(content, '') AS content, COALESCE(is_active, 0) AS is_active \
+         FROM {target_table} WHERE user_id = "
     ));
     qb.push_bind(user_id);
     qb.push(" AND memory_id IN (");
@@ -1999,7 +2013,15 @@ async fn load_target_memory_ids(
     let rows = qb.build().fetch_all(sql.pool()).await.map_err(db_err)?;
     Ok(rows
         .into_iter()
-        .filter_map(|row| row.try_get::<String, _>("memory_id").ok())
+        .filter_map(|row| {
+            Some((
+                row.try_get::<String, _>("memory_id").ok()?,
+                TargetPickRow {
+                    content: row.try_get("content").unwrap_or_default(),
+                    is_active: row.try_get::<i64, _>("is_active").unwrap_or(0) != 0,
+                },
+            ))
+        })
         .collect())
 }
 
@@ -2221,7 +2243,7 @@ fn map_pick_conflict(
     selected: Option<usize>,
 ) -> Result<Value, MemoriaError> {
     let message = err.to_string();
-    if message.to_lowercase().contains("conflict") {
+    if is_pick_conflict_error_message(&message) {
         let selection_detail = selected
             .map(|count| format!(" for {count} selected change(s)"))
             .unwrap_or_default();
@@ -2230,6 +2252,20 @@ fn map_pick_conflict(
         )));
     }
     Err(err)
+}
+
+fn is_pick_parser_error_message(message: &str) -> bool {
+    let lower = message.to_lowercase();
+    lower.contains("sql parser error")
+        && (lower.contains("data branch pick")
+            || (lower.contains("near \" pick") && lower.contains("when conflict")))
+}
+
+fn is_pick_conflict_error_message(message: &str) -> bool {
+    if is_pick_parser_error_message(message) {
+        return false;
+    }
+    message.to_lowercase().contains("conflict")
 }
 
 fn mcp_text(text: &str) -> Value {
@@ -2243,9 +2279,11 @@ fn mcp_json(value: &Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::{
+        is_pick_conflict_error_message, is_pick_parser_error_message, map_pick_conflict,
         normalize_keys, safety_prefix, snap_internal, validate_identifier, MAX_IDENTIFIER_LEN,
         MAX_PICK_KEYS,
     };
+    use memoria_core::MemoriaError;
 
     #[test]
     fn scoped_snapshot_internal_names_stay_within_matrixone_limit() {
@@ -2271,6 +2309,29 @@ mod tests {
             .collect::<Vec<_>>();
         let err = normalize_keys(keys).expect_err("should reject oversized key lists");
         assert!(err.to_string().contains("at most"), "{err}");
+    }
+
+    #[test]
+    fn parser_errors_are_not_classified_as_pick_conflicts() {
+        let parser_error = "SQL parser error: syntax error at line 1 column 16 near \" pick foo into bar keys('x') when conflict FAIL\";";
+        assert!(is_pick_parser_error_message(parser_error));
+        assert!(!is_pick_conflict_error_message(parser_error));
+        let err = MemoriaError::Database(parser_error.to_string());
+        let wrapped = map_pick_conflict(err.clone(), "src", "dst", Some(1)).unwrap_err();
+        assert_eq!(wrapped.to_string(), err.to_string());
+    }
+
+    #[test]
+    fn real_conflicts_are_still_wrapped_for_api_mapping() {
+        let err = MemoriaError::Database("branch pick conflict: target row differs".into());
+        let wrapped = map_pick_conflict(err, "src", "dst", Some(2)).unwrap_err();
+        match wrapped {
+            MemoriaError::Validation(msg) => {
+                assert!(msg.starts_with("Conflict: pick from branch 'src' into 'dst' aborted"));
+                assert!(msg.contains("2 selected change(s)"));
+            }
+            other => panic!("expected validation conflict, got {other:?}"),
+        }
     }
 
     #[test]

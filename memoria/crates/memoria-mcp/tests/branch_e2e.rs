@@ -671,6 +671,110 @@ async fn test_pick_snapshot_range_dry_run_returns_preview() {
 }
 
 #[tokio::test]
+async fn test_pick_snapshot_range_dry_run_skips_rows_identical_in_target() {
+    let (svc, git, pool, uid, ctx) = setup_with_mock_embedder().await;
+    let branch = bname("pick_snap_same_target");
+    let snap_before = format!("pick_before_{}", &Uuid::new_v4().simple().to_string()[..6]);
+    let snap_after = format!("pick_after_{}", &Uuid::new_v4().simple().to_string()[..6]);
+
+    store_mem("shared seed", &svc, &uid).await;
+    let original = svc
+        .list_active(&uid, 10)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|memory| memory.content == "shared seed")
+        .expect("original");
+
+    gc("memory_branch", json!({"name": branch}), &git, &svc, &uid).await;
+    gc("memory_checkout", json!({"name": branch}), &git, &svc, &uid).await;
+    let branch_table = ctx
+        .user_store(&uid)
+        .await
+        .list_branches(&uid)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|(name, _)| name == &branch)
+        .map(|(_, table)| table)
+        .expect("branch table");
+    gc(
+        "memory_snapshot",
+        json!({"name": snap_before}),
+        &git,
+        &svc,
+        &uid,
+    )
+    .await;
+    sqlx::query(&format!(
+        "UPDATE {branch_table} SET content = ? WHERE memory_id = ?"
+    ))
+    .bind("branch updated content")
+    .bind(&original.memory_id)
+    .execute(&pool)
+    .await
+    .expect("update branch");
+    gc(
+        "memory_snapshot",
+        json!({"name": snap_after}),
+        &git,
+        &svc,
+        &uid,
+    )
+    .await;
+    gc("memory_checkout", json!({"name": "main"}), &git, &svc, &uid).await;
+    sqlx::query("UPDATE mem_memories SET content = ? WHERE memory_id = ?")
+        .bind("branch updated content")
+        .bind(&original.memory_id)
+        .execute(&pool)
+        .await
+        .expect("update main");
+
+    let Some(r) = pick_result_or_skip(
+        memoria_mcp::git_tools::call(
+            "memory_pick",
+            json!({
+                "source": branch,
+                "selector": {
+                    "type": "snapshot_range",
+                    "from_snapshot": snap_before,
+                    "to_snapshot": snap_after
+                },
+                "dry_run": {
+                    "limit": 10,
+                    "include_content_preview": true
+                }
+            }),
+            &git,
+            &svc,
+            &uid,
+        )
+        .await,
+        "test_pick_snapshot_range_dry_run_skips_rows_identical_in_target",
+    ) else {
+        return;
+    };
+    let body = text_json(&r);
+    assert_eq!(body["dry_run"].as_bool(), Some(true), "{body}");
+    assert_eq!(
+        body["summary"]["candidate_count"].as_u64(),
+        Some(0),
+        "{body}"
+    );
+    assert_eq!(
+        body["summary"]["conflict_count"].as_u64(),
+        Some(0),
+        "{body}"
+    );
+    assert_eq!(body["summary"]["would_apply"].as_u64(), Some(0), "{body}");
+    assert_eq!(
+        body["candidates"].as_array().map(Vec::len),
+        Some(0),
+        "{body}"
+    );
+}
+
+#[tokio::test]
 async fn test_pick_retrieve_top_k_on_changed_rows() {
     let (svc, git, uid, _ctx) = setup_with_pick_embedder().await;
     let branch = bname("pick_retrieve");

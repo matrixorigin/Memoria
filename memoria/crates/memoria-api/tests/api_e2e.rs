@@ -30,7 +30,7 @@ fn is_pick_not_supported_message(body: &str) -> bool {
 async fn pick_response_json_or_skip(response: reqwest::Response, test_name: &str) -> Option<Value> {
     let status = response.status();
     let body = response.text().await.unwrap();
-    if status == reqwest::StatusCode::CONFLICT && is_pick_not_supported_message(&body) {
+    if is_pick_not_supported_message(&body) {
         eprintln!("⚠️ DATA BRANCH PICK not supported, skipping {test_name}");
         return None;
     }
@@ -6581,12 +6581,13 @@ async fn test_api_branch_pick_conflict_returns_409() {
         .send()
         .await
         .unwrap();
-    assert_eq!(r.status(), 409);
+    let status = r.status();
     let body = r.text().await.unwrap();
     if is_pick_not_supported_message(&body) {
         eprintln!("⚠️ DATA BRANCH PICK not supported, skipping test_api_branch_pick_fail_conflict_returns_409");
         return;
     }
+    assert_eq!(status, 409, "body: {body}");
     assert!(body.contains("Conflict:"), "body: {body}");
 }
 
