@@ -573,48 +573,56 @@ pub fn list() -> Value {
         },
         {
             "name": "memory_pick",
-            "description": "Selectively apply branch changes into a target branch (default main). key_list picks explicit memory_ids, snapshot_range picks changes between two named snapshots, and retrieve ranks changed rows by query before applying them. Set dry_run to preview candidates without modifying the database.",
+            "description": "Selectively apply branch changes from source into a target branch (default main). Use key_list only when you already know the exact memory_ids to bring over. Use snapshot_range only when you already have two existing named snapshots and want every source-branch change between them. Use retrieve only when you have a natural-language topic and want semantic ranking over rows that differ between source and target. This tool mutates branch state unless dry_run is provided. When uncertain, prefer dry_run first and keep the default strategy=fail. Do not use accept unless the user explicitly wants source changes to overwrite conflicting target rows.",
             "inputSchema": {
                 "type": "object",
+                "additionalProperties": false,
                 "properties": {
                     "source": {"type": "string", "description": "Source branch name to pick from."},
                     "target": {"type": "string", "default": "main", "description": "Target branch name. Defaults to main."},
                     "strategy": {
                         "type": "string",
+                        "enum": ["fail", "skip", "accept"],
                         "default": "fail",
-                        "description": "Conflict strategy: fail | skip | accept"
+                        "description": "Conflict strategy. fail = safest default, abort if any picked row conflicts with target; use this for safe preview-first flows and whenever overwrite policy is not explicit. skip = apply only non-conflicting rows; use this only if the user explicitly wants partial apply despite conflicts. accept = source branch wins and overwrites conflicting target rows; use this only if the user explicitly requests overwrite/source-wins behavior."
                     },
                     "selector": {
                         "type": "object",
-                        "description": "Choose specific rows by memory_id, by snapshot range, or by semantic retrieval over changed rows only.",
+                        "description": "Exactly one selector object. Pass the selector object itself here; do not use selector:'snapshot_range' and do not add sibling top-level fields like retrieve or snapshot_range.",
                         "oneOf": [
                             {
                                 "type": "object",
+                                "additionalProperties": false,
+                                "description": "Use key_list when you already know the exact memory_ids to apply. Example: selector={type:'key_list', keys:['m_101','m_205']}.",
                                 "properties": {
                                     "type": {"const": "key_list"},
                                     "keys": {
                                         "type": "array",
                                         "items": {"type": "string"},
-                                        "description": "Specific memory_ids from the source branch to apply."
+                                        "description": "Specific memory_ids from the source branch to apply. Use this only for explicit known IDs; maximum 1000 unique keys."
                                     }
                                 },
                                 "required": ["type", "keys"]
                             },
                             {
                                 "type": "object",
+                                "additionalProperties": false,
+                                "description": "Use snapshot_range when you already have two existing named snapshots on the source branch and want all changes between them. Example: selector={type:'snapshot_range', from_snapshot:'snap_a', to_snapshot:'snap_b'}.",
                                 "properties": {
                                     "type": {"const": "snapshot_range"},
-                                    "from_snapshot": {"type": "string"},
-                                    "to_snapshot": {"type": "string"}
+                                    "from_snapshot": {"type": "string", "description": "Existing start snapshot name on the source branch."},
+                                    "to_snapshot": {"type": "string", "description": "Existing end snapshot name on the source branch."}
                                 },
                                 "required": ["type", "from_snapshot", "to_snapshot"]
                             },
                             {
                                 "type": "object",
+                                "additionalProperties": false,
+                                "description": "Use retrieve when you only know a topic/intent and want semantic ranking over changed rows. Example: selector={type:'retrieve', query:'OAuth callback bugs', top_k:2, min_score:0.7}. Keep query/top_k/min_score inside selector.",
                                 "properties": {
                                     "type": {"const": "retrieve"},
                                     "query": {"type": "string", "description": "Natural-language query used to rank changed source memories."},
-                                    "top_k": {"type": "integer", "default": 5, "description": "Only valid for retrieve; keeps at most the top-k ranked changed memories."},
+                                    "top_k": {"type": "integer", "default": 5, "description": "Retrieve only. Keeps at most the top-k ranked changed memories in the actual apply set."},
                                     "min_score": {"type": "number", "description": "Optional retrieve-only score threshold. Candidates below this score are excluded from both dry_run previews and the final apply set."}
                                 },
                                 "required": ["type", "query"]
@@ -623,12 +631,13 @@ pub fn list() -> Value {
                     },
                     "dry_run": {
                         "type": "object",
-                        "description": "Preview the candidate set without applying it. limit/offset only shape the preview output; they do not change which memories would be picked.",
+                        "additionalProperties": false,
+                        "description": "Optional preview object. Any object here enables preview mode and prevents mutation. dry_run must be an object, not a boolean. limit/offset only shape preview output; they do not change which memories would be picked. For token-sensitive preview, keep limit small. In preview-first flows, usually leave strategy at the default fail unless the user explicitly wants to preview skip or accept behavior.",
                         "properties": {
-                            "limit": {"type": "integer", "default": 10, "description": "Maximum number of preview candidates to return."},
+                            "limit": {"type": "integer", "default": 10, "description": "Maximum number of preview candidates to return. Use 1-3 when token-sensitive."},
                             "offset": {"type": "integer", "default": 0, "description": "Preview pagination offset."},
                             "include_content_preview": {"type": "boolean", "default": true, "description": "When true, include a short content_preview for each candidate. Embeddings are never returned."},
-                            "include_scores": {"type": "boolean", "default": true, "description": "When true, include retrieve scores when available. Non-retrieve selectors omit scores."}
+                            "include_scores": {"type": "boolean", "default": true, "description": "When true, include retrieve scores when available. Non-retrieve selectors omit scores. Set false when you only need a tiny preview."}
                         }
                     }
                 },
