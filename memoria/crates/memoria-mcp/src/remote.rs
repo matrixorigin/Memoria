@@ -568,6 +568,29 @@ impl RemoteClient {
                 Ok(Self::mcp_json(&body))
             }
 
+            "memory_pick" => {
+                let source = args["source"].as_str().unwrap_or("");
+                let target = args["target"].as_str().unwrap_or("main");
+                let strategy = args["strategy"].as_str().unwrap_or("fail");
+                let r = self
+                    .client
+                    .post(self.url(&format!("/v1/branches/{source}/pick")))
+                    .json(&json!({
+                        "target": target,
+                        "strategy": strategy,
+                        "selector": args["selector"],
+                        "dry_run": args.get("dry_run").cloned().unwrap_or(Value::Null),
+                    }))
+                    .send()
+                    .await?;
+                let body = Self::parse_response(r).await?;
+                if body["dry_run"].as_bool().unwrap_or(false) {
+                    Ok(Self::mcp_json(&body))
+                } else {
+                    Ok(Self::mcp_text(body["result"].as_str().unwrap_or("")))
+                }
+            }
+
             "memory_diff" => {
                 let source = args["source"].as_str().unwrap_or("");
                 let r = self

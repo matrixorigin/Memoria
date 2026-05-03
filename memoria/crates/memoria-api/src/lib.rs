@@ -84,14 +84,12 @@ async fn call_log_mw(
             // which is necessary because JSON-RPC errors return HTTP 200.
             if !is_dashboard && !path.starts_with("/v1/mcp") {
                 if let Some(reporter) = &state.stats_reporter {
-                    reporter.report(
-                        memoria_service::stats_reporter::StatsEvent::ApiCallLogged {
-                            user_id: uid.clone(),
-                            path: path.clone(),
-                            is_mcp: false,
-                            is_success: status_code < 400,
-                        },
-                    );
+                    reporter.report(memoria_service::stats_reporter::StatsEvent::ApiCallLogged {
+                        user_id: uid.clone(),
+                        path: path.clone(),
+                        is_mcp: false,
+                        is_success: status_code < 400,
+                    });
                 }
             }
             if let Some(mask) = should_mark_metrics_dirty(&method, &path, status_code) {
@@ -147,6 +145,7 @@ fn should_mark_metrics_dirty(
                 } else if path.starts_with("/v1/snapshots/") && path.ends_with("/rollback")
                     || path.starts_with("/v1/branches/") && path.ends_with("/checkout")
                     || path.starts_with("/v1/branches/") && path.ends_with("/merge")
+                    || path.starts_with("/v1/branches/") && path.ends_with("/pick")
                 {
                     Some(DirtyMask::FULL)
                 } else if path.starts_with("/v1/sessions/") && path.ends_with("/summary") {
@@ -282,6 +281,10 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/v1/branches/:name/diff",
             get(routes::snapshots::diff_branch),
+        )
+        .route(
+            "/v1/branches/:name/pick",
+            post(routes::snapshots::pick_branch),
         )
         .route(
             "/v1/branches/:name",

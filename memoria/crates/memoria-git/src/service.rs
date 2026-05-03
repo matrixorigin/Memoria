@@ -29,6 +29,31 @@ fn quote_identifier(name: &str) -> String {
     format!("`{}`", name.replace('`', "``"))
 }
 
+fn quote_sql_literal(value: &str) -> String {
+    value
+        .chars()
+        .filter(|c| *c != '\0')
+        .fold(String::with_capacity(value.len()), |mut out, c| {
+            match c {
+                '\'' => out.push_str("''"),
+                '\\' => out.push_str("\\\\"),
+                _ => out.push(c),
+            }
+            out
+        })
+}
+
+fn pick_conflict_clause(strategy: &str) -> Result<&'static str, MemoriaError> {
+    match strategy {
+        "fail" => Ok("FAIL"),
+        "skip" => Ok("SKIP"),
+        "accept" => Ok("ACCEPT"),
+        other => Err(MemoriaError::Validation(format!(
+            "Unsupported pick strategy '{other}'. Use fail, skip, or accept."
+        ))),
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Snapshot {
     pub snapshot_name: String,
@@ -222,6 +247,59 @@ impl GitForDataService {
             &self.pool,
             &format!(
                 "data branch merge {db}.{safe_branch} into {db}.{safe_main} when conflict skip"
+            ),
+        )
+        .await
+    }
+
+    pub async fn pick_branch_keys(
+        &self,
+        source_table: &str,
+        target_table: &str,
+        keys: &[String],
+        strategy: &str,
+    ) -> Result<(), MemoriaError> {
+        if keys.is_empty() {
+            return Err(MemoriaError::Validation(
+                "key_list selector requires at least one key".into(),
+            ));
+        }
+        let safe_source = validate_identifier(source_table)?;
+        let safe_target = validate_identifier(target_table)?;
+        let conflict = pick_conflict_clause(strategy)?;
+        let db = quote_identifier(&self.db_name);
+        let key_list = keys
+            .iter()
+            .map(|key| format!("'{}'", quote_sql_literal(key)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        exec_ddl(
+            &self.pool,
+            &format!(
+                "data branch pick {db}.{safe_source} into {db}.{safe_target} keys({key_list}) when conflict {conflict}"
+            ),
+        )
+        .await
+    }
+
+    pub async fn pick_branch_snapshot_range(
+        &self,
+        source_table: &str,
+        target_table: &str,
+        from_snapshot: &str,
+        to_snapshot: &str,
+        strategy: &str,
+    ) -> Result<(), MemoriaError> {
+        let safe_source = validate_identifier(source_table)?;
+        let safe_target = validate_identifier(target_table)?;
+        let safe_from = validate_identifier(from_snapshot)?;
+        let safe_to = validate_identifier(to_snapshot)?;
+        let conflict = pick_conflict_clause(strategy)?;
+        let db = quote_identifier(&self.db_name);
+        exec_ddl(
+            &self.pool,
+            &format!(
+                "data branch pick {db}.{safe_source} into {db}.{safe_target} between snapshot '{safe_from}' and '{safe_to}' when conflict {conflict}"
             ),
         )
         .await

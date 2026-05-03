@@ -20,6 +20,39 @@ fn uid() -> String {
     format!("api_test_{}", uuid::Uuid::new_v4().simple())
 }
 
+fn is_pick_not_supported_message(body: &str) -> bool {
+    let lower = body.to_lowercase();
+    lower.contains("sql parser error")
+        && (lower.contains("data branch pick")
+            || (lower.contains("near \" pick") && lower.contains("when conflict")))
+}
+
+async fn pick_response_json_or_skip(response: reqwest::Response, test_name: &str) -> Option<Value> {
+    let status = response.status();
+    let body = response.text().await.unwrap();
+    if is_pick_not_supported_message(&body) {
+        eprintln!("⚠️ DATA BRANCH PICK not supported, skipping {test_name}");
+        return None;
+    }
+    assert_eq!(status, 200, "body: {body}");
+    Some(serde_json::from_str(&body).expect("pick response json"))
+}
+
+fn remote_pick_or_skip(result: anyhow::Result<Value>, test_name: &str) -> Option<Value> {
+    match result {
+        Ok(value) => Some(value),
+        Err(err) if is_pick_not_supported_message(&err.to_string()) => {
+            eprintln!("⚠️ DATA BRANCH PICK not supported, skipping {test_name}");
+            None
+        }
+        Err(err) => panic!("{err:?}"),
+    }
+}
+
+fn mcp_text_json(v: &Value) -> Value {
+    serde_json::from_str(v["content"][0]["text"].as_str().unwrap_or("")).expect("mcp json text")
+}
+
 fn episodic_rules() -> Vec<memoria_test_utils::PromptRule> {
     vec![
         (
@@ -110,6 +143,28 @@ impl SessionScopeTestEmbedder {
 impl memoria_core::interfaces::EmbeddingProvider for SessionScopeTestEmbedder {
     async fn embed(&self, text: &str) -> Result<Vec<f32>, memoria_core::MemoriaError> {
         Ok(Self::vector_for(text))
+    }
+
+    fn dimension(&self) -> usize {
+        test_dim()
+    }
+}
+
+struct PickTestEmbedder;
+
+#[async_trait::async_trait]
+impl memoria_core::interfaces::EmbeddingProvider for PickTestEmbedder {
+    async fn embed(&self, text: &str) -> Result<Vec<f32>, memoria_core::MemoriaError> {
+        let mut v = vec![0.0; test_dim()];
+        match text {
+            "alpha query" | "alpha branch memory" => v[0] = 1.0,
+            "beta branch memory" => {
+                v[0] = 0.6;
+                v[1] = 0.4;
+            }
+            _ => v[2] = 1.0,
+        }
+        Ok(v)
     }
 
     fn dimension(&self) -> usize {
@@ -1788,6 +1843,13 @@ async fn test_api_memory_history_not_found() {
 async fn spawn_api_for_remote() -> (String, reqwest::Client, support::multi_db::ApiTestServer) {
     // Reuse spawn_server but return the base URL for RemoteClient
     spawn_server().await
+}
+
+async fn spawn_api_for_remote_with_embedder(
+    embedder: Arc<dyn memoria_core::interfaces::EmbeddingProvider>,
+    dim: usize,
+) -> (String, reqwest::Client, support::multi_db::ApiTestServer) {
+    spawn_server_with_custom_embedder_and_pool(embedder, dim).await
 }
 
 #[tokio::test]
@@ -6174,6 +6236,1387 @@ async fn test_api_branch_list_returns_structured_json() {
         .send()
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn test_api_branch_pick_key_list_returns_result() {
+    let (base, client, server) = spawn_server().await;
+    let uid = uid();
+    let branch = format!(
+        "api_pick_{}",
+        &uuid::Uuid::new_v4().simple().to_string()[..6]
+    );
+
+    let r = client
+        .post(format!("{base}/v1/memories"))
+        .header("X-User-Id", &uid)
+        .json(&json!({"content": "main seed"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 201);
+
+    let r = client
+        .post(format!("{base}/v1/branches"))
+        .header("X-User-Id", &uid)
+        .json(&json!({ "name": branch }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 201);
+
+    let r = client
+        .post(format!("{base}/v1/branches/{branch}/checkout"))
+        .header("X-User-Id", &uid)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+
+    let alpha: Value = client
+        .post(format!("{base}/v1/memories"))
+        .header("X-User-Id", &uid)
+        .json(&json!({"content": "api branch alpha"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    client
+        .post(format!("{base}/v1/memories"))
+        .header("X-User-Id", &uid)
+        .json(&json!({"content": "api branch beta"}))
+        .send()
+        .await
+        .unwrap();
+
+    let r = client
+        .post(format!("{base}/v1/branches/main/checkout"))
+        .header("X-User-Id", &uid)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+
+    let r = client
+        .post(format!("{base}/v1/branches/{branch}/pick"))
+        .header("X-User-Id", &uid)
+        .json(&json!({
+            "selector": {"type": "key_list", "keys": [alpha["memory_id"].as_str().unwrap()]},
+        }))
+        .send()
+        .await
+        .unwrap();
+    let Some(body) =
+        pick_response_json_or_skip(r, "test_api_branch_pick_key_list_returns_result").await
+    else {
+        return;
+    };
+    assert!(
+        body["result"]
+            .as_str()
+            .unwrap_or("")
+            .contains("Picked 1 change"),
+        "pick result: {body}"
+    );
+
+    let active = server.service().list_active(&uid, 10).await.unwrap();
+    assert!(active
+        .iter()
+        .any(|memory| memory.content == "api branch alpha"));
+    assert!(!active
+        .iter()
+        .any(|memory| memory.content == "api branch beta"));
+}
+
+#[tokio::test]
+async fn test_api_branch_pick_key_list_dry_run_returns_preview() {
+    let (base, client, server) = spawn_server().await;
+    let uid = uid();
+    let branch = format!(
+        "api_pick_preview_{}",
+        &uuid::Uuid::new_v4().simple().to_string()[..6]
+    );
+
+    client
+        .post(format!("{base}/v1/memories"))
+        .header("X-User-Id", &uid)
+        .json(&json!({"content": "main seed"}))
+        .send()
+        .await
+        .unwrap();
+    client
+        .post(format!("{base}/v1/branches"))
+        .header("X-User-Id", &uid)
+        .json(&json!({ "name": branch }))
+        .send()
+        .await
+        .unwrap();
+    client
+        .post(format!("{base}/v1/branches/{branch}/checkout"))
+        .header("X-User-Id", &uid)
+        .send()
+        .await
+        .unwrap();
+
+    let alpha: Value = client
+        .post(format!("{base}/v1/memories"))
+        .header("X-User-Id", &uid)
+        .json(&json!({"content": "api branch alpha"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    client
+        .post(format!("{base}/v1/branches/main/checkout"))
+        .header("X-User-Id", &uid)
+        .send()
+        .await
+        .unwrap();
+
+    let r = client
+        .post(format!("{base}/v1/branches/{branch}/pick"))
+        .header("X-User-Id", &uid)
+        .json(&json!({
+            "selector": {"type": "key_list", "keys": [alpha["memory_id"].as_str().unwrap()]},
+            "dry_run": {
+                "limit": 1,
+                "include_content_preview": true,
+                "include_scores": true
+            }
+        }))
+        .send()
+        .await
+        .unwrap();
+    let Some(body) =
+        pick_response_json_or_skip(r, "test_api_branch_pick_key_list_dry_run_returns_preview")
+            .await
+    else {
+        return;
+    };
+    assert_eq!(body["dry_run"].as_bool(), Some(true), "{body}");
+    assert_eq!(
+        body["summary"]["candidate_count"].as_u64(),
+        Some(1),
+        "{body}"
+    );
+    let candidate = &body["candidates"][0];
+    assert_eq!(
+        candidate["content_preview"].as_str(),
+        Some("api branch alpha"),
+        "{body}"
+    );
+    assert!(candidate.get("score").is_none(), "{body}");
+    assert!(candidate.get("embedding").is_none(), "{body}");
+
+    let active = server.service().list_active(&uid, 10).await.unwrap();
+    assert!(!active
+        .iter()
+        .any(|memory| memory.content == "api branch alpha"));
+}
+
+#[tokio::test]
+async fn test_api_branch_pick_retrieve_validation_error() {
+    let (base, client, _server) = spawn_server().await;
+    let uid = uid();
+    let branch = format!(
+        "api_pick_bad_{}",
+        &uuid::Uuid::new_v4().simple().to_string()[..6]
+    );
+
+    client
+        .post(format!("{base}/v1/branches"))
+        .header("X-User-Id", &uid)
+        .json(&json!({ "name": branch }))
+        .send()
+        .await
+        .unwrap();
+
+    let r = client
+        .post(format!("{base}/v1/branches/{branch}/pick"))
+        .header("X-User-Id", &uid)
+        .json(&json!({
+            "selector": {"type": "retrieve", "query": "anything", "top_k": 0},
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 422);
+    let body = r.text().await.unwrap();
+    assert!(body.contains("top_k"), "body: {body}");
+}
+
+#[tokio::test]
+async fn test_api_branch_pick_retrieve_min_score_validation_error() {
+    let (base, client, _server) = spawn_server().await;
+    let uid = uid();
+    let branch = format!(
+        "api_pick_min_score_{}",
+        &uuid::Uuid::new_v4().simple().to_string()[..6]
+    );
+
+    client
+        .post(format!("{base}/v1/branches"))
+        .header("X-User-Id", &uid)
+        .json(&json!({ "name": branch }))
+        .send()
+        .await
+        .unwrap();
+
+    let r = client
+        .post(format!("{base}/v1/branches/{branch}/pick"))
+        .header("X-User-Id", &uid)
+        .json(&json!({
+            "selector": {"type": "retrieve", "query": "anything", "top_k": 1, "min_score": -1},
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 422);
+    let body = r.text().await.unwrap();
+    assert!(body.contains("min_score"), "body: {body}");
+}
+
+#[tokio::test]
+async fn test_api_branch_pick_dry_run_limit_validation_error() {
+    let (base, client, _server) = spawn_server().await;
+    let uid = uid();
+    let branch = format!(
+        "api_pick_limit_{}",
+        &uuid::Uuid::new_v4().simple().to_string()[..6]
+    );
+
+    client
+        .post(format!("{base}/v1/branches"))
+        .header("X-User-Id", &uid)
+        .json(&json!({ "name": branch }))
+        .send()
+        .await
+        .unwrap();
+
+    let r = client
+        .post(format!("{base}/v1/branches/{branch}/pick"))
+        .header("X-User-Id", &uid)
+        .json(&json!({
+            "selector": {"type": "key_list", "keys": ["abc"]},
+            "dry_run": {"limit": 0}
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 422);
+    let body = r.text().await.unwrap();
+    assert!(body.contains("dry_run.limit"), "body: {body}");
+}
+
+#[tokio::test]
+async fn test_api_branch_pick_conflict_returns_409() {
+    let (base, client, server) = spawn_server().await;
+    let uid = uid();
+    let branch = format!(
+        "api_pick_conflict_{}",
+        &uuid::Uuid::new_v4().simple().to_string()[..6]
+    );
+
+    let original: Value = client
+        .post(format!("{base}/v1/memories"))
+        .header("X-User-Id", &uid)
+        .json(&json!({"content": "api shared conflict"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    client
+        .post(format!("{base}/v1/branches"))
+        .header("X-User-Id", &uid)
+        .json(&json!({ "name": branch }))
+        .send()
+        .await
+        .unwrap();
+
+    let branch_table = server
+        .user_store(&uid)
+        .await
+        .list_branches(&uid)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|(name, _)| name == &branch)
+        .map(|(_, table)| table)
+        .expect("branch table");
+    let pool = server.user_db_pool(&uid).await;
+
+    sqlx::query(&format!(
+        "UPDATE {branch_table} SET content = ? WHERE memory_id = ?"
+    ))
+    .bind("api branch conflict")
+    .bind(original["memory_id"].as_str().unwrap())
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE mem_memories SET content = ? WHERE memory_id = ?")
+        .bind("api main conflict")
+        .bind(original["memory_id"].as_str().unwrap())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let r = client
+        .post(format!("{base}/v1/branches/{branch}/pick"))
+        .header("X-User-Id", &uid)
+        .json(&json!({
+            "strategy": "fail",
+            "selector": {
+                "type": "key_list",
+                "keys": [original["memory_id"].as_str().unwrap()]
+            },
+        }))
+        .send()
+        .await
+        .unwrap();
+    let status = r.status();
+    let body = r.text().await.unwrap();
+    if is_pick_not_supported_message(&body) {
+        eprintln!("⚠️ DATA BRANCH PICK not supported, skipping test_api_branch_pick_fail_conflict_returns_409");
+        return;
+    }
+    assert_eq!(status, 409, "body: {body}");
+    assert!(body.contains("Conflict:"), "body: {body}");
+}
+
+#[tokio::test]
+async fn test_api_branch_pick_snapshot_range_returns_result() {
+    let (base, client, server) = spawn_server().await;
+    let uid = uid();
+    let branch = format!(
+        "api_pick_snap_{}",
+        &uuid::Uuid::new_v4().simple().to_string()[..6]
+    );
+    let snap_before = format!(
+        "pick_before_{}",
+        &uuid::Uuid::new_v4().simple().to_string()[..6]
+    );
+    let snap_after = format!(
+        "pick_after_{}",
+        &uuid::Uuid::new_v4().simple().to_string()[..6]
+    );
+
+    let r = client
+        .post(format!("{base}/v1/memories"))
+        .header("X-User-Id", &uid)
+        .json(&json!({"content": "main seed"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 201);
+
+    let r = client
+        .post(format!("{base}/v1/branches"))
+        .header("X-User-Id", &uid)
+        .json(&json!({ "name": branch }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 201);
+
+    let r = client
+        .post(format!("{base}/v1/branches/{branch}/checkout"))
+        .header("X-User-Id", &uid)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+
+    let r = client
+        .post(format!("{base}/v1/snapshots"))
+        .header("X-User-Id", &uid)
+        .json(&json!({"name": snap_before}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 201);
+
+    let r = client
+        .post(format!("{base}/v1/memories"))
+        .header("X-User-Id", &uid)
+        .json(&json!({"content": "snapshot-ranged memory"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 201);
+
+    let r = client
+        .post(format!("{base}/v1/snapshots"))
+        .header("X-User-Id", &uid)
+        .json(&json!({"name": snap_after}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 201);
+
+    let r = client
+        .post(format!("{base}/v1/branches/main/checkout"))
+        .header("X-User-Id", &uid)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+
+    let r = client
+        .post(format!("{base}/v1/branches/{branch}/pick"))
+        .header("X-User-Id", &uid)
+        .json(&json!({
+            "selector": {
+                "type": "snapshot_range",
+                "from_snapshot": snap_before,
+                "to_snapshot": snap_after
+            },
+        }))
+        .send()
+        .await
+        .unwrap();
+    let Some(body) =
+        pick_response_json_or_skip(r, "test_api_branch_pick_snapshot_range_returns_result").await
+    else {
+        return;
+    };
+    assert!(
+        body["result"]
+            .as_str()
+            .unwrap_or("")
+            .contains("snapshot range"),
+        "pick result: {body}"
+    );
+
+    let active = server.service().list_active(&uid, 10).await.unwrap();
+    assert!(active
+        .iter()
+        .any(|memory| memory.content == "snapshot-ranged memory"));
+}
+
+#[tokio::test]
+async fn test_api_branch_pick_retrieve_returns_ranked_result() {
+    let (base, client, server) =
+        spawn_server_with_custom_embedder_and_pool(Arc::new(PickTestEmbedder), test_dim()).await;
+    let uid = uid();
+    let branch = format!(
+        "api_pick_retrieve_{}",
+        &uuid::Uuid::new_v4().simple().to_string()[..6]
+    );
+
+    let r = client
+        .post(format!("{base}/v1/memories"))
+        .header("X-User-Id", &uid)
+        .json(&json!({"content": "main seed"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 201);
+
+    let r = client
+        .post(format!("{base}/v1/branches"))
+        .header("X-User-Id", &uid)
+        .json(&json!({ "name": branch }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 201);
+
+    let r = client
+        .post(format!("{base}/v1/branches/{branch}/checkout"))
+        .header("X-User-Id", &uid)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+
+    client
+        .post(format!("{base}/v1/memories"))
+        .header("X-User-Id", &uid)
+        .json(&json!({"content": "alpha branch memory"}))
+        .send()
+        .await
+        .unwrap();
+    client
+        .post(format!("{base}/v1/memories"))
+        .header("X-User-Id", &uid)
+        .json(&json!({"content": "beta branch memory"}))
+        .send()
+        .await
+        .unwrap();
+
+    let r = client
+        .post(format!("{base}/v1/branches/main/checkout"))
+        .header("X-User-Id", &uid)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+
+    let r = client
+        .post(format!("{base}/v1/branches/{branch}/pick"))
+        .header("X-User-Id", &uid)
+        .json(&json!({
+            "selector": {"type": "retrieve", "query": "alpha query", "top_k": 1},
+        }))
+        .send()
+        .await
+        .unwrap();
+    let Some(body) =
+        pick_response_json_or_skip(r, "test_api_branch_pick_retrieve_returns_ranked_result").await
+    else {
+        return;
+    };
+    assert!(
+        body["result"].as_str().unwrap_or("").contains("top 1"),
+        "pick result: {body}"
+    );
+
+    let active = server.service().list_active(&uid, 10).await.unwrap();
+    assert!(active
+        .iter()
+        .any(|memory| memory.content == "alpha branch memory"));
+    assert!(!active
+        .iter()
+        .any(|memory| memory.content == "beta branch memory"));
+}
+
+#[tokio::test]
+async fn test_api_branch_pick_retrieve_dry_run_limits_preview() {
+    let (base, client, server) =
+        spawn_server_with_custom_embedder_and_pool(Arc::new(PickTestEmbedder), test_dim()).await;
+    let uid = uid();
+    let branch = format!(
+        "api_pick_preview_{}",
+        &uuid::Uuid::new_v4().simple().to_string()[..6]
+    );
+
+    client
+        .post(format!("{base}/v1/memories"))
+        .header("X-User-Id", &uid)
+        .json(&json!({"content": "main seed"}))
+        .send()
+        .await
+        .unwrap();
+    client
+        .post(format!("{base}/v1/branches"))
+        .header("X-User-Id", &uid)
+        .json(&json!({ "name": branch }))
+        .send()
+        .await
+        .unwrap();
+    client
+        .post(format!("{base}/v1/branches/{branch}/checkout"))
+        .header("X-User-Id", &uid)
+        .send()
+        .await
+        .unwrap();
+    client
+        .post(format!("{base}/v1/memories"))
+        .header("X-User-Id", &uid)
+        .json(&json!({"content": "alpha branch memory"}))
+        .send()
+        .await
+        .unwrap();
+    client
+        .post(format!("{base}/v1/memories"))
+        .header("X-User-Id", &uid)
+        .json(&json!({"content": "beta branch memory"}))
+        .send()
+        .await
+        .unwrap();
+    client
+        .post(format!("{base}/v1/branches/main/checkout"))
+        .header("X-User-Id", &uid)
+        .send()
+        .await
+        .unwrap();
+
+    let r = client
+        .post(format!("{base}/v1/branches/{branch}/pick"))
+        .header("X-User-Id", &uid)
+        .json(&json!({
+            "selector": {"type": "retrieve", "query": "alpha query", "top_k": 2},
+            "dry_run": {
+                "limit": 1,
+                "offset": 0,
+                "include_content_preview": true,
+                "include_scores": false
+            }
+        }))
+        .send()
+        .await
+        .unwrap();
+    let Some(body) =
+        pick_response_json_or_skip(r, "test_api_branch_pick_retrieve_dry_run_limits_preview").await
+    else {
+        return;
+    };
+    assert_eq!(
+        body["dry_run"].as_bool(),
+        Some(true),
+        "preview body: {body}"
+    );
+    assert_eq!(
+        body["summary"]["candidate_count"].as_u64(),
+        Some(2),
+        "{body}"
+    );
+    assert_eq!(body["summary"]["shown_count"].as_u64(), Some(1), "{body}");
+    assert_eq!(body["page"]["has_more"].as_bool(), Some(true), "{body}");
+    let candidate = &body["candidates"][0];
+    assert!(candidate.get("content_preview").is_some(), "{body}");
+    assert!(candidate.get("score").is_none(), "{body}");
+    assert!(candidate.get("embedding").is_none(), "{body}");
+
+    let active = server.service().list_active(&uid, 10).await.unwrap();
+    assert!(!active
+        .iter()
+        .any(|memory| memory.content == "alpha branch memory"));
+    assert!(!active
+        .iter()
+        .any(|memory| memory.content == "beta branch memory"));
+}
+
+#[tokio::test]
+async fn test_api_branch_pick_key_list_into_target_branch_returns_result() {
+    let (base, client, server) = spawn_server().await;
+    let uid = uid();
+    let source = format!(
+        "api_pick_src_{}",
+        &uuid::Uuid::new_v4().simple().to_string()[..6]
+    );
+    let target = format!(
+        "api_pick_tgt_{}",
+        &uuid::Uuid::new_v4().simple().to_string()[..6]
+    );
+
+    client
+        .post(format!("{base}/v1/memories"))
+        .header("X-User-Id", &uid)
+        .json(&json!({"content": "main seed"}))
+        .send()
+        .await
+        .unwrap();
+
+    let r = client
+        .post(format!("{base}/v1/branches"))
+        .header("X-User-Id", &uid)
+        .json(&json!({ "name": source }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 201);
+
+    let r = client
+        .post(format!("{base}/v1/branches"))
+        .header("X-User-Id", &uid)
+        .json(&json!({ "name": target }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 201);
+
+    let r = client
+        .post(format!("{base}/v1/branches/{source}/checkout"))
+        .header("X-User-Id", &uid)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+
+    let source_memory: Value = client
+        .post(format!("{base}/v1/memories"))
+        .header("X-User-Id", &uid)
+        .json(&json!({"content": "source-only memory"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let r = client
+        .post(format!("{base}/v1/branches/main/checkout"))
+        .header("X-User-Id", &uid)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+
+    let r = client
+        .post(format!("{base}/v1/branches/{source}/pick"))
+        .header("X-User-Id", &uid)
+        .json(&json!({
+            "target": target,
+            "selector": {
+                "type": "key_list",
+                "keys": [source_memory["memory_id"].as_str().unwrap()]
+            },
+        }))
+        .send()
+        .await
+        .unwrap();
+    let Some(body) = pick_response_json_or_skip(
+        r,
+        "test_api_branch_pick_key_list_into_target_branch_returns_result",
+    )
+    .await
+    else {
+        return;
+    };
+    assert!(
+        body["result"]
+            .as_str()
+            .unwrap_or("")
+            .contains("Picked 1 change"),
+        "pick result: {body}"
+    );
+
+    let r = client
+        .post(format!("{base}/v1/branches/{target}/checkout"))
+        .header("X-User-Id", &uid)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+
+    let target_active = server.service().list_active(&uid, 10).await.unwrap();
+    assert!(target_active
+        .iter()
+        .any(|memory| memory.content == "source-only memory"));
+}
+
+#[tokio::test]
+async fn test_api_branch_pick_accept_replaces_conflict() {
+    let (base, client, server) = spawn_server().await;
+    let uid = uid();
+    let branch = format!(
+        "api_pick_accept_{}",
+        &uuid::Uuid::new_v4().simple().to_string()[..6]
+    );
+
+    let original: Value = client
+        .post(format!("{base}/v1/memories"))
+        .header("X-User-Id", &uid)
+        .json(&json!({"content": "api shared accept"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    client
+        .post(format!("{base}/v1/branches"))
+        .header("X-User-Id", &uid)
+        .json(&json!({ "name": branch }))
+        .send()
+        .await
+        .unwrap();
+
+    let branch_table = server
+        .user_store(&uid)
+        .await
+        .list_branches(&uid)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|(name, _)| name == &branch)
+        .map(|(_, table)| table)
+        .expect("branch table");
+    let pool = server.user_db_pool(&uid).await;
+
+    sqlx::query(&format!(
+        "UPDATE {branch_table} SET content = ? WHERE memory_id = ?"
+    ))
+    .bind("api branch accepted")
+    .bind(original["memory_id"].as_str().unwrap())
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE mem_memories SET content = ? WHERE memory_id = ?")
+        .bind("api main stale")
+        .bind(original["memory_id"].as_str().unwrap())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let r = client
+        .post(format!("{base}/v1/branches/{branch}/pick"))
+        .header("X-User-Id", &uid)
+        .json(&json!({
+            "strategy": "accept",
+            "selector": {
+                "type": "key_list",
+                "keys": [original["memory_id"].as_str().unwrap()]
+            },
+        }))
+        .send()
+        .await
+        .unwrap();
+    let Some(body) =
+        pick_response_json_or_skip(r, "test_api_branch_pick_accept_replaces_conflict").await
+    else {
+        return;
+    };
+    assert!(
+        body["result"]
+            .as_str()
+            .unwrap_or("")
+            .contains("Picked 1 change"),
+        "pick result: {body}"
+    );
+
+    let row = sqlx::query("SELECT content FROM mem_memories WHERE memory_id = ?")
+        .bind(original["memory_id"].as_str().unwrap())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        sqlx::Row::try_get::<String, _>(&row, "content").unwrap(),
+        "api branch accepted"
+    );
+}
+
+#[tokio::test]
+async fn test_remote_pick_key_list() {
+    use memoria_mcp::remote::RemoteClient;
+    let (base, _, server) = spawn_api_for_remote().await;
+    let uid = uid();
+    let remote = RemoteClient::new(&base, None, uid.clone(), None);
+    let branch = format!(
+        "remote_pick_{}",
+        &uuid::Uuid::new_v4().simple().to_string()[..6]
+    );
+
+    remote
+        .call("memory_store", json!({"content": "remote main seed"}))
+        .await
+        .unwrap();
+    remote
+        .call("memory_branch", json!({"name": branch}))
+        .await
+        .unwrap();
+    remote
+        .call("memory_checkout", json!({"name": branch}))
+        .await
+        .unwrap();
+    remote
+        .call("memory_store", json!({"content": "remote branch memory"}))
+        .await
+        .unwrap();
+
+    let branch_memory_id = server
+        .service()
+        .list_active(&uid, 10)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|memory| memory.content == "remote branch memory")
+        .expect("branch memory")
+        .memory_id;
+
+    remote
+        .call("memory_checkout", json!({"name": "main"}))
+        .await
+        .unwrap();
+    let Some(r) = remote_pick_or_skip(
+        remote
+            .call(
+                "memory_pick",
+                json!({
+                    "source": branch,
+                    "selector": {"type": "key_list", "keys": [branch_memory_id]},
+                }),
+            )
+            .await,
+        "test_remote_pick_key_list",
+    ) else {
+        return;
+    };
+    let t = r["content"][0]["text"].as_str().unwrap_or("");
+    assert!(t.contains("Picked 1 change"), "remote pick: {t}");
+}
+
+#[tokio::test]
+async fn test_remote_pick_key_list_into_target_branch() {
+    use memoria_mcp::remote::RemoteClient;
+    let (base, _, server) = spawn_api_for_remote().await;
+    let uid = uid();
+    let source = format!(
+        "remote_pick_src_{}",
+        &uuid::Uuid::new_v4().simple().to_string()[..6]
+    );
+    let target = format!(
+        "remote_pick_tgt_{}",
+        &uuid::Uuid::new_v4().simple().to_string()[..6]
+    );
+    let remote = RemoteClient::new(&base, None, uid.clone(), None);
+
+    remote
+        .call("memory_store", json!({"content": "remote main seed"}))
+        .await
+        .unwrap();
+    remote
+        .call("memory_branch", json!({"name": source}))
+        .await
+        .unwrap();
+    remote
+        .call("memory_branch", json!({"name": target}))
+        .await
+        .unwrap();
+    remote
+        .call("memory_checkout", json!({"name": source}))
+        .await
+        .unwrap();
+    remote
+        .call(
+            "memory_store",
+            json!({"content": "remote target branch memory"}),
+        )
+        .await
+        .unwrap();
+
+    let branch_memory_id = server
+        .service()
+        .list_active(&uid, 10)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|memory| memory.content == "remote target branch memory")
+        .expect("branch memory")
+        .memory_id;
+
+    remote
+        .call("memory_checkout", json!({"name": "main"}))
+        .await
+        .unwrap();
+    let Some(r) = remote_pick_or_skip(
+        remote
+            .call(
+                "memory_pick",
+                json!({
+                    "source": source,
+                    "target": target,
+                    "selector": {"type": "key_list", "keys": [branch_memory_id]},
+                }),
+            )
+            .await,
+        "test_remote_pick_key_list_into_target_branch",
+    ) else {
+        return;
+    };
+    let t = r["content"][0]["text"].as_str().unwrap_or("");
+    assert!(t.contains("into"), "remote pick: {t}");
+
+    remote
+        .call("memory_checkout", json!({"name": target}))
+        .await
+        .unwrap();
+    let target_active = server.service().list_active(&uid, 10).await.unwrap();
+    assert!(target_active
+        .iter()
+        .any(|memory| memory.content == "remote target branch memory"));
+}
+
+#[tokio::test]
+async fn test_remote_pick_snapshot_range() {
+    use memoria_mcp::remote::RemoteClient;
+    let (base, _, server) = spawn_api_for_remote().await;
+    let uid = uid();
+    let remote = RemoteClient::new(&base, None, uid.clone(), None);
+    let branch = format!(
+        "remote_pick_snap_{}",
+        &uuid::Uuid::new_v4().simple().to_string()[..6]
+    );
+    let snap_before = format!(
+        "remote_pick_before_{}",
+        &uuid::Uuid::new_v4().simple().to_string()[..6]
+    );
+    let snap_after = format!(
+        "remote_pick_after_{}",
+        &uuid::Uuid::new_v4().simple().to_string()[..6]
+    );
+
+    remote
+        .call("memory_store", json!({"content": "remote main seed"}))
+        .await
+        .unwrap();
+    remote
+        .call("memory_branch", json!({"name": branch}))
+        .await
+        .unwrap();
+    remote
+        .call("memory_checkout", json!({"name": branch}))
+        .await
+        .unwrap();
+    remote
+        .call("memory_snapshot", json!({"name": snap_before}))
+        .await
+        .unwrap();
+    remote
+        .call(
+            "memory_store",
+            json!({"content": "remote snapshot-ranged memory"}),
+        )
+        .await
+        .unwrap();
+    remote
+        .call("memory_snapshot", json!({"name": snap_after}))
+        .await
+        .unwrap();
+    remote
+        .call("memory_checkout", json!({"name": "main"}))
+        .await
+        .unwrap();
+
+    let Some(r) = remote_pick_or_skip(
+        remote
+            .call(
+                "memory_pick",
+                json!({
+                    "source": branch,
+                    "selector": {
+                        "type": "snapshot_range",
+                        "from_snapshot": snap_before,
+                        "to_snapshot": snap_after
+                    }
+                }),
+            )
+            .await,
+        "test_remote_pick_snapshot_range",
+    ) else {
+        return;
+    };
+    let t = r["content"][0]["text"].as_str().unwrap_or("");
+    assert!(t.contains("snapshot range"), "remote pick: {t}");
+
+    let active = server.service().list_active(&uid, 10).await.unwrap();
+    assert!(active
+        .iter()
+        .any(|memory| memory.content == "remote snapshot-ranged memory"));
+}
+
+#[tokio::test]
+async fn test_remote_pick_accept_replaces_conflict() {
+    use memoria_mcp::remote::RemoteClient;
+    let (base, _, server) = spawn_api_for_remote().await;
+    let uid = uid();
+    let remote = RemoteClient::new(&base, None, uid.clone(), None);
+    let branch = format!(
+        "remote_pick_accept_{}",
+        &uuid::Uuid::new_v4().simple().to_string()[..6]
+    );
+
+    remote
+        .call("memory_store", json!({"content": "remote shared accept"}))
+        .await
+        .unwrap();
+    let original_id = server
+        .service()
+        .list_active(&uid, 10)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|memory| memory.content == "remote shared accept")
+        .expect("original memory")
+        .memory_id;
+
+    remote
+        .call("memory_branch", json!({"name": branch}))
+        .await
+        .unwrap();
+    let branch_table = server
+        .user_store(&uid)
+        .await
+        .list_branches(&uid)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|(name, _)| name == &branch)
+        .map(|(_, table)| table)
+        .expect("branch table");
+    let pool = server.user_db_pool(&uid).await;
+
+    sqlx::query(&format!(
+        "UPDATE {branch_table} SET content = ? WHERE memory_id = ?"
+    ))
+    .bind("remote branch accepted")
+    .bind(&original_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE mem_memories SET content = ? WHERE memory_id = ?")
+        .bind("remote main stale")
+        .bind(&original_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let Some(r) = remote_pick_or_skip(
+        remote
+            .call(
+                "memory_pick",
+                json!({
+                    "source": branch,
+                    "strategy": "accept",
+                    "selector": {"type": "key_list", "keys": [original_id]},
+                }),
+            )
+            .await,
+        "test_remote_pick_accept_replaces_conflict",
+    ) else {
+        return;
+    };
+    let t = r["content"][0]["text"].as_str().unwrap_or("");
+    assert!(t.contains("Picked 1 change"), "remote pick: {t}");
+
+    let row = sqlx::query("SELECT content FROM mem_memories WHERE memory_id = ?")
+        .bind(&original_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        sqlx::Row::try_get::<String, _>(&row, "content").unwrap(),
+        "remote branch accepted"
+    );
+}
+
+#[tokio::test]
+async fn test_remote_pick_retrieve_applies_ranked_result() {
+    use memoria_mcp::remote::RemoteClient;
+    let (base, _, server) =
+        spawn_api_for_remote_with_embedder(Arc::new(PickTestEmbedder), test_dim()).await;
+    let uid = uid();
+    let remote = RemoteClient::new(&base, None, uid.clone(), None);
+    let branch = format!(
+        "remote_pick_retrieve_{}",
+        &uuid::Uuid::new_v4().simple().to_string()[..6]
+    );
+
+    remote
+        .call("memory_store", json!({"content": "remote main seed"}))
+        .await
+        .unwrap();
+    remote
+        .call("memory_branch", json!({"name": branch}))
+        .await
+        .unwrap();
+    remote
+        .call("memory_checkout", json!({"name": branch}))
+        .await
+        .unwrap();
+    remote
+        .call("memory_store", json!({"content": "alpha branch memory"}))
+        .await
+        .unwrap();
+    remote
+        .call("memory_store", json!({"content": "beta branch memory"}))
+        .await
+        .unwrap();
+    remote
+        .call("memory_checkout", json!({"name": "main"}))
+        .await
+        .unwrap();
+
+    let Some(r) = remote_pick_or_skip(
+        remote
+            .call(
+                "memory_pick",
+                json!({
+                    "source": branch,
+                    "selector": {"type": "retrieve", "query": "alpha query", "top_k": 1},
+                }),
+            )
+            .await,
+        "test_remote_pick_retrieve_applies_ranked_result",
+    ) else {
+        return;
+    };
+    let t = r["content"][0]["text"].as_str().unwrap_or("");
+    assert!(t.contains("top 1"), "remote pick: {t}");
+
+    let active = server.service().list_active(&uid, 10).await.unwrap();
+    assert!(active
+        .iter()
+        .any(|memory| memory.content == "alpha branch memory"));
+    assert!(!active
+        .iter()
+        .any(|memory| memory.content == "beta branch memory"));
+}
+
+#[tokio::test]
+async fn test_remote_pick_fail_conflict_returns_error() {
+    use memoria_mcp::remote::RemoteClient;
+    let (base, _, server) = spawn_api_for_remote().await;
+    let uid = uid();
+    let remote = RemoteClient::new(&base, None, uid.clone(), None);
+    let branch = format!(
+        "remote_pick_conflict_{}",
+        &uuid::Uuid::new_v4().simple().to_string()[..6]
+    );
+
+    remote
+        .call("memory_store", json!({"content": "remote shared conflict"}))
+        .await
+        .unwrap();
+    let original_id = server
+        .service()
+        .list_active(&uid, 10)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|memory| memory.content == "remote shared conflict")
+        .expect("original memory")
+        .memory_id;
+
+    remote
+        .call("memory_branch", json!({"name": branch}))
+        .await
+        .unwrap();
+    let branch_table = server
+        .user_store(&uid)
+        .await
+        .list_branches(&uid)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|(name, _)| name == &branch)
+        .map(|(_, table)| table)
+        .expect("branch table");
+    let pool = server.user_db_pool(&uid).await;
+
+    sqlx::query(&format!(
+        "UPDATE {branch_table} SET content = ? WHERE memory_id = ?"
+    ))
+    .bind("remote branch conflict")
+    .bind(&original_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE mem_memories SET content = ? WHERE memory_id = ?")
+        .bind("remote main conflict")
+        .bind(&original_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let err = match remote
+        .call(
+            "memory_pick",
+            json!({
+                "source": branch,
+                "strategy": "fail",
+                "selector": {"type": "key_list", "keys": [original_id]},
+            }),
+        )
+        .await
+    {
+        Ok(value) => panic!("fail conflict should return error: {value:?}"),
+        Err(err) if is_pick_not_supported_message(&err.to_string()) => {
+            eprintln!(
+                "⚠️ DATA BRANCH PICK not supported, skipping test_remote_pick_fail_conflict_returns_error"
+            );
+            return;
+        }
+        Err(err) => err,
+    };
+    assert!(err.to_string().contains("Conflict:"), "{err:?}");
+}
+
+#[tokio::test]
+async fn test_remote_pick_retrieve_dry_run_returns_preview_json() {
+    use memoria_mcp::remote::RemoteClient;
+    let (base, _, server) =
+        spawn_api_for_remote_with_embedder(Arc::new(PickTestEmbedder), test_dim()).await;
+    let uid = uid();
+    let remote = RemoteClient::new(&base, None, uid.clone(), None);
+    let branch = format!(
+        "remote_pick_preview_{}",
+        &uuid::Uuid::new_v4().simple().to_string()[..6]
+    );
+
+    remote
+        .call("memory_store", json!({"content": "remote main seed"}))
+        .await
+        .unwrap();
+    remote
+        .call("memory_branch", json!({"name": branch}))
+        .await
+        .unwrap();
+    remote
+        .call("memory_checkout", json!({"name": branch}))
+        .await
+        .unwrap();
+    remote
+        .call("memory_store", json!({"content": "alpha branch memory"}))
+        .await
+        .unwrap();
+    remote
+        .call("memory_store", json!({"content": "beta branch memory"}))
+        .await
+        .unwrap();
+    remote
+        .call("memory_checkout", json!({"name": "main"}))
+        .await
+        .unwrap();
+
+    let Some(r) = remote_pick_or_skip(
+        remote
+            .call(
+                "memory_pick",
+                json!({
+                    "source": branch,
+                    "selector": {
+                        "type": "retrieve",
+                        "query": "alpha query",
+                        "top_k": 2,
+                        "min_score": 0.6
+                    },
+                    "dry_run": {
+                        "limit": 1,
+                        "include_content_preview": true,
+                        "include_scores": true
+                    }
+                }),
+            )
+            .await,
+        "test_remote_pick_retrieve_dry_run_returns_preview_json",
+    ) else {
+        return;
+    };
+    let body = mcp_text_json(&r);
+    assert_eq!(
+        body["dry_run"].as_bool(),
+        Some(true),
+        "remote preview: {body}"
+    );
+    assert_eq!(
+        body["summary"]["candidate_count"].as_u64(),
+        Some(1),
+        "{body}"
+    );
+    let candidate = &body["candidates"][0];
+    assert_eq!(
+        candidate["content_preview"].as_str(),
+        Some("alpha branch memory"),
+        "{body}"
+    );
+    assert!(candidate.get("score").is_some(), "{body}");
+    assert!(candidate.get("embedding").is_none(), "{body}");
+
+    let active = server.service().list_active(&uid, 10).await.unwrap();
+    assert!(!active
+        .iter()
+        .any(|memory| memory.content == "alpha branch memory"));
 }
 
 // ── Entity list ───────────────────────────────────────────────────────────────

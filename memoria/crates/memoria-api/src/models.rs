@@ -345,6 +345,84 @@ fn default_strategy() -> String {
     "accept".to_string()
 }
 
+#[derive(Debug, Deserialize, Serialize)]
+pub struct PickRequest {
+    /// Target branch for the selected changes. Defaults to main.
+    #[serde(default = "default_pick_target")]
+    pub target: String,
+    /// Conflict strategy for selected changes: fail | skip | accept. Defaults to fail.
+    #[serde(default = "default_pick_strategy")]
+    pub strategy: String,
+    /// Selector that decides which branch changes are eligible to apply.
+    pub selector: PickSelector,
+    /// Optional dry-run preview settings. When present, returns a preview instead of mutating state.
+    pub dry_run: Option<PickDryRunOptions>,
+}
+
+fn default_pick_target() -> String {
+    "main".to_string()
+}
+
+fn default_pick_strategy() -> String {
+    "fail".to_string()
+}
+
+fn default_pick_top_k() -> i64 {
+    5
+}
+
+fn default_pick_preview_limit() -> i64 {
+    10
+}
+
+fn default_pick_include_content_preview() -> bool {
+    true
+}
+
+fn default_pick_include_scores() -> bool {
+    true
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct PickDryRunOptions {
+    /// Maximum number of preview candidates to return.
+    #[serde(default = "default_pick_preview_limit")]
+    pub limit: i64,
+    /// Preview pagination offset.
+    #[serde(default)]
+    pub offset: i64,
+    /// Include a short content_preview for each candidate. Embeddings are never returned.
+    #[serde(default = "default_pick_include_content_preview")]
+    pub include_content_preview: bool,
+    /// Include retrieve scores when available. Non-retrieve selectors omit scores.
+    #[serde(default = "default_pick_include_scores")]
+    pub include_scores: bool,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum PickSelector {
+    KeyList {
+        /// Explicit memory_ids from the source branch to apply.
+        keys: Vec<String>,
+    },
+    SnapshotRange {
+        /// Start snapshot name in the source branch history.
+        from_snapshot: String,
+        /// End snapshot name in the source branch history.
+        to_snapshot: String,
+    },
+    Retrieve {
+        /// Natural-language query used to rank changed source rows.
+        query: String,
+        /// Maximum number of ranked rows eligible for application.
+        #[serde(default = "default_pick_top_k")]
+        top_k: i64,
+        /// Optional retrieve threshold. Rows below this score are excluded.
+        min_score: Option<f64>,
+    },
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 pub fn parse_memory_type(s: &str) -> Result<MemoryType, String> {

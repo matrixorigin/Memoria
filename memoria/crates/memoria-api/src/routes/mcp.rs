@@ -91,7 +91,7 @@ fn mcp_tool_dirty_mask(tool: &str) -> Option<crate::metrics_summary::DirtyMask> 
         "memory_snapshot" | "memory_snapshot_delete" => Some(DirtyMask::SNAPSHOT),
         "memory_rollback" => Some(DirtyMask::FULL),
         "memory_branch" | "memory_branch_delete" => Some(DirtyMask::BRANCH),
-        "memory_checkout" | "memory_merge" => Some(DirtyMask::FULL),
+        "memory_checkout" | "memory_merge" | "memory_pick" => Some(DirtyMask::FULL),
         _ => None,
     }
 }
@@ -133,14 +133,12 @@ pub async fn mcp_handler(
                 RpcMeta::err($code),
             );
             if let Some(reporter) = &state.stats_reporter {
-                reporter.report(
-                    memoria_service::stats_reporter::StatsEvent::ApiCallLogged {
-                        user_id: auth.user_id.clone(),
-                        path: $path.to_string(),
-                        is_mcp: true,
-                        is_success: false,
-                    },
-                );
+                reporter.report(memoria_service::stats_reporter::StatsEvent::ApiCallLogged {
+                    user_id: auth.user_id.clone(),
+                    path: $path.to_string(),
+                    is_mcp: true,
+                    is_success: false,
+                });
             }
             return Json($body).into_response();
         }};
