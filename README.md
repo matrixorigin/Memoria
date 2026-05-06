@@ -16,8 +16,9 @@
   [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg?style=flat-square)](LICENSE)
   [![MCP](https://img.shields.io/badge/Protocol-MCP-7C3AED?style=flat-square)](https://modelcontextprotocol.io)
   [![MatrixOne](https://img.shields.io/badge/Powered%20by-MatrixOne-00ADD8?style=flat-square&logo=database)](https://github.com/matrixorigin/matrixone)
+  [![Paper](https://img.shields.io/badge/arXiv-2604.03927-b31b1b?style=flat-square)](https://arxiv.org/abs/2604.03927)
 
-  [Quick Start](#-quick-start) · [Why Memoria](#-why-memoria) · [See It in Action](#-see-git-for-data-in-action) · [API Reference](#-api-reference) · [Architecture](#-architecture) · [Development](#-development)
+  [Quick Start](#-quick-start) · [Why Memoria](#-why-memoria) · [Research](#-research-foundation) · [See It in Action](#-see-git-for-data-in-action) · [API Reference](#-api-reference) · [Architecture](#-architecture) · [Development](#-development) · [Citation](#-citation)
 
 </div>
 
@@ -170,6 +171,14 @@ Or download binaries directly from [GitHub Releases](https://github.com/matrixor
 | **Audit trail** | Full snapshot + provenance on every mutation | Limited logging |
 | **Semantic retrieval** | Vector + full-text hybrid search | Vector only |
 | **Self-governance** | Automatic contradiction detection & quarantine | Manual cleanup |
+
+---
+
+## 🔬 Research Foundation
+
+Memoria's Git-for-Data layer is backed by [**Version Control System for Data with MatrixOne**](https://arxiv.org/abs/2604.03927), our arXiv paper on bringing Git-like workflows directly into a cloud-native database.
+
+The paper describes how MatrixOne's immutable storage and MVCC architecture make `clone`, `branch` / `tag`, `diff`, `merge`, and `revert` practical at terabyte scale without loading whole datasets into memory. Memoria applies the same foundation to AI-agent memory, so every memory change can be isolated, reviewed, merged, or rolled back with database-native consistency.
 
 ---
 
@@ -416,6 +425,25 @@ make release VERSION=0.2.0   # Bump, tag, push
 | [Plugin Development](skills/plugin-development/SKILL.md) | Governance plugins |
 | [Release](skills/release/SKILL.md) | Version bump, CI/CD |
 | [Local Embedding](skills/local-embedding/SKILL.md) | Offline embedding build |
+
+---
+
+## 📝 Citation
+
+If you use Memoria in academic work, or refer to its Git-for-Data foundation for AI-agent memory, please cite the MatrixOne paper that describes the underlying data version control design:
+
+```bibtex
+@misc{gou2026versioncontrolsystemdata,
+  title={Version Control System for Data with MatrixOne},
+  author={Gou, Hongshen and Tian, Feng and Wang, Long and Deng, Nan and Xu, Peng},
+  year={2026},
+  eprint={2604.03927},
+  archivePrefix={arXiv},
+  primaryClass={cs.DB},
+  doi={10.48550/arXiv.2604.03927},
+  url={https://arxiv.org/abs/2604.03927}
+}
+```
 
 ---
 
