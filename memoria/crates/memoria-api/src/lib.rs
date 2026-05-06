@@ -84,14 +84,12 @@ async fn call_log_mw(
             // which is necessary because JSON-RPC errors return HTTP 200.
             if !is_dashboard && !path.starts_with("/v1/mcp") {
                 if let Some(reporter) = &state.stats_reporter {
-                    reporter.report(
-                        memoria_service::stats_reporter::StatsEvent::ApiCallLogged {
-                            user_id: uid.clone(),
-                            path: path.clone(),
-                            is_mcp: false,
-                            is_success: status_code < 400,
-                        },
-                    );
+                    reporter.report(memoria_service::stats_reporter::StatsEvent::ApiCallLogged {
+                        user_id: uid.clone(),
+                        path: path.clone(),
+                        is_mcp: false,
+                        is_success: status_code < 400,
+                    });
                 }
             }
             if let Some(mask) = should_mark_metrics_dirty(&method, &path, status_code) {
@@ -149,7 +147,9 @@ fn should_mark_metrics_dirty(
                     || path.starts_with("/v1/branches/") && path.ends_with("/merge")
                 {
                     Some(DirtyMask::FULL)
-                } else if path.starts_with("/v1/sessions/") && path.ends_with("/summary") {
+                } else if (path.starts_with("/v1/branches/") && path.ends_with("/apply"))
+                    || (path.starts_with("/v1/sessions/") && path.ends_with("/summary"))
+                {
                     Some(DirtyMask::MEMORY)
                 } else {
                     None
@@ -178,7 +178,55 @@ fn should_mark_metrics_dirty(
 }
 
 /// Build the full API router with all routes.
+///
+/// Routes are organised into three groups:
+///
+/// 1. **Write routes** — guarded by [`auth::group_main_write_guard`] so that
+///    group-scoped requests on `main` are automatically rejected (403) without
+///    each handler needing a manual check.
+/// 2. **Merge route** — guarded by [`auth::group_merge_guard`] which blocks
+///    native merge entirely in group mode.
+/// 3. **Read / other routes** — no group-mode restrictions.
 pub fn build_router(state: AppState) -> Router {
+    // ── Write routes (group main-write guard) ────────────────────────────
+    // All endpoints that mutate the active memory table.
+    // In group mode these are forbidden when checked-out on `main`.
+    let write_routes = Router::new()
+        .route("/v1/memories", post(routes::memory::store_memory))
+        .route("/v1/memories/batch", post(routes::memory::batch_store))
+        .route(
+            "/v1/memories/correct",
+            post(routes::memory::correct_by_query),
+        )
+        .route("/v1/memories/purge", post(routes::memory::purge_memories))
+        .route(
+            "/v1/memories/:id/correct",
+            put(routes::memory::correct_memory),
+        )
+        .route("/v1/memories/:id", delete(routes::memory::delete_memory))
+        .route("/v1/observe", post(routes::memory::observe_turn))
+        .route(
+            "/v1/sessions/:session_id/summary",
+            post(routes::sessions::create_session_summary),
+        )
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth::group_main_write_guard,
+        ));
+
+    // ── Merge route (group merge guard) ──────────────────────────────────
+    // Native merge is entirely disabled in group mode.
+    let merge_route = Router::new()
+        .route(
+            "/v1/branches/:name/merge",
+            post(routes::snapshots::merge_branch),
+        )
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth::group_merge_guard,
+        ));
+
+    // ── Read / ungrouped routes ──────────────────────────────────────────
     Router::new()
         // Streamable HTTP MCP endpoint
         .route("/mcp", post(routes::mcp::mcp_handler))
@@ -187,32 +235,19 @@ pub fn build_router(state: AppState) -> Router {
         .route("/health/instance", get(routes::memory::health_instance))
         // Metrics
         .route("/metrics", get(routes::metrics::prometheus_metrics))
-        // Memory CRUD
+        // Memory reads
         .route("/v1/memories", get(routes::memory::list_memories))
-        .route("/v1/memories", post(routes::memory::store_memory))
-        .route("/v1/memories/batch", post(routes::memory::batch_store))
         .route("/v1/memories/retrieve", post(routes::memory::retrieve))
         .route("/v1/memories/search", post(routes::memory::search))
-        .route(
-            "/v1/memories/correct",
-            post(routes::memory::correct_by_query),
-        )
-        .route("/v1/memories/purge", post(routes::memory::purge_memories))
         .route("/v1/memories/:id", get(routes::memory::get_memory))
-        .route(
-            "/v1/memories/:id/correct",
-            put(routes::memory::correct_memory),
-        )
         .route(
             "/v1/memories/:id/history",
             get(routes::memory::get_memory_history),
         )
-        .route("/v1/memories/:id", delete(routes::memory::delete_memory))
         .route(
             "/v1/profiles/:target_user_id",
             get(routes::memory::get_profile),
         )
-        .route("/v1/observe", post(routes::memory::observe_turn))
         // Feedback
         .route(
             "/v1/memories/:id/feedback",
@@ -276,22 +311,22 @@ pub fn build_router(state: AppState) -> Router {
             post(routes::snapshots::checkout_branch),
         )
         .route(
-            "/v1/branches/:name/merge",
-            post(routes::snapshots::merge_branch),
-        )
-        .route(
             "/v1/branches/:name/diff",
             get(routes::snapshots::diff_branch),
+        )
+        .route(
+            "/v1/branches/:name/diff-items",
+            get(routes::snapshots::diff_branch_items),
+        )
+        .route(
+            "/v1/branches/:name/apply",
+            post(routes::snapshots::apply_branch),
         )
         .route(
             "/v1/branches/:name",
             delete(routes::snapshots::delete_branch),
         )
-        // Sessions (episodic memory)
-        .route(
-            "/v1/sessions/:session_id/summary",
-            post(routes::sessions::create_session_summary),
-        )
+        // Sessions
         .route("/v1/tasks/:task_id", get(routes::sessions::get_task_status))
         // API key management
         .route("/auth/keys", post(routes::auth::create_key))
@@ -299,6 +334,22 @@ pub fn build_router(state: AppState) -> Router {
         .route("/auth/keys/:id", get(routes::auth::get_key))
         .route("/auth/keys/:id/rotate", put(routes::auth::rotate_key))
         .route("/auth/keys/:id", delete(routes::auth::revoke_key))
+        // Group management (user-facing)
+        .route("/v1/groups", post(routes::groups::create_group))
+        .route("/v1/groups", get(routes::groups::list_my_groups))
+        .route("/v1/groups/:group_id", get(routes::groups::get_group))
+        .route(
+            "/v1/groups/:group_id/members/:user_id",
+            post(routes::groups::add_member),
+        )
+        .route(
+            "/v1/groups/:group_id/members/:user_id",
+            delete(routes::groups::remove_member),
+        )
+        .route("/v1/groups/:group_id", delete(routes::groups::delete_group))
+        // Merge write routes and merge-guarded route
+        .merge(write_routes)
+        .merge(merge_route)
         // Admin
         .route("/admin/stats", get(routes::admin::system_stats))
         .route("/admin/config", get(routes::admin::get_config))
@@ -386,6 +437,10 @@ pub fn build_router(state: AppState) -> Router {
             get(routes::plugins::list_audit_events),
         )
         .with_state(state.clone())
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth::actor_scope_layer,
+        ))
         .layer(DefaultBodyLimit::max(2 * 1024 * 1024)) // 2 MB
         .layer(axum::middleware::from_fn(metrics::middleware::http_metrics))
         .layer(

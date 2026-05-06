@@ -94,6 +94,7 @@ impl MemoryPipeline {
                 extra_metadata: None,
                 trust_tier: tier.unwrap_or_default(),
                 retrieval_score: None,
+                author_id: None,
             });
         }
 

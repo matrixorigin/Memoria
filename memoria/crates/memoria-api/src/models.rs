@@ -222,6 +222,8 @@ impl PurgeRequest {
 pub struct MemoryResponse {
     pub memory_id: String,
     pub user_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub author_id: Option<String>,
     pub memory_type: String,
     pub content: String,
     pub trust_tier: String,
@@ -238,6 +240,7 @@ impl From<Memory> for MemoryResponse {
         Self {
             memory_id: m.memory_id,
             user_id: m.user_id,
+            author_id: m.author_id,
             memory_type: m.memory_type.to_string(),
             content: m.content,
             trust_tier: m.trust_tier.to_string(),

@@ -105,7 +105,7 @@ pub async fn health_instance(
 
 pub async fn list_memories(
     State(state): State<AppState>,
-    AuthUser { user_id, .. }: AuthUser,
+    auth: AuthUser,
     Query(q): Query<ListQuery>,
 ) -> ApiResult<ListResponse> {
     let limit = q.limit.clamp(1, 500);
@@ -118,7 +118,7 @@ pub async fn list_memories(
     let mut memories = state
         .service
         .list_active_paged(
-            &user_id,
+            auth.scope_id(),
             fetch_limit,
             q.memory_type.as_deref(),
             q.session_id.as_deref(),
@@ -139,7 +139,7 @@ pub async fn list_memories(
 
 pub async fn store_memory(
     State(state): State<AppState>,
-    AuthUser { user_id, .. }: AuthUser,
+    auth: AuthUser,
     Json(req): Json<StoreRequest>,
 ) -> Result<(StatusCode, Json<MemoryResponse>), (StatusCode, String)> {
     if req.content.is_empty() {
@@ -168,16 +168,22 @@ pub async fn store_memory(
         .map(|s| chrono::DateTime::parse_from_rfc3339(s).map(|dt| dt.with_timezone(&chrono::Utc)))
         .transpose()
         .map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
+    let author = if auth.group_id.is_some() {
+        Some(auth.user_id.clone())
+    } else {
+        None
+    };
     let m = state
         .service
         .store_memory(
-            &user_id,
+            auth.scope_id(),
             &req.content,
             mt,
             req.session_id,
             tier,
             observed_at,
             req.initial_confidence,
+            author,
         )
         .await
         .map_err(|e| {
@@ -191,7 +197,7 @@ pub async fn store_memory(
 
 pub async fn batch_store(
     State(state): State<AppState>,
-    AuthUser { user_id, .. }: AuthUser,
+    auth: AuthUser,
     Json(req): Json<BatchStoreRequest>,
 ) -> Result<(StatusCode, Json<Vec<MemoryResponse>>), (StatusCode, String)> {
     if req.memories.len() > 100 {
@@ -232,9 +238,14 @@ pub async fn batch_store(
         validated.push((content, mt, session_id, tier));
     }
 
+    let author = if auth.group_id.is_some() {
+        Some(auth.user_id.clone())
+    } else {
+        None
+    };
     let results = state
         .service
-        .store_batch(&user_id, validated)
+        .store_batch(auth.scope_id(), validated, author)
         .await
         .map_err(api_err)?;
     Ok((
@@ -245,7 +256,7 @@ pub async fn batch_store(
 
 pub async fn retrieve(
     State(state): State<AppState>,
-    AuthUser { user_id, .. }: AuthUser,
+    auth: AuthUser,
     Json(req): Json<RetrieveRequest>,
 ) -> ApiResult<serde_json::Value> {
     req.validate()
@@ -260,7 +271,7 @@ pub async fn retrieve(
         let (results, explain) = state
             .service
             .retrieve_explain_level_with_options(
-                &user_id,
+                auth.scope_id(),
                 &req.query,
                 top_k,
                 level,
@@ -275,7 +286,7 @@ pub async fn retrieve(
     } else {
         let results = state
             .service
-            .retrieve_with_options(&user_id, &req.query, top_k, &retrieve_options)
+            .retrieve_with_options(auth.scope_id(), &req.query, top_k, &retrieve_options)
             .await
             .map_err(api_err)?;
         let items: Vec<MemoryResponse> = results.into_iter().map(Into::into).collect();
@@ -285,7 +296,7 @@ pub async fn retrieve(
 
 pub async fn search(
     State(state): State<AppState>,
-    AuthUser { user_id, .. }: AuthUser,
+    auth: AuthUser,
     Json(req): Json<SearchRequest>,
 ) -> ApiResult<serde_json::Value> {
     req.validate()
@@ -299,7 +310,7 @@ pub async fn search(
         let (results, explain) = state
             .service
             .retrieve_explain_level_with_options(
-                &user_id,
+                auth.scope_id(),
                 &req.query,
                 top_k,
                 level,
@@ -314,7 +325,7 @@ pub async fn search(
     } else {
         let results = state
             .service
-            .retrieve_with_options(&user_id, &req.query, top_k, &retrieve_options)
+            .retrieve_with_options(auth.scope_id(), &req.query, top_k, &retrieve_options)
             .await
             .map_err(api_err)?;
         Ok(Json(serde_json::json!(results
@@ -326,19 +337,19 @@ pub async fn search(
 
 pub async fn get_memory(
     State(state): State<AppState>,
-    AuthUser { user_id, is_master }: AuthUser,
+    auth: AuthUser,
     Path(id): Path<String>,
 ) -> ApiResult<Option<MemoryResponse>> {
     let owned = state
         .service
-        .get_for_user(&user_id, &id)
+        .get_for_user(auth.scope_id(), &id)
         .await
         .map_err(api_err_typed)?;
     if let Some(memory) = owned {
         return Ok(Json(Some(memory.into())));
     }
 
-    if !is_master {
+    if !auth.is_master {
         return Ok(Json(None));
     }
 
@@ -351,26 +362,26 @@ pub async fn get_memory(
 
 pub async fn correct_memory(
     State(state): State<AppState>,
-    AuthUser { user_id, is_master }: AuthUser,
+    auth: AuthUser,
     Path(id): Path<String>,
     Json(req): Json<CorrectRequest>,
 ) -> ApiResult<MemoryResponse> {
-    let effective_user_id = if is_master {
+    let effective_user_id = if auth.is_master {
         find_memory_any_user(&state, &id)
             .await?
             .map(|(owner_id, _)| owner_id)
-            .unwrap_or_else(|| user_id.clone())
+            .unwrap_or_else(|| auth.scope_id().to_string())
     } else {
         if state
             .service
-            .get_for_user(&user_id, &id)
+            .get_for_user(auth.scope_id(), &id)
             .await
             .map_err(api_err_typed)?
             .is_none()
         {
             return Err((StatusCode::NOT_FOUND, "Memory not found".to_string()));
         }
-        user_id.clone()
+        auth.scope_id().to_string()
     };
     let m = state
         .service
@@ -382,7 +393,7 @@ pub async fn correct_memory(
 
 pub async fn correct_by_query(
     State(state): State<AppState>,
-    AuthUser { user_id, .. }: AuthUser,
+    auth: AuthUser,
     Json(req): Json<CorrectByQueryRequest>,
 ) -> ApiResult<MemoryResponse> {
     req.validate()
@@ -392,7 +403,7 @@ pub async fn correct_by_query(
         .map_err(|err| (StatusCode::UNPROCESSABLE_ENTITY, err))?;
     let results = state
         .service
-        .retrieve_with_options(&user_id, &req.query, 1, &retrieve_options)
+        .retrieve_with_options(auth.scope_id(), &req.query, 1, &retrieve_options)
         .await
         .map_err(api_err)?;
     let found = results.into_iter().next().ok_or_else(|| {
@@ -403,7 +414,7 @@ pub async fn correct_by_query(
     })?;
     let m = state
         .service
-        .correct(&user_id, &found.memory_id, &req.new_content)
+        .correct(auth.scope_id(), &found.memory_id, &req.new_content)
         .await
         .map_err(api_err)?;
     Ok(Json(m.into()))
@@ -411,25 +422,25 @@ pub async fn correct_by_query(
 
 pub async fn delete_memory(
     State(state): State<AppState>,
-    AuthUser { user_id, is_master }: AuthUser,
+    auth: AuthUser,
     Path(id): Path<String>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    let effective_user_id = if is_master {
+    let effective_user_id = if auth.is_master {
         find_memory_any_user(&state, &id)
             .await?
             .map(|(owner_id, _)| owner_id)
-            .unwrap_or_else(|| user_id.clone())
+            .unwrap_or_else(|| auth.scope_id().to_string())
     } else {
         if state
             .service
-            .get_for_user(&user_id, &id)
+            .get_for_user(auth.scope_id(), &id)
             .await
             .map_err(api_err_typed)?
             .is_none()
         {
             return Err((StatusCode::NOT_FOUND, "Memory not found".to_string()));
         }
-        user_id.clone()
+        auth.scope_id().to_string()
     };
     let _ = state
         .service
@@ -441,7 +452,7 @@ pub async fn delete_memory(
 
 pub async fn purge_memories(
     State(state): State<AppState>,
-    AuthUser { user_id, is_master }: AuthUser,
+    auth: AuthUser,
     Json(req): Json<PurgeRequest>,
 ) -> ApiResult<PurgeResponse> {
     let selector = req
@@ -449,17 +460,17 @@ pub async fn purge_memories(
         .map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e))?;
     let result = match selector {
         PurgeSelector::MemoryIds(ids) => {
-            if !is_master {
+            if !auth.is_master {
                 for id in &ids {
                     let mem = state
                         .service
-                        .get_for_user(&user_id, id)
+                        .get_for_user(auth.scope_id(), id)
                         .await
                         .map_err(api_err)?
                         .ok_or_else(|| {
                             (StatusCode::NOT_FOUND, format!("Memory not found: {id}"))
                         })?;
-                    if mem.user_id != user_id {
+                    if !auth.is_group_scoped() && mem.user_id != auth.user_id {
                         return Err((StatusCode::FORBIDDEN, format!("Not your memory: {id}")));
                     }
                 }
@@ -467,13 +478,13 @@ pub async fn purge_memories(
             let id_refs: Vec<&str> = ids.iter().map(|s| s.as_str()).collect();
             state
                 .service
-                .purge_batch(&user_id, &id_refs)
+                .purge_batch(auth.scope_id(), &id_refs)
                 .await
                 .map_err(api_err)?
         }
         PurgeSelector::Topic(topic) => state
             .service
-            .purge_by_topic(&user_id, &topic)
+            .purge_by_topic(auth.scope_id(), &topic)
             .await
             .map_err(api_err)?,
         PurgeSelector::Session {
@@ -481,7 +492,7 @@ pub async fn purge_memories(
             memory_types,
         } => state
             .service
-            .purge_by_session_id(&user_id, &session_id, memory_types.as_deref())
+            .purge_by_session_id(auth.scope_id(), &session_id, memory_types.as_deref())
             .await
             .map_err(api_err)?,
         PurgeSelector::None => memoria_service::PurgeResult {
@@ -499,12 +510,12 @@ pub async fn purge_memories(
 
 pub async fn get_profile(
     State(state): State<AppState>,
-    AuthUser { user_id, is_master }: AuthUser,
+    auth: AuthUser,
     Path(target): Path<String>,
 ) -> ApiResult<serde_json::Value> {
-    let resolved = if target == "me" || target == user_id {
-        user_id
-    } else if is_master {
+    let resolved = if target == "me" || target == auth.user_id {
+        auth.scope_id().to_string()
+    } else if auth.is_master {
         target
     } else {
         return Err((
@@ -582,12 +593,12 @@ pub struct ObserveRequest {
 /// Without LLM: stores each non-empty assistant/user message as a semantic memory.
 pub async fn observe_turn(
     State(state): State<AppState>,
-    AuthUser { user_id, .. }: AuthUser,
+    auth: AuthUser,
     Json(req): Json<ObserveRequest>,
 ) -> ApiResult<serde_json::Value> {
     let (memories, has_llm) = state
         .service
-        .observe_turn(&user_id, &req.messages, req.session_id)
+        .observe_turn(auth.scope_id(), &req.messages, req.session_id)
         .await
         .map_err(api_err)?;
 
@@ -612,17 +623,17 @@ pub async fn observe_turn(
 /// GET /v1/memories/:id/history — version chain via superseded_by links.
 pub async fn get_memory_history(
     State(state): State<AppState>,
-    AuthUser { user_id, .. }: AuthUser,
+    auth: AuthUser,
     Path(id): Path<String>,
 ) -> ApiResult<serde_json::Value> {
     use sqlx::Row;
 
     let sql = state
         .service
-        .user_sql_store(&user_id)
+        .user_sql_store(auth.scope_id())
         .await
         .map_err(api_err)?;
-    let table = sql.active_table(&user_id).await.map_err(api_err)?;
+    let table = sql.active_table(auth.scope_id()).await.map_err(api_err)?;
 
     let mut chain = Vec::new();
     let mut visited = std::collections::HashSet::new();
@@ -639,7 +650,7 @@ pub async fn get_memory_history(
             table
         ))
         .bind(&cid)
-        .bind(&user_id)
+        .bind(auth.scope_id())
         .fetch_optional(sql.pool())
         .await
         .map_err(api_err)?;
@@ -678,7 +689,7 @@ pub async fn get_memory_history(
                 table
             ))
             .bind(&prev_id)
-            .bind(&user_id)
+            .bind(auth.scope_id())
             .fetch_optional(sql.pool())
             .await
             .map_err(api_err)?;
@@ -728,7 +739,7 @@ pub struct PipelineCandidate {
 
 pub async fn run_pipeline(
     State(state): State<AppState>,
-    AuthUser { user_id, .. }: AuthUser,
+    auth: AuthUser,
     Json(req): Json<PipelineRequest>,
 ) -> ApiResult<serde_json::Value> {
     use crate::models::{parse_memory_type, parse_trust_tier};
@@ -757,7 +768,7 @@ pub async fn run_pipeline(
 
     let pipeline = MemoryPipeline::new(state.service.clone(), Some(state.git.clone()));
     let result = pipeline
-        .run(&user_id, candidates, req.sandbox_query.as_deref())
+        .run(auth.scope_id(), candidates, req.sandbox_query.as_deref())
         .await;
 
     Ok(Json(serde_json::json!({
@@ -786,13 +797,18 @@ pub struct FeedbackResponse {
 /// POST /v1/memories/:id/feedback — record explicit relevance feedback.
 pub async fn record_feedback(
     State(state): State<AppState>,
-    AuthUser { user_id, .. }: AuthUser,
+    auth: AuthUser,
     Path(memory_id): Path<String>,
     Json(req): Json<FeedbackRequest>,
 ) -> Result<(StatusCode, Json<FeedbackResponse>), (StatusCode, String)> {
     let feedback_id = state
         .service
-        .record_feedback(&user_id, &memory_id, &req.signal, req.context.as_deref())
+        .record_feedback(
+            auth.scope_id(),
+            &memory_id,
+            &req.signal,
+            req.context.as_deref(),
+        )
         .await
         .map_err(api_err_typed)?;
     Ok((
@@ -808,11 +824,11 @@ pub async fn record_feedback(
 /// GET /v1/feedback/stats — get feedback statistics for the user.
 pub async fn get_feedback_stats(
     State(state): State<AppState>,
-    AuthUser { user_id, .. }: AuthUser,
+    auth: AuthUser,
 ) -> ApiResult<serde_json::Value> {
     let stats = state
         .service
-        .get_feedback_stats(&user_id)
+        .get_feedback_stats(auth.scope_id())
         .await
         .map_err(api_err)?;
     Ok(Json(serde_json::json!(stats)))
@@ -821,11 +837,11 @@ pub async fn get_feedback_stats(
 /// GET /v1/feedback/by-tier — get feedback breakdown by trust tier.
 pub async fn get_feedback_by_tier(
     State(state): State<AppState>,
-    AuthUser { user_id, .. }: AuthUser,
+    auth: AuthUser,
 ) -> ApiResult<serde_json::Value> {
     let breakdown = state
         .service
-        .get_feedback_by_tier(&user_id)
+        .get_feedback_by_tier(auth.scope_id())
         .await
         .map_err(api_err)?;
     Ok(Json(serde_json::json!({"breakdown": breakdown})))
@@ -834,15 +850,15 @@ pub async fn get_feedback_by_tier(
 /// GET /v1/retrieval-params — get user's adaptive retrieval parameters.
 pub async fn get_retrieval_params(
     State(state): State<AppState>,
-    AuthUser { user_id, .. }: AuthUser,
+    auth: AuthUser,
 ) -> ApiResult<serde_json::Value> {
     let sql = state
         .service
-        .user_sql_store(&user_id)
+        .user_sql_store(auth.scope_id())
         .await
         .map_err(api_err)?;
     let params = sql
-        .get_user_retrieval_params(&user_id)
+        .get_user_retrieval_params(auth.scope_id())
         .await
         .map_err(api_err)?;
     Ok(Json(serde_json::to_value(params).unwrap()))
@@ -858,17 +874,17 @@ pub struct SetRetrievalParamsRequest {
 /// PUT /v1/retrieval-params — update user's adaptive retrieval parameters.
 pub async fn set_retrieval_params(
     State(state): State<AppState>,
-    AuthUser { user_id, .. }: AuthUser,
+    auth: AuthUser,
     Json(req): Json<SetRetrievalParamsRequest>,
 ) -> ApiResult<serde_json::Value> {
     let sql = state
         .service
-        .user_sql_store(&user_id)
+        .user_sql_store(auth.scope_id())
         .await
         .map_err(api_err)?;
 
     let mut params = sql
-        .get_user_retrieval_params(&user_id)
+        .get_user_retrieval_params(auth.scope_id())
         .await
         .map_err(api_err)?;
 
@@ -891,24 +907,24 @@ pub async fn set_retrieval_params(
 /// POST /v1/retrieval-params/tune — trigger auto-tuning of retrieval parameters.
 pub async fn tune_retrieval_params(
     State(state): State<AppState>,
-    AuthUser { user_id, .. }: AuthUser,
+    auth: AuthUser,
 ) -> ApiResult<serde_json::Value> {
     use memoria_service::scoring::{DefaultScoringPlugin, ScoringPlugin};
 
     let sql = state
         .service
-        .user_sql_store(&user_id)
+        .user_sql_store(auth.scope_id())
         .await
         .map_err(api_err)?;
 
     let old_params = sql
-        .get_user_retrieval_params(&user_id)
+        .get_user_retrieval_params(auth.scope_id())
         .await
         .map_err(api_err)?;
 
     let plugin = DefaultScoringPlugin;
     match plugin
-        .tune_params(sql.as_ref(), &user_id)
+        .tune_params(sql.as_ref(), auth.scope_id())
         .await
         .map_err(api_err)?
     {
@@ -927,15 +943,15 @@ pub async fn tune_retrieval_params(
 
 pub async fn get_tool_usage(
     State(state): State<AppState>,
-    AuthUser { user_id, .. }: AuthUser,
+    auth: AuthUser,
 ) -> ApiResult<serde_json::Value> {
-    let mut usage = state.tool_usage_batcher.get_user_tool_usage(&user_id);
+    let mut usage = state.tool_usage_batcher.get_user_tool_usage(&auth.user_id);
     if usage.is_empty() {
         state
             .tool_usage_batcher
-            .load_user_from_db(&state.service, &user_id)
+            .load_user_from_db(&state.service, &auth.user_id)
             .await;
-        usage = state.tool_usage_batcher.get_user_tool_usage(&user_id);
+        usage = state.tool_usage_batcher.get_user_tool_usage(&auth.user_id);
     }
     let items: Vec<serde_json::Value> = usage
         .into_iter()

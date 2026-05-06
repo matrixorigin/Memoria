@@ -30,7 +30,8 @@ async fn setup() -> (
     String,
     support::multi_db::McpTestContext,
 ) {
-    let ctx = support::multi_db::setup_mcp_context("perf_optimizations", test_dim(), None, None).await;
+    let ctx =
+        support::multi_db::setup_mcp_context("perf_optimizations", test_dim(), None, None).await;
     let uid = uid();
     let store = ctx.user_store(&uid).await;
     let pool = ctx.user_db_pool(&uid).await;
@@ -59,7 +60,11 @@ async fn test_active_table_cache_hit_and_invalidation() {
 
     // First call: cache miss → DB lookup → should return "mem_memories"
     let t1 = store.active_table(&uid).await.expect("active_table 1");
-    assert_eq!(t1, store.t("mem_memories"), "default should be mem_memories");
+    assert_eq!(
+        t1,
+        store.t("mem_memories"),
+        "default should be mem_memories"
+    );
 
     // Second call: should be cache hit (same result)
     let t2 = store.active_table(&uid).await.expect("active_table 2");
@@ -89,7 +94,11 @@ async fn test_active_table_cache_hit_and_invalidation() {
 
     // Now active_table should return the branch table
     let t3 = store.active_table(&uid).await.expect("active_table 3");
-    assert_eq!(t3, store.t(&table_name), "should return branch table after switch");
+    assert_eq!(
+        t3,
+        store.t(&table_name),
+        "should return branch table after switch"
+    );
 
     // Switch back to main
     store

@@ -52,6 +52,24 @@ enum RpcMethod {
     Unknown(String),
 }
 
+const GIT_TOOL_NAMES: &[&str] = &[
+    "memory_snapshot",
+    "memory_snapshots",
+    "memory_snapshot_delete",
+    "memory_rollback",
+    "memory_branch",
+    "memory_branches",
+    "memory_checkout",
+    "memory_merge",
+    "memory_diff",
+    "memory_apply",
+    "memory_branch_delete",
+];
+
+fn is_git_tool(name: &str) -> bool {
+    GIT_TOOL_NAMES.contains(&name)
+}
+
 /// Dispatch a single JSON-RPC method in embedded mode.
 /// Used by the server-side Streamable HTTP MCP endpoint.
 pub async fn dispatch_http(
@@ -282,19 +300,7 @@ async fn dispatch(
             match mode {
                 Mode::Remote(client) => client.call(&name, args).await.map_err(internal_err),
                 Mode::Embedded { service, git } => {
-                    let git_tool_names = [
-                        "memory_snapshot",
-                        "memory_snapshots",
-                        "memory_snapshot_delete",
-                        "memory_rollback",
-                        "memory_branch",
-                        "memory_branches",
-                        "memory_checkout",
-                        "memory_merge",
-                        "memory_diff",
-                        "memory_branch_delete",
-                    ];
-                    if git_tool_names.contains(&name.as_str()) {
+                    if is_git_tool(&name) {
                         git_tools::call(&name, args, git, service, user_id)
                             .await
                             .map_err(|e| McpRpcError {
@@ -350,19 +356,7 @@ async fn dispatch_embedded_owned(
                 code: -32000,
                 message: e.to_string(),
             };
-            let git_tool_names = [
-                "memory_snapshot",
-                "memory_snapshots",
-                "memory_snapshot_delete",
-                "memory_rollback",
-                "memory_branch",
-                "memory_branches",
-                "memory_checkout",
-                "memory_merge",
-                "memory_diff",
-                "memory_branch_delete",
-            ];
-            if git_tool_names.contains(&name.as_str()) {
+            if is_git_tool(&name) {
                 git_tools::call_owned(name, args, git, service, user_id)
                     .await
                     .map_err(|e| McpRpcError {
@@ -380,5 +374,40 @@ async fn dispatch_embedded_owned(
             code: -32601,
             message: format!("Method not found: {method}"),
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_git_tool, GIT_TOOL_NAMES};
+
+    #[test]
+    fn git_dispatch_list_includes_memory_apply() {
+        assert!(is_git_tool("memory_apply"));
+    }
+
+    #[test]
+    fn git_tool_dispatch_matches_declared_git_tools() {
+        let declared_names: Vec<String> = crate::git_tools::list()
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|tool| tool.get("name").and_then(|name| name.as_str()))
+            .map(str::to_string)
+            .collect();
+
+        for name in GIT_TOOL_NAMES {
+            assert!(
+                declared_names.iter().any(|declared| declared == name),
+                "dispatch marked '{name}' as a git tool but git_tools::list() does not declare it"
+            );
+        }
+
+        for name in declared_names {
+            assert!(
+                is_git_tool(&name),
+                "git_tools::list() declares '{name}' but server dispatch does not route it"
+            );
+        }
     }
 }

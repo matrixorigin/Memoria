@@ -13,7 +13,7 @@
 
 use chrono::NaiveDateTime;
 use memoria_core::MemoriaError;
-use memoria_git::{service::DiffRow, GitForDataService};
+use memoria_git::GitForDataService;
 use memoria_service::MemoryService;
 use serde_json::{json, Value};
 use sqlx::Row;
@@ -462,6 +462,48 @@ pub fn list() -> Value {
                 },
                 "required": ["source"]
             }
+        },
+        {
+            "name": "memory_apply",
+            "description": "Selectively apply specific changes from a branch to main (cherry-pick). Use memory_diff first to see available changes, then pass the memory_ids you want to apply.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "source": {"type": "string", "description": "Branch name to apply from"},
+                    "adds": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "default": [],
+                        "description": "memory_ids to add (new in branch, absent from main)"
+                    },
+                    "updates": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "old_id": {"type": "string", "description": "Original memory_id (will be superseded)"},
+                                "new_id": {"type": "string", "description": "Corrected memory_id (active replacement)"}
+                            },
+                            "required": ["old_id", "new_id"]
+                        },
+                        "default": [],
+                        "description": "Correction pairs: old_id (superseded) → new_id (replacement)"
+                    },
+                    "removes": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "default": [],
+                        "description": "memory_ids to remove (soft-delete from main)"
+                    },
+                    "accept_branch_conflicts": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "default": [],
+                        "description": "Conflict memory_ids to resolve with branch-wins semantics. Unspecified conflicts stay on main."
+                    }
+                },
+                "required": ["source"]
+            }
         }
     ])
 }
@@ -477,6 +519,7 @@ enum GitToolCallName {
     MemoryMerge,
     MemoryBranchDelete,
     MemoryDiff,
+    MemoryApply,
     Unknown(String),
 }
 
@@ -498,6 +541,7 @@ pub async fn call(
         "memory_merge" => GitToolCallName::MemoryMerge,
         "memory_branch_delete" => GitToolCallName::MemoryBranchDelete,
         "memory_diff" => GitToolCallName::MemoryDiff,
+        "memory_apply" => GitToolCallName::MemoryApply,
         _ => GitToolCallName::Unknown(name.to_string()),
     };
     match tool {
@@ -728,10 +772,10 @@ pub async fn call(
                 )));
             }
 
-            // Duplicate name check (including deleted)
+            // Duplicate name check — only reject if an active branch with same name exists
             let branches_table = sql.t("mem_branches");
             let dup = sqlx::query(&format!(
-                "SELECT COUNT(*) as cnt FROM {branches_table} WHERE user_id = ? AND name = ?"
+                "SELECT COUNT(*) as cnt FROM {branches_table} WHERE user_id = ? AND name = ? AND status = 'active'"
             ))
             .bind(user_id)
             .bind(branch_name)
@@ -970,136 +1014,103 @@ pub async fn call(
         }
 
         GitToolCallName::MemoryDiff => {
-            let source_branch = args["source"].as_str().unwrap_or("");
-            let limit = args["limit"].as_i64().unwrap_or(50);
+            expect_tool_args(&args, "memory_diff", &["source", "limit"])?;
+            let source_branch = parse_required_string_arg(&args, "memory_diff", "source")?;
+            let limit = parse_optional_i64_arg(&args, "memory_diff", "limit", 50)?;
             let sql = svc.user_sql_store(user_id).await?;
+            let user_git = git_for_store(&sql)?;
             let branches = sql.list_branches(user_id).await?;
             let table_name = branches
                 .iter()
-                .find(|(name, _)| name == source_branch)
+                .find(|(name, _)| name == source_branch.as_str())
                 .map(|(_, t)| t.clone())
                 .ok_or_else(|| MemoriaError::NotFound(format!("Branch '{source_branch}'")))?;
-            let main_table = sql.t("mem_memories");
-            let branch_table = sql.t(&table_name);
 
-            let inserted_or_updated_sql = format!(
-                "SELECT \
-                    CASE WHEN m.memory_id IS NULL THEN 'INSERT' ELSE 'UPDATE' END AS flag, \
-                    b.memory_id, b.content, b.memory_type \
-                 FROM {branch_table} b \
-                 LEFT JOIN {main_table} m ON m.memory_id = b.memory_id \
-                 WHERE b.user_id = ? \
-                   AND (m.memory_id IS NULL \
-                        OR COALESCE(m.content, '') <> COALESCE(b.content, '') \
-                        OR COALESCE(m.is_active, 0) <> COALESCE(b.is_active, 0)) \
-                 ORDER BY b.created_at DESC \
-                 LIMIT ?"
-            );
-            let deleted_sql = format!(
-                "SELECT \
-                    'DELETE' AS flag, \
-                    m.memory_id, m.content, m.memory_type \
-                 FROM {main_table} m \
-                 LEFT JOIN {branch_table} b ON b.memory_id = m.memory_id \
-                 WHERE m.user_id = ? AND m.is_active = 1 AND b.memory_id IS NULL \
-                 ORDER BY m.created_at DESC \
-                 LIMIT ?"
-            );
-            let inserted_or_updated_count_sql = format!(
-                "SELECT COUNT(*) \
-                 FROM {branch_table} b \
-                 LEFT JOIN {main_table} m ON m.memory_id = b.memory_id \
-                 WHERE b.user_id = ? \
-                   AND (m.memory_id IS NULL \
-                        OR COALESCE(m.content, '') <> COALESCE(b.content, '') \
-                        OR COALESCE(m.is_active, 0) <> COALESCE(b.is_active, 0))"
-            );
-            let deleted_count_sql = format!(
-                "SELECT COUNT(*) \
-                 FROM {main_table} m \
-                 LEFT JOIN {branch_table} b ON b.memory_id = m.memory_id \
-                 WHERE m.user_id = ? AND m.is_active = 1 AND b.memory_id IS NULL"
-            );
-            let inserted_or_updated_total: i64 = sqlx::query_scalar(&inserted_or_updated_count_sql)
-                .bind(user_id)
-                .fetch_one(sql.pool())
-                .await
-                .map_err(db_err)?;
-            let deleted_total: i64 = sqlx::query_scalar(&deleted_count_sql)
-                .bind(user_id)
-                .fetch_one(sql.pool())
-                .await
-                .map_err(db_err)?;
+            // Use MatrixOne native `data branch diff` + classify
+            let raw_rows = user_git
+                .diff_branch_rows(&table_name, "mem_memories", user_id, limit * 3)
+                .await?;
+            let classified = memoria_git::classify_diff_rows(raw_rows, &table_name);
 
-            let mut rows: Vec<DiffRow> = sqlx::query(&inserted_or_updated_sql)
-                .bind(user_id)
-                .bind(limit)
-                .fetch_all(sql.pool())
-                .await
-                .map_err(db_err)?
-                .into_iter()
-                .map(|row| {
-                    Ok(DiffRow {
-                        flag: row.try_get("flag").map_err(db_err)?,
-                        memory_id: row.try_get("memory_id").map_err(db_err)?,
-                        content: row.try_get("content").unwrap_or_default(),
-                        memory_type: row
-                            .try_get("memory_type")
-                            .unwrap_or_else(|_| "semantic".into()),
-                    })
-                })
-                .collect::<Result<Vec<_>, MemoriaError>>()?;
-
-            let deleted_rows: Vec<DiffRow> = sqlx::query(&deleted_sql)
-                .bind(user_id)
-                .bind(limit)
-                .fetch_all(sql.pool())
-                .await
-                .map_err(db_err)?
-                .into_iter()
-                .map(|row| {
-                    Ok(DiffRow {
-                        flag: row.try_get("flag").map_err(db_err)?,
-                        memory_id: row.try_get("memory_id").map_err(db_err)?,
-                        content: row.try_get("content").unwrap_or_default(),
-                        memory_type: row
-                            .try_get("memory_type")
-                            .unwrap_or_else(|_| "semantic".into()),
-                    })
-                })
-                .collect::<Result<Vec<_>, MemoriaError>>()?;
-
-            rows.extend(deleted_rows);
-            rows.truncate(limit.max(0) as usize);
-            let shown = rows.len() as i64;
-            let total = inserted_or_updated_total + deleted_total;
+            let total = classified.added.len()
+                + classified.updated.len()
+                + classified.removed.len()
+                + classified.conflicts.len();
             if total == 0 {
                 return Ok(mcp_text(&format!(
                     "No changes in branch '{source_branch}' vs main."
                 )));
             }
-            let lines: Vec<String> = rows
-                .iter()
-                .map(|r| {
-                    let semantic = match r.flag.as_str() {
-                        "INSERT" => "new",
-                        "UPDATE" => "modified",
-                        "DELETE" => "removed",
-                        other => other,
-                    };
-                    let preview = if r.content.len() > 80 {
-                        let mut end = 80;
-                        while !r.content.is_char_boundary(end) { end -= 1; }
-                        format!("{}...", &r.content[..end])
-                    } else {
-                        r.content.clone()
-                    };
-                    format!(
-                        "[{semantic}] {}: {preview}",
-                        &r.memory_id[..8.min(r.memory_id.len())]
-                    )
-                })
-                .collect();
+
+            let preview = |content: &str| -> String {
+                if content.len() > 80 {
+                    let mut end = 80;
+                    while !content.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    format!("{}...", &content[..end])
+                } else {
+                    content.to_string()
+                }
+            };
+            let short_id = |id: &str| -> String { id[..8.min(id.len())].to_string() };
+
+            let mut lines: Vec<String> = Vec::new();
+            let limit_usize = limit.max(0) as usize;
+
+            for item in classified.added.iter().take(limit_usize) {
+                lines.push(format!(
+                    "[new] {}: {}",
+                    short_id(&item.memory_id),
+                    preview(&item.content)
+                ));
+            }
+            for pair in classified.updated.iter().take(limit_usize) {
+                lines.push(format!(
+                    "[modified] {} → {}: {}",
+                    short_id(&pair.old_memory_id),
+                    short_id(&pair.new_memory_id),
+                    preview(&pair.new_content)
+                ));
+            }
+            for item in classified.removed.iter().take(limit_usize) {
+                lines.push(format!(
+                    "[removed] {}: {}",
+                    short_id(&item.memory_id),
+                    preview(&item.content)
+                ));
+            }
+            for c in classified.conflicts.iter().take(limit_usize) {
+                let br_sup = c
+                    .branch_side
+                    .superseded_by_content
+                    .as_deref()
+                    .map(|s| format!(" →new: {}", preview(s)))
+                    .unwrap_or_default();
+                let mn_sup = c
+                    .main_side
+                    .superseded_by_content
+                    .as_deref()
+                    .map(|s| format!(" →new: {}", preview(s)))
+                    .unwrap_or_default();
+                lines.push(format!(
+                    "[CONFLICT] {}: branch({}{}), main({}{})",
+                    short_id(&c.memory_id),
+                    preview(&c.branch_side.content),
+                    br_sup,
+                    preview(&c.main_side.content),
+                    mn_sup,
+                ));
+            }
+            for item in classified.behind_main.iter().take(limit_usize) {
+                lines.push(format!(
+                    "[behind] {}: {}",
+                    short_id(&item.memory_id),
+                    preview(&item.content)
+                ));
+            }
+
+            let shown = lines.len();
             let truncated = if total > shown {
                 format!(" (showing {shown}/{total})")
             } else {
@@ -1108,6 +1119,62 @@ pub async fn call(
             Ok(mcp_text(&format!(
                 "Diff '{source_branch}' vs main{truncated}:\n{}",
                 lines.join("\n")
+            )))
+        }
+
+        GitToolCallName::MemoryApply => {
+            expect_tool_args(
+                &args,
+                "memory_apply",
+                &[
+                    "source",
+                    "adds",
+                    "updates",
+                    "removes",
+                    "accept_branch_conflicts",
+                ],
+            )?;
+            let source_branch = parse_required_string_arg(&args, "memory_apply", "source")?;
+            if source_branch == "main" {
+                return Ok(mcp_text("Cannot apply from main"));
+            }
+            let selection = memoria_git::ApplySelection {
+                adds: parse_apply_string_array(&args, "adds")?,
+                updates: parse_apply_updates(&args)?,
+                removes: parse_apply_string_array(&args, "removes")?,
+                accept_branch_conflicts: parse_apply_string_array(
+                    &args,
+                    "accept_branch_conflicts",
+                )?,
+            };
+            if selection.adds.is_empty()
+                && selection.updates.is_empty()
+                && selection.removes.is_empty()
+                && selection.accept_branch_conflicts.is_empty()
+            {
+                return Ok(mcp_text(
+                    "Nothing to apply. Provide at least one of: adds, updates, removes, accept_branch_conflicts.",
+                ));
+            }
+
+            let sql = svc.user_sql_store(user_id).await?;
+            let branches = sql.list_branches(user_id).await?;
+            let table_name = branches
+                .iter()
+                .find(|(name, _)| name == &source_branch)
+                .map(|(_, t)| t.clone())
+                .ok_or_else(|| MemoriaError::NotFound(format!("Branch '{source_branch}'")))?;
+            let branch_table_name = validate_identifier(&table_name)?.to_string();
+            let user_git = git_for_store(&sql)?;
+            let report = user_git
+                .selective_apply(&branch_table_name, "mem_memories", user_id, selection)
+                .await?;
+            Ok(mcp_text(&format!(
+                "Applied from '{source_branch}': {} added, {} updated, {} removed, {} conflicts accepted",
+                report.applied_adds.len(),
+                report.applied_updates.len(),
+                report.applied_removes.len(),
+                report.applied_conflicts.len()
             )))
         }
 
@@ -1189,9 +1256,110 @@ fn mcp_text(text: &str) -> Value {
     json!({"content": [{"type": "text", "text": text}]})
 }
 
+fn expect_tool_args<'a>(
+    args: &'a Value,
+    tool: &str,
+    allowed: &[&str],
+) -> Result<&'a serde_json::Map<String, Value>, MemoriaError> {
+    let map = args.as_object().ok_or_else(|| {
+        MemoriaError::Internal(format!("Invalid {tool} arguments: expected object"))
+    })?;
+    for key in map.keys() {
+        if !allowed.iter().any(|allowed_key| allowed_key == key) {
+            return Err(MemoriaError::Internal(format!(
+                "Invalid {tool} argument '{key}': unknown field"
+            )));
+        }
+    }
+    Ok(map)
+}
+
+fn parse_required_string_arg(
+    args: &Value,
+    tool: &str,
+    field: &str,
+) -> Result<String, MemoriaError> {
+    args.get(field)
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| {
+            MemoriaError::Internal(format!(
+                "Invalid {tool} '{field}': expected non-empty string"
+            ))
+        })
+}
+
+fn parse_optional_i64_arg(
+    args: &Value,
+    tool: &str,
+    field: &str,
+    default: i64,
+) -> Result<i64, MemoriaError> {
+    match args.get(field) {
+        None => Ok(default),
+        Some(value) => value.as_i64().ok_or_else(|| {
+            MemoriaError::Internal(format!("Invalid {tool} '{field}': expected integer"))
+        }),
+    }
+}
+
+fn parse_apply_string_array(args: &Value, field: &str) -> Result<Vec<String>, MemoriaError> {
+    match args.get(field) {
+        None => Ok(Vec::new()),
+        Some(Value::Array(values)) => values
+            .iter()
+            .enumerate()
+            .map(|(idx, value)| {
+                value.as_str().map(str::to_string).ok_or_else(|| {
+                    MemoriaError::Internal(format!(
+                        "Invalid memory_apply '{field}[{idx}]': expected string"
+                    ))
+                })
+            })
+            .collect(),
+        Some(_) => Err(MemoriaError::Internal(format!(
+            "Invalid memory_apply '{field}': expected array"
+        ))),
+    }
+}
+
+fn parse_apply_updates(args: &Value) -> Result<Vec<memoria_git::ApplyUpdatePair>, MemoriaError> {
+    match args.get("updates") {
+        None => Ok(Vec::new()),
+        Some(Value::Array(values)) => values
+            .iter()
+            .enumerate()
+            .map(|(idx, value)| {
+                let old_id = value.get("old_id").and_then(Value::as_str).ok_or_else(|| {
+                    MemoriaError::Internal(format!(
+                        "Invalid memory_apply 'updates[{idx}].old_id': expected string"
+                    ))
+                })?;
+                let new_id = value.get("new_id").and_then(Value::as_str).ok_or_else(|| {
+                    MemoriaError::Internal(format!(
+                        "Invalid memory_apply 'updates[{idx}].new_id': expected string"
+                    ))
+                })?;
+                Ok(memoria_git::ApplyUpdatePair {
+                    old_id: old_id.to_string(),
+                    new_id: new_id.to_string(),
+                })
+            })
+            .collect(),
+        Some(_) => Err(MemoriaError::Internal(
+            "Invalid memory_apply 'updates': expected array".to_string(),
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{safety_prefix, snap_internal, validate_identifier, MAX_IDENTIFIER_LEN};
+    use super::{
+        expect_tool_args, parse_apply_string_array, parse_apply_updates, safety_prefix,
+        snap_internal, validate_identifier, MAX_IDENTIFIER_LEN,
+    };
+    use serde_json::json;
 
     #[test]
     fn scoped_snapshot_internal_names_stay_within_matrixone_limit() {
@@ -1220,5 +1388,33 @@ mod tests {
         assert!(validate_identifier("br_bad-name").is_err());
         assert!(validate_identifier("br bad").is_err());
         assert!(validate_identifier("br`bad").is_err());
+    }
+
+    #[test]
+    fn apply_arrays_default_to_empty_when_missing() {
+        let args = json!({"source": "feature"});
+        assert!(parse_apply_string_array(&args, "adds").unwrap().is_empty());
+        assert!(parse_apply_string_array(&args, "removes")
+            .unwrap()
+            .is_empty());
+        assert!(parse_apply_updates(&args).unwrap().is_empty());
+    }
+
+    #[test]
+    fn apply_arrays_error_on_type_mismatch() {
+        let args = json!({"source": "feature", "adds": "oops"});
+        assert!(parse_apply_string_array(&args, "adds").is_err());
+    }
+
+    #[test]
+    fn apply_updates_error_on_missing_fields() {
+        let args = json!({"source": "feature", "updates": [{"old_id": "x"}]});
+        assert!(parse_apply_updates(&args).is_err());
+    }
+
+    #[test]
+    fn tool_args_error_on_unknown_field() {
+        let args = json!({"source": "feature", "adds": [], "bogus": true});
+        assert!(expect_tool_args(&args, "memory_apply", &["source", "adds"]).is_err());
     }
 }

@@ -405,6 +405,28 @@ make test            # Run all tests
 make release VERSION=0.2.0   # Bump, tag, push
 ```
 
+### Group collaboration demo
+
+The local group-collaboration UI demo reads its startup config from `scripts/.env` by default (`scripts/.env` is gitignored). Fill in at least:
+
+- `DATABASE_URL`
+- `MASTER_KEY`
+- `EMBEDDING_API_KEY`
+
+Then start the demo:
+
+```bash
+./scripts/start-group-collab-demo.sh
+```
+
+Recommended workflow:
+
+1. Register users, select an owner actor, and create a group.
+2. Add members and issue group keys so each participant gets a group actor card.
+3. For a multi-member group, create or checkout a branch before `store` / `correct` / `delete`; `main` stays read-only in that case. If the group currently has only the owner as an active member, the owner may write to `main` directly.
+4. Open **Diff & Apply** to review branch changes before promoting them to `main`.
+5. Checked items are applied to `main`; unchecked conflict items keep the `main` version, while checked conflict items mean **accept branch**.
+
 **Developer documentation** (for contributing to Memoria):
 
 | Skill | Description |

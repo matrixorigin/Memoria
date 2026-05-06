@@ -19,10 +19,15 @@ use std::sync::Mutex;
 use subtle::ConstantTimeEq;
 use tracing::warn;
 
-use crate::state::AppState;
+use crate::state::{AppState, CachedApiKeyPrincipal};
 
 pub struct AuthUser {
     pub user_id: String,
+    /// Routing scope: equals `user_id` in personal mode, `group_id` (e.g. `grp_xxx`)
+    /// in group mode.  Passed to service-layer methods to select the correct
+    /// physical database via `DbRouter::scope_store()`.
+    pub scope_id: String,
+    pub group_id: Option<String>,
     pub is_master: bool,
 }
 
@@ -34,6 +39,233 @@ impl AuthUser {
             Ok(())
         }
     }
+
+    pub fn scope_id(&self) -> &str {
+        &self.scope_id
+    }
+
+    pub fn is_group_scoped(&self) -> bool {
+        self.group_id.is_some()
+    }
+}
+
+async fn cached_or_db_principal(token: &str, state: &AppState) -> Option<CachedApiKeyPrincipal> {
+    let key_hash = format!("{:x}", Sha256::digest(token.as_bytes()));
+    if let Some(principal) = state.api_key_cache.get(&key_hash) {
+        return Some(principal);
+    }
+
+    let pool = state
+        .auth_pool
+        .as_ref()
+        .or_else(|| state.service.sql_store.as_ref().map(|s| s.pool()))?;
+
+    let row = sqlx::query(
+        "SELECT user_id, group_id FROM mem_api_keys \
+         WHERE key_hash = ? AND is_active = 1 \
+         AND (expires_at IS NULL OR expires_at > NOW(6))",
+    )
+    .bind(&key_hash)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| warn!("cached_or_db_principal: DB query failed: {e}"))
+    .ok()??;
+
+    let principal = CachedApiKeyPrincipal {
+        user_id: row.try_get("user_id").ok()?,
+        group_id: row.try_get("group_id").ok().flatten(),
+    };
+    state.api_key_cache.insert(
+        key_hash,
+        principal.user_id.clone(),
+        principal.group_id.clone(),
+    );
+    Some(principal)
+}
+
+async fn group_main_write_allowed_for_solo_owner(
+    state: &AppState,
+    group_id: &str,
+    user_id: &str,
+) -> bool {
+    let Some(pool) = state
+        .auth_pool
+        .as_ref()
+        .or_else(|| state.service.sql_store.as_ref().map(|s| s.pool()))
+    else {
+        return false;
+    };
+
+    let row = match sqlx::query(
+        "SELECT g.owner_user_id, CAST(COUNT(m.user_id) AS SIGNED) AS active_member_count \
+         FROM mem_groups g \
+         JOIN mem_group_members m ON g.group_id = m.group_id AND m.is_active = 1 \
+         WHERE g.group_id = ? AND g.status = 'active' \
+         GROUP BY g.owner_user_id \
+         LIMIT 1",
+    )
+    .bind(group_id)
+    .fetch_optional(pool)
+    .await
+    {
+        Ok(row) => row,
+        Err(e) => {
+            warn!("group_main_write_allowed_for_solo_owner: DB query failed: {e}");
+            return false;
+        }
+    };
+
+    let Some(row) = row else {
+        return false;
+    };
+
+    let Ok(owner_user_id) = row.try_get::<String, _>("owner_user_id") else {
+        return false;
+    };
+    let Ok(active_member_count) = row.try_get::<i64, _>("active_member_count") else {
+        return false;
+    };
+
+    owner_user_id == user_id && active_member_count == 1
+}
+
+// ── Group main-write guard (middleware) ──────────────────────────────────────
+
+/// Axum middleware that rejects write requests to `main` in group mode.
+///
+/// Applied as a route-layer on all memory-write endpoints so that individual
+/// handlers never need to call `reject_group_main_writes` manually.
+/// The token is resolved from the in-memory cache (no extra DB round-trip
+/// for the auth lookup itself).
+pub async fn group_main_write_guard(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    req: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
+    // Extract bearer token from Authorization header
+    let principal = req
+        .headers()
+        .get("Authorization")
+        .and_then(|v| v.to_str().ok())
+        .filter(|v| v.starts_with("Bearer "))
+        .map(|v| v[7..].to_string());
+
+    if let Some(token) = principal {
+        let master_match = !state.master_key.is_empty()
+            && token.len() == state.master_key.len()
+            && token.as_bytes().ct_eq(state.master_key.as_bytes()).into();
+        if master_match {
+            return next.run(req).await;
+        }
+        if let Some(p) = cached_or_db_principal(&token, &state)
+            .await
+            .filter(|p| p.group_id.is_some())
+        {
+            let gid = p.group_id.as_ref().unwrap();
+            // Set task-local so active_branch_name resolves per-member state
+            let user_id = p.user_id.clone();
+            // Check whether the user's active branch is `main`
+            if let Ok(sql) = state.service.user_sql_store(gid).await {
+                let branch = memoria_storage::ACTOR_USER_ID
+                    .scope(user_id, sql.active_branch_name(gid))
+                    .await;
+                if let Ok(branch) = branch {
+                    if branch == "main" {
+                        if group_main_write_allowed_for_solo_owner(&state, gid, &p.user_id).await {
+                            return next.run(req).await;
+                        }
+                        return (
+                            StatusCode::FORBIDDEN,
+                            "main is read-only in group mode; \
+                             create or checkout a branch, then use selective apply"
+                                .to_string(),
+                        )
+                            .into_response();
+                    }
+                }
+            }
+        }
+    }
+
+    next.run(req).await
+}
+
+/// Axum middleware that blocks native merge in group mode.
+///
+/// Applied only to the `/v1/branches/:name/merge` route.
+pub async fn group_merge_guard(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    req: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
+    let token = req
+        .headers()
+        .get("Authorization")
+        .and_then(|v| v.to_str().ok())
+        .filter(|v| v.starts_with("Bearer "))
+        .map(|v| v[7..].to_string());
+
+    if let Some(token) = token {
+        let master_match = !state.master_key.is_empty()
+            && token.len() == state.master_key.len()
+            && token.as_bytes().ct_eq(state.master_key.as_bytes()).into();
+        if !master_match
+            && cached_or_db_principal(&token, &state)
+                .await
+                .and_then(|p| p.group_id)
+                .is_some()
+        {
+            return (
+                StatusCode::FORBIDDEN,
+                "native branch merge is disabled in group mode; use selective apply instead"
+                    .to_string(),
+            )
+                .into_response();
+        }
+    }
+
+    next.run(req).await
+}
+
+// ── Actor scope middleware ───────────────────────────────────────────────────
+
+/// Axum middleware that sets the `ACTOR_USER_ID` task-local for group-scoped
+/// requests.  This lets the storage layer key per-user state (active branch)
+/// on the real human user rather than the group scope ID.
+pub async fn actor_scope_layer(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    req: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let token = req
+        .headers()
+        .get("Authorization")
+        .and_then(|v| v.to_str().ok())
+        .filter(|v| v.starts_with("Bearer "))
+        .map(|v| v[7..].to_string());
+
+    if let Some(token) = token {
+        let master_match = !state.master_key.is_empty()
+            && token.len() == state.master_key.len()
+            && token.as_bytes().ct_eq(state.master_key.as_bytes()).into();
+        if master_match {
+            return next.run(req).await;
+        }
+        if let Some(uid) = cached_or_db_principal(&token, &state)
+            .await
+            .and_then(|p| p.group_id.as_ref().map(|_| p.user_id))
+        {
+            return memoria_storage::ACTOR_USER_ID
+                .scope(uid, next.run(req))
+                .await;
+        }
+    }
+
+    next.run(req).await
 }
 
 #[derive(Deserialize)]
@@ -686,7 +918,7 @@ impl FromRequestParts<AppState> for AuthUser {
                 // fall through
             }
             // 2) API key — user_id resolved from DB, never master
-            else if let Some(uid) = validate_api_key(token, state).await {
+            else if let Some((uid, group_id)) = validate_api_key(token, state).await {
                 if let Some(tool) = tool_name {
                     state.tool_usage_batcher.mark_used(uid.clone(), tool);
                 }
@@ -698,8 +930,11 @@ impl FromRequestParts<AppState> for AuthUser {
                         *guard = Some(uid.clone());
                     }
                 }
+                let scope_id = group_id.clone().unwrap_or_else(|| uid.clone());
                 return Ok(AuthUser {
                     user_id: uid,
+                    scope_id,
+                    group_id,
                     is_master: false,
                 });
             } else {
@@ -743,6 +978,8 @@ impl FromRequestParts<AppState> for AuthUser {
         }
 
         Ok(AuthUser {
+            scope_id: user_id.clone(),
+            group_id: None,
             user_id,
             is_master: true,
         })
@@ -755,7 +992,7 @@ impl FromRequestParts<AppState> for AuthUser {
 /// Uses a dedicated auth connection pool so that auth validation is never
 /// blocked by slow business queries on the main pool.
 /// `last_used_at` is updated via batched writes (see [`LastUsedBatcher`]).
-async fn validate_api_key(token: &str, state: &AppState) -> Option<String> {
+async fn validate_api_key(token: &str, state: &AppState) -> Option<(String, Option<String>)> {
     state.service.sql_store.as_ref()?;
     let key_hash = format!("{:x}", Sha256::digest(token.as_bytes()));
 
@@ -765,11 +1002,15 @@ async fn validate_api_key(token: &str, state: &AppState) -> Option<String> {
         return None;
     }
 
-    // Check cache first — no DB hit at all
-    if let Some(user_id) = state.api_key_cache.get(&key_hash) {
+    // Check cache first — no DB hit at all.
+    // Note: cached entries skip the membership check below.  This is acceptable
+    // because (a) cache TTL is 5 min, and (b) remove_member / delete_group invalidate
+    // the cache for revoked keys.  The DB-level check on cache miss is the
+    // authoritative membership gate.
+    if let Some(principal) = state.api_key_cache.get(&key_hash) {
         // Still enqueue last_used_at update (batched, no DB pressure)
         state.last_used_batcher.mark_used(key_hash);
-        return Some(user_id);
+        return Some((principal.user_id, principal.group_id));
     }
 
     let Some(pool) = state.auth_pool.as_ref() else {
@@ -778,7 +1019,7 @@ async fn validate_api_key(token: &str, state: &AppState) -> Option<String> {
     };
 
     let row = sqlx::query(
-        "SELECT user_id FROM mem_api_keys \
+        "SELECT user_id, group_id FROM mem_api_keys \
          WHERE key_hash = ? AND is_active = 1 \
          AND (expires_at IS NULL OR expires_at > NOW(6))",
     )
@@ -789,16 +1030,45 @@ async fn validate_api_key(token: &str, state: &AppState) -> Option<String> {
     .ok()??;
 
     let user_id: String = row.try_get("user_id").ok()?;
+    let group_id: Option<String> = row.try_get("group_id").ok().flatten();
+
+    // Enforce real-time group membership: even if the key references a group,
+    // the user must still be an active member in `mem_group_members` and the
+    // group must be active.  This prevents access after member removal (the
+    // key-revocation path is eventually-consistent; this check is the
+    // authoritative gate).
+    if let Some(gid) = &group_id {
+        let cnt: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM mem_groups g \
+             JOIN mem_group_members m ON g.group_id = m.group_id \
+             WHERE g.group_id = ? AND g.status = 'active' \
+             AND m.user_id = ? AND m.is_active = 1",
+        )
+        .bind(gid)
+        .bind(&user_id)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| warn!("validate_api_key: membership check failed: {e}"))
+        .ok()?;
+        if cnt == 0 {
+            warn!(
+                user_id = %user_id,
+                group_id = %gid,
+                "auth: user not a member of group (or group inactive)"
+            );
+            return None;
+        }
+    }
 
     // Cache the result (TTL 5 min)
     state
         .api_key_cache
-        .insert(key_hash.clone(), user_id.clone());
+        .insert(key_hash.clone(), user_id.clone(), group_id.clone());
 
     // Enqueue batched last_used_at update — zero DB pressure on hot path
     state.last_used_batcher.mark_used(key_hash);
 
-    Some(user_id)
+    Some((user_id, group_id))
 }
 #[cfg(test)]
 mod tests {

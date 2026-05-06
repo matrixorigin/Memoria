@@ -352,7 +352,11 @@ pub async fn health_hygiene_global(
         let mut orphan_stats = 0i64;
 
         for user_id in user_ids {
-            let user_store = state.service.user_sql_store(&user_id).await.map_err(api_err)?;
+            let user_store = state
+                .service
+                .user_sql_store(&user_id)
+                .await
+                .map_err(api_err)?;
             let hygiene = user_store.health_hygiene(&user_id).await.map_err(db_err)?;
             inactive += hygiene["inactive_memories"].as_i64().unwrap_or(0);
             stale_working += hygiene["stale_working_memories"].as_i64().unwrap_or(0);

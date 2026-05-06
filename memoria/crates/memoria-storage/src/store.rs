@@ -12,6 +12,16 @@ use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+tokio::task_local! {
+    /// Real user ID for per-user state (active branch).
+    /// In group mode the "user_id" flowing through the service layer is the
+    /// group's scope_id (e.g. "grp_xxx").  The task-local carries the **real**
+    /// human user so that `active_branch_name` / `set_active_branch` key on
+    /// the individual, not the group.  In non-group mode this is never set and
+    /// the functions fall back to the passed `user_id`.
+    pub static ACTOR_USER_ID: String;
+}
+
 pub(crate) fn db_err(e: sqlx::Error) -> MemoriaError {
     if let Some(kind) = detect_connection_anomaly(&e) {
         record_connection_anomaly(kind);
@@ -1080,6 +1090,7 @@ impl SqlMemoryStore {
             r#"CREATE TABLE IF NOT EXISTS {memories_table} (
                 memory_id       VARCHAR(64)  PRIMARY KEY,
                 user_id         VARCHAR(64)  NOT NULL,
+                author_id       VARCHAR(64)  DEFAULT NULL,
                 memory_type     VARCHAR(20)  NOT NULL,
                 content         TEXT         NOT NULL,
                 embedding       vecf32({dim}),
@@ -1096,6 +1107,7 @@ impl SqlMemoryStore {
                 INDEX idx_user_active (user_id, is_active, memory_type),
                 INDEX idx_user_session (user_id, session_id),
                 INDEX idx_memories_user_observed (user_id, observed_at),
+                INDEX idx_author (author_id),
                 FULLTEXT INDEX ft_content (content) WITH PARSER ngram -- MO#23861: breaks on concurrent snapshot restore
             )"#,
             memories_table = memories_table,
@@ -1517,6 +1529,18 @@ impl SqlMemoryStore {
         .execute(pool)
         .await;
 
+        // author_id column — tracks the real human author in group mode
+        let _ = sqlx::query(&format!(
+            "ALTER TABLE {memories_table} ADD COLUMN author_id VARCHAR(64) DEFAULT NULL AFTER user_id"
+        ))
+        .execute(pool)
+        .await;
+        let _ = sqlx::query(&format!(
+            "ALTER TABLE {memories_table} ADD INDEX idx_author (author_id)"
+        ))
+        .execute(pool)
+        .await;
+
         Ok(())
     }
 
@@ -1573,6 +1597,7 @@ impl SqlMemoryStore {
             r#"CREATE TABLE IF NOT EXISTS mem_api_keys (
                 key_id       VARCHAR(36)  NOT NULL,
                 user_id      VARCHAR(64)  NOT NULL,
+                group_id     VARCHAR(64)  DEFAULT NULL,
                 name         VARCHAR(100) NOT NULL,
                 key_hash     VARCHAR(64)  NOT NULL,
                 key_prefix   VARCHAR(12)  NOT NULL,
@@ -1582,7 +1607,47 @@ impl SqlMemoryStore {
                 last_used_at DATETIME(6)  DEFAULT NULL,
                 PRIMARY KEY (key_id),
                 KEY idx_key_hash (key_hash),
-                KEY idx_user_active (user_id, is_active)
+                KEY idx_user_active (user_id, is_active),
+                KEY idx_group_active (group_id, is_active)
+            )"#,
+        )
+        .execute(&mut *conn)
+        .await
+        .map_err(db_err)?;
+
+        let key_group_col_exists: Option<i64> = sqlx::query_scalar(
+            "SELECT 1 FROM information_schema.columns \
+             WHERE table_schema = DATABASE() AND table_name = 'mem_api_keys' AND column_name = 'group_id' \
+             LIMIT 1",
+        )
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(db_err)?;
+        if key_group_col_exists.is_none() {
+            let alter = sqlx::query(
+                "ALTER TABLE mem_api_keys ADD COLUMN group_id VARCHAR(64) DEFAULT NULL",
+            );
+            if let Err(e) = alter.execute(&mut *conn).await {
+                if !is_duplicate_column(&e) {
+                    return Err(db_err(e));
+                }
+            }
+            let alter_idx = sqlx::query(
+                "ALTER TABLE mem_api_keys ADD KEY idx_group_active (group_id, is_active)",
+            );
+            let _ = alter_idx.execute(&mut *conn).await;
+        }
+
+        sqlx::query(
+            r#"CREATE TABLE IF NOT EXISTS mem_groups (
+                group_id      VARCHAR(64)  PRIMARY KEY,
+                group_name    VARCHAR(128) NOT NULL,
+                db_name       VARCHAR(128) NOT NULL UNIQUE,
+                owner_user_id VARCHAR(64)  NOT NULL,
+                status        VARCHAR(20)  NOT NULL DEFAULT 'active',
+                created_at    DATETIME(6)  NOT NULL,
+                updated_at    DATETIME(6)  NOT NULL,
+                KEY idx_group_status (status)
             )"#,
         )
         .execute(&mut *conn)
@@ -1834,6 +1899,23 @@ impl SqlMemoryStore {
         .await
         .map_err(db_err)?;
 
+        sqlx::query(
+            r#"CREATE TABLE IF NOT EXISTS mem_group_members (
+                group_id     VARCHAR(64)  NOT NULL,
+                user_id      VARCHAR(64)  NOT NULL,
+                display_name VARCHAR(128) DEFAULT NULL,
+                role         VARCHAR(20)  NOT NULL DEFAULT 'member',
+                is_active    TINYINT(1)   NOT NULL DEFAULT 1,
+                joined_at    DATETIME(6)  NOT NULL,
+                removed_at   DATETIME(6)  DEFAULT NULL,
+                PRIMARY KEY (group_id, user_id),
+                INDEX idx_user_active (user_id, is_active)
+            )"#,
+        )
+        .execute(&mut *conn)
+        .await
+        .map_err(db_err)?;
+
         Ok(())
     }
 
@@ -1956,7 +2038,7 @@ impl SqlMemoryStore {
             }
         }
         if let Some(router) = self.db_router.clone() {
-            match router.routed_store_for_user(user_id) {
+            match router.scope_store(user_id).await {
                 Ok(store) => {
                     let _ = store
                         .insert_edit_log_direct(
@@ -2054,7 +2136,7 @@ impl SqlMemoryStore {
             let mut first_err = None;
             let mut flushed_any = false;
             for (user_id, user_entries) in by_user {
-                match router.routed_store_for_user(user_id) {
+                match router.scope_store(user_id).await {
                     Ok(store) => match store.flush_edit_log_batch_direct(&user_entries).await {
                         Ok(()) => flushed_any = true,
                         Err(err) => {
@@ -2145,12 +2227,22 @@ impl SqlMemoryStore {
 
     // ── Branch state ──────────────────────────────────────────────────────────
 
+    /// Resolve the user ID for per-user state (active branch).
+    /// In group mode `ACTOR_USER_ID` carries the real human user;
+    /// in personal mode the task-local is unset and we fall back to `scope_id`.
+    fn state_user<'a>(&self, scope_id: &'a str) -> Cow<'a, str> {
+        ACTOR_USER_ID
+            .try_with(|id| Cow::Owned(id.clone()))
+            .unwrap_or(Cow::Borrowed(scope_id))
+    }
+
     pub async fn active_branch_name(&self, user_id: &str) -> Result<String, MemoriaError> {
+        let state_user = self.state_user(user_id);
         let user_state_table = self.t("mem_user_state");
         let row = sqlx::query(&format!(
             "SELECT active_branch FROM {user_state_table} WHERE user_id = ?"
         ))
-        .bind(user_id)
+        .bind(state_user.as_ref())
         .fetch_optional(&self.pool)
         .await
         .map_err(db_err)?;
@@ -2162,8 +2254,11 @@ impl SqlMemoryStore {
     }
 
     /// Returns the active table name for a user: "mem_memories" or branch table name.
+    /// Uses `ACTOR_USER_ID` (task-local) for the per-user active-branch state,
+    /// and `user_id` (the scope) for looking up the branch's table in `mem_branches`.
     pub async fn active_table(&self, user_id: &str) -> Result<String, MemoriaError> {
-        if let Some(cached) = self.active_table_cache.get(user_id) {
+        let cache_key = self.state_user(user_id);
+        if let Some(cached) = self.active_table_cache.get(cache_key.as_ref()) {
             return Ok(cached);
         }
 
@@ -2172,10 +2267,11 @@ impl SqlMemoryStore {
         if branch == "main" {
             let table = self.t("mem_memories");
             self.active_table_cache
-                .insert(user_id.to_string(), table.clone());
+                .insert(cache_key.into_owned(), table.clone());
             return Ok(table);
         }
 
+        // Branch metadata is owned by the scope (group_id or user_id), not the actor.
         let branches_table = self.t("mem_branches");
         let branch_row = sqlx::query(&format!(
             "SELECT table_name FROM {branches_table} WHERE user_id = ? AND name = ? AND status = 'active'"
@@ -2190,20 +2286,21 @@ impl SqlMemoryStore {
             Some(r) => {
                 let table = self.t(&r.try_get::<String, _>("table_name").map_err(db_err)?);
                 self.active_table_cache
-                    .insert(user_id.to_string(), table.clone());
+                    .insert(cache_key.into_owned(), table.clone());
                 Ok(table)
             }
             None => {
                 self.set_active_branch(user_id, "main").await?;
                 let table = self.t("mem_memories");
                 self.active_table_cache
-                    .insert(user_id.to_string(), table.clone());
+                    .insert(cache_key.into_owned(), table.clone());
                 Ok(table)
             }
         }
     }
 
     pub async fn set_active_branch(&self, user_id: &str, branch: &str) -> Result<(), MemoriaError> {
+        let state_user = self.state_user(user_id);
         let user_state_table = self.t("mem_user_state");
         let now = Utc::now().naive_utc();
         sqlx::query(&format!(
@@ -2211,7 +2308,7 @@ impl SqlMemoryStore {
                VALUES (?, ?, ?)
                ON DUPLICATE KEY UPDATE active_branch = ?, updated_at = ?"#,
         ))
-        .bind(user_id)
+        .bind(state_user.as_ref())
         .bind(branch)
         .bind(now)
         .bind(branch)
@@ -2219,12 +2316,17 @@ impl SqlMemoryStore {
         .execute(&self.pool)
         .await
         .map_err(db_err)?;
-        self.active_table_cache.invalidate(user_id);
+        self.active_table_cache.invalidate(state_user.as_ref());
         Ok(())
     }
 
     pub async fn invalidate_user_caches(&self, user_id: &str) {
+        // Invalidate both the scope key and (if different) the actor key
         self.active_table_cache.invalidate(user_id);
+        let state_user = self.state_user(user_id);
+        if state_user.as_ref() != user_id {
+            self.active_table_cache.invalidate(state_user.as_ref());
+        }
 
         // Keep rollback reconciliation scoped to the known per-user governance cooldowns.
         for operation in [
@@ -4139,7 +4241,7 @@ impl SqlMemoryStore {
         for chunk in ids.chunks(500) {
             let ph = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
             let sql = format!(
-                "SELECT memory_id, user_id, memory_type, content, \
+                "SELECT memory_id, user_id, author_id, memory_type, content, \
                  embedding AS emb_str, session_id, \
                  CAST(source_event_ids AS CHAR) AS src_ids, \
                  CAST(extra_metadata AS CHAR) AS extra_meta, \
@@ -4317,7 +4419,7 @@ impl SqlMemoryStore {
         memory_id: &str,
     ) -> Result<Option<Memory>, MemoriaError> {
         let row = sqlx::query(&format!(
-            "SELECT memory_id, user_id, memory_type, content, \
+            "SELECT memory_id, user_id, author_id, memory_type, content, \
              embedding AS emb_str, session_id, \
              CAST(source_event_ids AS CHAR) AS src_ids, \
              CAST(extra_metadata AS CHAR) AS extra_meta, \
@@ -4371,13 +4473,14 @@ impl SqlMemoryStore {
 
         sqlx::query(&format!(
             r#"INSERT INTO {table}
-               (memory_id, user_id, memory_type, content, embedding, session_id,
+               (memory_id, user_id, author_id, memory_type, content, embedding, session_id,
                 source_event_ids, extra_metadata, is_active, superseded_by,
                 trust_tier, initial_confidence, observed_at, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)"#
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)"#
         ))
         .bind(&memory.memory_id)
         .bind(&memory.user_id)
+        .bind(memory.author_id.as_deref())
         .bind(memory.memory_type.to_string())
         .bind(&memory.content)
         .bind(embedding)
@@ -4410,12 +4513,12 @@ impl SqlMemoryStore {
         for chunk in memories.chunks(50) {
             let placeholders = chunk
                 .iter()
-                .map(|_| "(?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)")
+                .map(|_| "(?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)")
                 .collect::<Vec<_>>()
                 .join(", ");
             let sql = format!(
                 "INSERT INTO {table} \
-                 (memory_id, user_id, memory_type, content, embedding, session_id, \
+                 (memory_id, user_id, author_id, memory_type, content, embedding, session_id, \
                   source_event_ids, extra_metadata, is_active, superseded_by, \
                   trust_tier, initial_confidence, observed_at, created_at, updated_at) \
                  VALUES {placeholders}"
@@ -4440,6 +4543,7 @@ impl SqlMemoryStore {
                 q = q
                     .bind(m.memory_id.clone())
                     .bind(m.user_id.clone())
+                    .bind(m.author_id.clone())
                     .bind(m.memory_type.to_string())
                     .bind(m.content.clone())
                     .bind(embedding)
@@ -4465,7 +4569,7 @@ impl SqlMemoryStore {
         limit: i64,
     ) -> Result<Vec<Memory>, MemoriaError> {
         let rows = sqlx::query(&format!(
-            "SELECT memory_id, user_id, memory_type, content, \
+            "SELECT memory_id, user_id, author_id, memory_type, content, \
              embedding AS emb_str, session_id, \
              CAST(source_event_ids AS CHAR) AS src_ids, \
              CAST(extra_metadata AS CHAR) AS extra_meta, \
@@ -4483,6 +4587,10 @@ impl SqlMemoryStore {
         .await
         .map_err(db_err)?;
         rows.iter().map(row_to_memory).collect()
+    }
+
+    pub fn qualified_table(&self, table: &str) -> String {
+        self.t(table)
     }
 
     /// Lightweight list for API responses — skips embedding, source_event_ids,
@@ -4514,7 +4622,7 @@ impl SqlMemoryStore {
         inner.push_str(" ORDER BY memory_id DESC LIMIT ?");
 
         let sql = format!(
-            "SELECT memory_id, user_id, memory_type, content, \
+            "SELECT memory_id, user_id, author_id, memory_type, content, \
              session_id, is_active, superseded_by, trust_tier, \
              initial_confidence, observed_at, created_at, updated_at \
              FROM {table} WHERE memory_id IN ({inner}) \
@@ -4658,7 +4766,7 @@ impl SqlMemoryStore {
         // Use OR semantics (no + prefix) — AND is too strict for natural language queries
         // because stopwords are removed from the index but +stopword still requires a match.
         let sql = format!(
-            "SELECT memory_id, user_id, memory_type, content, \
+            "SELECT memory_id, user_id, author_id, memory_type, content, \
              embedding AS emb_str, session_id, \
              CAST(source_event_ids AS CHAR) AS src_ids, \
              CAST(extra_metadata AS CHAR) AS extra_meta, \
@@ -4767,7 +4875,7 @@ impl SqlMemoryStore {
                 None => format!("LIMIT {limit}"),
             };
             format!(
-                "SELECT memory_id, user_id, memory_type, content, \
+                "SELECT memory_id, user_id, author_id, memory_type, content, \
                  session_id, \
                  CAST(source_event_ids AS CHAR) AS src_ids, \
                  CAST(extra_metadata AS CHAR) AS extra_meta, \
@@ -5395,7 +5503,7 @@ impl MemoryStore for SqlMemoryStore {
     async fn get(&self, memory_id: &str) -> Result<Option<Memory>, MemoriaError> {
         let table = self.t("mem_memories");
         let row = sqlx::query(&format!(
-            "SELECT memory_id, user_id, memory_type, content, \
+            "SELECT memory_id, user_id, author_id, memory_type, content, \
              embedding AS emb_str, session_id, \
              CAST(source_event_ids AS CHAR) AS src_ids, \
              CAST(extra_metadata AS CHAR) AS extra_meta, \
@@ -5503,6 +5611,9 @@ fn row_to_memory_base(row: &sqlx::mysql::MySqlRow) -> Result<Memory, MemoriaErro
     Ok(Memory {
         memory_id: row.try_get("memory_id").map_err(db_err)?,
         user_id: row.try_get("user_id").map_err(db_err)?,
+        author_id: row
+            .try_get::<Option<String>, _>("author_id")
+            .unwrap_or(None),
         memory_type: MemoryType::from_str(&memory_type_str)?,
         content: row.try_get("content").map_err(db_err)?,
         initial_confidence: row

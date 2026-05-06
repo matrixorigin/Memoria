@@ -344,7 +344,9 @@ async fn test_delete_single_verify_db() {
 
     // Before delete: active
     assert_eq!(
-        db_get_memory(&server, &uid, &mid).await.get::<i8, _>("is_active"),
+        db_get_memory(&server, &uid, &mid)
+            .await
+            .get::<i8, _>("is_active"),
         1
     );
 
@@ -409,7 +411,9 @@ async fn test_purge_bulk_verify_db() {
     // DB: 3 deactivated, 1 still active
     for mid in &ids[..3] {
         assert_eq!(
-            db_get_memory(&server, &uid, mid).await.get::<i8, _>("is_active"),
+            db_get_memory(&server, &uid, mid)
+                .await
+                .get::<i8, _>("is_active"),
             0
         );
     }
@@ -2014,7 +2018,11 @@ async fn test_full_user_workflow() {
         0
     );
     assert_eq!(
-        db_opt(&db_get_memory(&server, &uid, &pref_mid).await, "superseded_by").as_deref(),
+        db_opt(
+            &db_get_memory(&server, &uid, &pref_mid).await,
+            "superseded_by"
+        )
+        .as_deref(),
         Some(new_pref_mid.as_str())
     );
     assert_eq!(
