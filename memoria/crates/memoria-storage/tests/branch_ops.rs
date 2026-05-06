@@ -37,6 +37,7 @@ fn make_memory(user_id: &str, content: &str) -> Memory {
         observed_at: None,
         created_at: None,
         updated_at: None,
+        author_id: None,
     }
 }
 
