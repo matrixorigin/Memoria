@@ -1125,7 +1125,10 @@ async fn test_batch_upsert_entities_user_isolation() {
 
     let entities: Vec<(&str, &str, &str)> = vec![("rust", "Rust", "tech")];
     let r1 = store.batch_upsert_entities(&uid1, &entities).await.unwrap();
-    let r2 = store2.batch_upsert_entities(&uid2, &entities).await.unwrap();
+    let r2 = store2
+        .batch_upsert_entities(&uid2, &entities)
+        .await
+        .unwrap();
 
     // Same name, different users → different entity_ids
     assert_ne!(
@@ -1399,9 +1402,12 @@ async fn test_governance_cleans_orphan_graph_data() {
         updated_at: None,
         access_count: 0,
         retrieval_score: None,
+        author_id: None,
     };
     let memories_table = sql.t("mem_memories");
-    sql.insert_into(&memories_table, &mem).await.expect("insert");
+    sql.insert_into(&memories_table, &mem)
+        .await
+        .expect("insert");
 
     // Create graph node + entity links pointing to this memory
     let graph = sql.graph_store();

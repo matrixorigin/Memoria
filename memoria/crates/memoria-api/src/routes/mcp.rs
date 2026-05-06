@@ -133,14 +133,12 @@ pub async fn mcp_handler(
                 RpcMeta::err($code),
             );
             if let Some(reporter) = &state.stats_reporter {
-                reporter.report(
-                    memoria_service::stats_reporter::StatsEvent::ApiCallLogged {
-                        user_id: auth.user_id.clone(),
-                        path: $path.to_string(),
-                        is_mcp: true,
-                        is_success: false,
-                    },
-                );
+                reporter.report(memoria_service::stats_reporter::StatsEvent::ApiCallLogged {
+                    user_id: auth.user_id.clone(),
+                    path: $path.to_string(),
+                    is_mcp: true,
+                    is_success: false,
+                });
             }
             return Json($body).into_response();
         }};
@@ -206,6 +204,7 @@ pub async fn mcp_handler(
         None
     };
     let user_id = auth.user_id.clone();
+    let scope_id = auth.scope_id.clone();
     if let Some(tool) = tracked_tool.clone() {
         state.tool_usage_batcher.mark_used(user_id.clone(), tool);
     }
@@ -235,7 +234,7 @@ pub async fn mcp_handler(
             params,
             state.service.clone(),
             state.git.clone(),
-            user_id.clone(),
+            scope_id.clone(),
         )
         .await;
         let rpc = match &dispatch_result {
@@ -244,7 +243,7 @@ pub async fn mcp_handler(
         };
         if dispatch_result.is_ok() {
             if let Some(mask) = tracked_tool.as_deref().and_then(mcp_tool_dirty_mask) {
-                spawn_metrics_dirty_mark(state.clone(), user_id.clone(), mask);
+                spawn_metrics_dirty_mark(state.clone(), scope_id.clone(), mask);
             }
         }
         // Report accurate ops metrics using the real RPC path and success flag
@@ -270,7 +269,7 @@ pub async fn mcp_handler(
         params,
         state.service.clone(),
         state.git.clone(),
-        user_id.clone(),
+        scope_id.clone(),
     )
     .await
     {
@@ -294,7 +293,7 @@ pub async fn mcp_handler(
 
     if rpc.success {
         if let Some(mask) = tracked_tool.as_deref().and_then(mcp_tool_dirty_mask) {
-            spawn_metrics_dirty_mark(state.clone(), user_id.clone(), mask);
+            spawn_metrics_dirty_mark(state.clone(), scope_id.clone(), mask);
         }
     }
 

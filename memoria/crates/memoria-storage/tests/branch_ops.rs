@@ -37,6 +37,7 @@ fn make_memory(user_id: &str, content: &str) -> Memory {
         observed_at: None,
         created_at: None,
         updated_at: None,
+        author_id: None,
     }
 }
 
@@ -65,6 +66,7 @@ async fn create_branch_table(pool: &sqlx::MySqlPool, table: &str, dim: usize) {
             observed_at     DATETIME(6)  NOT NULL,
             created_at      DATETIME(6)  NOT NULL,
             updated_at      DATETIME(6),
+            author_id       VARCHAR(64),
             INDEX idx_user_active (user_id, is_active, memory_type)
         )"#
     );
@@ -505,8 +507,9 @@ async fn test_merge_not_insert_ignore_select_star() {
     assert_eq!(rows[0].content, "memory with embedding");
     println!("✅ regression: merge with vecf32 embedding inserts correctly");
 
-    // Document the broken pattern: INSERT IGNORE correctly skips rows with duplicate
-    // memory_id (PK conflict). The fix (NOT EXISTS) is equivalent but more explicit.
+    // Document the broken pattern: INSERT IGNORE SELECT * can fail due to column
+    // order mismatch (e.g. vecf32 cast error) or silently skip PK conflicts.
+    // The correct approach always uses explicit column lists (as above).
     let broken_sql =
         format!("INSERT IGNORE INTO mem_memories SELECT * FROM {branch_table} WHERE user_id = ?");
     sqlx::query("DELETE FROM mem_memories WHERE user_id = ?")
@@ -514,17 +517,21 @@ async fn test_merge_not_insert_ignore_select_star() {
         .execute(store.pool())
         .await
         .ok();
-    let broken_res = sqlx::query(&broken_sql)
+    match sqlx::query(&broken_sql)
         .bind(&user)
         .execute(store.pool())
         .await
-        .expect("broken merge");
-    // INSERT IGNORE works here because there's no PK conflict (fresh delete above).
-    // The production issue was memory_id already existing in main (stored before checkout).
-    println!(
-        "ℹ️  INSERT IGNORE SELECT * rowcount={} (correct fix uses NOT EXISTS instead)",
-        broken_res.rows_affected()
-    );
+    {
+        Ok(broken_res) => {
+            println!(
+                "ℹ️  INSERT IGNORE SELECT * rowcount={} (correct fix uses NOT EXISTS instead)",
+                broken_res.rows_affected()
+            );
+        }
+        Err(e) => {
+            println!("ℹ️  INSERT IGNORE SELECT * failed as expected: {e}");
+        }
+    }
 
     // Cleanup
     sqlx::raw_sql(&format!("DROP TABLE IF EXISTS {branch_table}"))

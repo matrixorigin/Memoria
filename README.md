@@ -414,6 +414,7 @@ make test            # Run all tests
 make release VERSION=0.2.0   # Bump, tag, push
 ```
 
+
 **Developer documentation** (for contributing to Memoria):
 
 | Skill | Description |

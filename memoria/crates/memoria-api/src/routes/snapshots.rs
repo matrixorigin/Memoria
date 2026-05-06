@@ -40,6 +40,13 @@ pub struct DiffSnapshotQuery {
     pub limit: Option<i64>,
 }
 
+#[derive(Deserialize, Default)]
+pub struct DiffBranchItemsQuery {
+    pub limit: Option<i64>,
+}
+
+pub type ApplyBranchRequest = memoria_git::ApplySelection;
+
 /// Delegate to git_tools::call for snapshot/branch operations.
 async fn git_call_text(
     state: &AppState,
@@ -197,6 +204,124 @@ fn format_branch_list_result(branches: &[Value]) -> String {
     format!("Branches:\n{text}")
 }
 
+/// Like `branch_table_name` but returns the raw table name (no db prefix or backticks),
+/// suitable for `data branch diff` which builds its own qualified identifiers.
+async fn branch_table_name_raw(
+    sql: &Arc<memoria_storage::SqlMemoryStore>,
+    scope_id: &str,
+    branch_name: &str,
+) -> Result<String, (StatusCode, String)> {
+    if branch_name == "main" {
+        return Ok("mem_memories".to_string());
+    }
+    for (name, table_name) in sql.list_branches(scope_id).await.map_err(api_err)? {
+        if name == branch_name {
+            return Ok(table_name);
+        }
+    }
+    Err((
+        StatusCode::NOT_FOUND,
+        format!("Branch not found: {branch_name}"),
+    ))
+}
+
+async fn branch_diff_items_payload(
+    state: &AppState,
+    scope_id: &str,
+    branch_name: &str,
+    limit: i64,
+) -> Result<Value, (StatusCode, String)> {
+    let sql = user_snapshot_store(state, scope_id).await?;
+    let git = user_git_service(&sql)?;
+    let branch_table_raw = branch_table_name_raw(&sql, scope_id, branch_name).await?;
+    let limit = limit.clamp(1, 500);
+
+    // Use MatrixOne native `data branch diff` + classify (with source-aware conflict detection)
+    let raw_rows = git
+        .diff_branch_rows(&branch_table_raw, "mem_memories", scope_id, limit * 3)
+        .await
+        .map_err(api_err)?;
+    let classified = memoria_git::classify_diff_rows(raw_rows, &branch_table_raw);
+
+    let item_to_json = |item: &memoria_git::DiffItem| -> Value {
+        json!({
+            "memory_id": item.memory_id,
+            "content": item.content,
+            "memory_type": item.memory_type,
+            "author_id": item.author_id,
+        })
+    };
+
+    let added: Vec<Value> = classified
+        .added
+        .iter()
+        .take(limit as usize)
+        .map(item_to_json)
+        .collect();
+    let updated: Vec<Value> = classified
+        .updated
+        .iter()
+        .take(limit as usize)
+        .map(|pair| {
+            json!({
+                "memory_id": pair.new_memory_id,
+                "content": pair.new_content,
+                "memory_type": pair.memory_type,
+                "old_memory_id": pair.old_memory_id,
+                "old_content": pair.old_content,
+                "author_id": pair.author_id,
+            })
+        })
+        .collect();
+    let removed: Vec<Value> = classified
+        .removed
+        .iter()
+        .take(limit as usize)
+        .map(item_to_json)
+        .collect();
+    let conflicts: Vec<Value> = classified
+        .conflicts
+        .iter()
+        .take(limit as usize)
+        .map(|c| {
+            json!({
+                "memory_id": c.memory_id,
+                "branch": {
+                    "content": c.branch_side.content,
+                    "is_active": c.branch_side.is_active,
+                    "superseded_by": c.branch_side.superseded_by,
+                    "superseded_by_content": c.branch_side.superseded_by_content,
+                    "author_id": c.branch_side.author_id,
+                },
+                "main": {
+                    "content": c.main_side.content,
+                    "is_active": c.main_side.is_active,
+                    "superseded_by": c.main_side.superseded_by,
+                    "superseded_by_content": c.main_side.superseded_by_content,
+                    "author_id": c.main_side.author_id,
+                },
+            })
+        })
+        .collect();
+
+    let behind_main: Vec<Value> = classified
+        .behind_main
+        .iter()
+        .take(limit as usize)
+        .map(item_to_json)
+        .collect();
+
+    Ok(json!({
+        "branch": branch_name,
+        "against": "main",
+        "added": added,
+        "updated": updated,
+        "removed": removed,
+        "conflicts": conflicts,
+        "behind_main": behind_main,
+    }))
+}
+
 fn parse_created_snapshot_result(text: &str) -> Option<(String, String)> {
     let rest = text.strip_prefix("Snapshot '")?;
     let (name, timestamp) = rest.split_once("' created at ")?;
@@ -327,12 +452,12 @@ async fn resolve_snapshot_internal(
 
 pub async fn create_snapshot(
     State(state): State<AppState>,
-    AuthUser { user_id, .. }: AuthUser,
+    auth: AuthUser,
     Json(req): Json<CreateSnapshotRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, String)> {
     let result = git_call_text(
         &state,
-        &user_id,
+        auth.scope_id(),
         "memory_snapshot",
         json!({ "name": req.name }),
     )
@@ -349,16 +474,16 @@ pub async fn create_snapshot(
         body["created_at"] = json!(created_at.clone());
         body["timestamp"] = json!(created_at);
 
-        let sql = user_snapshot_store(&state, &user_id).await?;
+        let sql = user_snapshot_store(&state, auth.scope_id()).await?;
         let snapshots =
-            memoria_mcp::git_tools::visible_snapshots_for_user(&state.service, &user_id)
+            memoria_mcp::git_tools::visible_snapshots_for_user(&state.service, auth.scope_id())
                 .await
                 .map_err(api_err_typed)?;
         if let Some(snapshot) = snapshots
             .iter()
             .find(|snapshot| snapshot.display_name == display_name)
         {
-            body = snapshot_summary_value(&sql, &user_id, snapshot).await?;
+            body = snapshot_summary_value(&sql, auth.scope_id(), snapshot).await?;
             body["description"] = json!(req.description.clone());
             body["result"] = json!(result.clone());
         }
@@ -368,26 +493,26 @@ pub async fn create_snapshot(
 
 pub async fn list_snapshots(
     State(state): State<AppState>,
-    AuthUser { user_id, .. }: AuthUser,
+    auth: AuthUser,
     Query(q): Query<ListSnapshotsQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     Ok(Json(
-        snapshot_list_payload(&state, &user_id, q.limit, q.offset).await?,
+        snapshot_list_payload(&state, auth.scope_id(), q.limit, q.offset).await?,
     ))
 }
 
 /// GET /v1/snapshots/:name — read snapshot detail with time-travel query
 pub async fn get_snapshot(
     State(state): State<AppState>,
-    AuthUser { user_id, .. }: AuthUser,
+    auth: AuthUser,
     Path(name): Path<String>,
     Query(q): Query<GetSnapshotQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let sql = user_snapshot_store(&state, &user_id).await?;
+    let sql = user_snapshot_store(&state, auth.scope_id()).await?;
     let pool = sql.pool();
-    let table = sql.active_table(&user_id).await.map_err(api_err)?;
+    let table = sql.active_table(auth.scope_id()).await.map_err(api_err)?;
 
-    let snap_name = resolve_snapshot_internal(&state, &user_id, &name).await?;
+    let snap_name = resolve_snapshot_internal(&state, auth.scope_id(), &name).await?;
     let limit = q.limit.unwrap_or(50).min(500);
     let offset = q.offset.unwrap_or(0);
     let detail = q.detail.as_deref().unwrap_or("brief");
@@ -397,7 +522,7 @@ pub async fn get_snapshot(
         "SELECT COUNT(*) as cnt FROM {table} {{SNAPSHOT = '{snap_name}'}} WHERE user_id = ? AND is_active > 0"
     );
     let total: i64 = sqlx::query_scalar(&count_sql)
-        .bind(&user_id)
+        .bind(auth.scope_id())
         .fetch_one(pool)
         .await
         .map_err(api_err)?;
@@ -408,7 +533,7 @@ pub async fn get_snapshot(
          WHERE user_id = ? AND is_active > 0 GROUP BY memory_type"
     );
     let type_rows = sqlx::query(&type_sql)
-        .bind(&user_id)
+        .bind(auth.scope_id())
         .fetch_all(pool)
         .await
         .map_err(api_err)?;
@@ -432,7 +557,7 @@ pub async fn get_snapshot(
           WHERE user_id = ? AND is_active > 0 ORDER BY observed_at DESC LIMIT ? OFFSET ?"
     );
     let rows = sqlx::query(&mem_sql)
-        .bind(&user_id)
+        .bind(auth.scope_id())
         .bind(limit)
         .bind(offset)
         .fetch_all(pool)
@@ -494,26 +619,26 @@ pub async fn get_snapshot(
 /// GET /v1/snapshots/:name/diff — compare snapshot vs current state
 pub async fn diff_snapshot(
     State(state): State<AppState>,
-    AuthUser { user_id, .. }: AuthUser,
+    auth: AuthUser,
     Path(name): Path<String>,
     Query(q): Query<DiffSnapshotQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let sql = user_snapshot_store(&state, &user_id).await?;
+    let sql = user_snapshot_store(&state, auth.scope_id()).await?;
     let pool = sql.pool();
-    let table = sql.active_table(&user_id).await.map_err(api_err)?;
+    let table = sql.active_table(auth.scope_id()).await.map_err(api_err)?;
 
-    let snap_name = resolve_snapshot_internal(&state, &user_id, &name).await?;
+    let snap_name = resolve_snapshot_internal(&state, auth.scope_id(), &name).await?;
     let limit = q.limit.unwrap_or(50).min(200);
 
     // Counts
     let snap_count: i64 = sqlx::query_scalar(&format!(
         "SELECT COUNT(*) FROM {table} {{SNAPSHOT = '{snap_name}'}} WHERE user_id = ? AND is_active > 0"
-    )).bind(&user_id).fetch_one(pool).await.map_err(api_err)?;
+    )).bind(auth.scope_id()).fetch_one(pool).await.map_err(api_err)?;
 
     let curr_count: i64 = sqlx::query_scalar(&format!(
         "SELECT COUNT(*) FROM {table} WHERE user_id = ? AND is_active > 0"
     ))
-    .bind(&user_id)
+    .bind(auth.scope_id())
     .fetch_one(pool)
     .await
     .map_err(api_err)?;
@@ -525,7 +650,7 @@ pub async fn diff_snapshot(
           WHERE c.user_id = ? AND c.is_active > 0 AND s.memory_id IS NULL LIMIT ?"
     );
     let added_rows = sqlx::query(&added_sql)
-        .bind(&user_id)
+        .bind(auth.scope_id())
         .bind(limit)
         .fetch_all(pool)
         .await
@@ -538,7 +663,7 @@ pub async fn diff_snapshot(
           WHERE s.user_id = ? AND s.is_active > 0 AND c.memory_id IS NULL LIMIT ?"
     );
     let removed_rows = sqlx::query(&removed_sql)
-        .bind(&user_id)
+        .bind(auth.scope_id())
         .bind(limit)
         .fetch_all(pool)
         .await
@@ -570,12 +695,12 @@ pub async fn diff_snapshot(
 
 pub async fn delete_snapshot(
     State(state): State<AppState>,
-    AuthUser { user_id, .. }: AuthUser,
+    auth: AuthUser,
     Path(name): Path<String>,
 ) -> Result<StatusCode, (StatusCode, String)> {
     git_call(
         &state,
-        &user_id,
+        auth.scope_id(),
         "memory_snapshot_delete",
         json!({ "names": name }),
     )
@@ -585,37 +710,46 @@ pub async fn delete_snapshot(
 
 pub async fn delete_snapshot_bulk(
     State(state): State<AppState>,
-    AuthUser { user_id, .. }: AuthUser,
+    auth: AuthUser,
     Json(req): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let r = git_call(&state, &user_id, "memory_snapshot_delete", req).await?;
+    let r = git_call(&state, auth.scope_id(), "memory_snapshot_delete", req).await?;
     Ok(Json(r))
 }
 
 pub async fn rollback(
     State(state): State<AppState>,
-    AuthUser { user_id, .. }: AuthUser,
+    auth: AuthUser,
     Path(name): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let r = git_call(&state, &user_id, "memory_rollback", json!({ "name": name })).await?;
+    let r = git_call(
+        &state,
+        auth.scope_id(),
+        "memory_rollback",
+        json!({ "name": name }),
+    )
+    .await?;
     Ok(Json(r))
 }
 
 pub async fn list_branches(
     State(state): State<AppState>,
-    AuthUser { user_id, .. }: AuthUser,
+    auth: AuthUser,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let sql = state
         .service
-        .user_sql_store(&user_id)
+        .user_sql_store(auth.scope_id())
         .await
         .map_err(api_err)?;
-    let active_branch = sql.active_branch_name(&user_id).await.map_err(api_err)?;
+    let active_branch = sql
+        .active_branch_name(auth.scope_id())
+        .await
+        .map_err(api_err)?;
     let mut branches = vec![json!({
         "name": "main",
         "active": active_branch == "main",
     })];
-    for (name, _table_name) in sql.list_branches(&user_id).await.map_err(api_err)? {
+    for (name, _table_name) in sql.list_branches(auth.scope_id()).await.map_err(api_err)? {
         branches.push(json!({
             "name": name,
             "active": name == active_branch,
@@ -636,12 +770,12 @@ pub async fn list_branches(
 
 pub async fn create_branch(
     State(state): State<AppState>,
-    AuthUser { user_id, .. }: AuthUser,
+    auth: AuthUser,
     Json(req): Json<CreateBranchRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, String)> {
     let r = git_call(
         &state,
-        &user_id,
+        auth.scope_id(),
         "memory_branch",
         json!({
             "name": req.name,
@@ -650,27 +784,39 @@ pub async fn create_branch(
         }),
     )
     .await?;
+    // MCP returns success with "already exists" text — surface as 409 Conflict
+    if let Some(text) = r["content"][0]["text"].as_str() {
+        if text.contains("already exists") {
+            return Err((StatusCode::CONFLICT, text.to_string()));
+        }
+    }
     Ok((StatusCode::CREATED, Json(r)))
 }
 
 pub async fn checkout_branch(
     State(state): State<AppState>,
-    AuthUser { user_id, .. }: AuthUser,
+    auth: AuthUser,
     Path(name): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let r = git_call(&state, &user_id, "memory_checkout", json!({ "name": name })).await?;
+    let r = git_call(
+        &state,
+        auth.scope_id(),
+        "memory_checkout",
+        json!({ "name": name }),
+    )
+    .await?;
     Ok(Json(r))
 }
 
 pub async fn merge_branch(
     State(state): State<AppState>,
-    AuthUser { user_id, .. }: AuthUser,
+    auth: AuthUser,
     Path(name): Path<String>,
     Json(req): Json<MergeRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let r = git_call(
         &state,
-        &user_id,
+        auth.scope_id(),
         "memory_merge",
         json!({ "source": name, "strategy": req.strategy }),
     )
@@ -680,21 +826,80 @@ pub async fn merge_branch(
 
 pub async fn diff_branch(
     State(state): State<AppState>,
-    AuthUser { user_id, .. }: AuthUser,
+    auth: AuthUser,
     Path(name): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let r = git_call(&state, &user_id, "memory_diff", json!({ "source": name })).await?;
+    let r = git_call(
+        &state,
+        auth.scope_id(),
+        "memory_diff",
+        json!({ "source": name }),
+    )
+    .await?;
     Ok(Json(r))
+}
+
+pub async fn diff_branch_items(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(name): Path<String>,
+    Query(q): Query<DiffBranchItemsQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    Ok(Json(
+        branch_diff_items_payload(&state, auth.scope_id(), &name, q.limit.unwrap_or(100)).await?,
+    ))
+}
+
+pub async fn apply_branch(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(name): Path<String>,
+    Json(req): Json<ApplyBranchRequest>,
+) -> Result<Json<memoria_git::ApplyResult>, (StatusCode, String)> {
+    if name == "main" {
+        return Err((StatusCode::BAD_REQUEST, "Cannot apply from main".into()));
+    }
+    let sql = user_snapshot_store(&state, auth.scope_id()).await?;
+    let git = user_git_service(&sql)?;
+    let branch_table = branch_table_name_raw(&sql, auth.scope_id(), &name).await?;
+    let response = git
+        .selective_apply(&branch_table, "mem_memories", auth.scope_id(), req)
+        .await
+        .map_err(api_err)?;
+    let payload = json!({
+        "actor_user_id": auth.user_id,
+        "group_id": auth.group_id,
+        "source_branch": name,
+        "applied_adds": response.applied_adds.clone(),
+        "applied_updates": response.applied_updates.clone(),
+        "applied_removes": response.applied_removes.clone(),
+        "applied_conflicts": response.applied_conflicts.clone(),
+        "skipped_adds": response.skipped_adds.clone(),
+        "skipped_updates": response.skipped_updates.clone(),
+        "skipped_removes": response.skipped_removes.clone(),
+        "skipped_conflicts": response.skipped_conflicts.clone(),
+    })
+    .to_string();
+    state.service.send_edit_log(
+        auth.scope_id(),
+        "branch_apply",
+        None,
+        Some(&payload),
+        "selective apply to main",
+        None,
+    );
+
+    Ok(Json(response))
 }
 
 pub async fn delete_branch(
     State(state): State<AppState>,
-    AuthUser { user_id, .. }: AuthUser,
+    auth: AuthUser,
     Path(name): Path<String>,
 ) -> Result<StatusCode, (StatusCode, String)> {
     git_call(
         &state,
-        &user_id,
+        auth.scope_id(),
         "memory_branch_delete",
         json!({ "name": name }),
     )

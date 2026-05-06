@@ -53,6 +53,7 @@ fn make_memory(id: &str, content: &str, user_id: &str) -> Memory {
         extra_metadata: None,
         trust_tier: TrustTier::T3Inferred,
         retrieval_score: None,
+        author_id: None,
     }
 }
 

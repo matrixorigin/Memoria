@@ -54,6 +54,7 @@ fn make_memory(id: &str, content: &str, user_id: &str) -> Memory {
         extra_metadata: None,
         trust_tier: TrustTier::T3Inferred,
         retrieval_score: None,
+        author_id: None,
     }
 }
 
@@ -426,6 +427,7 @@ async fn test_all_fields_round_trip() {
         extra_metadata: Some(meta),
         trust_tier: TrustTier::T1Verified,
         retrieval_score: None,
+        author_id: None,
     };
     store.insert(&m).await.expect("insert");
 
@@ -532,6 +534,7 @@ async fn test_null_optional_fields() {
         extra_metadata: None, // NULL JSON
         trust_tier: TrustTier::T3Inferred,
         retrieval_score: None,
+        author_id: None,
     };
     store.insert(&m).await.expect("insert with nulls");
 

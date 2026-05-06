@@ -1,10 +1,10 @@
 ---
-inclusion: auto
-name: memory-branching
-description: Git-like branching for memory - isolated experiments, tech evaluation, A/B comparison. Use when exploring alternatives or risky changes.
+description: USE WHEN evaluating technologies, isolating risky memory changes, or comparing alternative approaches using memory branches
+globs:
+alwaysApply: false
 ---
 
-<!-- memoria-version: 0.1.0-->
+<!-- memoria-version: 0.2.3-->
 
 # Memory Branching Patterns
 

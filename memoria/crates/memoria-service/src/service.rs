@@ -1137,6 +1137,7 @@ impl MemoryService {
         trust_tier: Option<TrustTier>,
         observed_at: Option<DateTime<Utc>>,
         initial_confidence: Option<f64>,
+        author_id: Option<String>,
     ) -> Result<Memory, MemoriaError> {
         let t0 = std::time::Instant::now();
         // Sensitivity check — block HIGH tier, redact MEDIUM tier
@@ -1155,6 +1156,7 @@ impl MemoryService {
         let memory = Memory {
             memory_id: Uuid::now_v7().simple().to_string(),
             user_id: user_id.to_string(),
+            author_id,
             memory_type,
             content: content.to_string(),
             initial_confidence: initial_confidence
@@ -1833,6 +1835,7 @@ impl MemoryService {
                 is_active: true,
                 access_count: 0,
                 retrieval_score: None,
+                author_id: old.author_id.clone(),
             };
 
             sql.insert_into(&table, &new_mem).await?;
@@ -1897,6 +1900,7 @@ impl MemoryService {
                 is_active: true,
                 access_count: 0,
                 retrieval_score: None,
+                author_id: old.author_id.clone(),
             };
 
             self.store.insert(&new_mem).await?;
@@ -2208,6 +2212,7 @@ impl MemoryService {
         &self,
         user_id: &str,
         items: Vec<(String, MemoryType, Option<String>, Option<TrustTier>)>,
+        author_id: Option<String>,
     ) -> Result<Vec<Memory>, MemoriaError> {
         if items.is_empty() {
             return Ok(vec![]);
@@ -2239,6 +2244,7 @@ impl MemoryService {
             let memory = Memory {
                 memory_id: Uuid::now_v7().simple().to_string(),
                 user_id: user_id.to_string(),
+                author_id: author_id.clone(),
                 memory_type: mt,
                 content,
                 initial_confidence: effective_tier.initial_confidence(),
@@ -2386,6 +2392,7 @@ impl MemoryService {
                 extra_metadata: None,
                 trust_tier: TrustTier::T3Inferred,
                 retrieval_score: None,
+                author_id: None,
             });
         }
         result
@@ -2426,6 +2433,7 @@ impl MemoryService {
                     extra_metadata: None,
                     trust_tier: TrustTier::T1Verified,
                     retrieval_score: None,
+                    author_id: None,
                 })
             })
             .collect()
@@ -2532,6 +2540,9 @@ impl MemoryService {
 
     pub async fn user_sql_store(&self, user_id: &str) -> Result<Arc<SqlMemoryStore>, MemoriaError> {
         if let Some(router) = &self.db_router {
+            if user_id.starts_with("grp_") {
+                return router.group_store(user_id).await;
+            }
             router.user_store(user_id).await
         } else {
             self.sql_store

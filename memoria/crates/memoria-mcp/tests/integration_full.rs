@@ -30,7 +30,8 @@ async fn setup() -> (
     String,
     support::multi_db::McpTestContext,
 ) {
-    let ctx = support::multi_db::setup_mcp_context("integration_full", test_dim(), None, None).await;
+    let ctx =
+        support::multi_db::setup_mcp_context("integration_full", test_dim(), None, None).await;
     let uid = format!("integ_{}", &Uuid::new_v4().simple().to_string()[..8]);
     (ctx.service(), ctx.git(), uid, ctx)
 }

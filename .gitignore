@@ -8,6 +8,7 @@ benchmark-*.html
 
 # Environment
 .env
+scripts/.env
 
 # IDE
 .vscode/
