@@ -472,6 +472,7 @@ async fn test_batch_entity_methods() {
         observed_at: Some(chrono::Utc::now()),
         created_at: Some(chrono::Utc::now()),
         updated_at: None,
+        author_id: None,
     };
     let memories_table = store.t("mem_memories");
     store
@@ -590,6 +591,7 @@ async fn test_find_near_duplicate_single_query_same_type_preference() {
         observed_at: Some(chrono::Utc::now()),
         created_at: Some(chrono::Utc::now()),
         updated_at: None,
+        author_id: None,
     };
     let memories_table = store.t("mem_memories");
     store
@@ -618,6 +620,7 @@ async fn test_find_near_duplicate_single_query_same_type_preference() {
         observed_at: Some(chrono::Utc::now()),
         created_at: Some(chrono::Utc::now()),
         updated_at: None,
+        author_id: None,
     };
     store
         .insert_into(&memories_table, &mem_b)
