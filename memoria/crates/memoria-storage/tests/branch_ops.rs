@@ -66,6 +66,7 @@ async fn create_branch_table(pool: &sqlx::MySqlPool, table: &str, dim: usize) {
             observed_at     DATETIME(6)  NOT NULL,
             created_at      DATETIME(6)  NOT NULL,
             updated_at      DATETIME(6),
+            author_id       VARCHAR(64),
             INDEX idx_user_active (user_id, is_active, memory_type)
         )"#
     );
