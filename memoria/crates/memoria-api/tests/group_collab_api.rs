@@ -12,6 +12,7 @@ fn test_dim() -> usize {
 
 fn admin_db_url() -> String {
     std::env::var("GROUP_TEST_ADMIN_DATABASE_URL")
+        .or_else(|_| std::env::var("DATABASE_URL"))
         .unwrap_or_else(|_| "mysql://root:111@127.0.0.1:6666/memoria".to_string())
 }
 
