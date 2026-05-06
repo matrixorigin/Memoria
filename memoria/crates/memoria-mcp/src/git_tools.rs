@@ -1016,7 +1016,7 @@ pub async fn call(
         GitToolCallName::MemoryDiff => {
             expect_tool_args(&args, "memory_diff", &["source", "limit"])?;
             let source_branch = parse_required_string_arg(&args, "memory_diff", "source")?;
-            let limit = parse_optional_i64_arg(&args, "memory_diff", "limit", 50)?;
+            let limit = parse_optional_i64_arg(&args, "memory_diff", "limit", 50)?.clamp(1, 500);
             let sql = svc.user_sql_store(user_id).await?;
             let user_git = git_for_store(&sql)?;
             let branches = sql.list_branches(user_id).await?;

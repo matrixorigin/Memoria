@@ -94,7 +94,7 @@ async fn load_group(
 ) -> Result<Option<GroupEntry>, (StatusCode, String)> {
     let row = sqlx::query(
         "SELECT group_id, group_name, db_name, owner_user_id, status, created_at, updated_at \
-         FROM mem_groups WHERE group_id = ?",
+         FROM mem_groups WHERE group_id = ? AND status = 'active'",
     )
     .bind(group_id)
     .fetch_optional(pool)
@@ -294,6 +294,16 @@ pub async fn create_group(
     let db_name = req
         .db_name
         .unwrap_or_else(|| default_group_db_name(&group_id));
+    if db_name.len() > 128
+        || !db_name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "db_name must be 1-128 chars of [A-Za-z0-9_]".into(),
+        ));
+    }
     let now = chrono::Utc::now().naive_utc();
 
     let mut members = req.members;
@@ -321,49 +331,54 @@ pub async fn create_group(
     .await
     .map_err(api_err)?;
 
-    sqlx::query(
-        "INSERT INTO mem_groups (group_id, group_name, db_name, owner_user_id, status, created_at, updated_at) \
-         VALUES (?, ?, ?, ?, 'active', ?, ?)",
-    )
-    .bind(&group_id)
-    .bind(&req.group_name)
-    .bind(&db_name)
-    .bind(&auth.user_id)
-    .bind(now)
-    .bind(now)
-    .execute(pool)
-    .await
-    .map_err(api_err)?;
-
-    // Insert members into mem_group_members
-    for member in &members {
-        let role = if member == &auth.user_id {
-            "owner"
-        } else {
-            "member"
-        };
+    let setup_result: Result<(), (StatusCode, String)> = async {
         sqlx::query(
-            "INSERT INTO mem_group_members (group_id, user_id, role, is_active, joined_at) \
-             VALUES (?, ?, ?, 1, ?)",
+            "INSERT INTO mem_groups (group_id, group_name, db_name, owner_user_id, status, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, 'active', ?, ?)",
         )
         .bind(&group_id)
-        .bind(member)
-        .bind(role)
+        .bind(&req.group_name)
+        .bind(&db_name)
+        .bind(&auth.user_id)
+        .bind(now)
         .bind(now)
         .execute(pool)
         .await
         .map_err(api_err)?;
-    }
 
-    let group_store = router.routed_store_for_db_name(&db_name).map_err(api_err)?;
-    group_store.migrate_user().await.map_err(api_err)?;
-
-    if let Some(seed) = req.seed.as_ref() {
-        if let Err(err) = seed_group_memories(router, &auth, &group_id, &db_name, seed, pool).await
-        {
-            cleanup_failed_group_creation(pool, &group_id, &db_name).await;
-            return Err(err);
+        for member in &members {
+            let role = if member == &auth.user_id {
+                "owner"
+            } else {
+                "member"
+            };
+            sqlx::query(
+                "INSERT INTO mem_group_members (group_id, user_id, role, is_active, joined_at) \
+                 VALUES (?, ?, ?, 1, ?)",
+            )
+            .bind(&group_id)
+            .bind(member)
+            .bind(role)
+            .bind(now)
+            .execute(pool)
+            .await
+            .map_err(api_err)?;
         }
+
+        let group_store = router.routed_store_for_db_name(&db_name).map_err(api_err)?;
+        group_store.migrate_user().await.map_err(api_err)?;
+
+        if let Some(seed) = req.seed.as_ref() {
+            seed_group_memories(router, &auth, &group_id, &db_name, seed, pool).await?;
+        }
+
+        Ok(())
+    }
+    .await;
+
+    if let Err(err) = setup_result {
+        cleanup_failed_group_creation(pool, &group_id, &db_name).await;
+        return Err(err);
     }
 
     let group = load_group(pool, &group_id).await?.ok_or((

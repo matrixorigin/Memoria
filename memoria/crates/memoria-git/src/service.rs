@@ -549,6 +549,7 @@ impl GitForDataService {
         user_id: &str,
         limit: i64,
     ) -> Result<Vec<DiffRow>, MemoriaError> {
+        let limit = limit.clamp(1, 5_000);
         let safe_branch = validate_identifier(branch_table)?;
         let safe_main = validate_identifier(main_table)?;
         let db = quote_identifier(&self.db_name);
