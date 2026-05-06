@@ -6,14 +6,14 @@
 - Keep single-user behavior unchanged when a request uses a normal personal API key.
 - Let a team share one physical Memoria database per group.
 - Reuse the existing branch model for experimentation inside a group database.
-- Protect `main` in group mode so it can only be changed through explicit selective apply.
+- Protect `main` in group mode so it can only be changed through explicit selective apply (with a solo-owner bypass for initial seeding).
 - Keep the first version operationally small and avoid adding new entities unless they are necessary.
 
 ## Non-Goals
 
 - No field-level merge or three-way conflict resolution.
 - No native branch merge in group mode (blocked by middleware).
-- No editor metadata on memory rows (apply actions are logged in edit-log only).
+- No per-edit attribution tracking — `author_id` records who created a memory, but subsequent corrections preserve the original author (corrector identity is in edit-log only).
 
 ## Background
 
@@ -136,7 +136,7 @@ Membership is validated at request entry with a 5-minute in-memory cache:
    - verify `user_id` is an active member (`is_active = 1`) in `mem_group_members`,
    - reject if any check fails.
 
-If a user is removed from the group (soft-deleted in `mem_group_members`) but still holds an old group key, the membership check rejects the request once the cache expires.
+If a user is removed from the group, their API keys are deactivated and the cache is proactively invalidated. As a defense-in-depth, the DB-level membership check on cache miss also rejects requests from non-members (authoritative gate).
 
 ### Key Issuance Rule
 
@@ -218,17 +218,19 @@ Three middleware layers enforce group-mode constraints at the router level, remo
 
 ### 1. Write Guard (`group_main_write_guard`)
 
-Applied to all write routes. If the request is group-scoped and the caller's active branch is `main`, returns **403 Forbidden**: "main is read-only in group mode; checkout a branch first."
+Applied to all write routes. If the request is group-scoped and the caller's active branch is `main`, returns **403 Forbidden**: "main is read-only in group mode; create or checkout a branch, then use selective apply."
+
+**Solo-owner exception**: When a group has exactly one active member (the owner), writes to `main` are allowed. This avoids forcing branch ceremonies when a user initially seeds a group database alone before inviting collaborators.
 
 Protected routes:
 - `POST /v1/memories` (store)
 - `POST /v1/memories/batch` (batch store)
-- `POST /v1/memories/by-query` (correct by query)
+- `POST /v1/memories/correct` (correct by query)
 - `POST /v1/memories/purge` (purge)
-- `PUT /v1/memories/:id` (correct)
+- `PUT /v1/memories/:id/correct` (correct by id)
 - `DELETE /v1/memories/:id` (delete)
 - `POST /v1/observe` (observe turn)
-- `POST /v1/sessions` (session summary)
+- `POST /v1/sessions/:session_id/summary` (session summary)
 
 ### 2. Merge Guard (`group_merge_guard`)
 
@@ -278,15 +280,19 @@ is parsed by column index.
 - **Branch-side rows**: `source == branch_table`
 - **Main-side rows**: `source == "mem_memories"`
 
-Any `memory_id` that appears on **both** sides is classified as a **CONFLICT**.
+Any `memory_id` that appears on **both** sides is classified as a **CONFLICT** (along with any `superseded_by` targets referenced by conflicting rows).
 The remaining branch-only rows are classified by `flag`, `is_active`, and `superseded_by`:
 
-| Raw flag | is_active | superseded_by | Classification |
-|----------|-----------|---------------|----------------|
-| INSERT   | 1         | —             | **ADDED** |
-| INSERT   | 0         | —             | hidden |
-| UPDATE   | 0         | set           | **UPDATED** (correction pair: old → new) |
-| UPDATE   | 0         | NULL          | **REMOVED** |
+| Scenario                       | flag   | is_active | superseded_by | Classification |
+|--------------------------------|--------|-----------|---------------|----------------|
+| New memory on branch           | INSERT | 1         | NULL          | **ADDED** |
+| Created then deleted on branch | INSERT | 0         | NULL          | hidden |
+| Created then corrected (old)   | INSERT | 0         | new_id        | hidden |
+| Created then corrected (new)   | INSERT | 1         | NULL          | **ADDED** (paired → **UPDATED**) |
+| Deleted main memory on branch  | UPDATE | 0         | NULL          | **REMOVED** |
+| Corrected main memory (old)    | UPDATE | 0         | new_id        | paired into **UPDATED** |
+
+**Pairing logic**: An UPDATE row (`is_active=0`, `superseded_by=new_id`) is paired with its corresponding INSERT row (`memory_id=new_id`, `is_active=1`). Together they form a single **UPDATED** entry containing both old and new content.
 
 Main-only rows with `is_active = 1` are returned as **BEHIND_MAIN** (informational).
 
@@ -318,7 +324,9 @@ display without extra queries.
 
 ### Endpoint
 
-`GET /v1/branches/:name/diff-items?limit=50`
+`GET /v1/branches/:name/diff-items?limit=100`
+
+Default limit is 100, max 500. Each category is independently truncated at the limit.
 
 Response:
 
@@ -455,8 +463,10 @@ Apply actions are logged via the existing edit-log mechanism with a `branch_appl
 | Method | Path | Auth | Description |
 |--------|------|------|-------------|
 | POST | `/auth/keys` | User or Owner | Create key (with optional `group_id`) |
-| DELETE | `/auth/keys/:key_id` | Owner of key | Revoke key |
 | GET | `/auth/keys` | Any user | List caller's keys |
+| GET | `/auth/keys/:id` | Owner of key | Get key details |
+| PUT | `/auth/keys/:id/rotate` | Owner of key | Rotate key (new secret, same metadata) |
+| DELETE | `/auth/keys/:id` | Owner of key | Revoke key |
 
 ### Branch Diff & Apply
 
@@ -503,50 +513,6 @@ Snapshot and rollback operations in a group database affect all members' data. N
 
 Group databases (`mem_grp_*`) are not registered in `mem_user_registry`. This means governance and stats operations do not traverse group databases. Adding group DB registration is a future improvement.
 
-## Test UI
+## Test UI (not shipped)
 
-A local HTML+JS test UI is provided at `tools/group-collab-ui/`.
-
-### Starting the UI Server
-
-```bash
-cd tools/group-collab-ui
-python3 server.py \
-  --host 0.0.0.0 \          # default; listens on all interfaces (LAN-accessible)
-  --port 8301 \
-  --backend http://127.0.0.1:8100 \
-  --master-key <master_key> \
-  --master-user admin
-```
-
-Environment variable overrides:
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `MEMORIA_UI_HOST` | `0.0.0.0` | Bind address |
-| `MEMORIA_UI_BACKEND` | `http://127.0.0.1:8100` | Memoria API base URL |
-| `MEMORIA_UI_MASTER_KEY` | — | Master key for admin operations |
-| `MEMORIA_UI_MASTER_USER` | `admin` | Master user ID |
-
-The UI proxies all `/api/*` requests to the backend, so the browser never needs direct
-access to the Memoria API port.
-
-### Diff Display
-
-The diff panel renders all 5 categories:
-
-| Section | Color | Selectable for Apply |
-|---------|-------|----------------------|
-| ✅ Added | green | ✓ |
-| 🔄 Updated | blue | ✓ |
-| 🗑️ Removed | red | ✓ |
-| ⚠️ Conflicts | purple | optional checkbox (accept branch) |
-| 📥 Behind Main | blue-grey | ✗ (informational) |
-
-All diff cards show `author_id` as a pill badge. Conflict cards show both sides
-(branch vs main) side-by-side, including `superseded_by` target content when available.
-
-
-
-
-1. personal 也变成分享的
+A local HTML+JS dev UI exists at `tools/group-collab-ui/` (git-excluded, for local verification only). It provides a proxy server and a diff panel that renders all 5 diff categories with author badges and conflict side-by-side comparison.
