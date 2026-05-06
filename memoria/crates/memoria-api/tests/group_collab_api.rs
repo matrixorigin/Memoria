@@ -55,6 +55,7 @@ impl TestServer {
             }
         }
         drop_database(&self.shared_pool, &self.shared_db_name).await;
+        self.shared_pool.close().await;
     }
 }
 
@@ -63,9 +64,12 @@ async fn spawn_server() -> TestServer {
     use memoria_service::MemoryService;
     use memoria_storage::{DbRouter, SqlMemoryStore};
 
+    std::env::set_var("DB_MAX_CONNECTIONS", "4");
     let admin_db = admin_db_url();
     memoria_test_utils::wait_for_mysql_ready(&admin_db, std::time::Duration::from_secs(30)).await;
-    let admin_pool = sqlx::MySqlPool::connect(&admin_db)
+    let admin_pool = sqlx::mysql::MySqlPoolOptions::new()
+        .max_connections(2)
+        .connect(&admin_db)
         .await
         .expect("admin pool");
 
@@ -77,6 +81,7 @@ async fn spawn_server() -> TestServer {
     .execute(&admin_pool)
     .await
     .expect("create shared db");
+    admin_pool.close().await;
 
     let shared_db_url = replace_db_name(&admin_db, &shared_db_name);
     let mut shared_store =
@@ -90,7 +95,9 @@ async fn spawn_server() -> TestServer {
             .await
             .expect("connect router"),
     );
-    let shared_pool = sqlx::MySqlPool::connect(&shared_db_url)
+    let shared_pool = sqlx::mysql::MySqlPoolOptions::new()
+        .max_connections(2)
+        .connect(&shared_db_url)
         .await
         .expect("shared pool");
     let git = Arc::new(GitForDataService::new(shared_pool.clone(), &shared_db_name));
