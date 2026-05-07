@@ -248,6 +248,32 @@ pub fn classify_diff_rows(rows: Vec<DiffRow>, branch_table: &str) -> ClassifiedD
         .copied()
         .collect();
 
+    // FIXME(memoria-team): Two known scenarios can cause duplicate memory_id entries in
+    // `result.added`, which surfaces in the dashboard as two visually identical INSERT rows
+    // sharing the same checkbox state (selecting one selects the other) and an off-by-one
+    // counter (e.g. "4 Changes" header but 5 rows rendered).
+    //
+    // Scenario A — superseded_map key collision:
+    //   If two distinct UPDATE rows both carry the same `superseded_by` new_id value
+    //   (a data-consistency anomaly), `HashMap::insert` silently overwrites the first entry.
+    //   The INSERT row whose `memory_id` matches that new_id therefore finds *no* match in
+    //   superseded_map on the first pass, falls through to `result.added`, and then the
+    //   same INSERT may be re-encountered if the diff output contains duplicate raw rows.
+    //
+    // Scenario B — MatrixOne `data branch diff` returning duplicate raw rows:
+    //   In certain MatrixOne versions/configurations the `data branch diff ... output limit N`
+    //   statement can return the same physical row twice. Both copies have flag=INSERT,
+    //   is_active=1, and the same memory_id, so both survive the `is_active == 0` filter and
+    //   both enter `result.added`.
+    //
+    // Recommended fix: before the INSERT processing loop, deduplicate `clean_branch` by
+    // (memory_id, flag) keeping the row with is_active=1 over is_active=0, and deduplicate
+    // `superseded_map` construction by only inserting the first occurrence of each new_id.
+    //
+    // Workaround already applied on the memoria-website frontend (GitMemory.jsx): the
+    // rendered diff list deduplicates allItems by rowKey so the UI stays consistent even
+    // when the API returns duplicates.
+
     // Build superseded map from clean branch rows
     let mut superseded_map: HashMap<String, &DiffRow> = HashMap::new();
     for r in &clean_branch {
@@ -555,9 +581,11 @@ impl GitForDataService {
         let db = quote_identifier(&self.db_name);
         // Fetch more than limit to account for filtering
         let fetch_limit = limit * 10 + 100;
+        // Note: the `columns (...)` filter clause is not supported by all MatrixOne
+        // versions (local standalone differs from cloud). Omit it so the query works
+        // everywhere; we filter by user_id in Rust after fetching.
         let sql = format!(
             "data branch diff {db}.{safe_branch} against {db}.{safe_main} \
-             columns (user_id, memory_id, content, memory_type, is_active, superseded_by, author_id) \
              output limit {fetch_limit}"
         );
         let rows = sqlx::raw_sql(&sql)

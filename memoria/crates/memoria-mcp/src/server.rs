@@ -80,10 +80,30 @@ pub async fn dispatch_http(
     user_id: String,
 ) -> Result<Value, McpRpcError> {
     let handle = tokio::runtime::Handle::current();
+
+    // `spawn_blocking` runs on a separate thread-pool thread and does NOT inherit
+    // Tokio task-local variables.  In group/space mode the `actor_scope_layer`
+    // middleware sets `ACTOR_USER_ID` to the real human user_id so that per-user
+    // state (active branch) is keyed on the individual rather than the group scope.
+    // Without propagating it here, MCP tool calls inside `spawn_blocking` fall back
+    // to `scope_id` (the group id), causing a mismatch: the Dashboard REST checkout
+    // writes `mem_user_state.user_id = real_user_id` while the MCP code-agent reads
+    // `mem_user_state.user_id = grp_xxx` — two different rows, always out of sync.
+    let actor_user_id = memoria_storage::ACTOR_USER_ID
+        .try_with(|id| id.clone())
+        .ok();
+
     tokio::task::spawn_blocking(move || {
-        handle.block_on(dispatch_embedded_owned(
-            method, params, service, git, user_id,
-        ))
+        let fut = dispatch_embedded_owned(method, params, service, git, user_id);
+        // Restore ACTOR_USER_ID inside the blocking thread so storage methods
+        // (`active_branch_name`, `set_active_branch`, `active_table`) see the
+        // same per-user scope they would in the original async task.
+        match actor_user_id {
+            Some(actor_id) => handle.block_on(
+                memoria_storage::ACTOR_USER_ID.scope(actor_id, fut)
+            ),
+            None => handle.block_on(fut),
+        }
     })
     .await
     .map_err(|e| McpRpcError {

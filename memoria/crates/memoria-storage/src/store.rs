@@ -141,7 +141,7 @@ async fn is_fresh_database(pool: &MySqlPool, schema_name: &str) -> Result<bool, 
 /// Bump whenever user-DB schema expectations change, including tables created
 /// by `bootstrap_user_schema()`, graph schema bootstrapping, or any compat
 /// migration handled by `apply_user_compat_migrations()`.
-pub const CURRENT_USER_SCHEMA_VERSION: i64 = 1;
+pub const CURRENT_USER_SCHEMA_VERSION: i64 = 2;
 const USER_SCHEMA_META_KEY: &str = "user_schema";
 
 async fn ensure_user_schema_meta_table(pool: &MySqlPool, table: &str) -> Result<(), MemoriaError> {
@@ -1530,16 +1530,79 @@ impl SqlMemoryStore {
         .await;
 
         // author_id column — tracks the real human author in group mode
-        let _ = sqlx::query(&format!(
-            "ALTER TABLE {memories_table} ADD COLUMN author_id VARCHAR(64) DEFAULT NULL AFTER user_id"
+        // Guard with existence check so the migration is idempotent (safe to run
+        // on both fresh and already-migrated databases).
+        let has_author_id =
+            info_schema_column_exists(pool, schema_name, "mem_memories", "author_id").await;
+        if !has_author_id {
+            let add_col = sqlx::query(&format!(
+                "ALTER TABLE {memories_table} ADD COLUMN author_id VARCHAR(64) DEFAULT NULL"
+            ))
+            .execute(pool)
+            .await;
+            match &add_col {
+                Ok(_) => tracing::info!("migration: added author_id column to {memories_table}"),
+                Err(e) => tracing::error!("migration: failed to add author_id to {memories_table}: {e}"),
+            }
+        } else {
+            tracing::debug!("migration: author_id column already exists in {memories_table}, skipping");
+        }
+        // Ensure the index exists even when the column already existed before this migration.
+        // This covers partially-migrated databases where `author_id` is present but
+        // `idx_author` is missing.
+        let has_memories_author_idx =
+            info_schema_index_exists(pool, schema_name, "mem_memories", "idx_author").await;
+        if !has_memories_author_idx {
+            let add_idx = sqlx::query(&format!(
+                "ALTER TABLE {memories_table} ADD INDEX idx_author (author_id)"
+            ))
+            .execute(pool)
+            .await;
+            if let Err(e) = add_idx {
+                tracing::warn!(
+                    "migration: failed to add idx_author on {memories_table} (may already exist): {e}"
+                );
+            }
+        }
+
+        // Also add author_id to any existing branch tables (which are separate physical tables).
+        // Branch tables are created as copies of mem_memories and need the same schema.
+        let branch_table_names: Vec<String> = sqlx::query_scalar(&format!(
+            "SELECT table_name FROM {branches_table} WHERE status = 'active' AND table_name != ''"
         ))
-        .execute(pool)
-        .await;
-        let _ = sqlx::query(&format!(
-            "ALTER TABLE {memories_table} ADD INDEX idx_author (author_id)"
-        ))
-        .execute(pool)
-        .await;
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default();
+
+        for bt_raw in &branch_table_names {
+            // bt_raw is the raw table name (e.g. br_abc123_my_branch) without DB prefix
+            let bt_full = self.t(bt_raw);
+            let has_col =
+                info_schema_column_exists(pool, schema_name, bt_raw, "author_id").await;
+            if !has_col {
+                let r = sqlx::query(&format!(
+                    "ALTER TABLE {bt_full} ADD COLUMN author_id VARCHAR(64) DEFAULT NULL"
+                ))
+                .execute(pool)
+                .await;
+                match r {
+                    Ok(_) => tracing::info!("migration: added author_id to branch table {bt_full}"),
+                    Err(e) => tracing::error!("migration: failed to add author_id to branch table {bt_full}: {e}"),
+                }
+            }
+            // Always ensure the index exists regardless of whether the column was just
+            // added or was already present (handles "column exists but index is missing"
+            // on older databases). The error is expected when the index already exists.
+            let has_idx =
+                info_schema_index_exists(pool, schema_name, bt_raw, "idx_author").await;
+            if !has_idx {
+                let _ = sqlx::query(&format!(
+                    "ALTER TABLE {bt_full} ADD INDEX idx_author (author_id)"
+                ))
+                .execute(pool)
+                .await;
+            }
+        }
 
         Ok(())
     }
@@ -2284,7 +2347,13 @@ impl SqlMemoryStore {
 
         match branch_row {
             Some(r) => {
-                let table = self.t(&r.try_get::<String, _>("table_name").map_err(db_err)?);
+                let raw = r.try_get::<String, _>("table_name").map_err(db_err)?;
+                let table = self.t(&raw);
+                // Branch metadata found in mem_branches — trust it.
+                // information_schema.tables is NOT reliable for MatrixOne zero-copy branch
+                // tables created via `data branch create table`, so we skip the existence probe
+                // here. If the physical table is genuinely gone, the subsequent DML query will
+                // return a DB error that propagates to the caller.
                 self.active_table_cache
                     .insert(cache_key.into_owned(), table.clone());
                 Ok(table)
@@ -4602,6 +4671,7 @@ impl SqlMemoryStore {
         limit: i64,
         memory_type: Option<&str>,
         session_id: Option<&str>,
+        trust_tier: Option<&str>,
         cursor: Option<&str>,
     ) -> Result<Vec<Memory>, MemoriaError> {
         let table = self.t(table);
@@ -4615,6 +4685,9 @@ impl SqlMemoryStore {
         }
         if session_id.is_some() {
             inner.push_str(" AND session_id = ?");
+        }
+        if trust_tier.is_some() {
+            inner.push_str(" AND trust_tier = ?");
         }
         if cursor.is_some() {
             inner.push_str(" AND memory_id < ?");
@@ -4635,6 +4708,9 @@ impl SqlMemoryStore {
         }
         if let Some(session_id) = session_id {
             q = q.bind(session_id);
+        }
+        if let Some(tt) = trust_tier {
+            q = q.bind(tt);
         }
         if let Some(c) = cursor {
             q = q.bind(c);

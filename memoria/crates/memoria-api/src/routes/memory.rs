@@ -67,6 +67,7 @@ async fn find_memory_any_user(
 pub struct ListQuery {
     pub memory_type: Option<String>,
     pub session_id: Option<String>,
+    pub trust_tier: Option<String>,
     #[serde(default = "default_limit")]
     pub limit: i64,
     pub cursor: Option<String>,
@@ -122,6 +123,7 @@ pub async fn list_memories(
             fetch_limit,
             q.memory_type.as_deref(),
             q.session_id.as_deref(),
+            q.trust_tier.as_deref(),
             cursor,
         )
         .await
