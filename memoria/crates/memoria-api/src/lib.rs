@@ -359,6 +359,10 @@ pub fn build_router(state: AppState) -> Router {
             get(routes::admin::user_stats),
         )
         .route(
+            "/admin/users/:user_id/branch-stats",
+            get(routes::admin::user_branch_stats),
+        )
+        .route(
             "/admin/users/:user_id/call-stats",
             get(routes::admin::user_call_stats),
         )
