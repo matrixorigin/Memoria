@@ -214,7 +214,7 @@ async fn test_list_branches() {
         .expect("reg b2");
 
     let branches = store.list_branches(&user).await.expect("list");
-    let names: Vec<_> = branches.iter().map(|(n, _)| n.as_str()).collect();
+    let names: Vec<_> = branches.iter().map(|(n, _, _)| n.as_str()).collect();
     assert!(names.contains(&b1.as_str()), "b1 missing");
     assert!(names.contains(&b2.as_str()), "b2 missing");
     println!("✅ list_branches: {:?}", names);
@@ -222,7 +222,7 @@ async fn test_list_branches() {
     // Delete one — should disappear
     store.deregister_branch(&user, &b1).await.expect("dereg");
     let branches = store.list_branches(&user).await.expect("list after delete");
-    let names: Vec<_> = branches.iter().map(|(n, _)| n.as_str()).collect();
+    let names: Vec<_> = branches.iter().map(|(n, _, _)| n.as_str()).collect();
     assert!(!names.contains(&b1.as_str()), "b1 should be gone");
     assert!(names.contains(&b2.as_str()), "b2 should remain");
     println!("✅ list_branches after delete: {:?}", names);

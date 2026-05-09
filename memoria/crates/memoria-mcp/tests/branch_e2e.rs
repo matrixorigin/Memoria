@@ -258,8 +258,8 @@ async fn test_merge_replace_updates_conflicting_memory() {
         .await
         .unwrap()
         .into_iter()
-        .find(|(name, _)| name == &branch)
-        .map(|(_, table)| table)
+        .find(|(name, _, _)| name == &branch)
+        .map(|(_, table, _)| table)
         .expect("branch table");
 
     let branch_memory_id = Uuid::new_v4().simple().to_string();
@@ -867,8 +867,8 @@ async fn test_diff_fields_complete() {
     let branches = sql.list_branches(&uid).await.unwrap();
     let table = branches
         .iter()
-        .find(|(n, _)| n == &branch)
-        .map(|(_, t)| t.clone())
+        .find(|(n, _, _)| n == &branch)
+        .map(|(_, t, _)| t.clone())
         .unwrap();
     let user_git = GitForDataService::new(
         sql.pool().clone(),
@@ -977,8 +977,8 @@ async fn test_diff_native_count_vs_join_rows() {
     let branches = sql.list_branches(&uid).await.unwrap();
     let table = branches
         .iter()
-        .find(|(n, _)| n == &branch)
-        .map(|(_, t)| t.clone())
+        .find(|(n, _, _)| n == &branch)
+        .map(|(_, t, _)| t.clone())
         .unwrap();
     let user_git = GitForDataService::new(
         sql.pool().clone(),

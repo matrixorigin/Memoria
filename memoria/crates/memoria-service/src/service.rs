@@ -2113,7 +2113,7 @@ impl MemoryService {
         user_id: &str,
         limit: i64,
     ) -> Result<Vec<Memory>, MemoriaError> {
-        self.list_active_filtered(user_id, limit, None, None, None)
+        self.list_active_filtered(user_id, limit, None, None, None, None)
             .await
     }
 
@@ -2124,9 +2124,10 @@ impl MemoryService {
         limit: i64,
         memory_type: Option<&str>,
         session_id: Option<&str>,
+        trust_tier: Option<&str>,
         cursor: Option<&str>,
     ) -> Result<Vec<Memory>, MemoriaError> {
-        self.list_active_filtered(user_id, limit, memory_type, session_id, cursor)
+        self.list_active_filtered(user_id, limit, memory_type, session_id, trust_tier, cursor)
             .await
     }
 
@@ -2136,13 +2137,14 @@ impl MemoryService {
         limit: i64,
         memory_type: Option<&str>,
         session_id: Option<&str>,
+        trust_tier: Option<&str>,
         cursor: Option<&str>,
     ) -> Result<Vec<Memory>, MemoriaError> {
         if self.sql_store.is_some() {
             let sql = self.user_sql_store(user_id).await?;
             let table = sql.active_table(user_id).await?;
             return sql
-                .list_active_lite(&table, user_id, limit, memory_type, session_id, cursor)
+                .list_active_lite(&table, user_id, limit, memory_type, session_id, trust_tier, cursor)
                 .await;
         }
         // Fallback: trait path — no SQL store means no server-side filter/cursor.
@@ -2153,6 +2155,9 @@ impl MemoryService {
         }
         if let Some(session_id) = session_id {
             mems.retain(|m| m.session_id.as_deref() == Some(session_id));
+        }
+        if let Some(tt) = trust_tier {
+            mems.retain(|m| m.trust_tier.to_string() == tt);
         }
         if let Some(cursor_id) = cursor {
             mems.retain(|m| m.memory_id.as_str() < cursor_id);

@@ -2,16 +2,62 @@ use chrono::NaiveDateTime;
 use memoria_core::MemoriaError;
 use serde::{Deserialize, Serialize};
 use sqlx::{mysql::MySqlPool, Row};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 
 fn db_err(e: sqlx::Error) -> MemoriaError {
     MemoriaError::Database(e.to_string())
 }
 
+/// Returns true when the error is MatrixOne's "txn need retry in rc mode, def changed"
+/// (error code 20631). This is a transient conflict that arises when a DDL operation
+/// runs concurrently with another DDL that modifies the same table's definition (e.g.
+/// an ALTER TABLE migration overlapping with `data branch merge`). The caller should
+/// back off briefly and retry the statement.
+fn is_mo_retry_error(e: &sqlx::Error) -> bool {
+    let msg = e.to_string();
+    msg.contains("20631") || msg.contains("txn need retry")
+}
+
+/// Returns true when the error indicates a SQL parse / unsupported-syntax failure.
+/// Used to detect that the connected MatrixOne build does not support `columns (...)`
+/// in `data branch diff` so we can fall back gracefully (Option B runtime downgrade).
+fn is_mo_syntax_error(e: &sqlx::Error) -> bool {
+    let msg = e.to_string().to_lowercase();
+    // MySQL/MatrixOne error 1064 = "You have an error in your SQL syntax".
+    // Also match plain-text parse-error messages from newer MO builds.
+    msg.contains("1064") || msg.contains("parse error") || msg.contains("syntax error")
+}
+
 /// Execute a DDL statement without prepared statement protocol.
-/// MatrixOne does not support PREPARE for DDL (CREATE SNAPSHOT, data branch, etc.)
+/// MatrixOne does not support PREPARE for DDL (CREATE SNAPSHOT, data branch, etc.).
+///
+/// Automatically retries up to 3 times on MatrixOne error 20631
+/// ("txn need retry in rc mode, def changed"), which is a transient conflict that can
+/// occur when concurrent DDL operations (e.g. schema migrations adding columns to branch
+/// tables) race with `data branch merge` or similar commands.
 async fn exec_ddl(pool: &MySqlPool, sql: &str) -> Result<(), MemoriaError> {
-    sqlx::raw_sql(sql).execute(pool).await.map_err(db_err)?;
-    Ok(())
+    const MAX_ATTEMPTS: u32 = 3;
+    let mut attempt = 0u32;
+    loop {
+        match sqlx::raw_sql(sql).execute(pool).await {
+            Ok(_) => return Ok(()),
+            Err(e) if attempt < MAX_ATTEMPTS - 1 && is_mo_retry_error(&e) => {
+                attempt += 1;
+                let backoff_ms = 50u64 * (1 << attempt); // 100 ms, 200 ms
+                tracing::warn!(
+                    attempt,
+                    backoff_ms,
+                    error = %e,
+                    "exec_ddl: MatrixOne 20631 retry",
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+            }
+            Err(e) => return Err(db_err(e)),
+        }
+    }
 }
 
 /// Validate identifier — alphanumeric + underscore only, prevents SQL injection in DDL.
@@ -248,6 +294,32 @@ pub fn classify_diff_rows(rows: Vec<DiffRow>, branch_table: &str) -> ClassifiedD
         .copied()
         .collect();
 
+    // FIXME(memoria-team): Two known scenarios can cause duplicate memory_id entries in
+    // `result.added`, which surfaces in the dashboard as two visually identical INSERT rows
+    // sharing the same checkbox state (selecting one selects the other) and an off-by-one
+    // counter (e.g. "4 Changes" header but 5 rows rendered).
+    //
+    // Scenario A — superseded_map key collision:
+    //   If two distinct UPDATE rows both carry the same `superseded_by` new_id value
+    //   (a data-consistency anomaly), `HashMap::insert` silently overwrites the first entry.
+    //   The INSERT row whose `memory_id` matches that new_id therefore finds *no* match in
+    //   superseded_map on the first pass, falls through to `result.added`, and then the
+    //   same INSERT may be re-encountered if the diff output contains duplicate raw rows.
+    //
+    // Scenario B — MatrixOne `data branch diff` returning duplicate raw rows:
+    //   In certain MatrixOne versions/configurations the `data branch diff ... output limit N`
+    //   statement can return the same physical row twice. Both copies have flag=INSERT,
+    //   is_active=1, and the same memory_id, so both survive the `is_active == 0` filter and
+    //   both enter `result.added`.
+    //
+    // Recommended fix: before the INSERT processing loop, deduplicate `clean_branch` by
+    // (memory_id, flag) keeping the row with is_active=1 over is_active=0, and deduplicate
+    // `superseded_map` construction by only inserting the first occurrence of each new_id.
+    //
+    // Workaround already applied on the memoria-website frontend (GitMemory.jsx): the
+    // rendered diff list deduplicates allItems by rowKey so the UI stays consistent even
+    // when the API returns duplicates.
+
     // Build superseded map from clean branch rows
     let mut superseded_map: HashMap<String, &DiffRow> = HashMap::new();
     for r in &clean_branch {
@@ -338,6 +410,15 @@ pub fn classify_diff_rows(rows: Vec<DiffRow>, branch_table: &str) -> ClassifiedD
 pub struct GitForDataService {
     pool: MySqlPool,
     db_name: String,
+    /// Whether the connected MatrixOne build supports the `columns (...)` projection
+    /// clause in `data branch diff`. Starts `true`; automatically flipped to `false`
+    /// the first time a parse/unsupported-syntax error is observed, after which all
+    /// diff calls in this process skip the projection (Option B runtime downgrade).
+    ///
+    /// Using `columns (...)` is strongly preferred: without it, MatrixOne ships every
+    /// column of the source table over the wire — including embedding vectors and
+    /// extra_metadata JSON — even though only 7 fields are read.
+    supports_diff_columns: Arc<AtomicBool>,
 }
 
 impl GitForDataService {
@@ -345,6 +426,7 @@ impl GitForDataService {
         Self {
             pool,
             db_name: db_name.into(),
+            supports_diff_columns: Arc::new(AtomicBool::new(true)),
         }
     }
 
@@ -542,6 +624,18 @@ impl GitForDataService {
     /// all rows and filter in Rust. Returns raw diff rows including source, is_active,
     /// superseded_by, and author_id.
     /// Use [`classify_diff_rows`] to get ADDED/UPDATED/REMOVED/CONFLICTS.
+    ///
+    /// ## Column projection
+    /// The preferred query includes `columns (user_id, memory_id, ...)` to avoid
+    /// shipping embedding vectors and extra_metadata JSON over the wire. If this MO
+    /// build does not support that clause (parse/syntax error), the flag
+    /// `supports_diff_columns` is set to `false` for the lifetime of the process and
+    /// all subsequent calls fall back to the full-row query (Option B runtime downgrade).
+    ///
+    /// In both query forms, MatrixOne prepends an implicit source column (the table
+    /// name the row originated from) as column index 0 in the result set, so ordinal
+    /// access `r.try_get(0usize)` reliably retrieves it regardless of whether the
+    /// projection clause is active.
     pub async fn diff_branch_rows(
         &self,
         branch_table: &str,
@@ -553,24 +647,59 @@ impl GitForDataService {
         let safe_branch = validate_identifier(branch_table)?;
         let safe_main = validate_identifier(main_table)?;
         let db = quote_identifier(&self.db_name);
-        // Fetch more than limit to account for filtering
+        // Fetch more rows than requested to account for user_id filtering in Rust.
         let fetch_limit = limit * 10 + 100;
-        let sql = format!(
+
+        // Projected query: only retrieve the 7 fields we actually read. Avoids shipping
+        // embedding vectors and extra_metadata JSON over the wire on every diff call.
+        const DIFF_COLS: &str =
+            "columns (user_id, memory_id, content, memory_type, is_active, superseded_by, author_id)";
+
+        let sql_projected = format!(
             "data branch diff {db}.{safe_branch} against {db}.{safe_main} \
-             columns (user_id, memory_id, content, memory_type, is_active, superseded_by, author_id) \
+             {DIFF_COLS} output limit {fetch_limit}"
+        );
+        let sql_full = format!(
+            "data branch diff {db}.{safe_branch} against {db}.{safe_main} \
              output limit {fetch_limit}"
         );
-        let rows = sqlx::raw_sql(&sql)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(db_err)?;
+
+        let rows = if self.supports_diff_columns.load(Ordering::Relaxed) {
+            match sqlx::raw_sql(&sql_projected).fetch_all(&self.pool).await {
+                Ok(rows) => rows,
+                Err(e) if is_mo_syntax_error(&e) => {
+                    // This MO build does not support columns (...) — disable for this
+                    // process lifetime and retry with the full-row query.
+                    self.supports_diff_columns.store(false, Ordering::Relaxed);
+                    tracing::warn!(
+                        error = %e,
+                        "data branch diff: `columns (...)` unsupported on this MatrixOne \
+                         build; falling back to full-row fetch. Consider upgrading to \
+                         MatrixOne ≥ 3.0-dev or aligning your cloud build."
+                    );
+                    sqlx::raw_sql(&sql_full)
+                        .fetch_all(&self.pool)
+                        .await
+                        .map_err(db_err)?
+                }
+                Err(e) => return Err(db_err(e)),
+            }
+        } else {
+            sqlx::raw_sql(&sql_full)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(db_err)?
+        };
+
         let mut result = Vec::new();
         for r in &rows {
             let uid: String = r.try_get("user_id").map_err(db_err)?;
             if uid != user_id {
                 continue;
             }
-            // First column (index 0) is the source table name
+            // Column index 0 is the implicit source column that MatrixOne prepends to
+            // `data branch diff` output — it holds the originating table name and is
+            // present in both the projected and full-row query forms.
             let source: String = r.try_get(0usize).unwrap_or_default();
             result.push(DiffRow {
                 source,

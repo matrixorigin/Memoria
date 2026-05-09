@@ -830,7 +830,7 @@ pub async fn call(
             };
             let text = branches
                 .iter()
-                .map(|(name, _table)| {
+                .map(|(name, _table, _created_at)| {
                     let marker = if *name == active_branch {
                         " ← active"
                     } else {
@@ -851,7 +851,7 @@ pub async fn call(
                 return Ok(mcp_text("Switched to branch 'main'"));
             }
             let branches = sql.list_branches(user_id).await?;
-            if !branches.iter().any(|(name, _)| name == branch) {
+            if !branches.iter().any(|(name, _, _)| name == branch) {
                 return Err(MemoriaError::NotFound(format!("Branch '{branch}'")));
             }
             sql.set_active_branch(user_id, branch).await?;
@@ -879,8 +879,8 @@ pub async fn call(
             let branches = sql.list_branches(user_id).await?;
             let table_name = branches
                 .iter()
-                .find(|(name, _)| name == source_branch)
-                .map(|(_, t)| t.clone())
+                .find(|(name, _, _)| name == source_branch)
+                .map(|(_, t, _)| t.clone())
                 .ok_or_else(|| MemoriaError::NotFound(format!("Branch '{source_branch}'")))?;
             let branch_table_name = validate_identifier(&table_name)?.to_string();
             let branch_table = sql.t(&branch_table_name);
@@ -1000,7 +1000,7 @@ pub async fn call(
             let sql = svc.user_sql_store(user_id).await?;
             let git = git_for_store(&sql)?;
             let branches = sql.list_branches(user_id).await?;
-            if let Some((_, table_name)) = branches.iter().find(|(name, _)| name == branch) {
+            if let Some((_, table_name, _)) = branches.iter().find(|(name, _, _)| name == branch) {
                 let was_active = sql.active_branch_name(user_id).await? == branch;
                 if was_active {
                     sql.set_active_branch(user_id, "main").await?;
@@ -1022,8 +1022,8 @@ pub async fn call(
             let branches = sql.list_branches(user_id).await?;
             let table_name = branches
                 .iter()
-                .find(|(name, _)| name == source_branch.as_str())
-                .map(|(_, t)| t.clone())
+                .find(|(name, _, _)| name == source_branch.as_str())
+                .map(|(_, t, _)| t.clone())
                 .ok_or_else(|| MemoriaError::NotFound(format!("Branch '{source_branch}'")))?;
 
             // Use MatrixOne native `data branch diff` + classify
@@ -1161,8 +1161,8 @@ pub async fn call(
             let branches = sql.list_branches(user_id).await?;
             let table_name = branches
                 .iter()
-                .find(|(name, _)| name == &source_branch)
-                .map(|(_, t)| t.clone())
+                .find(|(name, _, _)| name == &source_branch)
+                .map(|(_, t, _)| t.clone())
                 .ok_or_else(|| MemoriaError::NotFound(format!("Branch '{source_branch}'")))?;
             let branch_table_name = validate_identifier(&table_name)?.to_string();
             let user_git = git_for_store(&sql)?;

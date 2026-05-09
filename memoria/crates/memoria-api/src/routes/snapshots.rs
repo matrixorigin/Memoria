@@ -214,7 +214,7 @@ async fn branch_table_name_raw(
     if branch_name == "main" {
         return Ok("mem_memories".to_string());
     }
-    for (name, table_name) in sql.list_branches(scope_id).await.map_err(api_err)? {
+    for (name, table_name, _created_at) in sql.list_branches(scope_id).await.map_err(api_err)? {
         if name == branch_name {
             return Ok(table_name);
         }
@@ -749,10 +749,12 @@ pub async fn list_branches(
         "name": "main",
         "active": active_branch == "main",
     })];
-    for (name, _table_name) in sql.list_branches(auth.scope_id()).await.map_err(api_err)? {
+    for (name, _table_name, created_at) in sql.list_branches(auth.scope_id()).await.map_err(api_err)? {
+        let created_at_str = created_at.map(|dt| dt.format("%Y-%m-%dT%H:%M:%S").to_string());
         branches.push(json!({
             "name": name,
             "active": name == active_branch,
+            "created_at": created_at_str,
         }));
     }
     if !branches
