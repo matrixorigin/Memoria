@@ -67,6 +67,7 @@ async fn find_memory_any_user(
 pub struct ListQuery {
     pub memory_type: Option<String>,
     pub session_id: Option<String>,
+    pub trust_tier: Option<String>,
     #[serde(default = "default_limit")]
     pub limit: i64,
     pub cursor: Option<String>,
@@ -114,6 +115,9 @@ pub async fn list_memories(
         .cursor
         .as_deref()
         .filter(|c| c.len() == 32 && c.chars().all(|ch| ch.is_ascii_hexdigit()));
+    if let Some(tier) = q.trust_tier.as_deref() {
+        parse_trust_tier(tier).map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e))?;
+    }
     let fetch_limit = limit + 1;
     let mut memories = state
         .service
@@ -122,6 +126,7 @@ pub async fn list_memories(
             fetch_limit,
             q.memory_type.as_deref(),
             q.session_id.as_deref(),
+            q.trust_tier.as_deref(),
             cursor,
         )
         .await

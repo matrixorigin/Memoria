@@ -11,8 +11,8 @@ serde_json = { workspace = true }
 chrono = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+tokio = { workspace = true }
 
 [dev-dependencies]
 memoria-storage = { path = "../memoria-storage" }
-tokio = { workspace = true }
 uuid = { workspace = true }

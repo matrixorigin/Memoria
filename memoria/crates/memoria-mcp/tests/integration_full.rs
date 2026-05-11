@@ -373,8 +373,8 @@ async fn test_full_stack_all_fields() {
     let branches = sql_store.list_branches(&uid).await.unwrap();
     let branch_table = branches
         .iter()
-        .find(|(n, _)| n == &branch)
-        .map(|(_, t)| t.clone())
+        .find(|(n, _, _)| n == &branch)
+        .map(|(_, t, _)| t.clone())
         .unwrap();
 
     let branch_row = db_row(&pool, &branch_table, &mid_branch).await;

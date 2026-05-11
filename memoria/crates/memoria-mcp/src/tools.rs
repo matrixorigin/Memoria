@@ -516,6 +516,7 @@ pub async fn call(
                     limit,
                     args.get("memory_type").and_then(Value::as_str),
                     args.get("session_id").and_then(Value::as_str),
+                    args.get("trust_tier").and_then(Value::as_str),
                     None,
                 )
                 .await?;

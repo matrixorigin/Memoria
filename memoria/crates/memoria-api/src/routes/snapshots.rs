@@ -214,7 +214,7 @@ async fn branch_table_name_raw(
     if branch_name == "main" {
         return Ok("mem_memories".to_string());
     }
-    for (name, table_name) in sql.list_branches(scope_id).await.map_err(api_err)? {
+    for (name, table_name, _created_at) in sql.list_branches(scope_id).await.map_err(api_err)? {
         if name == branch_name {
             return Ok(table_name);
         }
@@ -241,7 +241,26 @@ async fn branch_diff_items_payload(
         .diff_branch_rows(&branch_table_raw, "mem_memories", scope_id, limit * 3)
         .await
         .map_err(api_err)?;
-    let classified = memoria_git::classify_diff_rows(raw_rows, &branch_table_raw);
+    let mut classified = memoria_git::classify_diff_rows(raw_rows, &branch_table_raw);
+
+    // classify_diff_rows cannot distinguish "deleted from main on branch" from
+    // "created-then-deleted on branch" without querying the main table (because
+    // data branch diff only returns the branch-side row for deletions). Resolve
+    // now: ghost removes (never in main) move to classified.ghost_removes.
+    git.resolve_ghost_removes(&mut classified, "mem_memories", scope_id)
+        .await
+        .map_err(api_err)?;
+
+    tracing::debug!(
+        branch = %branch_name,
+        added = classified.added.len(),
+        updated = classified.updated.len(),
+        removed = classified.removed.len(),
+        ghost_removes = classified.ghost_removes.len(),
+        conflicts = classified.conflicts.len(),
+        behind_main = classified.behind_main.len(),
+        "branch_diff_items_payload: classified result"
+    );
 
     let item_to_json = |item: &memoria_git::DiffItem| -> Value {
         json!({
@@ -749,10 +768,12 @@ pub async fn list_branches(
         "name": "main",
         "active": active_branch == "main",
     })];
-    for (name, _table_name) in sql.list_branches(auth.scope_id()).await.map_err(api_err)? {
+    for (name, _table_name, created_at) in sql.list_branches(auth.scope_id()).await.map_err(api_err)? {
+        let created_at_str = format_snapshot_timestamp(created_at);
         branches.push(json!({
             "name": name,
             "active": name == active_branch,
+            "created_at": created_at_str,
         }));
     }
     if !branches

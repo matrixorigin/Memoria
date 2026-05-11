@@ -83,7 +83,7 @@ async fn cached_or_db_principal(token: &str, state: &AppState) -> Option<CachedA
     Some(principal)
 }
 
-async fn group_main_write_allowed_for_solo_owner(
+pub(crate) async fn group_main_write_allowed_for_solo_owner(
     state: &AppState,
     group_id: &str,
     user_id: &str,

@@ -46,6 +46,41 @@ fn is_duplicate_column(e: &sqlx::Error) -> bool {
         .unwrap_or(false)
 }
 
+/// Returns true for MatrixOne's transient "txn need retry in rc mode, def changed"
+/// error (code 20631). This can occur when a DDL statement (e.g. ALTER TABLE on a
+/// branch table) races with a concurrent `data branch merge` that also modifies the
+/// same table definition.
+fn is_mo_retry_error(e: &sqlx::Error) -> bool {
+    let msg = e.to_string();
+    msg.contains("20631") || msg.contains("txn need retry")
+}
+
+/// Execute a raw DDL string, retrying up to 3 times on MatrixOne error 20631
+/// ("txn need retry in rc mode, def changed") with exponential backoff.
+/// Used for ALTER TABLE statements that may race with concurrent DDL in migrations.
+async fn exec_ddl_with_retry(pool: &sqlx::mysql::MySqlPool, sql: &str) -> Result<(), sqlx::Error> {
+    const MAX_ATTEMPTS: u32 = 3;
+    let mut attempt = 0u32;
+    loop {
+        match sqlx::query(sql).execute(pool).await {
+            Ok(_) => return Ok(()),
+            Err(e) if attempt < MAX_ATTEMPTS - 1 && is_mo_retry_error(&e) => {
+                attempt += 1;
+                let backoff_ms = 50u64 * (1 << attempt); // 100 ms, 200 ms
+                tracing::warn!(
+                    attempt,
+                    backoff_ms,
+                    error = %e,
+                    sql = sql,
+                    "exec_ddl_with_retry: MatrixOne 20631 — retrying migration DDL",
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 fn normalized_count_sql(sql: &str) -> String {
     sql.trim()
         .trim_end_matches(';')
@@ -141,7 +176,7 @@ async fn is_fresh_database(pool: &MySqlPool, schema_name: &str) -> Result<bool, 
 /// Bump whenever user-DB schema expectations change, including tables created
 /// by `bootstrap_user_schema()`, graph schema bootstrapping, or any compat
 /// migration handled by `apply_user_compat_migrations()`.
-pub const CURRENT_USER_SCHEMA_VERSION: i64 = 1;
+pub const CURRENT_USER_SCHEMA_VERSION: i64 = 2;
 const USER_SCHEMA_META_KEY: &str = "user_schema";
 
 async fn ensure_user_schema_meta_table(pool: &MySqlPool, table: &str) -> Result<(), MemoriaError> {
@@ -1530,16 +1565,112 @@ impl SqlMemoryStore {
         .await;
 
         // author_id column — tracks the real human author in group mode
-        let _ = sqlx::query(&format!(
-            "ALTER TABLE {memories_table} ADD COLUMN author_id VARCHAR(64) DEFAULT NULL AFTER user_id"
+        // Guard with existence check so the migration is idempotent (safe to run
+        // on both fresh and already-migrated databases).
+        let has_author_id =
+            info_schema_column_exists(pool, schema_name, "mem_memories", "author_id").await;
+        if !has_author_id {
+            let add_col = sqlx::query(&format!(
+                "ALTER TABLE {memories_table} ADD COLUMN author_id VARCHAR(64) DEFAULT NULL"
+            ))
+            .execute(pool)
+            .await;
+            match &add_col {
+                Ok(_) => tracing::info!("migration: added author_id column to {memories_table}"),
+                Err(e) if is_duplicate_column(e) => tracing::info!(
+                    "migration: author_id column already exists in {memories_table}, skipping"
+                ),
+                Err(e) => tracing::error!(
+                    "migration: failed to add author_id to {memories_table}: {e}"
+                ),
+            }
+        } else {
+            tracing::debug!("migration: author_id column already exists in {memories_table}, skipping");
+        }
+        // Ensure the index exists even when the column already existed before this migration.
+        // This covers partially-migrated databases where `author_id` is present but
+        // `idx_author` is missing.
+        let has_memories_author_idx =
+            info_schema_index_exists(pool, schema_name, "mem_memories", "idx_author").await;
+        if !has_memories_author_idx {
+            let add_idx = sqlx::query(&format!(
+                "ALTER TABLE {memories_table} ADD INDEX idx_author (author_id)"
+            ))
+            .execute(pool)
+            .await;
+            if let Err(e) = add_idx {
+                tracing::warn!(
+                    "migration: failed to add idx_author on {memories_table} (may already exist): {e}"
+                );
+            }
+        }
+
+        // Also add author_id to any existing branch tables (which are separate physical tables).
+        // Branch tables are created as copies of mem_memories and need the same schema.
+        let branch_table_names: Vec<String> = match sqlx::query_scalar(&format!(
+            "SELECT table_name FROM {branches_table} WHERE status = 'active' AND table_name != ''"
         ))
-        .execute(pool)
-        .await;
-        let _ = sqlx::query(&format!(
-            "ALTER TABLE {memories_table} ADD INDEX idx_author (author_id)"
-        ))
-        .execute(pool)
-        .await;
+        .fetch_all(pool)
+        .await
+        {
+            Ok(names) => names,
+            Err(e) => {
+                tracing::warn!(
+                    "migration: failed to load branch table names from {branches_table}, \
+                     skipping author_id/idx_author migration for branch tables: {e}"
+                );
+                vec![]
+            }
+        };
+
+        // Branch tables are physically separate copies of mem_memories; they need
+        // the same author_id column/index. ALTER TABLE here can race with a concurrent
+        // `data branch merge` (MatrixOne 20631 "def changed"), so we use a retrying
+        // helper instead of plain sqlx::query().execute().
+        for bt_raw in &branch_table_names {
+            // bt_raw is the raw table name (e.g. br_abc123_my_branch) without DB prefix.
+            // Validate against a strict allowlist before interpolating into DDL.
+            if !bt_raw.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                tracing::warn!(
+                    "migration: skipping branch table with invalid identifier '{bt_raw}'"
+                );
+                continue;
+            }
+            let bt_full = self.t(bt_raw);
+            let has_col =
+                info_schema_column_exists(pool, schema_name, bt_raw, "author_id").await;
+            if !has_col {
+                let r = exec_ddl_with_retry(
+                    pool,
+                    &format!("ALTER TABLE {bt_full} ADD COLUMN author_id VARCHAR(64) DEFAULT NULL"),
+                )
+                .await;
+                match r {
+                    Ok(_) => tracing::info!("migration: added author_id to branch table {bt_full}"),
+                    Err(e) => {
+                        // Propagate the error so that migrate_user() does NOT write the
+                        // schema version. The migration will be retried on the next startup
+                        // rather than being silently marked as complete.
+                        tracing::error!(
+                            "migration: failed to add author_id to branch table {bt_full}: {e}"
+                        );
+                        return Err(db_err(e));
+                    }
+                }
+            }
+            // Always ensure the index exists regardless of whether the column was just
+            // added or was already present (handles "column exists but index is missing"
+            // on older databases). The error is expected when the index already exists.
+            let has_idx =
+                info_schema_index_exists(pool, schema_name, bt_raw, "idx_author").await;
+            if !has_idx {
+                let _ = exec_ddl_with_retry(
+                    pool,
+                    &format!("ALTER TABLE {bt_full} ADD INDEX idx_author (author_id)"),
+                )
+                .await;
+            }
+        }
 
         Ok(())
     }
@@ -2284,7 +2415,13 @@ impl SqlMemoryStore {
 
         match branch_row {
             Some(r) => {
-                let table = self.t(&r.try_get::<String, _>("table_name").map_err(db_err)?);
+                let raw = r.try_get::<String, _>("table_name").map_err(db_err)?;
+                let table = self.t(&raw);
+                // Branch metadata found in mem_branches — trust it.
+                // information_schema.tables is NOT reliable for MatrixOne zero-copy branch
+                // tables created via `data branch create table`, so we skip the existence probe
+                // here. If the physical table is genuinely gone, the subsequent DML query will
+                // return a DB error that propagates to the caller.
                 self.active_table_cache
                     .insert(cache_key.into_owned(), table.clone());
                 Ok(table)
@@ -2386,10 +2523,14 @@ impl SqlMemoryStore {
     pub async fn list_branches(
         &self,
         user_id: &str,
-    ) -> Result<Vec<(String, String)>, MemoriaError> {
+    ) -> Result<Vec<(String, String, Option<chrono::NaiveDateTime>)>, MemoriaError> {
         let branches_table = self.t("mem_branches");
+        // ORDER BY: NULL created_at (legacy rows) sort last via IS NULL trick;
+        // tie-break by name for stable output when timestamps collide.
         let rows = sqlx::query(&format!(
-            "SELECT name, table_name FROM {branches_table} WHERE user_id = ? AND status = 'active'"
+            "SELECT name, table_name, created_at FROM {branches_table} \
+             WHERE user_id = ? AND status = 'active' \
+             ORDER BY created_at IS NULL ASC, created_at ASC, name ASC"
         ))
         .bind(user_id)
         .fetch_all(&self.pool)
@@ -2400,6 +2541,10 @@ impl SqlMemoryStore {
                 Ok((
                     r.try_get::<String, _>("name").map_err(db_err)?,
                     r.try_get::<String, _>("table_name").map_err(db_err)?,
+                    // Lenient: a corrupt/NULL timestamp yields None rather than failing the
+                    // entire branch list. name and table_name are strict because they drive
+                    // branch operations.
+                    r.try_get::<Option<chrono::NaiveDateTime>, _>("created_at").ok().flatten(),
                 ))
             })
             .collect()
@@ -4595,6 +4740,7 @@ impl SqlMemoryStore {
 
     /// Lightweight list for API responses — skips embedding, source_event_ids,
     /// extra_metadata to reduce I/O and deserialization cost.
+    #[allow(clippy::too_many_arguments)]
     pub async fn list_active_lite(
         &self,
         table: &str,
@@ -4602,6 +4748,7 @@ impl SqlMemoryStore {
         limit: i64,
         memory_type: Option<&str>,
         session_id: Option<&str>,
+        trust_tier: Option<&str>,
         cursor: Option<&str>,
     ) -> Result<Vec<Memory>, MemoriaError> {
         let table = self.t(table);
@@ -4615,6 +4762,9 @@ impl SqlMemoryStore {
         }
         if session_id.is_some() {
             inner.push_str(" AND session_id = ?");
+        }
+        if trust_tier.is_some() {
+            inner.push_str(" AND trust_tier = ?");
         }
         if cursor.is_some() {
             inner.push_str(" AND memory_id < ?");
@@ -4635,6 +4785,9 @@ impl SqlMemoryStore {
         }
         if let Some(session_id) = session_id {
             q = q.bind(session_id);
+        }
+        if let Some(tt) = trust_tier {
+            q = q.bind(tt);
         }
         if let Some(c) = cursor {
             q = q.bind(c);

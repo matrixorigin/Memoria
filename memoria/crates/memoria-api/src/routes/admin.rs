@@ -165,13 +165,25 @@ pub async fn user_stats(
     auth.require_master()?;
     let user_store = get_user_store(&state, &user_id).await?;
     let memories_table = user_store.t("mem_memories");
-    let memory_count = sqlx::query_scalar::<_, i64>(&format!(
-        "SELECT COUNT(*) FROM {memories_table} WHERE user_id = ? AND is_active > 0"
-    ))
-    .bind(&user_id)
-    .fetch_one(user_store.pool())
-    .await
-    .map_err(db_err)?;
+    // For group scopes (user_id starts with "grp_") count ALL active memories in the
+    // group database — the individual user_id filter would always return 0 since
+    // memories are attributed to each member's uid, not the group id itself.
+    let memory_count = if user_id.starts_with("grp_") {
+        sqlx::query_scalar::<_, i64>(&format!(
+            "SELECT COUNT(*) FROM {memories_table} WHERE is_active > 0"
+        ))
+        .fetch_one(user_store.pool())
+        .await
+        .map_err(db_err)?
+    } else {
+        sqlx::query_scalar::<_, i64>(&format!(
+            "SELECT COUNT(*) FROM {memories_table} WHERE user_id = ? AND is_active > 0"
+        ))
+        .bind(&user_id)
+        .fetch_one(user_store.pool())
+        .await
+        .map_err(db_err)?
+    };
     let snapshot_count = user_store
         .list_snapshot_registrations(&user_id)
         .await
@@ -785,6 +797,108 @@ pub async fn user_call_stats(
             "avg_retrieval_ms": at_avg_ret as i64,
         },
         "series": series,
+    })))
+}
+
+/// GET /admin/users/:user_id/branch-stats
+///
+/// Returns memory counts per branch for a given user (or group).
+/// Response:
+/// ```json
+/// {
+///   "branches": [
+///     {"name": "main",    "count": 170},
+///     {"name": "another", "count": 320}
+///   ],
+///   "total": 490
+/// }
+/// ```
+pub async fn user_branch_stats(
+    auth: AuthUser,
+    State(state): State<AppState>,
+    Path(user_id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    auth.require_master()?;
+    let user_store = get_user_store(&state, &user_id).await?;
+
+    // --- main branch ---
+    // Personal users have rows from multiple users in mem_memories (shared table), so
+    // we filter by user_id. Group users own an isolated per-group database where
+    // mem_memories contains only group data, so no user_id filter is needed there.
+    let memories_table = user_store.t("mem_memories");
+    let main_count: i64 = if user_id.starts_with("grp_") {
+        sqlx::query_scalar::<_, i64>(&format!(
+            "SELECT COUNT(*) FROM {memories_table} WHERE is_active > 0"
+        ))
+        .fetch_one(user_store.pool())
+        .await
+        .map_err(db_err)?
+    } else {
+        sqlx::query_scalar::<_, i64>(&format!(
+            "SELECT COUNT(*) FROM {memories_table} WHERE user_id = ? AND is_active > 0"
+        ))
+        .bind(&user_id)
+        .fetch_one(user_store.pool())
+        .await
+        .map_err(db_err)?
+    };
+
+    let mut branches_stats = vec![serde_json::json!({"name": "main", "count": main_count})];
+    let mut total = main_count;
+    let mut degraded_branches: Vec<String> = Vec::new();
+
+    // --- non-main branches from mem_branches ---
+    // Branch tables are per-user physical tables (created via `data branch create table`),
+    // so they only contain data belonging to the owning user/group. No user_id filter is
+    // required — this is consistent with the group-scoped main count above.
+    let branch_rows = user_store.list_branches(&user_id).await.map_err(api_err)?;
+    for (name, raw_table_name, _created_at) in &branch_rows {
+        if name == "main" || raw_table_name.is_empty() {
+            continue;
+        }
+        if !raw_table_name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            tracing::warn!(
+                user_id = %user_id,
+                branch = %name,
+                table = %raw_table_name,
+                "user_branch_stats: skipping branch with invalid table identifier"
+            );
+            degraded_branches.push(name.clone());
+            continue;
+        }
+        let bt = user_store.t(raw_table_name);
+        let count_result = sqlx::query_scalar::<_, i64>(&format!(
+            "SELECT COUNT(*) FROM {bt} WHERE is_active > 0"
+        ))
+        .fetch_one(user_store.pool())
+        .await;
+        let count = match count_result {
+            Ok(n) => n,
+            Err(e) => {
+                tracing::warn!(
+                    user_id = %user_id,
+                    branch = %name,
+                    table = %raw_table_name,
+                    error = %e,
+                    "user_branch_stats: failed to count memories for branch"
+                );
+                // Record degraded branch so the caller knows the total is unreliable.
+                degraded_branches.push(name.clone());
+                0
+            }
+        };
+        branches_stats.push(serde_json::json!({"name": name, "count": count}));
+        total += count;
+    }
+
+    Ok(Json(serde_json::json!({
+        "branches": branches_stats,
+        "total": total,
+        // `degraded` is true when at least one branch table could not be counted.
+        // In that case `total` is a lower bound and `degraded_branches` lists the
+        // affected branches — callers should treat the numbers as approximate.
+        "degraded": !degraded_branches.is_empty(),
+        "degraded_branches": degraded_branches,
     })))
 }
 

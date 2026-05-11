@@ -76,6 +76,25 @@ fn tracking_path(method: &str, params: Option<&serde_json::Value>) -> String {
     format!("/mcp/{sanitized}")
 }
 
+/// MCP write tools that mutate the active memory table.
+/// These are blocked when the caller is group-scoped and checked out on `main`,
+/// mirroring the REST `group_main_write_guard` middleware.
+///
+/// Read-only tools, branch-management tools (`memory_checkout`, `memory_branch`,
+/// `memory_branch_delete`), and snapshot ops are intentionally excluded.
+const GROUP_MAIN_WRITE_BLOCKED: &[&str] = &[
+    "memory_store",
+    "memory_correct",
+    "memory_purge",
+    "memory_observe",
+    "memory_governance",
+    "memory_consolidate",
+    "memory_reflect",
+    "memory_extract_entities",
+    "memory_link_entities",
+    "memory_rollback",
+];
+
 fn mcp_tool_dirty_mask(tool: &str) -> Option<crate::metrics_summary::DirtyMask> {
     use crate::metrics_summary::DirtyMask;
     match tool {
@@ -226,9 +245,75 @@ pub async fn mcp_handler(
         }
     };
 
+    // ── Group main-write guard (computed once, shared by both code paths) ─────
+    // Resolved here — before the Notification early-return — so that
+    // Notification-form write calls to `main` are also blocked instead of
+    // silently bypassing the restriction.
+    //
+    // Returns Some(tool_name) when the call must be blocked, None otherwise.
+    let blocked_tool: Option<String> = if let Some(gid) = &auth.group_id {
+        if let Some(tool) = tracked_tool.as_deref() {
+            if GROUP_MAIN_WRITE_BLOCKED.contains(&tool) {
+                // ACTOR_USER_ID is already set by the global actor_scope_layer.
+                let maybe_blocked = state
+                    .service
+                    .user_sql_store(gid)
+                    .await
+                    .ok()
+                    .map(|sql| {
+                        let gid_owned = gid.clone();
+                        memoria_storage::ACTOR_USER_ID
+                            .scope(auth.user_id.clone(), async move {
+                                sql.active_branch_name(&gid_owned).await
+                            })
+                    });
+                if let Some(fut) = maybe_blocked {
+                    if let Ok(branch) = fut.await {
+                        let is_solo_owner =
+                            crate::auth::group_main_write_allowed_for_solo_owner(
+                                &state,
+                                gid,
+                                &auth.user_id,
+                            )
+                            .await;
+                        if branch == "main" && !is_solo_owner {
+                            Some(tool.to_string())
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     // JSON-RPC 2.0: a Notification is a *valid* Request without an "id" member.
     // The server MUST NOT reply to Notifications.
     if req.get("id").is_none() {
+        // Write guard: per JSON-RPC 2.0 the server MUST NOT reply to Notifications,
+        // so we silently drop blocked writes without dispatching.
+        if blocked_tool.is_some() {
+            report_stats(&track_path, false);
+            state.call_log_batcher.record_rpc(
+                user_id,
+                "POST".to_string(),
+                track_path,
+                204,
+                t.elapsed().as_millis() as u32,
+                RpcMeta::err(-32001),
+            );
+            return StatusCode::NO_CONTENT.into_response();
+        }
         let dispatch_result = memoria_mcp::dispatch_http(
             method.clone(),
             params,
@@ -261,6 +346,36 @@ pub async fn mcp_handler(
     }
 
     let id = req["id"].clone();
+
+    // Use the pre-computed write-guard decision (see above).
+    if let Some(tool) = &blocked_tool {
+        let err_body = Json(json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": {
+                "code": -32001,
+                "message": format!(
+                    "Cannot call '{}' on 'main' in a shared space — \
+                     main is read-only in collaboration mode. \
+                     Your active branch is currently 'main'. \
+                     Call memory_checkout with a branch name \
+                     (e.g. {{\"name\": \"my-branch\"}}) to switch \
+                     to your own branch, then retry.",
+                    tool
+                )
+            }
+        }));
+        report_stats(&track_path, false);
+        state.call_log_batcher.record_rpc(
+            user_id,
+            "POST".to_string(),
+            track_path,
+            200,
+            t.elapsed().as_millis() as u32,
+            RpcMeta::err(-32001),
+        );
+        return err_body.into_response();
+    }
 
     // JSON-RPC spec: the HTTP response is always 200 OK, even for RPC errors.
     // Business-level error tracking uses rpc_success / rpc_error_code in the call log.
