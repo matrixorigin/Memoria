@@ -845,6 +845,7 @@ pub async fn user_branch_stats(
 
     let mut branches_stats = vec![serde_json::json!({"name": "main", "count": main_count})];
     let mut total = main_count;
+    let mut degraded_branches: Vec<String> = Vec::new();
 
     // --- non-main branches from mem_branches ---
     // Branch tables are per-user physical tables (created via `data branch create table`),
@@ -864,9 +865,6 @@ pub async fn user_branch_stats(
         let count = match count_result {
             Ok(n) => n,
             Err(e) => {
-                // Log the error so it's visible in diagnostics; surface 0 rather than
-                // failing the whole request — a single broken branch table shouldn't
-                // hide stats for all other branches.
                 tracing::warn!(
                     user_id = %user_id,
                     branch = %name,
@@ -874,6 +872,8 @@ pub async fn user_branch_stats(
                     error = %e,
                     "user_branch_stats: failed to count memories for branch"
                 );
+                // Record degraded branch so the caller knows the total is unreliable.
+                degraded_branches.push(name.clone());
                 0
             }
         };
@@ -884,6 +884,11 @@ pub async fn user_branch_stats(
     Ok(Json(serde_json::json!({
         "branches": branches_stats,
         "total": total,
+        // `degraded` is true when at least one branch table could not be counted.
+        // In that case `total` is a lower bound and `degraded_branches` lists the
+        // affected branches — callers should treat the numbers as approximate.
+        "degraded": !degraded_branches.is_empty(),
+        "degraded_branches": degraded_branches,
     })))
 }
 
