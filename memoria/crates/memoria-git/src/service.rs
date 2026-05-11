@@ -99,26 +99,51 @@ pub struct DiffRow {
 
 /// Classified diff result produced by [`classify_diff_rows`].
 ///
-/// Classification rules (based on MatrixOne `data branch diff` output):
+/// ## Classification rules
 ///
-/// | Scenario                        | main | branch        | flag   | is_active | superseded_by | Category    |
-/// |---------------------------------|------|---------------|--------|-----------|---------------|-------------|
-/// | New memory on branch            | ✗    | ✓ (active)    | INSERT | 1         | NULL          | **ADDED**   |
-/// | Created then deleted on branch  | ✗    | ✓ (inactive)  | INSERT | 0         | NULL          | hidden      |
-/// | Created then corrected (old)    | ✗    | ✓ (inactive)  | INSERT | 0         | new_id        | hidden      |
-/// | Created then corrected (new)    | ✗    | ✓ (active)    | INSERT | 1         | NULL          | **ADDED**   |
-/// | Deleted main memory on branch   | ✓    | ✓ (inactive)  | UPDATE | 0         | NULL          | **REMOVED** |
-/// | Corrected main memory (old)     | ✓    | ✓ (inactive)  | UPDATE | 0         | new_id        | **UPDATED** |
-/// | Corrected main memory (new)     | ✗    | ✓ (active)    | INSERT | 1         | NULL          | paired into **UPDATED** |
+/// Classification uses only `is_active` and `superseded_by`; the `flag` field is
+/// intentionally ignored.  MatrixOne's `data branch diff` flag values are not stable
+/// across versions:
+///   * Older builds: flag=INSERT for newly-inserted branch rows, flag=UPDATE for modified/deleted.
+///   * MatrixOne ≥ 3.0.11: flag=UPDATE for **all** diff rows regardless of DML operation.
+///
+/// Using flag for classification caused all newly-added branch memories to disappear
+/// from diff results on MatrixOne ≥ 3.0.11 (they were `flag=UPDATE, is_active=1` which
+/// matched neither the INSERT-processing nor the UPDATE-processing branch).
+///
+/// | Scenario                        | main | branch        | is_active | superseded_by | Category    |
+/// |---------------------------------|------|---------------|-----------|---------------|-------------|
+/// | New memory on branch            | ✗    | ✓ (active)    | 1         | NULL          | **ADDED**   |
+/// | Created then corrected (old)    | ✗    | ✓ (inactive)  | 0         | new_id        | hidden (part of UPDATED pair) |
+/// | Created then corrected (new)    | ✗    | ✓ (active)    | 1         | NULL          | **ADDED**   |
+/// | Deleted main memory on branch   | ✓    | ✓ (inactive)  | 0         | NULL          | **REMOVED** |
+/// | Created then deleted on branch  | ✗    | ✓ (inactive)  | 0         | NULL          | **REMOVED** (was hidden; see note below) |
+/// | Corrected main memory (old)     | ✓    | ✓ (inactive)  | 0         | new_id        | **UPDATED** |
+/// | Corrected main memory (new)     | ✗    | ✓ (active)    | 1         | NULL          | paired into **UPDATED** |
+///
+/// Note: "created then deleted on branch" rows initially land in `removed`, but
+/// `resolve_ghost_removes` moves them to `ghost_removes` (hidden) after verifying
+/// they are absent (or already inactive) in main — keeping `removed` aligned with
+/// what `selective_apply` can actually merge.
 #[derive(Debug, Clone, Default)]
 pub struct ClassifiedDiff {
     pub added: Vec<DiffItem>,
     pub updated: Vec<DiffUpdatedPair>,
+    /// Memories that are **active in main** (`is_active = 1`) and were deleted on
+    /// this branch. Initially populated by `classify_diff_rows` for all branch-only
+    /// inactive rows, then refined by `resolve_ghost_removes` which moves items that
+    /// are absent (or already inactive) in main into `ghost_removes`.
     pub removed: Vec<DiffItem>,
     pub conflicts: Vec<DiffConflict>,
     /// Main-only changes: rows that exist on main but not on this branch
     /// (other users' merges that happened after this branch was created).
     pub behind_main: Vec<DiffItem>,
+    /// Branch-only inactive rows with no superseded_by: the memory was
+    /// created AND deleted entirely within this branch — it never existed
+    /// in main. These are NOT shown as diffs; merging them is always a
+    /// no-op (the selective_apply remove guard requires main to have the
+    /// memory, which it doesn't).
+    pub ghost_removes: Vec<DiffItem>,
 }
 
 /// A single diff item (used for ADDED and REMOVED categories).
@@ -204,15 +229,36 @@ pub fn classify_diff_rows(rows: Vec<DiffRow>, branch_table: &str) -> ClassifiedD
 
     let mut result = ClassifiedDiff::default();
 
-    // Step 1: Separate by source
+    // Step 1: Separate by source.
+    // DiffRow.source was already normalized to the unqualified table name in diff_branch_rows,
+    // so this comparison should be stable regardless of MatrixOne version.
     let mut branch_rows: Vec<&DiffRow> = Vec::new();
     let mut main_rows: Vec<&DiffRow> = Vec::new();
     for r in &rows {
-        if r.source == branch_table {
+        // MatrixOne returns identifiers in lowercase regardless of how they were created,
+        // so use case-insensitive comparison to avoid misclassifying all branch rows as
+        // main-side when the branch name contains uppercase letters.
+        if r.source.eq_ignore_ascii_case(branch_table) {
             branch_rows.push(r);
         } else {
             main_rows.push(r);
         }
+    }
+    tracing::debug!(
+        total = rows.len(),
+        branch_side = branch_rows.len(),
+        main_side = main_rows.len(),
+        branch_table = %branch_table,
+        "classify_diff_rows: source split"
+    );
+    for r in &branch_rows {
+        tracing::debug!(
+            memory_id = %r.memory_id,
+            flag = %r.flag,
+            is_active = r.is_active,
+            superseded_by = ?r.superseded_by,
+            "classify_diff_rows: branch row"
+        );
     }
 
     // Step 2: Find conflicting memory_ids (present on both sides)
@@ -320,10 +366,16 @@ pub fn classify_diff_rows(rows: Vec<DiffRow>, branch_table: &str) -> ClassifiedD
     // rendered diff list deduplicates allItems by rowKey so the UI stays consistent even
     // when the API returns duplicates.
 
-    // Build superseded map from clean branch rows
+    // Classification no longer depends on `flag` because MatrixOne versions differ
+    // in what they return: older builds use flag=INSERT for newly inserted branch rows,
+    // while newer builds (≥ 3.0.11) return flag=UPDATE for all diff rows regardless of
+    // the actual DML operation. We therefore use only `is_active` and `superseded_by`
+    // to drive the three-way classification.
+
+    // Build superseded map: inactive branch rows that point to a replacement memory_id.
     let mut superseded_map: HashMap<String, &DiffRow> = HashMap::new();
     for r in &clean_branch {
-        if r.flag == "UPDATE" && r.is_active == 0 {
+        if r.is_active == 0 {
             if let Some(ref new_id) = r.superseded_by {
                 if !new_id.is_empty() {
                     superseded_map.insert(new_id.clone(), r);
@@ -332,9 +384,9 @@ pub fn classify_diff_rows(rows: Vec<DiffRow>, branch_table: &str) -> ClassifiedD
         }
     }
 
-    // Process INSERT rows
+    // Active rows (is_active=1): ADDED, or the "new" side of an UPDATED pair.
     for r in &clean_branch {
-        if r.flag != "INSERT" || r.is_active == 0 {
+        if r.is_active != 1 {
             continue;
         }
         if let Some(old_row) = superseded_map.remove(&r.memory_id) {
@@ -356,9 +408,24 @@ pub fn classify_diff_rows(rows: Vec<DiffRow>, branch_table: &str) -> ClassifiedD
         }
     }
 
-    // Process UPDATE rows — is_active=0 without superseded_by → REMOVED
+    // Branch-only inactive rows without superseded_by.
+    //
+    // `data branch diff` only returns the branch-side row for deletions — it
+    // does NOT return the main-side row — so every such row here is branch-only.
+    // There are two distinct scenarios that look identical at this point:
+    //
+    //   A. "Deleted from main on branch": memory_id exists in main (active).
+    //      → User-visible REMOVED; should propagate on merge.
+    //
+    //   B. "Created-then-deleted on branch": memory_id NEVER existed in main.
+    //      → Ghost/no-op; hide from diff (merge would skip anyway).
+    //
+    // We cannot distinguish A from B without querying the main table. The
+    // initial classification puts ALL of them into `removed`. Callers that have
+    // DB access should call `resolve_ghost_removes` afterwards to move bucket-B
+    // items from `removed` into `ghost_removes`.
     for r in &clean_branch {
-        if r.flag != "UPDATE" || r.is_active != 0 {
+        if r.is_active != 0 {
             continue;
         }
         let has_superseded = r
@@ -691,6 +758,23 @@ impl GitForDataService {
                 .map_err(db_err)?
         };
 
+        tracing::debug!(
+            branch_table = %branch_table,
+            main_table = %main_table,
+            raw_row_count = rows.len(),
+            "diff_branch_rows: raw rows from data branch diff"
+        );
+
+        // Log the first row's source column to diagnose qualified vs unqualified naming.
+        if let Some(first) = rows.first() {
+            let sample_source: String = first.try_get(0usize).unwrap_or_default();
+            tracing::debug!(
+                sample_source = %sample_source,
+                branch_table = %branch_table,
+                "diff_branch_rows: source column sample (col 0)"
+            );
+        }
+
         let mut result = Vec::new();
         for r in &rows {
             let uid: String = r.try_get("user_id").map_err(db_err)?;
@@ -700,7 +784,15 @@ impl GitForDataService {
             // Column index 0 is the implicit source column that MatrixOne prepends to
             // `data branch diff` output — it holds the originating table name and is
             // present in both the projected and full-row query forms.
-            let source: String = r.try_get(0usize).unwrap_or_default();
+            //
+            // Depending on the MatrixOne version, column 0 may be qualified ("db.table")
+            // or unqualified ("table"). We normalize to the unqualified form so that
+            // classify_diff_rows can reliably compare against the bare table name.
+            let source_raw: String = r.try_get(0usize).unwrap_or_default();
+            let source = source_raw
+                .rsplit_once('.')
+                .map(|(_, t)| t.to_string())
+                .unwrap_or(source_raw);
             result.push(DiffRow {
                 source,
                 flag: r.try_get("flag").map_err(db_err)?,
@@ -723,6 +815,11 @@ impl GitForDataService {
                 break;
             }
         }
+        tracing::debug!(
+            filtered_row_count = result.len(),
+            branch_table = %branch_table,
+            "diff_branch_rows: rows after user_id filter"
+        );
         Ok(result)
     }
 
@@ -794,44 +891,73 @@ impl GitForDataService {
             for id in &add_ids {
                 q = q.bind(id);
             }
+            // Use pool directly for the read-only branch-table probe.
+            // MatrixOne zero-copy branch tables may not be readable within an open
+            // write transaction on the same connection, causing the branch check to
+            // return empty and silently skip all adds.
             let branch_present: std::collections::HashSet<String> = q
-                .fetch_all(&mut *tx)
+                .fetch_all(&self.pool)
                 .await
                 .map_err(db_err)?
                 .iter()
                 .filter_map(|row| row.try_get::<String, _>("memory_id").ok())
                 .collect();
 
+            // Query main for ALL rows with these memory_ids (regardless of is_active),
+            // to check for existing records (active or inactive) that would conflict.
             let main_sql = format!(
-                "SELECT memory_id FROM {main_table_ref} WHERE user_id = ? AND memory_id IN ({placeholders})"
+                "SELECT memory_id, is_active FROM {main_table_ref} WHERE user_id = ? AND memory_id IN ({placeholders})"
             );
             let mut q = sqlx::query(&main_sql).bind(user_id);
             for id in &add_ids {
                 q = q.bind(id);
             }
-            let main_present: std::collections::HashSet<String> = q
-                .fetch_all(&mut *tx)
-                .await
-                .map_err(db_err)?
+            let main_rows = q.fetch_all(&self.pool).await.map_err(db_err)?;
+            let main_present_all: std::collections::HashSet<String> = main_rows
                 .iter()
                 .filter_map(|row| row.try_get::<String, _>("memory_id").ok())
                 .collect();
+            let main_active: std::collections::HashSet<String> = main_rows
+                .iter()
+                .filter(|row| row.try_get::<i8, _>("is_active").unwrap_or(0) == 1)
+                .filter_map(|row| row.try_get::<String, _>("memory_id").ok())
+                .collect();
 
+            tracing::debug!(
+                add_ids = add_ids.len(),
+                branch_present = branch_present.len(),
+                main_present_all = main_present_all.len(),
+                main_active = main_active.len(),
+                "selective_apply: add check"
+            );
+
+            // Classify adds into three buckets:
+            // - new_adds:     not in main at all → INSERT
+            // - restore_adds: in main but inactive (is_active=0, e.g. previously deleted)
+            //                 → DELETE stale row + INSERT branch version
+            // - skip:         already active in main → no-op
+            let mut new_adds: Vec<String> = Vec::new();
+            let mut restore_adds: Vec<String> = Vec::new();
             for id in &add_ids {
-                if branch_present.contains(id) && !main_present.contains(id) {
+                if !branch_present.contains(id) {
+                    result.skipped_adds.push(id.clone());
+                } else if main_active.contains(id) {
+                    // Already active in main — already merged.
+                    result.skipped_adds.push(id.clone());
+                } else if main_present_all.contains(id) {
+                    // Exists in main but inactive (deleted). Restore from branch.
+                    restore_adds.push(id.clone());
                     result.applied_adds.push(id.clone());
                 } else {
-                    result.skipped_adds.push(id.clone());
+                    // Genuinely new — not in main at all.
+                    new_adds.push(id.clone());
+                    result.applied_adds.push(id.clone());
                 }
             }
 
-            if !result.applied_adds.is_empty() {
-                let ph = result
-                    .applied_adds
-                    .iter()
-                    .map(|_| "?")
-                    .collect::<Vec<_>>()
-                    .join(",");
+            // INSERT genuinely new memories
+            if !new_adds.is_empty() {
+                let ph = new_adds.iter().map(|_| "?").collect::<Vec<_>>().join(",");
                 let insert_sql = format!(
                     "INSERT INTO {main_table_ref} \
                      (memory_id, user_id, memory_type, content, embedding, session_id, \
@@ -843,10 +969,45 @@ impl GitForDataService {
                      FROM {branch_table_ref} WHERE user_id = ? AND is_active = 1 AND memory_id IN ({ph})"
                 );
                 let mut q = sqlx::query(&insert_sql).bind(user_id);
-                for id in &result.applied_adds {
+                for id in &new_adds {
                     q = q.bind(id);
                 }
                 q.execute(&mut *tx).await.map_err(db_err)?;
+            }
+
+            // Restore inactive-in-main memories: delete stale row, then insert branch version.
+            // Cannot use INSERT...ON DUPLICATE KEY UPDATE because MatrixOne branch tables are
+            // read-only views in some builds. Instead: DELETE + INSERT.
+            if !restore_adds.is_empty() {
+                let ph = restore_adds.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+                let delete_sql = format!(
+                    "DELETE FROM {main_table_ref} WHERE user_id = ? AND memory_id IN ({ph})"
+                );
+                let mut q = sqlx::query(&delete_sql).bind(user_id);
+                for id in &restore_adds {
+                    q = q.bind(id);
+                }
+                q.execute(&mut *tx).await.map_err(db_err)?;
+
+                let insert_sql = format!(
+                    "INSERT INTO {main_table_ref} \
+                     (memory_id, user_id, memory_type, content, embedding, session_id, \
+                      source_event_ids, extra_metadata, is_active, superseded_by, \
+                      trust_tier, initial_confidence, observed_at, created_at, updated_at, author_id) \
+                     SELECT memory_id, user_id, memory_type, content, embedding, session_id, \
+                            source_event_ids, extra_metadata, is_active, superseded_by, \
+                            trust_tier, initial_confidence, observed_at, created_at, updated_at, author_id \
+                     FROM {branch_table_ref} WHERE user_id = ? AND is_active = 1 AND memory_id IN ({ph})"
+                );
+                let mut q = sqlx::query(&insert_sql).bind(user_id);
+                for id in &restore_adds {
+                    q = q.bind(id);
+                }
+                q.execute(&mut *tx).await.map_err(db_err)?;
+                tracing::info!(
+                    count = restore_adds.len(),
+                    "selective_apply: restored inactive-in-main memories from branch"
+                );
             }
         }
 
@@ -861,12 +1022,14 @@ impl GitForDataService {
                 .await
                 .map_err(db_err)?;
 
+                // Read branch table via pool (not tx) to avoid MatrixOne zero-copy
+                // visibility issues when reading branch tables inside an active transaction.
                 let branch_old_exists: i64 = sqlx::query_scalar(&format!(
                     "SELECT COUNT(*) FROM {branch_table_ref} WHERE memory_id = ? AND user_id = ?"
                 ))
                 .bind(&pair.old_id)
                 .bind(user_id)
-                .fetch_one(&mut *tx)
+                .fetch_one(&self.pool)
                 .await
                 .map_err(db_err)?;
                 let branch_new_exists: i64 = sqlx::query_scalar(&format!(
@@ -874,7 +1037,7 @@ impl GitForDataService {
                 ))
                 .bind(&pair.new_id)
                 .bind(user_id)
-                .fetch_one(&mut *tx)
+                .fetch_one(&self.pool)
                 .await
                 .map_err(db_err)?;
 
@@ -948,6 +1111,7 @@ impl GitForDataService {
                 .filter_map(|row| row.try_get::<String, _>("memory_id").ok())
                 .collect();
 
+            // Read branch table via pool (not tx) — same reason as update path above.
             let branch_sql = format!(
                 "SELECT memory_id FROM {branch_table_ref} WHERE user_id = ? AND is_active = 0 AND memory_id IN ({placeholders})"
             );
@@ -956,7 +1120,7 @@ impl GitForDataService {
                 q = q.bind(id);
             }
             let branch_present: std::collections::HashSet<String> = q
-                .fetch_all(&mut *tx)
+                .fetch_all(&self.pool)
                 .await
                 .map_err(db_err)?
                 .iter()
@@ -1034,8 +1198,11 @@ impl GitForDataService {
                 for id in &branch_ids {
                     q = q.bind(id);
                 }
+                // Read branch table via pool (not tx) — same reason as add/remove paths:
+                // MatrixOne zero-copy branch tables may not be visible inside an open
+                // write transaction on the same connection.
                 let branch_present: std::collections::HashSet<String> = q
-                    .fetch_all(&mut *tx)
+                    .fetch_all(&self.pool)
                     .await
                     .map_err(db_err)?
                     .iter()
@@ -1097,6 +1264,69 @@ impl GitForDataService {
 
         tx.commit().await.map_err(db_err)?;
         Ok(result)
+    }
+
+    /// Refine a [`ClassifiedDiff`] by querying the main table to distinguish
+    /// two cases that are indistinguishable from the raw `data branch diff` output:
+    ///
+    /// - **Real remove** (`memory_id` is **active** in main, `is_active = 1`): stays in `removed`.
+    ///   This matches the guard in `selective_apply`'s remove path so that every item
+    ///   shown as REMOVED in the UI is actually mergeable.
+    /// - **Ghost remove** (`memory_id` never existed in main, or already inactive):
+    ///   moved to `ghost_removes` (not shown to user).
+    ///
+    /// Must be called after [`classify_diff_rows`] when the caller has DB access.
+    /// If `classified.removed` is empty the method is a no-op.
+    pub async fn resolve_ghost_removes(
+        &self,
+        classified: &mut ClassifiedDiff,
+        main_table: &str,
+        user_id: &str,
+    ) -> Result<(), MemoriaError> {
+        if classified.removed.is_empty() {
+            return Ok(());
+        }
+        let main_table = validate_identifier(main_table)?;
+        let db = quote_identifier(&self.db_name);
+        let main_table_ref = format!("{db}.{main_table}");
+        let remove_ids: Vec<String> = classified
+            .removed
+            .iter()
+            .map(|r| r.memory_id.clone())
+            .collect();
+        let ph = remove_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        // Use is_active = 1 to match the exact guard in selective_apply's remove path
+        // (L1098: "is_active = 1"). A memory that is already inactive in main would
+        // never pass that guard, so showing it as REMOVED in the diff is a false-positive:
+        // the user sees a deletable item that the merge silently skips.
+        let sql = format!(
+            "SELECT memory_id FROM {main_table_ref} WHERE user_id = ? AND is_active = 1 AND memory_id IN ({ph})"
+        );
+        let mut q = sqlx::query_scalar(&sql).bind(user_id);
+        for id in &remove_ids {
+            q = q.bind(id);
+        }
+        let main_has: std::collections::HashSet<String> = q
+            .fetch_all(&self.pool)
+            .await
+            .map_err(db_err)?
+            .into_iter()
+            .collect();
+
+        let old_removed = std::mem::take(&mut classified.removed);
+        for item in old_removed {
+            if main_has.contains(&item.memory_id) {
+                classified.removed.push(item);
+            } else {
+                classified.ghost_removes.push(item);
+            }
+        }
+        tracing::debug!(
+            real_removes = classified.removed.len(),
+            ghost_removes = classified.ghost_removes.len(),
+            "resolve_ghost_removes: filtered removed bucket"
+        );
+        Ok(())
     }
 
     /// Count rows in a table at a given snapshot (for diff/validation).

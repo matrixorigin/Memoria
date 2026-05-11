@@ -856,6 +856,16 @@ pub async fn user_branch_stats(
         if name == "main" || raw_table_name.is_empty() {
             continue;
         }
+        if !raw_table_name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            tracing::warn!(
+                user_id = %user_id,
+                branch = %name,
+                table = %raw_table_name,
+                "user_branch_stats: skipping branch with invalid table identifier"
+            );
+            degraded_branches.push(name.clone());
+            continue;
+        }
         let bt = user_store.t(raw_table_name);
         let count_result = sqlx::query_scalar::<_, i64>(&format!(
             "SELECT COUNT(*) FROM {bt} WHERE is_active > 0"

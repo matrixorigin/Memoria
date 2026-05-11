@@ -115,6 +115,9 @@ pub async fn list_memories(
         .cursor
         .as_deref()
         .filter(|c| c.len() == 32 && c.chars().all(|ch| ch.is_ascii_hexdigit()));
+    if let Some(tier) = q.trust_tier.as_deref() {
+        parse_trust_tier(tier).map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e))?;
+    }
     let fetch_limit = limit + 1;
     let mut memories = state
         .service

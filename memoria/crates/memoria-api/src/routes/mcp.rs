@@ -303,6 +303,7 @@ pub async fn mcp_handler(
         // Write guard: per JSON-RPC 2.0 the server MUST NOT reply to Notifications,
         // so we silently drop blocked writes without dispatching.
         if blocked_tool.is_some() {
+            report_stats(&track_path, false);
             state.call_log_batcher.record_rpc(
                 user_id,
                 "POST".to_string(),

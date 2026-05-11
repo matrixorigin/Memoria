@@ -1030,7 +1030,11 @@ pub async fn call(
             let raw_rows = user_git
                 .diff_branch_rows(&table_name, "mem_memories", user_id, limit * 3)
                 .await?;
-            let classified = memoria_git::classify_diff_rows(raw_rows, &table_name);
+            let mut classified = memoria_git::classify_diff_rows(raw_rows, &table_name);
+            // Resolve ghost removes (created-then-deleted on branch, never in main)
+            user_git
+                .resolve_ghost_removes(&mut classified, "mem_memories", user_id)
+                .await?;
 
             let total = classified.added.len()
                 + classified.updated.len()

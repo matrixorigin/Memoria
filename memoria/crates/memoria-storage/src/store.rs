@@ -1577,7 +1577,12 @@ impl SqlMemoryStore {
             .await;
             match &add_col {
                 Ok(_) => tracing::info!("migration: added author_id column to {memories_table}"),
-                Err(e) => tracing::error!("migration: failed to add author_id to {memories_table}: {e}"),
+                Err(e) if is_duplicate_column(e) => tracing::info!(
+                    "migration: author_id column already exists in {memories_table}, skipping"
+                ),
+                Err(e) => tracing::error!(
+                    "migration: failed to add author_id to {memories_table}: {e}"
+                ),
             }
         } else {
             tracing::debug!("migration: author_id column already exists in {memories_table}, skipping");
@@ -1602,19 +1607,35 @@ impl SqlMemoryStore {
 
         // Also add author_id to any existing branch tables (which are separate physical tables).
         // Branch tables are created as copies of mem_memories and need the same schema.
-        let branch_table_names: Vec<String> = sqlx::query_scalar(&format!(
+        let branch_table_names: Vec<String> = match sqlx::query_scalar(&format!(
             "SELECT table_name FROM {branches_table} WHERE status = 'active' AND table_name != ''"
         ))
         .fetch_all(pool)
         .await
-        .unwrap_or_default();
+        {
+            Ok(names) => names,
+            Err(e) => {
+                tracing::warn!(
+                    "migration: failed to load branch table names from {branches_table}, \
+                     skipping author_id/idx_author migration for branch tables: {e}"
+                );
+                vec![]
+            }
+        };
 
         // Branch tables are physically separate copies of mem_memories; they need
         // the same author_id column/index. ALTER TABLE here can race with a concurrent
         // `data branch merge` (MatrixOne 20631 "def changed"), so we use a retrying
         // helper instead of plain sqlx::query().execute().
         for bt_raw in &branch_table_names {
-            // bt_raw is the raw table name (e.g. br_abc123_my_branch) without DB prefix
+            // bt_raw is the raw table name (e.g. br_abc123_my_branch) without DB prefix.
+            // Validate against a strict allowlist before interpolating into DDL.
+            if !bt_raw.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                tracing::warn!(
+                    "migration: skipping branch table with invalid identifier '{bt_raw}'"
+                );
+                continue;
+            }
             let bt_full = self.t(bt_raw);
             let has_col =
                 info_schema_column_exists(pool, schema_name, bt_raw, "author_id").await;
@@ -1626,7 +1647,15 @@ impl SqlMemoryStore {
                 .await;
                 match r {
                     Ok(_) => tracing::info!("migration: added author_id to branch table {bt_full}"),
-                    Err(e) => tracing::error!("migration: failed to add author_id to branch table {bt_full}: {e}"),
+                    Err(e) => {
+                        // Propagate the error so that migrate_user() does NOT write the
+                        // schema version. The migration will be retried on the next startup
+                        // rather than being silently marked as complete.
+                        tracing::error!(
+                            "migration: failed to add author_id to branch table {bt_full}: {e}"
+                        );
+                        return Err(db_err(e));
+                    }
                 }
             }
             // Always ensure the index exists regardless of whether the column was just
@@ -2512,6 +2541,9 @@ impl SqlMemoryStore {
                 Ok((
                     r.try_get::<String, _>("name").map_err(db_err)?,
                     r.try_get::<String, _>("table_name").map_err(db_err)?,
+                    // Lenient: a corrupt/NULL timestamp yields None rather than failing the
+                    // entire branch list. name and table_name are strict because they drive
+                    // branch operations.
                     r.try_get::<Option<chrono::NaiveDateTime>, _>("created_at").ok().flatten(),
                 ))
             })
