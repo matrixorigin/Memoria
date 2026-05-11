@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.4.0] - 2026-05-11
+
+### 🐛 Bug Fixes
+
+- Trivial fix for pro function (#201) ([caa3d79](https://github.com/matrixorigin/Memoria/commit/caa3d79438c71e6aebbcff5abc875728a80e3962))
+
+### 📚 Documentation
+
+- Add citation instructions (#197) ([a7c3547](https://github.com/matrixorigin/Memoria/commit/a7c3547264a14ac1746205d819b24381a68502a3))
+- Add MatrixOne research paper reference (#196) ([a5d2786](https://github.com/matrixorigin/Memoria/commit/a5d2786c61312185e668bf4c98fdb83be333e454))
+
+### 🚀 Features
+
+- Group collaboration API with per-member branch isolation (#198) ([357d44c](https://github.com/matrixorigin/Memoria/commit/357d44c126419912b6f6a1c76bb5c1ef143270b3))
 ## [0.3.3] - 2026-04-22
 
 ### 🐛 Bug Fixes
