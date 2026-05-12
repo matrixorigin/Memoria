@@ -61,6 +61,7 @@ const GIT_TOOL_NAMES: &[&str] = &[
     "memory_branches",
     "memory_checkout",
     "memory_merge",
+    "memory_pick",
     "memory_diff",
     "memory_apply",
     "memory_branch_delete",

@@ -145,6 +145,7 @@ fn should_mark_metrics_dirty(
                 } else if path.starts_with("/v1/snapshots/") && path.ends_with("/rollback")
                     || path.starts_with("/v1/branches/") && path.ends_with("/checkout")
                     || path.starts_with("/v1/branches/") && path.ends_with("/merge")
+                    || path.starts_with("/v1/branches/") && path.ends_with("/pick")
                 {
                     Some(DirtyMask::FULL)
                 } else if (path.starts_with("/v1/branches/") && path.ends_with("/apply"))
@@ -313,6 +314,10 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/v1/branches/:name/diff",
             get(routes::snapshots::diff_branch),
+        )
+        .route(
+            "/v1/branches/:name/pick",
+            post(routes::snapshots::pick_branch),
         )
         .route(
             "/v1/branches/:name/diff-items",

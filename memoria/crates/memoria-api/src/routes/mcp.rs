@@ -110,7 +110,7 @@ fn mcp_tool_dirty_mask(tool: &str) -> Option<crate::metrics_summary::DirtyMask> 
         "memory_snapshot" | "memory_snapshot_delete" => Some(DirtyMask::SNAPSHOT),
         "memory_rollback" => Some(DirtyMask::FULL),
         "memory_branch" | "memory_branch_delete" => Some(DirtyMask::BRANCH),
-        "memory_checkout" | "memory_merge" => Some(DirtyMask::FULL),
+        "memory_checkout" | "memory_merge" | "memory_pick" => Some(DirtyMask::FULL),
         _ => None,
     }
 }
