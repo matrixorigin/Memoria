@@ -31,10 +31,7 @@ pub enum StatsEvent {
     /// A previously deactivated memory was re-activated.
     MemoryActivated { user_id: String },
     /// An edit-log entry was written (any operation).
-    EditLogged {
-        user_id: String,
-        operation: String,
-    },
+    EditLogged { user_id: String, operation: String },
     /// One or more new entities were upserted for a user.
     EntitiesUpserted { user_id: String, count: u64 },
     /// An API or MCP call completed (used for devops/MCP tab).
@@ -151,9 +148,7 @@ async fn flush_batch(events: &[StatsEvent], pool: &MySqlPool) {
                 *metric_detail
                     .entry((user_id.clone(), "trust_tier".into(), trust_tier.clone()))
                     .or_default() += 1;
-                *daily
-                    .entry((today, "memory_stored".into()))
-                    .or_default() += 1;
+                *daily.entry((today, "memory_stored".into())).or_default() += 1;
             }
             StatsEvent::MemoryDeactivated { user_id } => {
                 let u = user_stats.entry(user_id.clone()).or_default();
@@ -193,13 +188,9 @@ async fn flush_batch(events: &[StatsEvent], pool: &MySqlPool) {
                         a.first_mcp_call = Some(chrono::Utc::now().naive_utc());
                     }
                     *mcp_paths.entry(path.clone()).or_default() += 1;
-                    *daily
-                        .entry((today, "mcp_calls".into()))
-                        .or_default() += 1;
+                    *daily.entry((today, "mcp_calls".into())).or_default() += 1;
                 }
-                *daily
-                    .entry((today, "api_calls".into()))
-                    .or_default() += 1;
+                *daily.entry((today, "api_calls".into())).or_default() += 1;
             }
         }
     }

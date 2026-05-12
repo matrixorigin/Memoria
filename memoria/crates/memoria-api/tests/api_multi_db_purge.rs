@@ -28,11 +28,7 @@ fn shared_db_url() -> String {
     std::env::var("MEMORIA_SHARED_DATABASE_URL").unwrap_or_else(|_| db_url())
 }
 
-async fn spawn_server_multi_db() -> (
-    String,
-    reqwest::Client,
-    tokio::task::JoinHandle<()>,
-) {
+async fn spawn_server_multi_db() -> (String, reqwest::Client, tokio::task::JoinHandle<()>) {
     use memoria_git::GitForDataService;
     use memoria_service::MemoryService;
     use memoria_storage::{DbRouter, SqlMemoryStore};
@@ -67,7 +63,9 @@ async fn spawn_server_multi_db() -> (
         .await
         .expect("bind");
     let port = listener.local_addr().unwrap().port();
-    let handle = tokio::spawn(async move { let _ = axum::serve(listener, app).await; });
+    let handle = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
 
     let client = reqwest::Client::builder()
         .no_proxy()

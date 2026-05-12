@@ -12,7 +12,11 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 use uuid::Uuid;
 
-async fn make_service() -> (Arc<MemoryService>, String, support::multi_db::McpTestContext) {
+async fn make_service() -> (
+    Arc<MemoryService>,
+    String,
+    support::multi_db::McpTestContext,
+) {
     let dim: usize = std::env::var("EMBEDDING_DIM")
         .unwrap_or_else(|_| "1024".to_string())
         .parse()

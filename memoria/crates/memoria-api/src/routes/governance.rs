@@ -9,19 +9,19 @@ use crate::{auth::AuthUser, models::*, routes::memory::api_err, state::AppState}
 
 pub async fn governance(
     State(state): State<AppState>,
-    AuthUser { user_id, .. }: AuthUser,
+    auth: AuthUser,
     Json(req): Json<GovernanceRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let sql = state
         .service
-        .user_sql_store(&user_id)
+        .user_sql_store(auth.scope_id())
         .await
         .map_err(api_err)?;
 
     const COOLDOWN_SECS: i64 = 3600;
     if !req.force {
         if let Some(remaining) = sql
-            .check_cooldown(&user_id, "governance", COOLDOWN_SECS)
+            .check_cooldown(auth.scope_id(), "governance", COOLDOWN_SECS)
             .await
             .map_err(api_err)?
         {
@@ -31,10 +31,10 @@ pub async fn governance(
         }
     }
     let quarantined = sql
-        .quarantine_low_confidence(&user_id)
+        .quarantine_low_confidence(auth.scope_id())
         .await
         .map_err(api_err)?;
-    let cleaned = sql.cleanup_stale(&user_id).await.map_err(api_err)?;
+    let cleaned = sql.cleanup_stale(auth.scope_id()).await.map_err(api_err)?;
     let orphan_graph_cleaned = if req.force {
         sql.cleanup_orphan_graph_data().await.unwrap_or_else(|e| {
             warn!("orphan graph cleanup failed: {e}");
@@ -42,7 +42,7 @@ pub async fn governance(
         })
     } else {
         match sql
-            .check_cooldown(&user_id, "orphan_graph_cleanup", COOLDOWN_SECS)
+            .check_cooldown(auth.scope_id(), "orphan_graph_cleanup", COOLDOWN_SECS)
             .await
         {
             Ok(Some(_)) => 0,
@@ -60,12 +60,14 @@ pub async fn governance(
         }
     };
     if orphan_graph_cleaned > 0 {
-        let _ = sql.set_cooldown(&user_id, "orphan_graph_cleanup").await;
+        let _ = sql
+            .set_cooldown(auth.scope_id(), "orphan_graph_cleanup")
+            .await;
     }
     if quarantined > 0 {
         let payload = serde_json::json!({"quarantined": quarantined}).to_string();
         state.service.send_edit_log(
-            &user_id,
+            auth.scope_id(),
             "governance:quarantine",
             None,
             Some(&payload),
@@ -76,7 +78,7 @@ pub async fn governance(
     if cleaned > 0 {
         let payload = serde_json::json!({"cleaned_stale": cleaned}).to_string();
         state.service.send_edit_log(
-            &user_id,
+            auth.scope_id(),
             "governance:cleanup_stale",
             None,
             Some(&payload),
@@ -87,7 +89,7 @@ pub async fn governance(
     if orphan_graph_cleaned > 0 {
         let payload = serde_json::json!({"orphan_graph_cleaned": orphan_graph_cleaned}).to_string();
         state.service.send_edit_log(
-            &user_id,
+            auth.scope_id(),
             "governance:cleanup_orphan_graph",
             None,
             Some(&payload),
@@ -95,7 +97,7 @@ pub async fn governance(
             None,
         );
     }
-    sql.set_cooldown(&user_id, "governance")
+    sql.set_cooldown(auth.scope_id(), "governance")
         .await
         .map_err(api_err)?;
     Ok(Json(
@@ -105,19 +107,19 @@ pub async fn governance(
 
 pub async fn consolidate(
     State(state): State<AppState>,
-    AuthUser { user_id, .. }: AuthUser,
+    auth: AuthUser,
     Json(req): Json<GovernanceRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let sql = state
         .service
-        .user_sql_store(&user_id)
+        .user_sql_store(auth.scope_id())
         .await
         .map_err(api_err)?;
 
     const COOLDOWN_SECS: i64 = 1800;
     if !req.force {
         if let Some(remaining) = sql
-            .check_cooldown(&user_id, "consolidate", COOLDOWN_SECS)
+            .check_cooldown(auth.scope_id(), "consolidate", COOLDOWN_SECS)
             .await
             .map_err(api_err)?
         {
@@ -128,10 +130,13 @@ pub async fn consolidate(
     }
     let graph = sql.graph_store();
     let result = DefaultConsolidationStrategy::default()
-        .consolidate(&graph, &ConsolidationInput::for_user(user_id.clone()))
+        .consolidate(
+            &graph,
+            &ConsolidationInput::for_user(auth.scope_id().to_string()),
+        )
         .await
         .map_err(api_err)?;
-    sql.set_cooldown(&user_id, "consolidate")
+    sql.set_cooldown(auth.scope_id(), "consolidate")
         .await
         .map_err(api_err)?;
     Ok(Json(json!({
@@ -147,12 +152,12 @@ pub async fn consolidate(
 
 pub async fn reflect(
     State(state): State<AppState>,
-    AuthUser { user_id, .. }: AuthUser,
+    auth: AuthUser,
     Json(req): Json<ReflectRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let sql = state
         .service
-        .user_sql_store(&user_id)
+        .user_sql_store(auth.scope_id())
         .await
         .map_err(api_err)?;
 
@@ -166,7 +171,7 @@ pub async fn reflect(
     const COOLDOWN_SECS: i64 = 7200;
     if req.mode != "candidates" && !req.force {
         if let Some(remaining) = sql
-            .check_cooldown(&user_id, "reflect", COOLDOWN_SECS)
+            .check_cooldown(auth.scope_id(), "reflect", COOLDOWN_SECS)
             .await
             .map_err(api_err)?
         {
@@ -177,7 +182,7 @@ pub async fn reflect(
     }
 
     let graph = sql.graph_store();
-    let clusters = memoria_mcp::tools::build_reflect_clusters(&graph, &user_id)
+    let clusters = memoria_mcp::tools::build_reflect_clusters(&graph, auth.scope_id())
         .await
         .map_err(api_err)?;
 
@@ -240,11 +245,12 @@ pub async fn reflect(
             let _ = state
                 .service
                 .store_memory(
-                    &user_id,
+                    auth.scope_id(),
                     &content,
                     mt,
                     None,
                     Some(memoria_core::TrustTier::T4Unverified),
+                    None,
                     None,
                     None,
                 )
@@ -252,7 +258,7 @@ pub async fn reflect(
             scenes_created += 1;
         }
     }
-    sql.set_cooldown(&user_id, "reflect")
+    sql.set_cooldown(auth.scope_id(), "reflect")
         .await
         .map_err(api_err)?;
     Ok(Json(
@@ -262,12 +268,12 @@ pub async fn reflect(
 
 pub async fn extract_entities(
     State(state): State<AppState>,
-    AuthUser { user_id, .. }: AuthUser,
+    auth: AuthUser,
     Json(req): Json<ExtractEntitiesRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let sql = state
         .service
-        .user_sql_store(&user_id)
+        .user_sql_store(auth.scope_id())
         .await
         .map_err(api_err)?;
 
@@ -280,7 +286,7 @@ pub async fn extract_entities(
 
     let graph = sql.graph_store();
     let unlinked = graph
-        .get_unlinked_memories(&user_id, 50)
+        .get_unlinked_memories(auth.scope_id(), 50)
         .await
         .map_err(api_err)?;
     if unlinked.is_empty() {
@@ -288,7 +294,10 @@ pub async fn extract_entities(
     }
 
     if req.mode == "candidates" || state.service.llm.is_none() {
-        let existing = graph.get_user_entities(&user_id).await.map_err(api_err)?;
+        let existing = graph
+            .get_user_entities(auth.scope_id())
+            .await
+            .map_err(api_err)?;
         return Ok(Json(json!({
             "status": "candidates",
             "unlinked": unlinked.len(),
@@ -332,8 +341,9 @@ pub async fn extract_entities(
             }
             let display = item["name"].as_str().unwrap_or("").trim().to_string();
             let etype = item["type"].as_str().unwrap_or("concept").to_string();
-            if let Ok((entity_id, is_new)) =
-                graph.upsert_entity(&user_id, &name, &display, &etype).await
+            if let Ok((entity_id, is_new)) = graph
+                .upsert_entity(auth.scope_id(), &name, &display, &etype)
+                .await
             {
                 links.push((memory_id.to_string(), entity_id, "llm"));
                 if is_new {
@@ -347,7 +357,7 @@ pub async fn extract_entities(
                 .map(|(m, e, s)| (m.as_str(), e.as_str(), *s))
                 .collect();
             let _ = graph
-                .batch_upsert_memory_entity_links(&user_id, &refs)
+                .batch_upsert_memory_entity_links(auth.scope_id(), &refs)
                 .await;
         }
     }
@@ -358,12 +368,12 @@ pub async fn extract_entities(
 
 pub async fn link_entities(
     State(state): State<AppState>,
-    AuthUser { user_id, .. }: AuthUser,
+    auth: AuthUser,
     Json(req): Json<LinkEntitiesRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let sql = state
         .service
-        .user_sql_store(&user_id)
+        .user_sql_store(auth.scope_id())
         .await
         .map_err(api_err)?;
     let graph = sql.graph_store();
@@ -377,7 +387,7 @@ pub async fn link_entities(
                 continue;
             }
             let (entity_id, is_new) = graph
-                .upsert_entity(&user_id, &name, &ent.name, &ent.entity_type)
+                .upsert_entity(auth.scope_id(), &name, &ent.name, &ent.entity_type)
                 .await
                 .map_err(api_err)?;
             links.push((link.memory_id.clone(), entity_id, "manual"));
@@ -394,7 +404,7 @@ pub async fn link_entities(
             .map(|(m, e, s)| (m.as_str(), e.as_str(), *s))
             .collect();
         graph
-            .batch_upsert_memory_entity_links(&user_id, &refs)
+            .batch_upsert_memory_entity_links(auth.scope_id(), &refs)
             .await
             .map_err(api_err)?;
     }
@@ -405,15 +415,18 @@ pub async fn link_entities(
 
 pub async fn get_entities(
     State(state): State<AppState>,
-    AuthUser { user_id, .. }: AuthUser,
+    auth: AuthUser,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let sql = state
         .service
-        .user_sql_store(&user_id)
+        .user_sql_store(auth.scope_id())
         .await
         .map_err(api_err)?;
     let graph = sql.graph_store();
-    let entities = graph.get_user_entities(&user_id).await.map_err(api_err)?;
+    let entities = graph
+        .get_user_entities(auth.scope_id())
+        .await
+        .map_err(api_err)?;
     Ok(Json(json!({
         "entities": entities.iter().map(|(n, t)| json!({"name": n, "entity_type": t})).collect::<Vec<_>>()
     })))

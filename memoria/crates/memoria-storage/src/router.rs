@@ -48,6 +48,14 @@ pub struct UserDatabaseRecord {
     pub status: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct GroupDatabaseRecord {
+    pub group_id: String,
+    pub db_name: String,
+    pub owner_user_id: String,
+    pub status: String,
+}
+
 #[derive(Clone)]
 pub struct DbRouter {
     shared_pool: MySqlPool,
@@ -494,6 +502,95 @@ impl DbRouter {
         .map_err(db_err)?;
 
         Ok(())
+    }
+
+    pub async fn group_record(
+        &self,
+        group_id: &str,
+    ) -> Result<Option<GroupDatabaseRecord>, MemoriaError> {
+        let row = sqlx::query(
+            "SELECT group_id, db_name, owner_user_id, status \
+             FROM mem_groups WHERE group_id = ? LIMIT 1",
+        )
+        .bind(group_id)
+        .fetch_optional(&self.shared_pool)
+        .await
+        .map_err(db_err)?;
+
+        row.map(|row| {
+            Ok(GroupDatabaseRecord {
+                group_id: row.try_get("group_id").map_err(db_err)?,
+                db_name: row.try_get("db_name").map_err(db_err)?,
+                owner_user_id: row.try_get("owner_user_id").map_err(db_err)?,
+                status: row.try_get("status").map_err(db_err)?,
+            })
+        })
+        .transpose()
+    }
+
+    pub async fn group_db_name(&self, group_id: &str) -> Result<String, MemoriaError> {
+        let row =
+            sqlx::query("SELECT db_name FROM mem_groups WHERE group_id = ? AND status = 'active'")
+                .bind(group_id)
+                .fetch_optional(&self.shared_pool)
+                .await
+                .map_err(db_err)?;
+
+        let row = row.ok_or_else(|| MemoriaError::NotFound(format!("Group '{group_id}'")))?;
+        row.try_get("db_name").map_err(db_err)
+    }
+
+    pub async fn group_store(&self, group_id: &str) -> Result<Arc<SqlMemoryStore>, MemoriaError> {
+        let cache_key = format!("group:{group_id}");
+        if let Some(cached) = self.user_store_cache.get(&cache_key) {
+            return Ok(cached);
+        }
+
+        let db_name = self.group_db_name(group_id).await?;
+        let cache_key_owned = cache_key.clone();
+        if self.user_schema_cache.get(&cache_key_owned).is_none() {
+            let _permit = self
+                .user_init_semaphore
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|_| MemoriaError::Internal("group schema init semaphore closed".into()))?;
+            if self.user_schema_cache.get(&cache_key_owned).is_none() {
+                let db_url = self.user_db_url(&db_name)?;
+                let init_result = match SqlMemoryStore::connect_routed(
+                    &db_url,
+                    self.embedding_dim,
+                    self.instance_id.clone(),
+                )
+                .await
+                {
+                    Ok(init_store) => init_store.migrate_user().await,
+                    Err(err) => Err(err),
+                };
+                init_result?;
+                self.user_schema_cache.insert(cache_key_owned.clone(), true);
+            }
+        }
+        let mut store = build_routed_store(
+            self.global_user_pool.clone(),
+            &self.shared_db_url,
+            self.embedding_dim,
+            &self.instance_id,
+            &db_name,
+        )?;
+        store.set_db_router(Arc::new(self.clone()));
+        let store = Arc::new(store);
+        self.user_store_cache.insert(cache_key, store.clone());
+        self.user_db_cache.insert(group_id.to_string(), db_name);
+        Ok(store)
+    }
+
+    pub async fn scope_store(&self, scope_id: &str) -> Result<Arc<SqlMemoryStore>, MemoriaError> {
+        if scope_id.starts_with("grp_") {
+            self.group_store(scope_id).await
+        } else {
+            self.user_store(scope_id).await
+        }
     }
 }
 

@@ -27,7 +27,14 @@ pub struct CachedMetrics {
 
 struct ApiKeyCacheEntry {
     user_id: String,
+    group_id: Option<String>,
     cached_at: Instant,
+}
+
+#[derive(Clone)]
+pub struct CachedApiKeyPrincipal {
+    pub user_id: String,
+    pub group_id: Option<String>,
 }
 
 #[derive(Clone)]
@@ -44,12 +51,15 @@ impl ApiKeyCache {
         }
     }
 
-    pub fn get(&self, key_hash: &str) -> Option<String> {
+    pub fn get(&self, key_hash: &str) -> Option<CachedApiKeyPrincipal> {
         let now = Instant::now();
         if let Ok(cache) = self.inner.read() {
             if let Some(entry) = cache.get(key_hash) {
                 if now.duration_since(entry.cached_at) < self.ttl {
-                    return Some(entry.user_id.clone());
+                    return Some(CachedApiKeyPrincipal {
+                        user_id: entry.user_id.clone(),
+                        group_id: entry.group_id.clone(),
+                    });
                 }
             }
         }
@@ -58,12 +68,13 @@ impl ApiKeyCache {
         None
     }
 
-    pub fn insert(&self, key_hash: String, user_id: String) {
+    pub fn insert(&self, key_hash: String, user_id: String, group_id: Option<String>) {
         if let Ok(mut cache) = self.inner.write() {
             cache.insert(
                 key_hash,
                 ApiKeyCacheEntry {
                     user_id,
+                    group_id,
                     cached_at: Instant::now(),
                 },
             );

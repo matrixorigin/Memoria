@@ -54,6 +54,7 @@ fn make_memory(id: &str, content: &str, user_id: &str) -> Memory {
         extra_metadata: None,
         trust_tier: TrustTier::T3Inferred,
         retrieval_score: None,
+        author_id: None,
     }
 }
 
@@ -426,6 +427,7 @@ async fn test_all_fields_round_trip() {
         extra_metadata: Some(meta),
         trust_tier: TrustTier::T1Verified,
         retrieval_score: None,
+        author_id: None,
     };
     store.insert(&m).await.expect("insert");
 
@@ -532,6 +534,7 @@ async fn test_null_optional_fields() {
         extra_metadata: None, // NULL JSON
         trust_tier: TrustTier::T3Inferred,
         retrieval_score: None,
+        author_id: None,
     };
     store.insert(&m).await.expect("insert with nulls");
 
@@ -714,7 +717,7 @@ async fn test_list_active_lite() {
         .expect("soft_delete");
 
     let results = store
-        .list_active_lite("mem_memories", &uid, 10, None, None, None)
+        .list_active_lite("mem_memories", &uid, 10, None, None, None, None)
         .await
         .expect("list_active_lite");
     assert_eq!(results.len(), 2, "should exclude soft-deleted");
@@ -748,14 +751,14 @@ async fn test_list_active_lite_limit_cap() {
     }
     // Request limit=2, should only get 2
     let results = store
-        .list_active_lite("mem_memories", &uid, 2, None, None, None)
+        .list_active_lite("mem_memories", &uid, 2, None, None, None, None)
         .await
         .expect("list_active_lite");
     assert_eq!(results.len(), 2, "should respect limit");
 
     // Request absurdly large limit — capped at 500 internally
     let results = store
-        .list_active_lite("mem_memories", &uid, 999999, None, None, None)
+        .list_active_lite("mem_memories", &uid, 999999, None, None, None, None)
         .await
         .expect("list_active_lite");
     assert!(results.len() <= 501, "should cap at 501");

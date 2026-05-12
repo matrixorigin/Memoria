@@ -28,10 +28,7 @@ fn uid() -> String {
 }
 
 fn safety_snapshot_prefix(db_name: &str) -> String {
-    format!(
-        "mem_snap_{}_pre_",
-        compact_identifier_fragment(db_name, 21)
-    )
+    format!("mem_snap_{}_pre_", compact_identifier_fragment(db_name, 21))
 }
 
 fn sanitize_identifier_fragment(value: &str) -> String {
@@ -501,7 +498,7 @@ async fn test_store_batch_all_fields() {
             None,
         ),
     ];
-    let results = svc.store_batch(&uid, items).await.unwrap();
+    let results = svc.store_batch(&uid, items, None).await.unwrap();
     assert_eq!(results.len(), 2);
     svc.flush_edit_log().await;
 
@@ -1075,6 +1072,7 @@ async fn test_edit_id_globally_unique() {
                 None,
             ),
         ],
+        None,
     )
     .await
     .unwrap();

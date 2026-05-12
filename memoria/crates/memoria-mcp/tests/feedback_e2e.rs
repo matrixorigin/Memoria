@@ -585,7 +585,7 @@ async fn test_feedback_db_verification() {
     store
         .record_feedback(&uid, memory_id_2, "irrelevant", None)
         .await
-    .unwrap();
+        .unwrap();
 
     // 4. Verify aggregated stats via direct SQL
     let feedback_table = store.t("mem_retrieval_feedback");
@@ -1359,8 +1359,7 @@ async fn test_duplicate_instance_id_lock_is_exclusive() {
     use memoria_service::distributed::DistributedLock;
     use std::time::Duration;
 
-    let ctx =
-        support::multi_db::setup_mcp_context("feedback_lock", test_dim(), None, None).await;
+    let ctx = support::multi_db::setup_mcp_context("feedback_lock", test_dim(), None, None).await;
     let store = ctx.shared_store();
 
     let lock_key = format!("test:dup_instance:{}", uid());

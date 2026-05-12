@@ -23,5 +23,5 @@ pub use pool_config::{
 pub use router::{DbRouter, UserDatabaseRecord};
 pub use store::{
     FeedbackStats, MemoryFeedback, OwnedEditLogEntry, PoolHealthLevel, PoolHealthSnapshot,
-    SqlMemoryStore, TierFeedback, UserRetrievalParams,
+    SqlMemoryStore, TierFeedback, UserRetrievalParams, ACTOR_USER_ID,
 };

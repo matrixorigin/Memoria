@@ -2,6 +2,34 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.4.0] - 2026-05-11
+
+### 🐛 Bug Fixes
+
+- Trivial fix for pro function (#201) ([caa3d79](https://github.com/matrixorigin/Memoria/commit/caa3d79438c71e6aebbcff5abc875728a80e3962))
+
+### 📚 Documentation
+
+- Add citation instructions (#197) ([a7c3547](https://github.com/matrixorigin/Memoria/commit/a7c3547264a14ac1746205d819b24381a68502a3))
+- Add MatrixOne research paper reference (#196) ([a5d2786](https://github.com/matrixorigin/Memoria/commit/a5d2786c61312185e668bf4c98fdb83be333e454))
+
+### 🚀 Features
+
+- Group collaboration API with per-member branch isolation (#198) ([357d44c](https://github.com/matrixorigin/Memoria/commit/357d44c126419912b6f6a1c76bb5c1ef143270b3))
+## [0.3.3] - 2026-04-22
+
+### 🐛 Bug Fixes
+
+- **cli**: Normalize MCP tool name; MatrixOne-safe srv_user_stats upsert (#192) ([f18069c](https://github.com/matrixorigin/Memoria/commit/f18069c01438ff85594254fd8e912603501fe8e5))
+
+### 🚀 Features
+
+- **memory**: Unify session scope across memory interfaces (#190) ([f504989](https://github.com/matrixorigin/Memoria/commit/f5049897bb37a327ff6c45b9e6d53bf1cab7e0a6))
+- Add multi-db pool budget sizing (#191) ([79c1fb0](https://github.com/matrixorigin/Memoria/commit/79c1fb060bfaf25af53d85dc0827d7629c6db6fe))
+
+### 🧪 Testing
+
+- Migrate API and MCP e2e to multi-db (#189) ([b34717d](https://github.com/matrixorigin/Memoria/commit/b34717d770ed58d0caa8d86f4b4247c0ad6c4a3e))
 ## [0.3.2] - 2026-04-17
 
 ### 🐛 Bug Fixes

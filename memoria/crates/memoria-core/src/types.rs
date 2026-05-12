@@ -125,6 +125,9 @@ impl std::str::FromStr for TrustTier {
 pub struct Memory {
     pub memory_id: String,
     pub user_id: String,
+    /// Real author in group mode (the human who created the memory).
+    /// `None` in personal mode (user_id is already the author).
+    pub author_id: Option<String>,
     pub memory_type: MemoryType,
     pub content: String,
     pub initial_confidence: f64,

@@ -152,7 +152,7 @@ When `memory_governance` reports snapshot_health with high auto_ratio (>50%), su
 - `memory_snapshot_delete(older_than="2026-01-01")` — remove snapshots before a date
 
 ### Branches (isolated experiments)
-Git-like workflow for memory. `memory_branch(name)` creates, `memory_checkout(name)` switches, `memory_diff(source)` previews changes, `memory_merge(source)` merges back, `memory_branch_delete(name)` cleans up. `memory_branches()` lists all.
+Git-like workflow for memory. `memory_branch(name)` creates, `memory_checkout(name)` switches, `memory_diff(source)` previews changes, `memory_apply(source, ...)` selectively promotes chosen branch items back to `main`, `memory_merge(source)` merges the whole branch back, and `memory_branch_delete(name)` cleans up. `memory_branches()` lists all.
 
 ### Entity graph
 Entity extraction is automatic — every `memory_store` triggers regex-based extraction, with LLM extraction as a fallback when configured. No manual intervention needed.

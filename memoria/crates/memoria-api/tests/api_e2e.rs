@@ -6548,8 +6548,8 @@ async fn test_api_branch_pick_conflict_returns_409() {
         .await
         .unwrap()
         .into_iter()
-        .find(|(name, _)| name == &branch)
-        .map(|(_, table)| table)
+        .find(|(name, _, _)| name == &branch)
+        .map(|(_, table, _)| table)
         .expect("branch table");
     let pool = server.user_db_pool(&uid).await;
 
@@ -7029,8 +7029,8 @@ async fn test_api_branch_pick_accept_replaces_conflict() {
         .await
         .unwrap()
         .into_iter()
-        .find(|(name, _)| name == &branch)
-        .map(|(_, table)| table)
+        .find(|(name, _, _)| name == &branch)
+        .map(|(_, table, _)| table)
         .expect("branch table");
     let pool = server.user_db_pool(&uid).await;
 
@@ -7341,8 +7341,8 @@ async fn test_remote_pick_accept_replaces_conflict() {
         .await
         .unwrap()
         .into_iter()
-        .find(|(name, _)| name == &branch)
-        .map(|(_, table)| table)
+        .find(|(name, _, _)| name == &branch)
+        .map(|(_, table, _)| table)
         .expect("branch table");
     let pool = server.user_db_pool(&uid).await;
 
@@ -7489,8 +7489,8 @@ async fn test_remote_pick_fail_conflict_returns_error() {
         .await
         .unwrap()
         .into_iter()
-        .find(|(name, _)| name == &branch)
-        .map(|(_, table)| table)
+        .find(|(name, _, _)| name == &branch)
+        .map(|(_, table, _)| table)
         .expect("branch table");
     let pool = server.user_db_pool(&uid).await;
 

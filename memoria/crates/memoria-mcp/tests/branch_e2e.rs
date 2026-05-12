@@ -215,6 +215,83 @@ async fn test_merge_accept_alias() {
 }
 
 #[tokio::test]
+async fn test_memory_apply_accept_branch_conflict() {
+    let (svc, git, uid, _ctx) = setup().await;
+    let branch = bname("apply_conflict");
+
+    store_mem("shared conflict base", &svc, &uid).await;
+    let original = svc
+        .list_active(&uid, 10)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|memory| memory.content == "shared conflict base")
+        .expect("original memory");
+
+    gc("memory_branch", json!({"name": branch}), &git, &svc, &uid).await;
+    gc("memory_checkout", json!({"name": branch}), &git, &svc, &uid).await;
+    let branch_corrected = svc
+        .correct(&uid, &original.memory_id, "branch-side correction")
+        .await
+        .expect("branch correction");
+
+    gc("memory_checkout", json!({"name": "main"}), &git, &svc, &uid).await;
+    let main_corrected = svc
+        .correct(&uid, &original.memory_id, "main-side correction")
+        .await
+        .expect("main correction");
+
+    let diff = gc("memory_diff", json!({"source": branch}), &git, &svc, &uid).await;
+    assert!(
+        text(&diff).contains("[CONFLICT]"),
+        "expected conflict in diff, got: {}",
+        text(&diff)
+    );
+
+    let applied = gc(
+        "memory_apply",
+        json!({
+            "source": branch,
+            "accept_branch_conflicts": [original.memory_id.clone()]
+        }),
+        &git,
+        &svc,
+        &uid,
+    )
+    .await;
+    assert!(
+        text(&applied).contains("1 conflicts accepted"),
+        "expected one accepted conflict, got: {}",
+        text(&applied)
+    );
+
+    let active = svc.list_active(&uid, 10).await.unwrap();
+    let active_contents: Vec<String> = active.iter().map(|memory| memory.content.clone()).collect();
+    assert!(active_contents
+        .iter()
+        .any(|content| content == "branch-side correction"));
+    assert!(!active_contents
+        .iter()
+        .any(|content| content == "main-side correction"));
+
+    let all_ids: Vec<String> = active
+        .iter()
+        .map(|memory| memory.memory_id.clone())
+        .collect();
+    assert!(all_ids.iter().any(|id| id == &branch_corrected.memory_id));
+    assert!(!all_ids.iter().any(|id| id == &main_corrected.memory_id));
+
+    gc(
+        "memory_branch_delete",
+        json!({"name": branch}),
+        &git,
+        &svc,
+        &uid,
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn test_merge_replace_updates_conflicting_memory() {
     let (svc, git, pool, uid, ctx) = setup_with_mock_embedder().await;
     let branch = bname("replace");
@@ -237,8 +314,8 @@ async fn test_merge_replace_updates_conflicting_memory() {
         .await
         .unwrap()
         .into_iter()
-        .find(|(name, _)| name == &branch)
-        .map(|(_, table)| table)
+        .find(|(name, _, _)| name == &branch)
+        .map(|(_, table, _)| table)
         .expect("branch table");
 
     let branch_memory_id = Uuid::new_v4().simple().to_string();
@@ -695,8 +772,8 @@ async fn test_pick_snapshot_range_dry_run_skips_rows_identical_in_target() {
         .await
         .unwrap()
         .into_iter()
-        .find(|(name, _)| name == &branch)
-        .map(|(_, table)| table)
+        .find(|(name, _, _)| name == &branch)
+        .map(|(_, table, _)| table)
         .expect("branch table");
     gc(
         "memory_snapshot",
@@ -904,8 +981,8 @@ async fn test_pick_fail_and_skip_conflicts() {
         .await
         .unwrap()
         .into_iter()
-        .find(|(name, _)| name == &branch)
-        .map(|(_, table)| table)
+        .find(|(name, _, _)| name == &branch)
+        .map(|(_, table, _)| table)
         .expect("branch table");
 
     sqlx::query(&format!(
@@ -996,8 +1073,8 @@ async fn test_pick_dry_run_fail_conflict_sets_would_abort() {
         .await
         .unwrap()
         .into_iter()
-        .find(|(name, _)| name == &branch)
-        .map(|(_, table)| table)
+        .find(|(name, _, _)| name == &branch)
+        .map(|(_, table, _)| table)
         .expect("branch table");
 
     sqlx::query(&format!(
@@ -1137,7 +1214,7 @@ async fn test_merge_unknown_strategy_rejected() {
     .await;
 }
 
-// ── 7. Duplicate branch name rejected (even after delete) ────────────────────
+// ── 7. Duplicate active branch name rejected; deleted names may be reused ────
 
 #[tokio::test]
 async fn test_duplicate_branch_name_rejected() {
@@ -1151,7 +1228,7 @@ async fn test_duplicate_branch_name_rejected() {
     assert!(text(&r).contains("already exists"), "got: {}", text(&r));
     println!("✅ duplicate rejected: {}", text(&r));
 
-    // Delete then try same name → still rejected (soft-deleted)
+    // Delete then try same name → allowed again
     gc(
         "memory_branch_delete",
         json!({"name": branch}),
@@ -1162,11 +1239,11 @@ async fn test_duplicate_branch_name_rejected() {
     .await;
     let r2 = gc("memory_branch", json!({"name": branch}), &git, &svc, &uid).await;
     assert!(
-        text(&r2).contains("already exists"),
-        "should reject reuse of deleted name, got: {}",
+        text(&r2).contains("Created"),
+        "should allow reuse of deleted name, got: {}",
         text(&r2)
     );
-    println!("✅ deleted name reuse rejected: {}", text(&r2));
+    println!("✅ deleted name reuse allowed: {}", text(&r2));
 }
 
 // ── 8. from_snapshot + from_timestamp mutual exclusion ───────────────────────
@@ -1545,8 +1622,8 @@ async fn test_diff_fields_complete() {
     let branches = sql.list_branches(&uid).await.unwrap();
     let table = branches
         .iter()
-        .find(|(n, _)| n == &branch)
-        .map(|(_, t)| t.clone())
+        .find(|(n, _, _)| n == &branch)
+        .map(|(_, t, _)| t.clone())
         .unwrap();
     let user_git = GitForDataService::new(
         sql.pool().clone(),
@@ -1655,8 +1732,8 @@ async fn test_diff_native_count_vs_join_rows() {
     let branches = sql.list_branches(&uid).await.unwrap();
     let table = branches
         .iter()
-        .find(|(n, _)| n == &branch)
-        .map(|(_, t)| t.clone())
+        .find(|(n, _, _)| n == &branch)
+        .map(|(_, t, _)| t.clone())
         .unwrap();
     let user_git = GitForDataService::new(
         sql.pool().clone(),

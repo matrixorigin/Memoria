@@ -52,6 +52,24 @@ enum RpcMethod {
     Unknown(String),
 }
 
+const GIT_TOOL_NAMES: &[&str] = &[
+    "memory_snapshot",
+    "memory_snapshots",
+    "memory_snapshot_delete",
+    "memory_rollback",
+    "memory_branch",
+    "memory_branches",
+    "memory_checkout",
+    "memory_merge",
+    "memory_diff",
+    "memory_apply",
+    "memory_branch_delete",
+];
+
+fn is_git_tool(name: &str) -> bool {
+    GIT_TOOL_NAMES.contains(&name)
+}
+
 /// Dispatch a single JSON-RPC method in embedded mode.
 /// Used by the server-side Streamable HTTP MCP endpoint.
 pub async fn dispatch_http(
@@ -62,10 +80,30 @@ pub async fn dispatch_http(
     user_id: String,
 ) -> Result<Value, McpRpcError> {
     let handle = tokio::runtime::Handle::current();
+
+    // `spawn_blocking` runs on a separate thread-pool thread and does NOT inherit
+    // Tokio task-local variables.  In group/space mode the `actor_scope_layer`
+    // middleware sets `ACTOR_USER_ID` to the real human user_id so that per-user
+    // state (active branch) is keyed on the individual rather than the group scope.
+    // Without propagating it here, MCP tool calls inside `spawn_blocking` fall back
+    // to `scope_id` (the group id), causing a mismatch: the Dashboard REST checkout
+    // writes `mem_user_state.user_id = real_user_id` while the MCP code-agent reads
+    // `mem_user_state.user_id = grp_xxx` — two different rows, always out of sync.
+    let actor_user_id = memoria_storage::ACTOR_USER_ID
+        .try_with(|id| id.clone())
+        .ok();
+
     tokio::task::spawn_blocking(move || {
-        handle.block_on(dispatch_embedded_owned(
-            method, params, service, git, user_id,
-        ))
+        let fut = dispatch_embedded_owned(method, params, service, git, user_id);
+        // Restore ACTOR_USER_ID inside the blocking thread so storage methods
+        // (`active_branch_name`, `set_active_branch`, `active_table`) see the
+        // same per-user scope they would in the original async task.
+        match actor_user_id {
+            Some(actor_id) => handle.block_on(
+                memoria_storage::ACTOR_USER_ID.scope(actor_id, fut)
+            ),
+            None => handle.block_on(fut),
+        }
     })
     .await
     .map_err(|e| McpRpcError {
@@ -282,19 +320,7 @@ async fn dispatch(
             match mode {
                 Mode::Remote(client) => client.call(&name, args).await.map_err(internal_err),
                 Mode::Embedded { service, git } => {
-                    let git_tool_names = [
-                        "memory_snapshot",
-                        "memory_snapshots",
-                        "memory_snapshot_delete",
-                        "memory_rollback",
-                        "memory_branch",
-                        "memory_branches",
-                        "memory_checkout",
-                        "memory_merge",
-                        "memory_diff",
-                        "memory_branch_delete",
-                    ];
-                    if git_tool_names.contains(&name.as_str()) {
+                    if is_git_tool(&name) {
                         git_tools::call(&name, args, git, service, user_id)
                             .await
                             .map_err(|e| McpRpcError {
@@ -350,19 +376,7 @@ async fn dispatch_embedded_owned(
                 code: -32000,
                 message: e.to_string(),
             };
-            let git_tool_names = [
-                "memory_snapshot",
-                "memory_snapshots",
-                "memory_snapshot_delete",
-                "memory_rollback",
-                "memory_branch",
-                "memory_branches",
-                "memory_checkout",
-                "memory_merge",
-                "memory_diff",
-                "memory_branch_delete",
-            ];
-            if git_tool_names.contains(&name.as_str()) {
+            if is_git_tool(&name) {
                 git_tools::call_owned(name, args, git, service, user_id)
                     .await
                     .map_err(|e| McpRpcError {
@@ -380,5 +394,40 @@ async fn dispatch_embedded_owned(
             code: -32601,
             message: format!("Method not found: {method}"),
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_git_tool, GIT_TOOL_NAMES};
+
+    #[test]
+    fn git_dispatch_list_includes_memory_apply() {
+        assert!(is_git_tool("memory_apply"));
+    }
+
+    #[test]
+    fn git_tool_dispatch_matches_declared_git_tools() {
+        let declared_names: Vec<String> = crate::git_tools::list()
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|tool| tool.get("name").and_then(|name| name.as_str()))
+            .map(str::to_string)
+            .collect();
+
+        for name in GIT_TOOL_NAMES {
+            assert!(
+                declared_names.iter().any(|declared| declared == name),
+                "dispatch marked '{name}' as a git tool but git_tools::list() does not declare it"
+            );
+        }
+
+        for name in declared_names {
+            assert!(
+                is_git_tool(&name),
+                "git_tools::list() declares '{name}' but server dispatch does not route it"
+            );
+        }
     }
 }

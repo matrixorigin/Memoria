@@ -57,14 +57,8 @@ pub async fn setup_mcp_context(
     llm: Option<Arc<LlmClient>>,
 ) -> McpTestContext {
     McpTestContext {
-        inner: MultiDbTestContext::new(
-            &db_url(),
-            db_name_prefix,
-            embedding_dim,
-            embedder,
-            llm,
-        )
-        .await,
+        inner: MultiDbTestContext::new(&db_url(), db_name_prefix, embedding_dim, embedder, llm)
+            .await,
     }
 }
 
