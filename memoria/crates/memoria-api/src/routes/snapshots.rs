@@ -374,15 +374,51 @@ async fn snapshot_summary_value(
     snapshot: &memoria_mcp::git_tools::VisibleSnapshot,
 ) -> Result<Value, (StatusCode, String)> {
     let snapshot_name = validate_snapshot_identifier(&snapshot.internal_name)?.to_string();
-    let table = sql.t("mem_memories");
-    let count_sql = format!(
-        "SELECT COUNT(*) as cnt FROM {table} {{SNAPSHOT = '{snapshot_name}'}} WHERE user_id = ? AND is_active > 0"
-    );
-    let memory_count: i64 = sqlx::query_scalar(&count_sql)
-        .bind(user_id)
-        .fetch_one(sql.pool())
-        .await
-        .map_err(api_err)?;
+    let memory_count = if let Some(memory_count) = snapshot.memory_count {
+        memory_count
+    } else {
+        // Read-through backfill for registrations created before mem_snapshots.extra.
+        // The response still returns a concrete count, and registered snapshots are
+        // persisted so later list calls avoid historical COUNT queries.
+        let started = std::time::Instant::now();
+        let memory_count =
+            memoria_mcp::git_tools::count_active_memories_at_snapshot(sql, user_id, &snapshot_name)
+                .await
+                .map_err(api_err_typed)?;
+        if snapshot.registered {
+            sql.update_snapshot_memory_count(
+                user_id,
+                &snapshot.display_name,
+                &snapshot_name,
+                memory_count,
+            )
+            .await
+            .map_err(api_err_typed)?;
+        }
+        let elapsed_ms = started.elapsed().as_millis();
+        if elapsed_ms >= 100 {
+            tracing::info!(
+                user_id = %user_id,
+                snapshot_display = %snapshot.display_name,
+                snapshot_internal = %snapshot_name,
+                memory_count,
+                persisted = snapshot.registered,
+                elapsed_ms,
+                "snapshot_list_phase: snapshot_memory_count"
+            );
+        } else {
+            tracing::debug!(
+                user_id = %user_id,
+                snapshot_display = %snapshot.display_name,
+                snapshot_internal = %snapshot_name,
+                memory_count,
+                persisted = snapshot.registered,
+                elapsed_ms,
+                "snapshot_list_phase: snapshot_memory_count"
+            );
+        }
+        memory_count
+    };
     let timestamp = format_snapshot_timestamp(snapshot.timestamp);
     Ok(json!({
         "name": snapshot.display_name,
@@ -401,11 +437,17 @@ async fn snapshot_list_payload(
     limit: i64,
     offset: i64,
 ) -> Result<Value, (StatusCode, String)> {
+    let started = std::time::Instant::now();
+    let store_started = std::time::Instant::now();
     let sql = user_snapshot_store(state, user_id).await?;
+    let store_elapsed_ms = store_started.elapsed().as_millis();
+    let visible_started = std::time::Instant::now();
     let all = memoria_mcp::git_tools::visible_snapshots_for_user(&state.service, user_id)
         .await
         .map_err(api_err_typed)?;
+    let visible_elapsed_ms = visible_started.elapsed().as_millis();
     let total = all.len();
+    let summaries_started = std::time::Instant::now();
     let mut snapshots = Vec::new();
     for snapshot in all
         .iter()
@@ -414,8 +456,37 @@ async fn snapshot_list_payload(
     {
         snapshots.push(snapshot_summary_value(&sql, user_id, snapshot).await?);
     }
+    let summaries_elapsed_ms = summaries_started.elapsed().as_millis();
     let has_more = offset.max(0) as usize + snapshots.len() < total;
     let result = format_snapshot_list_result(&snapshots, total);
+    let total_elapsed_ms = started.elapsed().as_millis();
+    if total_elapsed_ms >= 100 {
+        tracing::info!(
+            user_id = %user_id,
+            total_snapshots = total,
+            returned_snapshots = snapshots.len(),
+            limit = limit.max(0),
+            offset = offset.max(0),
+            store_elapsed_ms,
+            visible_elapsed_ms,
+            summaries_elapsed_ms,
+            total_elapsed_ms,
+            "snapshot_list_phase: list_payload"
+        );
+    } else {
+        tracing::debug!(
+            user_id = %user_id,
+            total_snapshots = total,
+            returned_snapshots = snapshots.len(),
+            limit = limit.max(0),
+            offset = offset.max(0),
+            store_elapsed_ms,
+            visible_elapsed_ms,
+            summaries_elapsed_ms,
+            total_elapsed_ms,
+            "snapshot_list_phase: list_payload"
+        );
+    }
     Ok(json!({
         "snapshots": snapshots,
         "total": total,

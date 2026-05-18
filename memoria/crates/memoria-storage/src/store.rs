@@ -173,6 +173,19 @@ async fn is_fresh_database(pool: &MySqlPool, schema_name: &str) -> Result<bool, 
     .map_err(db_err)
 }
 
+async fn info_schema_table_exists(pool: &MySqlPool, schema_name: &str, table_name: &str) -> bool {
+    sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM information_schema.tables \
+         WHERE table_schema = ? AND table_name = ?",
+    )
+    .bind(schema_name)
+    .bind(table_name)
+    .fetch_one(pool)
+    .await
+    .unwrap_or(0)
+        > 0
+}
+
 /// Bump whenever user-DB schema expectations change, including tables created
 /// by `bootstrap_user_schema()`, graph schema bootstrapping, or any compat
 /// migration handled by `apply_user_compat_migrations()`.
@@ -720,7 +733,24 @@ pub struct SqlMemoryStore {
 pub struct SnapshotRegistration {
     pub name: String,
     pub snapshot_name: String,
+    /// Extensible per-snapshot metadata. Keep derived fields here so future
+    /// snapshot attributes do not require another per-user schema migration.
+    pub extra: Option<serde_json::Value>,
     pub created_at: chrono::NaiveDateTime,
+}
+
+pub fn snapshot_extra_with_memory_count(memory_count: i64) -> serde_json::Value {
+    serde_json::json!({ "memory_count": memory_count })
+}
+
+pub fn snapshot_extra_memory_count(extra: Option<&serde_json::Value>) -> Option<i64> {
+    extra?.as_object()?.get("memory_count")?.as_i64()
+}
+
+fn snapshot_extra_from_row(
+    row: &sqlx::mysql::MySqlRow,
+) -> Result<Option<serde_json::Value>, MemoriaError> {
+    row.try_get("extra").map_err(db_err)
 }
 
 /// Aggregated feedback statistics for a user.
@@ -1182,6 +1212,7 @@ impl SqlMemoryStore {
                 user_id        VARCHAR(64)  NOT NULL,
                 name           VARCHAR(100) NOT NULL,
                 snapshot_name  VARCHAR(100) NOT NULL,
+                extra          JSON         DEFAULT NULL,
                 status         VARCHAR(20)  NOT NULL DEFAULT 'active',
                 created_at     DATETIME(6)  NOT NULL,
                 INDEX idx_user_snapshot_name (user_id, name, status),
@@ -1675,6 +1706,47 @@ impl SqlMemoryStore {
         Ok(())
     }
 
+    async fn ensure_snapshot_extra_column(
+        &self,
+        pool: &MySqlPool,
+        schema_name: &str,
+    ) -> Result<(), MemoriaError> {
+        // Targeted migration: old user DBs can stay at the same schema version,
+        // and missing derived values are populated lazily when snapshots are read.
+        if !info_schema_table_exists(pool, schema_name, "mem_snapshots").await
+            || info_schema_column_exists(pool, schema_name, "mem_snapshots", "extra").await
+        {
+            return Ok(());
+        }
+
+        let snapshots_table = self.t("mem_snapshots");
+        let started = std::time::Instant::now();
+        let result = sqlx::query(&format!(
+            "ALTER TABLE {snapshots_table} ADD COLUMN extra JSON DEFAULT NULL AFTER snapshot_name"
+        ))
+        .execute(pool)
+        .await;
+        match result {
+            Ok(_) => {
+                tracing::info!(
+                    schema_name,
+                    elapsed_ms = started.elapsed().as_millis(),
+                    "migration: added mem_snapshots.extra"
+                );
+                Ok(())
+            }
+            Err(e) if is_duplicate_column(&e) => Ok(()),
+            Err(e) => {
+                tracing::error!(
+                    schema_name,
+                    error = %e,
+                    "migration: failed to add mem_snapshots.extra"
+                );
+                Err(db_err(e))
+            }
+        }
+    }
+
     pub async fn migrate_user(&self) -> Result<(), MemoriaError> {
         let pool = &self.pool;
         let meta_table = self.t("mem_schema_meta");
@@ -1687,6 +1759,7 @@ impl SqlMemoryStore {
         }
 
         ensure_user_schema_meta_table(pool, &meta_table).await?;
+        self.ensure_snapshot_extra_column(pool, schema_name).await?;
         if load_user_schema_version(pool, &meta_table).await? == Some(CURRENT_USER_SCHEMA_VERSION) {
             return Ok(());
         }
@@ -2555,18 +2628,21 @@ impl SqlMemoryStore {
         user_id: &str,
         name: &str,
         snapshot_name: &str,
+        extra: Option<&serde_json::Value>,
     ) -> Result<(), MemoriaError> {
         let snapshots_table = self.t("mem_snapshots");
         let now = Utc::now().naive_utc();
         let id = uuid::Uuid::new_v4().simple().to_string();
+        let extra = extra.map(serde_json::to_string).transpose()?;
         sqlx::query(&format!(
-            r#"INSERT INTO {snapshots_table} (id, user_id, name, snapshot_name, status, created_at)
-               VALUES (?, ?, ?, ?, 'active', ?)"#
+            r#"INSERT INTO {snapshots_table} (id, user_id, name, snapshot_name, extra, status, created_at)
+               VALUES (?, ?, ?, ?, ?, 'active', ?)"#
         ))
         .bind(id)
         .bind(user_id)
         .bind(name)
         .bind(snapshot_name)
+        .bind(extra)
         .bind(now)
         .execute(&self.pool)
         .await
@@ -2581,7 +2657,7 @@ impl SqlMemoryStore {
     ) -> Result<Option<SnapshotRegistration>, MemoriaError> {
         let snapshots_table = self.t("mem_snapshots");
         let row = sqlx::query(&format!(
-            "SELECT name, snapshot_name, created_at \
+            "SELECT name, snapshot_name, extra, created_at \
              FROM {snapshots_table} \
              WHERE user_id = ? AND name = ? AND status = 'active' \
              ORDER BY created_at DESC LIMIT 1"
@@ -2596,6 +2672,7 @@ impl SqlMemoryStore {
             Ok(SnapshotRegistration {
                 name: r.try_get("name").map_err(db_err)?,
                 snapshot_name: r.try_get("snapshot_name").map_err(db_err)?,
+                extra: snapshot_extra_from_row(&r)?,
                 created_at: r.try_get("created_at").map_err(db_err)?,
             })
         })
@@ -2609,7 +2686,7 @@ impl SqlMemoryStore {
     ) -> Result<Option<SnapshotRegistration>, MemoriaError> {
         let snapshots_table = self.t("mem_snapshots");
         let row = sqlx::query(&format!(
-            "SELECT name, snapshot_name, created_at \
+            "SELECT name, snapshot_name, extra, created_at \
              FROM {snapshots_table} \
              WHERE user_id = ? AND snapshot_name = ? AND status = 'active' \
              ORDER BY created_at DESC LIMIT 1"
@@ -2624,6 +2701,7 @@ impl SqlMemoryStore {
             Ok(SnapshotRegistration {
                 name: r.try_get("name").map_err(db_err)?,
                 snapshot_name: r.try_get("snapshot_name").map_err(db_err)?,
+                extra: snapshot_extra_from_row(&r)?,
                 created_at: r.try_get("created_at").map_err(db_err)?,
             })
         })
@@ -2636,7 +2714,7 @@ impl SqlMemoryStore {
     ) -> Result<Vec<SnapshotRegistration>, MemoriaError> {
         let snapshots_table = self.t("mem_snapshots");
         let rows = sqlx::query(&format!(
-            "SELECT name, snapshot_name, created_at \
+            "SELECT name, snapshot_name, extra, created_at \
              FROM {snapshots_table} \
              WHERE user_id = ? AND status = 'active' \
              ORDER BY created_at DESC"
@@ -2651,10 +2729,67 @@ impl SqlMemoryStore {
                 Ok(SnapshotRegistration {
                     name: r.try_get("name").map_err(db_err)?,
                     snapshot_name: r.try_get("snapshot_name").map_err(db_err)?,
+                    extra: snapshot_extra_from_row(r)?,
                     created_at: r.try_get("created_at").map_err(db_err)?,
                 })
             })
             .collect()
+    }
+
+    pub async fn update_snapshot_memory_count(
+        &self,
+        user_id: &str,
+        name: &str,
+        snapshot_name: &str,
+        memory_count: i64,
+    ) -> Result<(), MemoriaError> {
+        let snapshots_table = self.t("mem_snapshots");
+        let row = sqlx::query(&format!(
+            "SELECT extra FROM {snapshots_table} \
+             WHERE user_id = ? AND name = ? AND snapshot_name = ? AND status = 'active' \
+             ORDER BY created_at DESC LIMIT 1"
+        ))
+        .bind(user_id)
+        .bind(name)
+        .bind(snapshot_name)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+
+        let Some(row) = row else {
+            return Err(MemoriaError::Internal(format!(
+                "active snapshot registration not found for user={user_id:?}, name={name:?}, snapshot={snapshot_name:?}"
+            )));
+        };
+
+        let mut extra = snapshot_extra_from_row(&row)?
+            .unwrap_or_else(|| serde_json::Value::Object(Default::default()));
+        let Some(obj) = extra.as_object_mut() else {
+            return Err(MemoriaError::Internal(format!(
+                "snapshot extra must be a JSON object for user={user_id:?}, name={name:?}, snapshot={snapshot_name:?}"
+            )));
+        };
+        obj.insert("memory_count".to_string(), serde_json::json!(memory_count));
+        let extra = serde_json::to_string(&extra)?;
+
+        let result = sqlx::query(&format!(
+            "UPDATE {snapshots_table} SET extra = ? \
+             WHERE user_id = ? AND name = ? AND snapshot_name = ? AND status = 'active'"
+        ))
+        .bind(extra)
+        .bind(user_id)
+        .bind(name)
+        .bind(snapshot_name)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+
+        if result.rows_affected() == 0 {
+            return Err(MemoriaError::Internal(format!(
+                "failed to update snapshot memory_count for user={user_id:?}, name={name:?}, snapshot={snapshot_name:?}"
+            )));
+        }
+        Ok(())
     }
 
     pub async fn deregister_snapshot(&self, user_id: &str, name: &str) -> Result<(), MemoriaError> {
