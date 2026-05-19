@@ -1126,7 +1126,7 @@ impl SqlMemoryStore {
                 memory_id       VARCHAR(64)  PRIMARY KEY,
                 user_id         VARCHAR(64)  NOT NULL,
                 author_id       VARCHAR(64)  DEFAULT NULL,
-                memory_type     VARCHAR(20)  NOT NULL,
+                memory_type     VARCHAR(64)  NOT NULL,
                 content         TEXT         NOT NULL,
                 embedding       vecf32({dim}),
                 session_id      VARCHAR(64),
@@ -5767,7 +5767,7 @@ fn row_to_memory_base(row: &sqlx::mysql::MySqlRow) -> Result<Memory, MemoriaErro
         author_id: row
             .try_get::<Option<String>, _>("author_id")
             .unwrap_or(None),
-        memory_type: MemoryType::from_str(&memory_type_str)?,
+        memory_type: memory_type_str.parse::<MemoryType>().unwrap(),
         content: row.try_get("content").map_err(db_err)?,
         initial_confidence: row
             .try_get::<f32, _>("initial_confidence")
