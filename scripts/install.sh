@@ -5,17 +5,20 @@
 #   curl -sSL ... | sh -s -- -v v0.1.0-rc1
 #   curl -sSL ... | sh -s -- -y              # skip confirmation
 #   curl -sSL ... | sh -s -- -d ~/.local/bin  # custom directory
+#   curl -sSL ... | sh -s -- --no-telemetry   # disable install telemetry
 #
 # Options:
-#   -v, --version TAG   Version to install (default: latest release)
-#   -d, --dir DIR       Install directory (default: /usr/local/bin, sudo if needed)
-#   -y, --yes           Skip confirmation prompt
-#   -n, --dry-run       Print download URL and exit
+#   -v, --version TAG      Version to install (default: latest release)
+#   -d, --dir DIR          Install directory (default: /usr/local/bin, sudo if needed)
+#   -y, --yes              Skip confirmation prompt
+#   -n, --dry-run          Print download URL and exit
+#   --no-telemetry         Disable anonymous install telemetry
 #
 # Env:
-#   MEMORIA_REPO        GitHub repo (default: matrixorigin/Memoria)
-#   MEMORIA_VERSION     Version tag (default: latest)
-#   MEMORIA_GHPROXY     ghproxy base URL (default: https://ghfast.top, auto-detected)
+#   MEMORIA_REPO           GitHub repo (default: matrixorigin/Memoria)
+#   MEMORIA_VERSION        Version tag (default: latest)
+#   MEMORIA_GHPROXY        ghproxy base URL (default: https://ghfast.top, auto-detected)
+#   MEMORIA_NO_TELEMETRY   Set to 1 to disable install telemetry
 
 set -eu
 
@@ -60,6 +63,7 @@ VERSION="${MEMORIA_VERSION:-}"
 INSTALL_DIR=""
 DRY_RUN=false
 FORCE=false
+NO_TELEMETRY="${MEMORIA_NO_TELEMETRY:-0}"
 
 # ── Platform detection ──────────────────────────────────────────────
 
@@ -168,23 +172,25 @@ INIT_TOKEN=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    -v|--version)   VERSION="$2"; shift 2 ;;
-    -d|--dir)       INSTALL_DIR="$2"; shift 2 ;;
-    -y|--yes)       FORCE=true; shift ;;
-    -n|--dry-run)   DRY_RUN=true; shift ;;
-    --tool)         INIT_TOOL="$2"; shift 2 ;;
-    --api-url)      INIT_API_URL="$2"; shift 2 ;;
-    --token)        INIT_TOKEN="$2"; shift 2 ;;
+    -v|--version)      VERSION="$2"; shift 2 ;;
+    -d|--dir)          INSTALL_DIR="$2"; shift 2 ;;
+    -y|--yes)          FORCE=true; shift ;;
+    -n|--dry-run)      DRY_RUN=true; shift ;;
+    --no-telemetry)    NO_TELEMETRY=1; shift ;;
+    --tool)            INIT_TOOL="$2"; shift 2 ;;
+    --api-url)         INIT_API_URL="$2"; shift 2 ;;
+    --token)           INIT_TOKEN="$2"; shift 2 ;;
     -h|--help)
       printf "Usage: install.sh [options]\n\n"
-      printf "  -v, --version TAG   Version to install (default: latest)\n"
-      printf "  -d, --dir DIR       Install directory (default: /usr/local/bin)\n"
-      printf "  -y, --yes           Skip confirmation prompt\n"
-      printf "  -n, --dry-run       Print download URL and exit\n"
-      printf "  --tool TOOL         Auto-init after install (kiro|cursor|claude|codex)\n"
-      printf "  --api-url URL       Memoria API URL for auto-init\n"
-      printf "  --token TOKEN       Memoria API token for auto-init\n"
-      printf "  -h, --help          Show this help\n"
+      printf "  -v, --version TAG      Version to install (default: latest)\n"
+      printf "  -d, --dir DIR          Install directory (default: /usr/local/bin)\n"
+      printf "  -y, --yes              Skip confirmation prompt\n"
+      printf "  -n, --dry-run          Print download URL and exit\n"
+      printf "  --no-telemetry         Disable anonymous install telemetry\n"
+      printf "  --tool TOOL            Auto-init after install (kiro|cursor|claude|codex)\n"
+      printf "  --api-url URL          Memoria API URL for auto-init\n"
+      printf "  --token TOKEN          Memoria API token for auto-init\n"
+      printf "  -h, --help             Show this help\n"
       exit 0
       ;;
     *) shift ;;
@@ -316,6 +322,31 @@ $SUDO chmod +x "$INSTALL_DIR/memoria"
 
 printf '\n'
 ok "Installed ${GREEN}memoria${NC} to ${GREEN}${INSTALL_DIR}/memoria${NC}"
+
+# ── Telemetry ────────────────────────────────────────────────────────────────
+# Sends a single anonymous ping to thememoria.ai after a successful install.
+# Collected: tool name, version, OS/arch platform. No personal data or tokens.
+# Disable with: --no-telemetry flag or MEMORIA_NO_TELEMETRY=1 environment variable.
+
+_track_install() {
+  if [ "$NO_TELEMETRY" = "1" ]; then
+    return
+  fi
+  _tool="${INIT_TOOL:-}"
+  _ver="${TAG:-}"
+  _plat="${TARGET:-}"
+  _api="${INIT_API_URL:-}"
+  _payload="{\"tool\":\"${_tool}\",\"version\":\"${_ver}\",\"platform\":\"${_plat}\",\"api_url\":\"${_api}\"}"
+  # Fire-and-forget: run in background subshell, suppress all output.
+  # If the server is unreachable the install is completely unaffected.
+  (curl -sSf --max-time 5 -X POST \
+    "https://thememoria.ai/api/track/install" \
+    -H "Content-Type: application/json" \
+    -d "$_payload" \
+    >/dev/null 2>&1) &
+}
+
+_track_install
 
 fi # end SKIP_DOWNLOAD
 

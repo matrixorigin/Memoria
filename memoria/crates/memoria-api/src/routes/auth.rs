@@ -11,28 +11,17 @@ use sqlx::Row;
 
 use crate::{auth::AuthUser, routes::memory::api_err, state::AppState};
 
-// ── DDL ───────────────────────────────────────────────────────────────────────
-
-pub async fn migrate_api_keys(pool: &sqlx::MySqlPool) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        r#"CREATE TABLE IF NOT EXISTS mem_api_keys (
-            key_id      VARCHAR(36)  NOT NULL,
-            user_id     VARCHAR(64)  NOT NULL,
-            name        VARCHAR(100) NOT NULL,
-            key_hash    VARCHAR(64)  NOT NULL,
-            key_prefix  VARCHAR(12)  NOT NULL,
-            is_active   TINYINT(1)   NOT NULL DEFAULT 1,
-            created_at  DATETIME(6)  NOT NULL,
-            expires_at  DATETIME(6)  DEFAULT NULL,
-            last_used_at DATETIME(6) DEFAULT NULL,
-            PRIMARY KEY (key_id),
-            KEY idx_key_hash (key_hash),
-            KEY idx_user_active (user_id, is_active)
-        )"#,
-    )
-    .execute(pool)
-    .await?;
-    Ok(())
+fn auth_pool(state: &AppState) -> Result<&sqlx::MySqlPool, (StatusCode, String)> {
+    state
+        .auth_pool
+        .as_ref()
+        .or_else(|| state.service.sql_store.as_ref().map(|s| s.pool()))
+        .ok_or_else(|| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Shared auth store required".to_string(),
+            )
+        })
 }
 
 // ── Key generation ────────────────────────────────────────────────────────────
@@ -52,12 +41,14 @@ pub struct CreateKeyRequest {
     pub user_id: String,
     pub name: String,
     pub expires_at: Option<String>,
+    pub group_id: Option<String>,
 }
 
 #[derive(Serialize)]
 pub struct KeyResponse {
     pub key_id: String,
     pub user_id: String,
+    pub group_id: Option<String>,
     pub name: String,
     pub key_prefix: String,
     pub created_at: String,
@@ -67,43 +58,93 @@ pub struct KeyResponse {
     pub raw_key: Option<String>,
 }
 
+async fn ensure_group_membership(
+    pool: &sqlx::MySqlPool,
+    user_id: &str,
+    group_id: &str,
+) -> Result<(), (StatusCode, String)> {
+    let cnt: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM mem_groups g \
+         JOIN mem_group_members m ON g.group_id = m.group_id \
+         WHERE g.group_id = ? AND g.status = 'active' \
+         AND m.user_id = ? AND m.is_active = 1",
+    )
+    .bind(group_id)
+    .bind(user_id)
+    .fetch_one(pool)
+    .await
+    .map_err(api_err)?;
+    if cnt == 0 {
+        return Err((
+            StatusCode::FORBIDDEN,
+            format!("User {user_id} is not an active member of group {group_id}"),
+        ));
+    }
+    Ok(())
+}
+
 // ── Handlers ──────────────────────────────────────────────────────────────────
 
-/// POST /auth/keys — create API key (master key required)
+/// POST /auth/keys — create API key
+///
+/// Access: master key can create any key. Group owners can create keys
+/// scoped to their own groups (group_id must be set, target user must be a member).
 pub async fn create_key(
     State(state): State<AppState>,
     auth: AuthUser,
     Json(req): Json<CreateKeyRequest>,
 ) -> Result<(StatusCode, Json<KeyResponse>), (StatusCode, String)> {
-    auth.require_master()?;
-    let sql = state.service.sql_store.as_ref().ok_or_else(|| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "SQL store required".to_string(),
-        )
-    })?;
+    let pool = auth_pool(&state)?;
 
-    // Ensure table exists
-    migrate_api_keys(sql.pool()).await.map_err(api_err)?;
+    match req.group_id.as_deref() {
+        Some(group_id) => {
+            // Group-scoped key: master OR group owner may create
+            if !auth.is_master {
+                // Verify caller is the group owner
+                let owner_row = sqlx::query(
+                    "SELECT owner_user_id FROM mem_groups WHERE group_id = ? AND status = 'active' LIMIT 1",
+                )
+                .bind(group_id)
+                .fetch_optional(pool)
+                .await
+                .map_err(api_err)?
+                .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Group not found: {group_id}")))?;
+
+                let owner: String = owner_row.try_get("owner_user_id").map_err(api_err)?;
+                if owner != auth.user_id {
+                    return Err((
+                        StatusCode::FORBIDDEN,
+                        "Only the group owner or master can create group keys".into(),
+                    ));
+                }
+            }
+            ensure_group_membership(pool, &req.user_id, group_id).await?;
+        }
+        None => {
+            // Personal key: master only
+            auth.require_master()?;
+        }
+    }
 
     let (raw_key, key_hash, key_prefix) = generate_key();
     let key_id = uuid::Uuid::new_v4().to_string();
     let now = chrono::Utc::now().naive_utc();
 
     sqlx::query(
-        "INSERT INTO mem_api_keys (key_id, user_id, name, key_hash, key_prefix, is_active, created_at, expires_at) \
-         VALUES (?,?,?,?,?,1,?,?)"
+        "INSERT INTO mem_api_keys (key_id, user_id, group_id, name, key_hash, key_prefix, is_active, created_at, expires_at) \
+         VALUES (?,?,?,?,?,?,1,?,?)"
     )
-    .bind(&key_id).bind(&req.user_id).bind(&req.name)
+    .bind(&key_id).bind(&req.user_id).bind(req.group_id.as_deref()).bind(&req.name)
     .bind(&key_hash).bind(&key_prefix).bind(now)
     .bind(req.expires_at.as_deref())
-    .execute(sql.pool()).await.map_err(api_err)?;
+    .execute(pool).await.map_err(api_err)?;
 
     Ok((
         StatusCode::CREATED,
         Json(KeyResponse {
             key_id,
             user_id: req.user_id,
+            group_id: req.group_id,
             name: req.name,
             key_prefix,
             created_at: now.to_string(),
@@ -119,21 +160,14 @@ pub async fn list_keys(
     State(state): State<AppState>,
     AuthUser { user_id, .. }: AuthUser,
 ) -> Result<Json<Vec<KeyResponse>>, (StatusCode, String)> {
-    let sql = state.service.sql_store.as_ref().ok_or_else(|| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "SQL store required".to_string(),
-        )
-    })?;
-
-    migrate_api_keys(sql.pool()).await.map_err(api_err)?;
+    let pool = auth_pool(&state)?;
 
     let rows = sqlx::query(
-        "SELECT key_id, user_id, name, key_prefix, created_at, expires_at, last_used_at \
+        "SELECT key_id, user_id, group_id, name, key_prefix, created_at, expires_at, last_used_at \
          FROM mem_api_keys WHERE user_id = ? AND is_active = 1 ORDER BY created_at DESC",
     )
     .bind(&user_id)
-    .fetch_all(sql.pool())
+    .fetch_all(pool)
     .await
     .map_err(api_err)?;
 
@@ -142,6 +176,7 @@ pub async fn list_keys(
         .map(|r| KeyResponse {
             key_id: r.try_get("key_id").unwrap_or_default(),
             user_id: r.try_get("user_id").unwrap_or_default(),
+            group_id: r.try_get("group_id").ok(),
             name: r.try_get("name").unwrap_or_default(),
             key_prefix: r.try_get("key_prefix").unwrap_or_default(),
             created_at: r
@@ -168,23 +203,19 @@ pub async fn list_keys(
 /// GET /auth/keys/:id — get a single API key by ID
 pub async fn get_key(
     State(state): State<AppState>,
-    AuthUser { user_id, is_master }: AuthUser,
+    AuthUser {
+        user_id, is_master, ..
+    }: AuthUser,
     Path(key_id): Path<String>,
 ) -> Result<Json<KeyResponse>, (StatusCode, String)> {
-    let sql = state.service.sql_store.as_ref().ok_or_else(|| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "SQL store required".to_string(),
-        )
-    })?;
-    migrate_api_keys(sql.pool()).await.map_err(api_err)?;
+    let pool = auth_pool(&state)?;
 
     let row = sqlx::query(
-        "SELECT key_id, user_id, name, key_prefix, created_at, expires_at, last_used_at \
+        "SELECT key_id, user_id, group_id, name, key_prefix, created_at, expires_at, last_used_at \
          FROM mem_api_keys WHERE key_id = ? AND is_active = 1",
     )
     .bind(&key_id)
-    .fetch_optional(sql.pool())
+    .fetch_optional(pool)
     .await
     .map_err(api_err)?;
 
@@ -196,6 +227,7 @@ pub async fn get_key(
     Ok(Json(KeyResponse {
         key_id: r.try_get("key_id").unwrap_or_default(),
         user_id: owner,
+        group_id: r.try_get("group_id").ok(),
         name: r.try_get("name").unwrap_or_default(),
         key_prefix: r.try_get("key_prefix").unwrap_or_default(),
         created_at: r
@@ -219,21 +251,18 @@ pub async fn get_key(
 /// PUT /auth/keys/:id/rotate — revoke old key, issue new one
 pub async fn rotate_key(
     State(state): State<AppState>,
-    AuthUser { user_id, is_master }: AuthUser,
+    AuthUser {
+        user_id, is_master, ..
+    }: AuthUser,
     Path(key_id): Path<String>,
 ) -> Result<(StatusCode, Json<KeyResponse>), (StatusCode, String)> {
-    let sql = state.service.sql_store.as_ref().ok_or_else(|| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "SQL store required".to_string(),
-        )
-    })?;
+    let pool = auth_pool(&state)?;
 
     let old = sqlx::query(
-        "SELECT user_id, name, expires_at, key_hash FROM mem_api_keys WHERE key_id = ? AND is_active = 1",
+        "SELECT user_id, group_id, name, expires_at, key_hash FROM mem_api_keys WHERE key_id = ? AND is_active = 1",
     )
     .bind(&key_id)
-    .fetch_optional(sql.pool())
+    .fetch_optional(pool)
     .await
     .map_err(api_err)?
     .ok_or_else(|| (StatusCode::NOT_FOUND, "Key not found".to_string()))?;
@@ -244,17 +273,18 @@ pub async fn rotate_key(
     }
 
     let name: String = old.try_get("name").map_err(api_err)?;
+    let group_id: Option<String> = old.try_get("group_id").ok();
     let expires_at: Option<chrono::NaiveDateTime> = old.try_get("expires_at").ok().flatten();
 
     // Invalidate cache before DB update
     if let Ok(key_hash) = old.try_get::<String, _>("key_hash") {
-        state.api_key_cache.invalidate(&key_hash).await;
+        state.api_key_cache.invalidate(&key_hash);
     }
 
     // Deactivate old
     sqlx::query("UPDATE mem_api_keys SET is_active = 0 WHERE key_id = ?")
         .bind(&key_id)
-        .execute(sql.pool())
+        .execute(pool)
         .await
         .map_err(api_err)?;
 
@@ -264,19 +294,20 @@ pub async fn rotate_key(
     let now = chrono::Utc::now().naive_utc();
 
     sqlx::query(
-        "INSERT INTO mem_api_keys (key_id, user_id, name, key_hash, key_prefix, is_active, created_at, expires_at) \
-         VALUES (?,?,?,?,?,1,?,?)"
+        "INSERT INTO mem_api_keys (key_id, user_id, group_id, name, key_hash, key_prefix, is_active, created_at, expires_at) \
+         VALUES (?,?,?,?,?,?,1,?,?)"
     )
-    .bind(&new_id).bind(&old_user).bind(&name)
+    .bind(&new_id).bind(&old_user).bind(group_id.as_deref()).bind(&name)
     .bind(&key_hash).bind(&key_prefix).bind(now)
     .bind(expires_at)
-    .execute(sql.pool()).await.map_err(api_err)?;
+    .execute(pool).await.map_err(api_err)?;
 
     Ok((
         StatusCode::CREATED,
         Json(KeyResponse {
             key_id: new_id,
             user_id: old_user,
+            group_id,
             name,
             key_prefix,
             created_at: now.to_string(),
@@ -288,38 +319,56 @@ pub async fn rotate_key(
 }
 
 /// DELETE /auth/keys/:id — revoke key
+///
+/// Access: key owner can revoke own key; master can revoke any key;
+/// group owner can revoke any key scoped to their group.
 pub async fn revoke_key(
     State(state): State<AppState>,
-    AuthUser { user_id, is_master }: AuthUser,
+    AuthUser {
+        user_id, is_master, ..
+    }: AuthUser,
     Path(key_id): Path<String>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    let sql = state.service.sql_store.as_ref().ok_or_else(|| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "SQL store required".to_string(),
-        )
-    })?;
+    let pool = auth_pool(&state)?;
 
-    let row = sqlx::query("SELECT user_id, key_hash FROM mem_api_keys WHERE key_id = ?")
+    let row = sqlx::query("SELECT user_id, group_id, key_hash FROM mem_api_keys WHERE key_id = ?")
         .bind(&key_id)
-        .fetch_optional(sql.pool())
+        .fetch_optional(pool)
         .await
         .map_err(api_err)?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "Key not found".to_string()))?;
 
-    let owner: String = row.try_get("user_id").map_err(api_err)?;
-    if owner != user_id && !is_master {
+    let key_owner: String = row.try_get("user_id").map_err(api_err)?;
+    let key_group: Option<String> = row.try_get("group_id").ok().flatten();
+
+    let mut authorized = is_master || key_owner == user_id;
+    if !authorized {
+        if let Some(gid) = &key_group {
+            // Check if caller is the group owner
+            let group_owner =
+                sqlx::query("SELECT owner_user_id FROM mem_groups WHERE group_id = ? LIMIT 1")
+                    .bind(gid)
+                    .fetch_optional(pool)
+                    .await
+                    .map_err(api_err)?
+                    .and_then(|r| r.try_get::<String, _>("owner_user_id").ok());
+            if group_owner.as_deref() == Some(&user_id) {
+                authorized = true;
+            }
+        }
+    }
+    if !authorized {
         return Err((StatusCode::FORBIDDEN, "Not your key".to_string()));
     }
 
     // Invalidate cache before DB update
     if let Ok(key_hash) = row.try_get::<String, _>("key_hash") {
-        state.api_key_cache.invalidate(&key_hash).await;
+        state.api_key_cache.invalidate(&key_hash);
     }
 
     sqlx::query("UPDATE mem_api_keys SET is_active = 0 WHERE key_id = ?")
         .bind(&key_id)
-        .execute(sql.pool())
+        .execute(pool)
         .await
         .map_err(api_err)?;
 

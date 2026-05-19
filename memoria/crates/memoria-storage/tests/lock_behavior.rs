@@ -24,7 +24,7 @@ async fn test_update_affected_rows() {
     .execute(store.pool())
     .await
     .expect("Insert failed");
-    
+
     println!("✅ INSERT affected_rows: {}", insert_result.rows_affected());
 
     // 2. 尝试 UPDATE 未过期的锁（应该失败，affected_rows = 0）
@@ -39,9 +39,16 @@ async fn test_update_affected_rows() {
     .execute(store.pool())
     .await
     .expect("Update failed");
-    
-    println!("✅ UPDATE (not expired) affected_rows: {}", update_result.rows_affected());
-    assert_eq!(update_result.rows_affected(), 0, "Should not update non-expired lock");
+
+    println!(
+        "✅ UPDATE (not expired) affected_rows: {}",
+        update_result.rows_affected()
+    );
+    assert_eq!(
+        update_result.rows_affected(),
+        0,
+        "Should not update non-expired lock"
+    );
 
     // 3. 等待锁过期
     tokio::time::sleep(tokio::time::Duration::from_secs(11)).await;
@@ -58,19 +65,25 @@ async fn test_update_affected_rows() {
     .execute(store.pool())
     .await
     .expect("Update failed");
-    
-    println!("✅ UPDATE (expired) affected_rows: {}", update_result2.rows_affected());
-    assert_eq!(update_result2.rows_affected(), 1, "Should update expired lock");
+
+    println!(
+        "✅ UPDATE (expired) affected_rows: {}",
+        update_result2.rows_affected()
+    );
+    assert_eq!(
+        update_result2.rows_affected(),
+        1,
+        "Should update expired lock"
+    );
 
     // 5. 验证 holder_id 已更新
-    let (holder,): (String,) = sqlx::query_as(
-        "SELECT holder_id FROM mem_distributed_locks WHERE lock_key = ?",
-    )
-    .bind(&lock_key)
-    .fetch_one(store.pool())
-    .await
-    .expect("Select failed");
-    
+    let (holder,): (String,) =
+        sqlx::query_as("SELECT holder_id FROM mem_distributed_locks WHERE lock_key = ?")
+            .bind(&lock_key)
+            .fetch_one(store.pool())
+            .await
+            .expect("Select failed");
+
     assert_eq!(holder, "holder2", "Holder should be updated");
     println!("✅ All tests passed");
 }

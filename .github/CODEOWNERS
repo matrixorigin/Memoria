@@ -1,0 +1,29 @@
+# Global owner — all files
+* @XuPeng-SH
+
+# Rust crates
+/memoria/crates/memoria-core/ @XuPeng-SH @aptend @gouhongshen
+/memoria/crates/memoria-api/ @XuPeng-SH
+/memoria/crates/memoria-mcp/ @XuPeng-SH
+/memoria/crates/memoria-cli/ @XuPeng-SH @aptend @gouhongshen
+/memoria/crates/memoria-service/ @XuPeng-SH @aptend @gouhongshen
+/memoria/crates/memoria-storage/ @XuPeng-SH @aptend @gouhongshen
+/memoria/crates/memoria-embedding/ @XuPeng-SH @aptend @gouhongshen
+/memoria/crates/memoria-git/ @XuPeng-SH @aptend @gouhongshen
+/memoria/crates/memoria-test-utils/ @XuPeng-SH @aptend @gouhongshen
+
+# Plugins
+/plugins/ @XuPeng-SH @aptend @randomradio
+
+# Infrastructure & config
+/docker-compose*.yml @XuPeng-SH @aptend @gouhongshen
+/config/ @XuPeng-SH @aptend @randomradio
+/scripts/ @XuPeng-SH @aptend @randomradio
+/Makefile @XuPeng-SH @aptend @randomradio
+
+# CI/CD
+/.github/ @XuPeng-SH @aptend @randomradio
+
+# Documentation
+/docs/ @XuPeng-SH @aptend
+/skills/ @XuPeng-SH @aptend

@@ -2109,9 +2109,10 @@ checksum = "f8ca58f447f06ed17d5fc4043ce1b10dd205e060fb3ce5b979b8ed8e59ff3f79"
 
 [[package]]
 name = "memoria-api"
-version = "0.2.3"
+version = "0.4.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
  "base64 0.22.1",
  "chrono",
@@ -2132,6 +2133,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_urlencoded",
+ "serial_test",
  "sha2",
  "sqlx",
  "subtle",
@@ -2146,9 +2148,10 @@ dependencies = [
 
 [[package]]
 name = "memoria-cli"
-version = "0.2.3"
+version = "0.4.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
  "base64 0.22.1",
  "clap",
@@ -2181,7 +2184,7 @@ dependencies = [
 
 [[package]]
 name = "memoria-core"
-version = "0.2.3"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2195,7 +2198,7 @@ dependencies = [
 
 [[package]]
 name = "memoria-embedding"
-version = "0.2.3"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2210,7 +2213,7 @@ dependencies = [
 
 [[package]]
 name = "memoria-git"
-version = "0.2.3"
+version = "0.4.0"
 dependencies = [
  "chrono",
  "memoria-core",
@@ -2226,7 +2229,7 @@ dependencies = [
 
 [[package]]
 name = "memoria-mcp"
-version = "0.2.3"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2254,7 +2257,7 @@ dependencies = [
 
 [[package]]
 name = "memoria-service"
-version = "0.2.3"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2265,6 +2268,7 @@ dependencies = [
  "memoria-embedding",
  "memoria-git",
  "memoria-storage",
+ "memoria-test-utils",
  "moka",
  "prost",
  "protoc-bin-vendored",
@@ -2285,28 +2289,38 @@ dependencies = [
 
 [[package]]
 name = "memoria-storage"
-version = "0.2.3"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "chrono",
+ "futures",
  "memoria-core",
+ "moka",
  "serde",
  "serde_json",
+ "sha2",
  "sqlx",
  "thiserror 1.0.69",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 
 [[package]]
 name = "memoria-test-utils"
-version = "0.2.3"
+version = "0.4.0"
 dependencies = [
  "axum",
+ "memoria-core",
  "memoria-embedding",
+ "memoria-git",
+ "memoria-service",
+ "memoria-storage",
  "serde_json",
+ "sqlx",
  "tokio",
+ "uuid",
 ]
 
 [[package]]

@@ -135,18 +135,12 @@ impl RateLimiter {
 }
 
 pub fn from_env() -> RateLimiter {
-    let config = std::env::var("MEMORIA_RATE_LIMIT_AUTH_KEYS")
-        .unwrap_or_else(|_| "1000,60".to_string());
+    let config =
+        std::env::var("MEMORIA_RATE_LIMIT_AUTH_KEYS").unwrap_or_else(|_| "1000,60".to_string());
 
     let parts: Vec<&str> = config.split(',').collect();
-    let raw_max: u32 = parts
-        .first()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(1000);
-    let raw_window: u64 = parts
-        .get(1)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(60);
+    let raw_max: u32 = parts.first().and_then(|s| s.parse().ok()).unwrap_or(1000);
+    let raw_window: u64 = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(60);
 
     if raw_max > MAX_REQUESTS_UPPER || raw_window > WINDOW_SECS_UPPER {
         warn!(
@@ -208,7 +202,11 @@ mod tests {
         // Allow generous slack (3x mean) to avoid flakiness.
         let mean = 1000 / SHARD_COUNT;
         for (i, &c) in counts.iter().enumerate() {
-            assert!(c <= mean * 3, "shard {i} has {c} keys, expected ≤ {}", mean * 3);
+            assert!(
+                c <= mean * 3,
+                "shard {i} has {c} keys, expected ≤ {}",
+                mean * 3
+            );
         }
         // All shards should be non-empty with 1000 keys across 64 shards.
         assert!(counts.iter().all(|&c| c > 0), "some shards are empty");

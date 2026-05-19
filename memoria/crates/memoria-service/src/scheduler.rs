@@ -10,7 +10,7 @@
 
 use std::sync::Arc;
 
-use memoria_storage::SqlMemoryStore;
+use memoria_storage::{configured_multi_db_pool_size, MultiDbPoolKind, SqlMemoryStore};
 use tokio::time::{interval, Duration};
 use tracing::{error, info, warn};
 
@@ -42,6 +42,7 @@ pub struct GovernanceScheduler {
     lock: Arc<dyn DistributedLock>,
     instance_id: String,
     lock_ttl: Duration,
+    isolated_pool_max_connections: Option<u32>,
 }
 
 #[derive(Clone)]
@@ -77,10 +78,93 @@ impl GovernanceScheduler {
         let lock_ttl = Duration::from_secs(config.lock_ttl_secs);
         let instance_id = config.instance_id.clone();
 
-        // Build distributed lock: real SQL lock if we have a sql_store, noop otherwise
-        let lock: Arc<dyn DistributedLock> = match &service.sql_store {
-            Some(store) => store.clone(),
-            None => Arc::new(crate::distributed::NoopDistributedLock),
+        // Create an isolated pool for governance so long-running operations
+        // (consolidation, cleanup, DDL rebuilds) do not starve request connections.
+        let governance_pool_size = match std::env::var("GOVERNANCE_POOL_SIZE")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+        {
+            Some(0) => 0,
+            Some(raw) => raw.clamp(
+                1,
+                memoria_storage::multi_db_pool_max_size(MultiDbPoolKind::Governance),
+            ),
+            None if service.db_router.is_some() => {
+                configured_multi_db_pool_size("GOVERNANCE_POOL_SIZE", MultiDbPoolKind::Governance)
+            }
+            None => 4,
+        };
+        #[allow(clippy::type_complexity)]
+        let (gov_store, gov_sql_store, lock, isolated_pool_max_connections): (
+            Option<Arc<dyn GovernanceStore>>,
+            Option<Arc<SqlMemoryStore>>,
+            Arc<dyn DistributedLock>,
+            Option<u32>,
+        ) = match &service.sql_store {
+            Some(store) => {
+                if governance_pool_size == 0 {
+                    info!("Governance isolated pool disabled; falling back to main pool");
+                    (
+                        Some(store.clone() as Arc<dyn GovernanceStore>),
+                        Some(store.clone()),
+                        store.clone() as Arc<dyn DistributedLock>,
+                        None,
+                    )
+                } else {
+                    match store.spawn_background_store(governance_pool_size).await {
+                        Ok(bg) => {
+                            info!(
+                                governance_pool_size,
+                                "Governance scheduler using isolated pool"
+                            );
+                            (
+                                Some(bg.clone() as Arc<dyn GovernanceStore>),
+                                Some(bg.clone()),
+                                bg as Arc<dyn DistributedLock>,
+                                Some(governance_pool_size),
+                            )
+                        }
+                        Err(e) => {
+                            warn!(
+                                error = %e,
+                                governance_pool_size,
+                                "Governance isolated pool failed, falling back to main pool"
+                            );
+                            (
+                                Some(store.clone() as Arc<dyn GovernanceStore>),
+                                Some(store.clone()),
+                                store.clone() as Arc<dyn DistributedLock>,
+                                None,
+                            )
+                        }
+                    }
+                }
+            }
+            None => (
+                None,
+                None,
+                Arc::new(crate::distributed::NoopDistributedLock) as Arc<dyn DistributedLock>,
+                None,
+            ),
+        };
+
+        // Helper to build the scheduler with governance-isolated stores
+        let build = |strategy: Arc<dyn GovernanceStrategy>,
+                     fallback: Arc<dyn GovernanceStrategy>,
+                     plugin: Option<ObservedPlugin>| {
+            let mut scheduler = Self::new_with_components(
+                gov_store.clone(),
+                gov_sql_store.clone(),
+                strategy,
+                fallback,
+                read_enabled_flag(),
+                plugin,
+                lock.clone(),
+                instance_id.clone(),
+                lock_ttl,
+            );
+            scheduler.isolated_pool_max_connections = isolated_pool_max_connections;
+            scheduler
         };
 
         // Dev mode: load plugin directly from local filesystem (hot-reload friendly)
@@ -98,8 +182,7 @@ impl GovernanceScheduler {
                     plugin_version = %version,
                     "Loaded governance plugin from local directory (dev mode)"
                 );
-                return Ok(Self::from_parts(
-                    service,
+                return Ok(build(
                     strategy,
                     delegate,
                     Some(ObservedPlugin {
@@ -108,14 +191,12 @@ impl GovernanceScheduler {
                         plugin_key,
                         version,
                     }),
-                    lock,
-                    instance_id,
-                    lock_ttl,
                 ));
             }
             warn!(plugin_dir = %dir, "MEMORIA_GOVERNANCE_PLUGIN_DIR set but manifest.json not found, falling back");
         }
 
+        // Use the main store for plugin lookup (one-time startup read)
         if let Some(store) = &service.sql_store {
             if let Some(active_plugin) = load_active_governance_plugin(
                 store.as_ref(),
@@ -131,8 +212,7 @@ impl GovernanceScheduler {
                     binding_key = %active_plugin.binding_key,
                     "Loaded governance plugin from shared repository binding"
                 );
-                return Ok(Self::from_parts(
-                    service,
+                return Ok(build(
                     active_plugin.strategy.clone(),
                     delegate,
                     Some(ObservedPlugin {
@@ -141,22 +221,11 @@ impl GovernanceScheduler {
                         plugin_key: active_plugin.plugin_key,
                         version: active_plugin.version,
                     }),
-                    lock,
-                    instance_id,
-                    lock_ttl,
                 ));
             }
         }
 
-        Ok(Self::from_parts(
-            service,
-            delegate.clone(),
-            delegate,
-            None,
-            lock,
-            instance_id,
-            lock_ttl,
-        ))
+        Ok(build(delegate.clone(), delegate, None))
     }
 
     pub fn new_with_registry(
@@ -275,6 +344,7 @@ impl GovernanceScheduler {
             lock,
             instance_id,
             lock_ttl,
+            isolated_pool_max_connections: None,
         }
     }
 
@@ -284,6 +354,16 @@ impl GovernanceScheduler {
 
     pub fn fallback_strategy_key(&self) -> &str {
         self.fallback_strategy.strategy_key()
+    }
+
+    pub fn isolated_pool_max_connections(&self) -> Option<u32> {
+        self.isolated_pool_max_connections
+    }
+
+    pub fn sql_store_configured_max_connections(&self) -> Option<u32> {
+        self.sql_store
+            .as_ref()
+            .and_then(|store| store.configured_max_connections())
     }
 
     /// Spawn background tasks. Returns immediately; tasks run in background.
@@ -616,12 +696,28 @@ mod tests {
         async fn cleanup_orphan_stats(&self) -> Result<i64, crate::MemoriaError> {
             Ok(0)
         }
-        async fn cleanup_edit_log(&self, _: i64) -> Result<i64, crate::MemoriaError> { Ok(0) }
-        async fn cleanup_feedback(&self, _: i64) -> Result<i64, crate::MemoriaError> { Ok(0) }
+        async fn cleanup_orphan_graph_data(&self) -> Result<i64, crate::MemoriaError> {
+            Ok(0)
+        }
+        async fn cleanup_edit_log(&self, _: i64) -> Result<i64, crate::MemoriaError> {
+            Ok(0)
+        }
+        async fn cleanup_feedback(&self, _: i64) -> Result<i64, crate::MemoriaError> {
+            Ok(0)
+        }
         async fn create_safety_snapshot(&self, _: &str) -> (Option<String>, Option<String>) {
             (Some("mem_snap_pre_daily_test".into()), None)
         }
-        async fn log_edit(&self, _: &str, _: &str, _: Option<&str>, _: Option<&str>, _: &str, _: Option<&str>) {}
+        async fn log_edit(
+            &self,
+            _: &str,
+            _: &str,
+            _: Option<&str>,
+            _: Option<&str>,
+            _: &str,
+            _: Option<&str>,
+        ) {
+        }
     }
 
     struct FallbackStore;
@@ -677,12 +773,28 @@ mod tests {
         async fn cleanup_orphan_stats(&self) -> Result<i64, crate::MemoriaError> {
             Ok(0)
         }
-        async fn cleanup_edit_log(&self, _: i64) -> Result<i64, crate::MemoriaError> { Ok(0) }
-        async fn cleanup_feedback(&self, _: i64) -> Result<i64, crate::MemoriaError> { Ok(0) }
+        async fn cleanup_orphan_graph_data(&self) -> Result<i64, crate::MemoriaError> {
+            Ok(0)
+        }
+        async fn cleanup_edit_log(&self, _: i64) -> Result<i64, crate::MemoriaError> {
+            Ok(0)
+        }
+        async fn cleanup_feedback(&self, _: i64) -> Result<i64, crate::MemoriaError> {
+            Ok(0)
+        }
         async fn create_safety_snapshot(&self, _: &str) -> (Option<String>, Option<String>) {
             (Some("mem_snap_pre_daily_fallback".into()), None)
         }
-        async fn log_edit(&self, _: &str, _: &str, _: Option<&str>, _: Option<&str>, _: &str, _: Option<&str>) {}
+        async fn log_edit(
+            &self,
+            _: &str,
+            _: &str,
+            _: Option<&str>,
+            _: Option<&str>,
+            _: &str,
+            _: Option<&str>,
+        ) {
+        }
     }
 
     #[derive(Default)]
@@ -747,12 +859,28 @@ mod tests {
         async fn cleanup_orphan_stats(&self) -> Result<i64, crate::MemoriaError> {
             Ok(0)
         }
-        async fn cleanup_edit_log(&self, _: i64) -> Result<i64, crate::MemoriaError> { Ok(0) }
-        async fn cleanup_feedback(&self, _: i64) -> Result<i64, crate::MemoriaError> { Ok(0) }
+        async fn cleanup_orphan_graph_data(&self) -> Result<i64, crate::MemoriaError> {
+            Ok(0)
+        }
+        async fn cleanup_edit_log(&self, _: i64) -> Result<i64, crate::MemoriaError> {
+            Ok(0)
+        }
+        async fn cleanup_feedback(&self, _: i64) -> Result<i64, crate::MemoriaError> {
+            Ok(0)
+        }
         async fn create_safety_snapshot(&self, _: &str) -> (Option<String>, Option<String>) {
             (None, None)
         }
-        async fn log_edit(&self, _: &str, _: &str, _: Option<&str>, _: Option<&str>, _: &str, _: Option<&str>) {}
+        async fn log_edit(
+            &self,
+            _: &str,
+            _: &str,
+            _: Option<&str>,
+            _: Option<&str>,
+            _: &str,
+            _: Option<&str>,
+        ) {
+        }
 
         async fn check_shared_breaker(
             &self,
@@ -1282,11 +1410,14 @@ mod tests {
         let config = Config {
             db_url: "mysql://root:111@localhost:6001/memoria".into(),
             db_name: "memoria".into(),
+            shared_db_url: "mysql://root:111@localhost:6001/memoria_shared".into(),
+            multi_db: false,
             embedding_provider: "mock".into(),
             embedding_model: "BAAI/bge-m3".into(),
             embedding_dim: 1024,
             embedding_api_key: String::new(),
             embedding_base_url: String::new(),
+            embedding_endpoints: vec![],
             llm_api_key: None,
             llm_base_url: "https://api.openai.com/v1".into(),
             llm_model: "gpt-4o-mini".into(),
@@ -1296,12 +1427,14 @@ mod tests {
             governance_plugin_dir: None,
             instance_id: "test-instance".into(),
             lock_ttl_secs: 120,
+            ops_metrics_enabled: false,
         };
-        let service = Arc::new(MemoryService::new(Arc::new(NoopMemoryStore), None));
-
         let scheduler = tokio::runtime::Runtime::new()
             .unwrap()
-            .block_on(GovernanceScheduler::from_config(service, &config))
+            .block_on(async {
+                let service = Arc::new(MemoryService::new(Arc::new(NoopMemoryStore), None, None));
+                GovernanceScheduler::from_config(service, &config).await
+            })
             .unwrap();
 
         assert_eq!(scheduler.strategy.strategy_key(), "governance:default:v1");
@@ -1489,7 +1622,11 @@ mod tests {
             "primary_b should not be called while breaker is open"
         );
         assert_eq!(exec.report.status, StrategyStatus::Degraded);
-        assert!(exec.report.warnings.iter().any(|w| w.contains("circuit breaker is open")));
+        assert!(exec
+            .report
+            .warnings
+            .iter()
+            .any(|w| w.contains("circuit breaker is open")));
     }
 
     /// Gap: two scheduler instances competing for the same task — only one executes,
@@ -1526,8 +1663,14 @@ mod tests {
 
         // Both try to run hourly concurrently
         let lock_key = "governance:hourly";
-        let a_got = shared_lock.try_acquire(lock_key, "instance_a", Duration::from_secs(120)).await.unwrap();
-        let b_got = shared_lock.try_acquire(lock_key, "instance_b", Duration::from_secs(120)).await.unwrap();
+        let a_got = shared_lock
+            .try_acquire(lock_key, "instance_a", Duration::from_secs(120))
+            .await
+            .unwrap();
+        let b_got = shared_lock
+            .try_acquire(lock_key, "instance_b", Duration::from_secs(120))
+            .await
+            .unwrap();
 
         assert!(a_got ^ b_got, "exactly one should acquire the lock");
 
@@ -1539,15 +1682,25 @@ mod tests {
 
         let exec = winner.run_task(GovernanceTask::Hourly).await.unwrap();
         assert_eq!(exec.report.status, StrategyStatus::Success);
-        assert!(loser_strategy.tasks.lock().unwrap().is_empty(), "loser should not have run");
+        assert!(
+            loser_strategy.tasks.lock().unwrap().is_empty(),
+            "loser should not have run"
+        );
 
         // Release and let loser run
         let holder = if a_got { "instance_a" } else { "instance_b" };
         shared_lock.release(lock_key, holder).await.unwrap();
 
-        let loser = if a_got { scheduler_b.clone() } else { scheduler_a.clone() };
+        let loser = if a_got {
+            scheduler_b.clone()
+        } else {
+            scheduler_a.clone()
+        };
         let loser_holder = if a_got { "instance_b" } else { "instance_a" };
-        let got = shared_lock.try_acquire(lock_key, loser_holder, Duration::from_secs(120)).await.unwrap();
+        let got = shared_lock
+            .try_acquire(lock_key, loser_holder, Duration::from_secs(120))
+            .await
+            .unwrap();
         assert!(got);
 
         let exec2 = loser.run_task(GovernanceTask::Hourly).await.unwrap();

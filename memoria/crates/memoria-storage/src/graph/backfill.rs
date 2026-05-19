@@ -89,9 +89,7 @@ pub async fn backfill_graph(
                 .iter()
                 .map(|(m, e, s)| (m.as_str(), e.as_str(), *s))
                 .collect();
-            let _ = graph
-                .batch_upsert_memory_entity_links(user_id, &refs)
-                .await;
+            let _ = graph.batch_upsert_memory_entity_links(user_id, &refs).await;
         }
     }
 

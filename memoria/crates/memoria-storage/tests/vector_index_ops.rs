@@ -115,7 +115,10 @@ async fn test_should_rebuild_vector_index() {
 
     assert!(!should2, "Should not rebuild during cooldown");
     assert!(cooldown2.is_some(), "Should have cooldown");
-    assert!(cooldown2.unwrap() > 0 && cooldown2.unwrap() <= 3600, "Cooldown should be within range");
+    assert!(
+        cooldown2.unwrap() > 0 && cooldown2.unwrap() <= 3600,
+        "Cooldown should be within range"
+    );
 }
 
 #[tokio::test]
@@ -175,7 +178,11 @@ async fn test_rebuild_vector_index_adaptive_cooldown() {
             .await
             .expect("Check cooldown");
 
-        assert!(cooldown.is_some(), "Should have cooldown for {} rows", row_count);
+        assert!(
+            cooldown.is_some(),
+            "Should have cooldown for {} rows",
+            row_count
+        );
         let remaining = cooldown.unwrap();
         // 允许一些误差（因为时间流逝）
         assert!(
@@ -187,7 +194,6 @@ async fn test_rebuild_vector_index_adaptive_cooldown() {
         );
     }
 }
-
 
 #[tokio::test]
 async fn test_rebuild_failure_exponential_backoff() {
@@ -261,7 +267,13 @@ async fn test_vector_search_pre_filter_multi_user() {
     let insert = |uid: String, content: String, emb: Vec<f32>| {
         let pool = store.pool().clone();
         let mid = uuid::Uuid::new_v4().simple().to_string();
-        let vec_lit = format!("[{}]", emb.iter().map(|f| f.to_string()).collect::<Vec<_>>().join(","));
+        let vec_lit = format!(
+            "[{}]",
+            emb.iter()
+                .map(|f| f.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        );
         async move {
             sqlx::query(&format!(
                 "INSERT INTO mem_memories \
@@ -287,8 +299,14 @@ async fn test_vector_search_pre_filter_multi_user() {
     insert(uid_b.clone(), "user B memory 1".into(), make_emb(0)).await;
 
     // Build IVF index after data import
-    let indexed = store.rebuild_vector_index("mem_memories").await.expect("rebuild");
-    assert!(indexed > 0, "expected at least 1 indexed row, got {indexed}");
+    let indexed = store
+        .rebuild_vector_index("mem_memories")
+        .await
+        .expect("rebuild");
+    assert!(
+        indexed > 0,
+        "expected at least 1 indexed row, got {indexed}"
+    );
 
     // Query close to user A's memories
     let query = make_emb(0);
@@ -317,12 +335,522 @@ async fn test_vector_search_pre_filter_multi_user() {
 
     let a_ids: std::collections::HashSet<_> = results_a.iter().map(|m| &m.memory_id).collect();
     let b_ids: std::collections::HashSet<_> = results_b.iter().map(|m| &m.memory_id).collect();
-    assert!(a_ids.is_disjoint(&b_ids), "results must not overlap between users");
+    assert!(
+        a_ids.is_disjoint(&b_ids),
+        "results must not overlap between users"
+    );
 
     // Cleanup
     sqlx::query("DELETE FROM mem_memories WHERE user_id = ? OR user_id = ?")
         .bind(&uid_a)
         .bind(&uid_b)
+        .execute(store.pool())
+        .await
+        .ok();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// cleanup_tool_results
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn test_cleanup_tool_results() {
+    let store = setup().await;
+    let uid = uuid::Uuid::new_v4().to_string();
+
+    // Insert an old tool_result (observed 100 hours ago)
+    let old_id = uuid::Uuid::new_v4().to_string();
+    sqlx::query(
+        "INSERT INTO mem_memories (memory_id, user_id, memory_type, content, is_active, initial_confidence, source_event_ids, observed_at, created_at, updated_at) \
+         VALUES (?, ?, 'tool_result', 'old result', 1, 0.9, '[]', NOW() - INTERVAL 100 HOUR, NOW(), NOW())"
+    ).bind(&old_id).bind(&uid).execute(store.pool()).await.unwrap();
+
+    // Insert a fresh tool_result
+    let fresh_id = uuid::Uuid::new_v4().to_string();
+    sqlx::query(
+        "INSERT INTO mem_memories (memory_id, user_id, memory_type, content, is_active, initial_confidence, source_event_ids, observed_at, created_at, updated_at) \
+         VALUES (?, ?, 'tool_result', 'fresh result', 1, 0.9, '[]', NOW(), NOW(), NOW())"
+    ).bind(&fresh_id).bind(&uid).execute(store.pool()).await.unwrap();
+
+    // Insert a non-tool_result that is also old — should NOT be deleted
+    let semantic_id = uuid::Uuid::new_v4().to_string();
+    sqlx::query(
+        "INSERT INTO mem_memories (memory_id, user_id, memory_type, content, is_active, initial_confidence, source_event_ids, observed_at, created_at, updated_at) \
+         VALUES (?, ?, 'semantic', 'old semantic', 1, 0.9, '[]', NOW() - INTERVAL 100 HOUR, NOW(), NOW())"
+    ).bind(&semantic_id).bind(&uid).execute(store.pool()).await.unwrap();
+
+    let cleaned = store.cleanup_tool_results(72).await.unwrap();
+    assert!(cleaned >= 1, "should clean at least the old tool_result");
+
+    // Old tool_result gone
+    let (c,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM mem_memories WHERE memory_id = ?")
+        .bind(&old_id)
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+    assert_eq!(c, 0, "old tool_result should be deleted");
+
+    // Fresh tool_result still there
+    let (c,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM mem_memories WHERE memory_id = ?")
+        .bind(&fresh_id)
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+    assert_eq!(c, 1, "fresh tool_result should remain");
+
+    // Semantic memory untouched
+    let (c,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM mem_memories WHERE memory_id = ?")
+        .bind(&semantic_id)
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+    assert_eq!(c, 1, "semantic memory should remain");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// cleanup_orphaned_incrementals
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn test_cleanup_orphaned_incrementals() {
+    let store = setup().await;
+    let uid = uuid::Uuid::new_v4().to_string();
+    let sid = uuid::Uuid::new_v4().to_string();
+
+    // Insert an old incremental summary (>24h, has session_id, no full summary exists)
+    let inc_id = uuid::Uuid::new_v4().to_string();
+    sqlx::query(
+        "INSERT INTO mem_memories (memory_id, user_id, memory_type, content, is_active, initial_confidence, source_event_ids, session_id, observed_at, created_at, updated_at) \
+         VALUES (?, ?, 'episodic', '[session_summary:incremental] partial summary', 1, 0.9, '[]', ?, NOW() - INTERVAL 48 HOUR, NOW(), NOW())"
+    ).bind(&inc_id).bind(&uid).bind(&sid).execute(store.pool()).await.unwrap();
+
+    // Insert a normal memory — should NOT be affected
+    let normal_id = uuid::Uuid::new_v4().to_string();
+    sqlx::query(
+        "INSERT INTO mem_memories (memory_id, user_id, memory_type, content, is_active, initial_confidence, source_event_ids, observed_at, created_at, updated_at) \
+         VALUES (?, ?, 'semantic', 'normal memory', 1, 0.9, '[]', NOW() - INTERVAL 48 HOUR, NOW(), NOW())"
+    ).bind(&normal_id).bind(&uid).execute(store.pool()).await.unwrap();
+
+    let cleaned = store.cleanup_orphaned_incrementals(&uid, 24).await.unwrap();
+    assert_eq!(cleaned, 1, "should clean the orphaned incremental");
+
+    // Incremental deactivated
+    let (active,): (i8,) = sqlx::query_as("SELECT is_active FROM mem_memories WHERE memory_id = ?")
+        .bind(&inc_id)
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+    assert_eq!(active, 0, "incremental should be deactivated");
+
+    // Normal memory untouched
+    let (active,): (i8,) = sqlx::query_as("SELECT is_active FROM mem_memories WHERE memory_id = ?")
+        .bind(&normal_id)
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+    assert_eq!(active, 1, "normal memory should remain active");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// compress_redundant
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn test_compress_redundant() {
+    let store = setup().await;
+    let uid = uuid::Uuid::new_v4().to_string();
+    let dim = test_dim();
+
+    // Create two memories with identical embeddings (cosine similarity = 1.0)
+    let emb = format!("[{}]", vec!["0.1"; dim].join(","));
+
+    let id_old = uuid::Uuid::new_v4().to_string();
+    sqlx::query(
+        "INSERT INTO mem_memories (memory_id, user_id, memory_type, content, embedding, is_active, initial_confidence, source_event_ids, observed_at, created_at, updated_at) \
+         VALUES (?, ?, 'semantic', 'duplicate A', ?, 1, 0.9, '[]', NOW() - INTERVAL 2 HOUR, NOW(), NOW())"
+    ).bind(&id_old).bind(&uid).bind(&emb).execute(store.pool()).await.unwrap();
+
+    let id_new = uuid::Uuid::new_v4().to_string();
+    sqlx::query(
+        "INSERT INTO mem_memories (memory_id, user_id, memory_type, content, embedding, is_active, initial_confidence, source_event_ids, observed_at, created_at, updated_at) \
+         VALUES (?, ?, 'semantic', 'duplicate B', ?, 1, 0.9, '[]', NOW() - INTERVAL 1 HOUR, NOW(), NOW())"
+    ).bind(&id_new).bind(&uid).bind(&emb).execute(store.pool()).await.unwrap();
+
+    // Create a memory with a very different embedding — should NOT be compressed
+    let diff_emb = format!("[{}]", vec!["0.9"; dim].join(","));
+    let id_diff = uuid::Uuid::new_v4().to_string();
+    sqlx::query(
+        "INSERT INTO mem_memories (memory_id, user_id, memory_type, content, embedding, is_active, initial_confidence, source_event_ids, observed_at, created_at, updated_at) \
+         VALUES (?, ?, 'semantic', 'different', ?, 1, 0.9, '[]', NOW(), NOW(), NOW())"
+    ).bind(&id_diff).bind(&uid).bind(&diff_emb).execute(store.pool()).await.unwrap();
+
+    let compressed = store
+        .compress_redundant(&uid, 0.95, 30, 10_000)
+        .await
+        .unwrap();
+    assert_eq!(compressed, 1, "should compress 1 redundant pair");
+
+    // Older duplicate physically deleted
+    let (c,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM mem_memories WHERE memory_id = ?")
+        .bind(&id_old)
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+    assert_eq!(c, 0, "older duplicate should be physically deleted");
+
+    // Newer duplicate still active
+    let (active,): (i8,) = sqlx::query_as("SELECT is_active FROM mem_memories WHERE memory_id = ?")
+        .bind(&id_new)
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+    assert_eq!(active, 1, "newer duplicate should remain active");
+
+    // Different memory untouched
+    let (active,): (i8,) = sqlx::query_as("SELECT is_active FROM mem_memories WHERE memory_id = ?")
+        .bind(&id_diff)
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+    assert_eq!(active, 1, "different memory should remain active");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// cleanup_orphan_branches
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn test_cleanup_orphan_branches() {
+    let store = setup().await;
+
+    // Create a sandbox table that looks like an orphan branch
+    let (db_name,): (String,) = sqlx::query_as("SELECT DATABASE()")
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+    let table_name = format!("memories_sandbox_{}", uuid::Uuid::new_v4().simple());
+
+    // Create via DATA BRANCH (the same mechanism the app uses)
+    let create_sql =
+        format!("DATA BRANCH CREATE TABLE {db_name}.{table_name} FROM {db_name}.mem_memories");
+    let create_result = sqlx::raw_sql(&create_sql).execute(store.pool()).await;
+
+    if create_result.is_err() {
+        // If DATA BRANCH is not supported in this test environment, skip
+        eprintln!("⚠️ DATA BRANCH not supported, skipping test_cleanup_orphan_branches");
+        return;
+    }
+
+    // Verify table exists
+    let (count,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM information_schema.tables WHERE table_name = ?")
+            .bind(&table_name)
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+    assert_eq!(count, 1, "sandbox table should exist");
+
+    // Clean orphan branches
+    let cleaned = store.cleanup_orphan_branches().await.unwrap();
+    assert!(cleaned >= 1, "should clean at least 1 orphan branch table");
+
+    // Verify table is gone
+    let (count,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM information_schema.tables WHERE table_name = ?")
+            .bind(&table_name)
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+    assert_eq!(count, 0, "sandbox table should be deleted");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// health_hygiene — dangling graph nodes (memory physically deleted)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn test_health_hygiene_detects_dangling_graph_nodes() {
+    let store = setup().await;
+    let uid = uuid::Uuid::new_v4().to_string();
+    let nonexistent_mid = uuid::Uuid::new_v4().to_string();
+    let node_id = uuid::Uuid::new_v4().as_simple().to_string();
+
+    // Insert an active graph node pointing to a memory_id that doesn't exist at all
+    sqlx::query(
+        "INSERT INTO memory_graph_nodes (node_id, user_id, node_type, content, memory_id, is_active, created_at) \
+         VALUES (?, ?, 'memory', 'dangling node', ?, 1, NOW())"
+    ).bind(&node_id).bind(&uid).bind(&nonexistent_mid)
+    .execute(store.pool()).await.unwrap();
+
+    let result = store.health_hygiene(&uid).await.unwrap();
+    let orphan_gn = result["orphan_graph_nodes"].as_i64().unwrap();
+    assert!(
+        orphan_gn >= 1,
+        "should detect dangling graph node (memory physically deleted)"
+    );
+
+    // Also verify global
+    let global = store.health_hygiene_global().await.unwrap();
+    let global_gn = global["orphan_graph_nodes"].as_i64().unwrap();
+    assert!(
+        global_gn >= 1,
+        "global should also detect dangling graph node"
+    );
+
+    // Cleanup
+    sqlx::query("DELETE FROM memory_graph_nodes WHERE node_id = ?")
+        .bind(&node_id)
+        .execute(store.pool())
+        .await
+        .ok();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// health_hygiene — entity nodes (memory_id IS NULL) must NOT be reported as orphan
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn test_health_hygiene_does_not_misreport_entity_nodes() {
+    let store = setup().await;
+    let uid = uuid::Uuid::new_v4().to_string();
+    let node_id = uuid::Uuid::new_v4().as_simple().to_string();
+
+    // Insert an entity node with memory_id = NULL — this is legitimate
+    sqlx::query(
+        "INSERT INTO memory_graph_nodes (node_id, user_id, node_type, content, memory_id, is_active, created_at) \
+         VALUES (?, ?, 'entity', 'some concept', NULL, 1, NOW())"
+    ).bind(&node_id).bind(&uid)
+    .execute(store.pool()).await.unwrap();
+
+    let result = store.health_hygiene(&uid).await.unwrap();
+    let orphan_gn = result["orphan_graph_nodes"].as_i64().unwrap();
+    assert_eq!(
+        orphan_gn, 0,
+        "entity node (memory_id=NULL) must not be counted as orphan"
+    );
+
+    // Cleanup
+    sqlx::query("DELETE FROM memory_graph_nodes WHERE node_id = ?")
+        .bind(&node_id)
+        .execute(store.pool())
+        .await
+        .ok();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// detect_pollution — empty result set (SUM returns NULL)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn test_detect_pollution_empty_user() {
+    let store = setup().await;
+    // Brand new user with zero memories — SUM(CASE...) returns NULL
+    let uid = uuid::Uuid::new_v4().to_string();
+    let result = store.detect_pollution(&uid, 24).await.unwrap();
+    assert!(!result, "empty user should not be flagged as polluted");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// cleanup_stale — preserves version chain (superseded_by rows kept)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn test_cleanup_stale_preserves_history_chain() {
+    let store = setup().await;
+    let uid = uuid::Uuid::new_v4().to_string();
+    let old_mid = uuid::Uuid::new_v4().to_string();
+    let new_mid = uuid::Uuid::new_v4().to_string();
+    let plain_mid = uuid::Uuid::new_v4().to_string();
+
+    // Insert the target of the version chain (active, the "new" version)
+    sqlx::query(
+        "INSERT INTO mem_memories (memory_id, user_id, memory_type, content, source_event_ids, \
+         is_active, observed_at, created_at) \
+         VALUES (?, ?, 'semantic', 'new version', '[]', 1, NOW(), NOW())",
+    )
+    .bind(&new_mid)
+    .bind(&uid)
+    .execute(store.pool())
+    .await
+    .unwrap();
+
+    // Insert a superseded memory (part of version chain) — inactive, old, has superseded_by
+    sqlx::query(
+        "INSERT INTO mem_memories (memory_id, user_id, memory_type, content, source_event_ids, \
+         is_active, superseded_by, updated_at, observed_at, created_at) \
+         VALUES (?, ?, 'semantic', 'old version', '[]', 0, ?, \
+         DATE_SUB(NOW(), INTERVAL 48 HOUR), DATE_SUB(NOW(), INTERVAL 48 HOUR), NOW())",
+    )
+    .bind(&old_mid)
+    .bind(&uid)
+    .bind(&new_mid)
+    .execute(store.pool())
+    .await
+    .unwrap();
+
+    // Insert a plain inactive memory (no superseded_by, old enough) — should be deleted
+    sqlx::query(
+        "INSERT INTO mem_memories (memory_id, user_id, memory_type, content, source_event_ids, \
+         is_active, updated_at, observed_at, created_at) \
+         VALUES (?, ?, 'semantic', 'plain stale', '[]', 0, \
+         DATE_SUB(NOW(), INTERVAL 48 HOUR), DATE_SUB(NOW(), INTERVAL 48 HOUR), NOW())",
+    )
+    .bind(&plain_mid)
+    .bind(&uid)
+    .execute(store.pool())
+    .await
+    .unwrap();
+
+    let cleaned = store.cleanup_stale(&uid).await.unwrap();
+    assert_eq!(cleaned, 1, "should delete only the plain inactive memory");
+
+    // Version chain row preserved
+    let (c,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM mem_memories WHERE memory_id = ?")
+        .bind(&old_mid)
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        c, 1,
+        "superseded memory must be preserved for history chain"
+    );
+
+    // Plain stale deleted
+    let (c,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM mem_memories WHERE memory_id = ?")
+        .bind(&plain_mid)
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+    assert_eq!(c, 0, "plain inactive memory should be deleted");
+
+    // Cleanup
+    sqlx::query("DELETE FROM mem_memories WHERE memory_id IN (?, ?)")
+        .bind(&old_mid)
+        .bind(&new_mid)
+        .execute(store.pool())
+        .await
+        .ok();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// cleanup_stale — deletes broken version chain (superseded_by target gone)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn test_cleanup_stale_deletes_broken_chain() {
+    let store = setup().await;
+    let uid = uuid::Uuid::new_v4().to_string();
+    let broken_mid = uuid::Uuid::new_v4().to_string();
+    let gone_target = uuid::Uuid::new_v4().to_string(); // never inserted
+
+    // Insert inactive memory whose superseded_by points to a nonexistent memory
+    sqlx::query(
+        "INSERT INTO mem_memories (memory_id, user_id, memory_type, content, source_event_ids, \
+         is_active, superseded_by, updated_at, observed_at, created_at) \
+         VALUES (?, ?, 'semantic', 'broken chain', '[]', 0, ?, \
+         DATE_SUB(NOW(), INTERVAL 48 HOUR), DATE_SUB(NOW(), INTERVAL 48 HOUR), NOW())",
+    )
+    .bind(&broken_mid)
+    .bind(&uid)
+    .bind(&gone_target)
+    .execute(store.pool())
+    .await
+    .unwrap();
+
+    let cleaned = store.cleanup_stale(&uid).await.unwrap();
+    assert_eq!(cleaned, 1, "should delete broken chain row");
+
+    let (c,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM mem_memories WHERE memory_id = ?")
+        .bind(&broken_mid)
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+    assert_eq!(c, 0, "broken chain memory should be deleted");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// cleanup_stale — cascading broken chain deletion (A→B→C, C gone → B gone → A gone)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn test_cleanup_stale_cascading_broken_chain() {
+    let store = setup().await;
+    let uid = uuid::Uuid::new_v4().to_string();
+    let mid_a = uuid::Uuid::new_v4().to_string();
+    let mid_b = uuid::Uuid::new_v4().to_string();
+    let mid_c = uuid::Uuid::new_v4().to_string(); // never inserted — the root break
+
+    // Chain: A → B → C (C doesn't exist)
+    // B is inactive with superseded_by = C (broken)
+    sqlx::query(
+        "INSERT INTO mem_memories (memory_id, user_id, memory_type, content, source_event_ids, \
+         is_active, superseded_by, updated_at, observed_at, created_at) \
+         VALUES (?, ?, 'semantic', 'version B', '[]', 0, ?, \
+         DATE_SUB(NOW(), INTERVAL 48 HOUR), DATE_SUB(NOW(), INTERVAL 48 HOUR), NOW())",
+    )
+    .bind(&mid_b)
+    .bind(&uid)
+    .bind(&mid_c)
+    .execute(store.pool())
+    .await
+    .unwrap();
+
+    // A is inactive with superseded_by = B (valid chain, but B will be deleted)
+    sqlx::query(
+        "INSERT INTO mem_memories (memory_id, user_id, memory_type, content, source_event_ids, \
+         is_active, superseded_by, updated_at, observed_at, created_at) \
+         VALUES (?, ?, 'semantic', 'version A', '[]', 0, ?, \
+         DATE_SUB(NOW(), INTERVAL 48 HOUR), DATE_SUB(NOW(), INTERVAL 48 HOUR), NOW())",
+    )
+    .bind(&mid_a)
+    .bind(&uid)
+    .bind(&mid_b)
+    .execute(store.pool())
+    .await
+    .unwrap();
+
+    let cleaned = store.cleanup_stale(&uid).await.unwrap();
+    assert_eq!(cleaned, 2, "should cascade-delete both A and B");
+
+    let (c,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM mem_memories WHERE memory_id IN (?, ?)")
+            .bind(&mid_a)
+            .bind(&mid_b)
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+    assert_eq!(c, 0, "both chain nodes should be gone");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// detect_pollution — normal user returns false
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn test_detect_pollution_normal_user() {
+    let store = setup().await;
+    let uid = uuid::Uuid::new_v4().to_string();
+
+    // Insert 5 active memories, none superseded → ratio = 0/5 = 0 < 0.3
+    for i in 0..5 {
+        let mid = uuid::Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO mem_memories (memory_id, user_id, memory_type, content, source_event_ids, \
+             is_active, observed_at, created_at, updated_at) \
+             VALUES (?, ?, 'semantic', ?, '[]', 1, NOW(), NOW(), NOW())"
+        ).bind(&mid).bind(&uid).bind(format!("fact {i}"))
+        .execute(store.pool()).await.unwrap();
+    }
+
+    let result = store.detect_pollution(&uid, 24).await.unwrap();
+    assert!(
+        !result,
+        "normal user with no supersedes should not be polluted"
+    );
+
+    // Cleanup
+    sqlx::query("DELETE FROM mem_memories WHERE user_id = ?")
+        .bind(&uid)
         .execute(store.pool())
         .await
         .ok();

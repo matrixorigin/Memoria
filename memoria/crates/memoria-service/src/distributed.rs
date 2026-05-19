@@ -168,7 +168,12 @@ pub struct AsyncTask {
 /// Trait for cross-instance async task tracking (e.g. episodic summary generation).
 #[async_trait]
 pub trait AsyncTaskStore: Send + Sync {
-    async fn create_task(&self, task_id: &str, instance_id: &str, user_id: &str) -> Result<(), MemoriaError>;
+    async fn create_task(
+        &self,
+        task_id: &str,
+        instance_id: &str,
+        user_id: &str,
+    ) -> Result<(), MemoriaError>;
     async fn complete_task(
         &self,
         task_id: &str,
@@ -180,7 +185,12 @@ pub trait AsyncTaskStore: Send + Sync {
 
 #[async_trait]
 impl AsyncTaskStore for SqlMemoryStore {
-    async fn create_task(&self, task_id: &str, instance_id: &str, user_id: &str) -> Result<(), MemoriaError> {
+    async fn create_task(
+        &self,
+        task_id: &str,
+        instance_id: &str,
+        user_id: &str,
+    ) -> Result<(), MemoriaError> {
         sqlx::query(
             "INSERT INTO mem_async_tasks (task_id, instance_id, user_id, status, created_at, updated_at) \
              VALUES (?, ?, ?, 'processing', NOW(), NOW())",

@@ -8,6 +8,8 @@ use sqlx::Row;
 
 use crate::{auth::AuthUser, models::*, state::AppState};
 
+use memoria_core::nullable_str_from_row;
+
 type ApiResult<T> = Result<Json<T>, (StatusCode, String)>;
 pub fn api_err(e: impl std::fmt::Display) -> (StatusCode, String) {
     tracing::error!(error = %e, "internal server error");
@@ -31,9 +33,41 @@ pub fn api_err_typed(e: memoria_core::MemoriaError) -> (StatusCode, String) {
     (status, e.to_string())
 }
 
+async fn find_memory_any_user(
+    state: &AppState,
+    memory_id: &str,
+) -> Result<Option<(String, memoria_core::Memory)>, (StatusCode, String)> {
+    let shared = state.service.shared_sql_store().map_err(api_err_typed)?;
+    let Some(router) = shared.db_router() else {
+        let memory = state.service.get(memory_id).await.map_err(api_err_typed)?;
+        return Ok(memory.map(|m| (m.user_id.clone(), m)));
+    };
+
+    let user_ids = router.list_active_users().await.map_err(api_err_typed)?;
+    for candidate in user_ids {
+        let sql = state
+            .service
+            .user_sql_store(&candidate)
+            .await
+            .map_err(api_err_typed)?;
+        let table = sql.active_table(&candidate).await.map_err(api_err_typed)?;
+        if let Some(memory) = sql
+            .get_from(&table, memory_id)
+            .await
+            .map_err(api_err_typed)?
+        {
+            return Ok(Some((candidate, memory)));
+        }
+    }
+
+    Ok(None)
+}
+
 #[derive(Deserialize, Default)]
 pub struct ListQuery {
     pub memory_type: Option<String>,
+    pub session_id: Option<String>,
+    pub trust_tier: Option<String>,
     #[serde(default = "default_limit")]
     pub limit: i64,
     pub cursor: Option<String>,
@@ -46,65 +80,84 @@ pub async fn health() -> &'static str {
     "ok"
 }
 
-pub async fn health_instance(State(state): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
+pub async fn health_instance(
+    State(state): State<AppState>,
+) -> (StatusCode, Json<serde_json::Value>) {
     let db_ok = if let Some(sql) = &state.service.sql_store {
-        sqlx::query("SELECT 1")
-            .execute(sql.pool())
-            .await
-            .is_ok()
+        sqlx::query("SELECT 1").execute(sql.pool()).await.is_ok()
     } else {
         false
     };
     let status = if db_ok { "ok" } else { "degraded" };
-    let code = if db_ok { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE };
-    (code, Json(serde_json::json!({
-        "status": status,
-        "instance_id": state.instance_id,
-        "db": db_ok,
-    })))
+    let code = if db_ok {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (
+        code,
+        Json(serde_json::json!({
+            "status": status,
+            "instance_id": state.instance_id,
+            "db": db_ok,
+        })),
+    )
 }
 
 pub async fn list_memories(
     State(state): State<AppState>,
-    AuthUser { user_id, .. }: AuthUser,
+    auth: AuthUser,
     Query(q): Query<ListQuery>,
 ) -> ApiResult<ListResponse> {
-    let limit = q.limit.min(500);
-    let memories = state
+    let limit = q.limit.clamp(1, 500);
+    // Cursor is a memory_id; validate it looks like a hex string
+    let cursor = q
+        .cursor
+        .as_deref()
+        .filter(|c| c.len() == 32 && c.chars().all(|ch| ch.is_ascii_hexdigit()));
+    if let Some(tier) = q.trust_tier.as_deref() {
+        parse_trust_tier(tier).map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e))?;
+    }
+    let fetch_limit = limit + 1;
+    let mut memories = state
         .service
-        .list_active(&user_id, limit)
+        .list_active_paged(
+            auth.scope_id(),
+            fetch_limit,
+            q.memory_type.as_deref(),
+            q.session_id.as_deref(),
+            q.trust_tier.as_deref(),
+            cursor,
+        )
         .await
         .map_err(api_err)?;
-    let items: Vec<MemoryResponse> = memories
-        .into_iter()
-        .filter(|m| {
-            q.memory_type
-                .as_deref()
-                .map(|t| m.memory_type.to_string() == t)
-                .unwrap_or(true)
-        })
-        .map(Into::into)
-        .collect();
-    let next_cursor = if items.len() == limit as usize {
-        items
-            .last()
-            .map(|m| format!("{}|{}", m.observed_at.as_deref().unwrap_or(""), m.memory_id))
+    let has_more = memories.len() > limit as usize;
+    memories.truncate(limit as usize);
+    let next_cursor = if has_more {
+        memories.last().map(|m| m.memory_id.clone())
     } else {
         None
     };
+    let items: Vec<MemoryResponse> = memories.into_iter().map(Into::into).collect();
     Ok(Json(ListResponse { items, next_cursor }))
 }
 
 pub async fn store_memory(
     State(state): State<AppState>,
-    AuthUser { user_id, .. }: AuthUser,
+    auth: AuthUser,
     Json(req): Json<StoreRequest>,
 ) -> Result<(StatusCode, Json<MemoryResponse>), (StatusCode, String)> {
     if req.content.is_empty() {
-        return Err((StatusCode::UNPROCESSABLE_ENTITY, "content must not be empty".into()));
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "content must not be empty".into(),
+        ));
     }
     if req.content.len() > 32_768 {
-        return Err((StatusCode::UNPROCESSABLE_ENTITY, "content exceeds 32 KiB limit".into()));
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "content exceeds 32 KiB limit".into(),
+        ));
     }
     let mt =
         parse_memory_type(&req.memory_type).map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e))?;
@@ -120,21 +173,27 @@ pub async fn store_memory(
         .map(|s| chrono::DateTime::parse_from_rfc3339(s).map(|dt| dt.with_timezone(&chrono::Utc)))
         .transpose()
         .map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
+    let author = if auth.group_id.is_some() {
+        Some(auth.user_id.clone())
+    } else {
+        None
+    };
     let m = state
         .service
         .store_memory(
-            &user_id,
+            auth.scope_id(),
             &req.content,
             mt,
             req.session_id,
             tier,
             observed_at,
             req.initial_confidence,
+            author,
         )
         .await
         .map_err(|e| {
             if matches!(e, memoria_core::MemoriaError::Blocked(_)) {
-                crate::routes::metrics::SENSITIVITY_BLOCKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                crate::metrics::registry().security.sensitivity_blocks.inc();
             }
             api_err_typed(e)
         })?;
@@ -143,15 +202,21 @@ pub async fn store_memory(
 
 pub async fn batch_store(
     State(state): State<AppState>,
-    AuthUser { user_id, .. }: AuthUser,
+    auth: AuthUser,
     Json(req): Json<BatchStoreRequest>,
 ) -> Result<(StatusCode, Json<Vec<MemoryResponse>>), (StatusCode, String)> {
     if req.memories.len() > 100 {
-        return Err((StatusCode::UNPROCESSABLE_ENTITY, "batch exceeds 100 items".into()));
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "batch exceeds 100 items".into(),
+        ));
     }
     for m in &req.memories {
         if m.content.len() > 32_768 {
-            return Err((StatusCode::UNPROCESSABLE_ENTITY, "content exceeds 32 KiB limit".into()));
+            return Err((
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "content exceeds 32 KiB limit".into(),
+            ));
         }
     }
     let items: Vec<_> = req
@@ -178,9 +243,14 @@ pub async fn batch_store(
         validated.push((content, mt, session_id, tier));
     }
 
+    let author = if auth.group_id.is_some() {
+        Some(auth.user_id.clone())
+    } else {
+        None
+    };
     let results = state
         .service
-        .store_batch(&user_id, validated)
+        .store_batch(auth.scope_id(), validated, author)
         .await
         .map_err(api_err)?;
     Ok((
@@ -191,57 +261,27 @@ pub async fn batch_store(
 
 pub async fn retrieve(
     State(state): State<AppState>,
-    AuthUser { user_id, .. }: AuthUser,
+    auth: AuthUser,
     Json(req): Json<RetrieveRequest>,
 ) -> ApiResult<serde_json::Value> {
+    req.validate()
+        .map_err(|err| (StatusCode::UNPROCESSABLE_ENTITY, err))?;
     let top_k = req.top_k.clamp(1, 100);
     let level = memoria_service::ExplainLevel::from_str_or_bool(&req.explain);
-    let filter_session = req
-        .session_id
-        .as_deref()
-        .filter(|_| !req.include_cross_session);
-
-    let apply_filter = |mut mems: Vec<memoria_core::Memory>| -> Vec<memoria_core::Memory> {
-        if let Some(sid) = filter_session {
-            mems.retain(|m| m.session_id.as_deref() == Some(sid));
-        }
-        mems
-    };
+    let retrieve_options = req
+        .retrieve_options()
+        .map_err(|err| (StatusCode::UNPROCESSABLE_ENTITY, err))?;
 
     if level != memoria_service::ExplainLevel::None {
         let (results, explain) = state
             .service
-            .retrieve_explain_level(&user_id, &req.query, top_k, level)
-            .await
-            .map_err(api_err)?;
-        let items: Vec<MemoryResponse> =
-            apply_filter(results).into_iter().map(Into::into).collect();
-        Ok(Json(
-            serde_json::json!({"results": items, "explain": explain}),
-        ))
-    } else {
-        let results = state
-            .service
-            .retrieve(&user_id, &req.query, top_k)
-            .await
-            .map_err(api_err)?;
-        let items: Vec<MemoryResponse> =
-            apply_filter(results).into_iter().map(Into::into).collect();
-        Ok(Json(serde_json::json!(items)))
-    }
-}
-
-pub async fn search(
-    State(state): State<AppState>,
-    AuthUser { user_id, .. }: AuthUser,
-    Json(req): Json<RetrieveRequest>,
-) -> ApiResult<serde_json::Value> {
-    let top_k = req.top_k.clamp(1, 100);
-    let level = memoria_service::ExplainLevel::from_str_or_bool(&req.explain);
-    if level != memoria_service::ExplainLevel::None {
-        let (results, explain) = state
-            .service
-            .search_explain_level(&user_id, &req.query, top_k, level)
+            .retrieve_explain_level_with_options(
+                auth.scope_id(),
+                &req.query,
+                top_k,
+                level,
+                &retrieve_options,
+            )
             .await
             .map_err(api_err)?;
         let items: Vec<MemoryResponse> = results.into_iter().map(Into::into).collect();
@@ -251,7 +291,46 @@ pub async fn search(
     } else {
         let results = state
             .service
-            .search(&user_id, &req.query, top_k)
+            .retrieve_with_options(auth.scope_id(), &req.query, top_k, &retrieve_options)
+            .await
+            .map_err(api_err)?;
+        let items: Vec<MemoryResponse> = results.into_iter().map(Into::into).collect();
+        Ok(Json(serde_json::json!(items)))
+    }
+}
+
+pub async fn search(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Json(req): Json<SearchRequest>,
+) -> ApiResult<serde_json::Value> {
+    req.validate()
+        .map_err(|err| (StatusCode::UNPROCESSABLE_ENTITY, err))?;
+    let top_k = req.top_k.clamp(1, 100);
+    let level = memoria_service::ExplainLevel::from_str_or_bool(&req.explain);
+    let retrieve_options = req
+        .retrieve_options()
+        .map_err(|err| (StatusCode::UNPROCESSABLE_ENTITY, err))?;
+    if level != memoria_service::ExplainLevel::None {
+        let (results, explain) = state
+            .service
+            .retrieve_explain_level_with_options(
+                auth.scope_id(),
+                &req.query,
+                top_k,
+                level,
+                &retrieve_options,
+            )
+            .await
+            .map_err(api_err)?;
+        let items: Vec<MemoryResponse> = results.into_iter().map(Into::into).collect();
+        Ok(Json(
+            serde_json::json!({"results": items, "explain": explain}),
+        ))
+    } else {
+        let results = state
+            .service
+            .retrieve_with_options(auth.scope_id(), &req.query, top_k, &retrieve_options)
             .await
             .map_err(api_err)?;
         Ok(Json(serde_json::json!(results
@@ -263,51 +342,73 @@ pub async fn search(
 
 pub async fn get_memory(
     State(state): State<AppState>,
-    AuthUser { user_id, is_master }: AuthUser,
+    auth: AuthUser,
     Path(id): Path<String>,
 ) -> ApiResult<Option<MemoryResponse>> {
-    let m = state.service.get(&id).await.map_err(api_err)?;
-    if let Some(ref mem) = m {
-        if !is_master && mem.user_id != user_id {
-            return Err((StatusCode::FORBIDDEN, "Not your memory".to_string()));
-        }
+    let owned = state
+        .service
+        .get_for_user(auth.scope_id(), &id)
+        .await
+        .map_err(api_err_typed)?;
+    if let Some(memory) = owned {
+        return Ok(Json(Some(memory.into())));
     }
-    Ok(Json(m.map(Into::into)))
+
+    if !auth.is_master {
+        return Ok(Json(None));
+    }
+
+    if let Some((_, memory)) = find_memory_any_user(&state, &id).await? {
+        return Ok(Json(Some(memory.into())));
+    }
+
+    Ok(Json(None))
 }
 
 pub async fn correct_memory(
     State(state): State<AppState>,
-    AuthUser { user_id, is_master }: AuthUser,
+    auth: AuthUser,
     Path(id): Path<String>,
     Json(req): Json<CorrectRequest>,
 ) -> ApiResult<MemoryResponse> {
-    if !is_master {
-        let existing = state
+    let effective_user_id = if auth.is_master {
+        find_memory_any_user(&state, &id)
+            .await?
+            .map(|(owner_id, _)| owner_id)
+            .unwrap_or_else(|| auth.scope_id().to_string())
+    } else {
+        if state
             .service
-            .get(&id)
+            .get_for_user(auth.scope_id(), &id)
             .await
-            .map_err(api_err)?
-            .ok_or_else(|| (StatusCode::NOT_FOUND, "Memory not found".to_string()))?;
-        if existing.user_id != user_id {
-            return Err((StatusCode::FORBIDDEN, "Not your memory".to_string()));
+            .map_err(api_err_typed)?
+            .is_none()
+        {
+            return Err((StatusCode::NOT_FOUND, "Memory not found".to_string()));
         }
-    }
+        auth.scope_id().to_string()
+    };
     let m = state
         .service
-        .correct(&id, &req.new_content)
+        .correct(&effective_user_id, &id, &req.new_content)
         .await
-        .map_err(api_err)?;
+        .map_err(api_err_typed)?;
     Ok(Json(m.into()))
 }
 
 pub async fn correct_by_query(
     State(state): State<AppState>,
-    AuthUser { user_id, .. }: AuthUser,
+    auth: AuthUser,
     Json(req): Json<CorrectByQueryRequest>,
 ) -> ApiResult<MemoryResponse> {
+    req.validate()
+        .map_err(|err| (StatusCode::UNPROCESSABLE_ENTITY, err))?;
+    let retrieve_options = req
+        .retrieve_options()
+        .map_err(|err| (StatusCode::UNPROCESSABLE_ENTITY, err))?;
     let results = state
         .service
-        .retrieve(&user_id, &req.query, 1)
+        .retrieve_with_options(auth.scope_id(), &req.query, 1, &retrieve_options)
         .await
         .map_err(api_err)?;
     let found = results.into_iter().next().ok_or_else(|| {
@@ -318,7 +419,7 @@ pub async fn correct_by_query(
     })?;
     let m = state
         .service
-        .correct(&found.memory_id, &req.new_content)
+        .correct(auth.scope_id(), &found.memory_id, &req.new_content)
         .await
         .map_err(api_err)?;
     Ok(Json(m.into()))
@@ -326,53 +427,84 @@ pub async fn correct_by_query(
 
 pub async fn delete_memory(
     State(state): State<AppState>,
-    AuthUser { user_id, is_master }: AuthUser,
+    auth: AuthUser,
     Path(id): Path<String>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    if !is_master {
-        let existing = state.service.get(&id).await.map_err(api_err)?
-            .ok_or_else(|| (StatusCode::NOT_FOUND, "Memory not found".to_string()))?;
-        if existing.user_id != user_id {
-            return Err((StatusCode::FORBIDDEN, "Not your memory".to_string()));
+    let effective_user_id = if auth.is_master {
+        find_memory_any_user(&state, &id)
+            .await?
+            .map(|(owner_id, _)| owner_id)
+            .unwrap_or_else(|| auth.scope_id().to_string())
+    } else {
+        if state
+            .service
+            .get_for_user(auth.scope_id(), &id)
+            .await
+            .map_err(api_err_typed)?
+            .is_none()
+        {
+            return Err((StatusCode::NOT_FOUND, "Memory not found".to_string()));
         }
-    }
-    let _ = state.service.purge(&user_id, &id).await.map_err(api_err)?;
+        auth.scope_id().to_string()
+    };
+    let _ = state
+        .service
+        .purge(&effective_user_id, &id)
+        .await
+        .map_err(api_err_typed)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 pub async fn purge_memories(
     State(state): State<AppState>,
-    AuthUser { user_id, is_master }: AuthUser,
+    auth: AuthUser,
     Json(req): Json<PurgeRequest>,
 ) -> ApiResult<PurgeResponse> {
-    let result = if let Some(ids) = &req.memory_ids {
-        if !is_master {
-            for id in ids {
-                let mem = state.service.get(id).await.map_err(api_err)?
-                    .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Memory not found: {id}")))?;
-                if mem.user_id != user_id {
-                    return Err((StatusCode::FORBIDDEN, format!("Not your memory: {id}")));
+    let selector = req
+        .selector()
+        .map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e))?;
+    let result = match selector {
+        PurgeSelector::MemoryIds(ids) => {
+            if !auth.is_master {
+                for id in &ids {
+                    let mem = state
+                        .service
+                        .get_for_user(auth.scope_id(), id)
+                        .await
+                        .map_err(api_err)?
+                        .ok_or_else(|| {
+                            (StatusCode::NOT_FOUND, format!("Memory not found: {id}"))
+                        })?;
+                    if !auth.is_group_scoped() && mem.user_id != auth.user_id {
+                        return Err((StatusCode::FORBIDDEN, format!("Not your memory: {id}")));
+                    }
                 }
             }
+            let id_refs: Vec<&str> = ids.iter().map(|s| s.as_str()).collect();
+            state
+                .service
+                .purge_batch(auth.scope_id(), &id_refs)
+                .await
+                .map_err(api_err)?
         }
-        let id_refs: Vec<&str> = ids.iter().map(|s| s.as_str()).collect();
-        state
+        PurgeSelector::Topic(topic) => state
             .service
-            .purge_batch(&user_id, &id_refs)
+            .purge_by_topic(auth.scope_id(), &topic)
             .await
-            .map_err(api_err)?
-    } else if let Some(topic) = &req.topic {
-        state
+            .map_err(api_err)?,
+        PurgeSelector::Session {
+            session_id,
+            memory_types,
+        } => state
             .service
-            .purge_by_topic(&user_id, topic)
+            .purge_by_session_id(auth.scope_id(), &session_id, memory_types.as_deref())
             .await
-            .map_err(api_err)?
-    } else {
-        memoria_service::PurgeResult {
+            .map_err(api_err)?,
+        PurgeSelector::None => memoria_service::PurgeResult {
             purged: 0,
             snapshot_name: None,
             warning: None,
-        }
+        },
     };
     Ok(Json(PurgeResponse {
         purged: result.purged,
@@ -383,12 +515,12 @@ pub async fn purge_memories(
 
 pub async fn get_profile(
     State(state): State<AppState>,
-    AuthUser { user_id, is_master }: AuthUser,
+    auth: AuthUser,
     Path(target): Path<String>,
 ) -> ApiResult<serde_json::Value> {
-    let resolved = if target == "me" || target == user_id {
-        user_id
-    } else if is_master {
+    let resolved = if target == "me" || target == auth.user_id {
+        auth.scope_id().to_string()
+    } else if auth.is_master {
         target
     } else {
         return Err((
@@ -398,9 +530,10 @@ pub async fn get_profile(
     };
     let sql = state
         .service
-        .sql_store
-        .as_ref()
-        .ok_or_else(|| api_err("SQL store required"))?;
+        .user_sql_store(&resolved)
+        .await
+        .map_err(api_err)?;
+    let table = sql.active_table(&resolved).await.map_err(api_err)?;
     let memories = state
         .service
         .list_active(&resolved, 50)
@@ -412,13 +545,16 @@ pub async fn get_profile(
         .map(|m| m.content.as_str())
         .collect();
 
-    // Stats enrichment (matches Python)
-    let stats: serde_json::Value = sqlx::query(
+    // Stats enrichment follows the user's active branch table.
+    let stats_query = format!(
         "SELECT memory_type, COUNT(*) as cnt, \
          ROUND(AVG(initial_confidence), 2) as avg_conf, \
          MIN(observed_at) as oldest, MAX(observed_at) as newest \
-         FROM mem_memories WHERE user_id = ? AND is_active = 1 GROUP BY memory_type"
-    ).bind(&resolved).fetch_all(sql.pool()).await
+         FROM {table} WHERE user_id = ? AND is_active = 1 GROUP BY memory_type"
+    );
+    let stats: serde_json::Value = sqlx::query(&stats_query)
+    .bind(&resolved)
+    .fetch_all(sql.pool()).await
     .map(|rows| {
         let mut by_type = serde_json::Map::new();
         let mut total = 0i64;
@@ -462,12 +598,12 @@ pub struct ObserveRequest {
 /// Without LLM: stores each non-empty assistant/user message as a semantic memory.
 pub async fn observe_turn(
     State(state): State<AppState>,
-    AuthUser { user_id, .. }: AuthUser,
+    auth: AuthUser,
     Json(req): Json<ObserveRequest>,
 ) -> ApiResult<serde_json::Value> {
     let (memories, has_llm) = state
         .service
-        .observe_turn(&user_id, &req.messages, req.session_id)
+        .observe_turn(auth.scope_id(), &req.messages, req.session_id)
         .await
         .map_err(api_err)?;
 
@@ -492,18 +628,17 @@ pub async fn observe_turn(
 /// GET /v1/memories/:id/history — version chain via superseded_by links.
 pub async fn get_memory_history(
     State(state): State<AppState>,
-    AuthUser { user_id, .. }: AuthUser,
+    auth: AuthUser,
     Path(id): Path<String>,
 ) -> ApiResult<serde_json::Value> {
     use sqlx::Row;
 
-    let sql = state.service.sql_store.as_ref().ok_or_else(|| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "SQL store required".to_string(),
-        )
-    })?;
-    let table = sql.active_table(&user_id).await.map_err(api_err)?;
+    let sql = state
+        .service
+        .user_sql_store(auth.scope_id())
+        .await
+        .map_err(api_err)?;
+    let table = sql.active_table(auth.scope_id()).await.map_err(api_err)?;
 
     let mut chain = Vec::new();
     let mut visited = std::collections::HashSet::new();
@@ -516,11 +651,11 @@ pub async fn get_memory_history(
         }
         let row = sqlx::query(&format!(
             "SELECT memory_id, content, is_active, superseded_by, observed_at, memory_type \
-                 FROM `{}` WHERE memory_id = ? AND user_id = ?",
+                 FROM {} WHERE memory_id = ? AND user_id = ?",
             table
         ))
         .bind(&cid)
-        .bind(&user_id)
+        .bind(auth.scope_id())
         .fetch_optional(sql.pool())
         .await
         .map_err(api_err)?;
@@ -528,7 +663,8 @@ pub async fn get_memory_history(
         match row {
             Some(r) => {
                 let mid: String = r.try_get("memory_id").unwrap_or_default();
-                let sup: Option<String> = r.try_get("superseded_by").ok().flatten();
+                let sup: Option<String> =
+                    nullable_str_from_row(r.try_get("superseded_by").ok().flatten());
                 chain.push(serde_json::json!({
                     "memory_id": mid,
                     "content": r.try_get::<String, _>("content").unwrap_or_default(),
@@ -554,11 +690,11 @@ pub async fn get_memory_history(
         loop {
             let older = sqlx::query(&format!(
                 "SELECT memory_id, content, is_active, superseded_by, observed_at, memory_type \
-                     FROM `{}` WHERE superseded_by = ? AND user_id = ?",
+                     FROM {} WHERE superseded_by = ? AND user_id = ?",
                 table
             ))
             .bind(&prev_id)
-            .bind(&user_id)
+            .bind(auth.scope_id())
             .fetch_optional(sql.pool())
             .await
             .map_err(api_err)?;
@@ -608,7 +744,7 @@ pub struct PipelineCandidate {
 
 pub async fn run_pipeline(
     State(state): State<AppState>,
-    AuthUser { user_id, .. }: AuthUser,
+    auth: AuthUser,
     Json(req): Json<PipelineRequest>,
 ) -> ApiResult<serde_json::Value> {
     use crate::models::{parse_memory_type, parse_trust_tier};
@@ -637,7 +773,7 @@ pub async fn run_pipeline(
 
     let pipeline = MemoryPipeline::new(state.service.clone(), Some(state.git.clone()));
     let result = pipeline
-        .run(&user_id, candidates, req.sandbox_query.as_deref())
+        .run(auth.scope_id(), candidates, req.sandbox_query.as_deref())
         .await;
 
     Ok(Json(serde_json::json!({
@@ -666,13 +802,18 @@ pub struct FeedbackResponse {
 /// POST /v1/memories/:id/feedback — record explicit relevance feedback.
 pub async fn record_feedback(
     State(state): State<AppState>,
-    AuthUser { user_id, .. }: AuthUser,
+    auth: AuthUser,
     Path(memory_id): Path<String>,
     Json(req): Json<FeedbackRequest>,
 ) -> Result<(StatusCode, Json<FeedbackResponse>), (StatusCode, String)> {
     let feedback_id = state
         .service
-        .record_feedback(&user_id, &memory_id, &req.signal, req.context.as_deref())
+        .record_feedback(
+            auth.scope_id(),
+            &memory_id,
+            &req.signal,
+            req.context.as_deref(),
+        )
         .await
         .map_err(api_err_typed)?;
     Ok((
@@ -688,11 +829,11 @@ pub async fn record_feedback(
 /// GET /v1/feedback/stats — get feedback statistics for the user.
 pub async fn get_feedback_stats(
     State(state): State<AppState>,
-    AuthUser { user_id, .. }: AuthUser,
+    auth: AuthUser,
 ) -> ApiResult<serde_json::Value> {
     let stats = state
         .service
-        .get_feedback_stats(&user_id)
+        .get_feedback_stats(auth.scope_id())
         .await
         .map_err(api_err)?;
     Ok(Json(serde_json::json!(stats)))
@@ -701,11 +842,11 @@ pub async fn get_feedback_stats(
 /// GET /v1/feedback/by-tier — get feedback breakdown by trust tier.
 pub async fn get_feedback_by_tier(
     State(state): State<AppState>,
-    AuthUser { user_id, .. }: AuthUser,
+    auth: AuthUser,
 ) -> ApiResult<serde_json::Value> {
     let breakdown = state
         .service
-        .get_feedback_by_tier(&user_id)
+        .get_feedback_by_tier(auth.scope_id())
         .await
         .map_err(api_err)?;
     Ok(Json(serde_json::json!({"breakdown": breakdown})))
@@ -714,15 +855,15 @@ pub async fn get_feedback_by_tier(
 /// GET /v1/retrieval-params — get user's adaptive retrieval parameters.
 pub async fn get_retrieval_params(
     State(state): State<AppState>,
-    AuthUser { user_id, .. }: AuthUser,
+    auth: AuthUser,
 ) -> ApiResult<serde_json::Value> {
     let sql = state
         .service
-        .sql_store
-        .as_ref()
-        .ok_or_else(|| (StatusCode::SERVICE_UNAVAILABLE, "SQL store not available".to_string()))?;
+        .user_sql_store(auth.scope_id())
+        .await
+        .map_err(api_err)?;
     let params = sql
-        .get_user_retrieval_params(&user_id)
+        .get_user_retrieval_params(auth.scope_id())
         .await
         .map_err(api_err)?;
     Ok(Json(serde_json::to_value(params).unwrap()))
@@ -738,17 +879,17 @@ pub struct SetRetrievalParamsRequest {
 /// PUT /v1/retrieval-params — update user's adaptive retrieval parameters.
 pub async fn set_retrieval_params(
     State(state): State<AppState>,
-    AuthUser { user_id, .. }: AuthUser,
+    auth: AuthUser,
     Json(req): Json<SetRetrievalParamsRequest>,
 ) -> ApiResult<serde_json::Value> {
     let sql = state
         .service
-        .sql_store
-        .as_ref()
-        .ok_or_else(|| (StatusCode::SERVICE_UNAVAILABLE, "SQL store not available".to_string()))?;
+        .user_sql_store(auth.scope_id())
+        .await
+        .map_err(api_err)?;
 
     let mut params = sql
-        .get_user_retrieval_params(&user_id)
+        .get_user_retrieval_params(auth.scope_id())
         .await
         .map_err(api_err)?;
 
@@ -762,30 +903,36 @@ pub async fn set_retrieval_params(
         params.confidence_weight = v.clamp(0.0, 0.5);
     }
 
-    sql.set_user_retrieval_params(&params).await.map_err(api_err)?;
+    sql.set_user_retrieval_params(&params)
+        .await
+        .map_err(api_err)?;
     Ok(Json(serde_json::to_value(params).unwrap()))
 }
 
 /// POST /v1/retrieval-params/tune — trigger auto-tuning of retrieval parameters.
 pub async fn tune_retrieval_params(
     State(state): State<AppState>,
-    AuthUser { user_id, .. }: AuthUser,
+    auth: AuthUser,
 ) -> ApiResult<serde_json::Value> {
     use memoria_service::scoring::{DefaultScoringPlugin, ScoringPlugin};
 
     let sql = state
         .service
-        .sql_store
-        .as_ref()
-        .ok_or_else(|| (StatusCode::SERVICE_UNAVAILABLE, "SQL store not available".to_string()))?;
+        .user_sql_store(auth.scope_id())
+        .await
+        .map_err(api_err)?;
 
     let old_params = sql
-        .get_user_retrieval_params(&user_id)
+        .get_user_retrieval_params(auth.scope_id())
         .await
         .map_err(api_err)?;
 
     let plugin = DefaultScoringPlugin;
-    match plugin.tune_params(sql.as_ref(), &user_id).await.map_err(api_err)? {
+    match plugin
+        .tune_params(sql.as_ref(), auth.scope_id())
+        .await
+        .map_err(api_err)?
+    {
         Some(new_params) => Ok(Json(serde_json::json!({
             "tuned": true,
             "old_params": old_params,
@@ -797,4 +944,23 @@ pub async fn tune_retrieval_params(
             "current_params": old_params
         }))),
     }
+}
+
+pub async fn get_tool_usage(
+    State(state): State<AppState>,
+    auth: AuthUser,
+) -> ApiResult<serde_json::Value> {
+    let mut usage = state.tool_usage_batcher.get_user_tool_usage(&auth.user_id);
+    if usage.is_empty() {
+        state
+            .tool_usage_batcher
+            .load_user_from_db(&state.service, &auth.user_id)
+            .await;
+        usage = state.tool_usage_batcher.get_user_tool_usage(&auth.user_id);
+    }
+    let items: Vec<serde_json::Value> = usage
+        .into_iter()
+        .map(|(tool, ts)| serde_json::json!({"tool_name": tool, "last_used_at": ts.to_rfc3339()}))
+        .collect();
+    Ok(Json(serde_json::json!(items)))
 }

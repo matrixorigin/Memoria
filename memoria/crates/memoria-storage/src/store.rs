@@ -1,21 +1,626 @@
+use crate::router::DbRouter;
 use async_trait::async_trait;
-use chrono::Utc;
-use memoria_core::{interfaces::MemoryStore, MemoriaError, Memory, MemoryType, TrustTier};
-use sqlx::{mysql::MySqlPool, Row};
+use chrono::{NaiveDateTime, Utc};
+use memoria_core::{
+    interfaces::MemoryStore, nullable_str, nullable_str_from_row, MemoriaError, Memory, MemoryType,
+    TrustTier,
+};
+use sqlx::{mysql::MySqlPool, MySql, QueryBuilder, Row};
+use std::borrow::Cow;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+tokio::task_local! {
+    /// Real user ID for per-user state (active branch).
+    /// In group mode the "user_id" flowing through the service layer is the
+    /// group's scope_id (e.g. "grp_xxx").  The task-local carries the **real**
+    /// human user so that `active_branch_name` / `set_active_branch` key on
+    /// the individual, not the group.  In non-group mode this is never set and
+    /// the functions fall back to the passed `user_id`.
+    pub static ACTOR_USER_ID: String;
+}
 
 pub(crate) fn db_err(e: sqlx::Error) -> MemoriaError {
+    if let Some(kind) = detect_connection_anomaly(&e) {
+        record_connection_anomaly(kind);
+        tracing::error!(
+            error_kind = kind.as_str(),
+            error = %e,
+            "database connection anomaly"
+        );
+    }
     MemoriaError::Database(e.to_string())
 }
 
-/// One entry for [`SqlMemoryStore::batch_log_edit`].
-/// Fields: `(user_id, operation, memory_id, payload, reason, snapshot_before)`.
-pub type EditLogEntry<'a> = (&'a str, &'a str, Option<&'a str>, Option<&'a str>, &'a str, Option<&'a str>);
+/// Returns true when a failed ALTER TABLE ADD COLUMN was rejected because
+/// the column already exists (MySQL/MatrixOne error 1060).
+/// This is the expected outcome when the column was created by CREATE TABLE
+/// before information_schema reflects it, so it should be treated as a no-op.
+fn is_duplicate_column(e: &sqlx::Error) -> bool {
+    use sqlx::mysql::MySqlDatabaseError;
+    e.as_database_error()
+        .and_then(|de| de.as_error().downcast_ref::<MySqlDatabaseError>())
+        .map(|me| me.number() == 1060)
+        .unwrap_or(false)
+}
+
+/// Returns true for MatrixOne's transient "txn need retry in rc mode, def changed"
+/// error (code 20631). This can occur when a DDL statement (e.g. ALTER TABLE on a
+/// branch table) races with a concurrent `data branch merge` that also modifies the
+/// same table definition.
+fn is_mo_retry_error(e: &sqlx::Error) -> bool {
+    let msg = e.to_string();
+    msg.contains("20631") || msg.contains("txn need retry")
+}
+
+/// Execute a raw DDL string, retrying up to 3 times on MatrixOne error 20631
+/// ("txn need retry in rc mode, def changed") with exponential backoff.
+/// Used for ALTER TABLE statements that may race with concurrent DDL in migrations.
+async fn exec_ddl_with_retry(pool: &sqlx::mysql::MySqlPool, sql: &str) -> Result<(), sqlx::Error> {
+    const MAX_ATTEMPTS: u32 = 3;
+    let mut attempt = 0u32;
+    loop {
+        match sqlx::query(sql).execute(pool).await {
+            Ok(_) => return Ok(()),
+            Err(e) if attempt < MAX_ATTEMPTS - 1 && is_mo_retry_error(&e) => {
+                attempt += 1;
+                let backoff_ms = 50u64 * (1 << attempt); // 100 ms, 200 ms
+                tracing::warn!(
+                    attempt,
+                    backoff_ms,
+                    error = %e,
+                    sql = sql,
+                    "exec_ddl_with_retry: MatrixOne 20631 — retrying migration DDL",
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+fn normalized_count_sql(sql: &str) -> String {
+    sql.trim()
+        .trim_end_matches(';')
+        .trim()
+        .strip_suffix("> 0")
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| sql.to_string())
+}
+
+#[allow(dead_code)]
+async fn query_has_rows(pool: &MySqlPool, sql: &str) -> bool {
+    // Strip "> 0" suffix if present — MatrixOne returns bool for "COUNT(*) > 0"
+    // which sqlx cannot decode as i64. Use plain COUNT(*) and compare in Rust.
+    let sql = normalized_count_sql(sql);
+    sqlx::query_scalar::<_, i64>(&sql)
+        .fetch_one(pool)
+        .await
+        .unwrap_or(0)
+        > 0
+}
+
+async fn info_schema_column_exists(
+    pool: &MySqlPool,
+    schema_name: &str,
+    table_name: &str,
+    column_name: &str,
+) -> bool {
+    sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM information_schema.columns \
+         WHERE table_schema = ? AND table_name = ? AND column_name = ?",
+    )
+    .bind(schema_name)
+    .bind(table_name)
+    .bind(column_name)
+    .fetch_one(pool)
+    .await
+    .unwrap_or(0)
+        > 0
+}
+
+async fn info_schema_index_exists(
+    pool: &MySqlPool,
+    schema_name: &str,
+    table_name: &str,
+    index_name: &str,
+) -> bool {
+    sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM information_schema.statistics \
+         WHERE table_schema = ? AND table_name = ? AND index_name = ?",
+    )
+    .bind(schema_name)
+    .bind(table_name)
+    .bind(index_name)
+    .fetch_one(pool)
+    .await
+    .unwrap_or(0)
+        > 0
+}
+
+async fn info_schema_index_column_exists(
+    pool: &MySqlPool,
+    schema_name: &str,
+    table_name: &str,
+    index_name: &str,
+    column_name: &str,
+) -> bool {
+    sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM information_schema.statistics \
+         WHERE table_schema = ? AND table_name = ? AND index_name = ? \
+         AND column_name = ?",
+    )
+    .bind(schema_name)
+    .bind(table_name)
+    .bind(index_name)
+    .bind(column_name)
+    .fetch_one(pool)
+    .await
+    .unwrap_or(0)
+        > 0
+}
+
+async fn is_fresh_database(pool: &MySqlPool, schema_name: &str) -> Result<bool, MemoriaError> {
+    sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = ?",
+    )
+    .bind(schema_name)
+    .fetch_one(pool)
+    .await
+    .map(|count| count == 0)
+    .map_err(db_err)
+}
+
+/// Bump whenever user-DB schema expectations change, including tables created
+/// by `bootstrap_user_schema()`, graph schema bootstrapping, or any compat
+/// migration handled by `apply_user_compat_migrations()`.
+pub const CURRENT_USER_SCHEMA_VERSION: i64 = 2;
+const USER_SCHEMA_META_KEY: &str = "user_schema";
+
+async fn ensure_user_schema_meta_table(pool: &MySqlPool, table: &str) -> Result<(), MemoriaError> {
+    sqlx::query(&format!(
+        r#"CREATE TABLE IF NOT EXISTS {table} (
+            schema_key     VARCHAR(64) PRIMARY KEY,
+            schema_version BIGINT      NOT NULL,
+            updated_at     DATETIME(6) NOT NULL
+        )"#
+    ))
+    .execute(pool)
+    .await
+    .map_err(db_err)?;
+    Ok(())
+}
+
+async fn load_user_schema_version(
+    pool: &MySqlPool,
+    table: &str,
+) -> Result<Option<i64>, MemoriaError> {
+    let row = sqlx::query(&format!(
+        "SELECT schema_version FROM {table} WHERE schema_key = ? LIMIT 1"
+    ))
+    .bind(USER_SCHEMA_META_KEY)
+    .fetch_optional(pool)
+    .await
+    .map_err(db_err)?;
+
+    row.map(|r| r.try_get::<i64, _>("schema_version").map_err(db_err))
+        .transpose()
+}
+
+async fn store_user_schema_version(
+    pool: &MySqlPool,
+    table: &str,
+    version: i64,
+) -> Result<(), MemoriaError> {
+    let now = Utc::now().naive_utc();
+    sqlx::query(&format!(
+        r#"INSERT INTO {table} (schema_key, schema_version, updated_at)
+           VALUES (?, ?, ?)
+           ON DUPLICATE KEY UPDATE
+               schema_version = VALUES(schema_version),
+               updated_at = VALUES(updated_at)"#
+    ))
+    .bind(USER_SCHEMA_META_KEY)
+    .bind(version)
+    .bind(now)
+    .execute(pool)
+    .await
+    .map_err(db_err)?;
+    Ok(())
+}
+
+const POOL_MONITOR_INTERVAL_SECS: u64 = 30;
+const POOL_MONITOR_REPEAT_AFTER_TICKS: u32 = 10;
+const POOL_SATURATED_LOG_DELAY_SECS: u64 = 300;
+const POOL_ANOMALY_RECENT_WINDOW_SECS: u64 = 600;
+const MAX_IDENTIFIER_LEN: usize = 64;
+const SAFETY_SNAPSHOT_SCOPE_MAX_LEN: usize = 21;
+const SAFETY_SNAPSHOT_OPERATION_MAX_LEN: usize = 20;
+const SAFETY_SNAPSHOT_UUID_LEN: usize = 8;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConnectionAnomalyKind {
+    None = 0,
+    PoolTimedOut = 1,
+    PoolClosed = 2,
+    Io = 3,
+    Tls = 4,
+    Protocol = 5,
+    TooManyConnections = 6,
+}
+
+impl ConnectionAnomalyKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::PoolTimedOut => "pool_timed_out",
+            Self::PoolClosed => "pool_closed",
+            Self::Io => "io",
+            Self::Tls => "tls",
+            Self::Protocol => "protocol",
+            Self::TooManyConnections => "too_many_connections",
+        }
+    }
+}
+
+impl From<u8> for ConnectionAnomalyKind {
+    fn from(value: u8) -> Self {
+        match value {
+            1 => Self::PoolTimedOut,
+            2 => Self::PoolClosed,
+            3 => Self::Io,
+            4 => Self::Tls,
+            5 => Self::Protocol,
+            6 => Self::TooManyConnections,
+            _ => Self::None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ConnectionAnomalySnapshot {
+    kind: ConnectionAnomalyKind,
+    age_secs: Option<u64>,
+    total: u64,
+    pool_timeouts_total: u64,
+}
+
+static LAST_CONNECTION_ANOMALY_AT_SECS: AtomicU64 = AtomicU64::new(0);
+static LAST_CONNECTION_ANOMALY_KIND: AtomicU8 = AtomicU8::new(ConnectionAnomalyKind::None as u8);
+static CONNECTION_ANOMALIES_TOTAL: AtomicU64 = AtomicU64::new(0);
+static POOL_TIMEOUTS_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+fn unix_now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn detect_connection_anomaly(e: &sqlx::Error) -> Option<ConnectionAnomalyKind> {
+    match e {
+        sqlx::Error::PoolTimedOut => Some(ConnectionAnomalyKind::PoolTimedOut),
+        sqlx::Error::PoolClosed => Some(ConnectionAnomalyKind::PoolClosed),
+        sqlx::Error::Io(_) => Some(ConnectionAnomalyKind::Io),
+        sqlx::Error::Tls(_) => Some(ConnectionAnomalyKind::Tls),
+        sqlx::Error::Protocol(_) => Some(ConnectionAnomalyKind::Protocol),
+        _ => e
+            .as_database_error()
+            .and_then(|de| {
+                de.as_error()
+                    .downcast_ref::<sqlx::mysql::MySqlDatabaseError>()
+            })
+            .and_then(|me| {
+                if me.number() == 1040 {
+                    Some(ConnectionAnomalyKind::TooManyConnections)
+                } else {
+                    None
+                }
+            }),
+    }
+}
+
+fn record_connection_anomaly(kind: ConnectionAnomalyKind) {
+    LAST_CONNECTION_ANOMALY_AT_SECS.store(unix_now_secs(), Ordering::Relaxed);
+    LAST_CONNECTION_ANOMALY_KIND.store(kind as u8, Ordering::Relaxed);
+    CONNECTION_ANOMALIES_TOTAL.fetch_add(1, Ordering::Relaxed);
+    if matches!(kind, ConnectionAnomalyKind::PoolTimedOut) {
+        POOL_TIMEOUTS_TOTAL.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+fn connection_anomaly_snapshot() -> ConnectionAnomalySnapshot {
+    let last_at = LAST_CONNECTION_ANOMALY_AT_SECS.load(Ordering::Relaxed);
+    let age_secs = if last_at == 0 {
+        None
+    } else {
+        Some(unix_now_secs().saturating_sub(last_at))
+    };
+    ConnectionAnomalySnapshot {
+        kind: ConnectionAnomalyKind::from(LAST_CONNECTION_ANOMALY_KIND.load(Ordering::Relaxed)),
+        age_secs,
+        total: CONNECTION_ANOMALIES_TOTAL.load(Ordering::Relaxed),
+        pool_timeouts_total: POOL_TIMEOUTS_TOTAL.load(Ordering::Relaxed),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PoolHealthLevel {
+    Healthy,
+    HighUtilization,
+    Saturated,
+    Empty,
+}
+
+impl PoolHealthLevel {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Healthy => "healthy",
+            Self::HighUtilization => "high_utilization",
+            Self::Saturated => "saturated",
+            Self::Empty => "empty",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PoolHealthSnapshot {
+    pub configured_max_connections: Option<u32>,
+    pub size: u32,
+    pub active: u32,
+    pub idle: u32,
+    pub level: PoolHealthLevel,
+    pub since: std::time::Instant,
+    pub consecutive_observations: u32,
+    pub last_connection_anomaly_kind: &'static str,
+    pub last_connection_anomaly_age_secs: Option<u64>,
+    pub connection_anomalies_total: u64,
+    pub pool_timeouts_total: u64,
+    pub saturated_warning_emitted: bool,
+}
+
+impl PoolHealthSnapshot {
+    pub fn new(configured_max_connections: Option<u32>) -> Self {
+        Self {
+            configured_max_connections,
+            size: 0,
+            active: 0,
+            idle: 0,
+            level: PoolHealthLevel::Healthy,
+            since: std::time::Instant::now(),
+            consecutive_observations: 0,
+            last_connection_anomaly_kind: ConnectionAnomalyKind::None.as_str(),
+            last_connection_anomaly_age_secs: None,
+            connection_anomalies_total: 0,
+            pool_timeouts_total: 0,
+            saturated_warning_emitted: false,
+        }
+    }
+}
+
+fn classify_pool_health(
+    size: u32,
+    idle: u32,
+    configured_max_connections: Option<u32>,
+) -> PoolHealthLevel {
+    if size == 0 {
+        PoolHealthLevel::Empty
+    } else if idle == 0
+        && configured_max_connections
+            .map(|max| max > 0 && size >= max)
+            .unwrap_or(false)
+    {
+        PoolHealthLevel::Saturated
+    } else if idle == 0 || idle < size / 10 + 1 {
+        PoolHealthLevel::HighUtilization
+    } else {
+        PoolHealthLevel::Healthy
+    }
+}
+
+fn should_repeat_pool_log(consecutive_observations: u32) -> bool {
+    consecutive_observations.checked_rem(POOL_MONITOR_REPEAT_AFTER_TICKS) == Some(0)
+}
+
+fn should_emit_saturated_warning(state_duration_secs: u64, warning_emitted: bool) -> bool {
+    state_duration_secs >= POOL_SATURATED_LOG_DELAY_SECS && !warning_emitted
+}
+
+/// Spawn a background task that periodically logs pool utilization.
+/// Warns when idle connections drop below 10% of pool size.
+/// Stops automatically when the pool is closed.
+pub fn spawn_pool_monitor(
+    pool: MySqlPool,
+    configured_max_connections: Option<u32>,
+    health: Arc<std::sync::Mutex<PoolHealthSnapshot>>,
+    pool_name: &'static str,
+) {
+    ::tokio::spawn(async move {
+        let mut interval =
+            ::tokio::time::interval(std::time::Duration::from_secs(POOL_MONITOR_INTERVAL_SECS));
+        interval.tick().await; // skip immediate
+        loop {
+            interval.tick().await;
+            if pool.is_closed() {
+                tracing::debug!("pool monitor stopping — pool closed");
+                break;
+            }
+            let size = pool.size();
+            let idle = pool.num_idle();
+            let active = size.saturating_sub(idle as u32);
+            let level = classify_pool_health(size, idle as u32, configured_max_connections);
+            let anomaly = connection_anomaly_snapshot();
+
+            let mut guard = health.lock().unwrap();
+            let previous_level = guard.level;
+            let previous_since = guard.since;
+            let previous_saturated_warning_emitted = guard.saturated_warning_emitted;
+
+            if previous_level == level {
+                guard.consecutive_observations = guard.consecutive_observations.saturating_add(1);
+            } else {
+                guard.level = level;
+                guard.since = std::time::Instant::now();
+                guard.consecutive_observations = 1;
+                guard.saturated_warning_emitted = false;
+            }
+
+            guard.configured_max_connections = configured_max_connections;
+            guard.size = size;
+            guard.active = active;
+            guard.idle = idle as u32;
+            guard.last_connection_anomaly_kind = anomaly.kind.as_str();
+            guard.last_connection_anomaly_age_secs = anomaly.age_secs;
+            guard.connection_anomalies_total = anomaly.total;
+            guard.pool_timeouts_total = anomaly.pool_timeouts_total;
+
+            let recent_anomaly = anomaly
+                .age_secs
+                .map(|age| age <= POOL_ANOMALY_RECENT_WINDOW_SECS)
+                .unwrap_or(false);
+            let state_duration_secs = guard.since.elapsed().as_secs();
+
+            let should_log = match level {
+                PoolHealthLevel::Healthy => {
+                    previous_level != PoolHealthLevel::Healthy
+                        && (previous_level != PoolHealthLevel::Saturated
+                            || previous_saturated_warning_emitted)
+                }
+                PoolHealthLevel::Empty => {
+                    if recent_anomaly {
+                        previous_level != level
+                            || guard.consecutive_observations == 1
+                            || should_repeat_pool_log(guard.consecutive_observations)
+                    } else {
+                        previous_level != level
+                    }
+                }
+                PoolHealthLevel::Saturated => should_emit_saturated_warning(
+                    state_duration_secs,
+                    guard.saturated_warning_emitted,
+                ),
+                PoolHealthLevel::HighUtilization => {
+                    previous_level != level
+                        || guard.consecutive_observations == 1
+                        || should_repeat_pool_log(guard.consecutive_observations)
+                }
+            };
+
+            if !should_log {
+                continue;
+            }
+
+            let unhealthy_for_secs = previous_since.elapsed().as_secs();
+            match level {
+                PoolHealthLevel::Healthy => {
+                    tracing::info!(
+                        pool_name,
+                        previous_state = previous_level.as_str(),
+                        previous_state_duration_secs = unhealthy_for_secs,
+                        pool_size = size,
+                        pool_active = active,
+                        pool_idle = idle,
+                        configured_max_connections,
+                        "connection pool recovered"
+                    );
+                }
+                PoolHealthLevel::Empty => {
+                    if recent_anomaly {
+                        tracing::warn!(
+                            pool_name,
+                            pool_size = size,
+                            pool_active = active,
+                            pool_idle = idle,
+                            configured_max_connections,
+                            state = level.as_str(),
+                            state_duration_secs,
+                            consecutive_observations = guard.consecutive_observations,
+                            last_connection_anomaly_kind = anomaly.kind.as_str(),
+                            last_connection_anomaly_age_secs = anomaly.age_secs.unwrap_or_default(),
+                            connection_anomalies_total = anomaly.total,
+                            pool_timeouts_total = anomaly.pool_timeouts_total,
+                            "connection pool has no established connections after recent connectivity failures; existing connections may have been dropped or new ones cannot be established"
+                        );
+                    } else {
+                        tracing::info!(
+                            pool_name,
+                            pool_size = size,
+                            pool_active = active,
+                            pool_idle = idle,
+                            configured_max_connections,
+                            state = level.as_str(),
+                            state_duration_secs,
+                            consecutive_observations = guard.consecutive_observations,
+                            "connection pool currently has no established connections; this is expected when idle_timeout has drained the pool and no requests are using it"
+                        );
+                    }
+                }
+                PoolHealthLevel::Saturated => {
+                    tracing::warn!(
+                        pool_name,
+                        pool_size = size,
+                        pool_active = active,
+                        pool_idle = idle,
+                        configured_max_connections,
+                        state = level.as_str(),
+                        state_duration_secs,
+                        consecutive_observations = guard.consecutive_observations,
+                        "connection pool saturated — pool is at configured max and all established connections are busy"
+                    );
+                    guard.saturated_warning_emitted = true;
+                }
+                PoolHealthLevel::HighUtilization => {
+                    if idle == 0 {
+                        tracing::warn!(
+                            pool_name,
+                            pool_size = size,
+                            pool_active = active,
+                            pool_idle = idle,
+                            configured_max_connections,
+                            state = level.as_str(),
+                            state_duration_secs,
+                            consecutive_observations = guard.consecutive_observations,
+                            "connection pool has no idle connections; pool can still expand"
+                        );
+                    } else {
+                        tracing::warn!(
+                            pool_name,
+                            pool_size = size,
+                            pool_active = active,
+                            pool_idle = idle,
+                            configured_max_connections,
+                            state = level.as_str(),
+                            state_duration_secs,
+                            consecutive_observations = guard.consecutive_observations,
+                            "connection pool high utilization"
+                        );
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// Owned edit-log entry for async batched writes.
+#[derive(Clone)]
+pub struct OwnedEditLogEntry {
+    pub edit_id: String,
+    pub user_id: String,
+    pub operation: String,
+    pub memory_id: Option<String>,
+    pub payload: Option<String>,
+    pub reason: String,
+    pub snapshot_before: Option<String>,
+}
 
 /// Generate a UUID v7 (time-ordered) as a simple hex string.
 fn uuid7_id() -> String {
     uuid::Uuid::now_v7().simple().to_string()
 }
+
+// Workaround: MO#24001 — nullable_str / nullable_str_from_row imported from memoria_core.
 
 /// Sanitize a string for safe interpolation inside a SQL single-quoted literal.
 /// Escapes `'`, `\`, and strips NUL bytes.
@@ -23,12 +628,14 @@ fn uuid7_id() -> String {
 fn sanitize_sql_literal(s: &str) -> String {
     s.chars()
         .filter(|c| *c != '\0')
-        .map(|c| match c {
-            '\'' => ' ',
-            '\\' => ' ',
-            _ => c,
+        .fold(String::with_capacity(s.len()), |mut out, c| {
+            match c {
+                '\'' => out.push_str("''"),
+                '\\' => out.push_str("\\\\"),
+                _ => out.push(c),
+            }
+            out
         })
-        .collect()
 }
 
 /// Sanitize a string for use inside MATCH ... AGAINST('...' IN BOOLEAN MODE).
@@ -36,9 +643,12 @@ fn sanitize_sql_literal(s: &str) -> String {
 fn sanitize_fulltext_query(s: &str) -> String {
     s.chars()
         .filter(|c| *c != '\0')
-        .map(|c| match c {
-            '\'' | '\\' | '"' | '+' | '-' | '<' | '>' | '(' | ')' | '~' | '*' | '@' => ' ',
-            _ => c,
+        .map(|c| {
+            if c.is_alphanumeric() || c == '_' {
+                c
+            } else {
+                ' '
+            }
         })
         .collect::<String>()
         .split_whitespace()
@@ -88,6 +698,22 @@ pub struct SqlMemoryStore {
     pool: MySqlPool,
     embedding_dim: usize,
     instance_id: String,
+    database_url: Option<String>,
+    configured_max_connections: Option<u32>,
+    pool_health: Arc<std::sync::Mutex<PoolHealthSnapshot>>,
+    /// Cache: user_id → active table name (TTL 5s, invalidated on branch switch)
+    active_table_cache: moka::sync::Cache<String, String>,
+    /// Cache: (user_id, operation) → last_run Instant (avoids DB query for cooldown checks)
+    cooldown_cache: moka::sync::Cache<String, std::time::Instant>,
+    /// Cache: user_id → graph node count (TTL 2 min, shared across GraphStore instances)
+    node_count_cache: moka::sync::Cache<String, i64>,
+    /// Optional: route log_edit through async buffer instead of direct INSERT.
+    /// Shared across main store and background pool clones so a single clear drains all.
+    edit_log_tx: Arc<std::sync::RwLock<Option<tokio::sync::mpsc::Sender<OwnedEditLogEntry>>>>,
+    db_router: Option<Arc<DbRouter>>,
+    /// When Some, `t()` qualifies table names with this database prefix.
+    /// Enables a single global pool to serve queries for different per-user databases.
+    db_name: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -150,15 +776,147 @@ impl SqlMemoryStore {
             pool,
             embedding_dim,
             instance_id,
+            database_url: None,
+            configured_max_connections: None,
+            pool_health: Arc::new(std::sync::Mutex::new(PoolHealthSnapshot::new(None))),
+            // Short TTL: multi-instance deployments without sticky sessions could
+            // serve stale branch mappings after a branch switch on another instance.
+            // 5s keeps the hot-path benefit while limiting the inconsistency window.
+            active_table_cache: moka::sync::Cache::builder()
+                .max_capacity(10_000)
+                .time_to_live(std::time::Duration::from_secs(5))
+                .build(),
+            cooldown_cache: moka::sync::Cache::builder()
+                .max_capacity(1_000)
+                .time_to_live(std::time::Duration::from_secs(7200)) // max cooldown is 2h
+                .build(),
+            node_count_cache: moka::sync::Cache::builder()
+                .max_capacity(10_000)
+                .time_to_live(std::time::Duration::from_secs(120))
+                .build(),
+            edit_log_tx: Arc::new(std::sync::RwLock::new(None)),
+            db_router: None,
+            db_name: None,
         }
+    }
+
+    /// Set the edit-log channel sender (once, at startup).
+    pub fn set_edit_log_tx(&self, tx: tokio::sync::mpsc::Sender<OwnedEditLogEntry>) {
+        *self.edit_log_tx.write().unwrap() = Some(tx);
+    }
+
+    /// Clear the edit-log sender (shutdown drain). After this, log_edit falls back to direct INSERT.
+    pub fn clear_edit_log_tx(&self) {
+        *self.edit_log_tx.write().unwrap() = None;
     }
 
     pub fn pool(&self) -> &MySqlPool {
         &self.pool
     }
 
+    /// Acquire a connection from the pool.
+    ///
+    /// NOTE: due to rust-lang/rust#100013 (async_trait + sqlx Executor lifetime),
+    /// only use `conn()` in methods with ≤~18 queries. Routed stores must use
+    /// qualified table names via `self.t()` (or receive an already-qualified
+    /// `table` argument) instead of relying on session-level database switching.
+    #[allow(dead_code)]
+    async fn conn(&self) -> Result<sqlx::pool::PoolConnection<sqlx::MySql>, MemoriaError> {
+        self.pool.acquire().await.map_err(db_err)
+    }
+
+    #[allow(dead_code)]
+    async fn migration_pool(&self) -> Result<MySqlPool, MemoriaError> {
+        if self.db_name.is_some() {
+            let database_url = self.database_url.as_ref().ok_or_else(|| {
+                MemoriaError::Internal("routed store missing database_url".into())
+            })?;
+            return sqlx::mysql::MySqlPoolOptions::new()
+                .max_connections(1)
+                .min_connections(0)
+                .acquire_timeout(std::time::Duration::from_secs(10))
+                .connect(database_url)
+                .await
+                .map_err(db_err);
+        }
+        Ok(self.pool.clone())
+    }
+
+    pub fn db_name(&self) -> Option<&str> {
+        self.db_name.as_deref()
+    }
+
+    async fn current_schema_name(&self) -> Result<Cow<'_, str>, MemoriaError> {
+        if let Some(schema_name) = self.db_name.as_deref().or_else(|| {
+            self.database_url
+                .as_deref()
+                .and_then(parse_db_name_from_url)
+        }) {
+            return Ok(Cow::Borrowed(schema_name));
+        }
+        let schema_name = sqlx::query_scalar::<_, Option<String>>("SELECT DATABASE()")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(db_err)?
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| MemoriaError::Internal("store missing database name".into()))?;
+        Ok(Cow::Owned(schema_name))
+    }
+
+    pub fn set_db_name(&mut self, name: String) {
+        self.db_name = Some(name);
+    }
+
+    pub fn set_database_url(&mut self, url: String) {
+        self.database_url = Some(url);
+    }
+
+    /// Qualify a table name with the database prefix when `db_name` is set.
+    /// Returns bare table name for shared-DB stores, or `` `db`.table `` for per-user stores.
+    pub fn t(&self, table: &str) -> String {
+        if table.contains('.') || table.contains('`') {
+            return table.to_string();
+        }
+        match &self.db_name {
+            None => table.to_string(),
+            Some(db) => format!("`{}`.{}", db.replace('`', "``"), table),
+        }
+    }
+
+    pub fn set_db_router(&mut self, router: Arc<DbRouter>) {
+        self.db_router = Some(router);
+    }
+
+    pub fn db_router(&self) -> Option<Arc<DbRouter>> {
+        self.db_router.clone()
+    }
+
+    pub fn database_name(&self) -> Option<&str> {
+        self.db_name.as_deref().or_else(|| {
+            self.database_url
+                .as_deref()
+                .and_then(parse_db_name_from_url)
+        })
+    }
+
+    pub fn configured_max_connections(&self) -> Option<u32> {
+        self.configured_max_connections
+    }
+
+    pub fn pool_health_snapshot(&self) -> PoolHealthSnapshot {
+        self.pool_health.lock().unwrap().clone()
+    }
+
     pub fn graph_store(&self) -> crate::graph::GraphStore {
-        crate::graph::GraphStore::new(self.pool.clone(), self.embedding_dim)
+        let mut gs = crate::graph::GraphStore::with_node_count_cache(
+            self.pool.clone(),
+            self.embedding_dim,
+            self.node_count_cache.clone(),
+        );
+        if let Some(db) = &self.db_name {
+            gs.set_db_name(db.clone());
+        }
+        gs
     }
 
     pub async fn connect(
@@ -166,42 +924,208 @@ impl SqlMemoryStore {
         embedding_dim: usize,
         instance_id: String,
     ) -> Result<Self, MemoriaError> {
-        // Auto-create database if it doesn't exist
-        if let Some((base_url, db_name)) = database_url.rsplit_once('/') {
-            if !db_name.is_empty() {
+        const DB_MAX_CONNECTIONS_UPPER: u32 = 512;
+        let max_conns =
+            configured_max_connections("DB_MAX_CONNECTIONS", 64, DB_MAX_CONNECTIONS_UPPER);
+        Self::connect_with_pool_limit(
+            database_url,
+            embedding_dim,
+            instance_id,
+            max_conns,
+            true,
+            true,
+            "main_sql_store",
+        )
+        .await
+    }
+
+    pub async fn connect_shared(
+        database_url: &str,
+        embedding_dim: usize,
+        instance_id: String,
+    ) -> Result<Self, MemoriaError> {
+        const SHARED_DB_MAX_CONNECTIONS_UPPER: u32 = 128;
+        let max_conns = configured_max_connections(
+            "MEMORIA_SHARED_MAIN_POOL_MAX_CONNECTIONS",
+            12,
+            SHARED_DB_MAX_CONNECTIONS_UPPER,
+        );
+        Self::connect_with_pool_limit(
+            database_url,
+            embedding_dim,
+            instance_id,
+            max_conns,
+            true,
+            true,
+            "shared_sql_store",
+        )
+        .await
+    }
+
+    pub async fn connect_routed(
+        database_url: &str,
+        embedding_dim: usize,
+        instance_id: String,
+    ) -> Result<Self, MemoriaError> {
+        const ROUTED_DB_MAX_CONNECTIONS_UPPER: u32 = 64;
+        let max_conns = configured_max_connections(
+            "MEMORIA_ROUTED_DB_MAX_CONNECTIONS",
+            1,
+            ROUTED_DB_MAX_CONNECTIONS_UPPER,
+        );
+        Self::connect_with_pool_limit(
+            database_url,
+            embedding_dim,
+            instance_id,
+            max_conns,
+            false,
+            false,
+            "routed_sql_store",
+        )
+        .await
+    }
+
+    pub fn from_existing_pool(
+        pool: MySqlPool,
+        embedding_dim: usize,
+        instance_id: String,
+        database_url: Option<String>,
+        configured_max_connections: Option<u32>,
+        pool_name: &'static str,
+    ) -> Self {
+        let mut store = Self::new(pool.clone(), embedding_dim, instance_id);
+        store.database_url = database_url;
+        store.configured_max_connections = configured_max_connections;
+        {
+            let mut health = store.pool_health.lock().unwrap();
+            health.configured_max_connections = configured_max_connections;
+        }
+        spawn_pool_monitor(
+            pool,
+            configured_max_connections,
+            store.pool_health.clone(),
+            pool_name,
+        );
+        store
+    }
+
+    async fn connect_with_pool_limit(
+        database_url: &str,
+        embedding_dim: usize,
+        instance_id: String,
+        max_conns: u32,
+        log_info: bool,
+        ensure_database_exists: bool,
+        pool_name: &'static str,
+    ) -> Result<Self, MemoriaError> {
+        if ensure_database_exists {
+            // Auto-create database if it doesn't exist
+            if let Some((base_url, db_name, _suffix)) = split_database_url(database_url) {
                 let base_pool = sqlx::mysql::MySqlPoolOptions::new()
                     .max_connections(1)
                     .connect(base_url)
                     .await;
                 if let Ok(base_pool) = base_pool {
-                    let _ = sqlx::query(&format!("CREATE DATABASE IF NOT EXISTS {db_name}"))
-                        .execute(&base_pool)
-                        .await;
+                    let _ = sqlx::raw_sql(&format!(
+                        "CREATE DATABASE IF NOT EXISTS {}",
+                        quote_ident(db_name)
+                    ))
+                    .execute(&base_pool)
+                    .await;
                 }
             }
         }
-        const DB_MAX_CONNECTIONS_UPPER: u32 = 512;
-        let max_conns: u32 = std::env::var("DB_MAX_CONNECTIONS")
+        let max_lifetime_secs: u64 = std::env::var("DB_MAX_LIFETIME_SECS")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(32)
-            .clamp(1, DB_MAX_CONNECTIONS_UPPER);
+            .unwrap_or(3600);
         let pool = sqlx::mysql::MySqlPoolOptions::new()
             .max_connections(max_conns)
+            .max_lifetime(std::time::Duration::from_secs(max_lifetime_secs))
             .idle_timeout(std::time::Duration::from_secs(300))
             .acquire_timeout(std::time::Duration::from_secs(10))
             .connect(database_url)
             .await
             .map_err(db_err)?;
-        Ok(Self::new(pool, embedding_dim, instance_id))
+        if log_info {
+            tracing::info!(
+                max_connections = max_conns,
+                max_lifetime_secs = max_lifetime_secs,
+                "Main connection pool initialized"
+            );
+        }
+        Ok(Self::from_existing_pool(
+            pool,
+            embedding_dim,
+            instance_id,
+            Some(database_url.to_string()),
+            Some(max_conns),
+            pool_name,
+        ))
+    }
+
+    /// Create a small isolated pool for background tasks (DDL, maintenance).
+    /// Returns an error if no database_url was stored or if pool creation fails.
+    pub async fn spawn_background_store(
+        &self,
+        max_connections: u32,
+    ) -> Result<std::sync::Arc<Self>, MemoriaError> {
+        let url = self.database_url.as_deref().ok_or_else(|| {
+            MemoriaError::Internal("background pool requires database_url".into())
+        })?;
+        match sqlx::mysql::MySqlPoolOptions::new()
+            .max_connections(max_connections)
+            .max_lifetime(std::time::Duration::from_secs(3600))
+            .idle_timeout(std::time::Duration::from_secs(300))
+            .acquire_timeout(std::time::Duration::from_secs(30))
+            .connect(url)
+            .await
+        {
+            Ok(pool) => {
+                tracing::info!(
+                    max_connections = max_connections,
+                    "Background connection pool initialized"
+                );
+                let mut s = Self::new(pool, self.embedding_dim, self.instance_id.clone());
+                s.database_url = self.database_url.clone();
+                s.configured_max_connections = Some(max_connections);
+                {
+                    let mut health = s.pool_health.lock().unwrap();
+                    health.configured_max_connections = Some(max_connections);
+                }
+                // Share the same edit_log_tx Arc so clear_edit_log_tx drains all stores at once
+                s.edit_log_tx = self.edit_log_tx.clone();
+                s.db_router = self.db_router.clone();
+                Ok(std::sync::Arc::new(s))
+            }
+            Err(e) => Err(db_err(e)),
+        }
     }
 
     pub async fn migrate(&self) -> Result<(), MemoriaError> {
-        // mem_memories
+        self.migrate_user().await?;
+        self.migrate_shared().await?;
+        Ok(())
+    }
+
+    async fn bootstrap_user_schema(&self, pool: &MySqlPool) -> Result<(), MemoriaError> {
+        let memories_table = self.t("mem_memories");
+        let user_state_table = self.t("mem_user_state");
+        let branches_table = self.t("mem_branches");
+        let snapshots_table = self.t("mem_snapshots");
+        let cooldown_table = self.t("mem_governance_cooldown");
+        let entity_links_table = self.t("mem_entity_links");
+        let memories_stats_table = self.t("mem_memories_stats");
+        let edit_log_table = self.t("mem_edit_log");
+        let retrieval_feedback_table = self.t("mem_retrieval_feedback");
+        let retrieval_params_table = self.t("mem_user_retrieval_params");
+        let tool_usage_table = self.t("mem_tool_usage");
+        let api_call_log_table = self.t("mem_api_call_log");
         let sql = format!(
-            r#"CREATE TABLE IF NOT EXISTS mem_memories (
+            r#"CREATE TABLE IF NOT EXISTS {memories_table} (
                 memory_id       VARCHAR(64)  PRIMARY KEY,
                 user_id         VARCHAR(64)  NOT NULL,
+                author_id       VARCHAR(64)  DEFAULT NULL,
                 memory_type     VARCHAR(20)  NOT NULL,
                 content         TEXT         NOT NULL,
                 embedding       vecf32({dim}),
@@ -217,30 +1141,28 @@ impl SqlMemoryStore {
                 updated_at      DATETIME(6),
                 INDEX idx_user_active (user_id, is_active, memory_type),
                 INDEX idx_user_session (user_id, session_id),
+                INDEX idx_memories_user_observed (user_id, observed_at),
+                INDEX idx_author (author_id),
                 FULLTEXT INDEX ft_content (content) WITH PARSER ngram -- MO#23861: breaks on concurrent snapshot restore
             )"#,
+            memories_table = memories_table,
             dim = self.embedding_dim
         );
-        sqlx::query(&sql)
-            .execute(&self.pool)
-            .await
-            .map_err(db_err)?;
+        sqlx::query(&sql).execute(pool).await.map_err(db_err)?;
 
-        // mem_user_state — active branch per user
-        sqlx::query(
-            r#"CREATE TABLE IF NOT EXISTS mem_user_state (
+        sqlx::query(&format!(
+            r#"CREATE TABLE IF NOT EXISTS {user_state_table} (
                 user_id       VARCHAR(64)  PRIMARY KEY,
                 active_branch VARCHAR(100) NOT NULL DEFAULT 'main',
                 updated_at    DATETIME(6)
             )"#,
-        )
-        .execute(&self.pool)
+        ))
+        .execute(pool)
         .await
         .map_err(db_err)?;
 
-        // mem_branches — branch registry
-        sqlx::query(
-            r#"CREATE TABLE IF NOT EXISTS mem_branches (
+        sqlx::query(&format!(
+            r#"CREATE TABLE IF NOT EXISTS {branches_table} (
                 id          VARCHAR(64)  PRIMARY KEY,
                 user_id     VARCHAR(64)  NOT NULL,
                 name        VARCHAR(100) NOT NULL,
@@ -249,14 +1171,13 @@ impl SqlMemoryStore {
                 created_at  DATETIME(6)  NOT NULL,
                 INDEX idx_user_name (user_id, name)
             )"#,
-        )
-        .execute(&self.pool)
+        ))
+        .execute(pool)
         .await
         .map_err(db_err)?;
 
-        // mem_snapshots — user snapshot registry
-        sqlx::query(
-            r#"CREATE TABLE IF NOT EXISTS mem_snapshots (
+        sqlx::query(&format!(
+            r#"CREATE TABLE IF NOT EXISTS {snapshots_table} (
                 id             VARCHAR(64)  PRIMARY KEY,
                 user_id        VARCHAR(64)  NOT NULL,
                 name           VARCHAR(100) NOT NULL,
@@ -266,35 +1187,615 @@ impl SqlMemoryStore {
                 INDEX idx_user_snapshot_name (user_id, name, status),
                 INDEX idx_user_snapshot_internal (user_id, snapshot_name, status)
             )"#,
-        )
-        .execute(&self.pool)
+        ))
+        .execute(pool)
         .await
         .map_err(db_err)?;
 
-        // mem_governance_cooldown — per-user cooldown tracking
-        sqlx::query(
-            r#"CREATE TABLE IF NOT EXISTS mem_governance_cooldown (
+        sqlx::query(&format!(
+            r#"CREATE TABLE IF NOT EXISTS {cooldown_table} (
                 user_id     VARCHAR(64)  NOT NULL,
                 operation   VARCHAR(32)  NOT NULL,
                 last_run_at DATETIME(6)  NOT NULL,
                 PRIMARY KEY (user_id, operation)
             )"#,
+        ))
+        .execute(pool)
+        .await
+        .map_err(db_err)?;
+
+        sqlx::query(&format!(
+            r#"CREATE TABLE IF NOT EXISTS {entity_links_table} (
+                id          VARCHAR(64)  PRIMARY KEY,
+                user_id     VARCHAR(64)  NOT NULL,
+                memory_id   VARCHAR(64)  NOT NULL,
+                entity_name VARCHAR(200) NOT NULL,
+                entity_type VARCHAR(50)  NOT NULL DEFAULT 'concept',
+                source      VARCHAR(20)  NOT NULL DEFAULT 'manual',
+                created_at  DATETIME(6)  NOT NULL,
+                INDEX idx_user_memory (user_id, memory_id),
+                INDEX idx_user_entity (user_id, entity_name)
+            )"#,
+        ))
+        .execute(pool)
+        .await
+        .map_err(db_err)?;
+
+        sqlx::query(&format!(
+            r#"CREATE TABLE IF NOT EXISTS {memories_stats_table} (
+                memory_id        VARCHAR(64)  PRIMARY KEY,
+                access_count     INT          NOT NULL DEFAULT 0,
+                last_accessed_at DATETIME(6),
+                feedback_useful  INT          NOT NULL DEFAULT 0,
+                feedback_irrelevant INT       NOT NULL DEFAULT 0,
+                feedback_outdated INT         NOT NULL DEFAULT 0,
+                feedback_wrong   INT          NOT NULL DEFAULT 0,
+                last_feedback_at DATETIME(6)
+            )"#,
+        ))
+        .execute(pool)
+        .await
+        .map_err(db_err)?;
+
+        sqlx::query(&format!(
+            r#"CREATE TABLE IF NOT EXISTS {edit_log_table} (
+                edit_id         VARCHAR(64)  NOT NULL,
+                user_id         VARCHAR(64)  NOT NULL,
+                memory_id       VARCHAR(64)  DEFAULT NULL,
+                operation       VARCHAR(64)  NOT NULL,
+                payload         JSON         DEFAULT NULL,
+                reason          TEXT         DEFAULT NULL,
+                snapshot_before VARCHAR(64)  DEFAULT NULL,
+                created_at      DATETIME(6)  NOT NULL DEFAULT NOW(),
+                created_by      VARCHAR(64)  NOT NULL,
+                INDEX idx_user_time (user_id, created_at),
+                INDEX idx_memory_time (memory_id, created_at)
+            ) CLUSTER BY (created_at, user_id)"#,
+        ))
+        .execute(pool)
+        .await
+        .map_err(db_err)?;
+
+        sqlx::query(&format!(
+            r#"CREATE TABLE IF NOT EXISTS {retrieval_feedback_table} (
+                id          VARCHAR(64)  PRIMARY KEY,
+                user_id     VARCHAR(64)  NOT NULL,
+                memory_id   VARCHAR(64)  NOT NULL,
+                signal      VARCHAR(16)  NOT NULL,
+                context     TEXT         DEFAULT NULL,
+                created_at  DATETIME(6)  NOT NULL,
+                INDEX idx_feedback_user (user_id, created_at),
+                INDEX idx_feedback_memory (memory_id),
+                INDEX idx_feedback_memory_user (user_id, memory_id),
+                INDEX idx_feedback_created_at (created_at)
+            )"#,
+        ))
+        .execute(pool)
+        .await
+        .map_err(db_err)?;
+
+        sqlx::query(&format!(
+            r#"CREATE TABLE IF NOT EXISTS {retrieval_params_table} (
+                user_id              VARCHAR(64)  PRIMARY KEY,
+                feedback_weight      DOUBLE       NOT NULL DEFAULT 0.1,
+                temporal_decay_hours DOUBLE       NOT NULL DEFAULT 168.0,
+                confidence_weight    DOUBLE       NOT NULL DEFAULT 0.1,
+                updated_at           DATETIME(6)  NOT NULL
+            )"#,
+        ))
+        .execute(pool)
+        .await
+        .map_err(db_err)?;
+
+        sqlx::query(&format!(
+            r#"CREATE TABLE IF NOT EXISTS {tool_usage_table} (
+                user_id      VARCHAR(64)  NOT NULL,
+                tool_name    VARCHAR(128) NOT NULL,
+                last_used_at DATETIME(6)  NOT NULL,
+                PRIMARY KEY (user_id, tool_name)
+            )"#,
+        ))
+        .execute(pool)
+        .await
+        .map_err(db_err)?;
+
+        sqlx::query(&format!(
+            r#"CREATE TABLE IF NOT EXISTS {api_call_log_table} (
+                id              BIGINT       NOT NULL AUTO_INCREMENT,
+                user_id         VARCHAR(64)  NOT NULL,
+                method          VARCHAR(10)  NOT NULL DEFAULT '',
+                path            VARCHAR(256) NOT NULL,
+                status_code     SMALLINT     NOT NULL DEFAULT 0,
+                latency_ms      INT          NOT NULL DEFAULT 0,
+                called_at       DATETIME(6)  NOT NULL DEFAULT NOW(6),
+                rpc_success     TINYINT(1)   NOT NULL DEFAULT 1,
+                rpc_error_code  INT          NULL,
+                PRIMARY KEY (id),
+                INDEX idx_user_called (user_id, called_at)
+            )"#,
+        ))
+        .execute(pool)
+        .await
+        .map_err(db_err)?;
+
+        self.graph_store().migrate().await?;
+        Ok(())
+    }
+
+    async fn apply_user_compat_migrations(&self, pool: &MySqlPool) -> Result<(), MemoriaError> {
+        let schema_name = self.current_schema_name().await?;
+        let schema_name = schema_name.as_ref();
+        let memories_stats_table = self.t("mem_memories_stats");
+        let edit_log_table = self.t("mem_edit_log");
+        let memories_table = self.t("mem_memories");
+        let branches_table = self.t("mem_branches");
+        let api_call_log_table = self.t("mem_api_call_log");
+        let retrieval_feedback_table = self.t("mem_retrieval_feedback");
+        let graph_nodes_table = self.t("memory_graph_nodes");
+
+        let _ = sqlx::query(&format!(
+            "ALTER TABLE {memories_stats_table} ADD COLUMN feedback_useful INT NOT NULL DEFAULT 0"
+        ))
+        .execute(pool)
+        .await;
+        let _ = sqlx::query(&format!(
+            "ALTER TABLE {memories_stats_table} ADD COLUMN feedback_irrelevant INT NOT NULL DEFAULT 0"
+        ))
+        .execute(pool)
+        .await;
+        let _ = sqlx::query(&format!(
+            "ALTER TABLE {memories_stats_table} ADD COLUMN feedback_outdated INT NOT NULL DEFAULT 0"
+        ))
+        .execute(pool)
+        .await;
+        let _ = sqlx::query(&format!(
+            "ALTER TABLE {memories_stats_table} ADD COLUMN feedback_wrong INT NOT NULL DEFAULT 0"
+        ))
+        .execute(pool)
+        .await;
+        let _ = sqlx::query(&format!(
+            "ALTER TABLE {memories_stats_table} ADD COLUMN last_feedback_at DATETIME(6)"
+        ))
+        .execute(pool)
+        .await;
+
+        let _ = sqlx::query(&format!(
+            "ALTER TABLE {edit_log_table} ADD COLUMN memory_id VARCHAR(64) DEFAULT NULL"
+        ))
+        .execute(pool)
+        .await;
+        let _ = sqlx::query(&format!(
+            "ALTER TABLE {edit_log_table} ADD COLUMN payload JSON DEFAULT NULL"
+        ))
+        .execute(pool)
+        .await;
+
+        let _ = sqlx::query(&format!(
+            "ALTER TABLE {memories_table} ADD COLUMN extra_metadata JSON AFTER source_event_ids"
+        ))
+        .execute(pool)
+        .await;
+
+        let needs_upgrade = !info_schema_index_column_exists(
+            pool,
+            schema_name,
+            "mem_memories",
+            "idx_user_active",
+            "memory_type",
         )
-        .execute(&self.pool)
+        .await;
+        if needs_upgrade {
+            let _ = sqlx::query(&format!(
+                "ALTER TABLE {memories_table} DROP INDEX idx_user_active"
+            ))
+            .execute(pool)
+            .await;
+            let _ = sqlx::query(&format!(
+                "ALTER TABLE {memories_table} ADD INDEX idx_user_active (user_id, is_active, memory_type)"
+            ))
+            .execute(pool)
+            .await;
+        }
+
+        let has_table_name =
+            info_schema_column_exists(pool, schema_name, "mem_branches", "table_name").await;
+        if !has_table_name {
+            let _ = sqlx::query(&format!(
+                "ALTER TABLE {branches_table} ADD COLUMN table_name VARCHAR(100) NOT NULL DEFAULT ''"
+            ))
+            .execute(pool)
+            .await;
+        }
+
+        let has_id = info_schema_column_exists(pool, schema_name, "mem_branches", "id").await;
+        if !has_id {
+            let _ = sqlx::query(&format!("DROP TABLE IF EXISTS {branches_table}"))
+                .execute(pool)
+                .await;
+            sqlx::query(&format!(
+                r#"CREATE TABLE IF NOT EXISTS {branches_table} (
+                    id          VARCHAR(64)  PRIMARY KEY,
+                    user_id     VARCHAR(64)  NOT NULL,
+                    name        VARCHAR(100) NOT NULL,
+                    table_name  VARCHAR(100) NOT NULL,
+                    status      VARCHAR(20)  NOT NULL DEFAULT 'active',
+                    created_at  DATETIME(6)  NOT NULL,
+                    INDEX idx_user_name (user_id, name)
+                )"#
+            ))
+            .execute(pool)
+            .await
+            .map_err(db_err)?;
+        }
+
+        let has_method_col =
+            info_schema_column_exists(pool, schema_name, "mem_api_call_log", "method").await;
+        if !has_method_col {
+            let _ = sqlx::query(&format!(
+                "ALTER TABLE {api_call_log_table} ADD COLUMN method VARCHAR(10) NOT NULL DEFAULT ''"
+            ))
+            .execute(pool)
+            .await;
+        }
+
+        let add_rpc_success = sqlx::query(&format!(
+            "ALTER TABLE {api_call_log_table} ADD COLUMN rpc_success TINYINT(1) NOT NULL DEFAULT 1"
+        ))
+        .execute(pool)
+        .await;
+        if let Err(e) = add_rpc_success {
+            if !is_duplicate_column(&e) {
+                tracing::error!(
+                    error = %e,
+                    "Migration fatal: mem_api_call_log.rpc_success could not be added. \
+                     The call-log writer always inserts this column; without it ALL \
+                     call-log flushes will fail with 'unknown column', silently dropping \
+                     every /v1/* and /mcp monitoring entry. \
+                     Fix DB permissions or add the column manually, then restart."
+                );
+                return Err(db_err(e));
+            }
+        }
+
+        let add_rpc_error_code = sqlx::query(&format!(
+            "ALTER TABLE {api_call_log_table} ADD COLUMN rpc_error_code INT NULL"
+        ))
+        .execute(pool)
+        .await;
+        if let Err(e) = add_rpc_error_code {
+            if !is_duplicate_column(&e) {
+                tracing::error!(
+                    error = %e,
+                    "Migration fatal: mem_api_call_log.rpc_error_code could not be added. \
+                     The call-log writer always inserts this column; without it ALL \
+                     call-log flushes will fail with 'unknown column'. \
+                     Fix DB permissions or add the column manually, then restart."
+                );
+                return Err(db_err(e));
+            }
+        }
+
+        let has_feedback_memory_user_idx = info_schema_index_exists(
+            pool,
+            schema_name,
+            "mem_retrieval_feedback",
+            "idx_feedback_memory_user",
+        )
+        .await;
+        if !has_feedback_memory_user_idx {
+            let _ = sqlx::query(&format!(
+                "ALTER TABLE {retrieval_feedback_table} ADD INDEX idx_feedback_memory_user (user_id, memory_id)"
+            ))
+            .execute(pool)
+            .await;
+        }
+
+        let has_feedback_created_at_idx = info_schema_index_exists(
+            pool,
+            schema_name,
+            "mem_retrieval_feedback",
+            "idx_feedback_created_at",
+        )
+        .await;
+        if !has_feedback_created_at_idx {
+            let _ = sqlx::query(&format!(
+                "ALTER TABLE {retrieval_feedback_table} ADD INDEX idx_feedback_created_at (created_at)"
+            ))
+            .execute(pool)
+            .await;
+        }
+
+        let has_memories_user_observed_idx = info_schema_index_exists(
+            pool,
+            schema_name,
+            "mem_memories",
+            "idx_memories_user_observed",
+        )
+        .await;
+        if !has_memories_user_observed_idx {
+            let _ = sqlx::query(&format!(
+                "ALTER TABLE {memories_table} ADD INDEX idx_memories_user_observed (user_id, observed_at)"
+            ))
+            .execute(pool)
+            .await;
+        }
+
+        let has_user_active_created_idx =
+            info_schema_index_exists(pool, schema_name, "mem_memories", "idx_user_active_created")
+                .await;
+        if has_user_active_created_idx {
+            let _ = sqlx::query(&format!(
+                "ALTER TABLE {memories_table} DROP INDEX idx_user_active_created"
+            ))
+            .execute(pool)
+            .await;
+        }
+
+        let has_empty_superseded = query_has_rows(
+            pool,
+            &format!("SELECT COUNT(*) FROM {memories_table} WHERE superseded_by = ''"),
+        )
+        .await;
+        if has_empty_superseded {
+            for (tbl, col) in [
+                (memories_table.clone(), "superseded_by"),
+                (memories_table.clone(), "session_id"),
+                (graph_nodes_table.clone(), "superseded_by"),
+                (graph_nodes_table.clone(), "session_id"),
+                (graph_nodes_table.clone(), "memory_id"),
+                (graph_nodes_table.clone(), "entity_type"),
+                (graph_nodes_table.clone(), "conflicts_with"),
+                (graph_nodes_table.clone(), "conflict_resolution"),
+            ] {
+                if let Err(e) =
+                    sqlx::query(&format!("UPDATE {tbl} SET {col} = NULL WHERE {col} = ''"))
+                        .execute(pool)
+                        .await
+                {
+                    tracing::warn!(table = tbl, column = col, error = %e, "MO#24001 migration: failed to normalize empty strings");
+                }
+            }
+        }
+
+        let _ = sqlx::raw_sql(&format!(
+            "UPDATE {memories_table} SET embedding = NULL \
+             WHERE embedding IS NOT NULL AND vector_dims(embedding) = 0"
+        ))
+        .execute(pool)
+        .await;
+
+        // author_id column — tracks the real human author in group mode
+        // Guard with existence check so the migration is idempotent (safe to run
+        // on both fresh and already-migrated databases).
+        let has_author_id =
+            info_schema_column_exists(pool, schema_name, "mem_memories", "author_id").await;
+        if !has_author_id {
+            let add_col = sqlx::query(&format!(
+                "ALTER TABLE {memories_table} ADD COLUMN author_id VARCHAR(64) DEFAULT NULL"
+            ))
+            .execute(pool)
+            .await;
+            match &add_col {
+                Ok(_) => tracing::info!("migration: added author_id column to {memories_table}"),
+                Err(e) if is_duplicate_column(e) => tracing::info!(
+                    "migration: author_id column already exists in {memories_table}, skipping"
+                ),
+                Err(e) => tracing::error!(
+                    "migration: failed to add author_id to {memories_table}: {e}"
+                ),
+            }
+        } else {
+            tracing::debug!("migration: author_id column already exists in {memories_table}, skipping");
+        }
+        // Ensure the index exists even when the column already existed before this migration.
+        // This covers partially-migrated databases where `author_id` is present but
+        // `idx_author` is missing.
+        let has_memories_author_idx =
+            info_schema_index_exists(pool, schema_name, "mem_memories", "idx_author").await;
+        if !has_memories_author_idx {
+            let add_idx = sqlx::query(&format!(
+                "ALTER TABLE {memories_table} ADD INDEX idx_author (author_id)"
+            ))
+            .execute(pool)
+            .await;
+            if let Err(e) = add_idx {
+                tracing::warn!(
+                    "migration: failed to add idx_author on {memories_table} (may already exist): {e}"
+                );
+            }
+        }
+
+        // Also add author_id to any existing branch tables (which are separate physical tables).
+        // Branch tables are created as copies of mem_memories and need the same schema.
+        let branch_table_names: Vec<String> = match sqlx::query_scalar(&format!(
+            "SELECT table_name FROM {branches_table} WHERE status = 'active' AND table_name != ''"
+        ))
+        .fetch_all(pool)
+        .await
+        {
+            Ok(names) => names,
+            Err(e) => {
+                tracing::warn!(
+                    "migration: failed to load branch table names from {branches_table}, \
+                     skipping author_id/idx_author migration for branch tables: {e}"
+                );
+                vec![]
+            }
+        };
+
+        // Branch tables are physically separate copies of mem_memories; they need
+        // the same author_id column/index. ALTER TABLE here can race with a concurrent
+        // `data branch merge` (MatrixOne 20631 "def changed"), so we use a retrying
+        // helper instead of plain sqlx::query().execute().
+        for bt_raw in &branch_table_names {
+            // bt_raw is the raw table name (e.g. br_abc123_my_branch) without DB prefix.
+            // Validate against a strict allowlist before interpolating into DDL.
+            if !bt_raw.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                tracing::warn!(
+                    "migration: skipping branch table with invalid identifier '{bt_raw}'"
+                );
+                continue;
+            }
+            let bt_full = self.t(bt_raw);
+            let has_col =
+                info_schema_column_exists(pool, schema_name, bt_raw, "author_id").await;
+            if !has_col {
+                let r = exec_ddl_with_retry(
+                    pool,
+                    &format!("ALTER TABLE {bt_full} ADD COLUMN author_id VARCHAR(64) DEFAULT NULL"),
+                )
+                .await;
+                match r {
+                    Ok(_) => tracing::info!("migration: added author_id to branch table {bt_full}"),
+                    Err(e) => {
+                        // Propagate the error so that migrate_user() does NOT write the
+                        // schema version. The migration will be retried on the next startup
+                        // rather than being silently marked as complete.
+                        tracing::error!(
+                            "migration: failed to add author_id to branch table {bt_full}: {e}"
+                        );
+                        return Err(db_err(e));
+                    }
+                }
+            }
+            // Always ensure the index exists regardless of whether the column was just
+            // added or was already present (handles "column exists but index is missing"
+            // on older databases). The error is expected when the index already exists.
+            let has_idx =
+                info_schema_index_exists(pool, schema_name, bt_raw, "idx_author").await;
+            if !has_idx {
+                let _ = exec_ddl_with_retry(
+                    pool,
+                    &format!("ALTER TABLE {bt_full} ADD INDEX idx_author (author_id)"),
+                )
+                .await;
+            }
+        }
+
+        Ok(())
+    }
+
+    pub async fn migrate_user(&self) -> Result<(), MemoriaError> {
+        let pool = &self.pool;
+        let meta_table = self.t("mem_schema_meta");
+        let schema_name = self.current_schema_name().await?;
+        let schema_name = schema_name.as_ref();
+
+        let is_fresh = is_fresh_database(pool, schema_name).await?;
+        if is_fresh {
+            return self.migrate_user_fresh().await;
+        }
+
+        ensure_user_schema_meta_table(pool, &meta_table).await?;
+        if load_user_schema_version(pool, &meta_table).await? == Some(CURRENT_USER_SCHEMA_VERSION) {
+            return Ok(());
+        }
+
+        self.bootstrap_user_schema(pool).await?;
+        self.apply_user_compat_migrations(pool).await?;
+        store_user_schema_version(pool, &meta_table, CURRENT_USER_SCHEMA_VERSION).await?;
+        Ok(())
+    }
+
+    pub(crate) async fn migrate_user_fresh(&self) -> Result<(), MemoriaError> {
+        let pool = &self.pool;
+        let meta_table = self.t("mem_schema_meta");
+        self.bootstrap_user_schema(pool).await?;
+        ensure_user_schema_meta_table(pool, &meta_table).await?;
+        store_user_schema_version(pool, &meta_table, CURRENT_USER_SCHEMA_VERSION).await?;
+        Ok(())
+    }
+
+    pub async fn migrate_shared(&self) -> Result<(), MemoriaError> {
+        let schema_name = self.current_schema_name().await?;
+        let schema_name = schema_name.as_ref();
+        let mut conn = self.conn().await?;
+        sqlx::query(
+            r#"CREATE TABLE IF NOT EXISTS mem_user_registry (
+                user_id     VARCHAR(64)  PRIMARY KEY,
+                db_name     VARCHAR(128) NOT NULL UNIQUE,
+                status      VARCHAR(20)  NOT NULL DEFAULT 'active',
+                created_at  DATETIME(6)  NOT NULL,
+                updated_at  DATETIME(6)  NOT NULL,
+                INDEX idx_status (status)
+            )"#,
+        )
+        .execute(&mut *conn)
+        .await
+        .map_err(db_err)?;
+
+        sqlx::query(
+            r#"CREATE TABLE IF NOT EXISTS mem_api_keys (
+                key_id       VARCHAR(36)  NOT NULL,
+                user_id      VARCHAR(64)  NOT NULL,
+                group_id     VARCHAR(64)  DEFAULT NULL,
+                name         VARCHAR(100) NOT NULL,
+                key_hash     VARCHAR(64)  NOT NULL,
+                key_prefix   VARCHAR(12)  NOT NULL,
+                is_active    TINYINT(1)   NOT NULL DEFAULT 1,
+                created_at   DATETIME(6)  NOT NULL,
+                expires_at   DATETIME(6)  DEFAULT NULL,
+                last_used_at DATETIME(6)  DEFAULT NULL,
+                PRIMARY KEY (key_id),
+                KEY idx_key_hash (key_hash),
+                KEY idx_user_active (user_id, is_active),
+                KEY idx_group_active (group_id, is_active)
+            )"#,
+        )
+        .execute(&mut *conn)
+        .await
+        .map_err(db_err)?;
+
+        let key_group_col_exists: Option<i64> = sqlx::query_scalar(
+            "SELECT 1 FROM information_schema.columns \
+             WHERE table_schema = DATABASE() AND table_name = 'mem_api_keys' AND column_name = 'group_id' \
+             LIMIT 1",
+        )
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(db_err)?;
+        if key_group_col_exists.is_none() {
+            let alter = sqlx::query(
+                "ALTER TABLE mem_api_keys ADD COLUMN group_id VARCHAR(64) DEFAULT NULL",
+            );
+            if let Err(e) = alter.execute(&mut *conn).await {
+                if !is_duplicate_column(&e) {
+                    return Err(db_err(e));
+                }
+            }
+            let alter_idx = sqlx::query(
+                "ALTER TABLE mem_api_keys ADD KEY idx_group_active (group_id, is_active)",
+            );
+            let _ = alter_idx.execute(&mut *conn).await;
+        }
+
+        sqlx::query(
+            r#"CREATE TABLE IF NOT EXISTS mem_groups (
+                group_id      VARCHAR(64)  PRIMARY KEY,
+                group_name    VARCHAR(128) NOT NULL,
+                db_name       VARCHAR(128) NOT NULL UNIQUE,
+                owner_user_id VARCHAR(64)  NOT NULL,
+                status        VARCHAR(20)  NOT NULL DEFAULT 'active',
+                created_at    DATETIME(6)  NOT NULL,
+                updated_at    DATETIME(6)  NOT NULL,
+                KEY idx_group_status (status)
+            )"#,
+        )
+        .execute(&mut *conn)
         .await
         .map_err(db_err)?;
 
         sqlx::query(
             r#"CREATE TABLE IF NOT EXISTS mem_governance_runtime_state (
                 strategy_key       VARCHAR(128) NOT NULL,
-                task               VARCHAR(32)  NOT NULL,
+                `task`             VARCHAR(32)  NOT NULL,
                 failure_count      INT          NOT NULL DEFAULT 0,
                 circuit_open_until DATETIME(6)  DEFAULT NULL,
                 updated_at         DATETIME(6)  NOT NULL,
-                PRIMARY KEY (strategy_key, task)
+                PRIMARY KEY (strategy_key, `task`)
             )"#,
         )
-        .execute(&self.pool)
+        .execute(&mut *conn)
         .await
         .map_err(db_err)?;
 
@@ -309,7 +1810,7 @@ impl SqlMemoryStore {
                 created_by   VARCHAR(64)  NOT NULL
             )"#,
         )
-        .execute(&self.pool)
+        .execute(&mut *conn)
         .await
         .map_err(db_err)?;
 
@@ -333,7 +1834,7 @@ impl SqlMemoryStore {
                 INDEX idx_plugin_signer (signer)
             )"#,
         )
-        .execute(&self.pool)
+        .execute(&mut *conn)
         .await
         .map_err(db_err)?;
 
@@ -348,7 +1849,7 @@ impl SqlMemoryStore {
                 PRIMARY KEY (domain, binding_key)
             )"#,
         )
-        .execute(&self.pool)
+        .execute(&mut *conn)
         .await
         .map_err(db_err)?;
 
@@ -364,7 +1865,7 @@ impl SqlMemoryStore {
                 PRIMARY KEY (plugin_key, version)
             )"#,
         )
-        .execute(&self.pool)
+        .execute(&mut *conn)
         .await
         .map_err(db_err)?;
 
@@ -386,7 +1887,7 @@ impl SqlMemoryStore {
                 UNIQUE KEY uniq_binding_rule (domain, binding_key, subject_key, priority)
             )"#,
         )
-        .execute(&self.pool)
+        .execute(&mut *conn)
         .await
         .map_err(db_err)?;
 
@@ -407,112 +1908,10 @@ impl SqlMemoryStore {
                 INDEX idx_plugin_audit_lookup (domain, binding_key, plugin_key, created_at)
             )"#,
         )
-        .execute(&self.pool)
+        .execute(&mut *conn)
         .await
         .map_err(db_err)?;
 
-        // mem_entity_links — entity graph (lightweight, no graph tables)
-        sqlx::query(
-            r#"CREATE TABLE IF NOT EXISTS mem_entity_links (
-                id          VARCHAR(64)  PRIMARY KEY,
-                user_id     VARCHAR(64)  NOT NULL,
-                memory_id   VARCHAR(64)  NOT NULL,
-                entity_name VARCHAR(200) NOT NULL,
-                entity_type VARCHAR(50)  NOT NULL DEFAULT 'concept',
-                source      VARCHAR(20)  NOT NULL DEFAULT 'manual',
-                created_at  DATETIME(6)  NOT NULL,
-                INDEX idx_user_memory (user_id, memory_id),
-                INDEX idx_user_entity (user_id, entity_name)
-            )"#,
-        )
-        .execute(&self.pool)
-        .await
-        .map_err(db_err)?;
-
-        // mem_memories_stats — access_count + feedback tracking (separated to reduce write contention)
-        sqlx::query(
-            r#"CREATE TABLE IF NOT EXISTS mem_memories_stats (
-                memory_id        VARCHAR(64)  PRIMARY KEY,
-                access_count     INT          NOT NULL DEFAULT 0,
-                last_accessed_at DATETIME(6),
-                feedback_useful  INT          NOT NULL DEFAULT 0,
-                feedback_irrelevant INT       NOT NULL DEFAULT 0,
-                feedback_outdated INT         NOT NULL DEFAULT 0,
-                feedback_wrong   INT          NOT NULL DEFAULT 0,
-                last_feedback_at DATETIME(6)
-            )"#,
-        )
-        .execute(&self.pool)
-        .await
-        .map_err(db_err)?;
-
-        // Migration: add feedback columns to existing mem_memories_stats
-        let _ = sqlx::query(
-            "ALTER TABLE mem_memories_stats ADD COLUMN feedback_useful INT NOT NULL DEFAULT 0",
-        )
-        .execute(&self.pool)
-        .await;
-        let _ = sqlx::query(
-            "ALTER TABLE mem_memories_stats ADD COLUMN feedback_irrelevant INT NOT NULL DEFAULT 0",
-        )
-        .execute(&self.pool)
-        .await;
-        let _ = sqlx::query(
-            "ALTER TABLE mem_memories_stats ADD COLUMN feedback_outdated INT NOT NULL DEFAULT 0",
-        )
-        .execute(&self.pool)
-        .await;
-        let _ = sqlx::query(
-            "ALTER TABLE mem_memories_stats ADD COLUMN feedback_wrong INT NOT NULL DEFAULT 0",
-        )
-        .execute(&self.pool)
-        .await;
-        let _ = sqlx::query(
-            "ALTER TABLE mem_memories_stats ADD COLUMN last_feedback_at DATETIME(6)",
-        )
-        .execute(&self.pool)
-        .await;
-
-        // mem_edit_log — append-only audit log for inject/correct/purge/governance
-        sqlx::query(
-            r#"CREATE TABLE IF NOT EXISTS mem_edit_log (
-                edit_id         VARCHAR(64)  NOT NULL,
-                user_id         VARCHAR(64)  NOT NULL,
-                memory_id       VARCHAR(64)  DEFAULT NULL,
-                operation       VARCHAR(64)  NOT NULL,
-                payload         JSON         DEFAULT NULL,
-                reason          TEXT         DEFAULT NULL,
-                snapshot_before VARCHAR(64)  DEFAULT NULL,
-                created_at      DATETIME(6)  NOT NULL DEFAULT NOW(),
-                created_by      VARCHAR(64)  NOT NULL,
-                INDEX idx_user_time (user_id, created_at),
-                INDEX idx_memory_time (memory_id, created_at)
-            ) CLUSTER BY (created_at, user_id)"#,
-        )
-        .execute(&self.pool)
-        .await
-        .map_err(db_err)?;
-
-        // Migration: add memory_id column to existing mem_edit_log tables
-        let _ = sqlx::query(
-            "ALTER TABLE mem_edit_log ADD COLUMN memory_id VARCHAR(64) DEFAULT NULL",
-        )
-        .execute(&self.pool)
-        .await;
-
-        // Migration: add payload column to existing mem_edit_log tables
-        let _ = sqlx::query(
-            "ALTER TABLE mem_edit_log ADD COLUMN payload JSON DEFAULT NULL",
-        )
-        .execute(&self.pool)
-        .await;
-
-        // Graph tables
-        self.graph_store().migrate().await?;
-
-        // ── Distributed coordination tables ───────────────────────────────────
-
-        // mem_distributed_locks — DB-based mutual exclusion for multi-instance
         sqlx::query(
             r#"CREATE TABLE IF NOT EXISTS mem_distributed_locks (
                 lock_key    VARCHAR(128) PRIMARY KEY,
@@ -522,11 +1921,10 @@ impl SqlMemoryStore {
                 INDEX idx_lock_expires (expires_at)
             )"#,
         )
-        .execute(&self.pool)
+        .execute(&mut *conn)
         .await
         .map_err(db_err)?;
 
-        // mem_async_tasks — cross-instance async task tracking
         sqlx::query(
             r#"CREATE TABLE IF NOT EXISTS mem_async_tasks (
                 task_id     VARCHAR(64)  PRIMARY KEY,
@@ -540,107 +1938,112 @@ impl SqlMemoryStore {
                 INDEX idx_task_status (status, created_at)
             )"#,
         )
-        .execute(&self.pool)
+        .execute(&mut *conn)
         .await
         .map_err(db_err)?;
 
-        // Backfill user_id column for existing deployments (ignore if already exists)
-        let _ = sqlx::query(
-            "ALTER TABLE mem_async_tasks ADD COLUMN user_id VARCHAR(64) NOT NULL DEFAULT '' AFTER instance_id",
-        )
-        .execute(&self.pool)
-        .await;
-
-        // Backfill extra_metadata column for existing deployments (ignore if already exists)
-        let _ = sqlx::query(
-            "ALTER TABLE mem_memories ADD COLUMN extra_metadata JSON AFTER source_event_ids",
-        )
-        .execute(&self.pool)
-        .await;
-
-        // Migrate idx_user_active to include memory_type (idempotent)
-        let needs_upgrade: bool = sqlx::query_scalar(
-            "SELECT COUNT(*) = 0 FROM information_schema.statistics \
-             WHERE table_schema = DATABASE() AND table_name = 'mem_memories' \
-             AND index_name = 'idx_user_active' AND column_name = 'memory_type'",
-        )
-        .fetch_one(&self.pool)
-        .await
-        .unwrap_or(false);
-        if needs_upgrade {
-            let _ = sqlx::query("ALTER TABLE mem_memories DROP INDEX idx_user_active")
-                .execute(&self.pool)
-                .await;
-            let _ = sqlx::query("ALTER TABLE mem_memories ADD INDEX idx_user_active (user_id, is_active, memory_type)")
-                .execute(&self.pool).await;
-        }
-
-        // Migration: mem_branches may lack table_name column (old schema)
-        let has_table_name: bool = sqlx::query_scalar(
-            "SELECT COUNT(*) > 0 FROM information_schema.columns \
-             WHERE table_schema = DATABASE() AND table_name = 'mem_branches' AND column_name = 'table_name'"
-        ).fetch_one(&self.pool).await.unwrap_or(false);
-        if !has_table_name {
-            let _ = sqlx::query(
-                "ALTER TABLE mem_branches ADD COLUMN table_name VARCHAR(100) NOT NULL DEFAULT ''",
+        let has_async_task_user_id =
+            info_schema_column_exists(&self.pool, schema_name, "mem_async_tasks", "user_id").await;
+        if !has_async_task_user_id {
+            let add_async_task_user_id = sqlx::query(
+                "ALTER TABLE mem_async_tasks ADD COLUMN user_id VARCHAR(64) NOT NULL DEFAULT '' AFTER instance_id",
             )
-            .execute(&self.pool)
+            .execute(&mut *conn)
             .await;
+            if let Err(e) = add_async_task_user_id {
+                if !is_duplicate_column(&e) {
+                    tracing::warn!(
+                        error = %e,
+                        "shared migration: failed to add mem_async_tasks.user_id compatibility column"
+                    );
+                }
+            }
         }
 
-        // Migration: mem_branches old schema used branch_id/branch_db — recreate with new schema
-        let has_id: bool = sqlx::query_scalar(
-            "SELECT COUNT(*) > 0 FROM information_schema.columns \
-             WHERE table_schema = DATABASE() AND table_name = 'mem_branches' AND column_name = 'id'"
-        ).fetch_one(&self.pool).await.unwrap_or(false);
-        if !has_id {
-            let _ = sqlx::query("DROP TABLE IF EXISTS mem_branches")
-                .execute(&self.pool)
-                .await;
-            sqlx::query(
-                r#"CREATE TABLE IF NOT EXISTS mem_branches (
-                    id          VARCHAR(64)  PRIMARY KEY,
-                    user_id     VARCHAR(64)  NOT NULL,
-                    name        VARCHAR(100) NOT NULL,
-                    table_name  VARCHAR(100) NOT NULL,
-                    status      VARCHAR(20)  NOT NULL DEFAULT 'active',
-                    created_at  DATETIME(6)  NOT NULL,
-                    INDEX idx_user_name (user_id, name)
-                )"#,
-            )
-            .execute(&self.pool)
-            .await
-            .map_err(db_err)?;
-        }
-
-        // mem_retrieval_feedback — explicit relevance feedback for adaptive tuning
+        // ── Ops-metrics aggregate tables (push-based stats written by Memoria) ──
+        // Created here so they exist in both single-db and multi-db deployments.
+        // DbRouter::ensure_user_registry_table also creates these for multi-db
+        // startup — CREATE TABLE IF NOT EXISTS makes all paths idempotent.
         sqlx::query(
-            r#"CREATE TABLE IF NOT EXISTS mem_retrieval_feedback (
-                id          VARCHAR(64)  PRIMARY KEY,
-                user_id     VARCHAR(64)  NOT NULL,
-                memory_id   VARCHAR(64)  NOT NULL,
-                signal      VARCHAR(16)  NOT NULL,
-                context     TEXT         DEFAULT NULL,
-                created_at  DATETIME(6)  NOT NULL,
-                INDEX idx_feedback_user (user_id, created_at),
-                INDEX idx_feedback_memory (memory_id)
+            r#"CREATE TABLE IF NOT EXISTS srv_user_stats (
+                user_id          VARCHAR(64)  NOT NULL PRIMARY KEY,
+                total_memories   BIGINT       NOT NULL DEFAULT 0,
+                active_memories  BIGINT       NOT NULL DEFAULT 0,
+                inactive_memories BIGINT      NOT NULL DEFAULT 0,
+                total_entities   BIGINT       NOT NULL DEFAULT 0,
+                total_edits      BIGINT       NOT NULL DEFAULT 0,
+                updated_at       DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP
+                                 ON UPDATE CURRENT_TIMESTAMP
             )"#,
         )
-        .execute(&self.pool)
+        .execute(&mut *conn)
         .await
         .map_err(db_err)?;
 
-        // mem_user_retrieval_params — per-user adaptive scoring parameters
         sqlx::query(
-            r#"CREATE TABLE IF NOT EXISTS mem_user_retrieval_params (
-                user_id              VARCHAR(64)  PRIMARY KEY,
-                feedback_weight      DOUBLE       NOT NULL DEFAULT 0.1,
-                temporal_decay_hours DOUBLE       NOT NULL DEFAULT 168.0,
-                confidence_weight    DOUBLE       NOT NULL DEFAULT 0.1,
-                updated_at           DATETIME(6)  NOT NULL
+            r#"CREATE TABLE IF NOT EXISTS srv_user_metric_detail (
+                user_id  VARCHAR(64)  NOT NULL,
+                metric   VARCHAR(64)  NOT NULL,
+                dim_key  VARCHAR(128) NOT NULL,
+                cnt      BIGINT       NOT NULL DEFAULT 0,
+                PRIMARY KEY (user_id, metric, dim_key)
             )"#,
         )
-        .execute(&self.pool)
+        .execute(&mut *conn)
+        .await
+        .map_err(db_err)?;
+
+        sqlx::query(
+            r#"CREATE TABLE IF NOT EXISTS srv_daily_stats (
+                dt      DATE         NOT NULL,
+                metric  VARCHAR(64)  NOT NULL,
+                cnt     BIGINT       NOT NULL DEFAULT 0,
+                PRIMARY KEY (dt, metric)
+            )"#,
+        )
+        .execute(&mut *conn)
+        .await
+        .map_err(db_err)?;
+
+        sqlx::query(
+            r#"CREATE TABLE IF NOT EXISTS srv_user_api_stats (
+                user_id        VARCHAR(64) NOT NULL PRIMARY KEY,
+                total_calls    BIGINT      NOT NULL DEFAULT 0,
+                mcp_calls      BIGINT      NOT NULL DEFAULT 0,
+                mcp_errors     BIGINT      NOT NULL DEFAULT 0,
+                first_mcp_call DATETIME    DEFAULT NULL,
+                updated_at     DATETIME    NOT NULL DEFAULT CURRENT_TIMESTAMP
+                               ON UPDATE CURRENT_TIMESTAMP
+            )"#,
+        )
+        .execute(&mut *conn)
+        .await
+        .map_err(db_err)?;
+
+        sqlx::query(
+            r#"CREATE TABLE IF NOT EXISTS srv_mcp_path_stats (
+                path  VARCHAR(128) NOT NULL PRIMARY KEY,
+                cnt   BIGINT       NOT NULL DEFAULT 0
+            )"#,
+        )
+        .execute(&mut *conn)
+        .await
+        .map_err(db_err)?;
+
+        sqlx::query(
+            r#"CREATE TABLE IF NOT EXISTS mem_group_members (
+                group_id     VARCHAR(64)  NOT NULL,
+                user_id      VARCHAR(64)  NOT NULL,
+                display_name VARCHAR(128) DEFAULT NULL,
+                role         VARCHAR(20)  NOT NULL DEFAULT 'member',
+                is_active    TINYINT(1)   NOT NULL DEFAULT 1,
+                joined_at    DATETIME(6)  NOT NULL,
+                removed_at   DATETIME(6)  DEFAULT NULL,
+                PRIMARY KEY (group_id, user_id),
+                INDEX idx_user_active (user_id, is_active)
+            )"#,
+        )
+        .execute(&mut *conn)
         .await
         .map_err(db_err)?;
 
@@ -703,12 +2106,17 @@ impl SqlMemoryStore {
         &self,
         operation: &str,
     ) -> (Option<String>, Option<String>) {
-        let name = format!(
-            "mem_snap_pre_{}_{}",
-            operation,
-            &uuid::Uuid::new_v4().simple().to_string()[..8]
-        );
-        let sql = format!("CREATE SNAPSHOT {name} FOR ACCOUNT sys");
+        let snapshot_prefix = safety_snapshot_prefix(self.database_name());
+        let legacy_prefix = legacy_safety_snapshot_prefix(self.database_name());
+        let name = build_safety_snapshot_name(self.database_name(), operation);
+        debug_assert!(name.len() <= MAX_IDENTIFIER_LEN);
+        let sql = match self.database_name() {
+            Some(db_name) => format!(
+                "CREATE SNAPSHOT {name} FOR DATABASE {}",
+                quote_ident(db_name)
+            ),
+            None => format!("CREATE SNAPSHOT {name} FOR ACCOUNT"),
+        };
 
         // First attempt
         if sqlx::raw_sql(&sql).execute(&self.pool).await.is_ok() {
@@ -716,7 +2124,16 @@ impl SqlMemoryStore {
         }
 
         // Failed — try to reclaim space by dropping oldest pre_ snapshots
-        let dropped = self.cleanup_oldest_safety_snapshots(10).await;
+        let mut dropped = self
+            .cleanup_oldest_safety_snapshots(&snapshot_prefix, 10)
+            .await;
+        if let Some(legacy_prefix) = legacy_prefix.as_deref() {
+            if legacy_prefix != snapshot_prefix && dropped < 10 {
+                dropped += self
+                    .cleanup_oldest_safety_snapshots(legacy_prefix, 10 - dropped)
+                    .await;
+            }
+        }
         if dropped > 0 {
             // Retry
             if sqlx::raw_sql(&sql).execute(&self.pool).await.is_ok() {
@@ -737,11 +2154,12 @@ impl SqlMemoryStore {
     }
 
     /// Drop the N oldest `mem_snap_pre_` snapshots. Returns count dropped.
-    async fn cleanup_oldest_safety_snapshots(&self, n: usize) -> usize {
+    async fn cleanup_oldest_safety_snapshots(&self, prefix: &str, n: usize) -> usize {
         let rows: Vec<(String,)> = sqlx::query_as(
             "SELECT sname FROM mo_catalog.mo_snapshots \
-             WHERE prefix_eq(sname, 'mem_snap_pre_') ORDER BY ts ASC",
+             WHERE prefix_eq(sname, ?) ORDER BY ts ASC",
         )
+        .bind(prefix)
         .fetch_all(&self.pool)
         .await
         .unwrap_or_default();
@@ -770,64 +2188,310 @@ impl SqlMemoryStore {
         reason: &str,
         snapshot_before: Option<&str>,
     ) {
+        if let Some(tx) = self.edit_log_tx.read().unwrap().clone() {
+            let entry = OwnedEditLogEntry {
+                edit_id: uuid7_id(),
+                user_id: user_id.to_string(),
+                operation: operation.to_string(),
+                memory_id: memory_id.map(String::from),
+                payload: payload.map(String::from),
+                reason: reason.to_string(),
+                snapshot_before: snapshot_before.map(String::from),
+            };
+            match tx.try_send(entry) {
+                Ok(()) => return,
+                Err(tokio::sync::mpsc::error::TrySendError::Full(entry)) => {
+                    tracing::warn!(
+                        user_id = %entry.user_id,
+                        operation = %entry.operation,
+                        memory_id = ?entry.memory_id,
+                        "edit log async buffer full, dropping entry"
+                    );
+                    return;
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    // Channel closed (drain in progress) — fall through to direct INSERT
+                }
+            }
+        }
+        if let Some(router) = self.db_router.clone() {
+            match router.scope_store(user_id).await {
+                Ok(store) => {
+                    let _ = store
+                        .insert_edit_log_direct(
+                            user_id,
+                            operation,
+                            memory_id,
+                            payload,
+                            reason,
+                            snapshot_before,
+                        )
+                        .await;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        user_id,
+                        operation,
+                        error = %e,
+                        "failed to route edit log entry to user store"
+                    );
+                }
+            }
+            return;
+        }
+        let _ = self
+            .insert_edit_log_direct(
+                user_id,
+                operation,
+                memory_id,
+                payload,
+                reason,
+                snapshot_before,
+            )
+            .await;
+    }
+
+    async fn insert_edit_log_direct(
+        &self,
+        user_id: &str,
+        operation: &str,
+        memory_id: Option<&str>,
+        payload: Option<&str>,
+        reason: &str,
+        snapshot_before: Option<&str>,
+    ) -> Result<(), MemoriaError> {
+        let edit_log_table = self.t("mem_edit_log");
         let edit_id = uuid7_id();
-        let _ = sqlx::query(
-            "INSERT INTO mem_edit_log (edit_id, user_id, memory_id, operation, payload, reason, snapshot_before, created_by) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
-        )
-        .bind(&edit_id)
-        .bind(user_id)
-        .bind(memory_id)
-        .bind(operation)
-        .bind(payload)
-        .bind(reason)
-        .bind(snapshot_before)
-        .bind(user_id)
-        .execute(&self.pool)
-        .await;
+        // MO workaround (revert when fixed): MatrixOne prepared-statement bind of
+        // Option<String>::None to nullable columns inherits the previous row's value
+        // instead of SQL NULL in multi-row INSERTs. Use SQL NULL literal instead.
+        // TODO: revert to plain `(?, ?, ?, ?, ?, ?, ?, ?)` + direct bind once MO fixes this.
+        let mid_ph = if memory_id.is_some() { "?" } else { "NULL" };
+        let pay_ph = if payload.is_some() { "?" } else { "NULL" };
+        let snap_ph = if snapshot_before.is_some() {
+            "?"
+        } else {
+            "NULL"
+        };
+        let sql = format!(
+            "INSERT INTO {edit_log_table} (edit_id, user_id, memory_id, operation, payload, reason, snapshot_before, created_by) \
+             VALUES (?, ?, {mid_ph}, ?, {pay_ph}, ?, {snap_ph}, ?)"
+        );
+        let mut q = sqlx::query(&sql).bind(&edit_id).bind(user_id);
+        if let Some(v) = memory_id {
+            q = q.bind(v);
+        }
+        q = q.bind(operation);
+        if let Some(v) = payload {
+            q = q.bind(v);
+        }
+        q = q.bind(reason);
+        if let Some(v) = snapshot_before {
+            q = q.bind(v);
+        }
+        q.bind(user_id).execute(&self.pool).await.map_err(db_err)?;
+        Ok(())
+    }
+
+    /// Batch-insert edit log entries in a single multi-row INSERT.
+    pub async fn flush_edit_log_batch(
+        &self,
+        entries: &[OwnedEditLogEntry],
+    ) -> Result<(), MemoriaError> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        if let Some(router) = self.db_router.clone() {
+            let mut by_user: std::collections::HashMap<&str, Vec<OwnedEditLogEntry>> =
+                std::collections::HashMap::new();
+            for entry in entries {
+                by_user
+                    .entry(entry.user_id.as_str())
+                    .or_default()
+                    .push(entry.clone());
+            }
+            let mut first_err = None;
+            let mut flushed_any = false;
+            for (user_id, user_entries) in by_user {
+                match router.scope_store(user_id).await {
+                    Ok(store) => match store.flush_edit_log_batch_direct(&user_entries).await {
+                        Ok(()) => flushed_any = true,
+                        Err(err) => {
+                            tracing::warn!(
+                                user_id,
+                                error = %err,
+                                "failed to flush edit log batch for routed user"
+                            );
+                            if first_err.is_none() {
+                                first_err = Some(err);
+                            }
+                        }
+                    },
+                    Err(err) => {
+                        tracing::warn!(
+                            user_id,
+                            error = %err,
+                            "failed to resolve routed user store for edit log flush"
+                        );
+                        if first_err.is_none() {
+                            first_err = Some(err);
+                        }
+                    }
+                }
+            }
+            if let Some(err) = first_err {
+                if flushed_any {
+                    tracing::warn!(
+                        error = %err,
+                        "edit log batch flushed partially; some routed user entries were dropped"
+                    );
+                    return Ok(());
+                }
+                return Err(err);
+            }
+            return Ok(());
+        }
+        self.flush_edit_log_batch_direct(entries).await
+    }
+
+    async fn flush_edit_log_batch_direct(
+        &self,
+        entries: &[OwnedEditLogEntry],
+    ) -> Result<(), MemoriaError> {
+        let edit_log_table = self.t("mem_edit_log");
+        for chunk in entries.chunks(100) {
+            // MO workaround (revert when fixed): MatrixOne prepared-statement bind of
+            // Option<String>::None to nullable columns inherits the previous row's value
+            // instead of SQL NULL in multi-row INSERTs. Use SQL NULL literal instead.
+            // TODO: revert to plain `(?, ?, ?, ?, ?, ?, ?, ?)` + direct bind once MO fixes this.
+            let placeholders: Vec<String> = chunk
+                .iter()
+                .map(|e| {
+                    let mid = if e.memory_id.is_some() { "?" } else { "NULL" };
+                    let pay = if e.payload.is_some() { "?" } else { "NULL" };
+                    let snap = if e.snapshot_before.is_some() {
+                        "?"
+                    } else {
+                        "NULL"
+                    };
+                    format!("(?, ?, {mid}, ?, {pay}, ?, {snap}, ?)")
+                })
+                .collect();
+            let sql = format!(
+                "INSERT INTO {edit_log_table} (edit_id, user_id, memory_id, operation, payload, reason, snapshot_before, created_by) VALUES {}",
+                placeholders.join(", ")
+            );
+            let mut q = sqlx::query(&sql);
+            for e in chunk {
+                q = q.bind(&e.edit_id).bind(&e.user_id);
+                if let Some(v) = &e.memory_id {
+                    q = q.bind(v);
+                }
+                q = q.bind(&e.operation);
+                if let Some(v) = &e.payload {
+                    q = q.bind(v);
+                }
+                q = q.bind(&e.reason);
+                if let Some(v) = &e.snapshot_before {
+                    q = q.bind(v);
+                }
+                q = q.bind(&e.user_id);
+            }
+            q.execute(&self.pool).await.map_err(db_err)?;
+        }
+        Ok(())
     }
 
     // ── Branch state ──────────────────────────────────────────────────────────
 
-    /// Returns the active table name for a user: "mem_memories" or branch table name.
-    pub async fn active_table(&self, user_id: &str) -> Result<String, MemoriaError> {
-        let row = sqlx::query("SELECT active_branch FROM mem_user_state WHERE user_id = ?")
-            .bind(user_id)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(db_err)?;
+    /// Resolve the user ID for per-user state (active branch).
+    /// In group mode `ACTOR_USER_ID` carries the real human user;
+    /// in personal mode the task-local is unset and we fall back to `scope_id`.
+    fn state_user<'a>(&self, scope_id: &'a str) -> Cow<'a, str> {
+        ACTOR_USER_ID
+            .try_with(|id| Cow::Owned(id.clone()))
+            .unwrap_or(Cow::Borrowed(scope_id))
+    }
 
-        let branch = row
+    pub async fn active_branch_name(&self, user_id: &str) -> Result<String, MemoriaError> {
+        let state_user = self.state_user(user_id);
+        let user_state_table = self.t("mem_user_state");
+        let row = sqlx::query(&format!(
+            "SELECT active_branch FROM {user_state_table} WHERE user_id = ?"
+        ))
+        .bind(state_user.as_ref())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+
+        Ok(row
             .and_then(|r| r.try_get::<String, _>("active_branch").ok())
-            .unwrap_or_else(|| "main".to_string());
+            .filter(|branch| !branch.trim().is_empty())
+            .unwrap_or_else(|| "main".to_string()))
+    }
 
-        if branch == "main" {
-            return Ok("mem_memories".to_string());
+    /// Returns the active table name for a user: "mem_memories" or branch table name.
+    /// Uses `ACTOR_USER_ID` (task-local) for the per-user active-branch state,
+    /// and `user_id` (the scope) for looking up the branch's table in `mem_branches`.
+    pub async fn active_table(&self, user_id: &str) -> Result<String, MemoriaError> {
+        let cache_key = self.state_user(user_id);
+        if let Some(cached) = self.active_table_cache.get(cache_key.as_ref()) {
+            return Ok(cached);
         }
 
-        let branch_row = sqlx::query(
-            "SELECT table_name FROM mem_branches WHERE user_id = ? AND name = ? AND status = 'active'"
-        )
-        .bind(user_id).bind(&branch)
-        .fetch_optional(&self.pool).await.map_err(db_err)?;
+        let branch = self.active_branch_name(user_id).await?;
+
+        if branch == "main" {
+            let table = self.t("mem_memories");
+            self.active_table_cache
+                .insert(cache_key.into_owned(), table.clone());
+            return Ok(table);
+        }
+
+        // Branch metadata is owned by the scope (group_id or user_id), not the actor.
+        let branches_table = self.t("mem_branches");
+        let branch_row = sqlx::query(&format!(
+            "SELECT table_name FROM {branches_table} WHERE user_id = ? AND name = ? AND status = 'active'"
+        ))
+        .bind(user_id)
+        .bind(&branch)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
 
         match branch_row {
-            Some(r) => Ok(r.try_get::<String, _>("table_name").map_err(db_err)?),
+            Some(r) => {
+                let raw = r.try_get::<String, _>("table_name").map_err(db_err)?;
+                let table = self.t(&raw);
+                // Branch metadata found in mem_branches — trust it.
+                // information_schema.tables is NOT reliable for MatrixOne zero-copy branch
+                // tables created via `data branch create table`, so we skip the existence probe
+                // here. If the physical table is genuinely gone, the subsequent DML query will
+                // return a DB error that propagates to the caller.
+                self.active_table_cache
+                    .insert(cache_key.into_owned(), table.clone());
+                Ok(table)
+            }
             None => {
                 self.set_active_branch(user_id, "main").await?;
-                Ok("mem_memories".to_string())
+                let table = self.t("mem_memories");
+                self.active_table_cache
+                    .insert(cache_key.into_owned(), table.clone());
+                Ok(table)
             }
         }
     }
 
     pub async fn set_active_branch(&self, user_id: &str, branch: &str) -> Result<(), MemoriaError> {
+        let state_user = self.state_user(user_id);
+        let user_state_table = self.t("mem_user_state");
         let now = Utc::now().naive_utc();
-        sqlx::query(
-            r#"INSERT INTO mem_user_state (user_id, active_branch, updated_at)
+        sqlx::query(&format!(
+            r#"INSERT INTO {user_state_table} (user_id, active_branch, updated_at)
                VALUES (?, ?, ?)
                ON DUPLICATE KEY UPDATE active_branch = ?, updated_at = ?"#,
-        )
-        .bind(user_id)
+        ))
+        .bind(state_user.as_ref())
         .bind(branch)
         .bind(now)
         .bind(branch)
@@ -835,7 +2499,28 @@ impl SqlMemoryStore {
         .execute(&self.pool)
         .await
         .map_err(db_err)?;
+        self.active_table_cache.invalidate(state_user.as_ref());
         Ok(())
+    }
+
+    pub async fn invalidate_user_caches(&self, user_id: &str) {
+        // Invalidate both the scope key and (if different) the actor key
+        self.active_table_cache.invalidate(user_id);
+        let state_user = self.state_user(user_id);
+        if state_user.as_ref() != user_id {
+            self.active_table_cache.invalidate(state_user.as_ref());
+        }
+
+        // Keep rollback reconciliation scoped to the known per-user governance cooldowns.
+        for operation in [
+            "governance",
+            "consolidate",
+            "reflect",
+            "orphan_graph_cleanup",
+        ] {
+            let key = format!("{user_id}:{operation}");
+            self.cooldown_cache.invalidate(&key);
+        }
     }
 
     pub async fn register_branch(
@@ -844,12 +2529,13 @@ impl SqlMemoryStore {
         name: &str,
         table_name: &str,
     ) -> Result<(), MemoriaError> {
+        let branches_table = self.t("mem_branches");
         let now = Utc::now().naive_utc();
         let id = uuid::Uuid::new_v4().simple().to_string();
-        sqlx::query(
-            r#"INSERT INTO mem_branches (id, user_id, name, table_name, status, created_at)
-               VALUES (?, ?, ?, ?, 'active', ?)"#,
-        )
+        sqlx::query(&format!(
+            r#"INSERT INTO {branches_table} (id, user_id, name, table_name, status, created_at)
+               VALUES (?, ?, ?, ?, 'active', ?)"#
+        ))
         .bind(id)
         .bind(user_id)
         .bind(name)
@@ -862,22 +2548,36 @@ impl SqlMemoryStore {
     }
 
     pub async fn deregister_branch(&self, user_id: &str, name: &str) -> Result<(), MemoriaError> {
-        sqlx::query("UPDATE mem_branches SET status = 'deleted' WHERE user_id = ? AND name = ?")
-            .bind(user_id)
-            .bind(name)
-            .execute(&self.pool)
-            .await
-            .map_err(db_err)?;
+        let was_active = self.active_branch_name(user_id).await? == name;
+        let branches_table = self.t("mem_branches");
+        sqlx::query(&format!(
+            "UPDATE {branches_table} SET status = 'deleted' WHERE user_id = ? AND name = ?"
+        ))
+        .bind(user_id)
+        .bind(name)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        if was_active {
+            self.set_active_branch(user_id, "main").await?;
+        } else {
+            self.active_table_cache.invalidate(user_id);
+        }
         Ok(())
     }
 
     pub async fn list_branches(
         &self,
         user_id: &str,
-    ) -> Result<Vec<(String, String)>, MemoriaError> {
-        let rows = sqlx::query(
-            "SELECT name, table_name FROM mem_branches WHERE user_id = ? AND status = 'active'",
-        )
+    ) -> Result<Vec<(String, String, Option<chrono::NaiveDateTime>)>, MemoriaError> {
+        let branches_table = self.t("mem_branches");
+        // ORDER BY: NULL created_at (legacy rows) sort last via IS NULL trick;
+        // tie-break by name for stable output when timestamps collide.
+        let rows = sqlx::query(&format!(
+            "SELECT name, table_name, created_at FROM {branches_table} \
+             WHERE user_id = ? AND status = 'active' \
+             ORDER BY created_at IS NULL ASC, created_at ASC, name ASC"
+        ))
         .bind(user_id)
         .fetch_all(&self.pool)
         .await
@@ -887,6 +2587,10 @@ impl SqlMemoryStore {
                 Ok((
                     r.try_get::<String, _>("name").map_err(db_err)?,
                     r.try_get::<String, _>("table_name").map_err(db_err)?,
+                    // Lenient: a corrupt/NULL timestamp yields None rather than failing the
+                    // entire branch list. name and table_name are strict because they drive
+                    // branch operations.
+                    r.try_get::<Option<chrono::NaiveDateTime>, _>("created_at").ok().flatten(),
                 ))
             })
             .collect()
@@ -898,12 +2602,13 @@ impl SqlMemoryStore {
         name: &str,
         snapshot_name: &str,
     ) -> Result<(), MemoriaError> {
+        let snapshots_table = self.t("mem_snapshots");
         let now = Utc::now().naive_utc();
         let id = uuid::Uuid::new_v4().simple().to_string();
-        sqlx::query(
-            r#"INSERT INTO mem_snapshots (id, user_id, name, snapshot_name, status, created_at)
-               VALUES (?, ?, ?, ?, 'active', ?)"#,
-        )
+        sqlx::query(&format!(
+            r#"INSERT INTO {snapshots_table} (id, user_id, name, snapshot_name, status, created_at)
+               VALUES (?, ?, ?, ?, 'active', ?)"#
+        ))
         .bind(id)
         .bind(user_id)
         .bind(name)
@@ -920,12 +2625,13 @@ impl SqlMemoryStore {
         user_id: &str,
         name: &str,
     ) -> Result<Option<SnapshotRegistration>, MemoriaError> {
-        let row = sqlx::query(
+        let snapshots_table = self.t("mem_snapshots");
+        let row = sqlx::query(&format!(
             "SELECT name, snapshot_name, created_at \
-             FROM mem_snapshots \
+             FROM {snapshots_table} \
              WHERE user_id = ? AND name = ? AND status = 'active' \
-             ORDER BY created_at DESC LIMIT 1",
-        )
+             ORDER BY created_at DESC LIMIT 1"
+        ))
         .bind(user_id)
         .bind(name)
         .fetch_optional(&self.pool)
@@ -947,12 +2653,13 @@ impl SqlMemoryStore {
         user_id: &str,
         snapshot_name: &str,
     ) -> Result<Option<SnapshotRegistration>, MemoriaError> {
-        let row = sqlx::query(
+        let snapshots_table = self.t("mem_snapshots");
+        let row = sqlx::query(&format!(
             "SELECT name, snapshot_name, created_at \
-             FROM mem_snapshots \
+             FROM {snapshots_table} \
              WHERE user_id = ? AND snapshot_name = ? AND status = 'active' \
-             ORDER BY created_at DESC LIMIT 1",
-        )
+             ORDER BY created_at DESC LIMIT 1"
+        ))
         .bind(user_id)
         .bind(snapshot_name)
         .fetch_optional(&self.pool)
@@ -973,12 +2680,13 @@ impl SqlMemoryStore {
         &self,
         user_id: &str,
     ) -> Result<Vec<SnapshotRegistration>, MemoriaError> {
-        let rows = sqlx::query(
+        let snapshots_table = self.t("mem_snapshots");
+        let rows = sqlx::query(&format!(
             "SELECT name, snapshot_name, created_at \
-             FROM mem_snapshots \
+             FROM {snapshots_table} \
              WHERE user_id = ? AND status = 'active' \
-             ORDER BY created_at DESC",
-        )
+             ORDER BY created_at DESC"
+        ))
         .bind(user_id)
         .fetch_all(&self.pool)
         .await
@@ -996,9 +2704,10 @@ impl SqlMemoryStore {
     }
 
     pub async fn deregister_snapshot(&self, user_id: &str, name: &str) -> Result<(), MemoriaError> {
-        sqlx::query(
-            "UPDATE mem_snapshots SET status = 'deleted' WHERE user_id = ? AND name = ? AND status = 'active'",
-        )
+        let snapshots_table = self.t("mem_snapshots");
+        sqlx::query(&format!(
+            "UPDATE {snapshots_table} SET status = 'deleted' WHERE user_id = ? AND name = ? AND status = 'active'"
+        ))
         .bind(user_id)
         .bind(name)
         .execute(&self.pool)
@@ -1012,10 +2721,11 @@ impl SqlMemoryStore {
         user_id: &str,
         snapshot_name: &str,
     ) -> Result<(), MemoriaError> {
-        sqlx::query(
-            "UPDATE mem_snapshots SET status = 'deleted' \
-             WHERE user_id = ? AND snapshot_name = ? AND status = 'active'",
-        )
+        let snapshots_table = self.t("mem_snapshots");
+        sqlx::query(&format!(
+            "UPDATE {snapshots_table} SET status = 'deleted' \
+             WHERE user_id = ? AND snapshot_name = ? AND status = 'active'"
+        ))
         .bind(user_id)
         .bind(snapshot_name)
         .execute(&self.pool)
@@ -1027,19 +2737,32 @@ impl SqlMemoryStore {
     // ── Governance ────────────────────────────────────────────────────────────
 
     /// Check cooldown. Returns Some(remaining_seconds) if still in cooldown, None if can run.
+    /// Uses in-memory cache as fast path; falls back to DB for cross-instance consistency.
     pub async fn check_cooldown(
         &self,
         user_id: &str,
         operation: &str,
         cooldown_secs: i64,
     ) -> Result<Option<i64>, MemoriaError> {
-        let row = sqlx::query(
+        let mut conn = self.conn().await?;
+        let cooldown_table = self.t("mem_governance_cooldown");
+        let key = format!("{}:{}", user_id, operation);
+        if let Some(last_run) = self.cooldown_cache.get(&key) {
+            let elapsed = last_run.elapsed().as_secs() as i64;
+            if elapsed < cooldown_secs {
+                return Ok(Some(cooldown_secs - elapsed));
+            }
+            // Expired in memory — can run
+            return Ok(None);
+        }
+        // Cache miss — check DB (cold start or cross-instance)
+        let row = sqlx::query(&format!(
             "SELECT TIMESTAMPDIFF(SECOND, last_run_at, NOW()) as elapsed \
-             FROM mem_governance_cooldown WHERE user_id = ? AND operation = ?",
-        )
+             FROM {cooldown_table} WHERE user_id = ? AND operation = ?"
+        ))
         .bind(user_id)
         .bind(operation)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *conn)
         .await
         .map_err(db_err)?;
         match row {
@@ -1049,6 +2772,10 @@ impl SqlMemoryStore {
                 if elapsed >= cooldown_secs {
                     Ok(None)
                 } else {
+                    // Backfill cache from DB
+                    let age = std::time::Duration::from_secs(elapsed as u64);
+                    let approx_start = std::time::Instant::now() - age;
+                    self.cooldown_cache.insert(key, approx_start);
                     Ok(Some(cooldown_secs - elapsed))
                 }
             }
@@ -1056,18 +2783,22 @@ impl SqlMemoryStore {
     }
 
     pub async fn set_cooldown(&self, user_id: &str, operation: &str) -> Result<(), MemoriaError> {
+        let mut conn = self.conn().await?;
+        let cooldown_table = self.t("mem_governance_cooldown");
         let now = Utc::now().naive_utc();
-        sqlx::query(
-            "INSERT INTO mem_governance_cooldown (user_id, operation, last_run_at) \
-             VALUES (?, ?, ?) ON DUPLICATE KEY UPDATE last_run_at = ?",
-        )
+        sqlx::query(&format!(
+            "INSERT INTO {cooldown_table} (user_id, operation, last_run_at) \
+             VALUES (?, ?, ?) ON DUPLICATE KEY UPDATE last_run_at = ?"
+        ))
         .bind(user_id)
         .bind(operation)
         .bind(now)
         .bind(now)
-        .execute(&self.pool)
+        .execute(&mut *conn)
         .await
         .map_err(db_err)?;
+        let key = format!("{}:{}", user_id, operation);
+        self.cooldown_cache.insert(key, std::time::Instant::now());
         Ok(())
     }
 
@@ -1076,15 +2807,17 @@ impl SqlMemoryStore {
         strategy_key: &str,
         task: &str,
     ) -> Result<Option<i64>, MemoriaError> {
-        let row = sqlx::query(
+        let mut conn = self.conn().await?;
+        let runtime_table = self.t("mem_governance_runtime_state");
+        let row = sqlx::query(&format!(
             "SELECT TIMESTAMPDIFF(SECOND, NOW(), circuit_open_until) AS remaining \
-             FROM mem_governance_runtime_state \
-             WHERE strategy_key = ? AND task = ? \
-               AND circuit_open_until IS NOT NULL AND circuit_open_until > NOW()",
-        )
+             FROM {runtime_table} \
+             WHERE strategy_key = ? AND `task` = ? \
+                AND circuit_open_until IS NOT NULL AND circuit_open_until > NOW()"
+        ))
         .bind(strategy_key)
         .bind(task)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *conn)
         .await
         .map_err(db_err)?;
 
@@ -1098,13 +2831,15 @@ impl SqlMemoryStore {
         threshold: usize,
         cooldown_secs: i64,
     ) -> Result<Option<i64>, MemoriaError> {
+        let mut conn = self.conn().await?;
+        let runtime_table = self.t("mem_governance_runtime_state");
         let open_on_insert = threshold <= 1;
         let initial_failures = if open_on_insert { 0 } else { 1 };
-        sqlx::query(
-            "INSERT INTO mem_governance_runtime_state \
-                 (strategy_key, task, failure_count, circuit_open_until, updated_at) \
-             VALUES (?, ?, ?, CASE WHEN ? THEN DATE_ADD(NOW(), INTERVAL ? SECOND) ELSE NULL END, NOW()) \
-             ON DUPLICATE KEY UPDATE \
+        sqlx::query(&format!(
+            "INSERT INTO {runtime_table} \
+                 (strategy_key, `task`, failure_count, circuit_open_until, updated_at) \
+              VALUES (?, ?, ?, CASE WHEN ? THEN DATE_ADD(NOW(), INTERVAL ? SECOND) ELSE NULL END, NOW()) \
+              ON DUPLICATE KEY UPDATE \
                  failure_count = CASE \
                      WHEN circuit_open_until IS NOT NULL AND circuit_open_until > NOW() THEN failure_count \
                      WHEN failure_count + 1 >= ? THEN 0 \
@@ -1114,9 +2849,9 @@ impl SqlMemoryStore {
                      WHEN circuit_open_until IS NOT NULL AND circuit_open_until > NOW() THEN circuit_open_until \
                      WHEN failure_count + 1 >= ? THEN DATE_ADD(NOW(), INTERVAL ? SECOND) \
                      ELSE NULL \
-                 END, \
-                 updated_at = NOW()"
-        )
+                  END, \
+                  updated_at = NOW()"
+        ))
         .bind(strategy_key)
         .bind(task)
         .bind(initial_failures)
@@ -1125,7 +2860,7 @@ impl SqlMemoryStore {
         .bind(threshold as i64)
         .bind(threshold as i64)
         .bind(cooldown_secs)
-        .execute(&self.pool)
+        .execute(&mut *conn)
         .await
         .map_err(db_err)?;
 
@@ -1138,15 +2873,17 @@ impl SqlMemoryStore {
         strategy_key: &str,
         task: &str,
     ) -> Result<(), MemoriaError> {
-        sqlx::query(
-            "INSERT INTO mem_governance_runtime_state \
-                 (strategy_key, task, failure_count, circuit_open_until, updated_at) \
-             VALUES (?, ?, 0, NULL, NOW()) \
-             ON DUPLICATE KEY UPDATE failure_count = 0, circuit_open_until = NULL, updated_at = NOW()"
-        )
+        let mut conn = self.conn().await?;
+        let runtime_table = self.t("mem_governance_runtime_state");
+        sqlx::query(&format!(
+            "INSERT INTO {runtime_table} \
+                 (strategy_key, `task`, failure_count, circuit_open_until, updated_at) \
+              VALUES (?, ?, 0, NULL, NOW()) \
+              ON DUPLICATE KEY UPDATE failure_count = 0, circuit_open_until = NULL, updated_at = NOW()"
+        ))
         .bind(strategy_key)
         .bind(task)
-        .execute(&self.pool)
+        .execute(&mut *conn)
         .await
         .map_err(db_err)?;
         Ok(())
@@ -1155,6 +2892,7 @@ impl SqlMemoryStore {
     /// Quarantine memories whose effective confidence has decayed below threshold.
     /// effective_confidence = initial_confidence * EXP(-age_days / half_life)
     pub async fn quarantine_low_confidence(&self, user_id: &str) -> Result<i64, MemoriaError> {
+        let memories_table = self.t("mem_memories");
         const THRESHOLD: f64 = 0.2;
         const BATCH: i64 = 500;
         let tiers: &[(&str, f64)] = &[("T1", 365.0), ("T2", 180.0), ("T3", 60.0), ("T4", 30.0)];
@@ -1162,47 +2900,91 @@ impl SqlMemoryStore {
         for (tier, hl) in tiers {
             loop {
                 let res = sqlx::query(&format!(
-                    "UPDATE mem_memories SET is_active = 0, updated_at = NOW() \
+                    "DELETE FROM {memories_table} \
                      WHERE user_id = ? AND is_active = 1 AND trust_tier = ? \
-                       AND (initial_confidence * EXP(-TIMESTAMPDIFF(DAY, observed_at, NOW()) / {hl})) < {THRESHOLD} \
-                     LIMIT {BATCH}"
+                        AND (initial_confidence * EXP(-TIMESTAMPDIFF(DAY, observed_at, NOW()) / {hl})) < {THRESHOLD} \
+                      LIMIT {BATCH}"
                 ))
-                .bind(user_id).bind(tier)
-                .execute(&self.pool).await.map_err(db_err)?;
+                .bind(user_id)
+                .bind(tier)
+                .execute(&self.pool)
+                .await
+                .map_err(db_err)?;
                 let n = res.rows_affected() as i64;
                 total += n;
-                if n < BATCH { break; }
+                if n < BATCH {
+                    break;
+                }
             }
         }
         Ok(total)
     }
 
-    /// Delete inactive memories with very low initial_confidence (already superseded/stale).
+    /// Delete inactive memories that are not part of a version chain.
+    /// Rows with superseded_by are kept — they form the history trail
+    /// exposed by `/v1/memories/:id/history`.
+    /// A 24-hour grace period prevents deleting freshly-archived memories
+    /// (e.g. working memories archived by the same governance run).
     pub async fn cleanup_stale(&self, user_id: &str) -> Result<i64, MemoriaError> {
+        let memories_table = self.t("mem_memories");
         const BATCH: u64 = 500;
         let mut total = 0i64;
+        // Phase 1: delete plain inactive (no version chain, past grace period)
         loop {
-            let res = sqlx::query(
-                "DELETE FROM mem_memories WHERE user_id = ? AND is_active = 0 AND initial_confidence < 0.1 LIMIT 500"
-            )
-            .bind(user_id).execute(&self.pool).await.map_err(db_err)?;
+            let res = sqlx::query(&format!(
+                "DELETE FROM {memories_table} WHERE user_id = ? AND is_active = 0 \
+                  AND (superseded_by IS NULL OR superseded_by = '') \
+                  AND updated_at < DATE_SUB(NOW(), INTERVAL 24 HOUR) LIMIT 500"
+            ))
+            .bind(user_id)
+            .execute(&self.pool)
+            .await
+            .map_err(db_err)?;
             let n = res.rows_affected();
             total += n as i64;
-            if n < BATCH { break; }
+            if n < BATCH {
+                break;
+            }
+        }
+        // Phase 2: delete broken chain rows (superseded_by target no longer exists)
+        loop {
+            let ids: Vec<(String,)> = sqlx::query_as(&format!(
+                "SELECT old.memory_id FROM {memories_table} old \
+                 LEFT JOIN {memories_table} new ON old.superseded_by = new.memory_id \
+                 WHERE old.user_id = ? AND old.is_active = 0 \
+                   AND old.superseded_by IS NOT NULL AND old.superseded_by != '' \
+                   AND new.memory_id IS NULL LIMIT 500"
+            ))
+            .bind(user_id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(db_err)?;
+            if ids.is_empty() {
+                break;
+            }
+            let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let sql = format!("DELETE FROM {memories_table} WHERE memory_id IN ({placeholders})");
+            let mut q = sqlx::query(&sql);
+            for (id,) in &ids {
+                q = q.bind(id);
+            }
+            let r = q.execute(&self.pool).await.map_err(db_err)?;
+            total += r.rows_affected() as i64;
         }
         Ok(total)
     }
 
     /// Delete expired tool_result memories (TTL = 72h by default).
     pub async fn cleanup_tool_results(&self, ttl_hours: i64) -> Result<i64, MemoriaError> {
+        let memories_table = self.t("mem_memories");
         let mut total = 0i64;
         loop {
-            let res = sqlx::query(
-                "DELETE FROM mem_memories \
+            let res = sqlx::query(&format!(
+                "DELETE FROM {memories_table} \
                  WHERE memory_type = 'tool_result' \
                    AND TIMESTAMPDIFF(HOUR, observed_at, NOW()) > ? \
-                 LIMIT 5000",
-            )
+                 LIMIT 5000"
+            ))
             .bind(ttl_hours)
             .execute(&self.pool)
             .await
@@ -1222,14 +3004,15 @@ impl SqlMemoryStore {
         &self,
         stale_hours: i64,
     ) -> Result<Vec<(String, i64)>, MemoriaError> {
+        let memories_table = self.t("mem_memories");
         const BATCH: i64 = 500;
 
         // Collect affected users first (cheap DISTINCT query)
-        let users: Vec<(String,)> = sqlx::query_as(
-            "SELECT DISTINCT user_id FROM mem_memories \
+        let users: Vec<(String,)> = sqlx::query_as(&format!(
+            "SELECT DISTINCT user_id FROM {memories_table} \
              WHERE memory_type = 'working' AND is_active = 1 \
-               AND TIMESTAMPDIFF(HOUR, observed_at, NOW()) > ?",
-        )
+               AND TIMESTAMPDIFF(HOUR, observed_at, NOW()) > ?"
+        ))
         .bind(stale_hours)
         .fetch_all(&self.pool)
         .await
@@ -1244,12 +3027,12 @@ impl SqlMemoryStore {
         for (uid,) in users {
             let mut total = 0i64;
             loop {
-                let res = sqlx::query(
-                    "UPDATE mem_memories SET is_active = 0, updated_at = NOW() \
+                let res = sqlx::query(&format!(
+                    "UPDATE {memories_table} SET is_active = 0, updated_at = NOW() \
                      WHERE user_id = ? AND memory_type = 'working' AND is_active = 1 \
                        AND TIMESTAMPDIFF(HOUR, observed_at, NOW()) > ? \
-                     LIMIT 500",
-                )
+                     LIMIT 500"
+                ))
                 .bind(&uid)
                 .bind(stale_hours)
                 .execute(&self.pool)
@@ -1257,7 +3040,9 @@ impl SqlMemoryStore {
                 .map_err(db_err)?;
                 let n = res.rows_affected() as i64;
                 total += n;
-                if n < BATCH { break; }
+                if n < BATCH {
+                    break;
+                }
             }
             if total > 0 {
                 result.push((uid, total));
@@ -1276,13 +3061,18 @@ impl SqlMemoryStore {
         window_days: i64,
         max_pairs: usize,
     ) -> Result<i64, MemoriaError> {
-        let rows: Vec<(String, String, chrono::NaiveDateTime, String)> = sqlx::query_as(
+        let memories_table = self.t("mem_memories");
+        // Cap the fetch at 5,000 rows to bound memory usage: each embedding can be
+        // several KB, so loading unbounded rows risks exhausting heap for active users.
+        // The max_pairs limit already caps pair-comparison work in the loop below.
+        let rows: Vec<(String, String, chrono::NaiveDateTime, String)> = sqlx::query_as(&format!(
             "SELECT memory_id, memory_type, observed_at, embedding \
-             FROM mem_memories \
+             FROM {memories_table} \
              WHERE user_id = ? AND is_active = 1 AND embedding IS NOT NULL \
                AND TIMESTAMPDIFF(DAY, observed_at, NOW()) <= ? \
-             ORDER BY memory_type, observed_at DESC",
-        )
+               ORDER BY memory_type, observed_at DESC \
+             LIMIT 5000"
+        ))
         .bind(user_id)
         .bind(window_days)
         .fetch_all(&self.pool)
@@ -1319,7 +3109,7 @@ impl SqlMemoryStore {
             }
         }
 
-        let mut to_deactivate: Vec<(String, String)> = vec![];
+        let mut to_delete: Vec<String> = vec![];
         let mut deactivated_ids: std::collections::HashSet<String> = Default::default();
         let mut pairs_checked = 0;
 
@@ -1351,50 +3141,52 @@ impl SqlMemoryStore {
                         })
                         .sum();
                     if (dist_sq as f64) < l2_sq_threshold {
-                        let (older, newer) = if group[i].ts >= group[j].ts {
-                            (group[j].id.clone(), group[i].id.clone())
+                        let older = if group[i].ts >= group[j].ts {
+                            group[j].id.clone()
                         } else {
-                            (group[i].id.clone(), group[j].id.clone())
+                            group[i].id.clone()
                         };
                         deactivated_ids.insert(older.clone());
-                        to_deactivate.push((older, newer));
+                        to_delete.push(older);
                     }
                 }
             }
         }
 
-        if to_deactivate.is_empty() {
+        if to_delete.is_empty() {
             return Ok(0);
         }
 
-        // Batch UPDATE with CASE for superseded_by (preserves audit trail for all rows)
-        // Split into chunks of 100 to avoid SQL statement size limits
-        for chunk in to_deactivate.chunks(100) {
+        // Batch DELETE redundant memories (edit_log provides audit trail)
+        for chunk in to_delete.chunks(100) {
             let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-            let case_clauses = chunk.iter().map(|_| "WHEN ? THEN ?").collect::<Vec<_>>().join(" ");
-            let sql = format!(
-                "UPDATE mem_memories SET is_active = 0, superseded_by = CASE memory_id {case_clauses} END, updated_at = NOW() WHERE memory_id IN ({placeholders})"
-            );
+            let sql = format!("DELETE FROM {memories_table} WHERE memory_id IN ({placeholders})");
             let mut q = sqlx::query(&sql);
-            // Bind CASE values first
-            for (older, newer) in chunk {
-                q = q.bind(older).bind(newer);
-            }
-            // Then bind IN clause values
-            for (older, _) in chunk {
-                q = q.bind(older);
+            for id in chunk {
+                q = q.bind(id);
             }
             q.execute(&self.pool).await.map_err(db_err)?;
         }
 
-        Ok(to_deactivate.len() as i64)
+        Ok(to_delete.len() as i64)
     }
 
     /// Rebuild IVF vector index for a table. lists = max(1, rows/50), capped at 1024.
     pub async fn rebuild_vector_index(&self, table: &str) -> Result<i64, MemoriaError> {
         Self::validate_table_name(table)?;
+        let qualified_table = self.t(table);
+
+        // Workaround: MO PREPARE/EXECUTE stores None vecf32 as '[]' instead of NULL.
+        // Nullify zero-dimension vectors before counting/indexing.
+        let _ = sqlx::raw_sql(&format!(
+            "UPDATE {qualified_table} SET embedding = NULL \
+              WHERE embedding IS NOT NULL AND vector_dims(embedding) = 0"
+        ))
+        .execute(&self.pool)
+        .await;
+
         let row: (i64,) = sqlx::query_as(&format!(
-            "SELECT COUNT(*) FROM {table} WHERE embedding IS NOT NULL"
+            "SELECT COUNT(*) FROM {qualified_table} WHERE embedding IS NOT NULL"
         ))
         .fetch_one(&self.pool)
         .await
@@ -1406,17 +3198,17 @@ impl SqlMemoryStore {
         let idx_name = format!("{table}_embedding_ivf");
         // IVF hurts recall on small datasets; only build when rows >= 500
         if total_rows < 500 {
-            let _ = sqlx::raw_sql(&format!("DROP INDEX {idx_name} ON {table}"))
+            let _ = sqlx::raw_sql(&format!("DROP INDEX {idx_name} ON {qualified_table}"))
                 .execute(&self.pool)
                 .await;
             return Ok(total_rows);
         }
         let lists = (total_rows / 50).clamp(1, 1024);
-        let _ = sqlx::raw_sql(&format!("DROP INDEX {idx_name} ON {table}"))
+        let _ = sqlx::raw_sql(&format!("DROP INDEX {idx_name} ON {qualified_table}"))
             .execute(&self.pool)
             .await;
         sqlx::raw_sql(&format!(
-            "CREATE INDEX {idx_name} USING ivfflat ON {table}(embedding) LISTS {lists} op_type 'vector_l2_ops'"
+            "CREATE INDEX {idx_name} USING ivfflat ON {qualified_table}(embedding) LISTS {lists} op_type 'vector_l2_ops'"
         ))
         .execute(&self.pool).await.map_err(db_err)?;
         Ok(total_rows)
@@ -1428,22 +3220,23 @@ impl SqlMemoryStore {
         user_id: &str,
         older_than_hours: i64,
     ) -> Result<i64, MemoriaError> {
-        let ids: Vec<(String,)> = sqlx::query_as(
-            "SELECT inc.memory_id FROM mem_memories AS inc \
+        let memories_table = self.t("mem_memories");
+        let ids: Vec<(String,)> = sqlx::query_as(&format!(
+            "SELECT inc.memory_id FROM {memories_table} AS inc \
              WHERE inc.user_id = ? \
                AND inc.is_active = 1 \
                AND LOCATE('[session_summary:incremental]', inc.content) = 1 \
-               AND inc.session_id IS NOT NULL \
+               AND inc.session_id IS NOT NULL AND inc.session_id != '' \
                AND TIMESTAMPDIFF(HOUR, inc.observed_at, NOW()) > ? \
                AND NOT EXISTS ( \
-                   SELECT 1 FROM mem_memories AS full_s \
+                   SELECT 1 FROM {memories_table} AS full_s \
                    WHERE full_s.user_id = ? \
                      AND full_s.is_active = 1 \
                      AND full_s.session_id IS NULL \
                      AND LOCATE('[session_summary]', full_s.content) = 1 \
                      AND full_s.observed_at > inc.observed_at \
-               )",
-        )
+               )"
+        ))
         .bind(user_id)
         .bind(older_than_hours)
         .bind(user_id)
@@ -1457,7 +3250,7 @@ impl SqlMemoryStore {
         for chunk in ids.chunks(500) {
             let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
             let sql = format!(
-                "UPDATE mem_memories SET is_active = 0, updated_at = NOW() WHERE memory_id IN ({placeholders})"
+                "UPDATE {memories_table} SET is_active = 0, updated_at = NOW() WHERE memory_id IN ({placeholders})"
             );
             let mut q = sqlx::query(&sql);
             for (id,) in chunk {
@@ -1470,13 +3263,48 @@ impl SqlMemoryStore {
 
     /// Drop old milestone snapshots, keep last N (weekly).
     pub async fn cleanup_snapshots(&self, keep_last_n: usize) -> Result<i64, MemoriaError> {
-        let rows: Vec<(String,)> = sqlx::query_as(
-            "SELECT sname FROM mo_catalog.mo_snapshots \
-             WHERE prefix_eq(sname, 'mem_milestone_') ORDER BY ts DESC",
-        )
-        .fetch_all(&self.pool)
-        .await
-        .map_err(db_err)?;
+        let rows: Vec<(String,)> = if let Some(db_name) = self.database_name() {
+            let mut snapshots: Vec<(String, Option<NaiveDateTime>)> = sqlx::query("SHOW SNAPSHOTS")
+                .fetch_all(&self.pool)
+                .await
+                .map_err(db_err)?
+                .into_iter()
+                .filter_map(|row| {
+                    let snapshot_name: String = row.try_get("SNAPSHOT_NAME").ok()?;
+                    if !snapshot_name.starts_with("mem_milestone_") {
+                        return None;
+                    }
+                    let snapshot_db = row.try_get::<String, _>("DATABASE_NAME").ok()?;
+                    if snapshot_db != db_name {
+                        return None;
+                    }
+                    let timestamp =
+                        row.try_get::<NaiveDateTime, _>("TIMESTAMP")
+                            .ok()
+                            .or_else(|| {
+                                row.try_get::<String, _>("TIMESTAMP").ok().and_then(|s| {
+                                    NaiveDateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S%.f")
+                                        .ok()
+                                        .or_else(|| {
+                                            NaiveDateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S")
+                                                .ok()
+                                        })
+                                })
+                            });
+                    Some((snapshot_name, timestamp))
+                })
+                .collect();
+            snapshots.sort_by(|a, b| b.1.cmp(&a.1));
+            snapshots.into_iter().map(|(name, _)| (name,)).collect()
+        } else {
+            sqlx::query_as(
+                "SELECT sname FROM mo_catalog.mo_snapshots \
+                 WHERE prefix_eq(sname, 'mem_milestone_') ORDER BY ts DESC",
+            )
+            .fetch_all(&self.pool)
+            .await
+            .map_err(db_err)?
+        };
 
         if rows.len() <= keep_last_n {
             return Ok(0);
@@ -1493,23 +3321,27 @@ impl SqlMemoryStore {
 
     /// Clean up sandbox branches that were not properly dropped (weekly).
     pub async fn cleanup_orphan_branches(&self) -> Result<i64, MemoriaError> {
+        let Some(db_name) = self.database_name().map(str::to_string) else {
+            return Ok(0);
+        };
         let rows: Vec<(String,)> = sqlx::query_as(
             "SELECT table_name FROM information_schema.tables \
-             WHERE table_name LIKE 'memories_sandbox_%'",
+             WHERE table_schema = ? AND table_name LIKE 'memories_sandbox_%'",
         )
+        .bind(&db_name)
         .fetch_all(&self.pool)
         .await
         .map_err(db_err)?;
 
-        let (db_name,): (String,) = sqlx::query_as("SELECT DATABASE()")
-            .fetch_one(&self.pool)
-            .await
-            .map_err(db_err)?;
         let mut cleaned = 0i64;
         for (table_name,) in rows {
-            let _ = sqlx::raw_sql(&format!("DATA BRANCH DELETE TABLE {db_name}.{table_name}"))
-                .execute(&self.pool)
-                .await;
+            let _ = sqlx::raw_sql(&format!(
+                "DATA BRANCH DELETE TABLE {}.{}",
+                quote_ident(&db_name),
+                quote_ident(&table_name)
+            ))
+            .execute(&self.pool)
+            .await;
             cleaned += 1;
         }
         Ok(cleaned)
@@ -1520,10 +3352,11 @@ impl SqlMemoryStore {
         if memory_ids.is_empty() {
             return Ok(());
         }
+        let memory_stats_table = self.t("mem_memories_stats");
         for chunk in memory_ids.chunks(100) {
             let placeholders: Vec<&str> = chunk.iter().map(|_| "(?, 1, NOW())").collect();
             let sql = format!(
-                "INSERT INTO mem_memories_stats (memory_id, access_count, last_accessed_at) VALUES {} \
+                "INSERT INTO {memory_stats_table} (memory_id, access_count, last_accessed_at) VALUES {} \
                  ON DUPLICATE KEY UPDATE access_count = access_count + 1, last_accessed_at = NOW()",
                 placeholders.join(", ")
             );
@@ -1537,14 +3370,19 @@ impl SqlMemoryStore {
     }
 
     /// Batch bump with pre-aggregated counts (used by AccessCounter flush).
-    pub async fn bump_access_counts_batch(&self, batch: &[(String, u64)]) -> Result<(), MemoriaError> {
+    pub async fn bump_access_counts_batch(
+        &self,
+        batch: &[(String, u64)],
+    ) -> Result<(), MemoriaError> {
         if batch.is_empty() {
             return Ok(());
         }
+        let memory_stats_table = self.t("mem_memories_stats");
         for chunk in batch.chunks(100) {
-            let placeholders: Vec<String> = chunk.iter().map(|_| "(?, ?, NOW())".to_string()).collect();
+            let placeholders: Vec<String> =
+                chunk.iter().map(|_| "(?, ?, NOW())".to_string()).collect();
             let sql = format!(
-                "INSERT INTO mem_memories_stats (memory_id, access_count, last_accessed_at) VALUES {} \
+                "INSERT INTO {memory_stats_table} (memory_id, access_count, last_accessed_at) VALUES {} \
                  ON DUPLICATE KEY UPDATE access_count = access_count + VALUES(access_count), last_accessed_at = NOW()",
                 placeholders.join(", ")
             );
@@ -1559,79 +3397,171 @@ impl SqlMemoryStore {
 
     /// Reset access_count to 0 for all memories of a user.
     pub async fn reset_access_counts(&self, user_id: &str) -> Result<i64, MemoriaError> {
-        let result = sqlx::query(
-            "UPDATE mem_memories_stats s \
-             JOIN mem_memories m ON s.memory_id = m.memory_id \
+        let mut conn = self.conn().await?;
+        let stats_table = self.t("mem_memories_stats");
+        let memories_table = self.t("mem_memories");
+        let result = sqlx::query(&format!(
+            "UPDATE {stats_table} s \
+             JOIN {memories_table} m ON s.memory_id = m.memory_id \
              SET s.access_count = 0 \
-             WHERE m.user_id = ?",
-        )
+             WHERE m.user_id = ?"
+        ))
         .bind(user_id)
-        .execute(&self.pool)
+        .execute(&mut *conn)
         .await
         .map_err(db_err)?;
         Ok(result.rows_affected() as i64)
     }
 
     /// Clean up orphaned stats records (stats without corresponding memory).
+    /// Runs in batches of 1,000 to limit lock pressure.
+    ///
+    /// Multi-table DELETE with LIMIT is not valid MySQL/MatrixOne syntax, so we
+    /// first SELECT the orphan IDs and then DELETE them by primary key.
     pub async fn cleanup_orphan_stats(&self) -> Result<i64, MemoriaError> {
-        let result = sqlx::query(
-            "DELETE s FROM mem_memories_stats s \
-             LEFT JOIN mem_memories m ON s.memory_id = m.memory_id \
-             WHERE m.memory_id IS NULL",
-        )
-        .execute(&self.pool)
-        .await
-        .map_err(db_err)?;
-        Ok(result.rows_affected() as i64)
+        let stats_table = self.t("mem_memories_stats");
+        let memories_table = self.t("mem_memories");
+        const BATCH: i64 = 1000;
+        let mut total = 0i64;
+        loop {
+            // Step 1: collect up to BATCH orphan IDs.
+            let ids: Vec<(String,)> = sqlx::query_as(&format!(
+                "SELECT s.memory_id \
+                 FROM {stats_table} s \
+                 LEFT JOIN {memories_table} m ON s.memory_id = m.memory_id \
+                 WHERE m.memory_id IS NULL \
+                 LIMIT 1000"
+            ))
+            .fetch_all(&self.pool)
+            .await
+            .map_err(db_err)?;
+
+            if ids.is_empty() {
+                break;
+            }
+
+            // Step 2: delete by primary key (single-table, so LIMIT is allowed, though
+            // not needed here since the IN-list is already capped at BATCH).
+            let placeholders: Vec<&str> = ids.iter().map(|_| "?").collect();
+            let sql = format!(
+                "DELETE FROM {stats_table} WHERE memory_id IN ({})",
+                placeholders.join(", ")
+            );
+            let mut q = sqlx::query(&sql);
+            for (id,) in &ids {
+                q = q.bind(id);
+            }
+            let n = q.execute(&self.pool).await.map_err(db_err)?.rows_affected() as i64;
+            total += n;
+
+            if (ids.len() as i64) < BATCH {
+                break;
+            }
+        }
+        Ok(total)
     }
 
     /// Delete old audit-log rows older than `retain_days` days, in batches to avoid lock pressure.
     pub async fn cleanup_edit_log(&self, retain_days: i64) -> Result<i64, MemoriaError> {
+        let edit_log_table = self.t("mem_edit_log");
         const BATCH: u64 = 1000;
         let mut total = 0i64;
         loop {
-            let res = sqlx::query(
-                "DELETE FROM mem_edit_log WHERE created_at < DATE_SUB(NOW(), INTERVAL ? DAY) LIMIT 1000"
-            )
+            let res = sqlx::query(&format!(
+                "DELETE FROM {edit_log_table} WHERE created_at < DATE_SUB(NOW(), INTERVAL ? DAY) LIMIT 1000"
+            ))
             .bind(retain_days)
-            .execute(&self.pool).await.map_err(db_err)?;
+            .execute(&self.pool)
+            .await
+            .map_err(db_err)?;
             let n = res.rows_affected();
             total += n as i64;
-            if n < BATCH { break; }
+            if n < BATCH {
+                break;
+            }
         }
         Ok(total)
     }
 
     /// Delete old feedback rows older than `retain_days` days, in batches.
     pub async fn cleanup_feedback(&self, retain_days: i64) -> Result<i64, MemoriaError> {
+        let feedback_table = self.t("mem_retrieval_feedback");
         const BATCH: u64 = 1000;
         let mut total = 0i64;
         loop {
-            let res = sqlx::query(
-                "DELETE FROM mem_retrieval_feedback WHERE created_at < DATE_SUB(NOW(), INTERVAL ? DAY) LIMIT 1000"
-            )
+            let res = sqlx::query(&format!(
+                "DELETE FROM {feedback_table} WHERE created_at < DATE_SUB(NOW(), INTERVAL ? DAY) LIMIT 1000"
+            ))
             .bind(retain_days)
-            .execute(&self.pool).await.map_err(db_err)?;
+            .execute(&self.pool)
+            .await
+            .map_err(db_err)?;
             let n = res.rows_affected();
             total += n as i64;
-            if n < BATCH { break; }
+            if n < BATCH {
+                break;
+            }
         }
         Ok(total)
+    }
+
+    /// Remove orphaned rows from `mem_entity_links` whose memory_id
+    /// no longer exists or is inactive in `mem_memories`. Idempotent, batch-safe.
+    pub async fn cleanup_orphan_entity_links(&self) -> Result<i64, MemoriaError> {
+        let entity_links_table = self.t("mem_entity_links");
+        let memories_table = self.t("mem_memories");
+        // Two-step: find orphan IDs, then delete by primary key.
+        let orphans: Vec<(String,)> = sqlx::query_as(&format!(
+            "SELECT l.id FROM {entity_links_table} l \
+             LEFT JOIN {memories_table} m ON l.memory_id = m.memory_id AND m.is_active = 1 \
+             WHERE m.memory_id IS NULL \
+             LIMIT 5000"
+        ))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        if orphans.is_empty() {
+            return Ok(0);
+        }
+        let placeholders = orphans.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!("DELETE FROM {entity_links_table} WHERE id IN ({placeholders})");
+        let mut q = sqlx::query(&sql);
+        for (id,) in &orphans {
+            q = q.bind(id);
+        }
+        let r = q.execute(&self.pool).await.map_err(db_err)?;
+        Ok(r.rows_affected() as i64)
+    }
+
+    /// Delete entity links in `mem_entity_links` for a specific memory_id.
+    pub async fn delete_entity_links_by_memory_id(
+        &self,
+        memory_id: &str,
+    ) -> Result<i64, MemoriaError> {
+        let table = self.t("mem_entity_links");
+        let r = sqlx::query(&format!("DELETE FROM {table} WHERE memory_id = ?"))
+            .bind(memory_id)
+            .execute(&self.pool)
+            .await
+            .map_err(db_err)?;
+        Ok(r.rows_affected() as i64)
     }
 
     /// Validate table name to prevent SQL injection
     fn validate_table_name(table: &str) -> Result<(), MemoriaError> {
         // 只允许字母、数字、下划线
         if !table.chars().all(|c| c.is_alphanumeric() || c == '_') {
-            return Err(MemoriaError::Validation(
-                format!("Invalid table name: {}", table),
-            ));
+            return Err(MemoriaError::Validation(format!(
+                "Invalid table name: {}",
+                table
+            )));
         }
         // 白名单验证（允许 mem_ 和 test_ 前缀）
         if !table.starts_with("mem_") && !table.starts_with("test_") {
-            return Err(MemoriaError::Validation(
-                format!("Table not allowed for vector index operations: {}", table),
-            ));
+            return Err(MemoriaError::Validation(format!(
+                "Table not allowed for vector index operations: {}",
+                table
+            )));
         }
         Ok(())
     }
@@ -1642,16 +3572,19 @@ impl SqlMemoryStore {
         &self,
         table: &str,
     ) -> Result<(bool, i64, Option<i64>), MemoriaError> {
+        let mut conn = self.conn().await?;
         Self::validate_table_name(table)?;
+        let qualified_table = self.t(table);
+        let runtime_table = self.t("mem_governance_runtime_state");
         let key = format!("vector_index_rebuild:{table}");
 
         // 1. 检查冷却
-        let cooldown_check: Option<(chrono::NaiveDateTime,)> = sqlx::query_as(
-            "SELECT circuit_open_until FROM mem_governance_runtime_state \
-             WHERE strategy_key = ? AND task = 'rebuild'",
-        )
+        let cooldown_check: Option<(chrono::NaiveDateTime,)> = sqlx::query_as(&format!(
+            "SELECT circuit_open_until FROM {runtime_table} \
+             WHERE strategy_key = ? AND `task` = 'rebuild'"
+        ))
         .bind(&key)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *conn)
         .await
         .map_err(db_err)?;
 
@@ -1665,19 +3598,19 @@ impl SqlMemoryStore {
 
         // 2. 查当前行数（表可能不存在）
         let current_rows: i64 = sqlx::query_scalar(&format!(
-            "SELECT COUNT(*) FROM {table} WHERE embedding IS NOT NULL"
+            "SELECT COUNT(*) FROM {qualified_table} WHERE embedding IS NOT NULL"
         ))
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *conn)
         .await
         .unwrap_or_default(); // 表不存在或查询失败，返回0
 
         // 3. 查上次重建时的行数
-        let last_rows: Option<(i32,)> = sqlx::query_as(
-            "SELECT failure_count FROM mem_governance_runtime_state \
-             WHERE strategy_key = ? AND task = 'rebuild'",
-        )
+        let last_rows: Option<(i32,)> = sqlx::query_as(&format!(
+            "SELECT failure_count FROM {runtime_table} \
+             WHERE strategy_key = ? AND `task` = 'rebuild'"
+        ))
         .bind(&key)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *conn)
         .await
         .map_err(db_err)?;
 
@@ -1703,25 +3636,27 @@ impl SqlMemoryStore {
         row_count: i64,
         cooldown_secs: i64,
     ) -> Result<(), MemoriaError> {
+        let mut conn = self.conn().await?;
         Self::validate_table_name(table)?;
+        let runtime_table = self.t("mem_governance_runtime_state");
         let key = format!("vector_index_rebuild:{table}");
 
         let cooldown_until =
             chrono::Utc::now().naive_utc() + chrono::Duration::seconds(cooldown_secs);
 
-        sqlx::query(
-            "INSERT INTO mem_governance_runtime_state \
-             (strategy_key, task, failure_count, circuit_open_until, updated_at) \
+        sqlx::query(&format!(
+            "INSERT INTO {runtime_table} \
+             (strategy_key, `task`, failure_count, circuit_open_until, updated_at) \
              VALUES (?, 'rebuild', ?, ?, NOW()) \
              ON DUPLICATE KEY UPDATE \
              failure_count = VALUES(failure_count), \
              circuit_open_until = VALUES(circuit_open_until), \
-             updated_at = NOW()",
-        )
+             updated_at = NOW()"
+        ))
         .bind(&key)
         .bind(row_count as i32) // 复用 failure_count 字段存行数
         .bind(cooldown_until)
-        .execute(&self.pool)
+        .execute(&mut *conn)
         .await
         .map_err(db_err)?;
 
@@ -1734,16 +3669,18 @@ impl SqlMemoryStore {
         &self,
         table: &str,
     ) -> Result<i64, MemoriaError> {
+        let mut conn = self.conn().await?;
         Self::validate_table_name(table)?;
+        let runtime_table = self.t("mem_governance_runtime_state");
         let key = format!("vector_index_rebuild:{table}");
 
         // 查询当前失败次数（存储在 failure_count 的负数）
-        let current_failures: Option<(i32,)> = sqlx::query_as(
-            "SELECT failure_count FROM mem_governance_runtime_state \
-             WHERE strategy_key = ? AND task = 'rebuild' AND failure_count < 0",
-        )
+        let current_failures: Option<(i32,)> = sqlx::query_as(&format!(
+            "SELECT failure_count FROM {runtime_table} \
+             WHERE strategy_key = ? AND `task` = 'rebuild' AND failure_count < 0"
+        ))
         .bind(&key)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *conn)
         .await
         .map_err(db_err)?;
 
@@ -1751,27 +3688,27 @@ impl SqlMemoryStore {
 
         // 指数退避：5分钟 → 15分钟 → 1小时
         let cooldown_secs = match failure_count {
-            1 => 300,      // 5分钟
-            2 => 900,      // 15分钟
-            _ => 3600,     // 1小时
+            1 => 300,  // 5分钟
+            2 => 900,  // 15分钟
+            _ => 3600, // 1小时
         };
 
         let cooldown_until =
             chrono::Utc::now().naive_utc() + chrono::Duration::seconds(cooldown_secs);
 
-        sqlx::query(
-            "INSERT INTO mem_governance_runtime_state \
-             (strategy_key, task, failure_count, circuit_open_until, updated_at) \
+        sqlx::query(&format!(
+            "INSERT INTO {runtime_table} \
+             (strategy_key, `task`, failure_count, circuit_open_until, updated_at) \
              VALUES (?, 'rebuild', ?, ?, NOW()) \
              ON DUPLICATE KEY UPDATE \
              failure_count = VALUES(failure_count), \
              circuit_open_until = VALUES(circuit_open_until), \
-             updated_at = NOW()",
-        )
+             updated_at = NOW()"
+        ))
         .bind(&key)
         .bind(-(failure_count as i32)) // 负数表示失败次数
         .bind(cooldown_until)
-        .execute(&self.pool)
+        .execute(&mut *conn)
         .await
         .map_err(db_err)?;
 
@@ -1780,18 +3717,20 @@ impl SqlMemoryStore {
 
     /// Try to acquire a distributed lock (returns true if acquired).
     pub async fn try_acquire_lock(&self, key: &str, ttl_secs: i64) -> Result<bool, MemoriaError> {
+        let mut conn = self.conn().await?;
+        let lock_table = self.t("mem_distributed_locks");
         let expires_at = chrono::Utc::now().naive_utc() + chrono::Duration::seconds(ttl_secs);
-        
+
         // 方案1：尝试更新过期的锁
-        let update_result = sqlx::query(
-            "UPDATE mem_distributed_locks \
+        let update_result = sqlx::query(&format!(
+            "UPDATE {lock_table} \
              SET holder_id = ?, acquired_at = NOW(), expires_at = ? \
-             WHERE lock_key = ? AND expires_at < NOW()",
-        )
+             WHERE lock_key = ? AND expires_at < NOW()"
+        ))
         .bind(&self.instance_id)
         .bind(expires_at)
         .bind(key)
-        .execute(&self.pool)
+        .execute(&mut *conn)
         .await
         .map_err(db_err)?;
 
@@ -1800,14 +3739,14 @@ impl SqlMemoryStore {
         }
 
         // 方案2：尝试插入新锁
-        let insert_result = sqlx::query(
-            "INSERT INTO mem_distributed_locks (lock_key, holder_id, acquired_at, expires_at) \
-             VALUES (?, ?, NOW(), ?)",
-        )
+        let insert_result = sqlx::query(&format!(
+            "INSERT INTO {lock_table} (lock_key, holder_id, acquired_at, expires_at) \
+             VALUES (?, ?, NOW(), ?)"
+        ))
         .bind(key)
         .bind(&self.instance_id)
         .bind(expires_at)
-        .execute(&self.pool)
+        .execute(&mut *conn)
         .await;
 
         match insert_result {
@@ -1816,7 +3755,41 @@ impl SqlMemoryStore {
                 // 检查是否是主键冲突（锁已存在且未过期）
                 let err_str = e.to_string();
                 if err_str.contains("Duplicate") || err_str.contains("1062") {
-                    Ok(false)
+                    // MatrixOne SI: the row may have been deleted by another
+                    // connection but our snapshot still sees the old key.
+                    // A fresh SELECT forces a snapshot refresh.
+                    let exists: (i64,) = sqlx::query_as(&format!(
+                        "SELECT COUNT(*) FROM {lock_table} \
+                         WHERE lock_key = ? AND expires_at >= NOW()"
+                    ))
+                    .bind(key)
+                    .fetch_one(&mut *conn)
+                    .await
+                    .map_err(db_err)?;
+                    if exists.0 > 0 {
+                        return Ok(false); // lock genuinely held
+                    }
+                    // Row was deleted — retry INSERT with refreshed snapshot
+                    let retry = sqlx::query(&format!(
+                        "INSERT INTO {lock_table} (lock_key, holder_id, acquired_at, expires_at) \
+                         VALUES (?, ?, NOW(), ?)"
+                    ))
+                    .bind(key)
+                    .bind(&self.instance_id)
+                    .bind(expires_at)
+                    .execute(&mut *conn)
+                    .await;
+                    match retry {
+                        Ok(_) => Ok(true),
+                        Err(e2) => {
+                            let s = e2.to_string();
+                            if s.contains("Duplicate") || s.contains("1062") {
+                                Ok(false)
+                            } else {
+                                Err(db_err(e2))
+                            }
+                        }
+                    }
                 } else {
                     Err(db_err(e))
                 }
@@ -1826,12 +3799,14 @@ impl SqlMemoryStore {
 
     /// Release a distributed lock.
     pub async fn release_lock(&self, key: &str) -> Result<(), MemoriaError> {
-        sqlx::query(
-            "DELETE FROM mem_distributed_locks WHERE lock_key = ? AND holder_id = ?",
-        )
+        let mut conn = self.conn().await?;
+        let lock_table = self.t("mem_distributed_locks");
+        sqlx::query(&format!(
+            "DELETE FROM {lock_table} WHERE lock_key = ? AND holder_id = ?"
+        ))
         .bind(key)
         .bind(&self.instance_id)
-        .execute(&self.pool)
+        .execute(&mut *conn)
         .await
         .map_err(db_err)?;
         Ok(())
@@ -1848,6 +3823,10 @@ impl SqlMemoryStore {
         signal: &str,
         context: Option<&str>,
     ) -> Result<String, MemoriaError> {
+        let mut conn = self.conn().await?;
+        let memories_table = self.t("mem_memories");
+        let feedback_table = self.t("mem_retrieval_feedback");
+        let memory_stats_table = self.t("mem_memories_stats");
         // Validate signal
         if !["useful", "irrelevant", "outdated", "wrong"].contains(&signal) {
             return Err(MemoriaError::Validation(format!(
@@ -1856,12 +3835,12 @@ impl SqlMemoryStore {
             )));
         }
         // Verify memory exists and belongs to user
-        let count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM mem_memories WHERE memory_id = ? AND user_id = ?",
-        )
+        let count: i64 = sqlx::query_scalar(&format!(
+            "SELECT COUNT(*) FROM {memories_table} WHERE memory_id = ? AND user_id = ?"
+        ))
         .bind(memory_id)
         .bind(user_id)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *conn)
         .await
         .map_err(db_err)?;
         if count == 0 {
@@ -1872,16 +3851,16 @@ impl SqlMemoryStore {
         }
 
         let id = uuid::Uuid::new_v4().simple().to_string();
-        sqlx::query(
-            "INSERT INTO mem_retrieval_feedback (id, user_id, memory_id, signal, context, created_at) \
-             VALUES (?, ?, ?, ?, ?, NOW())",
-        )
+        sqlx::query(&format!(
+            "INSERT INTO {feedback_table} (id, user_id, memory_id, signal, context, created_at) \
+             VALUES (?, ?, ?, ?, ?, NOW())"
+        ))
         .bind(&id)
         .bind(user_id)
         .bind(memory_id)
         .bind(signal)
         .bind(context)
-        .execute(&self.pool)
+        .execute(&mut *conn)
         .await
         .map_err(db_err)?;
 
@@ -1894,12 +3873,12 @@ impl SqlMemoryStore {
             _ => unreachable!(),
         };
         let sql = format!(
-            "INSERT INTO mem_memories_stats (memory_id, {col}, last_feedback_at) VALUES (?, 1, NOW()) \
+            "INSERT INTO {memory_stats_table} (memory_id, {col}, last_feedback_at) VALUES (?, 1, NOW()) \
              ON DUPLICATE KEY UPDATE {col} = {col} + 1, last_feedback_at = NOW()"
         );
         sqlx::query(&sql)
             .bind(memory_id)
-            .execute(&self.pool)
+            .execute(&mut *conn)
             .await
             .map_err(db_err)?;
 
@@ -1907,19 +3886,17 @@ impl SqlMemoryStore {
     }
 
     /// Get feedback statistics for a user (for adaptive tuning analysis).
-    pub async fn get_feedback_stats(
-        &self,
-        user_id: &str,
-    ) -> Result<FeedbackStats, MemoriaError> {
-        let row: (i64, i64, i64, i64, i64) = sqlx::query_as(
+    pub async fn get_feedback_stats(&self, user_id: &str) -> Result<FeedbackStats, MemoriaError> {
+        let feedback_table = self.t("mem_retrieval_feedback");
+        let row: (i64, i64, i64, i64, i64) = sqlx::query_as(&format!(
             "SELECT \
                COUNT(*) as total, \
                COALESCE(SUM(CASE WHEN signal = 'useful' THEN 1 ELSE 0 END), 0) as useful, \
                COALESCE(SUM(CASE WHEN signal = 'irrelevant' THEN 1 ELSE 0 END), 0) as irrelevant, \
                COALESCE(SUM(CASE WHEN signal = 'outdated' THEN 1 ELSE 0 END), 0) as outdated, \
                COALESCE(SUM(CASE WHEN signal = 'wrong' THEN 1 ELSE 0 END), 0) as wrong \
-             FROM mem_retrieval_feedback WHERE user_id = ?",
-        )
+             FROM {feedback_table} WHERE user_id = ?"
+        ))
         .bind(user_id)
         .fetch_one(&self.pool)
         .await
@@ -1938,21 +3915,27 @@ impl SqlMemoryStore {
         &self,
         user_id: &str,
     ) -> Result<Vec<TierFeedback>, MemoriaError> {
-        let rows: Vec<(String, String, i64)> = sqlx::query_as(
+        let feedback_table = self.t("mem_retrieval_feedback");
+        let memories_table = self.t("mem_memories");
+        let rows: Vec<(String, String, i64)> = sqlx::query_as(&format!(
             "SELECT m.trust_tier, f.signal, COUNT(*) as cnt \
-             FROM mem_retrieval_feedback f \
-             JOIN mem_memories m ON f.memory_id = m.memory_id \
+             FROM {feedback_table} f \
+             JOIN {memories_table} m ON f.memory_id = m.memory_id \
              WHERE f.user_id = ? \
              GROUP BY m.trust_tier, f.signal \
-             ORDER BY m.trust_tier, f.signal",
-        )
+             ORDER BY m.trust_tier, f.signal"
+        ))
         .bind(user_id)
         .fetch_all(&self.pool)
         .await
         .map_err(db_err)?;
         Ok(rows
             .into_iter()
-            .map(|(tier, signal, count)| TierFeedback { tier, signal, count })
+            .map(|(tier, signal, count)| TierFeedback {
+                tier,
+                signal,
+                count,
+            })
             .collect())
     }
 
@@ -1961,10 +3944,11 @@ impl SqlMemoryStore {
         &self,
         memory_id: &str,
     ) -> Result<MemoryFeedback, MemoriaError> {
-        let row: Option<(i32, i32, i32, i32)> = sqlx::query_as(
+        let memory_stats_table = self.t("mem_memories_stats");
+        let row: Option<(i32, i32, i32, i32)> = sqlx::query_as(&format!(
             "SELECT feedback_useful, feedback_irrelevant, feedback_outdated, feedback_wrong \
-             FROM mem_memories_stats WHERE memory_id = ?",
-        )
+             FROM {memory_stats_table} WHERE memory_id = ?"
+        ))
         .bind(memory_id)
         .fetch_optional(&self.pool)
         .await
@@ -1985,6 +3969,7 @@ impl SqlMemoryStore {
         &self,
         memory_ids: &[String],
     ) -> Result<std::collections::HashMap<String, MemoryFeedback>, MemoriaError> {
+        let memory_stats_table = self.t("mem_memories_stats");
         let mut map = std::collections::HashMap::new();
         if memory_ids.is_empty() {
             return Ok(map);
@@ -1993,7 +3978,7 @@ impl SqlMemoryStore {
             let placeholders: Vec<&str> = chunk.iter().map(|_| "?").collect();
             let sql = format!(
                 "SELECT memory_id, feedback_useful, feedback_irrelevant, feedback_outdated, feedback_wrong \
-                 FROM mem_memories_stats WHERE memory_id IN ({})",
+                 FROM {memory_stats_table} WHERE memory_id IN ({})",
                 placeholders.join(", ")
             );
             let mut q = sqlx::query(&sql);
@@ -2007,7 +3992,15 @@ impl SqlMemoryStore {
                 let irrelevant: i32 = row.try_get("feedback_irrelevant").unwrap_or(0);
                 let outdated: i32 = row.try_get("feedback_outdated").unwrap_or(0);
                 let wrong: i32 = row.try_get("feedback_wrong").unwrap_or(0);
-                map.insert(id, MemoryFeedback { useful, irrelevant, outdated, wrong });
+                map.insert(
+                    id,
+                    MemoryFeedback {
+                        useful,
+                        irrelevant,
+                        outdated,
+                        wrong,
+                    },
+                );
             }
         }
         Ok(map)
@@ -2020,10 +4013,11 @@ impl SqlMemoryStore {
         &self,
         user_id: &str,
     ) -> Result<UserRetrievalParams, MemoriaError> {
-        let row = sqlx::query(
+        let retrieval_params_table = self.t("mem_user_retrieval_params");
+        let row = sqlx::query(&format!(
             "SELECT feedback_weight, temporal_decay_hours, confidence_weight \
-             FROM mem_user_retrieval_params WHERE user_id = ?",
-        )
+             FROM {retrieval_params_table} WHERE user_id = ?"
+        ))
         .bind(user_id)
         .fetch_optional(&self.pool)
         .await
@@ -2048,17 +4042,18 @@ impl SqlMemoryStore {
         &self,
         params: &UserRetrievalParams,
     ) -> Result<(), MemoriaError> {
+        let retrieval_params_table = self.t("mem_user_retrieval_params");
         let now = Utc::now().format("%Y-%m-%d %H:%M:%S%.6f").to_string();
-        sqlx::query(
-            "INSERT INTO mem_user_retrieval_params \
+        sqlx::query(&format!(
+            "INSERT INTO {retrieval_params_table} \
              (user_id, feedback_weight, temporal_decay_hours, confidence_weight, updated_at) \
              VALUES (?, ?, ?, ?, ?) \
              ON DUPLICATE KEY UPDATE \
              feedback_weight = VALUES(feedback_weight), \
              temporal_decay_hours = VALUES(temporal_decay_hours), \
              confidence_weight = VALUES(confidence_weight), \
-             updated_at = VALUES(updated_at)",
-        )
+             updated_at = VALUES(updated_at)"
+        ))
         .bind(&params.user_id)
         .bind(params.feedback_weight)
         .bind(params.temporal_decay_hours)
@@ -2075,6 +4070,7 @@ impl SqlMemoryStore {
         &self,
         memory_ids: &[String],
     ) -> Result<std::collections::HashMap<String, i32>, MemoriaError> {
+        let memory_stats_table = self.t("mem_memories_stats");
         let mut map = std::collections::HashMap::new();
         if memory_ids.is_empty() {
             return Ok(map);
@@ -2082,7 +4078,7 @@ impl SqlMemoryStore {
         for chunk in memory_ids.chunks(500) {
             let placeholders: Vec<&str> = chunk.iter().map(|_| "?").collect();
             let sql = format!(
-                "SELECT memory_id, access_count FROM mem_memories_stats WHERE memory_id IN ({})",
+                "SELECT memory_id, access_count FROM {memory_stats_table} WHERE memory_id IN ({})",
                 placeholders.join(", ")
             );
             let mut q = sqlx::query(&sql);
@@ -2099,40 +4095,231 @@ impl SqlMemoryStore {
         Ok(map)
     }
 
+    /// Combined fetch of access_count + feedback in a single query (replaces
+    /// separate get_access_counts + get_feedback_batch calls).
+    pub async fn get_stats_batch(
+        &self,
+        memory_ids: &[String],
+    ) -> Result<
+        (
+            std::collections::HashMap<String, i32>,
+            std::collections::HashMap<String, MemoryFeedback>,
+        ),
+        MemoriaError,
+    > {
+        let memory_stats_table = self.t("mem_memories_stats");
+        let mut ac_map = std::collections::HashMap::new();
+        let mut fb_map = std::collections::HashMap::new();
+        if memory_ids.is_empty() {
+            return Ok((ac_map, fb_map));
+        }
+        for chunk in memory_ids.chunks(500) {
+            let placeholders: Vec<&str> = chunk.iter().map(|_| "?").collect();
+            let sql = format!(
+                "SELECT memory_id, access_count, \
+                 feedback_useful, feedback_irrelevant, feedback_outdated, feedback_wrong \
+                 FROM {memory_stats_table} WHERE memory_id IN ({})",
+                placeholders.join(", ")
+            );
+            let mut q = sqlx::query(&sql);
+            for id in chunk {
+                q = q.bind(id);
+            }
+            let rows = q.fetch_all(&self.pool).await.map_err(db_err)?;
+            for row in &rows {
+                let id: String = row.try_get("memory_id").map_err(db_err)?;
+                let count: i32 = row.try_get("access_count").unwrap_or(0);
+                ac_map.insert(id.clone(), count);
+                fb_map.insert(
+                    id,
+                    MemoryFeedback {
+                        useful: row.try_get("feedback_useful").unwrap_or(0),
+                        irrelevant: row.try_get("feedback_irrelevant").unwrap_or(0),
+                        outdated: row.try_get("feedback_outdated").unwrap_or(0),
+                        wrong: row.try_get("feedback_wrong").unwrap_or(0),
+                    },
+                );
+            }
+        }
+        Ok((ac_map, fb_map))
+    }
+
     /// Detect pollution: high supersede ratio in recent changes (threshold=0.3).
     pub async fn detect_pollution(
         &self,
         user_id: &str,
         since_hours: i64,
     ) -> Result<bool, MemoriaError> {
-        let row: (i64, i64) = sqlx::query_as(
+        let mut conn = self.conn().await?;
+        let memories_table = self.t("mem_memories");
+        let row: (i64, Option<i64>) = sqlx::query_as(&format!(
             "SELECT COUNT(*) as total_changes, \
-             SUM(CASE WHEN superseded_by IS NOT NULL THEN 1 ELSE 0 END) as supersedes \
-             FROM mem_memories \
-             WHERE user_id = ? AND updated_at >= DATE_SUB(NOW(), INTERVAL ? HOUR)",
-        )
+             SUM(CASE WHEN superseded_by IS NOT NULL AND superseded_by != '' THEN 1 ELSE 0 END) as supersedes \
+             FROM {memories_table} \
+             WHERE user_id = ? AND updated_at >= DATE_SUB(NOW(), INTERVAL ? HOUR)"
+        ))
         .bind(user_id)
         .bind(since_hours)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *conn)
         .await
         .map_err(db_err)?;
         let (total, supersedes) = row;
         if total == 0 {
             return Ok(false);
         }
-        Ok(supersedes as f64 / total as f64 > 0.3)
+        Ok(supersedes.unwrap_or(0) as f64 / total as f64 > 0.3)
+    }
+
+    /// Hygiene diagnostics: orphan counts and stale data that governance can clean.
+    pub async fn health_hygiene(&self, user_id: &str) -> Result<serde_json::Value, MemoriaError> {
+        let mut conn = self.conn().await?;
+        let memories_table = self.t("mem_memories");
+        let memory_entity_links_table = self.t("mem_memory_entity_links");
+        let entity_links_table = self.t("mem_entity_links");
+        let graph_nodes_table = self.t("memory_graph_nodes");
+        let (inactive,): (i64,) = sqlx::query_as(&format!(
+            "SELECT COUNT(*) FROM {memories_table} WHERE user_id = ? AND is_active = 0 \
+             AND (superseded_by IS NULL OR superseded_by = '') \
+             AND updated_at < DATE_SUB(NOW(), INTERVAL 24 HOUR)"
+        ))
+        .bind(user_id)
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(db_err)?;
+
+        let (stale_working,): (i64,) = sqlx::query_as(&format!(
+            "SELECT COUNT(*) FROM {memories_table} WHERE user_id = ? AND memory_type = 'working' \
+             AND is_active = 1 AND TIMESTAMPDIFF(HOUR, observed_at, NOW()) > 24"
+        ))
+        .bind(user_id)
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(db_err)?;
+
+        let (orphan_mel,): (i64,) = sqlx::query_as(&format!(
+            "SELECT COUNT(*) FROM {memory_entity_links_table} l \
+             LEFT JOIN {memories_table} m ON l.memory_id = m.memory_id AND m.is_active = 1 \
+             WHERE l.user_id = ? AND m.memory_id IS NULL"
+        ))
+        .bind(user_id)
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(db_err)?;
+
+        let (orphan_el,): (i64,) = sqlx::query_as(&format!(
+            "SELECT COUNT(*) FROM {entity_links_table} l \
+             LEFT JOIN {memories_table} m ON l.memory_id = m.memory_id AND m.is_active = 1 \
+             WHERE l.user_id = ? AND m.memory_id IS NULL"
+        ))
+        .bind(user_id)
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(db_err)?;
+
+        let (orphan_graph_nodes,): (i64,) = sqlx::query_as(&format!(
+            "SELECT COUNT(*) FROM {graph_nodes_table} g \
+             LEFT JOIN {memories_table} m ON g.memory_id = m.memory_id \
+             WHERE g.user_id = ? AND g.is_active = 1 AND g.memory_id IS NOT NULL \
+               AND (m.is_active = 0 OR m.memory_id IS NULL)"
+        ))
+        .bind(user_id)
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(db_err)?;
+
+        Ok(serde_json::json!({
+            "inactive_memories": inactive,
+            "stale_working_memories": stale_working,
+            "orphan_memory_entity_links": orphan_mel,
+            "orphan_entity_links": orphan_el,
+            "orphan_graph_nodes": orphan_graph_nodes,
+        }))
+    }
+
+    /// Global hygiene diagnostics (admin).
+    pub async fn health_hygiene_global(&self) -> Result<serde_json::Value, MemoriaError> {
+        let mut conn = self.conn().await?;
+        let memories_table = self.t("mem_memories");
+        let memory_entity_links_table = self.t("mem_memory_entity_links");
+        let entity_links_table = self.t("mem_entity_links");
+        let graph_nodes_table = self.t("memory_graph_nodes");
+        let memory_stats_table = self.t("mem_memories_stats");
+        let (inactive,): (i64,) = sqlx::query_as(&format!(
+            "SELECT COUNT(*) FROM {memories_table} WHERE is_active = 0 \
+             AND (superseded_by IS NULL OR superseded_by = '') \
+             AND updated_at < DATE_SUB(NOW(), INTERVAL 24 HOUR)"
+        ))
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(db_err)?;
+
+        let (stale_working,): (i64,) = sqlx::query_as(&format!(
+            "SELECT COUNT(*) FROM {memories_table} WHERE memory_type = 'working' \
+             AND is_active = 1 AND TIMESTAMPDIFF(HOUR, observed_at, NOW()) > 24"
+        ))
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(db_err)?;
+
+        let (orphan_mel,): (i64,) = sqlx::query_as(&format!(
+            "SELECT COUNT(*) FROM {memory_entity_links_table} l \
+             LEFT JOIN {memories_table} m ON l.memory_id = m.memory_id AND m.is_active = 1 \
+             WHERE m.memory_id IS NULL"
+        ))
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(db_err)?;
+
+        let (orphan_el,): (i64,) = sqlx::query_as(&format!(
+            "SELECT COUNT(*) FROM {entity_links_table} l \
+             LEFT JOIN {memories_table} m ON l.memory_id = m.memory_id AND m.is_active = 1 \
+             WHERE m.memory_id IS NULL"
+        ))
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(db_err)?;
+
+        let (orphan_graph_nodes,): (i64,) = sqlx::query_as(&format!(
+            "SELECT COUNT(*) FROM {graph_nodes_table} g \
+             LEFT JOIN {memories_table} m ON g.memory_id = m.memory_id \
+             WHERE g.is_active = 1 AND g.memory_id IS NOT NULL \
+               AND (m.is_active = 0 OR m.memory_id IS NULL)"
+        ))
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(db_err)?;
+
+        let (orphan_stats,): (i64,) = sqlx::query_as(&format!(
+            "SELECT COUNT(*) FROM {memory_stats_table} s \
+             LEFT JOIN {memories_table} m ON s.memory_id = m.memory_id \
+             WHERE m.memory_id IS NULL"
+        ))
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(db_err)?;
+
+        Ok(serde_json::json!({
+            "inactive_memories": inactive,
+            "stale_working_memories": stale_working,
+            "orphan_memory_entity_links": orphan_mel,
+            "orphan_entity_links": orphan_el,
+            "orphan_graph_nodes": orphan_graph_nodes,
+            "orphan_stats": orphan_stats,
+        }))
     }
 
     /// Per-type stats: count, avg_confidence, contradiction_rate, avg_staleness_hours.
     pub async fn health_analyze(&self, user_id: &str) -> Result<serde_json::Value, MemoriaError> {
-        let rows: Vec<(String, i64, f64, i64, f64)> = sqlx::query_as(
+        let mut conn = self.conn().await?;
+        let memories_table = self.t("mem_memories");
+        let rows: Vec<(String, i64, f64, i64, f64)> = sqlx::query_as(&format!(
             "SELECT memory_type, COUNT(*) as total, AVG(initial_confidence) as avg_conf, \
-             COUNT(CASE WHEN superseded_by IS NOT NULL THEN 1 END) as superseded, \
+             COUNT(CASE WHEN superseded_by IS NOT NULL AND superseded_by != '' THEN 1 END) as superseded, \
              AVG(TIMESTAMPDIFF(HOUR, observed_at, NOW())) as avg_stale_h \
-             FROM mem_memories WHERE user_id = ? GROUP BY memory_type",
-        )
+             FROM {memories_table} WHERE user_id = ? GROUP BY memory_type"
+        ))
         .bind(user_id)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *conn)
         .await
         .map_err(db_err)?;
 
@@ -2161,14 +4348,16 @@ impl SqlMemoryStore {
         &self,
         user_id: &str,
     ) -> Result<serde_json::Value, MemoriaError> {
-        let row: (i64, i64, f64) = sqlx::query_as(
+        let mut conn = self.conn().await?;
+        let memories_table = self.t("mem_memories");
+        let row: (i64, i64, f64) = sqlx::query_as(&format!(
             "SELECT COUNT(*) as total, \
              SUM(CASE WHEN is_active = 1 THEN 1 ELSE 0 END) as active, \
              AVG(LENGTH(content)) as avg_content_size \
-             FROM mem_memories WHERE user_id = ?",
-        )
+             FROM {memories_table} WHERE user_id = ?"
+        ))
         .bind(user_id)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *conn)
         .await
         .map_err(db_err)?;
 
@@ -2182,25 +4371,33 @@ impl SqlMemoryStore {
 
     /// IVF capacity estimate: global vector count + growth rate + recommendation.
     pub async fn health_capacity(&self, user_id: &str) -> Result<serde_json::Value, MemoriaError> {
+        let mut conn = self.conn().await?;
+        let memories_table = self.t("mem_memories");
         const IVF_OPTIMAL: i64 = 50_000;
         const IVF_DEGRADED: i64 = 200_000;
 
-        let (user_active,): (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM mem_memories WHERE user_id = ? AND is_active = 1")
-                .bind(user_id)
-                .fetch_one(&self.pool)
-                .await
-                .map_err(db_err)?;
+        let (user_active,): (i64,) = sqlx::query_as(&format!(
+            "SELECT COUNT(*) FROM {memories_table} WHERE user_id = ? AND is_active = 1"
+        ))
+        .bind(user_id)
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(db_err)?;
 
-        let (global_total,): (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM mem_memories WHERE is_active = 1")
-                .fetch_one(&self.pool)
-                .await
-                .map_err(db_err)?;
+        let (global_total,): (i64,) = sqlx::query_as(&format!(
+            "SELECT COUNT(*) FROM {memories_table} WHERE is_active = 1"
+        ))
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(db_err)?;
 
-        let (added_30d,): (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM mem_memories WHERE user_id = ? AND observed_at >= NOW() - INTERVAL 30 DAY"
-        ).bind(user_id).fetch_one(&self.pool).await.map_err(db_err)?;
+        let (added_30d,): (i64,) = sqlx::query_as(&format!(
+            "SELECT COUNT(*) FROM {memories_table} WHERE user_id = ? AND observed_at >= NOW() - INTERVAL 30 DAY"
+        ))
+        .bind(user_id)
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(db_err)?;
 
         let recommendation = if global_total > IVF_DEGRADED {
             "partition_required"
@@ -2226,6 +4423,7 @@ impl SqlMemoryStore {
         &self,
         ids: &[String],
     ) -> Result<std::collections::HashMap<String, Memory>, MemoriaError> {
+        let memories_table = self.t("mem_memories");
         if ids.is_empty() {
             return Ok(Default::default());
         }
@@ -2234,13 +4432,13 @@ impl SqlMemoryStore {
         for chunk in ids.chunks(500) {
             let ph = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
             let sql = format!(
-                "SELECT memory_id, user_id, memory_type, content, \
+                "SELECT memory_id, user_id, author_id, memory_type, content, \
                  embedding AS emb_str, session_id, \
                  CAST(source_event_ids AS CHAR) AS src_ids, \
                  CAST(extra_metadata AS CHAR) AS extra_meta, \
                  is_active, superseded_by, trust_tier, initial_confidence, \
                  observed_at, created_at, updated_at \
-                 FROM mem_memories WHERE memory_id IN ({ph}) AND is_active = 1"
+                 FROM {memories_table} WHERE memory_id IN ({ph}) AND is_active = 1"
             );
             let mut q = sqlx::query(&sql);
             for id in chunk {
@@ -2272,81 +4470,176 @@ impl SqlMemoryStore {
         exclude_id: &str,
         l2_threshold: f64,
     ) -> Result<Option<(String, String, f64)>, MemoriaError> {
-        // Same-type first, then cross-type fallback
-        if let Some(hit) = self
-            .find_near_duplicate_inner(
-                table,
-                user_id,
-                embedding,
-                Some(memory_type),
-                exclude_id,
-                l2_threshold,
-            )
-            .await?
-        {
-            return Ok(Some(hit));
-        }
-        self.find_near_duplicate_inner(table, user_id, embedding, None, exclude_id, l2_threshold)
-            .await
-    }
-
-    async fn find_near_duplicate_inner(
-        &self,
-        table: &str,
-        user_id: &str,
-        embedding: &[f32],
-        memory_type: Option<&str>,
-        exclude_id: &str,
-        l2_threshold: f64,
-    ) -> Result<Option<(String, String, f64)>, MemoriaError> {
+        let table = self.t(table);
         let vec_literal = vec_to_mo(embedding);
-        let type_filter = match memory_type {
-            Some(_) => "AND memory_type = ? ",
-            None => "",
-        };
         let sql = format!(
             "SELECT memory_id, content, \
              l2_distance(embedding, '{vec_literal}') AS l2_dist \
              FROM {table} \
-             WHERE user_id = ? AND is_active = 1 {type_filter}\
-               AND embedding IS NOT NULL AND vector_dims(embedding) > 0 \
-               AND memory_id != ? \
-             ORDER BY l2_dist ASC LIMIT 1 by rank with option 'mode=post'"
+             WHERE user_id = ? AND is_active = 1 \
+               AND memory_type = ? \
+                AND embedding IS NOT NULL AND vector_dims(embedding) > 0 \
+                AND memory_id != ? \
+              ORDER BY l2_dist ASC LIMIT 1 by rank with option 'mode=post'"
         );
-        let mut q = sqlx::query(&sql).bind(user_id);
-        if let Some(mt) = memory_type {
-            q = q.bind(mt);
-        }
-        let row = q
+        let rows = sqlx::query(&sql)
+            .bind(user_id)
+            .bind(memory_type)
             .bind(exclude_id)
-            .fetch_optional(&self.pool)
+            .fetch_all(&self.pool)
             .await
             .map_err(db_err)?;
-        if let Some(r) = row {
+
+        for r in &rows {
             let dist: f64 = r
                 .try_get::<f64, _>("l2_dist")
                 .or_else(|_| r.try_get::<f32, _>("l2_dist").map(|v| v as f64))
                 .unwrap_or(f64::MAX);
-            if dist <= l2_threshold {
-                let mid: String = r.try_get("memory_id").map_err(db_err)?;
-                let content: String = r.try_get("content").map_err(db_err)?;
-                return Ok(Some((mid, content, dist)));
+            if dist > l2_threshold {
+                continue;
             }
+            let mid: String = r.try_get("memory_id").map_err(db_err)?;
+            let content: String = r.try_get("content").map_err(db_err)?;
+            return Ok(Some((mid, content, dist)));
         }
         Ok(None)
     }
 
     /// Mark a memory as superseded by another.
+    /// Branch-aware soft-delete: deactivate a memory in the given table.
+    /// Returns the number of rows actually deactivated (0 means the memory
+    /// was already inactive or not found — idempotent, not an error).
+    pub async fn soft_delete_from(
+        &self,
+        table: &str,
+        memory_id: &str,
+    ) -> Result<u64, MemoriaError> {
+        let mut conn = self.conn().await?;
+        let table = self.t(table);
+        let now = Utc::now().naive_utc();
+        let res = sqlx::query(&format!(
+            "UPDATE {table} SET is_active = 0, updated_at = ? WHERE memory_id = ? AND is_active = 1"
+        ))
+        .bind(now)
+        .bind(memory_id)
+        .execute(&mut *conn)
+        .await
+        .map_err(db_err)?;
+        Ok(res.rows_affected())
+    }
+
+    /// Batch soft-delete: deactivate multiple memories in one round trip per chunk.
+    pub async fn soft_delete_batch_from(
+        &self,
+        table: &str,
+        ids: &[String],
+    ) -> Result<(), MemoriaError> {
+        let mut conn = self.conn().await?;
+        let table = self.t(table);
+        for chunk in ids.chunks(200) {
+            let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let sql = format!(
+                "UPDATE {table} SET is_active = 0, updated_at = NOW() WHERE memory_id IN ({placeholders})"
+            );
+            let mut q = sqlx::query(&sql);
+            for id in chunk {
+                q = q.bind(id);
+            }
+            q.execute(&mut *conn).await.map_err(db_err)?;
+        }
+        Ok(())
+    }
+
+    /// Batch cleanup entity data for multiple memory IDs.
+    pub async fn cleanup_entity_data_batch(&self, ids: &[String]) {
+        let mut conn = match self.conn().await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!("failed to acquire connection: {e}");
+                return;
+            }
+        };
+        let graph = self.graph_store();
+        let graph_nodes_table = graph.t("memory_graph_nodes");
+        let memory_entity_links_table = graph.t("mem_memory_entity_links");
+        let entity_links_table = self.t("mem_entity_links");
+        for chunk in ids.chunks(200) {
+            let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+
+            // Deactivate graph nodes
+            let sql = format!(
+                "UPDATE {graph_nodes_table} SET is_active = 0 WHERE memory_id IN ({placeholders})"
+            );
+            let mut q = sqlx::query(&sql);
+            for id in chunk {
+                q = q.bind(id);
+            }
+            if let Err(e) = q.execute(&mut *conn).await {
+                tracing::warn!("batch deactivate graph nodes failed: {e}");
+            }
+
+            // Delete memory_entity_links
+            let sql = format!(
+                "DELETE FROM {memory_entity_links_table} WHERE memory_id IN ({placeholders})"
+            );
+            let mut q = sqlx::query(&sql);
+            for id in chunk {
+                q = q.bind(id);
+            }
+            if let Err(e) = q.execute(&mut *conn).await {
+                tracing::warn!("batch delete memory_entity_links failed: {e}");
+            }
+
+            // Delete entity_links
+            let sql =
+                format!("DELETE FROM {entity_links_table} WHERE memory_id IN ({placeholders})");
+            let mut q = sqlx::query(&sql);
+            for id in chunk {
+                q = q.bind(id);
+            }
+            if let Err(e) = q.execute(&mut *conn).await {
+                tracing::warn!("batch delete entity_links failed: {e}");
+            }
+        }
+    }
+
+    /// Branch-aware get: fetch an active memory from the given table.
+    pub async fn get_from(
+        &self,
+        table: &str,
+        memory_id: &str,
+    ) -> Result<Option<Memory>, MemoriaError> {
+        let row = sqlx::query(&format!(
+            "SELECT memory_id, user_id, author_id, memory_type, content, \
+             embedding AS emb_str, session_id, \
+             CAST(source_event_ids AS CHAR) AS src_ids, \
+             CAST(extra_metadata AS CHAR) AS extra_meta, \
+             is_active, superseded_by, trust_tier, initial_confidence, \
+             observed_at, created_at, updated_at \
+             FROM {table} WHERE memory_id = ? AND is_active = 1"
+        ))
+        .bind(memory_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+        row.map(|r| row_to_memory(&r)).transpose()
+    }
+
     pub async fn supersede_memory(
         &self,
         table: &str,
         old_id: &str,
         new_id: &str,
     ) -> Result<(), MemoriaError> {
+        let table = self.t(table);
         sqlx::query(&format!(
             "UPDATE {table} SET is_active = 0, superseded_by = ?, updated_at = NOW() WHERE memory_id = ?"
-        )).bind(new_id).bind(old_id)
-        .execute(&self.pool).await.map_err(db_err)?;
+        ))
+        .bind(new_id)
+        .bind(old_id)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
         Ok(())
     }
 
@@ -2371,20 +4664,21 @@ impl SqlMemoryStore {
 
         sqlx::query(&format!(
             r#"INSERT INTO {table}
-               (memory_id, user_id, memory_type, content, embedding, session_id,
+               (memory_id, user_id, author_id, memory_type, content, embedding, session_id,
                 source_event_ids, extra_metadata, is_active, superseded_by,
                 trust_tier, initial_confidence, observed_at, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)"#
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)"#
         ))
         .bind(&memory.memory_id)
         .bind(&memory.user_id)
+        .bind(memory.author_id.as_deref())
         .bind(memory.memory_type.to_string())
         .bind(&memory.content)
         .bind(embedding)
-        .bind(&memory.session_id)
+        .bind(nullable_str(&memory.session_id))
         .bind(source_event_ids)
         .bind(extra_metadata)
-        .bind(&memory.superseded_by)
+        .bind(nullable_str(&memory.superseded_by))
         .bind(memory.trust_tier.to_string())
         .bind(memory.initial_confidence as f32)
         .bind(observed_at)
@@ -2410,12 +4704,12 @@ impl SqlMemoryStore {
         for chunk in memories.chunks(50) {
             let placeholders = chunk
                 .iter()
-                .map(|_| "(?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)")
+                .map(|_| "(?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)")
                 .collect::<Vec<_>>()
                 .join(", ");
             let sql = format!(
                 "INSERT INTO {table} \
-                 (memory_id, user_id, memory_type, content, embedding, session_id, \
+                 (memory_id, user_id, author_id, memory_type, content, embedding, session_id, \
                   source_event_ids, extra_metadata, is_active, superseded_by, \
                   trust_tier, initial_confidence, observed_at, created_at, updated_at) \
                  VALUES {placeholders}"
@@ -2440,13 +4734,14 @@ impl SqlMemoryStore {
                 q = q
                     .bind(m.memory_id.clone())
                     .bind(m.user_id.clone())
+                    .bind(m.author_id.clone())
                     .bind(m.memory_type.to_string())
                     .bind(m.content.clone())
                     .bind(embedding)
-                    .bind(m.session_id.clone())
+                    .bind(nullable_str(&m.session_id).map(str::to_string))
                     .bind(source_event_ids)
                     .bind(extra_metadata)
-                    .bind(m.superseded_by.clone())
+                    .bind(nullable_str(&m.superseded_by).map(str::to_string))
                     .bind(m.trust_tier.to_string())
                     .bind(m.initial_confidence as f32)
                     .bind(observed_at)
@@ -2458,41 +4753,6 @@ impl SqlMemoryStore {
         Ok(())
     }
 
-    /// Batch-insert multiple edit log entries in a single statement.
-    pub async fn batch_log_edit(
-        &self,
-        entries: &[EditLogEntry<'_>],
-    ) {
-        if entries.is_empty() {
-            return;
-        }
-        for chunk in entries.chunks(50) {
-            let placeholders = chunk
-                .iter()
-                .map(|_| "(?, ?, ?, ?, ?, ?, ?, ?)")
-                .collect::<Vec<_>>()
-                .join(", ");
-            let sql = format!(
-                "INSERT INTO mem_edit_log \
-                 (edit_id, user_id, memory_id, operation, payload, reason, snapshot_before, created_by) \
-                 VALUES {placeholders}"
-            );
-            let mut q = sqlx::query(&sql);
-            for (user_id, operation, memory_id, payload, reason, snapshot_before) in chunk {
-                q = q
-                    .bind(uuid7_id())
-                    .bind(*user_id)
-                    .bind(*memory_id)
-                    .bind(*operation)
-                    .bind(*payload)
-                    .bind(*reason)
-                    .bind(*snapshot_before)
-                    .bind(*user_id);
-            }
-            let _ = q.execute(&self.pool).await;
-        }
-    }
-
     pub async fn list_active_from(
         &self,
         table: &str,
@@ -2500,14 +4760,17 @@ impl SqlMemoryStore {
         limit: i64,
     ) -> Result<Vec<Memory>, MemoriaError> {
         let rows = sqlx::query(&format!(
-            "SELECT memory_id, user_id, memory_type, content, \
+            "SELECT memory_id, user_id, author_id, memory_type, content, \
              embedding AS emb_str, session_id, \
              CAST(source_event_ids AS CHAR) AS src_ids, \
              CAST(extra_metadata AS CHAR) AS extra_meta, \
              is_active, superseded_by, trust_tier, initial_confidence, \
              observed_at, created_at, updated_at \
-             FROM {table} WHERE user_id = ? AND is_active = 1 \
-             ORDER BY created_at DESC LIMIT ?"
+             FROM {table} WHERE memory_id IN (\
+               SELECT memory_id FROM {table} \
+               WHERE user_id = ? AND is_active = 1 \
+               ORDER BY memory_id DESC LIMIT ?\
+             ) ORDER BY memory_id DESC"
         ))
         .bind(user_id)
         .bind(limit)
@@ -2515,6 +4778,69 @@ impl SqlMemoryStore {
         .await
         .map_err(db_err)?;
         rows.iter().map(row_to_memory).collect()
+    }
+
+    pub fn qualified_table(&self, table: &str) -> String {
+        self.t(table)
+    }
+
+    /// Lightweight list for API responses — skips embedding, source_event_ids,
+    /// extra_metadata to reduce I/O and deserialization cost.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn list_active_lite(
+        &self,
+        table: &str,
+        user_id: &str,
+        limit: i64,
+        memory_type: Option<&str>,
+        session_id: Option<&str>,
+        trust_tier: Option<&str>,
+        cursor: Option<&str>,
+    ) -> Result<Vec<Memory>, MemoriaError> {
+        let table = self.t(table);
+        // Cap at 501 (not 500) so the caller can request limit+1 for has_more detection.
+        let safe_limit = limit.clamp(1, 501);
+        // Subquery: sort only memory_id in the index, then fetch full rows for the top-N.
+        let mut inner =
+            format!("SELECT memory_id FROM {table} WHERE user_id = ? AND is_active = 1");
+        if memory_type.is_some() {
+            inner.push_str(" AND memory_type = ?");
+        }
+        if session_id.is_some() {
+            inner.push_str(" AND session_id = ?");
+        }
+        if trust_tier.is_some() {
+            inner.push_str(" AND trust_tier = ?");
+        }
+        if cursor.is_some() {
+            inner.push_str(" AND memory_id < ?");
+        }
+        inner.push_str(" ORDER BY memory_id DESC LIMIT ?");
+
+        let sql = format!(
+            "SELECT memory_id, user_id, author_id, memory_type, content, \
+             session_id, is_active, superseded_by, trust_tier, \
+             initial_confidence, observed_at, created_at, updated_at \
+             FROM {table} WHERE memory_id IN ({inner}) \
+             ORDER BY memory_id DESC"
+        );
+
+        let mut q = sqlx::query(&sql).bind(user_id);
+        if let Some(mt) = memory_type {
+            q = q.bind(mt);
+        }
+        if let Some(session_id) = session_id {
+            q = q.bind(session_id);
+        }
+        if let Some(tt) = trust_tier {
+            q = q.bind(tt);
+        }
+        if let Some(c) = cursor {
+            q = q.bind(c);
+        }
+        q = q.bind(safe_limit);
+        let rows = q.fetch_all(&self.pool).await.map_err(db_err)?;
+        rows.iter().map(row_to_memory_lite).collect()
     }
 
     /// Find memory IDs whose content contains `topic` (exact substring match).
@@ -2525,6 +4851,8 @@ impl SqlMemoryStore {
         user_id: &str,
         topic: &str,
     ) -> Result<Vec<String>, MemoriaError> {
+        let mut conn = self.conn().await?;
+        let table = self.t(table);
         // Require minimum length to avoid full table scan
         if topic.trim().len() < 3 {
             return Err(MemoriaError::Validation(
@@ -2533,28 +4861,76 @@ impl SqlMemoryStore {
         }
         let ft_safe = sanitize_fulltext_query(topic);
         let like_safe = sanitize_like_pattern(topic);
-        if ft_safe.is_empty() {
-            return Ok(vec![]);
+        let like_pat = format!("%{like_safe}%");
+
+        // Try fulltext + LIKE first (fast path)
+        if !ft_safe.is_empty() {
+            let ft_terms: String = ft_safe
+                .split_whitespace()
+                .map(|w| format!("+{w}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let sql = format!(
+                "SELECT memory_id FROM {table} \
+                 WHERE user_id = ? AND is_active = 1 \
+                   AND MATCH(content) AGAINST('{ft_terms}' IN BOOLEAN MODE) \
+                   AND content LIKE ?"
+            );
+            let rows: Vec<(String,)> = sqlx::query_as(&sql)
+                .bind(user_id)
+                .bind(&like_pat)
+                .fetch_all(&mut *conn)
+                .await
+                .map_err(db_err)?;
+            if !rows.is_empty() {
+                return Ok(rows.into_iter().map(|r| r.0).collect());
+            }
         }
-        let ft_terms: String = ft_safe
-            .split_whitespace()
-            .map(|w| format!("+{w}"))
-            .collect::<Vec<_>>()
-            .join(" ");
+
+        // Fallback: LIKE on user's active memories (idx_user_active narrows scan)
         let sql = format!(
             "SELECT memory_id FROM {table} \
-             WHERE user_id = ? AND is_active = 1 \
-               AND MATCH(content) AGAINST('{ft_terms}' IN BOOLEAN MODE) \
-               AND content LIKE ?"
+             WHERE user_id = ? AND is_active = 1 AND content LIKE ? LIMIT 500"
         );
-        let like_pat = format!("%{like_safe}%");
         let rows: Vec<(String,)> = sqlx::query_as(&sql)
             .bind(user_id)
             .bind(&like_pat)
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *conn)
             .await
             .map_err(db_err)?;
         Ok(rows.into_iter().map(|r| r.0).collect())
+    }
+
+    pub async fn find_ids_by_session_id(
+        &self,
+        table: &str,
+        user_id: &str,
+        session_id: &str,
+        memory_types: Option<&[MemoryType]>,
+    ) -> Result<Vec<String>, MemoriaError> {
+        let mut conn = self.conn().await?;
+        let table = self.t(table);
+        let mut query_builder: QueryBuilder<MySql> =
+            QueryBuilder::new(format!("SELECT memory_id FROM {table} WHERE user_id = "));
+        query_builder
+            .push_bind(user_id)
+            .push(" AND session_id = ")
+            .push_bind(session_id)
+            .push(" AND is_active = 1");
+        if let Some(memory_types) = memory_types.filter(|types| !types.is_empty()) {
+            query_builder.push(" AND memory_type IN (");
+            let mut separated = query_builder.separated(", ");
+            for memory_type in memory_types {
+                separated.push_bind(memory_type.to_string());
+            }
+            separated.push_unseparated(")");
+        }
+        let rows = query_builder
+            .build_query_as::<(String,)>()
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(db_err)?;
+        Ok(rows.into_iter().map(|row| row.0).collect())
     }
 
     #[tracing::instrument(skip(self))]
@@ -2565,14 +4941,31 @@ impl SqlMemoryStore {
         query: &str,
         limit: i64,
     ) -> Result<Vec<Memory>, MemoriaError> {
+        self.search_fulltext_from_scoped(table, user_id, query, limit, None)
+            .await
+    }
+
+    pub async fn search_fulltext_from_scoped(
+        &self,
+        table: &str,
+        user_id: &str,
+        query: &str,
+        limit: i64,
+        session_id: Option<&str>,
+    ) -> Result<Vec<Memory>, MemoriaError> {
         let safe = sanitize_fulltext_query(query);
         if safe.is_empty() {
             return Ok(vec![]);
         }
+        let session_clause = if session_id.is_some() {
+            " AND (session_id = ? OR session_id IS NULL)"
+        } else {
+            ""
+        };
         // Use OR semantics (no + prefix) — AND is too strict for natural language queries
         // because stopwords are removed from the index but +stopword still requires a match.
         let sql = format!(
-            "SELECT memory_id, user_id, memory_type, content, \
+            "SELECT memory_id, user_id, author_id, memory_type, content, \
              embedding AS emb_str, session_id, \
              CAST(source_event_ids AS CHAR) AS src_ids, \
              CAST(extra_metadata AS CHAR) AS extra_meta, \
@@ -2580,16 +4973,15 @@ impl SqlMemoryStore {
              observed_at, created_at, updated_at, \
              MATCH(content) AGAINST('{safe}' IN BOOLEAN MODE) AS ft_score \
              FROM {table} \
-             WHERE user_id = ? AND is_active = 1 \
+             WHERE user_id = ? AND is_active = 1{session_clause} \
                AND MATCH(content) AGAINST('{safe}' IN BOOLEAN MODE) \
              ORDER BY ft_score DESC LIMIT ?"
         );
-        let rows = match sqlx::query(&sql)
-            .bind(user_id)
-            .bind(limit)
-            .fetch_all(&self.pool)
-            .await
-        {
+        let mut stmt = sqlx::query(&sql).bind(user_id);
+        if let Some(session_id) = session_id {
+            stmt = stmt.bind(session_id);
+        }
+        let rows = match stmt.bind(limit).fetch_all(&self.pool).await {
             Ok(rows) => rows,
             Err(e) => {
                 // MatrixOne returns 20101 when the search string tokenizes to an empty pattern
@@ -2621,7 +5013,19 @@ impl SqlMemoryStore {
         embedding: &[f32],
         limit: i64,
     ) -> Result<Vec<Memory>, MemoriaError> {
-        self.search_vector_from_filtered(table, user_id, embedding, limit, None)
+        self.search_vector_from_scoped(table, user_id, embedding, limit, None)
+            .await
+    }
+
+    pub async fn search_vector_from_scoped(
+        &self,
+        table: &str,
+        user_id: &str,
+        embedding: &[f32],
+        limit: i64,
+        session_id: Option<&str>,
+    ) -> Result<Vec<Memory>, MemoriaError> {
+        self.search_vector_from_filtered_scoped(table, user_id, embedding, limit, None, session_id)
             .await
     }
 
@@ -2634,34 +5038,83 @@ impl SqlMemoryStore {
         limit: i64,
         memory_type: Option<&str>,
     ) -> Result<Vec<Memory>, MemoriaError> {
+        self.search_vector_from_filtered_scoped(table, user_id, embedding, limit, memory_type, None)
+            .await
+    }
+
+    /// Vector search with optional memory_type and strict session pre-filter.
+    /// When session_id is provided, the candidate set includes that session plus
+    /// unscoped memories (session_id IS NULL).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn search_vector_from_filtered_scoped(
+        &self,
+        table: &str,
+        user_id: &str,
+        embedding: &[f32],
+        limit: i64,
+        memory_type: Option<&str>,
+        session_id: Option<&str>,
+    ) -> Result<Vec<Memory>, MemoriaError> {
         let vec_literal = vec_to_mo(embedding);
         let type_clause = match memory_type {
             Some(mt) => format!(" AND memory_type = '{}'", sanitize_sql_literal(mt)),
             None => String::new(),
         };
+        let session_clause = match session_id {
+            Some(session_id) => format!(
+                " AND (session_id = '{}' OR session_id IS NULL)",
+                sanitize_sql_literal(session_id)
+            ),
+            None => String::new(),
+        };
+        let rank_mode = if session_id.is_some() { "pre" } else { "post" };
+        let build_sql = |rank_mode: Option<&str>| {
+            let limit_clause = match rank_mode {
+                Some(mode) => format!("LIMIT {limit} by rank with option 'mode={mode}'"),
+                None => format!("LIMIT {limit}"),
+            };
+            format!(
+                "SELECT memory_id, user_id, author_id, memory_type, content, \
+                 session_id, \
+                 CAST(source_event_ids AS CHAR) AS src_ids, \
+                 CAST(extra_metadata AS CHAR) AS extra_meta, \
+                 is_active, superseded_by, trust_tier, initial_confidence, \
+                 observed_at, created_at, updated_at, \
+                 l2_distance(embedding, '{vec_literal}') AS l2_dist \
+                 FROM {table} \
+                 WHERE user_id = '{}' AND is_active = 1 AND embedding IS NOT NULL{type_clause}{session_clause} \
+                 ORDER BY l2_distance(embedding, '{vec_literal}') ASC \
+                 {limit_clause}",
+                sanitize_sql_literal(user_id),
+            )
+        };
         // MatrixOne bug workaround: prepared statement with l2_distance in ORDER BY returns 0 rows
         // Solution: inline all parameters instead of using bind()
-        let sql = format!(
-            "SELECT memory_id, user_id, memory_type, content, \
-             session_id, \
-             CAST(source_event_ids AS CHAR) AS src_ids, \
-             CAST(extra_metadata AS CHAR) AS extra_meta, \
-             is_active, superseded_by, trust_tier, initial_confidence, \
-             observed_at, created_at, updated_at \
-             FROM {table} \
-             WHERE user_id = '{}' AND is_active = 1 AND embedding IS NOT NULL{type_clause} \
-             ORDER BY l2_distance(embedding, '{vec_literal}') ASC \
-             LIMIT {} by rank with option 'mode=post'",
-            sanitize_sql_literal(user_id),
-            limit
-        );
-        
-        let rows = sqlx::query(&sql)
+        let mut rows = sqlx::query(&build_sql(Some(rank_mode)))
             .fetch_all(&self.pool)
             .await
             .map_err(db_err)?;
-        
-        rows.iter().map(row_to_memory).collect()
+        // Strict session retrieval must preserve session-scoped semantics even if
+        // MatrixOne's IVF pre-filter path under-fills top_k on a tiny candidate set.
+        if session_id.is_some() && rows.len() < limit as usize {
+            rows = sqlx::query(&build_sql(None))
+                .fetch_all(&self.pool)
+                .await
+                .map_err(db_err)?;
+        }
+
+        rows.iter()
+            .map(|r| {
+                let mut m = row_to_memory(r)?;
+                if let Ok(dist) = r
+                    .try_get::<f64, _>("l2_dist")
+                    .or_else(|_| r.try_get::<f32, _>("l2_dist").map(|v| v as f64))
+                {
+                    m.retrieval_score = Some(1.0 / (1.0 + dist.max(0.0)));
+                }
+                Ok(m)
+            })
+            .collect()
     }
 
     /// Hybrid search: vector + fulltext, merged with 4-dimension weighted scoring.
@@ -2675,9 +5128,33 @@ impl SqlMemoryStore {
         query: &str,
         limit: i64,
     ) -> Result<Vec<Memory>, MemoriaError> {
-        let params = self.get_user_retrieval_params(user_id).await.unwrap_or_default();
+        self.search_hybrid_from_scoped(table, user_id, embedding, query, limit, None)
+            .await
+    }
+
+    pub async fn search_hybrid_from_scoped(
+        &self,
+        table: &str,
+        user_id: &str,
+        embedding: &[f32],
+        query: &str,
+        limit: i64,
+        session_id: Option<&str>,
+    ) -> Result<Vec<Memory>, MemoriaError> {
+        let params = self
+            .get_user_retrieval_params(user_id)
+            .await
+            .unwrap_or_default();
         let (mems, _) = self
-            .search_hybrid_from_scored(table, user_id, embedding, query, limit, params.feedback_weight)
+            .search_hybrid_from_scored_scoped(
+                table,
+                user_id,
+                embedding,
+                query,
+                limit,
+                params.feedback_weight,
+                session_id,
+            )
             .await?;
         Ok(mems)
     }
@@ -2693,14 +5170,36 @@ impl SqlMemoryStore {
         limit: i64,
         feedback_weight: f64,
     ) -> Result<(Vec<Memory>, Vec<(String, f64, f64, f64, f64, f64)>), MemoriaError> {
+        self.search_hybrid_from_scored_scoped(
+            table,
+            user_id,
+            embedding,
+            query,
+            limit,
+            feedback_weight,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn search_hybrid_from_scored_scoped(
+        &self,
+        table: &str,
+        user_id: &str,
+        embedding: &[f32],
+        query: &str,
+        limit: i64,
+        feedback_weight: f64,
+        session_id: Option<&str>,
+    ) -> Result<(Vec<Memory>, Vec<(String, f64, f64, f64, f64, f64)>), MemoriaError> {
         let fetch_k = (limit * 3).max(20);
-        let vec_results = self
-            .search_vector_from(table, user_id, embedding, fetch_k)
-            .await?;
-        let ft_results = self
-            .search_fulltext_from(table, user_id, query, fetch_k)
-            .await
-            .unwrap_or_default();
+        let (vec_results, ft_results) = tokio::join!(
+            self.search_vector_from_scoped(table, user_id, embedding, fetch_k, session_id),
+            self.search_fulltext_from_scoped(table, user_id, query, fetch_k, session_id)
+        );
+        let vec_results = vec_results?;
+        let ft_results = ft_results.unwrap_or_default();
 
         let ft_map: std::collections::HashMap<String, f64> = ft_results
             .iter()
@@ -2730,12 +5229,9 @@ impl SqlMemoryStore {
 
         let mut score_breakdown: Vec<(String, f64, f64, f64, f64, f64)> = Vec::new();
 
-        // Fetch access counts for frequency boost
+        // Fetch access counts + feedback in a single query
         let ac_ids: Vec<String> = candidates.iter().map(|m| m.memory_id.clone()).collect();
-        let ac_map = self.get_access_counts(&ac_ids).await.unwrap_or_default();
-
-        // Fetch feedback for relevance adjustment
-        let fb_map = self.get_feedback_batch(&ac_ids).await.unwrap_or_default();
+        let (ac_map, fb_map) = self.get_stats_batch(&ac_ids).await.unwrap_or_default();
 
         for m in &mut candidates {
             let vec_score = m.retrieval_score.unwrap_or(0.0);
@@ -2757,11 +5253,10 @@ impl SqlMemoryStore {
             };
             let mut final_score =
                 W_VEC * vec_score + W_KW * kw_score + W_TIME * time_score + W_CONF * conf_score;
-            // Frequency boost: log(1 + access_count) — mild boost for frequently retrieved memories
             let ac = ac_map.get(&m.memory_id).copied().unwrap_or(0);
-            if ac > 0 {
-                final_score *= 1.0 + 0.1 * ((1 + ac) as f64).ln();
-            }
+            // Keep access_count for observability, but exclude it from ranking.
+            // Repeated evaluation otherwise creates self-reinforcing winners that
+            // swamp fresher, more relevant memories.
 
             // Feedback adjustment: boost useful, penalize negative feedback
             if let Some(fb) = fb_map.get(&m.memory_id) {
@@ -2826,11 +5321,15 @@ impl SqlMemoryStore {
         &self,
         user_id: &str,
     ) -> Result<std::collections::HashSet<String>, MemoriaError> {
-        let rows = sqlx::query("SELECT DISTINCT memory_id FROM mem_entity_links WHERE user_id = ?")
-            .bind(user_id)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(db_err)?;
+        let mut conn = self.conn().await?;
+        let entity_links_table = self.t("mem_entity_links");
+        let rows = sqlx::query(&format!(
+            "SELECT DISTINCT memory_id FROM {entity_links_table} WHERE user_id = ?"
+        ))
+        .bind(user_id)
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(db_err)?;
         Ok(rows
             .iter()
             .filter_map(|r| r.try_get::<String, _>("memory_id").ok())
@@ -2842,11 +5341,13 @@ impl SqlMemoryStore {
         &self,
         user_id: &str,
     ) -> Result<Vec<(String, String)>, MemoriaError> {
-        let rows = sqlx::query(
-            "SELECT DISTINCT entity_name, entity_type FROM mem_entity_links WHERE user_id = ? ORDER BY entity_name"
-        )
+        let mut conn = self.conn().await?;
+        let entity_links_table = self.t("mem_entity_links");
+        let rows = sqlx::query(&format!(
+            "SELECT DISTINCT entity_name, entity_type FROM {entity_links_table} WHERE user_id = ? ORDER BY entity_name"
+        ))
         .bind(user_id)
-        .fetch_all(&self.pool).await.map_err(db_err)?;
+        .fetch_all(&mut *conn).await.map_err(db_err)?;
         Ok(rows
             .iter()
             .filter_map(|r| {
@@ -2864,17 +5365,19 @@ impl SqlMemoryStore {
         memory_id: &str,
         entities: &[(String, String)], // (name, type)
     ) -> Result<(usize, usize), MemoriaError> {
+        let mut conn = self.conn().await?;
+        let entity_links_table = self.t("mem_entity_links");
         if entities.is_empty() {
             return Ok((0, 0));
         }
         // Fetch existing entity names for this (user, memory) pair
         let existing: std::collections::HashSet<String> = {
-            let rows = sqlx::query(
-                "SELECT entity_name FROM mem_entity_links WHERE user_id = ? AND memory_id = ?",
-            )
+            let rows = sqlx::query(&format!(
+                "SELECT entity_name FROM {entity_links_table} WHERE user_id = ? AND memory_id = ?"
+            ))
             .bind(user_id)
             .bind(memory_id)
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *conn)
             .await
             .map_err(db_err)?;
             rows.iter()
@@ -2904,7 +5407,7 @@ impl SqlMemoryStore {
                 .collect::<Vec<_>>()
                 .join(", ");
             let sql = format!(
-                "INSERT INTO mem_entity_links \
+                "INSERT INTO {entity_links_table} \
                  (id, user_id, memory_id, entity_name, entity_type, source, created_at) \
                  VALUES {placeholders}"
             );
@@ -2919,28 +5422,294 @@ impl SqlMemoryStore {
                     .bind(*etype)
                     .bind(now);
             }
-            q.execute(&self.pool).await.map_err(db_err)?;
+            q.execute(&mut *conn).await.map_err(db_err)?;
         }
         Ok((to_insert.len(), reused))
+    }
+}
+
+fn parse_db_name_from_url(database_url: &str) -> Option<&str> {
+    split_database_url(database_url).map(|(_, db_name, _)| db_name)
+}
+
+fn configured_max_connections(env_name: &str, default: u32, upper: u32) -> u32 {
+    std::env::var(env_name)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default)
+        .clamp(1, upper)
+}
+
+fn split_database_url(database_url: &str) -> Option<(&str, &str, &str)> {
+    let suffix_start = database_url.find(['?', '#']).unwrap_or(database_url.len());
+    let (without_suffix, suffix) = database_url.split_at(suffix_start);
+    let (base, db_name) = without_suffix.rsplit_once('/')?;
+    if db_name.is_empty() {
+        return None;
+    }
+    Some((base, db_name, suffix))
+}
+
+fn quote_ident(name: &str) -> String {
+    format!("`{}`", name.replace('`', "``"))
+}
+
+fn sanitize_identifier_fragment(value: &str) -> String {
+    let sanitized = value
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('_')
+        .to_string();
+    if sanitized.is_empty() {
+        "db".to_string()
+    } else {
+        sanitized
+    }
+}
+
+fn compact_identifier_fragment(value: &str, max_len: usize) -> String {
+    let sanitized = sanitize_identifier_fragment(value);
+    if sanitized.len() <= max_len {
+        return sanitized;
+    }
+    if max_len <= 4 {
+        return sanitized.chars().take(max_len).collect();
+    }
+    let head_len = (max_len - 1) / 2;
+    let tail_len = max_len - head_len - 1;
+    let head: String = sanitized.chars().take(head_len).collect();
+    let tail_chars: Vec<char> = sanitized.chars().collect();
+    let tail: String = tail_chars[tail_chars.len().saturating_sub(tail_len)..]
+        .iter()
+        .collect();
+    format!("{head}_{tail}")
+}
+
+fn safety_snapshot_scope(db_name: &str) -> String {
+    compact_identifier_fragment(db_name, SAFETY_SNAPSHOT_SCOPE_MAX_LEN)
+}
+
+fn safety_snapshot_prefix(db_name: Option<&str>) -> String {
+    match db_name {
+        Some(db_name) => format!("mem_snap_{}_pre_", safety_snapshot_scope(db_name)),
+        None => "mem_snap_pre_".to_string(),
+    }
+}
+
+fn legacy_safety_snapshot_prefix(db_name: Option<&str>) -> Option<String> {
+    db_name.map(|db_name| format!("mem_snap_{db_name}_pre_"))
+}
+
+fn build_safety_snapshot_name(db_name: Option<&str>, operation: &str) -> String {
+    let prefix = safety_snapshot_prefix(db_name);
+    let operation = compact_identifier_fragment(operation, SAFETY_SNAPSHOT_OPERATION_MAX_LEN);
+    let suffix = &uuid::Uuid::new_v4().simple().to_string()[..SAFETY_SNAPSHOT_UUID_LEN];
+    let name = format!("{prefix}{operation}_{suffix}");
+    debug_assert!(name.len() <= MAX_IDENTIFIER_LEN);
+    name
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        classify_pool_health, detect_connection_anomaly, should_emit_saturated_warning,
+        ConnectionAnomalyKind, OwnedEditLogEntry, PoolHealthLevel, PoolHealthSnapshot,
+        SqlMemoryStore,
+    };
+    use sqlx::mysql::MySqlPoolOptions;
+    use std::io::{self, Write};
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    static LOG_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    #[test]
+    fn saturated_warning_requires_full_delay_and_only_emits_once() {
+        assert!(!should_emit_saturated_warning(299, false));
+        assert!(should_emit_saturated_warning(300, false));
+        assert!(!should_emit_saturated_warning(600, true));
+    }
+
+    #[test]
+    fn saturated_warning_rearms_after_relief() {
+        let mut snapshot = PoolHealthSnapshot::new(Some(20));
+        snapshot.saturated_warning_emitted = true;
+        snapshot.level = PoolHealthLevel::HighUtilization;
+        snapshot.saturated_warning_emitted = false;
+
+        assert!(should_emit_saturated_warning(
+            300,
+            snapshot.saturated_warning_emitted
+        ));
+    }
+
+    #[derive(Clone)]
+    struct SharedWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for SharedWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn log_edit_warns_when_async_buffer_is_full() {
+        let _guard = LOG_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("log test lock should not be poisoned");
+
+        let pool = MySqlPoolOptions::new()
+            .connect_lazy("mysql://root:111@localhost:6001/memoria")
+            .expect("lazy pool");
+        let store = SqlMemoryStore::new(pool, 4, "test-instance".to_string());
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        tx.try_send(OwnedEditLogEntry {
+            edit_id: "existing".to_string(),
+            user_id: "u1".to_string(),
+            operation: "inject".to_string(),
+            memory_id: Some("m1".to_string()),
+            payload: None,
+            reason: "prefill".to_string(),
+            snapshot_before: None,
+        })
+        .expect("prefill channel");
+        store.set_edit_log_tx(tx);
+
+        let logs = Arc::new(Mutex::new(Vec::new()));
+        let make_writer = {
+            let logs = Arc::clone(&logs);
+            move || SharedWriter(Arc::clone(&logs))
+        };
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(make_writer)
+            .with_ansi(false)
+            .without_time()
+            .finish();
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+
+        store
+            .log_edit("u1", "purge", Some("m2"), None, "test", None)
+            .await;
+
+        let output = String::from_utf8(logs.lock().unwrap().clone()).expect("utf8 logs");
+        assert!(
+            output.contains("edit log async buffer full, dropping entry"),
+            "expected warning in logs, got: {output}"
+        );
+        assert!(
+            output.contains("operation=purge"),
+            "expected operation field in logs: {output}"
+        );
+    }
+
+    /// Verify that log_edit falls back to direct INSERT when the async channel is closed
+    /// (simulates the race between clear_edit_log_tx and a concurrent log_edit call
+    /// that already cloned the sender before it was cleared).
+    #[tokio::test(flavor = "current_thread")]
+    async fn log_edit_falls_back_on_closed_channel() {
+        let _guard = LOG_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("log test lock should not be poisoned");
+
+        let pool = MySqlPoolOptions::new()
+            .connect_lazy("mysql://root:111@localhost:6001/memoria")
+            .expect("lazy pool");
+        let store = SqlMemoryStore::new(pool, 4, "test-instance".to_string());
+        // Create a channel and immediately drop the receiver → sender is closed
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+        drop(_rx);
+        store.set_edit_log_tx(tx);
+
+        // log_edit should NOT warn about "dropping entry" — it should fall through
+        // to direct INSERT (which will fail on lazy pool, but that's fine for this test)
+        let logs = Arc::new(Mutex::new(Vec::new()));
+        let make_writer = {
+            let logs = Arc::clone(&logs);
+            move || SharedWriter(Arc::clone(&logs))
+        };
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(make_writer)
+            .with_ansi(false)
+            .without_time()
+            .finish();
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+
+        store
+            .log_edit("u1", "purge", Some("m1"), None, "closed-test", None)
+            .await;
+
+        let output = String::from_utf8(logs.lock().unwrap().clone()).expect("utf8 logs");
+        assert!(
+            !output.contains("dropping entry"),
+            "closed channel should fall back to direct INSERT, not drop: {output}"
+        );
+    }
+
+    #[test]
+    fn classify_pool_health_reserves_saturated_for_maxed_pools() {
+        assert_eq!(classify_pool_health(0, 0, Some(8)), PoolHealthLevel::Empty);
+        assert_eq!(
+            classify_pool_health(2, 0, Some(4)),
+            PoolHealthLevel::HighUtilization
+        );
+        assert_eq!(
+            classify_pool_health(4, 0, Some(4)),
+            PoolHealthLevel::Saturated
+        );
+        assert_eq!(
+            classify_pool_health(20, 1, Some(20)),
+            PoolHealthLevel::HighUtilization
+        );
+        assert_eq!(
+            classify_pool_health(8, 3, Some(8)),
+            PoolHealthLevel::Healthy
+        );
+        assert_eq!(
+            classify_pool_health(8, 0, None),
+            PoolHealthLevel::HighUtilization
+        );
+    }
+
+    #[test]
+    fn detect_connection_anomaly_catches_pool_timeout() {
+        assert_eq!(
+            detect_connection_anomaly(&sqlx::Error::PoolTimedOut),
+            Some(ConnectionAnomalyKind::PoolTimedOut)
+        );
     }
 }
 
 #[async_trait]
 impl MemoryStore for SqlMemoryStore {
     async fn insert(&self, memory: &Memory) -> Result<(), MemoriaError> {
-        self.insert_into("mem_memories", memory).await
+        let table = self.t("mem_memories");
+        self.insert_into(&table, memory).await
     }
 
     async fn get(&self, memory_id: &str) -> Result<Option<Memory>, MemoriaError> {
-        let row = sqlx::query(
-            "SELECT memory_id, user_id, memory_type, content, \
+        let table = self.t("mem_memories");
+        let row = sqlx::query(&format!(
+            "SELECT memory_id, user_id, author_id, memory_type, content, \
              embedding AS emb_str, session_id, \
              CAST(source_event_ids AS CHAR) AS src_ids, \
              CAST(extra_metadata AS CHAR) AS extra_meta, \
              is_active, superseded_by, trust_tier, initial_confidence, \
              observed_at, created_at, updated_at \
-             FROM mem_memories WHERE memory_id = ? AND is_active = 1",
-        )
+             FROM {table} WHERE memory_id = ? AND is_active = 1"
+        ))
         .bind(memory_id)
         .fetch_optional(&self.pool)
         .await
@@ -2950,6 +5719,7 @@ impl MemoryStore for SqlMemoryStore {
 
     async fn update(&self, memory: &Memory) -> Result<(), MemoriaError> {
         let now = Utc::now().naive_utc();
+        let table = self.t("mem_memories");
         // Workaround: MO#23859 — PREPARE/EXECUTE corrupts NULL JSON on 2nd+ execution.
         let extra_metadata = memory
             .extra_metadata
@@ -2957,19 +5727,19 @@ impl MemoryStore for SqlMemoryStore {
             .map(serde_json::to_string)
             .transpose()?
             .unwrap_or_else(|| "{}".to_string());
-        sqlx::query(
-            r#"UPDATE mem_memories
-               SET content = ?, memory_type = ?, trust_tier = ?,
-                   initial_confidence = ?, extra_metadata = ?,
-                   superseded_by = ?, updated_at = ?
-               WHERE memory_id = ?"#,
-        )
+        sqlx::query(&format!(
+            "UPDATE {table} \
+             SET content = ?, memory_type = ?, trust_tier = ?, \
+                 initial_confidence = ?, extra_metadata = ?, \
+                 superseded_by = ?, updated_at = ? \
+             WHERE memory_id = ?"
+        ))
         .bind(&memory.content)
         .bind(memory.memory_type.to_string())
         .bind(memory.trust_tier.to_string())
         .bind(memory.initial_confidence as f32)
         .bind(extra_metadata)
-        .bind(&memory.superseded_by)
+        .bind(nullable_str(&memory.superseded_by))
         .bind(now)
         .bind(&memory.memory_id)
         .execute(&self.pool)
@@ -2980,17 +5750,21 @@ impl MemoryStore for SqlMemoryStore {
 
     async fn soft_delete(&self, memory_id: &str) -> Result<(), MemoriaError> {
         let now = Utc::now().naive_utc();
-        sqlx::query("UPDATE mem_memories SET is_active = 0, updated_at = ? WHERE memory_id = ?")
-            .bind(now)
-            .bind(memory_id)
-            .execute(&self.pool)
-            .await
-            .map_err(db_err)?;
+        let table = self.t("mem_memories");
+        sqlx::query(&format!(
+            "UPDATE {table} SET is_active = 0, updated_at = ? WHERE memory_id = ?"
+        ))
+        .bind(now)
+        .bind(memory_id)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
         Ok(())
     }
 
     async fn list_active(&self, user_id: &str, limit: i64) -> Result<Vec<Memory>, MemoriaError> {
-        self.list_active_from("mem_memories", user_id, limit).await
+        let table = self.t("mem_memories");
+        self.list_active_from(&table, user_id, limit).await
     }
 
     async fn search_fulltext(
@@ -2999,7 +5773,8 @@ impl MemoryStore for SqlMemoryStore {
         query: &str,
         limit: i64,
     ) -> Result<Vec<Memory>, MemoriaError> {
-        self.search_fulltext_from("mem_memories", user_id, query, limit)
+        let table = self.t("mem_memories");
+        self.search_fulltext_from(&table, user_id, query, limit)
             .await
     }
 
@@ -3009,38 +5784,16 @@ impl MemoryStore for SqlMemoryStore {
         embedding: &[f32],
         limit: i64,
     ) -> Result<Vec<Memory>, MemoriaError> {
-        self.search_vector_from("mem_memories", user_id, embedding, limit)
+        let table = self.t("mem_memories");
+        self.search_vector_from(&table, user_id, embedding, limit)
             .await
     }
 }
 
-fn row_to_memory(row: &sqlx::mysql::MySqlRow) -> Result<Memory, MemoriaError> {
+/// Shared base fields for both full and lite row mappers.
+fn row_to_memory_base(row: &sqlx::mysql::MySqlRow) -> Result<Memory, MemoriaError> {
     let memory_type_str: String = row.try_get("memory_type").map_err(db_err)?;
     let trust_tier_str: String = row.try_get("trust_tier").map_err(db_err)?;
-
-    let source_event_ids: Vec<String> = {
-        let s: String = row.try_get("src_ids").map_err(db_err)?;
-        serde_json::from_str(&s)?
-    };
-    let extra_metadata = {
-        let s: Option<String> = row.try_get("extra_meta").map_err(db_err)?;
-        // Workaround: MO#23859 — we store "{}" instead of NULL; treat empty object as None.
-        s.filter(|v| v != "{}")
-            .map(|v| serde_json::from_str(&v))
-            .transpose()?
-    };
-    let embedding: Option<Vec<f32>> = {
-        // Try emb_str first (for compatibility with old queries that use CAST)
-        if let Ok(Some(s)) = row.try_get::<Option<String>, _>("emb_str") {
-            Some(mo_to_vec(&s)?)
-        } else if let Ok(Some(s)) = row.try_get::<Option<String>, _>("embedding") {
-            // Direct embedding column (MatrixOne returns vector as string)
-            Some(mo_to_vec(&s)?)
-        } else {
-            // No embedding column in result set (e.g., vector search queries)
-            None
-        }
-    };
     let observed_at = row
         .try_get::<chrono::NaiveDateTime, _>("observed_at")
         .ok()
@@ -3057,25 +5810,62 @@ fn row_to_memory(row: &sqlx::mysql::MySqlRow) -> Result<Memory, MemoriaError> {
     Ok(Memory {
         memory_id: row.try_get("memory_id").map_err(db_err)?,
         user_id: row.try_get("user_id").map_err(db_err)?,
+        author_id: row
+            .try_get::<Option<String>, _>("author_id")
+            .unwrap_or(None),
         memory_type: MemoryType::from_str(&memory_type_str)?,
         content: row.try_get("content").map_err(db_err)?,
         initial_confidence: row
             .try_get::<f32, _>("initial_confidence")
             .map_err(db_err)? as f64,
-        embedding,
-        source_event_ids,
-        superseded_by: row.try_get("superseded_by").map_err(db_err)?,
+        embedding: None,
+        source_event_ids: Vec::new(),
+        superseded_by: nullable_str_from_row(row.try_get("superseded_by").map_err(db_err)?),
         is_active: {
             let v: i8 = row.try_get("is_active").map_err(db_err)?;
             v != 0
         },
         access_count: 0,
-        session_id: row.try_get("session_id").map_err(db_err)?,
+        session_id: nullable_str_from_row(row.try_get("session_id").map_err(db_err)?),
         observed_at,
         created_at,
         updated_at,
-        extra_metadata,
+        extra_metadata: None,
         trust_tier: TrustTier::from_str(&trust_tier_str)?,
         retrieval_score: None,
     })
+}
+
+fn row_to_memory(row: &sqlx::mysql::MySqlRow) -> Result<Memory, MemoriaError> {
+    let mut m = row_to_memory_base(row)?;
+
+    m.source_event_ids = {
+        let s: String = row.try_get("src_ids").map_err(db_err)?;
+        serde_json::from_str(&s)?
+    };
+    m.extra_metadata = {
+        let s: Option<String> = row.try_get("extra_meta").map_err(db_err)?;
+        // Workaround: MO#23859 — we store "{}" instead of NULL; treat empty object as None.
+        s.filter(|v| v != "{}")
+            .map(|v| serde_json::from_str(&v))
+            .transpose()?
+    };
+    m.embedding = {
+        // Try emb_str first (for compatibility with old queries that use CAST)
+        if let Ok(Some(s)) = row.try_get::<Option<String>, _>("emb_str") {
+            Some(mo_to_vec(&s)?)
+        } else if let Ok(Some(s)) = row.try_get::<Option<String>, _>("embedding") {
+            // Direct embedding column (MatrixOne returns vector as string)
+            Some(mo_to_vec(&s)?)
+        } else {
+            // No embedding column in result set (e.g., vector search queries)
+            None
+        }
+    };
+    Ok(m)
+}
+
+/// Lightweight row mapper — skips embedding, source_event_ids, extra_metadata.
+fn row_to_memory_lite(row: &sqlx::mysql::MySqlRow) -> Result<Memory, MemoriaError> {
+    row_to_memory_base(row)
 }

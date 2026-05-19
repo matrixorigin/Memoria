@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PLUGIN_ID="memory-memoria"
-DEFAULT_REPO_URL="https://github.com/matrixorigin/openclaw-memoria.git"
+PLUGIN_ID="thememoria"
+DEFAULT_REPO_URL="https://github.com/matrixorigin/Memoria.git"
 DEFAULT_REPO_REF="main"
 DEFAULT_MEMORIA_VERSION="v0.1.0"
 
@@ -39,12 +39,18 @@ MEMORIA_TOOL_NAMES=(
 )
 
 log() {
-  printf '[memory-memoria] %s\n' "$*"
+  printf '[thememoria] %s\n' "$*"
 }
 
 fail() {
-  printf '[memory-memoria] error: %s\n' "$*" >&2
+  printf '[thememoria] error: %s\n' "$*" >&2
   exit 1
+}
+
+binary_lacks_local_embedding_support() {
+  local bin_path="$1"
+  [[ -f "${bin_path}" ]] || return 1
+  LC_ALL=C grep -a -q 'compiled without local-embedding feature' "${bin_path}"
 }
 
 need_cmd() {
@@ -114,6 +120,7 @@ Options:
   --memoria-bin <path|command>  Use an existing memoria executable.
   --memoria-version <tag>       Rust Memoria release tag. Default: v0.1.0.
   --memoria-install-dir <path>  Where to install memoria if it is missing.
+  --binary-only                 Only install/validate the memoria binary, then exit.
   --skip-memoria-install        Require an existing memoria executable.
   --skip-plugin-install         Assume the plugin is already installed/enabled in OpenClaw.
   --verify                      Run verify_plugin_install.mjs after installation.
@@ -337,6 +344,7 @@ MEMORIA_RELEASE_TAG="${MEMORIA_RELEASE_TAG:-$DEFAULT_MEMORIA_VERSION}"
 MEMORIA_BINARY_INSTALL_DIR="${MEMORIA_BINARY_INSTALL_DIR:-$HOME/.local/bin}"
 SKIP_MEMORIA_INSTALL=false
 SKIP_PLUGIN_INSTALL=false
+BINARY_ONLY=false
 RUN_VERIFY=false
 
 while [[ $# -gt 0 ]]; do
@@ -375,6 +383,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --skip-memoria-install)
       SKIP_MEMORIA_INSTALL=true
+      shift
+      ;;
+    --binary-only)
+      BINARY_ONLY=true
       shift
       ;;
     --skip-plugin-install)
@@ -436,6 +448,13 @@ else
   log "Using existing checkout: ${SOURCE_DIR}"
 fi
 
+if [[ ! -f "${SOURCE_DIR}/openclaw.plugin.json" || ! -f "${SOURCE_DIR}/package.json" ]]; then
+  if [[ -f "${SOURCE_DIR}/plugins/openclaw/openclaw.plugin.json" && -f "${SOURCE_DIR}/plugins/openclaw/package.json" ]]; then
+    SOURCE_DIR="${SOURCE_DIR}/plugins/openclaw"
+    log "Resolved plugin source directory: ${SOURCE_DIR}"
+  fi
+fi
+
 [[ -f "${SOURCE_DIR}/openclaw.plugin.json" ]] || fail "Missing openclaw.plugin.json in ${SOURCE_DIR}"
 [[ -f "${SOURCE_DIR}/package.json" ]] || fail "Missing package.json in ${SOURCE_DIR}"
 
@@ -447,6 +466,16 @@ else
   log "Installed memoria executable: ${MEMORIA_EXECUTABLE_VALUE}"
 fi
 log "Memoria version: $("${MEMORIA_EXECUTABLE_VALUE}" --version 2>/dev/null | head -n 1)"
+
+if [[ "${BINARY_ONLY}" == true ]]; then
+  cat <<EOF
+
+Binary install complete.
+
+Memoria executable: ${MEMORIA_EXECUTABLE_VALUE}
+EOF
+  exit 0
+fi
 
 MEMORIA_DB_URL="$(normalize_db_url "${MEMORIA_DB_URL:-mysql://root:111@127.0.0.1:6001/memoria}")"
 MEMORIA_DEFAULT_USER_ID="${MEMORIA_DEFAULT_USER_ID:-openclaw-user}"
@@ -485,7 +514,10 @@ if [[ "${MEMORIA_EMBEDDING_PROVIDER}" != "local" && -z "${MEMORIA_EMBEDDING_DIM}
   log "Auto-selected embedding dimension ${MEMORIA_EMBEDDING_DIM} for ${MEMORIA_EMBEDDING_MODEL}"
 fi
 if [[ "${MEMORIA_EMBEDDING_PROVIDER}" == "local" ]]; then
-  log "Embedding provider is local. Make sure your memoria binary was built with local-embedding support."
+  if binary_lacks_local_embedding_support "${MEMORIA_EXECUTABLE_VALUE}"; then
+    fail "MEMORIA_EMBEDDING_PROVIDER=local requires a memoria binary built with local-embedding support. Resolved ${MEMORIA_EXECUTABLE_VALUE}, but that binary was built without the feature. Use a remote embedding provider or install/rebuild a local-embedding-enabled memoria binary."
+  fi
+  log "Embedding provider is local and the selected memoria binary passed the local-embedding capability check."
 fi
 if [[ "${MEMORIA_AUTO_OBSERVE}" == "true" ]]; then
   [[ -n "${MEMORIA_LLM_API_KEY}" ]] || fail "MEMORIA_AUTO_OBSERVE=true requires MEMORIA_LLM_API_KEY"

@@ -39,8 +39,9 @@ sqlx = { workspace = true }
 sha2 = "0.10"
 subtle = "2.6"
 base64 = "0.22"
+async-trait = { workspace = true }
 tempfile = "3.14"
-moka = { version = "0.12", features = ["future"] }
+moka = { version = "0.12", features = ["future", "sync"] }
 
 [dev-dependencies]
 tokio = { workspace = true }
@@ -51,3 +52,4 @@ memoria-service = { workspace = true }
 memoria-test-utils = { workspace = true }
 ed25519-dalek = { version = "2.1", default-features = false, features = ["std"] }
 uuid = { workspace = true }
+serial_test = "3.4.0"

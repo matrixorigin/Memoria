@@ -1,18 +1,18 @@
 ---
-name: memory-memoria
+name: thememoria
 description: |
   Use Memoria as OpenClaw's durable memory slot.
   Triggers: "remember this", "save to memory", "what do you remember",
   "continue from last time", "forget this", "correct memory", "take a snapshot",
   "rollback memory", "branch memory", "merge memory", "use long-term memory".
-version: 0.1.0
+version: 0.2.0
 metadata:
   openclaw:
     emoji: "🧠"
     homepage: https://github.com/matrixorigin/Memoria
 ---
 
-# Memory (Memoria)
+# Memoria
 
 Use this skill when OpenClaw should treat Memoria as the durable external memory system for the current user or project.
 
@@ -46,16 +46,15 @@ Pick the smallest reference that matches the task:
 
 ## Important Notes
 
-- OpenClaw's built-in file memory is separate from Memoria.
-- The Memoria plugin defaults to explicit writes, not silent auto-capture.
+- OpenClaw's built-in file memory (`openclaw memory`) is separate from Memoria (`openclaw memoria`).
+- The plugin defaults to explicit writes, not silent auto-capture.
 - `memory_get` is a compatibility helper; when in doubt, prefer `memory_retrieve`, `memory_search`, or `memory_list`.
 - Memoria's core strengths are semantic retrieval, durable cross-session memory, snapshots, rollback, branches, merge, and governance.
 
 ## Quick Start
 
 ```bash
-openclaw plugins install @matrixorigin/memory-memoria
-openclaw plugins enable memory-memoria
-openclaw memoria install
-openclaw memoria verify
+openclaw plugins install @matrixorigin/thememoria
+openclaw memoria setup --mode cloud --api-url <MEMORIA_API_URL> --api-key <API_KEY>
+openclaw memoria health
 ```

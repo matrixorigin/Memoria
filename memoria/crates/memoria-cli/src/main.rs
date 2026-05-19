@@ -7,11 +7,13 @@
 //!   memoria status        — show configuration status
 //!   memoria rules         — write/update steering rules (auto-detect or --tool)
 //!   memoria benchmark     — run benchmark against a Memoria API server
+//!   memoria migrate       — run offline migration and cutover tooling
 
 mod benchmark;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
+use std::future::IntoFuture;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -36,6 +38,11 @@ const CLAUDE_MEMORY_HYGIENE: &str = include_str!("../templates/claude_memory_hyg
 const CLAUDE_MEMORY_BRANCHING: &str = include_str!("../templates/claude_memory_branching.md");
 const CLAUDE_GOAL_EVOLUTION: &str = include_str!("../templates/claude_goal_evolution.md");
 const CODEX_AGENTS: &str = include_str!("../templates/codex_agents.md");
+const GEMINI_RULE: &str = include_str!("../templates/gemini_rule.md");
+const GEMINI_SESSION_LIFECYCLE: &str = include_str!("../templates/gemini_session_lifecycle.md");
+const GEMINI_MEMORY_HYGIENE: &str = include_str!("../templates/gemini_memory_hygiene.md");
+const GEMINI_MEMORY_BRANCHING: &str = include_str!("../templates/gemini_memory_branching.md");
+const GEMINI_GOAL_EVOLUTION: &str = include_str!("../templates/gemini_goal_evolution.md");
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
 
@@ -45,6 +52,7 @@ enum ToolName {
     Cursor,
     Claude,
     Codex,
+    Gemini,
 }
 
 impl std::fmt::Display for ToolName {
@@ -54,6 +62,7 @@ impl std::fmt::Display for ToolName {
             ToolName::Cursor => write!(f, "cursor"),
             ToolName::Claude => write!(f, "claude"),
             ToolName::Codex => write!(f, "codex"),
+            ToolName::Gemini => write!(f, "gemini"),
         }
     }
 }
@@ -72,6 +81,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Start REST API server
+    #[cfg(feature = "server-runtime")]
     Serve {
         #[arg(long, env = "DATABASE_URL")]
         db_url: Option<String>,
@@ -81,10 +91,12 @@ enum Commands {
         master_key: String,
     },
     /// Start MCP server (embedded or remote mode)
+    #[cfg(feature = "server-runtime")]
     Mcp {
-        /// AI tool that launched this MCP server (sent as X-Memoria-Tool header)
+        /// AI tool that launched this MCP server (sent as X-Memoria-Tool header).
+        /// Accepts any string (e.g. kiro, cursor, opencode, my-agent).
         #[arg(long, env = "MEMORIA_TOOL")]
-        tool: Option<ToolName>,
+        tool: Option<String>,
         /// Remote Memoria API URL (remote mode)
         #[arg(long, env = "MEMORIA_API_URL")]
         api_url: Option<String>,
@@ -131,7 +143,7 @@ enum Commands {
     /// Write MCP config + steering rules (-i for interactive wizard)
     Init {
         /// AI tool to configure
-        #[arg(long, value_name = "kiro|cursor|claude")]
+        #[arg(long, value_name = "kiro|cursor|claude|gemini")]
         tool: Vec<ToolName>,
         /// Interactive setup wizard
         #[arg(short = 'i', long)]
@@ -162,7 +174,7 @@ enum Commands {
     /// Write/update steering rules (auto-detect or specify --tool, --force to overwrite)
     Rules {
         /// AI tool to write rules for (auto-detected if omitted)
-        #[arg(long, value_name = "kiro|cursor|claude")]
+        #[arg(long, value_name = "kiro|cursor|claude|gemini")]
         tool: Vec<ToolName>,
         /// Interactive tool selection
         #[arg(short = 'i', long)]
@@ -194,6 +206,11 @@ enum Commands {
     Plugin {
         #[command(subcommand)]
         command: PluginCommands,
+    },
+    /// Run offline migration tooling
+    Migrate {
+        #[command(subcommand)]
+        command: MigrationCommands,
     },
 }
 
@@ -341,14 +358,169 @@ enum PluginCommands {
     },
 }
 
+#[derive(Subcommand)]
+enum MigrationCommands {
+    /// Migrate a legacy single-db deployment into shared DB + per-user DB layout
+    LegacyToMultiDb {
+        /// Legacy single-db DATABASE_URL (source)
+        #[arg(long, env = "DATABASE_URL")]
+        legacy_db_url: String,
+        /// Shared DB URL for the target multi-db deployment
+        #[arg(long, env = "MEMORIA_SHARED_DATABASE_URL")]
+        shared_db_url: String,
+        /// Embedding dimension used by the target schema
+        #[arg(long, env = "EMBEDDING_DIM", default_value_t = 1024)]
+        embedding_dim: usize,
+        /// Limit per-user migration to one or more users (for rehearsal/troubleshooting)
+        #[arg(long = "user")]
+        user_ids: Vec<String>,
+        /// Number of users to migrate in parallel (default: 1 = serial)
+        #[arg(long, default_value_t = 1)]
+        concurrency: usize,
+        /// Execute the migration; without this flag, the command performs a dry run only
+        #[arg(long)]
+        execute: bool,
+        /// Save the full migration report as JSON
+        #[arg(long)]
+        report_out: Option<String>,
+    },
+}
+
 // ── Serve (API server) ────────────────────────────────────────────────────────
 
+#[cfg(feature = "server-runtime")]
+fn configured_server_pool_size(env_name: &str, default: u32, upper: u32) -> u32 {
+    std::env::var(env_name)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default)
+        .clamp(1, upper)
+}
+
+#[cfg(feature = "server-runtime")]
+const LEGACY_MIGRATION_MAX_CONCURRENCY_ENV: &str = "MEMORIA_LEGACY_MIGRATION_MAX_CONCURRENCY";
+#[cfg(feature = "server-runtime")]
+const LEGACY_MIGRATION_DEFAULT_CONCURRENCY: usize = 6;
+
+#[cfg(feature = "server-runtime")]
+fn configured_legacy_migration_concurrency() -> usize {
+    std::env::var(LEGACY_MIGRATION_MAX_CONCURRENCY_ENV)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .or_else(|| {
+            std::env::var("MEMORIA_USER_SCHEMA_INIT_MAX_CONCURRENCY")
+                .ok()
+                .and_then(|s| s.parse().ok())
+        })
+        .unwrap_or(LEGACY_MIGRATION_DEFAULT_CONCURRENCY)
+        .clamp(1, 64)
+}
+
+#[cfg(feature = "server-runtime")]
+async fn connect_git_pool(database_url: &str, multi_db: bool) -> Result<sqlx::MySqlPool> {
+    use sqlx::mysql::MySqlPoolOptions;
+
+    let default_max = if multi_db { 8 } else { 10 };
+    let max_connections =
+        configured_server_pool_size("MEMORIA_GIT_POOL_MAX_CONNECTIONS", default_max, 64);
+    let pool = MySqlPoolOptions::new()
+        .max_connections(max_connections)
+        .max_lifetime(std::time::Duration::from_secs(3600))
+        .idle_timeout(std::time::Duration::from_secs(300))
+        .acquire_timeout(std::time::Duration::from_secs(10))
+        .connect(database_url)
+        .await?;
+    tracing::info!(max_connections, "Git-for-data connection pool initialized");
+    Ok(pool)
+}
+
+#[cfg(feature = "server-runtime")]
+fn apply_detected_runtime_topology(
+    cfg: &mut memoria_service::Config,
+    topology: memoria_storage::RuntimeTopology,
+) -> Option<memoria_storage::PendingLegacyMultiDbMigration> {
+    use memoria_storage::RuntimeTopology;
+
+    match topology {
+        RuntimeTopology::FreshSingleDb => {
+            tracing::info!(
+                shared_db_url = %redact_url(&cfg.shared_db_url),
+                "Detected fresh deployment; continuing startup in multi-db mode"
+            );
+            enable_runtime_multi_db(cfg);
+            None
+        }
+        RuntimeTopology::MultiDbReady => {
+            tracing::info!(
+                shared_db_url = %redact_url(&cfg.shared_db_url),
+                "Detected completed shared registry behind legacy config; continuing in multi-db mode"
+            );
+            enable_runtime_multi_db(cfg);
+            None
+        }
+        RuntimeTopology::PendingLegacyMigration(pending) => Some(pending),
+    }
+}
+
+#[cfg(feature = "server-runtime")]
+async fn bootstrap_runtime_topology(cfg: &mut memoria_service::Config) -> Result<()> {
+    use memoria_storage::{
+        detect_runtime_topology, execute_legacy_single_db_to_multi_db,
+        LegacyToMultiDbMigrationOptions,
+    };
+
+    if cfg.multi_db {
+        return Ok(());
+    }
+
+    let Some(pending) = apply_detected_runtime_topology(
+        cfg,
+        detect_runtime_topology(&cfg.db_url, &cfg.shared_db_url).await?,
+    ) else {
+        return Ok(());
+    };
+
+    let migration_concurrency = configured_legacy_migration_concurrency();
+    tracing::info!(
+        legacy_db_name = %pending.legacy_db_name,
+        shared_db_name = %pending.shared_db_name,
+        users = pending.legacy_users.len(),
+        missing_users = pending.missing_users.len(),
+        migration_concurrency,
+        "Auto-migrating legacy single-db deployment before startup"
+    );
+    execute_legacy_single_db_to_multi_db(
+        &cfg.db_url,
+        &cfg.shared_db_url,
+        cfg.embedding_dim,
+        LegacyToMultiDbMigrationOptions {
+            user_ids: Vec::new(),
+            concurrency: migration_concurrency,
+        },
+    )
+    .await?;
+    enable_runtime_multi_db(cfg);
+    tracing::info!(
+        shared_db_url = %redact_url(&cfg.shared_db_url),
+        "Legacy migration completed; continuing startup in multi-db mode"
+    );
+    Ok(())
+}
+
+#[cfg(feature = "server-runtime")]
+fn enable_runtime_multi_db(cfg: &mut memoria_service::Config) {
+    cfg.multi_db = true;
+    if let Some(db_name) = parse_db_name(&cfg.shared_db_url) {
+        cfg.db_name = db_name;
+    }
+}
+
+#[cfg(feature = "server-runtime")]
 async fn cmd_serve(db_url: Option<String>, port: u16, master_key: String) -> Result<()> {
     use memoria_api::{build_router, AppState};
     use memoria_git::GitForDataService;
-    use memoria_service::{Config, MemoryService};
-    use memoria_storage::SqlMemoryStore;
-    use sqlx::mysql::MySqlPool;
+    use memoria_service::{shutdown_signal, Config, MemoryService};
+    use memoria_storage::{DbRouter, SqlMemoryStore};
     use tower_http::trace::TraceLayer;
 
     memoria_api::otel::init_tracing();
@@ -358,15 +530,19 @@ async fn cmd_serve(db_url: Option<String>, port: u16, master_key: String) -> Res
         cfg.db_url = v;
     }
 
-    // Auto-infer embedding dimension when EMBEDDING_DIM=0 (or unset).
-    // Probes the embedding service with a test call and uses the returned
-    // vector length as the actual dimension.
+    validate_embedding_config(&cfg)?;
+    bootstrap_runtime_topology(&mut cfg).await?;
     if cfg.embedding_dim == 0 && cfg.has_embedding() {
         cfg.embedding_dim = probe_embedding_dim(&cfg).await?;
     }
+    let redacted_db_url = redact_url(&cfg.db_url);
+    let redacted_shared_db_url = redact_url(&cfg.shared_db_url);
 
     tracing::info!(
-        db_url = %cfg.db_url, port = port,
+        db_url = %redacted_db_url,
+        shared_db_url = %redacted_shared_db_url,
+        multi_db = cfg.multi_db,
+        port = port,
         instance_id = %cfg.instance_id,
         embedding_dim = cfg.embedding_dim,
         has_llm = cfg.has_llm(),
@@ -376,39 +552,124 @@ async fn cmd_serve(db_url: Option<String>, port: u16, master_key: String) -> Res
         "Starting Memoria API server"
     );
 
-    let store = SqlMemoryStore::connect(&cfg.db_url, cfg.embedding_dim, cfg.instance_id.clone()).await?;
-    store.migrate().await?;
-    store.check_embedding_dim_compat().await?;
-
-    let pool = MySqlPool::connect(&cfg.db_url).await?;
-    let git = Arc::new(GitForDataService::new(pool, &cfg.db_name));
+    let (store, db_router, git) = if cfg.multi_db {
+        let router = Arc::new(
+            DbRouter::connect(
+                &cfg.shared_db_url,
+                cfg.embedding_dim,
+                cfg.instance_id.clone(),
+            )
+            .await?,
+        );
+        let shared_pool = router.shared_pool().clone();
+        let shared_pool_max_connections = router.shared_pool_max_connections();
+        tracing::info!(
+            shared_pool_max_connections,
+            "Reusing shared database pool for shared store and git service"
+        );
+        let mut store = SqlMemoryStore::from_existing_pool(
+            shared_pool.clone(),
+            cfg.embedding_dim,
+            cfg.instance_id.clone(),
+            Some(cfg.shared_db_url.clone()),
+            Some(shared_pool_max_connections),
+            "shared_db_merged_pool",
+        );
+        store.migrate_shared().await?;
+        store.check_embedding_dim_compat().await?;
+        store.set_db_router(router.clone());
+        let git = Arc::new(GitForDataService::new(
+            shared_pool,
+            router.shared_db_name().to_string(),
+        ));
+        (Arc::new(store), Some(router), git)
+    } else {
+        let store =
+            SqlMemoryStore::connect(&cfg.db_url, cfg.embedding_dim, cfg.instance_id.clone())
+                .await?;
+        store.migrate().await?;
+        store.check_embedding_dim_compat().await?;
+        let pool = connect_git_pool(&cfg.db_url, false).await?;
+        let git_db_name = parse_db_name(&cfg.db_url).unwrap_or_else(|| cfg.db_name.clone());
+        let git = Arc::new(GitForDataService::new(pool, git_db_name));
+        (Arc::new(store), None, git)
+    };
 
     let embedder = build_embedder(&cfg);
     let llm = build_llm(&cfg);
 
-    let service = Arc::new(MemoryService::new_sql_with_llm(
-        Arc::new(store),
-        embedder,
-        llm,
-    ));
+    let service =
+        Arc::new(MemoryService::new_sql_with_llm_and_router(store, db_router, embedder, llm).await);
     Arc::new(memoria_service::GovernanceScheduler::from_config(service.clone(), &cfg).await?)
         .start();
-    let state = AppState::new(service, git, master_key)
+    let state = AppState::new(service.clone(), git, master_key)
         .with_instance_id(cfg.instance_id.clone())
-        .init_auth_pool(&cfg.db_url)
-        .await;
+        .init_auth_pool(cfg.effective_sql_url(), cfg.ops_metrics_enabled)
+        .await?;
 
-    let app = build_router(state).layer(TraceLayer::new_for_http());
+    let app = build_router(state.clone()).layer(TraceLayer::new_for_http());
     let addr = format!("0.0.0.0:{}", port);
     tracing::info!("Listening on {addr}");
     let listener = tokio::net::TcpListener::bind(&addr).await?;
-    axum::serve(listener, app).await?;
+    run_with_edit_log_drain(
+        service,
+        axum::serve(listener, app).with_graceful_shutdown(shutdown_signal()),
+    )
+    .await?;
+    state.drain_flushers().await;
     Ok(())
+}
+
+fn parse_db_name(database_url: &str) -> Option<String> {
+    let suffix_start = database_url.find(['?', '#']).unwrap_or(database_url.len());
+    let without_suffix = &database_url[..suffix_start];
+    let (_, db_name) = without_suffix.rsplit_once('/')?;
+    if db_name.is_empty() {
+        return None;
+    }
+    Some(db_name.to_string())
+}
+
+fn redact_url(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url.to_string();
+    };
+    let Some((userinfo, host)) = rest.split_once('@') else {
+        return url.to_string();
+    };
+    if userinfo.is_empty() {
+        return url.to_string();
+    }
+    let redacted_userinfo = if userinfo.contains(':') {
+        "***:***"
+    } else {
+        "***"
+    };
+    format!("{scheme}://{redacted_userinfo}@{host}")
+}
+
+fn normalize_tool_name(tool: Option<String>) -> Option<String> {
+    tool.and_then(|raw| {
+        // Normalize to the same format the dashboard uses:
+        // trim, lowercase, collapse whitespace runs into a single hyphen.
+        // "My Agent" → "my-agent", "cursor" → "cursor".
+        let lower = raw.trim().to_ascii_lowercase();
+        let normalized = lower
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join("-");
+        if normalized.is_empty() {
+            None
+        } else {
+            Some(normalized)
+        }
+    })
 }
 
 // ── MCP server ────────────────────────────────────────────────────────────────
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(feature = "server-runtime")]
 async fn cmd_mcp(
     tool: Option<String>,
     api_url: Option<String>,
@@ -428,8 +689,7 @@ async fn cmd_mcp(
 ) -> Result<()> {
     use memoria_git::GitForDataService;
     use memoria_service::{Config, MemoryService};
-    use memoria_storage::SqlMemoryStore;
-    use sqlx::mysql::MySqlPool;
+    use memoria_storage::{DbRouter, SqlMemoryStore};
 
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
@@ -439,8 +699,12 @@ async fn cmd_mcp(
     if let Some(api_url) = &api_url {
         let user = user.clone().unwrap_or_else(|| "default".to_string());
         tracing::info!(api_url = %api_url, user = %user, "Starting Memoria MCP (remote mode)");
-        let remote =
-            memoria_mcp::remote::RemoteClient::new(api_url, token.as_deref(), user.clone(), tool.as_deref());
+        let remote = memoria_mcp::remote::RemoteClient::new(
+            api_url,
+            token.as_deref(),
+            user.clone(),
+            tool.as_deref(),
+        );
         return memoria_mcp::run_stdio_remote(remote, user).await;
     }
 
@@ -476,6 +740,10 @@ async fn cmd_mcp(
     if let Some(v) = db_name {
         cfg.db_name = v;
     }
+    validate_embedding_config(&cfg)?;
+    bootstrap_runtime_topology(&mut cfg).await?;
+    let redacted_db_url = redact_url(&cfg.db_url);
+    let redacted_shared_db_url = redact_url(&cfg.shared_db_url);
 
     // Auto-infer embedding dimension when EMBEDDING_DIM=0 (or unset).
     if cfg.embedding_dim == 0 && cfg.has_embedding() {
@@ -483,7 +751,9 @@ async fn cmd_mcp(
     }
 
     tracing::info!(
-        db_url = %cfg.db_url,
+        db_url = %redacted_db_url,
+        shared_db_url = %redacted_shared_db_url,
+        multi_db = cfg.multi_db,
         embedding_provider = %cfg.embedding_provider,
         embedding_dim = cfg.embedding_dim,
         has_llm = cfg.has_llm(),
@@ -492,28 +762,69 @@ async fn cmd_mcp(
         "Starting Memoria MCP (embedded mode)"
     );
 
-    let store = SqlMemoryStore::connect(&cfg.db_url, cfg.embedding_dim, cfg.instance_id.clone()).await?;
-    store.migrate().await?;
-    store.check_embedding_dim_compat().await?;
-
-    let pool = MySqlPool::connect(&cfg.db_url).await?;
-    let git = Arc::new(GitForDataService::new(pool, &cfg.db_name));
+    let (store, db_router, git) = if cfg.multi_db {
+        let router = Arc::new(
+            DbRouter::connect(
+                &cfg.shared_db_url,
+                cfg.embedding_dim,
+                cfg.instance_id.clone(),
+            )
+            .await?,
+        );
+        let shared_pool = router.shared_pool().clone();
+        let shared_pool_max_connections = router.shared_pool_max_connections();
+        tracing::info!(
+            shared_pool_max_connections,
+            "Reusing shared database pool for shared store and git service"
+        );
+        let mut store = SqlMemoryStore::from_existing_pool(
+            shared_pool.clone(),
+            cfg.embedding_dim,
+            cfg.instance_id.clone(),
+            Some(cfg.shared_db_url.clone()),
+            Some(shared_pool_max_connections),
+            "shared_db_merged_pool",
+        );
+        store.migrate_shared().await?;
+        store.check_embedding_dim_compat().await?;
+        store.set_db_router(router.clone());
+        let git = Arc::new(GitForDataService::new(
+            shared_pool,
+            router.shared_db_name().to_string(),
+        ));
+        (Arc::new(store), Some(router), git)
+    } else {
+        let store =
+            SqlMemoryStore::connect(&cfg.db_url, cfg.embedding_dim, cfg.instance_id.clone())
+                .await?;
+        store.migrate().await?;
+        store.check_embedding_dim_compat().await?;
+        let pool = connect_git_pool(&cfg.db_url, false).await?;
+        let git_db_name = parse_db_name(&cfg.db_url).unwrap_or_else(|| cfg.db_name.clone());
+        let git = Arc::new(GitForDataService::new(pool, git_db_name));
+        (Arc::new(store), None, git)
+    };
 
     let embedder = build_embedder(&cfg);
     let llm = build_llm(&cfg);
 
-    let service = Arc::new(MemoryService::new_sql_with_llm(
-        Arc::new(store),
-        embedder,
-        llm,
-    ));
+    let service =
+        Arc::new(MemoryService::new_sql_with_llm_and_router(store, db_router, embedder, llm).await);
     Arc::new(memoria_service::GovernanceScheduler::from_config(service.clone(), &cfg).await?)
         .start();
 
     if transport == "sse" {
-        memoria_mcp::run_sse(service, git, cfg.user, mcp_port).await
+        run_with_edit_log_drain(
+            service.clone(),
+            memoria_mcp::run_sse(service, git, cfg.user, mcp_port),
+        )
+        .await
     } else {
-        memoria_mcp::run_stdio(service, git, cfg.user).await
+        run_with_edit_log_drain(
+            service.clone(),
+            memoria_mcp::run_stdio(service, git, cfg.user),
+        )
+        .await
     }
 }
 
@@ -560,7 +871,8 @@ async fn cmd_plugin(command: PluginCommands) -> Result<()> {
     if let Some(db_url) = cfg_db_url {
         cfg.db_url = db_url;
     }
-    let store = SqlMemoryStore::connect(&cfg.db_url, cfg.embedding_dim, cfg.instance_id.clone()).await?;
+    let store =
+        SqlMemoryStore::connect(&cfg.db_url, cfg.embedding_dim, cfg.instance_id.clone()).await?;
     store.migrate().await?;
 
     match command {
@@ -759,6 +1071,124 @@ async fn cmd_plugin(command: PluginCommands) -> Result<()> {
     Ok(())
 }
 
+async fn cmd_migrate(command: MigrationCommands) -> Result<()> {
+    use memoria_storage::{
+        execute_legacy_single_db_to_multi_db, plan_legacy_single_db_to_multi_db,
+        LegacyToMultiDbMigrationOptions, LegacyToMultiDbMigrationReport, TableMigrationReport,
+    };
+
+    fn print_table_group(label: &str, items: &[TableMigrationReport]) {
+        if items.is_empty() {
+            return;
+        }
+        println!("{label}:");
+        for item in items {
+            let target = item
+                .target_rows
+                .map(|rows| rows.to_string())
+                .unwrap_or_else(|| "-".to_string());
+            let note = item
+                .note
+                .as_deref()
+                .map(|note| format!(" ({note})"))
+                .unwrap_or_default();
+            println!(
+                "  - {}\tsource={}\ttarget={}\tstatus={}{}",
+                item.table_name, item.source_rows, target, item.status, note
+            );
+        }
+    }
+
+    fn print_report(report: &LegacyToMultiDbMigrationReport) {
+        println!(
+            "Migration mode: {}",
+            if report.dry_run { "dry-run" } else { "execute" }
+        );
+        println!(
+            "Legacy DB: {}\nShared DB: {}\nUsers: {}",
+            report.legacy_db_name,
+            report.shared_db_name,
+            report.selected_users.len()
+        );
+        if let Some(snapshot) = report.pre_execute_account_snapshot.as_deref() {
+            println!("Pre-execute account snapshot: {snapshot}");
+        }
+        if !report.skipped_shared_runtime_tables.is_empty() {
+            println!(
+                "Skipped runtime tables: {}",
+                report.skipped_shared_runtime_tables.join(", ")
+            );
+        }
+        if !report.warnings.is_empty() {
+            println!("Warnings:");
+            for warning in &report.warnings {
+                println!("  - {warning}");
+            }
+        }
+        print_table_group("Shared tables", &report.shared_tables);
+        for user in &report.users {
+            println!(
+                "\nUser {}\n  target_db={}\n  active_branch={}\n  active_legacy_snapshots={}",
+                user.user_id,
+                user.target_db,
+                user.active_branch.as_deref().unwrap_or("main"),
+                user.active_snapshot_count
+            );
+            for warning in &user.warnings {
+                println!("  warning: {warning}");
+            }
+            print_table_group("  User tables", &user.tables);
+            print_table_group("  Branch tables", &user.branch_tables);
+        }
+    }
+
+    match command {
+        MigrationCommands::LegacyToMultiDb {
+            legacy_db_url,
+            shared_db_url,
+            embedding_dim,
+            user_ids,
+            concurrency,
+            execute,
+            report_out,
+        } => {
+            let options = LegacyToMultiDbMigrationOptions {
+                user_ids,
+                concurrency,
+            };
+            let report = if execute {
+                execute_legacy_single_db_to_multi_db(
+                    &legacy_db_url,
+                    &shared_db_url,
+                    embedding_dim,
+                    options,
+                )
+                .await?
+            } else {
+                plan_legacy_single_db_to_multi_db(
+                    &legacy_db_url,
+                    &shared_db_url,
+                    embedding_dim,
+                    options,
+                )
+                .await?
+            };
+            print_report(&report);
+            if let Some(path) = report_out {
+                std::fs::write(&path, serde_json::to_string_pretty(&report)?)?;
+                println!("Saved report: {path}");
+            }
+            if report.dry_run {
+                println!(
+                    "\nDry run only. Stop writers, resolve warnings, then rerun with --execute."
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
 // ── Plugin scaffolding ────────────────────────────────────────────────────────
 
 fn cmd_plugin_init(dir: &Path, name: &str, capabilities: &str, runtime: &str) -> Result<()> {
@@ -894,39 +1324,99 @@ async fn probe_embedding_dim(cfg: &memoria_service::Config) -> Result<usize> {
 fn build_embedder(
     cfg: &memoria_service::Config,
 ) -> Option<Arc<dyn memoria_core::interfaces::EmbeddingProvider>> {
-    use memoria_embedding::HttpEmbedder;
+    #[cfg(feature = "server-runtime")]
+    use memoria_api::InstrumentedEmbedder;
+    use memoria_embedding::{HttpEmbedder, RoundRobinEmbedder};
 
-    if cfg.embedding_provider == "mock" {
+    let (raw, provider_label): (Arc<dyn memoria_core::interfaces::EmbeddingProvider>, &str) = if cfg
+        .embedding_provider
+        == "mock"
+    {
         tracing::info!(dim = cfg.embedding_dim, "using mock embedder");
-        return Some(Arc::new(memoria_embedding::MockEmbedder::new(cfg.embedding_dim))
-            as Arc<dyn memoria_core::interfaces::EmbeddingProvider>);
-    }
-
-    if cfg.has_embedding() {
-        Some(Arc::new(HttpEmbedder::new(
-            &cfg.embedding_base_url,
-            &cfg.embedding_api_key,
-            &cfg.embedding_model,
-            cfg.embedding_dim,
-        ))
-            as Arc<dyn memoria_core::interfaces::EmbeddingProvider>)
+        (
+            Arc::new(memoria_embedding::MockEmbedder::new(cfg.embedding_dim)),
+            "mock",
+        )
+    } else if cfg.has_embedding() {
+        let endpoints = cfg.resolved_embedding_endpoints();
+        if endpoints.len() > 1 {
+            tracing::info!(
+                count = endpoints.len(),
+                model = %cfg.embedding_model,
+                "using round-robin HTTP embedder"
+            );
+            (
+                Arc::new(RoundRobinEmbedder::new(
+                    endpoints.into_iter().map(|e| (e.url, e.api_key)).collect(),
+                    &cfg.embedding_model,
+                    cfg.embedding_dim,
+                )),
+                "round-robin",
+            )
+        } else {
+            let ep = endpoints
+                .into_iter()
+                .next()
+                .expect("has_embedding() guarantees at least one endpoint");
+            tracing::info!(url = %ep.url, model = %cfg.embedding_model, "using single HTTP embedder");
+            (
+                Arc::new(HttpEmbedder::new(
+                    ep.url,
+                    ep.api_key,
+                    &cfg.embedding_model,
+                    cfg.embedding_dim,
+                )),
+                "http",
+            )
+        }
     } else if cfg.embedding_provider == "local" {
         #[cfg(feature = "local-embedding")]
         {
             let local = memoria_embedding::LocalEmbedder::new(&cfg.embedding_model)
                 .expect("Failed to load local embedding model");
-            Some(Arc::new(local) as Arc<dyn memoria_core::interfaces::EmbeddingProvider>)
+            (
+                Arc::new(local) as Arc<dyn memoria_core::interfaces::EmbeddingProvider>,
+                "local",
+            )
         }
         #[cfg(not(feature = "local-embedding"))]
         {
             tracing::error!(
                 "EMBEDDING_PROVIDER=local but compiled without local-embedding feature"
             );
-            None
+            return None;
         }
     } else {
-        None
+        tracing::warn!(
+            provider = %cfg.embedding_provider,
+            "no embedding backend initialised — check EMBEDDING_BASE_URL / EMBEDDING_ENDPOINTS"
+        );
+        return None;
+    };
+
+    #[cfg(feature = "server-runtime")]
+    {
+        Some(Arc::new(InstrumentedEmbedder::new(raw, provider_label))
+            as Arc<dyn memoria_core::interfaces::EmbeddingProvider>)
     }
+    #[cfg(not(feature = "server-runtime"))]
+    {
+        let _ = provider_label;
+        Some(raw)
+    }
+}
+
+fn validate_embedding_config(cfg: &memoria_service::Config) -> Result<()> {
+    if cfg.embedding_provider == "local" {
+        #[cfg(not(feature = "local-embedding"))]
+        {
+            anyhow::bail!(
+                "EMBEDDING_PROVIDER=local requires a binary built with `local-embedding` support. \
+Use an HTTP embedding provider instead, or rebuild Memoria with `--features local-embedding`."
+            );
+        }
+    }
+    Ok(())
 }
 
 fn build_llm(cfg: &memoria_service::Config) -> Option<Arc<memoria_embedding::LlmClient>> {
@@ -937,6 +1427,25 @@ fn build_llm(cfg: &memoria_service::Config) -> Option<Arc<memoria_embedding::Llm
             cfg.llm_model.clone(),
         ))
     })
+}
+
+async fn run_with_edit_log_drain<T, E, Fut>(
+    service: Arc<memoria_service::MemoryService>,
+    fut: Fut,
+) -> Result<T>
+where
+    Fut: IntoFuture<Output = std::result::Result<T, E>>,
+    E: Into<anyhow::Error>,
+{
+    let result = fut.into_future().await.map_err(Into::into);
+    if !service.drain_edit_log().await {
+        // Surface drain failure even if the main task succeeded,
+        // so external supervisors see a non-zero exit code.
+        return Err(anyhow::anyhow!(
+            "edit-log drain failed; some audit records may be lost"
+        ));
+    }
+    result
 }
 
 // ── Init / Status / Rules ─────────────────────────────────────────────────
@@ -1004,10 +1513,55 @@ fn mcp_entry(
     full_args.push(tool_name.to_string());
     full_args.extend(args);
 
+    // All Memoria MCP tools — used to populate autoApprove so that
+    // editors like Kiro and Cursor do not prompt on every memory operation.
+    // The user has already established trust by installing Memoria and
+    // providing an API token; requiring per-call approval defeats ambient
+    // memory workflows.  Editors that do not recognise the field ignore it.
+    let auto_approve: Vec<serde_json::Value> = vec![
+        "memory_store",
+        "memory_retrieve",
+        "memory_search",
+        "memory_list",
+        "memory_correct",
+        "memory_purge",
+        "memory_profile",
+        "memory_feedback",
+        "memory_capabilities",
+        "memory_governance",
+        "memory_consolidate",
+        "memory_reflect",
+        "memory_snapshot",
+        "memory_snapshots",
+        "memory_snapshot_delete",
+        "memory_rollback",
+        "memory_branch",
+        "memory_branches",
+        "memory_checkout",
+        "memory_merge",
+        "memory_branch_delete",
+        "memory_diff",
+        "memory_count",
+        "memory_observe",
+        "memory_id",
+        "memory_ids",
+        "memory_type",
+        "memory_extract_entities",
+        "memory_link_entities",
+        "memory_graph_nodes",
+        "memory_graph_edges",
+        "memory_get_retrieval_params",
+        "memory_tune_params",
+        "memory_rebuild_index",
+    ]
+    .into_iter()
+    .map(serde_json::Value::from)
+    .collect();
+
     let mut entry = serde_json::json!({
         "command": "memoria",
         "args": full_args,
-        "_version": VERSION,
+        "autoApprove": auto_approve,
     });
     if !env.is_empty() {
         entry["env"] = serde_json::Value::Object(env);
@@ -1032,12 +1586,22 @@ fn detect_tools(project_dir: &Path) -> Vec<String> {
     if project_dir.join(".cursor").exists() || which_cmd("cursor").is_some() {
         tools.push("cursor".to_string());
     }
-    if project_dir.join(".mcp.json").exists() || project_dir.join(".claude").exists() || which_cmd("claude").is_some() {
+    if project_dir.join(".mcp.json").exists()
+        || project_dir.join(".claude").exists()
+        || which_cmd("claude").is_some()
+    {
         tools.push("claude".to_string());
     }
-    let codex_config = std::env::var("HOME").ok().map(std::path::PathBuf::from).map(|h| h.join(".codex/config.toml")).unwrap_or_default();
+    let codex_config = std::env::var("HOME")
+        .ok()
+        .map(std::path::PathBuf::from)
+        .map(|h| h.join(".codex/config.toml"))
+        .unwrap_or_default();
     if codex_config.exists() || which_cmd("codex").is_some() {
         tools.push("codex".to_string());
+    }
+    if project_dir.join(".gemini").exists() || which_cmd("gemini").is_some() {
+        tools.push("gemini".to_string());
     }
     tools
 }
@@ -1123,11 +1687,36 @@ fn configure_kiro(project_dir: &Path, entry: &serde_json::Value, force: bool) ->
             entry,
             project_dir,
         ),
-        write_rule(&steering.join("memory.md"), KIRO_STEERING, force, project_dir),
-        write_rule(&steering.join("session-lifecycle.md"), KIRO_SESSION_LIFECYCLE, force, project_dir),
-        write_rule(&steering.join("memory-hygiene.md"), KIRO_MEMORY_HYGIENE, force, project_dir),
-        write_rule(&steering.join("memory-branching-patterns.md"), KIRO_MEMORY_BRANCHING, force, project_dir),
-        write_rule(&steering.join("goal-driven-evolution.md"), KIRO_GOAL_EVOLUTION, force, project_dir),
+        write_rule(
+            &steering.join("memory.md"),
+            KIRO_STEERING,
+            force,
+            project_dir,
+        ),
+        write_rule(
+            &steering.join("session-lifecycle.md"),
+            KIRO_SESSION_LIFECYCLE,
+            force,
+            project_dir,
+        ),
+        write_rule(
+            &steering.join("memory-hygiene.md"),
+            KIRO_MEMORY_HYGIENE,
+            force,
+            project_dir,
+        ),
+        write_rule(
+            &steering.join("memory-branching-patterns.md"),
+            KIRO_MEMORY_BRANCHING,
+            force,
+            project_dir,
+        ),
+        write_rule(
+            &steering.join("goal-driven-evolution.md"),
+            KIRO_GOAL_EVOLUTION,
+            force,
+            project_dir,
+        ),
     ]
 }
 
@@ -1136,10 +1725,30 @@ fn configure_cursor(project_dir: &Path, entry: &serde_json::Value, force: bool) 
     vec![
         write_mcp_json(&project_dir.join(".cursor/mcp.json"), entry, project_dir),
         write_rule(&rules.join("memory.mdc"), CURSOR_RULE, force, project_dir),
-        write_rule(&rules.join("session-lifecycle.mdc"), CURSOR_SESSION_LIFECYCLE, force, project_dir),
-        write_rule(&rules.join("memory-hygiene.mdc"), CURSOR_MEMORY_HYGIENE, force, project_dir),
-        write_rule(&rules.join("memory-branching-patterns.mdc"), CURSOR_MEMORY_BRANCHING, force, project_dir),
-        write_rule(&rules.join("goal-driven-evolution.mdc"), CURSOR_GOAL_EVOLUTION, force, project_dir),
+        write_rule(
+            &rules.join("session-lifecycle.mdc"),
+            CURSOR_SESSION_LIFECYCLE,
+            force,
+            project_dir,
+        ),
+        write_rule(
+            &rules.join("memory-hygiene.mdc"),
+            CURSOR_MEMORY_HYGIENE,
+            force,
+            project_dir,
+        ),
+        write_rule(
+            &rules.join("memory-branching-patterns.mdc"),
+            CURSOR_MEMORY_BRANCHING,
+            force,
+            project_dir,
+        ),
+        write_rule(
+            &rules.join("goal-driven-evolution.mdc"),
+            CURSOR_GOAL_EVOLUTION,
+            force,
+            project_dir,
+        ),
     ]
 }
 
@@ -1150,11 +1759,36 @@ fn configure_claude(project_dir: &Path, entry: &serde_json::Value, force: bool) 
         entry,
         project_dir,
     )];
-    results.push(write_rule(&rules.join("memory.md"), CLAUDE_RULE, force, project_dir));
-    results.push(write_rule(&rules.join("session-lifecycle.md"), CLAUDE_SESSION_LIFECYCLE, force, project_dir));
-    results.push(write_rule(&rules.join("memory-hygiene.md"), CLAUDE_MEMORY_HYGIENE, force, project_dir));
-    results.push(write_rule(&rules.join("memory-branching-patterns.md"), CLAUDE_MEMORY_BRANCHING, force, project_dir));
-    results.push(write_rule(&rules.join("goal-driven-evolution.md"), CLAUDE_GOAL_EVOLUTION, force, project_dir));
+    results.push(write_rule(
+        &rules.join("memory.md"),
+        CLAUDE_RULE,
+        force,
+        project_dir,
+    ));
+    results.push(write_rule(
+        &rules.join("session-lifecycle.md"),
+        CLAUDE_SESSION_LIFECYCLE,
+        force,
+        project_dir,
+    ));
+    results.push(write_rule(
+        &rules.join("memory-hygiene.md"),
+        CLAUDE_MEMORY_HYGIENE,
+        force,
+        project_dir,
+    ));
+    results.push(write_rule(
+        &rules.join("memory-branching-patterns.md"),
+        CLAUDE_MEMORY_BRANCHING,
+        force,
+        project_dir,
+    ));
+    results.push(write_rule(
+        &rules.join("goal-driven-evolution.md"),
+        CLAUDE_GOAL_EVOLUTION,
+        force,
+        project_dir,
+    ));
     // Warn if legacy CLAUDE.md contains memoria rules
     let claude_md = project_dir.join("CLAUDE.md");
     if claude_md.exists() {
@@ -1171,14 +1805,20 @@ fn configure_codex(project_dir: &Path, entry: &serde_json::Value, force: bool) -
     let mut results = vec![];
 
     // MCP: write to ~/.codex/config.toml (global, TOML format)
-    let config_path = std::env::var("HOME").ok().map(std::path::PathBuf::from)
+    let config_path = std::env::var("HOME")
+        .ok()
+        .map(std::path::PathBuf::from)
         .map(|h| h.join(".codex/config.toml"))
         .unwrap_or_else(|| std::path::PathBuf::from("~/.codex/config.toml"));
 
     let command = entry["command"].as_str().unwrap_or("memoria");
     let args: Vec<String> = entry["args"]
         .as_array()
-        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default();
 
     let args_toml = args
@@ -1216,7 +1856,12 @@ fn configure_codex(project_dir: &Path, entry: &serde_json::Value, force: bool) -
             .find("\n[")
             .map(|i| re_start + 1 + i)
             .unwrap_or(existing_toml.len());
-        format!("{}{}{}", &existing_toml[..re_start], new_section.trim_start(), &existing_toml[re_end..])
+        format!(
+            "{}{}{}",
+            &existing_toml[..re_start],
+            new_section.trim_start(),
+            &existing_toml[re_end..]
+        )
     } else {
         format!("{}{}", existing_toml.trim_end(), new_section)
     };
@@ -1268,22 +1913,114 @@ fn configure_codex(project_dir: &Path, entry: &serde_json::Value, force: bool) -
                 .rfind("\n---\n")
                 .map(|i| i + 1) // keep the \n before ---
                 .unwrap_or(0);
-            format!("{}\n\n---\n\n{}", &existing[..section_start].trim_end(), content)
+            format!(
+                "{}\n\n---\n\n{}",
+                &existing[..section_start].trim_end(),
+                content
+            )
         } else {
             format!("{}\n\n---\n\n{}", existing.trim_end(), content)
         };
         std::fs::write(&agents_md, updated).ok();
         results.push(format!(
             "  ✓ AGENTS.md (updated memoria section{})",
-            regex_version(&content).map(|v| format!(", v{}", v)).unwrap_or_default()
+            regex_version(&content)
+                .map(|v| format!(", v{}", v))
+                .unwrap_or_default()
         ));
     } else {
         std::fs::write(&agents_md, &content).ok();
         results.push(format!(
             "  ✓ AGENTS.md{}",
-            regex_version(&content).map(|v| format!(" (v{})", v)).unwrap_or_default()
+            regex_version(&content)
+                .map(|v| format!(" (v{})", v))
+                .unwrap_or_default()
         ));
     }
+
+    results
+}
+
+fn configure_gemini(project_dir: &Path, entry: &serde_json::Value, force: bool) -> Vec<String> {
+    let mut results = vec![];
+
+    // MCP: write to .gemini/settings.json (project-level)
+    let settings_path = project_dir.join(".gemini/settings.json");
+    let relative = settings_path
+        .strip_prefix(project_dir)
+        .unwrap_or(&settings_path);
+
+    if settings_path.exists() {
+        if let Ok(content) = std::fs::read_to_string(&settings_path) {
+            if let Ok(mut existing) = serde_json::from_str::<serde_json::Value>(&content) {
+                existing["mcpServers"][MCP_KEY] = entry.clone();
+                std::fs::write(
+                    &settings_path,
+                    serde_json::to_string_pretty(&existing).unwrap(),
+                )
+                .ok();
+                results.push(format!(
+                    "  ✓ {} (updated memoria entry)",
+                    relative.display()
+                ));
+            } else {
+                // File exists but invalid JSON — overwrite
+                let wrapper = serde_json::json!({ "mcpServers": { MCP_KEY: entry } });
+                std::fs::write(
+                    &settings_path,
+                    serde_json::to_string_pretty(&wrapper).unwrap(),
+                )
+                .ok();
+                results.push(format!("  ✓ {} (created)", relative.display()));
+            }
+        }
+    } else {
+        if let Some(parent) = settings_path.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        let wrapper = serde_json::json!({ "mcpServers": { MCP_KEY: entry } });
+        std::fs::write(
+            &settings_path,
+            serde_json::to_string_pretty(&wrapper).unwrap(),
+        )
+        .ok();
+        results.push(format!("  ✓ {} (created)", relative.display()));
+    }
+
+    // Rules: write GEMINI.md files to project root
+    results.push(write_rule(
+        &project_dir.join("GEMINI.md"),
+        GEMINI_RULE,
+        force,
+        project_dir,
+    ));
+
+    // Additional rule files in .gemini/ directory
+    let rules_dir = project_dir.join(".gemini");
+    results.push(write_rule(
+        &rules_dir.join("session-lifecycle.md"),
+        GEMINI_SESSION_LIFECYCLE,
+        force,
+        project_dir,
+    ));
+    results.push(write_rule(
+        &rules_dir.join("memory-hygiene.md"),
+        GEMINI_MEMORY_HYGIENE,
+        force,
+        project_dir,
+    ));
+    results.push(write_rule(
+        &rules_dir.join("memory-branching-patterns.md"),
+        GEMINI_MEMORY_BRANCHING,
+        force,
+        project_dir,
+    ));
+    results.push(write_rule(
+        &rules_dir.join("goal-driven-evolution.md"),
+        GEMINI_GOAL_EVOLUTION,
+        force,
+        project_dir,
+    ));
 
     results
 }
@@ -1329,6 +2066,7 @@ fn load_existing_config(project_dir: &Path) -> ExistingConfig {
         ("kiro", ".kiro/settings/mcp.json"),
         ("cursor", ".cursor/mcp.json"),
         ("claude", ".mcp.json"),
+        ("gemini", ".gemini/settings.json"),
     ];
     let mut found_entry: Option<serde_json::Value> = None;
     for (tool, path) in &candidates {
@@ -1344,6 +2082,7 @@ fn load_existing_config(project_dir: &Path) -> ExistingConfig {
                         "kiro" => cfg.tools.push(ToolName::Kiro),
                         "cursor" => cfg.tools.push(ToolName::Cursor),
                         "claude" => cfg.tools.push(ToolName::Claude),
+                        "gemini" => cfg.tools.push(ToolName::Gemini),
                         _ => {}
                     }
                     if found_entry.is_none() {
@@ -1354,7 +2093,9 @@ fn load_existing_config(project_dir: &Path) -> ExistingConfig {
         }
     }
     // Check codex ~/.codex/config.toml
-    let codex_config = std::env::var("HOME").ok().map(std::path::PathBuf::from)
+    let codex_config = std::env::var("HOME")
+        .ok()
+        .map(std::path::PathBuf::from)
         .map(|h| h.join(".codex/config.toml"))
         .unwrap_or_default();
     if let Ok(toml_content) = std::fs::read_to_string(&codex_config) {
@@ -1362,13 +2103,23 @@ fn load_existing_config(project_dir: &Path) -> ExistingConfig {
             cfg.tools.push(ToolName::Codex);
             // Parse db_url from args line if found_entry not yet set
             if found_entry.is_none() {
-                if let Some(args_line) = toml_content.lines().find(|l| l.trim_start().starts_with("args = [")) {
-                    let args_str = args_line.trim_start().trim_start_matches("args = [").trim_end_matches(']');
-                    let args: Vec<String> = args_str.split(',')
+                if let Some(args_line) = toml_content
+                    .lines()
+                    .find(|l| l.trim_start().starts_with("args = ["))
+                {
+                    let args_str = args_line
+                        .trim_start()
+                        .trim_start_matches("args = [")
+                        .trim_end_matches(']');
+                    let args: Vec<String> = args_str
+                        .split(',')
                         .map(|s| s.trim().trim_matches('"').to_string())
                         .collect();
                     // Reconstruct a minimal entry so the existing parser below can reuse it
-                    let args_json: Vec<serde_json::Value> = args.iter().map(|a| serde_json::Value::String(a.clone())).collect();
+                    let args_json: Vec<serde_json::Value> = args
+                        .iter()
+                        .map(|a| serde_json::Value::String(a.clone()))
+                        .collect();
                     found_entry = Some(serde_json::json!({"args": args_json}));
                 }
             }
@@ -1581,12 +2332,16 @@ fn cmd_init_interactive(
 
     // ── Step 1: AI Tool ─────────────────────────────────────────────
     let tools: Vec<ToolName> = if let Some(pre) = prefill_tools {
-        let names: Vec<&str> = pre.iter().map(|t| match t {
-            ToolName::Kiro => "Kiro",
-            ToolName::Cursor => "Cursor",
-            ToolName::Claude => "Claude Code",
-            ToolName::Codex => "Codex",
-        }).collect();
+        let names: Vec<&str> = pre
+            .iter()
+            .map(|t| match t {
+                ToolName::Kiro => "Kiro",
+                ToolName::Cursor => "Cursor",
+                ToolName::Claude => "Claude Code",
+                ToolName::Codex => "Codex",
+                ToolName::Gemini => "Gemini CLI",
+            })
+            .collect();
         cliclack::note("AI Tool", names.join(", ")).ok();
         pre
     } else {
@@ -1606,13 +2361,25 @@ fn cmd_init_interactive(
             if existing.tools.iter().any(|t| matches!(t, ToolName::Codex)) {
                 v.push(3);
             }
+            if existing.tools.iter().any(|t| matches!(t, ToolName::Gemini)) {
+                v.push(4);
+            }
             v
         };
         let tool_sel: Vec<usize> = match cliclack::multiselect("Which AI tools?")
             .item(0, "Kiro", "")
             .item(1, "Cursor", "")
             .item(2, "Claude Code", "")
-            .item(3, "Codex", "MCP in ~/.codex/config.toml, rules in AGENTS.md")
+            .item(
+                3,
+                "Codex",
+                "MCP in ~/.codex/config.toml, rules in AGENTS.md",
+            )
+            .item(
+                4,
+                "Gemini CLI",
+                "MCP in .gemini/settings.json, rules in GEMINI.md",
+            )
             .initial_values(tool_defaults)
             .interact()
         {
@@ -1635,6 +2402,9 @@ fn cmd_init_interactive(
         if tool_sel.contains(&3) {
             t.push(ToolName::Codex);
         }
+        if tool_sel.contains(&4) {
+            t.push(ToolName::Gemini);
+        }
         if t.is_empty() {
             cliclack::outro_cancel("No tool selected").ok();
             return;
@@ -1646,120 +2416,176 @@ fn cmd_init_interactive(
     // If --api-url + --token are pre-filled, skip DB and Embedding steps entirely
     let use_api_mode = prefill_api_url.is_some() && prefill_token.is_some();
 
-    let (final_db_url, final_api_url, final_token, emb_provider, emb_model, emb_dim, emb_api_key, emb_base_url, emb_label) =
-        if use_api_mode {
-            let api_url = prefill_api_url.clone().unwrap();
-            let token = prefill_token.clone().unwrap();
-            cliclack::note(
-                "Database (MatrixOne)",
-                format!("API URL:  {}\nToken:    {}", api_url, mask_key(&token)),
-            )
-            .ok();
-            (None, Some(api_url), Some(token), None, String::new(), String::new(), String::new(), String::new(), "N/A")
+    let (
+        final_db_url,
+        final_api_url,
+        final_token,
+        emb_provider,
+        emb_model,
+        emb_dim,
+        emb_api_key,
+        emb_base_url,
+        emb_label,
+    ) = if use_api_mode {
+        let api_url = prefill_api_url.clone().unwrap();
+        let token = prefill_token.clone().unwrap();
+        cliclack::note(
+            "Database (MatrixOne)",
+            format!("API URL:  {}\nToken:    {}", api_url, mask_key(&token)),
+        )
+        .ok();
+        (
+            None,
+            Some(api_url),
+            Some(token),
+            None,
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            "N/A",
+        )
+    } else {
+        cliclack::note(
+            "Database (MatrixOne)",
+            "Configure your MatrixOne connection",
+        )
+        .ok();
+
+        let db_host: String = cliclack::input("Host")
+            .default_input(&existing.db_host)
+            .interact()
+            .unwrap_or_else(|_| existing.db_host.clone());
+        let db_port: String = cliclack::input("Port")
+            .default_input(&existing.db_port)
+            .interact()
+            .unwrap_or_else(|_| existing.db_port.clone());
+        let db_user: String = cliclack::input("User")
+            .default_input(&existing.db_user)
+            .interact()
+            .unwrap_or_else(|_| existing.db_user.clone());
+        let db_pass: String = if existing.db_pass.is_empty() {
+            cliclack::input("Password")
+                .default_input("111")
+                .interact()
+                .unwrap_or_else(|_| "111".into())
         } else {
-            cliclack::note(
-                "Database (MatrixOne)",
-                "Configure your MatrixOne connection",
-            )
-            .ok();
-
-            let db_host: String = cliclack::input("Host")
-                .default_input(&existing.db_host)
+            cliclack::input("Password")
+                .default_input(&existing.db_pass)
                 .interact()
-                .unwrap_or_else(|_| existing.db_host.clone());
-            let db_port: String = cliclack::input("Port")
-                .default_input(&existing.db_port)
-                .interact()
-                .unwrap_or_else(|_| existing.db_port.clone());
-            let db_user: String = cliclack::input("User")
-                .default_input(&existing.db_user)
-                .interact()
-                .unwrap_or_else(|_| existing.db_user.clone());
-            let db_pass: String = if existing.db_pass.is_empty() {
-                cliclack::input("Password")
-                    .default_input("111")
-                    .interact()
-                    .unwrap_or_else(|_| "111".into())
-            } else {
-                cliclack::input("Password")
-                    .default_input(&existing.db_pass)
-                    .interact()
-                    .unwrap_or_else(|_| existing.db_pass.clone())
-            };
-            let db_name: String = cliclack::input("Database")
-                .default_input(&existing.db_name)
-                .interact()
-                .unwrap_or_else(|_| existing.db_name.clone());
-            let db_url = format!(
-                "mysql://{}:{}@{}:{}/{}",
-                db_user, db_pass, db_host, db_port, db_name
-            );
-
-            // ── Step 3: Embedding ───────────────────────────────────────────
-            cliclack::note(
-                "Embedding Service",
-                "⚠ Dimension is locked on first startup. Choose a preset, then adjust any field.",
-            )
-            .ok();
-
-            let emb_default: usize = match existing.emb_provider.as_str() {
-                "openai" if existing.emb_base_url.contains("siliconflow") => 0,
-                "openai" if existing.emb_base_url.contains("localhost:11434") => 2,
-                "openai" if existing.emb_base_url.is_empty() => 1,
-                "openai" => 3,
-                _ => 0,
-            };
-            let emb_choice: usize = cliclack::select("Preset")
-                .item(0, "SiliconFlow", "BAAI/bge-m3, 1024d — recommended, free tier")
-                .item(1, "OpenAI", "text-embedding-3-small, 1536d")
-                .item(2, "Ollama", "nomic-embed-text, 768d — local")
-                .item(3, "Custom", "enter all fields manually")
-                .initial_value(emb_default)
-                .interact()
-                .unwrap_or(emb_default);
-
-            let (pre_url, pre_model, pre_dim) = match emb_choice {
-                0 => ("https://api.siliconflow.cn/v1", "BAAI/bge-m3", "1024"),
-                1 => ("https://api.openai.com/v1", "text-embedding-3-small", "1536"),
-                2 => ("http://localhost:11434/v1", "nomic-embed-text", "768"),
-                _ => ("", "", ""),
-            };
-            let def_url = if !existing.emb_base_url.is_empty() { &existing.emb_base_url } else { pre_url };
-            let def_key = &existing.emb_api_key;
-            let def_model = if !existing.emb_model.is_empty() { &existing.emb_model } else { pre_model };
-            let def_dim = if !existing.emb_dim.is_empty() { &existing.emb_dim } else { pre_dim };
-
-            let mut url_input = cliclack::input("Base URL").default_input(def_url);
-            if def_url.is_empty() {
-                url_input = url_input.placeholder("https://api.openai.com/v1");
-            }
-            let emb_base_url: String = url_input.interact().unwrap_or_else(|_| def_url.to_string());
-            let emb_api_key: String = if def_key.is_empty() {
-                cliclack::password("API Key").mask('▪').interact().unwrap_or_default()
-            } else {
-                let v: String = cliclack::password(format!("API Key [{}]", mask_key(def_key)))
-                    .mask('▪')
-                    .allow_empty()
-                    .interact()
-                    .unwrap_or_default();
-                if v.is_empty() { def_key.clone() } else { v }
-            };
-            let emb_model: String = cliclack::input("Model")
-                .default_input(def_model)
-                .interact()
-                .unwrap_or_else(|_| def_model.to_string());
-            let emb_dim: String = cliclack::input("Dimension")
-                .default_input(def_dim)
-                .interact()
-                .unwrap_or_else(|_| def_dim.to_string());
-            let emb_label = match emb_choice {
-                0 => "SiliconFlow",
-                1 => "OpenAI",
-                2 => "Ollama",
-                _ => "Custom",
-            };
-            (Some(db_url), None, None, Some("openai".to_string()), emb_model, emb_dim, emb_api_key, emb_base_url, emb_label)
+                .unwrap_or_else(|_| existing.db_pass.clone())
         };
+        let db_name: String = cliclack::input("Database")
+            .default_input(&existing.db_name)
+            .interact()
+            .unwrap_or_else(|_| existing.db_name.clone());
+        let db_url = format!(
+            "mysql://{}:{}@{}:{}/{}",
+            db_user, db_pass, db_host, db_port, db_name
+        );
+
+        // ── Step 3: Embedding ───────────────────────────────────────────
+        cliclack::note(
+            "Embedding Service",
+            "⚠ Dimension is locked on first startup. Choose a preset, then adjust any field.",
+        )
+        .ok();
+
+        let emb_default: usize = match existing.emb_provider.as_str() {
+            "openai" if existing.emb_base_url.contains("siliconflow") => 0,
+            "openai" if existing.emb_base_url.contains("localhost:11434") => 2,
+            "openai" if existing.emb_base_url.is_empty() => 1,
+            "openai" => 3,
+            _ => 0,
+        };
+        let emb_choice: usize = cliclack::select("Preset")
+            .item(
+                0,
+                "SiliconFlow",
+                "BAAI/bge-m3, 1024d — recommended, free tier",
+            )
+            .item(1, "OpenAI", "text-embedding-3-small, 1536d")
+            .item(2, "Ollama", "nomic-embed-text, 768d — local")
+            .item(3, "Custom", "enter all fields manually")
+            .initial_value(emb_default)
+            .interact()
+            .unwrap_or(emb_default);
+
+        let (pre_url, pre_model, pre_dim) = match emb_choice {
+            0 => ("https://api.siliconflow.cn/v1", "BAAI/bge-m3", "1024"),
+            1 => (
+                "https://api.openai.com/v1",
+                "text-embedding-3-small",
+                "1536",
+            ),
+            2 => ("http://localhost:11434/v1", "nomic-embed-text", "768"),
+            _ => ("", "", ""),
+        };
+        let def_url = if !existing.emb_base_url.is_empty() {
+            &existing.emb_base_url
+        } else {
+            pre_url
+        };
+        let def_key = &existing.emb_api_key;
+        let def_model = if !existing.emb_model.is_empty() {
+            &existing.emb_model
+        } else {
+            pre_model
+        };
+        let def_dim = if !existing.emb_dim.is_empty() {
+            &existing.emb_dim
+        } else {
+            pre_dim
+        };
+
+        let mut url_input = cliclack::input("Base URL").default_input(def_url);
+        if def_url.is_empty() {
+            url_input = url_input.placeholder("https://api.openai.com/v1");
+        }
+        let emb_base_url: String = url_input.interact().unwrap_or_else(|_| def_url.to_string());
+        let emb_api_key: String = if def_key.is_empty() {
+            cliclack::password("API Key")
+                .mask('▪')
+                .interact()
+                .unwrap_or_default()
+        } else {
+            let v: String = cliclack::password(format!("API Key [{}]", mask_key(def_key)))
+                .mask('▪')
+                .allow_empty()
+                .interact()
+                .unwrap_or_default();
+            if v.is_empty() {
+                def_key.clone()
+            } else {
+                v
+            }
+        };
+        let emb_model: String = cliclack::input("Model")
+            .default_input(def_model)
+            .interact()
+            .unwrap_or_else(|_| def_model.to_string());
+        let emb_dim: String = cliclack::input("Dimension")
+            .default_input(def_dim)
+            .interact()
+            .unwrap_or_else(|_| def_dim.to_string());
+        let emb_label = match emb_choice {
+            0 => "SiliconFlow",
+            1 => "OpenAI",
+            2 => "Ollama",
+            _ => "Custom",
+        };
+        (
+            Some(db_url),
+            None,
+            None,
+            Some("openai".to_string()),
+            emb_model,
+            emb_dim,
+            emb_api_key,
+            emb_base_url,
+            emb_label,
+        )
+    };
 
     // ── Summary ─────────────────────────────────────────────────────
     let tool_names: Vec<&str> = tools
@@ -1769,11 +2595,16 @@ fn cmd_init_interactive(
             ToolName::Cursor => "Cursor",
             ToolName::Claude => "Claude Code",
             ToolName::Codex => "Codex",
+            ToolName::Gemini => "Gemini CLI",
         })
         .collect();
 
     let db_line = if use_api_mode {
-        format!("API URL:   {}\nToken:     {}", final_api_url.as_deref().unwrap_or(""), mask_key(final_token.as_deref().unwrap_or("")))
+        format!(
+            "API URL:   {}\nToken:     {}",
+            final_api_url.as_deref().unwrap_or(""),
+            mask_key(final_token.as_deref().unwrap_or(""))
+        )
     } else {
         format!("Database:  {}", final_db_url.as_deref().unwrap_or(""))
     };
@@ -1874,10 +2705,26 @@ fn cmd_init_interactive(
         "default".into(),
         force,
         emb_provider,
-        if emb_model.is_empty() { None } else { Some(emb_model) },
-        if emb_dim.is_empty() { None } else { Some(emb_dim) },
-        if emb_api_key.is_empty() { None } else { Some(emb_api_key) },
-        if emb_base_url.is_empty() { None } else { Some(emb_base_url) },
+        if emb_model.is_empty() {
+            None
+        } else {
+            Some(emb_model)
+        },
+        if emb_dim.is_empty() {
+            None
+        } else {
+            Some(emb_dim)
+        },
+        if emb_api_key.is_empty() {
+            None
+        } else {
+            Some(emb_api_key)
+        },
+        if emb_base_url.is_empty() {
+            None
+        } else {
+            Some(emb_base_url)
+        },
     );
 
     cliclack::outro("You're all set! Restart your AI tool to activate Memoria.").ok();
@@ -1917,6 +2764,7 @@ fn cmd_init(
             ToolName::Cursor => configure_cursor(project_dir, &entry, force),
             ToolName::Claude => configure_claude(project_dir, &entry, force),
             ToolName::Codex => configure_codex(project_dir, &entry, force),
+            ToolName::Gemini => configure_gemini(project_dir, &entry, force),
         };
         for r in results {
             println!("{}", r);
@@ -2030,7 +2878,11 @@ fn cmd_status(project_dir: &Path) {
                 }
             }
             "codex" => {
-                let config = std::env::var("HOME").ok().map(std::path::PathBuf::from).map(|h| h.join(".codex/config.toml")).unwrap_or_default();
+                let config = std::env::var("HOME")
+                    .ok()
+                    .map(std::path::PathBuf::from)
+                    .map(|h| h.join(".codex/config.toml"))
+                    .unwrap_or_default();
                 if config.exists() {
                     let has_memoria = std::fs::read_to_string(&config)
                         .map(|c| c.contains("[mcp_servers.memoria]"))
@@ -2053,6 +2905,50 @@ fn cmd_status(project_dir: &Path) {
                     println!("  ✗ AGENTS.md (missing)");
                 }
             }
+            "gemini" => {
+                let settings = project_dir.join(".gemini/settings.json");
+                if settings.exists() {
+                    let has_memoria = std::fs::read_to_string(&settings)
+                        .ok()
+                        .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
+                        .and_then(|j| j.get("mcpServers")?.get(MCP_KEY).cloned())
+                        .is_some();
+                    if has_memoria {
+                        println!("  ✓ .gemini/settings.json (memoria entry present)");
+                    } else {
+                        println!("  ✗ .gemini/settings.json (no memoria entry)");
+                    }
+                } else {
+                    println!("  ✗ .gemini/settings.json (missing)");
+                }
+                let gemini_md = project_dir.join("GEMINI.md");
+                if gemini_md.exists() {
+                    let ver = installed_version(&gemini_md)
+                        .map(|v| format!(" (v{})", v))
+                        .unwrap_or_default();
+                    println!("  ✓ GEMINI.md{}", ver);
+                } else {
+                    println!("  ✗ GEMINI.md (missing)");
+                }
+                let rules = [
+                    "session-lifecycle.md",
+                    "memory-hygiene.md",
+                    "memory-branching-patterns.md",
+                    "goal-driven-evolution.md",
+                ];
+                for name in &rules {
+                    let path = project_dir.join(".gemini").join(name);
+                    let rel = format!(".gemini/{}", name);
+                    if path.exists() {
+                        let ver = installed_version(&path)
+                            .map(|v| format!(" (v{})", v))
+                            .unwrap_or_default();
+                        println!("  ✓ {}{}", rel, ver);
+                    } else {
+                        println!("  ✗ {} (missing)", rel);
+                    }
+                }
+            }
             _ => continue,
         }
     }
@@ -2072,7 +2968,10 @@ fn write_rules_for_tool(project_dir: &Path, tool: &str, force: bool) {
                 ("goal-driven-evolution.md", KIRO_GOAL_EVOLUTION),
             ];
             for (name, content) in pairs {
-                println!("{}", write_rule(&steering.join(name), content, force, project_dir));
+                println!(
+                    "{}",
+                    write_rule(&steering.join(name), content, force, project_dir)
+                );
             }
         }
         "cursor" => {
@@ -2085,7 +2984,10 @@ fn write_rules_for_tool(project_dir: &Path, tool: &str, force: bool) {
                 ("goal-driven-evolution.mdc", CURSOR_GOAL_EVOLUTION),
             ];
             for (name, content) in pairs {
-                println!("{}", write_rule(&rules.join(name), content, force, project_dir));
+                println!(
+                    "{}",
+                    write_rule(&rules.join(name), content, force, project_dir)
+                );
             }
         }
         "claude" => {
@@ -2098,12 +3000,42 @@ fn write_rules_for_tool(project_dir: &Path, tool: &str, force: bool) {
                 ("goal-driven-evolution.md", CLAUDE_GOAL_EVOLUTION),
             ];
             for (name, content) in pairs {
-                println!("{}", write_rule(&rules.join(name), content, force, project_dir));
+                println!(
+                    "{}",
+                    write_rule(&rules.join(name), content, force, project_dir)
+                );
             }
         }
         "codex" => {
             let agents_md = project_dir.join("AGENTS.md");
-            println!("{}", write_rule(&agents_md, CODEX_AGENTS, force, project_dir));
+            println!(
+                "{}",
+                write_rule(&agents_md, CODEX_AGENTS, force, project_dir)
+            );
+        }
+        "gemini" => {
+            println!(
+                "{}",
+                write_rule(
+                    &project_dir.join("GEMINI.md"),
+                    GEMINI_RULE,
+                    force,
+                    project_dir
+                )
+            );
+            let rules_dir = project_dir.join(".gemini");
+            let pairs: &[(&str, &str)] = &[
+                ("session-lifecycle.md", GEMINI_SESSION_LIFECYCLE),
+                ("memory-hygiene.md", GEMINI_MEMORY_HYGIENE),
+                ("memory-branching-patterns.md", GEMINI_MEMORY_BRANCHING),
+                ("goal-driven-evolution.md", GEMINI_GOAL_EVOLUTION),
+            ];
+            for (name, content) in pairs {
+                println!(
+                    "{}",
+                    write_rule(&rules_dir.join(name), content, force, project_dir)
+                );
+            }
         }
         _ => {}
     }
@@ -2117,18 +3049,29 @@ fn cmd_rules(project_dir: &Path, tools: Vec<ToolName>, interactive: bool, force:
             .item(1, "Cursor", "")
             .item(2, "Claude Code", "")
             .item(3, "Codex", "")
-            .item(4, "All", "")
+            .item(4, "Gemini CLI", "")
+            .item(5, "All", "")
             .interact()
         {
             Ok(v) => v,
-            Err(_) => { cliclack::outro_cancel("Cancelled").ok(); return; }
+            Err(_) => {
+                cliclack::outro_cancel("Cancelled").ok();
+                return;
+            }
         };
         match sel {
             0 => vec!["kiro".to_string()],
             1 => vec!["cursor".to_string()],
             2 => vec!["claude".to_string()],
             3 => vec!["codex".to_string()],
-            _ => vec!["kiro".to_string(), "cursor".to_string(), "claude".to_string(), "codex".to_string()],
+            4 => vec!["gemini".to_string()],
+            _ => vec![
+                "kiro".to_string(),
+                "cursor".to_string(),
+                "claude".to_string(),
+                "codex".to_string(),
+                "gemini".to_string(),
+            ],
         }
     } else if tools.is_empty() {
         let detected = detect_tools(project_dir);
@@ -2170,7 +3113,12 @@ fn cmd_update(ghproxy: Option<&str>) {
             .get(&api)
             .header("User-Agent", "memoria-cli")
             .send()
-            .or_else(|_| client.get(&api_proxy).header("User-Agent", "memoria-cli").send());
+            .or_else(|_| {
+                client
+                    .get(&api_proxy)
+                    .header("User-Agent", "memoria-cli")
+                    .send()
+            });
         match resp {
             Ok(r) if r.status().is_success() => {
                 let json: serde_json::Value = r.json().unwrap_or_default();
@@ -2193,16 +3141,28 @@ fn cmd_update(ghproxy: Option<&str>) {
     println!("Updating v{} → v{}", current, latest);
 
     // ── Build URLs ──────────────────────────────────────────────────
-    let gh_url = format!("https://github.com/{}/releases/download/{}/{}", repo, resolved_tag, asset);
-    let gh_sum_url = format!("https://github.com/{}/releases/download/{}/SHA256SUMS.txt", repo, resolved_tag);
+    let gh_url = format!(
+        "https://github.com/{}/releases/download/{}/{}",
+        repo, resolved_tag, asset
+    );
+    let gh_sum_url = format!(
+        "https://github.com/{}/releases/download/{}/SHA256SUMS.txt",
+        repo, resolved_tag
+    );
 
     // ── Download with progress ──────────────────────────────────────
     println!("Downloading {}", gh_url);
     let (dl_url, sum_url) = match client.get(&gh_url).send() {
         Ok(r) if !r.status().is_server_error() => (gh_url.clone(), gh_sum_url.clone()),
         _ => {
-            println!("Direct download failed, retrying via proxy: {}", ghproxy_base);
-            (format!("{}/{}", ghproxy_base, gh_url), format!("{}/{}", ghproxy_base, gh_sum_url))
+            println!(
+                "Direct download failed, retrying via proxy: {}",
+                ghproxy_base
+            );
+            (
+                format!("{}/{}", ghproxy_base, gh_url),
+                format!("{}/{}", ghproxy_base, gh_sum_url),
+            )
         }
     };
 
@@ -2210,7 +3170,10 @@ fn cmd_update(ghproxy: Option<&str>) {
         .get(&dl_url)
         .timeout(std::time::Duration::from_secs(120))
         .send()
-        .unwrap_or_else(|e| { eprintln!("error: {}", e); std::process::exit(1); });
+        .unwrap_or_else(|e| {
+            eprintln!("error: {}", e);
+            std::process::exit(1);
+        });
 
     if !resp.status().is_success() {
         eprintln!("error: download failed: HTTP {}", resp.status());
@@ -2230,14 +3193,19 @@ fn cmd_update(ghproxy: Option<&str>) {
                 downloaded += n as u64;
                 if total > 0 {
                     let pct = downloaded * 100 / total;
-                    print!("\r  {:.1} MB / {:.1} MB  ({}%)",
+                    print!(
+                        "\r  {:.1} MB / {:.1} MB  ({}%)",
                         downloaded as f64 / 1_048_576.0,
                         total as f64 / 1_048_576.0,
-                        pct);
+                        pct
+                    );
                     let _ = std::io::Write::flush(&mut std::io::stdout());
                 }
             }
-            Err(e) => { eprintln!("\nerror: read failed: {}", e); std::process::exit(1); }
+            Err(e) => {
+                eprintln!("\nerror: read failed: {}", e);
+                std::process::exit(1);
+            }
         }
     }
     println!();
@@ -2256,7 +3224,10 @@ fn cmd_update(ghproxy: Option<&str>) {
     let new_bin = tmp.path().join("memoria");
     if let Err(e) = self_replace::self_replace(&new_bin) {
         if e.kind() == std::io::ErrorKind::PermissionDenied {
-            eprintln!("error: permission denied replacing {}", current_exe.display());
+            eprintln!(
+                "error: permission denied replacing {}",
+                current_exe.display()
+            );
             eprintln!("hint:  try: sudo memoria update");
         } else {
             eprintln!("error: failed to replace binary: {}", e);
@@ -2289,11 +3260,14 @@ fn detect_install_target() -> String {
     let os = std::env::consts::OS;
     let arch = std::env::consts::ARCH;
     match (os, arch) {
-        ("linux", "x86_64")  => "x86_64-unknown-linux-musl".into(),
+        ("linux", "x86_64") => "x86_64-unknown-linux-musl".into(),
         ("linux", "aarch64") => "aarch64-unknown-linux-musl".into(),
-        ("macos", "x86_64")  => "x86_64-apple-darwin".into(),
+        ("macos", "x86_64") => "x86_64-apple-darwin".into(),
         ("macos", "aarch64") => "aarch64-apple-darwin".into(),
-        _ => { eprintln!("error: unsupported platform: {} {}", os, arch); std::process::exit(1); }
+        _ => {
+            eprintln!("error: unsupported platform: {} {}", os, arch);
+            std::process::exit(1);
+        }
     }
 }
 
@@ -2301,7 +3275,9 @@ fn sha256_hex(data: &[u8]) -> String {
     use std::fmt::Write;
     // simple SHA-256 via sha2 if available, else skip
     let mut s = String::new();
-    for b in data.iter().take(0) { write!(s, "{:02x}", b).ok(); }
+    for b in data.iter().take(0) {
+        write!(s, "{:02x}", b).ok();
+    }
     s
 }
 
@@ -2460,6 +3436,7 @@ fn main() -> Result<()> {
     let project_dir = cli.dir.canonicalize().unwrap_or(cli.dir);
 
     match cli.command {
+        #[cfg(feature = "server-runtime")]
         Commands::Serve {
             db_url,
             port,
@@ -2470,6 +3447,7 @@ fn main() -> Result<()> {
                 .build()?
                 .block_on(cmd_serve(db_url, port, master_key))?;
         }
+        #[cfg(feature = "server-runtime")]
         Commands::Mcp {
             tool,
             api_url,
@@ -2487,11 +3465,12 @@ fn main() -> Result<()> {
             transport,
             mcp_port,
         } => {
+            let tool = normalize_tool_name(tool);
             tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?
                 .block_on(cmd_mcp(
-                    tool.map(|t| t.to_string()),
+                    tool,
                     api_url,
                     token,
                     db_url,
@@ -2552,7 +3531,11 @@ fn main() -> Result<()> {
             }
         }
         Commands::Status => cmd_status(&project_dir),
-        Commands::Rules { tool, interactive, force } => cmd_rules(&project_dir, tool, interactive, force),
+        Commands::Rules {
+            tool,
+            interactive,
+            force,
+        } => cmd_rules(&project_dir, tool, interactive, force),
         Commands::Update { ghproxy } => cmd_update(ghproxy.as_deref()),
         Commands::Benchmark {
             api_url,
@@ -2569,6 +3552,443 @@ fn main() -> Result<()> {
                 .build()?
                 .block_on(cmd_plugin(command))?;
         }
+        Commands::Migrate { command } => {
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?
+                .block_on(cmd_migrate(command))?;
+        }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(feature = "server-runtime")]
+    use super::{
+        apply_detected_runtime_topology, configured_legacy_migration_concurrency,
+        LEGACY_MIGRATION_MAX_CONCURRENCY_ENV,
+    };
+    use super::{
+        enable_runtime_multi_db, normalize_tool_name, redact_url, run_with_edit_log_drain,
+        validate_embedding_config, Cli, Commands, MigrationCommands,
+    };
+    use async_trait::async_trait;
+    use clap::Parser;
+    use memoria_core::{interfaces::MemoryStore, MemoriaError, Memory};
+    use memoria_service::{Config, MemoryService};
+    use memoria_storage::OwnedEditLogEntry;
+    #[cfg(feature = "server-runtime")]
+    use memoria_storage::{PendingLegacyMultiDbMigration, RuntimeTopology};
+    #[cfg(feature = "server-runtime")]
+    use std::sync::OnceLock;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Default)]
+    struct DummyStore;
+
+    #[async_trait]
+    impl MemoryStore for DummyStore {
+        async fn insert(&self, _: &Memory) -> Result<(), MemoriaError> {
+            Ok(())
+        }
+
+        async fn get(&self, _: &str) -> Result<Option<Memory>, MemoriaError> {
+            Ok(None)
+        }
+
+        async fn update(&self, _: &Memory) -> Result<(), MemoriaError> {
+            Ok(())
+        }
+
+        async fn soft_delete(&self, _: &str) -> Result<(), MemoriaError> {
+            Ok(())
+        }
+
+        async fn list_active(&self, _: &str, _: i64) -> Result<Vec<Memory>, MemoriaError> {
+            Ok(vec![])
+        }
+
+        async fn search_fulltext(
+            &self,
+            _: &str,
+            _: &str,
+            _: i64,
+        ) -> Result<Vec<Memory>, MemoriaError> {
+            Ok(vec![])
+        }
+
+        async fn search_vector(
+            &self,
+            _: &str,
+            _: &[f32],
+            _: i64,
+        ) -> Result<Vec<Memory>, MemoriaError> {
+            Ok(vec![])
+        }
+    }
+
+    fn test_config() -> Config {
+        Config {
+            db_url: "mysql://root:111@localhost:6001/memoria".to_string(),
+            db_name: "memoria".to_string(),
+            shared_db_url: "mysql://root:111@localhost:6001/memoria_shared".to_string(),
+            multi_db: false,
+            embedding_provider: "openai".to_string(),
+            embedding_model: "BAAI/bge-m3".to_string(),
+            embedding_dim: 1024,
+            embedding_api_key: String::new(),
+            embedding_base_url: String::new(),
+            embedding_endpoints: vec![],
+            llm_api_key: None,
+            llm_base_url: "https://api.openai.com/v1".to_string(),
+            llm_model: "gpt-4o-mini".to_string(),
+            user: "default".to_string(),
+            governance_plugin_binding: "default".to_string(),
+            governance_plugin_subject: "system".to_string(),
+            governance_plugin_dir: None,
+            instance_id: "test-instance".to_string(),
+            lock_ttl_secs: 120,
+            ops_metrics_enabled: false,
+        }
+    }
+
+    #[cfg(feature = "server-runtime")]
+    static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    #[cfg(feature = "server-runtime")]
+    fn with_env<F: FnOnce()>(vars: &[(&str, Option<&str>)], f: F) {
+        let _lock = ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        struct EnvGuard(Vec<(String, Option<std::ffi::OsString>)>);
+
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                for (key, old) in &self.0 {
+                    match old {
+                        Some(value) => unsafe { std::env::set_var(key, value) },
+                        None => unsafe { std::env::remove_var(key) },
+                    }
+                }
+            }
+        }
+
+        let _restore = EnvGuard(
+            vars.iter()
+                .map(|(key, value)| {
+                    let old = std::env::var_os(key);
+                    match value {
+                        Some(value) => unsafe { std::env::set_var(key, value) },
+                        None => unsafe { std::env::remove_var(key) },
+                    }
+                    (key.to_string(), old)
+                })
+                .collect(),
+        );
+
+        f();
+    }
+
+    #[cfg(feature = "server-runtime")]
+    #[test]
+    fn legacy_migration_concurrency_defaults_to_six() {
+        with_env(
+            &[
+                (LEGACY_MIGRATION_MAX_CONCURRENCY_ENV, None),
+                ("MEMORIA_USER_SCHEMA_INIT_MAX_CONCURRENCY", None),
+            ],
+            || {
+                assert_eq!(configured_legacy_migration_concurrency(), 6);
+            },
+        );
+    }
+
+    #[cfg(feature = "server-runtime")]
+    #[test]
+    fn legacy_migration_concurrency_prefers_dedicated_override() {
+        with_env(
+            &[
+                (LEGACY_MIGRATION_MAX_CONCURRENCY_ENV, Some("8")),
+                ("MEMORIA_USER_SCHEMA_INIT_MAX_CONCURRENCY", Some("5")),
+            ],
+            || {
+                assert_eq!(configured_legacy_migration_concurrency(), 8);
+            },
+        );
+    }
+
+    #[test]
+    fn non_local_embedding_config_is_valid() {
+        let cfg = test_config();
+        assert!(validate_embedding_config(&cfg).is_ok());
+    }
+
+    #[cfg(not(feature = "local-embedding"))]
+    #[test]
+    fn local_embedding_without_feature_fails_validation() {
+        let mut cfg = test_config();
+        cfg.embedding_provider = "local".to_string();
+
+        let err = validate_embedding_config(&cfg).expect_err("local embedding should fail");
+        assert!(
+            err.to_string().contains("local-embedding"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[cfg(feature = "local-embedding")]
+    #[test]
+    fn local_embedding_with_feature_passes_validation() {
+        let mut cfg = test_config();
+        cfg.embedding_provider = "local".to_string();
+
+        assert!(validate_embedding_config(&cfg).is_ok());
+    }
+
+    fn test_service() -> (Arc<MemoryService>, Arc<Mutex<Vec<OwnedEditLogEntry>>>) {
+        let (svc, entries) = MemoryService::new_with_test_entries(Arc::new(DummyStore), None);
+        (Arc::new(svc), entries)
+    }
+
+    #[tokio::test]
+    async fn run_with_edit_log_drain_flushes_after_success() {
+        let (service, entries) = test_service();
+        run_with_edit_log_drain(service.clone(), async {
+            service.send_edit_log("u1", "inject", Some("m1"), Some("{}"), "test", None);
+            Ok::<_, anyhow::Error>(())
+        })
+        .await
+        .expect("helper should succeed");
+
+        let drained = entries.lock().unwrap();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].operation, "inject");
+    }
+
+    #[tokio::test]
+    async fn run_with_edit_log_drain_flushes_after_error() {
+        let (service, entries) = test_service();
+        let err = run_with_edit_log_drain(service.clone(), async {
+            service.send_edit_log("u1", "purge", Some("m1"), None, "test", None);
+            Err::<(), _>(anyhow::anyhow!("boom"))
+        })
+        .await
+        .expect_err("helper should return original error");
+
+        assert!(err.to_string().contains("boom"));
+
+        let drained = entries.lock().unwrap();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].operation, "purge");
+    }
+
+    #[test]
+    fn migrate_cli_defaults_to_dry_run() {
+        let cli = Cli::parse_from([
+            "memoria",
+            "migrate",
+            "legacy-to-multi-db",
+            "--legacy-db-url",
+            "mysql://root:111@localhost:6001/memoria",
+            "--shared-db-url",
+            "mysql://root:111@localhost:6001/memoria_shared",
+        ]);
+
+        match cli.command {
+            Commands::Migrate {
+                command:
+                    MigrationCommands::LegacyToMultiDb {
+                        execute, user_ids, ..
+                    },
+            } => {
+                assert!(!execute);
+                assert!(user_ids.is_empty());
+            }
+            _ => panic!("unexpected command"),
+        }
+    }
+
+    #[test]
+    fn migrate_cli_accepts_execute_and_users() {
+        let cli = Cli::parse_from([
+            "memoria",
+            "migrate",
+            "legacy-to-multi-db",
+            "--legacy-db-url",
+            "mysql://root:111@localhost:6001/memoria",
+            "--shared-db-url",
+            "mysql://root:111@localhost:6001/memoria_shared",
+            "--execute",
+            "--user",
+            "alice",
+            "--user",
+            "bob",
+        ]);
+
+        match cli.command {
+            Commands::Migrate {
+                command:
+                    MigrationCommands::LegacyToMultiDb {
+                        execute, user_ids, ..
+                    },
+            } => {
+                assert!(execute);
+                assert_eq!(user_ids, vec!["alice".to_string(), "bob".to_string()]);
+            }
+            _ => panic!("unexpected command"),
+        }
+    }
+
+    #[test]
+    fn redact_url_masks_credentials() {
+        assert_eq!(
+            redact_url("mysql://root:111@localhost:6001/memoria"),
+            "mysql://***:***@localhost:6001/memoria"
+        );
+    }
+
+    #[test]
+    fn redact_url_leaves_non_credential_urls_unchanged() {
+        assert_eq!(
+            redact_url("mysql://localhost:6001/memoria"),
+            "mysql://localhost:6001/memoria"
+        );
+    }
+
+    #[test]
+    fn normalize_tool_name_trims_lowercases_and_filters_empty() {
+        assert_eq!(
+            normalize_tool_name(Some("  CuRsOr-Agent  ".to_string())),
+            Some("cursor-agent".to_string())
+        );
+        // spaces (and multiple spaces) are collapsed into hyphens,
+        // matching the dashboard's sanitizeAgentName behaviour
+        assert_eq!(
+            normalize_tool_name(Some("My  Agent".to_string())),
+            Some("my-agent".to_string())
+        );
+        assert_eq!(
+            normalize_tool_name(Some("  Claude Code  ".to_string())),
+            Some("claude-code".to_string())
+        );
+        assert_eq!(normalize_tool_name(Some("   ".to_string())), None);
+        assert_eq!(normalize_tool_name(None), None);
+    }
+
+    #[test]
+    fn enable_runtime_multi_db_switches_to_shared_db_name() {
+        let mut cfg = test_config();
+
+        enable_runtime_multi_db(&mut cfg);
+
+        assert!(cfg.multi_db);
+        assert_eq!(cfg.db_name, "memoria_shared");
+        assert_eq!(cfg.db_url, "mysql://root:111@localhost:6001/memoria");
+    }
+
+    #[cfg(feature = "server-runtime")]
+    #[test]
+    fn fresh_topology_bootstrap_defaults_to_multi_db() {
+        let mut cfg = test_config();
+
+        let pending = apply_detected_runtime_topology(&mut cfg, RuntimeTopology::FreshSingleDb);
+
+        assert!(pending.is_none());
+        assert!(cfg.multi_db);
+        assert_eq!(cfg.db_name, "memoria_shared");
+        assert_eq!(cfg.db_url, "mysql://root:111@localhost:6001/memoria");
+    }
+
+    #[cfg(feature = "server-runtime")]
+    #[test]
+    fn multi_db_ready_bootstrap_keeps_multi_db_enabled() {
+        let mut cfg = test_config();
+
+        let pending = apply_detected_runtime_topology(&mut cfg, RuntimeTopology::MultiDbReady);
+
+        assert!(pending.is_none());
+        assert!(cfg.multi_db);
+        assert_eq!(cfg.db_name, "memoria_shared");
+    }
+
+    #[cfg(feature = "server-runtime")]
+    #[test]
+    fn pending_migration_bootstrap_waits_for_migration_before_switching() {
+        let mut cfg = test_config();
+        let pending = PendingLegacyMultiDbMigration {
+            legacy_db_name: "memoria".to_string(),
+            shared_db_name: "memoria_shared".to_string(),
+            legacy_users: vec!["alice".to_string(), "bob".to_string()],
+            missing_users: vec!["bob".to_string()],
+        };
+
+        let migration = apply_detected_runtime_topology(
+            &mut cfg,
+            RuntimeTopology::PendingLegacyMigration(pending.clone()),
+        );
+
+        assert_eq!(migration, Some(pending));
+        assert!(!cfg.multi_db);
+        assert_eq!(cfg.db_name, "memoria");
+    }
+
+    #[test]
+    fn mcp_entry_includes_auto_approve() {
+        use super::mcp_entry;
+
+        // Remote mode
+        let entry = mcp_entry(
+            None,
+            Some("https://cloud.memoria.dev"),
+            Some("tok"),
+            "alice",
+            "kiro",
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let approved = entry["autoApprove"]
+            .as_array()
+            .expect("autoApprove must be an array");
+        assert!(
+            !approved.is_empty(),
+            "autoApprove must contain at least one tool"
+        );
+        // Core tools that the issue specifically calls out
+        for tool in &[
+            "memory_store",
+            "memory_retrieve",
+            "memory_search",
+            "memory_purge",
+        ] {
+            assert!(
+                approved.iter().any(|v| v.as_str() == Some(tool)),
+                "autoApprove is missing tool: {tool}"
+            );
+        }
+
+        // Embedded mode
+        let entry_embedded = mcp_entry(
+            Some("mysql://root:111@localhost:6001/memoria"),
+            None,
+            None,
+            "alice",
+            "cursor",
+            Some("openai"),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(
+            entry_embedded["autoApprove"].is_array(),
+            "autoApprove must be present in embedded mode too"
+        );
+    }
 }

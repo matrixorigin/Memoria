@@ -8,18 +8,15 @@ use memoria_core::MemoriaError;
 use memoria_storage::SqlMemoryStore;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 pub struct RebuildWorker {
     store: Arc<SqlMemoryStore>,
-    rx: mpsc::UnboundedReceiver<RebuildSignal>,
+    rx: mpsc::Receiver<RebuildSignal>,
 }
 
 impl RebuildWorker {
-    pub fn new(
-        store: Arc<SqlMemoryStore>,
-        rx: mpsc::UnboundedReceiver<RebuildSignal>,
-    ) -> Self {
+    pub fn new(store: Arc<SqlMemoryStore>, rx: mpsc::Receiver<RebuildSignal>) -> Self {
         Self { store, rx }
     }
 
@@ -34,14 +31,14 @@ impl RebuildWorker {
 
     async fn handle_signal(&self, signal: RebuildSignal) -> Result<(), MemoriaError> {
         let table = &signal.table_name;
-        debug!("Received rebuild signal for {}: {:?}", table, signal.reason);
+        info!("Received rebuild signal for {}: {:?}", table, signal.reason);
 
         // 1. 检查分布式冷却状态
         let (should_rebuild, current_rows, cooldown_remaining) =
             self.store.should_rebuild_vector_index(table).await?;
 
         if let Some(remaining) = cooldown_remaining {
-            debug!(
+            info!(
                 "Vector index rebuild for {} in cooldown: {}s remaining",
                 table, remaining
             );
@@ -49,7 +46,7 @@ impl RebuildWorker {
         }
 
         if !should_rebuild {
-            debug!("Vector index rebuild for {} not needed", table);
+            info!("Vector index rebuild for {} not needed", table);
             return Ok(());
         }
 
@@ -62,7 +59,7 @@ impl RebuildWorker {
             .await?;
 
         if !lock_acquired {
-            debug!("Another node is rebuilding vector index for {}", table);
+            info!("Another node is rebuilding vector index for {}", table);
             return Ok(());
         }
 
@@ -74,11 +71,8 @@ impl RebuildWorker {
         );
 
         let start = std::time::Instant::now();
-        let rebuild_result = tokio::time::timeout(
-            rebuild_timeout,
-            self.store.rebuild_vector_index(table),
-        )
-        .await;
+        let rebuild_result =
+            tokio::time::timeout(rebuild_timeout, self.store.rebuild_vector_index(table)).await;
 
         match rebuild_result {
             Ok(Ok(rebuilt_rows)) => {
@@ -138,11 +132,11 @@ impl RebuildWorker {
 /// 自适应冷却时间计算
 fn calculate_cooldown(row_count: i64) -> i64 {
     match row_count {
-        0..=500 => 0,            // 不需要索引
-        501..=5_000 => 3600,     // 1小时
-        5_001..=20_000 => 10800,  // 3小时
-        20_001..=50_000 => 21600, // 6小时
+        0..=500 => 0,              // 不需要索引
+        501..=5_000 => 3600,       // 1小时
+        5_001..=20_000 => 10800,   // 3小时
+        20_001..=50_000 => 21600,  // 6小时
         50_001..=100_000 => 43200, // 12小时
-        _ => 86400,              // 24小时
+        _ => 86400,                // 24小时
     }
 }

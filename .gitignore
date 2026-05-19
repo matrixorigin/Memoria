@@ -8,6 +8,7 @@ benchmark-*.html
 
 # Environment
 .env
+scripts/.env
 
 # IDE
 .vscode/
@@ -24,6 +25,7 @@ CLAUDE.md
 # Rust
 memoria/target/
 memoria/.env
+memoria/Dockerfile.prebuilt
 
 # Python (legacy)
 __pycache__/
@@ -40,3 +42,5 @@ scripts/migrate_embedding_dim.sh
 
 # Plugin dev keys
 dev-signing-key.b64
+.npmrc
+nohup.out

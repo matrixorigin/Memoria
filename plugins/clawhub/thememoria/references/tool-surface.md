@@ -17,11 +17,11 @@ Memoria gives OpenClaw:
 
 ### Recall
 
-- `memory_retrieve`: best default for relevant context
+- `memory_retrieve`: best default for relevant context; supports optional `session_id` + `session_scope` (`prefer` or `only`)
 - `memory_recall`: compatibility alias for `memory_retrieve`
-- `memory_search`: semantic lookup across memories
+- `memory_search`: semantic lookup across memories; also supports optional `session_id` + `session_scope`
 - `memory_get`: fetch a specific prior result if you already have an id
-- `memory_list`: bounded inventory of stored memories
+- `memory_list`: bounded inventory of stored memories, with optional exact `session_id` filtering
 
 ### Write And Repair
 

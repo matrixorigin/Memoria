@@ -41,6 +41,8 @@ jobs:
           - target: aarch64-apple-darwin
             os: macos-latest
             strip_bin: strip
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
 
     steps:
       - uses: actions/checkout@v4
@@ -86,17 +88,26 @@ jobs:
           SQLX_OFFLINE: "true"
         run: cargo build --release -p memoria-cli --target ${{ matrix.target }}
 
-      - name: Package
+      - name: Package (unix)
+        if: runner.os != 'Windows'
         run: |
           mkdir -p dist
           cp memoria/target/${{ matrix.target }}/release/memoria dist/ 2>/dev/null || true
           ${{ matrix.strip_bin }} dist/memoria 2>/dev/null || true
           cd dist && tar czf ../memoria-${{ matrix.target }}.tar.gz *
 
+      - name: Package (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist
+          Copy-Item "memoria/target/${{ matrix.target }}/release/memoria.exe" dist/
+          Compress-Archive -Path dist/* -DestinationPath "memoria-${{ matrix.target }}.zip"
+
       - uses: actions/upload-artifact@v4
         with:
           name: memoria-${{ matrix.target }}
-          path: memoria-${{ matrix.target }}.tar.gz
+          path: memoria-${{ matrix.target }}.*
 
   release:
     name: Create Release
@@ -113,8 +124,8 @@ jobs:
       - name: Generate checksums
         run: |
           cd artifacts
-          find . -name '*.tar.gz' -exec cp {} . \;
-          sha256sum *.tar.gz > SHA256SUMS.txt
+          find . \( -name '*.tar.gz' -o -name '*.zip' \) -exec cp {} . \;
+          sha256sum *.tar.gz *.zip > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
       - name: Create Release
@@ -123,6 +134,7 @@ jobs:
           tag_name: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
           files: |
             artifacts/*.tar.gz
+            artifacts/*.zip
             artifacts/SHA256SUMS.txt
           generate_release_notes: true
           prerelease: ${{ contains(github.ref_name, '-rc') || contains(github.ref_name, '-beta') || contains(github.ref_name, '-alpha') }}

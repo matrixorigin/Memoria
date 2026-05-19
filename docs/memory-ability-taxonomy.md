@@ -106,22 +106,14 @@
 
 ## 使用方式
 
-对已有 report JSON 做归一化：
+Rust CLI 的 `memoria benchmark` 命令在生成报告时已内置 `by_source_family`、`by_longmemeval_category`、`by_beam_ability` 分类。
 
 ```bash
-uv run python scripts/rollup_benchmark_report.py path/to/report.json
+memoria benchmark --api-url <URL> --token <TOKEN> --dataset <DATASET>
 ```
 
-对一个结果目录递归处理：
+报告中包含：
 
-```bash
-uv run python scripts/rollup_benchmark_report.py benchmarks/results/
-```
-
-处理后，每个报告会新增：
-
-- `memory_ability_taxonomy`
-- `by_memory_ability_bucket`
-- 每条 result 的
-  - `memory_ability_bucket`
-  - `memory_ability_bucket_label`
+- `by_source_family` — 按数据集来源分类
+- `by_longmemeval_category` — LongMemEval 官方分类
+- `by_beam_ability` — BEAM 官方能力分类

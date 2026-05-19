@@ -52,6 +52,7 @@ async fn recreate_table(table: &str) {
     .execute(&mut conn)
     .await
     .expect("create test table");
+    wait_for_table_visible(table).await;
 }
 
 async fn drop_table(table: &str) {
@@ -60,6 +61,32 @@ async fn drop_table(table: &str) {
         .execute(&mut conn)
         .await
         .expect("drop test table");
+}
+
+fn is_missing_table(e: &sqlx::Error) -> bool {
+    e.to_string().contains("no such table")
+}
+
+async fn wait_for_table_visible(table: &str) {
+    let deadline = Instant::now() + WAIT_TIMEOUT;
+
+    loop {
+        let mut conn = connect_session().await;
+        match sqlx::query_scalar::<_, i64>(&format!("SELECT COUNT(*) FROM {table}"))
+            .fetch_one(&mut conn)
+            .await
+        {
+            Ok(_) => return,
+            Err(e) if is_missing_table(&e) => {
+                assert!(
+                    Instant::now() < deadline,
+                    "timed out waiting for {table} to become visible across sessions; last error: {e}",
+                );
+            }
+            Err(e) => panic!("failed while waiting for {table} to become visible: {e}"),
+        }
+        sleep(POLL_INTERVAL).await;
+    }
 }
 
 async fn insert_row(conn: &mut MySqlConnection, table: &str, id: &str, version: i64, note: &str) {
