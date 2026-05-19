@@ -11,6 +11,16 @@ fn new_id() -> String {
     Uuid::new_v4().simple().to_string()
 }
 
+/// Columns for GraphNode (excluding embedding for lightweight queries)
+const NODE_COLS_NO_EMB: &str = "node_id, user_id, node_type, content, entity_type, memory_id, \
+    session_id, confidence, trust_tier, importance, source_nodes, conflicts_with, \
+    conflict_resolution, access_count, cross_session_count, is_active, superseded_by, created_at";
+
+/// Columns for GraphNode (including embedding)
+const NODE_COLS_WITH_EMB: &str = "node_id, user_id, node_type, content, entity_type, embedding, memory_id, \
+    session_id, confidence, trust_tier, importance, source_nodes, conflicts_with, \
+    conflict_resolution, access_count, cross_session_count, is_active, superseded_by, created_at";
+
 pub struct GraphStore {
     pool: MySqlPool,
     embedding_dim: usize,
@@ -128,7 +138,7 @@ impl GraphStore {
     // ── Node reads ───────────────────────────────────────────────────────────
 
     pub async fn get_node(&self, node_id: &str) -> Result<Option<GraphNode>, MemoriaError> {
-        let row = sqlx::query("SELECT * FROM memory_graph_nodes WHERE node_id = ?")
+        let row = sqlx::query(&format!("SELECT {NODE_COLS_WITH_EMB} FROM memory_graph_nodes WHERE node_id = ?"))
             .bind(node_id)
             .fetch_optional(&self.pool)
             .await
@@ -141,27 +151,27 @@ impl GraphStore {
             return Ok(vec![]);
         }
         let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-        let sql = format!("SELECT * FROM memory_graph_nodes WHERE node_id IN ({placeholders})");
+        let sql = format!("SELECT {NODE_COLS_NO_EMB} FROM memory_graph_nodes WHERE node_id IN ({placeholders})");
         let mut q = sqlx::query(&sql);
         for id in ids {
             q = q.bind(id);
         }
         let rows = q.fetch_all(&self.pool).await.map_err(db_err)?;
-        Ok(rows.iter().map(row_to_node).collect())
+        Ok(rows.iter().map(row_to_node_no_emb).collect())
     }
 
     pub async fn get_node_by_memory_id(
         &self,
         memory_id: &str,
     ) -> Result<Option<GraphNode>, MemoriaError> {
-        let row = sqlx::query(
-            "SELECT * FROM memory_graph_nodes WHERE memory_id = ? AND is_active = 1 LIMIT 1",
-        )
+        let row = sqlx::query(&format!(
+            "SELECT {NODE_COLS_NO_EMB} FROM memory_graph_nodes WHERE memory_id = ? AND is_active = 1 LIMIT 1",
+        ))
         .bind(memory_id)
         .fetch_optional(&self.pool)
         .await
         .map_err(db_err)?;
-        Ok(row.map(|r| row_to_node(&r)))
+        Ok(row.map(|r| row_to_node_no_emb(&r)))
     }
 
     /// Get all active nodes of a given type for a user (no embedding loaded).
@@ -430,30 +440,31 @@ impl GraphStore {
         display_name: &str,
         entity_type: &str,
     ) -> Result<(String, bool), MemoriaError> {
-        // Check existing
-        let existing =
-            sqlx::query("SELECT entity_id FROM mem_entities WHERE user_id = ? AND name = ?")
-                .bind(user_id)
-                .bind(name)
-                .fetch_optional(&self.pool)
-                .await
-                .map_err(db_err)?;
-
-        if let Some(row) = existing {
-            let id: String = row.try_get("entity_id").map_err(db_err)?;
-            return Ok((id, false));
-        }
-
+        // Try INSERT first; on duplicate (user_id, name) catch the error and SELECT.
         let entity_id = new_id()[..32].to_string();
         let now = chrono::Utc::now().naive_utc();
-        sqlx::query(
+        let res = sqlx::query(
             "INSERT INTO mem_entities (entity_id, user_id, name, display_name, entity_type, created_at) \
              VALUES (?,?,?,?,?,?)"
         )
         .bind(&entity_id).bind(user_id).bind(name).bind(display_name)
         .bind(entity_type).bind(now)
-        .execute(&self.pool).await.map_err(db_err)?;
-        Ok((entity_id, true))
+        .execute(&self.pool).await;
+
+        match res {
+            Ok(_) => Ok((entity_id, true)),
+            Err(sqlx::Error::Database(e))
+                if e.message().contains("Duplicate entry") =>
+            {
+                // Duplicate on unique key — fetch existing
+                let row = sqlx::query("SELECT entity_id FROM mem_entities WHERE user_id = ? AND name = ?")
+                    .bind(user_id).bind(name)
+                    .fetch_one(&self.pool).await.map_err(db_err)?;
+                let id: String = row.try_get("entity_id").map_err(db_err)?;
+                Ok((id, false))
+            }
+            Err(e) => Err(db_err(e)),
+        }
     }
 
     pub async fn upsert_memory_entity_link(
@@ -485,6 +496,50 @@ impl GraphStore {
         .execute(&self.pool)
         .await
         .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// Batch-upsert multiple memory↔entity links in a single multi-row INSERT.
+    /// Each entry: (memory_id, entity_id, source).
+    /// `user_id` is shared across all entries.
+    pub async fn batch_upsert_memory_entity_links(
+        &self,
+        user_id: &str,
+        links: &[(&str, &str, &str)], // (memory_id, entity_id, source)
+    ) -> Result<(), MemoriaError> {
+        if links.is_empty() {
+            return Ok(());
+        }
+        let now = chrono::Utc::now().naive_utc();
+        for chunk in links.chunks(50) {
+            let placeholders = chunk
+                .iter()
+                .map(|_| "(?,?,?,?,?,?)")
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "INSERT INTO mem_memory_entity_links \
+                 (memory_id, entity_id, user_id, source, weight, created_at) \
+                 VALUES {placeholders} \
+                 ON DUPLICATE KEY UPDATE source = VALUES(source), weight = VALUES(weight)"
+            );
+            let mut q = sqlx::query(&sql);
+            for (memory_id, entity_id, source) in chunk {
+                let weight: f32 = match *source {
+                    "manual" => 1.0,
+                    "llm" => 0.9,
+                    _ => 0.8,
+                };
+                q = q
+                    .bind(*memory_id)
+                    .bind(*entity_id)
+                    .bind(user_id)
+                    .bind(*source)
+                    .bind(weight)
+                    .bind(now);
+            }
+            q.execute(&self.pool).await.map_err(db_err)?;
+        }
         Ok(())
     }
 
@@ -556,12 +611,12 @@ impl GraphStore {
                 .join(",")
         );
         let sql = format!(
-            "SELECT *, l2_distance(embedding, '{vec_lit}') AS l2_dist \
+            "SELECT {NODE_COLS_NO_EMB}, l2_distance(embedding, '{vec_lit}') AS l2_dist \
              FROM memory_graph_nodes \
              WHERE user_id = ? AND is_active = 1 \
                AND embedding IS NOT NULL AND vector_dims(embedding) > 0 \
              ORDER BY l2_dist ASC \
-             LIMIT ?"
+             LIMIT ? by rank with option 'mode=post'"
         );
         let rows = sqlx::query(&sql)
             .bind(user_id)
@@ -605,23 +660,32 @@ impl GraphStore {
             return Ok(vec![]);
         }
         let sql = format!(
-            "SELECT *, MATCH(content) AGAINST('{safe}' IN BOOLEAN MODE) AS ft_score \
+            "SELECT {NODE_COLS_NO_EMB}, MATCH(content) AGAINST('{safe}' IN BOOLEAN MODE) AS ft_score \
              FROM memory_graph_nodes \
              WHERE user_id = ? AND is_active = 1 \
              AND MATCH(content) AGAINST('{safe}' IN BOOLEAN MODE) \
              ORDER BY ft_score DESC LIMIT ?"
         );
-        let rows = sqlx::query(&sql)
+        let rows = match sqlx::query(&sql)
             .bind(user_id)
             .bind(top_k)
             .fetch_all(&self.pool)
             .await
-            .map_err(db_err)?;
+        {
+            Ok(rows) => rows,
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("20101") && msg.contains("empty pattern") {
+                    return Ok(vec![]);
+                }
+                return Err(db_err(e));
+            }
+        };
         Ok(rows
             .iter()
             .map(|r| {
                 let score: f32 = r.try_get("ft_score").unwrap_or(0.0);
-                (row_to_node(r), score)
+                (row_to_node_no_emb(r), score)
             })
             .collect())
     }

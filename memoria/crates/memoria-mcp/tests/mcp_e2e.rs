@@ -19,7 +19,7 @@ async fn make_service() -> (Arc<MemoryService>, String) {
         .parse()
         .unwrap_or(1024);
 
-    let store = SqlMemoryStore::connect(&db_url, dim)
+    let store = SqlMemoryStore::connect(&db_url, dim, uuid::Uuid::new_v4().to_string())
         .await
         .expect("connect");
     store.migrate().await.expect("migrate");
@@ -164,10 +164,10 @@ async fn test_e2e_tools_list_has_8() {
     let tools = memoria_mcp::tools::list();
     assert_eq!(
         tools.as_array().unwrap().len(),
-        15,
-        "expected 15 core tools"
+        12,
+        "expected 12 agent-facing tools (6 hidden from MCP listing)"
     );
-    println!("✅ tools_list: 15 tools");
+    println!("✅ tools_list: 12 tools (6 hidden)");
 }
 
 // ── MCP branch → store → merge end-to-end ────────────────────────────────────
@@ -188,7 +188,7 @@ async fn make_git_service() -> (
         .parse()
         .unwrap_or(1024);
 
-    let store = SqlMemoryStore::connect(&db_url, dim)
+    let store = SqlMemoryStore::connect(&db_url, dim, uuid::Uuid::new_v4().to_string())
         .await
         .expect("connect");
     store.migrate().await.expect("migrate");

@@ -36,7 +36,7 @@ fn bname(suffix: &str) -> String {
 async fn setup() -> (Arc<MemoryService>, Arc<GitForDataService>, String) {
     let pool = MySqlPool::connect(&db_url()).await.expect("pool");
     let db_name = db_url().rsplit('/').next().unwrap_or("memoria").to_string();
-    let store = SqlMemoryStore::connect(&db_url(), test_dim())
+    let store = SqlMemoryStore::connect(&db_url(), test_dim(), uuid::Uuid::new_v4().to_string())
         .await
         .expect("store");
     store.migrate().await.expect("migrate");

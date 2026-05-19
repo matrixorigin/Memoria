@@ -2,6 +2,55 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.3] - 2026-03-21
+
+### ⚡ Performance
+
+- Fix performance issues (#73) ([b64de86](https://github.com/matrixorigin/Memoria/commit/b64de86360b0d795917df22985b9a1650e889191))
+
+### 📚 Documentation
+
+- **readme**: Polish beat card spacing and idea bulb icon (#69) ([c88cccc](https://github.com/matrixorigin/Memoria/commit/c88cccccfe9c07ccc6cb728d5731d71e310cd2e3))
+- Add Git for Data story demo (#66) ([2d71edb](https://github.com/matrixorigin/Memoria/commit/2d71edbeed9d4112f66e719b6ef578607cadf8ba))
+
+### 🚀 Features
+
+- Add ClawHub Memoria skill bundle (#71) ([7b4034a](https://github.com/matrixorigin/Memoria/commit/7b4034a6e416d1bc92711f0e5227784d3c76e5d3))
+- Distributed Deployment: Health Checks, Pool Metrics, OpenTelemetry, Grafana Dashboard (#67) ([cd77c9e](https://github.com/matrixorigin/Memoria/commit/cd77c9e350b452935044273ebfdae40d6500a7c9))
+
+### 🧪 Testing
+
+- Add more test (#68) ([50c3d9a](https://github.com/matrixorigin/Memoria/commit/50c3d9a4d19eb2ee0006ac0be5bbc57837568a84))
+## [0.2.2] - 2026-03-20
+
+### 🐛 Bug Fixes
+
+- Security and snapshot count  (#61) ([eafed50](https://github.com/matrixorigin/Memoria/commit/eafed5001036ff6720281eea5a625b793bcfc036))
+- Flaky ci test (#58) ([c788dc0](https://github.com/matrixorigin/Memoria/commit/c788dc072c3d6541d438d75a35fd8fa1d88a7887))
+
+### 🚀 Features
+
+- Feedback system, adaptive retrieval, governance audit trail, API hardening, and comprehensive e2e tests (#65) ([539fd8a](https://github.com/matrixorigin/Memoria/commit/539fd8a3aa33c8503400f8f824af697f1c59ac53))
+- Add --tool flag to mcp subcommand and fix codex support (#64) ([1701094](https://github.com/matrixorigin/Memoria/commit/1701094a99fa7677d9e2264d1b92a3be6c67db1b))
+- Interactive init prefill, Codex support, self-update, install auto-init (#63) ([6394d8d](https://github.com/matrixorigin/Memoria/commit/6394d8d5b5924a36adf8f5259bfaa436018ef3f2))
+- Enable apikey authentication (#47) ([18c6c17](https://github.com/matrixorigin/Memoria/commit/18c6c17f1029244fd30149159a0c8e19142e57dd))
+## [0.2.1] - 2026-03-19
+
+### 🏗️ Build
+
+- **ci**: Switch Linux release binaries to musl static linking (#56) ([b651cd1](https://github.com/matrixorigin/Memoria/commit/b651cd1abed188bca6b701e12be17000d8a35183))
+
+### 📚 Documentation
+
+- **openclaw**: Simplify install path and clarify success checks (#57) ([1e5a5f3](https://github.com/matrixorigin/Memoria/commit/1e5a5f3d350ccb26af3362da11533e97ea61823e))
+
+### 🚀 Features
+
+- More skills (#55) ([f62d777](https://github.com/matrixorigin/Memoria/commit/f62d777586e201956f5a86a89b15a476a0873561))
+
+### 🧪 Testing
+
+- Add session consistency test (#54) ([27bf9f8](https://github.com/matrixorigin/Memoria/commit/27bf9f89f5ac52eb6056c72fa0f30754a719cd9d))
 ## [0.2.0-rc] - 2026-03-19
 
 ### 🐛 Bug Fixes

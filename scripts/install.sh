@@ -15,6 +15,7 @@
 # Env:
 #   MEMORIA_REPO        GitHub repo (default: matrixorigin/Memoria)
 #   MEMORIA_VERSION     Version tag (default: latest)
+#   MEMORIA_GHPROXY     ghproxy base URL (default: https://ghfast.top, auto-detected)
 
 set -eu
 
@@ -72,8 +73,8 @@ detect_target() {
   esac
   case "$os" in
     linux)
-      [ "$arch" = "x86_64" ] && printf "x86_64-unknown-linux-gnu" && return
-      [ "$arch" = "aarch64" ] && printf "aarch64-unknown-linux-gnu" && return
+      [ "$arch" = "x86_64" ] && printf "x86_64-unknown-linux-musl" && return
+      [ "$arch" = "aarch64" ] && printf "aarch64-unknown-linux-musl" && return
       ;;
     darwin)
       [ "$arch" = "x86_64" ] && printf "x86_64-apple-darwin" && return
@@ -159,20 +160,30 @@ confirm() {
   esac
 }
 
+INIT_TOOL=""
+INIT_API_URL=""
+INIT_TOKEN=""
+
 # ── Parse args ──────────────────────────────────────────────────────
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    -v|--version) VERSION="$2"; shift 2 ;;
-    -d|--dir)     INSTALL_DIR="$2"; shift 2 ;;
-    -y|--yes)     FORCE=true; shift ;;
-    -n|--dry-run) DRY_RUN=true; shift ;;
+    -v|--version)   VERSION="$2"; shift 2 ;;
+    -d|--dir)       INSTALL_DIR="$2"; shift 2 ;;
+    -y|--yes)       FORCE=true; shift ;;
+    -n|--dry-run)   DRY_RUN=true; shift ;;
+    --tool)         INIT_TOOL="$2"; shift 2 ;;
+    --api-url)      INIT_API_URL="$2"; shift 2 ;;
+    --token)        INIT_TOKEN="$2"; shift 2 ;;
     -h|--help)
       printf "Usage: install.sh [options]\n\n"
       printf "  -v, --version TAG   Version to install (default: latest)\n"
       printf "  -d, --dir DIR       Install directory (default: /usr/local/bin)\n"
       printf "  -y, --yes           Skip confirmation prompt\n"
       printf "  -n, --dry-run       Print download URL and exit\n"
+      printf "  --tool TOOL         Auto-init after install (kiro|cursor|claude|codex)\n"
+      printf "  --api-url URL       Memoria API URL for auto-init\n"
+      printf "  --token TOKEN       Memoria API token for auto-init\n"
       printf "  -h, --help          Show this help\n"
       exit 0
       ;;
@@ -189,17 +200,19 @@ if [ -z "$TARGET" ]; then
 fi
 
 TAG="${VERSION:-latest}"
-ASSET="memoria-${TARGET}.tar.gz"
 if [ "$TAG" = "latest" ]; then
-  URL="https://github.com/${REPO}/releases/latest/download/${ASSET}"
-  SUM_URL="https://github.com/${REPO}/releases/latest/download/SHA256SUMS.txt"
-else
-  URL="https://github.com/${REPO}/releases/download/${TAG}/${ASSET}"
-  SUM_URL="https://github.com/${REPO}/releases/download/${TAG}/SHA256SUMS.txt"
+  RESOLVED_TAG=$(curl -sSf -o /dev/null -w '%{redirect_url}' "https://github.com/${REPO}/releases/latest" 2>/dev/null | grep -oE '[^/]+$')
+  if [ -n "$RESOLVED_TAG" ]; then
+    TAG="$RESOLVED_TAG"
+  fi
 fi
+ASSET="memoria-${TARGET}.tar.gz"
+GH_URL="https://github.com/${REPO}/releases/download/${TAG}/${ASSET}"
+GH_SUM_URL="https://github.com/${REPO}/releases/download/${TAG}/SHA256SUMS.txt"
+GHPROXY="${MEMORIA_GHPROXY:-https://ghfast.top}"
 
 if [ "$DRY_RUN" = true ]; then
-  echo "URL: $URL"
+  echo "URL: $GH_URL"
   exit 0
 fi
 
@@ -209,26 +222,50 @@ if [ -z "$INSTALL_DIR" ]; then
   INSTALL_DIR=/usr/local/bin
 fi
 
-# ── Show plan & confirm ────────────────────────────────────────────
+# ── Check existing installation ─────────────────────────────────────
 
-printf '\n'
-info "${BOLD}Version${NC}:   ${GREEN}${TAG}${NC}"
-info "${BOLD}Platform${NC}:  ${GREEN}${TARGET}${NC}"
-info "${BOLD}Directory${NC}: ${GREEN}${INSTALL_DIR}${NC}"
-printf '\n'
-
-if ! confirm "Install memoria?"; then
-  info "Aborted"
-  exit 0
+SKIP_DOWNLOAD=false
+# Auto-confirm when all init params are provided
+if [ -n "$INIT_TOOL" ] && [ -n "$INIT_API_URL" ] && [ -n "$INIT_TOKEN" ]; then
+  FORCE=true
+fi
+if command -v memoria >/dev/null 2>&1; then
+  INSTALLED_VERSION="$(memoria --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
+  if [ -n "$INSTALLED_VERSION" ]; then
+    TARGET_VERSION="${TAG#v}"
+    if [ "$INSTALLED_VERSION" = "$TARGET_VERSION" ]; then
+      ok "memoria v${INSTALLED_VERSION} already installed (latest)"
+      SKIP_DOWNLOAD=true
+      INSTALL_DIR="$(dirname "$(command -v memoria)")"
+    else
+      info "memoria v${INSTALLED_VERSION} installed, upgrading to v${TARGET_VERSION}"
+    fi
+  fi
 fi
 
-# ── Determine sudo requirement ──────────────────────────────────────
+# ── Show plan & confirm ────────────────────────────────────────────
 
+if [ "$SKIP_DOWNLOAD" = false ]; then
+  printf '\n'
+  info "${BOLD}Version${NC}:   ${GREEN}${TAG}${NC}"
+  info "${BOLD}Platform${NC}:  ${GREEN}${TARGET}${NC}"
+  info "${BOLD}Directory${NC}: ${GREEN}${INSTALL_DIR}${NC}"
+  printf '\n'
+
+  if ! confirm "Install memoria?"; then
+    info "Aborted"
+    exit 0
+  fi
+fi
+
+# ── Download ────────────────────────────────────────────────────────
+
+if [ "$SKIP_DOWNLOAD" = false ]; then
+
+# Determine sudo requirement
 SUDO=""
 if ! test_writeable "$INSTALL_DIR" 2>/dev/null; then
-  # Directory doesn't exist or isn't writeable
   if [ ! -d "$INSTALL_DIR" ]; then
-    # Try to create it; if that fails, need sudo
     if ! mkdir -p "$INSTALL_DIR" 2>/dev/null; then
       elevate_priv
       SUDO="sudo"
@@ -240,17 +277,24 @@ if ! test_writeable "$INSTALL_DIR" 2>/dev/null; then
   fi
 fi
 
-# ── Download ────────────────────────────────────────────────────────
-
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
-info "Downloading ${BLUE}${URL}${NC}"
-curl -fL# -o "$TMP/$ASSET" "$URL" || {
-  error "Download failed — check that version '${TAG}' exists"
-  info "Available releases: ${BLUE}https://github.com/${REPO}/releases${NC}"
-  exit 1
-}
+info "Downloading ${BLUE}${GH_URL}${NC}"
+if ! curl -fL# --max-time 10 -o "$TMP/$ASSET" "$GH_URL" 2>/dev/null; then
+  warn "Direct download failed, retrying via proxy: ${GHPROXY}"
+  URL="${GHPROXY}/${GH_URL}"
+  SUM_URL="${GHPROXY}/${GH_SUM_URL}"
+  info "Downloading ${BLUE}${URL}${NC}"
+  curl -fL# -o "$TMP/$ASSET" "$URL" || {
+    error "Download failed — check that version '${TAG}' exists"
+    info "Available releases: ${BLUE}https://github.com/${REPO}/releases${NC}"
+    exit 1
+  }
+else
+  URL="$GH_URL"
+  SUM_URL="$GH_SUM_URL"
+fi
 
 # ── Verify checksum ─────────────────────────────────────────────────
 
@@ -273,11 +317,29 @@ $SUDO chmod +x "$INSTALL_DIR/memoria"
 printf '\n'
 ok "Installed ${GREEN}memoria${NC} to ${GREEN}${INSTALL_DIR}/memoria${NC}"
 
+fi # end SKIP_DOWNLOAD
+
+# ── Auto-init ────────────────────────────────────────────────────────
+
+if [ -n "$INIT_TOOL" ] && [ -n "$INIT_API_URL" ] && [ -n "$INIT_TOKEN" ]; then
+  printf '\n'
+  info "Running: memoria init --tool ${INIT_TOOL} --api-url ${INIT_API_URL} --token ***"
+  "$INSTALL_DIR/memoria" init \
+    --tool "$INIT_TOOL" \
+    --api-url "$INIT_API_URL" \
+    --token "$INIT_TOKEN" \
+    --force
+elif [ -n "$INIT_TOOL" ]; then
+  printf '\n'
+  info "Running: memoria init -i --tool ${INIT_TOOL}"
+  "$INSTALL_DIR/memoria" init -i --tool "$INIT_TOOL"
+fi
+
 # ── PATH check ──────────────────────────────────────────────────────
 
 if ! check_path "$INSTALL_DIR"; then
   print_path_hint "$INSTALL_DIR"
-else
+elif [ -z "$INIT_TOOL" ]; then
   printf '\n'
   info "Next: run ${BLUE}memoria init -i${NC} in your project directory to start the setup wizard"
 fi

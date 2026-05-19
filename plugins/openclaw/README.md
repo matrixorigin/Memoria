@@ -18,6 +18,21 @@ In practice that means:
 
 ## Quick Start
 
+### Preflight
+
+Verify prerequisites before installing:
+
+```bash
+openclaw --version
+# -> OpenClaw vX.Y.Z (CLI is installed and in PATH)
+
+memoria --version 2>/dev/null || echo "not installed (installer can install it)"
+# -> memoria X.Y.Z or fallback message
+
+openclaw plugins list
+# -> command succeeds and prints plugin table
+```
+
 Assume OpenClaw is already installed and healthy.
 
 If you want the shortest OpenClaw-native path:
@@ -27,10 +42,10 @@ If you want the shortest OpenClaw-native path:
 - install the plugin with `openclaw plugins install`
 - let the plugin install or validate the Rust `memoria` runtime through `openclaw memoria install`
 
-Example:
+For ordinary users and AI agents, prefer npm install first:
 
 ```bash
-openclaw plugins install --link /path/to/openclaw-memoria/plugins/openclaw
+openclaw plugins install @matrixorigin/memory-memoria
 openclaw plugins enable memory-memoria
 
 MEMORIA_DB_URL='mysql://root:111@127.0.0.1:6001/memoria' \
@@ -41,10 +56,10 @@ MEMORIA_EMBEDDING_DIM='1536' \
 openclaw memoria install
 ```
 
-If you published the package to npm, the install step becomes:
+If you are installing from a local checkout (development/contributor workflow), use:
 
 ```bash
-openclaw plugins install @matrixorigin/memory-memoria
+openclaw plugins install --link /path/to/Memoria/plugins/openclaw
 openclaw plugins enable memory-memoria
 openclaw memoria install
 ```
@@ -57,6 +72,22 @@ The installer will:
 - write the plugin config into `~/.openclaw/openclaw.json`
 - add the Memoria tool surface to global and existing agent tool policy
 - install the managed skills in `~/.openclaw/skills`
+
+### Agent-Driven Install
+
+If you are operating from an OpenClaw chat/channel and want the agent to install for you, send:
+
+```text
+Install Memoria plugin for OpenClaw.
+Use: openclaw plugins install @matrixorigin/memory-memoria, then enable memory-memoria.
+Then run openclaw memoria install with:
+MEMORIA_DB_URL=mysql://root:111@127.0.0.1:6001/memoria
+MEMORIA_EMBEDDING_PROVIDER=openai
+MEMORIA_EMBEDDING_MODEL=text-embedding-3-small
+MEMORIA_EMBEDDING_DIM=1536
+MEMORIA_EMBEDDING_API_KEY from my shell env.
+Finally run openclaw memoria verify and report pass/fail.
+```
 
 ## Installer Inputs
 
@@ -82,6 +113,35 @@ Installer flags:
 - `--skip-plugin-install`: only rewrite plugin config; assume OpenClaw already installed and the plugin already loaded
 - `--verify`: run a post-install smoke check
 
+## ⚠️ Common Pitfalls
+
+**macOS `sh` vs `bash`:** The installer script is bash (`#!/usr/bin/env bash`) and uses bash-specific syntax.
+If you pipe a script, use `bash -s --`, not `sh -s --`.
+
+```bash
+# ✅ Correct
+curl -fsSL <url> | bash -s --
+
+# ❌ May fail with "bad substitution"
+curl -fsSL <url> | sh -s --
+```
+
+**Explicit memory mode is default (`autoObserve=false`):** the plugin does not auto-write memories from conversation turns.
+Writes happen when the agent explicitly calls tools like `memory_store` (or related write tools).
+This keeps memory writes intentional and reviewable.
+If you want auto-capture, set `MEMORIA_AUTO_OBSERVE=true` and provide `MEMORIA_LLM_API_KEY` + `MEMORIA_LLM_MODEL`.
+
+**Old schema vs new runtime:** If you upgraded from an older Memoria setup, existing DB schema may not match current Rust runtime expectations.
+Use a fresh database name in `MEMORIA_DB_URL` for a clean install path.
+
+```text
+# Old/default style
+mysql://root:111@127.0.0.1:6001/memoria
+
+# Clean-start recommendation
+mysql://root:111@127.0.0.1:6001/memoria_v2
+```
+
 ## Tool Surface
 
 The OpenClaw plugin exposes:
@@ -103,17 +163,26 @@ Current differences to be aware of:
 - `memory_stats` is derived from available MCP outputs, so inactive-memory totals and entity totals are not currently available
 - `memory_entities` is no longer exposed, because the Rust Memoria MCP toolset does not provide a matching tool
 - old `mysql+pymysql://...` DSNs are normalized to `mysql://...` automatically during install and config parsing
+- if you previously used an older Memoria stack, schema drift can cause runtime errors; using a fresh DB name (for example `memoria_v2`) avoids most upgrade collisions
 
 ## Uninstall
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/matrixorigin/openclaw-memoria/main/scripts/uninstall-openclaw-memoria.sh | \
+curl -fsSL https://raw.githubusercontent.com/matrixorigin/Memoria/main/plugins/openclaw/scripts/uninstall-openclaw-memoria.sh | \
   bash -s --
 ```
 
 That removes the plugin entry, tool policy additions, managed skills, and the default managed checkout path.
 
 ## Verification
+
+### Success Criteria
+
+| Level | Check | Command | Pass |
+|---|---|---|---|
+| 1. Plugin loaded | OpenClaw recognizes plugin | `openclaw plugins list` | `memory-memoria` is listed and enabled |
+| 2. Backend reachable | Memoria can reach configured backend | `openclaw memoria verify` | exits successfully |
+| 3. Memory persisted | Store -> retrieve round-trip works | `openclaw memoria stats` + `openclaw ltm list --limit 10` | non-zero memory appears after a write |
 
 Before the smoke check, confirm the CLIs you are about to use are the ones you expect:
 

@@ -7,7 +7,7 @@ use serde::Deserialize;
 use serde_json::json;
 use sqlx::Row;
 
-use crate::{auth::AuthUser, models::*, routes::memory::api_err, state::AppState};
+use crate::{auth::AuthUser, models::*, routes::memory::{api_err, api_err_typed}, state::AppState};
 
 #[derive(Deserialize, Default)]
 pub struct ListSnapshotsQuery {
@@ -41,7 +41,7 @@ async fn git_call(
 ) -> Result<serde_json::Value, (StatusCode, String)> {
     let result = memoria_mcp::git_tools::call(tool, args, &state.git, &state.service, user_id)
         .await
-        .map_err(api_err)?;
+        .map_err(api_err_typed)?;
     // Extract text from MCP response
     let text = result["content"][0]["text"]
         .as_str()
@@ -50,9 +50,64 @@ async fn git_call(
     Ok(json!({ "result": text }))
 }
 
+fn validate_snapshot_identifier(name: &str) -> Result<&str, (StatusCode, String)> {
+    if !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+        Ok(name)
+    } else {
+        Err((StatusCode::BAD_REQUEST, "Invalid snapshot name".into()))
+    }
+}
+
+fn milestone_internal(name: &str) -> Option<String> {
+    if let Some(rest) = name.strip_prefix("auto:") {
+        Some(format!("mem_milestone_{rest}"))
+    } else if name.starts_with("mem_milestone_") || name.starts_with("mem_snap_pre_") {
+        Some(name.to_string())
+    } else {
+        None
+    }
+}
+
+async fn resolve_snapshot_internal(
+    state: &AppState,
+    user_id: &str,
+    name: &str,
+) -> Result<String, (StatusCode, String)> {
+    let sql = state
+        .service
+        .sql_store
+        .as_ref()
+        .ok_or((StatusCode::SERVICE_UNAVAILABLE, "SQL store required".into()))?;
+
+    let internal = if let Some(milestone) = milestone_internal(name) {
+        milestone
+    } else if name.starts_with("mem_snap_") {
+        sql.get_snapshot_registration_by_internal(user_id, name)
+            .await
+            .map_err(api_err)?
+            .map(|r| r.snapshot_name)
+            .ok_or((StatusCode::NOT_FOUND, "Snapshot not found".into()))?
+    } else {
+        sql.get_snapshot_registration(user_id, name)
+            .await
+            .map_err(api_err)?
+            .map(|r| r.snapshot_name)
+            .ok_or((StatusCode::NOT_FOUND, "Snapshot not found".into()))?
+    };
+
+    let internal = validate_snapshot_identifier(&internal)?.to_string();
+    state
+        .git
+        .get_snapshot(&internal)
+        .await
+        .map_err(api_err)?
+        .ok_or((StatusCode::NOT_FOUND, "Snapshot not found".into()))?;
+    Ok(internal)
+}
+
 pub async fn create_snapshot(
     State(state): State<AppState>,
-    AuthUser(user_id): AuthUser,
+    AuthUser { user_id, .. }: AuthUser,
     Json(req): Json<CreateSnapshotRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, String)> {
     let r = git_call(
@@ -67,7 +122,7 @@ pub async fn create_snapshot(
 
 pub async fn list_snapshots(
     State(state): State<AppState>,
-    AuthUser(user_id): AuthUser,
+    AuthUser { user_id, .. }: AuthUser,
     Query(q): Query<ListSnapshotsQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let r = git_call(
@@ -83,7 +138,7 @@ pub async fn list_snapshots(
 /// GET /v1/snapshots/:name — read snapshot detail with time-travel query
 pub async fn get_snapshot(
     State(state): State<AppState>,
-    AuthUser(user_id): AuthUser,
+    AuthUser { user_id, .. }: AuthUser,
     Path(name): Path<String>,
     Query(q): Query<GetSnapshotQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
@@ -94,7 +149,7 @@ pub async fn get_snapshot(
         .map(|s| s.pool())
         .ok_or((StatusCode::SERVICE_UNAVAILABLE, "SQL store required".into()))?;
 
-    let snap_name = format!("mem_snap_{name}");
+    let snap_name = resolve_snapshot_internal(&state, &user_id, &name).await?;
     let limit = q.limit.unwrap_or(50).min(500);
     let offset = q.offset.unwrap_or(0);
     let detail = q.detail.as_deref().unwrap_or("brief");
@@ -182,7 +237,7 @@ pub async fn get_snapshot(
 /// GET /v1/snapshots/:name/diff — compare snapshot vs current state
 pub async fn diff_snapshot(
     State(state): State<AppState>,
-    AuthUser(user_id): AuthUser,
+    AuthUser { user_id, .. }: AuthUser,
     Path(name): Path<String>,
     Query(q): Query<DiffSnapshotQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
@@ -193,7 +248,7 @@ pub async fn diff_snapshot(
         .map(|s| s.pool())
         .ok_or((StatusCode::SERVICE_UNAVAILABLE, "SQL store required".into()))?;
 
-    let snap_name = format!("mem_snap_{name}");
+    let snap_name = resolve_snapshot_internal(&state, &user_id, &name).await?;
     let limit = q.limit.unwrap_or(50).min(200);
 
     // Counts
@@ -257,7 +312,7 @@ pub async fn diff_snapshot(
 
 pub async fn delete_snapshot(
     State(state): State<AppState>,
-    AuthUser(user_id): AuthUser,
+    AuthUser { user_id, .. }: AuthUser,
     Path(name): Path<String>,
 ) -> Result<StatusCode, (StatusCode, String)> {
     git_call(
@@ -272,7 +327,7 @@ pub async fn delete_snapshot(
 
 pub async fn delete_snapshot_bulk(
     State(state): State<AppState>,
-    AuthUser(user_id): AuthUser,
+    AuthUser { user_id, .. }: AuthUser,
     Json(req): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let r = git_call(&state, &user_id, "memory_snapshot_delete", req).await?;
@@ -281,7 +336,7 @@ pub async fn delete_snapshot_bulk(
 
 pub async fn rollback(
     State(state): State<AppState>,
-    AuthUser(user_id): AuthUser,
+    AuthUser { user_id, .. }: AuthUser,
     Path(name): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let r = git_call(&state, &user_id, "memory_rollback", json!({ "name": name })).await?;
@@ -290,7 +345,7 @@ pub async fn rollback(
 
 pub async fn list_branches(
     State(state): State<AppState>,
-    AuthUser(user_id): AuthUser,
+    AuthUser { user_id, .. }: AuthUser,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let r = git_call(&state, &user_id, "memory_branches", json!({})).await?;
     Ok(Json(r))
@@ -298,7 +353,7 @@ pub async fn list_branches(
 
 pub async fn create_branch(
     State(state): State<AppState>,
-    AuthUser(user_id): AuthUser,
+    AuthUser { user_id, .. }: AuthUser,
     Json(req): Json<CreateBranchRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, String)> {
     let r = git_call(
@@ -317,7 +372,7 @@ pub async fn create_branch(
 
 pub async fn checkout_branch(
     State(state): State<AppState>,
-    AuthUser(user_id): AuthUser,
+    AuthUser { user_id, .. }: AuthUser,
     Path(name): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let r = git_call(&state, &user_id, "memory_checkout", json!({ "name": name })).await?;
@@ -326,7 +381,7 @@ pub async fn checkout_branch(
 
 pub async fn merge_branch(
     State(state): State<AppState>,
-    AuthUser(user_id): AuthUser,
+    AuthUser { user_id, .. }: AuthUser,
     Path(name): Path<String>,
     Json(req): Json<MergeRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
@@ -342,7 +397,7 @@ pub async fn merge_branch(
 
 pub async fn diff_branch(
     State(state): State<AppState>,
-    AuthUser(user_id): AuthUser,
+    AuthUser { user_id, .. }: AuthUser,
     Path(name): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let r = git_call(&state, &user_id, "memory_diff", json!({ "source": name })).await?;
@@ -351,7 +406,7 @@ pub async fn diff_branch(
 
 pub async fn delete_branch(
     State(state): State<AppState>,
-    AuthUser(user_id): AuthUser,
+    AuthUser { user_id, .. }: AuthUser,
     Path(name): Path<String>,
 ) -> Result<StatusCode, (StatusCode, String)> {
     git_call(

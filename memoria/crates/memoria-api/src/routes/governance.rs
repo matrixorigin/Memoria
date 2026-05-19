@@ -7,7 +7,7 @@ use crate::{auth::AuthUser, models::*, routes::memory::api_err, state::AppState}
 
 pub async fn governance(
     State(state): State<AppState>,
-    AuthUser(user_id): AuthUser,
+    AuthUser { user_id, .. }: AuthUser,
     Json(req): Json<GovernanceRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let sql = state.service.sql_store.as_ref().ok_or_else(|| {
@@ -35,24 +35,12 @@ pub async fn governance(
         .map_err(api_err)?;
     let cleaned = sql.cleanup_stale(&user_id).await.map_err(api_err)?;
     if quarantined > 0 {
-        sql.log_edit(
-            &user_id,
-            "governance:quarantine",
-            &[],
-            &format!("quarantined {quarantined}"),
-            None,
-        )
-        .await;
+        let payload = serde_json::json!({"quarantined": quarantined}).to_string();
+        sql.log_edit(&user_id, "governance:quarantine", None, Some(&payload), &format!("quarantined {quarantined}"), None).await;
     }
     if cleaned > 0 {
-        sql.log_edit(
-            &user_id,
-            "governance:cleanup_stale",
-            &[],
-            &format!("cleaned {cleaned}"),
-            None,
-        )
-        .await;
+        let payload = serde_json::json!({"cleaned_stale": cleaned}).to_string();
+        sql.log_edit(&user_id, "governance:cleanup_stale", None, Some(&payload), &format!("cleaned {cleaned}"), None).await;
     }
     sql.set_cooldown(&user_id, "governance")
         .await
@@ -64,7 +52,7 @@ pub async fn governance(
 
 pub async fn consolidate(
     State(state): State<AppState>,
-    AuthUser(user_id): AuthUser,
+    AuthUser { user_id, .. }: AuthUser,
     Json(req): Json<GovernanceRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let sql = state.service.sql_store.as_ref().ok_or_else(|| {
@@ -107,7 +95,7 @@ pub async fn consolidate(
 
 pub async fn reflect(
     State(state): State<AppState>,
-    AuthUser(user_id): AuthUser,
+    AuthUser { user_id, .. }: AuthUser,
     Json(req): Json<ReflectRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let sql = state.service.sql_store.as_ref().ok_or_else(|| {
@@ -223,7 +211,7 @@ pub async fn reflect(
 
 pub async fn extract_entities(
     State(state): State<AppState>,
-    AuthUser(user_id): AuthUser,
+    AuthUser { user_id, .. }: AuthUser,
     Json(req): Json<ExtractEntitiesRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let sql = state.service.sql_store.as_ref().ok_or_else(|| {
@@ -286,6 +274,7 @@ pub async fn extract_entities(
                 continue;
             }
         };
+        let mut links: Vec<(String, String, &str)> = Vec::new();
         for item in &items {
             let name = item["name"].as_str().unwrap_or("").trim().to_lowercase();
             if name.is_empty() {
@@ -296,13 +285,20 @@ pub async fn extract_entities(
             if let Ok((entity_id, is_new)) =
                 graph.upsert_entity(&user_id, &name, &display, &etype).await
             {
-                let _ = graph
-                    .upsert_memory_entity_link(memory_id, &entity_id, &user_id, "llm")
-                    .await;
+                links.push((memory_id.to_string(), entity_id, "llm"));
                 if is_new {
                     total_created += 1;
                 }
             }
+        }
+        if !links.is_empty() {
+            let refs: Vec<(&str, &str, &str)> = links
+                .iter()
+                .map(|(m, e, s)| (m.as_str(), e.as_str(), *s))
+                .collect();
+            let _ = graph
+                .batch_upsert_memory_entity_links(&user_id, &refs)
+                .await;
         }
     }
     Ok(Json(
@@ -312,7 +308,7 @@ pub async fn extract_entities(
 
 pub async fn link_entities(
     State(state): State<AppState>,
-    AuthUser(user_id): AuthUser,
+    AuthUser { user_id, .. }: AuthUser,
     Json(req): Json<LinkEntitiesRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let sql = state.service.sql_store.as_ref().ok_or_else(|| {
@@ -324,6 +320,7 @@ pub async fn link_entities(
     let graph = sql.graph_store();
     let mut created = 0usize;
     let mut reused = 0usize;
+    let mut links: Vec<(String, String, &str)> = Vec::new();
     for link in &req.entities {
         for ent in &link.entities {
             let name = ent.name.trim().to_lowercase();
@@ -334,16 +331,23 @@ pub async fn link_entities(
                 .upsert_entity(&user_id, &name, &ent.name, &ent.entity_type)
                 .await
                 .map_err(api_err)?;
-            graph
-                .upsert_memory_entity_link(&link.memory_id, &entity_id, &user_id, "manual")
-                .await
-                .map_err(api_err)?;
+            links.push((link.memory_id.clone(), entity_id, "manual"));
             if is_new {
                 created += 1;
             } else {
                 reused += 1;
             }
         }
+    }
+    if !links.is_empty() {
+        let refs: Vec<(&str, &str, &str)> = links
+            .iter()
+            .map(|(m, e, s)| (m.as_str(), e.as_str(), *s))
+            .collect();
+        graph
+            .batch_upsert_memory_entity_links(&user_id, &refs)
+            .await
+            .map_err(api_err)?;
     }
     Ok(Json(
         json!({ "entities_created": created, "entities_reused": reused, "edges_created": created }),
@@ -352,7 +356,7 @@ pub async fn link_entities(
 
 pub async fn get_entities(
     State(state): State<AppState>,
-    AuthUser(user_id): AuthUser,
+    AuthUser { user_id, .. }: AuthUser,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let sql = state.service.sql_store.as_ref().ok_or_else(|| {
         (

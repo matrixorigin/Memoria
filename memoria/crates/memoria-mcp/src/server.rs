@@ -221,7 +221,9 @@ async fn dispatch(
                         "memory_branch_delete",
                     ];
                     if git_tool_names.contains(&name.as_str()) {
-                        git_tools::call(&name, args, git, service, user_id).await
+                        git_tools::call(&name, args, git, service, user_id)
+                            .await
+                            .map_err(|e| anyhow::anyhow!("{e}"))
                     } else {
                         tools::call(&name, args, service, user_id).await
                     }

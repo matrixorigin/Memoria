@@ -1,7 +1,7 @@
 .PHONY: help check-env up down status logs logs-db \
         up-db down-db up-api down-api rebuild-api health \
         dev build build-local check \
-        test test-unit test-integration test-e2e bench bench-rollup \
+        test test-unit test-integration test-e2e bench bench-rollup dev-bench \
         new-key list-keys revoke-keys \
         clean reset
 
@@ -49,6 +49,7 @@ help:
 	@echo "  make test-e2e           E2E API tests (needs DB)"
 	@echo "  make bench              Run benchmark (needs: make up)"
 	@echo "  make bench-rollup REPORT=path/to/report.json"
+	@echo "  make dev-bench          Load test API (DURATION=60 USERS=10 SCENARIO=all)"
 	@echo ""
 	@echo "API Keys:"
 	@echo "  make new-key USER=alice NAME=dev-key"
@@ -218,6 +219,13 @@ bench: check-env
 bench-rollup:
 	@if [ -z "$(REPORT)" ]; then echo "❌ Usage: make bench-rollup REPORT=path/to/report-or-dir"; exit 1; fi
 	@uv run python scripts/rollup_benchmark_report.py "$(REPORT)"
+
+dev-bench: check-env
+	@cd memoria && SQLX_OFFLINE=true cargo run -p memoria-cli --bin loadtest -- \
+		--api-url "$(BENCH_URL)" --token "$(BENCH_TOKEN)" \
+		$(if $(DURATION),--duration $(DURATION),) \
+		$(if $(USERS),--users $(USERS),) \
+		$(if $(SCENARIO),--scenario $(SCENARIO),)
 
 # ── API Keys ────────────────────────────────────────────────────────
 

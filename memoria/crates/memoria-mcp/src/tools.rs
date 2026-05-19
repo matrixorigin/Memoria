@@ -112,16 +112,6 @@ pub fn list() -> Value {
             }
         },
         {
-            "name": "memory_rebuild_index",
-            "description": "Rebuild IVF vector index for a memory table. Only call when governance reports needs_rebuild=True.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "table": {"type": "string", "default": "mem_memories"}
-                }
-            }
-        },
-        {
             "name": "memory_consolidate",
             "description": "Run graph consolidation: detect contradicting memories, fix orphaned nodes, manage trust tiers. 30-minute cooldown.",
             "inputSchema": {
@@ -143,40 +133,16 @@ pub fn list() -> Value {
             }
         },
         {
-            "name": "memory_extract_entities",
-            "description": "Extract named entities from memories and build entity graph.",
+            "name": "memory_feedback",
+            "description": "Record explicit relevance feedback for a memory. Helps improve retrieval over time.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "mode": {"type": "string", "default": "auto"}
-                }
-            }
-        },
-        {
-            "name": "memory_link_entities",
-            "description": "Write entity links from user-LLM extraction results.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "entities": {"type": "string"}
+                    "memory_id": {"type": "string", "description": "ID of the memory to provide feedback on"},
+                    "signal": {"type": "string", "enum": ["useful", "irrelevant", "outdated", "wrong"], "description": "Feedback signal"},
+                    "context": {"type": "string", "description": "Optional context about why this feedback was given"}
                 },
-                "required": ["entities"]
-            }
-        },
-        {
-            "name": "memory_observe",
-            "description": "Observe a conversation turn and extract memories from messages. Stores assistant/user messages as semantic memories.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "messages": {
-                        "type": "array",
-                        "items": {"type": "object"},
-                        "description": "Array of {role, content} message objects"
-                    },
-                    "session_id": {"type": "string"}
-                },
-                "required": ["messages"]
+                "required": ["memory_id", "signal"]
             }
         }
     ])
@@ -248,15 +214,23 @@ pub async fn call(
 
                 // Auto entity extraction (regex, lightweight)
                 let entities = memoria_storage::extract_entities(&m.content);
+                let mut links: Vec<(String, String, &str)> = Vec::new();
                 for ent in &entities {
                     if let Ok((entity_id, _)) = graph
                         .upsert_entity(user_id, &ent.name, &ent.display, &ent.entity_type)
                         .await
                     {
-                        let _ = graph
-                            .upsert_memory_entity_link(&m.memory_id, &entity_id, user_id, "regex")
-                            .await;
+                        links.push((m.memory_id.clone(), entity_id, "regex"));
                     }
+                }
+                if !links.is_empty() {
+                    let refs: Vec<(&str, &str, &str)> = links
+                        .iter()
+                        .map(|(m, e, s)| (m.as_str(), e.as_str(), *s))
+                        .collect();
+                    let _ = graph
+                        .batch_upsert_memory_entity_links(user_id, &refs)
+                        .await;
                 }
             }
 
@@ -414,9 +388,8 @@ pub async fn call(
         "memory_capabilities" => Ok(mcp_text(
             "Available tools: memory_store, memory_retrieve, memory_search, \
              memory_correct, memory_purge, memory_profile, memory_list, \
-             memory_capabilities, memory_governance, memory_rebuild_index, \
-             memory_consolidate, memory_reflect, memory_extract_entities, \
-             memory_link_entities, memory_observe",
+             memory_capabilities, memory_governance, memory_consolidate, \
+             memory_reflect, memory_feedback",
         )),
 
         "memory_governance" => {
@@ -439,6 +412,32 @@ pub async fn call(
             let quarantined = sql.quarantine_low_confidence(user_id).await?;
             let cleaned = sql.cleanup_stale(user_id).await?;
             sql.set_cooldown(user_id, "governance").await?;
+
+            // Audit log for quarantine/cleanup
+            if quarantined > 0 {
+                let payload = serde_json::json!({"quarantined": quarantined}).to_string();
+                sql.log_edit(
+                    user_id,
+                    "governance:quarantine",
+                    None,
+                    Some(&payload),
+                    &format!("quarantined {quarantined}"),
+                    None,
+                )
+                .await;
+            }
+            if cleaned > 0 {
+                let payload = serde_json::json!({"cleaned_stale": cleaned}).to_string();
+                sql.log_edit(
+                    user_id,
+                    "governance:cleanup",
+                    None,
+                    Some(&payload),
+                    &format!("cleaned_stale {cleaned}"),
+                    None,
+                )
+                .await;
+            }
 
             // Snapshot health
             let snap_health = {
@@ -718,6 +717,7 @@ pub async fn call(
                                 Ok(v) => v,
                                 Err(_) => continue,
                             };
+                        let mut links: Vec<(String, String, &str)> = Vec::new();
                         for item in &items {
                             let name = item["name"].as_str().unwrap_or("").trim().to_lowercase();
                             if name.is_empty() {
@@ -728,16 +728,21 @@ pub async fn call(
                             if let Ok((entity_id, is_new)) =
                                 graph.upsert_entity(user_id, &name, &display, &etype).await
                             {
-                                let _ = graph
-                                    .upsert_memory_entity_link(
-                                        memory_id, &entity_id, user_id, "llm",
-                                    )
-                                    .await;
+                                links.push((memory_id.to_string(), entity_id, "llm"));
                                 if is_new {
                                     total_created += 1;
                                     total_edges += 1;
                                 }
                             }
+                        }
+                        if !links.is_empty() {
+                            let refs: Vec<(&str, &str, &str)> = links
+                                .iter()
+                                .map(|(m, e, s)| (m.as_str(), e.as_str(), *s))
+                                .collect();
+                            let _ = graph
+                                .batch_upsert_memory_entity_links(user_id, &refs)
+                                .await;
                         }
                     }
 
@@ -816,18 +821,26 @@ pub async fn call(
                 if ents.is_empty() {
                     continue;
                 }
+                let mut links: Vec<(String, String, &str)> = Vec::new();
                 for (name, display, etype) in &ents {
                     let (entity_id, is_new) =
                         graph.upsert_entity(user_id, name, display, etype).await?;
-                    graph
-                        .upsert_memory_entity_link(memory_id, &entity_id, user_id, "manual")
-                        .await?;
+                    links.push((memory_id.to_string(), entity_id, "manual"));
                     if is_new {
                         total_created += 1;
                         total_edges += 1;
                     } else {
                         total_reused += 1;
                     }
+                }
+                if !links.is_empty() {
+                    let refs: Vec<(&str, &str, &str)> = links
+                        .iter()
+                        .map(|(m, e, s)| (m.as_str(), e.as_str(), *s))
+                        .collect();
+                    graph
+                        .batch_upsert_memory_entity_links(user_id, &refs)
+                        .await?;
                 }
             }
 
@@ -837,6 +850,57 @@ pub async fn call(
                 "entities_reused": total_reused,
                 "edges_created": total_edges
             }))?))
+        }
+
+        "memory_feedback" => {
+            let memory_id = args["memory_id"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("memory_id is required"))?;
+            let signal = args["signal"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("signal is required"))?;
+            let context = args["context"].as_str();
+
+            let feedback_id = service
+                .record_feedback(user_id, memory_id, signal, context)
+                .await?;
+
+            Ok(mcp_text(&format!(
+                "Recorded feedback: memory={}, signal={}, feedback_id={}",
+                memory_id, signal, feedback_id
+            )))
+        }
+
+        "memory_get_retrieval_params" => {
+            let sql = service
+                .sql_store
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("SQL store not available"))?;
+            let params = sql.get_user_retrieval_params(user_id).await?;
+            Ok(mcp_text(&serde_json::to_string_pretty(&params)?))
+        }
+
+        "memory_tune_params" => {
+            use memoria_service::scoring::{DefaultScoringPlugin, ScoringPlugin};
+
+            let sql = service
+                .sql_store
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("SQL store not available"))?;
+
+            let old_params = sql.get_user_retrieval_params(user_id).await?;
+            let plugin = DefaultScoringPlugin;
+            match plugin.tune_params(sql.as_ref(), user_id).await? {
+                Some(new_params) => Ok(mcp_text(&format!(
+                    "Parameters tuned:\n  feedback_weight: {:.3} → {:.3}\n  temporal_decay_hours: {:.1} → {:.1}\n  confidence_weight: {:.3} → {:.3}",
+                    old_params.feedback_weight, new_params.feedback_weight,
+                    old_params.temporal_decay_hours, new_params.temporal_decay_hours,
+                    old_params.confidence_weight, new_params.confidence_weight
+                ))),
+                None => Ok(mcp_text(
+                    "Not enough feedback to tune parameters (minimum 10 feedback signals required)"
+                )),
+            }
         }
 
         "memory_observe" => {
@@ -874,20 +938,23 @@ pub async fn call(
                     };
                     let _ = graph.create_node(&node).await;
                     let entities = memoria_storage::extract_entities(&m.content);
+                    let mut links: Vec<(String, String, &str)> = Vec::new();
                     for ent in &entities {
                         if let Ok((entity_id, _)) = graph
                             .upsert_entity(user_id, &ent.name, &ent.display, &ent.entity_type)
                             .await
                         {
-                            let _ = graph
-                                .upsert_memory_entity_link(
-                                    &m.memory_id,
-                                    &entity_id,
-                                    user_id,
-                                    "regex",
-                                )
-                                .await;
+                            links.push((m.memory_id.clone(), entity_id, "regex"));
                         }
+                    }
+                    if !links.is_empty() {
+                        let refs: Vec<(&str, &str, &str)> = links
+                            .iter()
+                            .map(|(m, e, s)| (m.as_str(), e.as_str(), *s))
+                            .collect();
+                        let _ = graph
+                            .batch_upsert_memory_entity_links(user_id, &refs)
+                            .await;
                     }
                 }
             }

@@ -1,5 +1,5 @@
 /// Branch-aware memory integration tests against real MatrixOne.
-/// Run: DATABASE_URL=mysql://root:111@localhost:6001/memoria \
+/// Run: DATABASE_URL=mysql://root:111@localhost:6001/memoria_test \
 ///      cargo test -p memoria-storage --test branch_ops -- --nocapture
 use memoria_core::{Memory, MemoryType, TrustTier};
 use memoria_storage::SqlMemoryStore;
@@ -8,7 +8,7 @@ use uuid::Uuid;
 
 fn db_url() -> String {
     std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "mysql://root:111@localhost:6001/memoria".to_string())
+        .unwrap_or_else(|_| "mysql://root:111@localhost:6001/memoria_test".to_string())
 }
 
 fn uid() -> String {
@@ -76,7 +76,8 @@ async fn create_branch_table(pool: &sqlx::MySqlPool, table: &str, dim: usize) {
 
 async fn setup() -> SqlMemoryStore {
     let pool = MySqlPool::connect(&db_url()).await.expect("connect");
-    let store = SqlMemoryStore::new(pool, test_dim());
+    let instance_id = uuid::Uuid::new_v4().to_string();
+    let store = SqlMemoryStore::new(pool, test_dim(), instance_id);
     store.migrate().await.expect("migrate");
     store
 }

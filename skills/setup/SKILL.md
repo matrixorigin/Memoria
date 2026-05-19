@@ -1,6 +1,6 @@
 ---
 name: setup
-description: Install Memoria and configure MCP for AI tools (Kiro, Cursor, Claude Code). Decision tree for embedded vs remote mode, database, embedding provider. Use when helping users set up Memoria.
+description: Install Memoria and configure MCP for AI tools (Kiro, Cursor, Claude Code, Codex). Decision tree for embedded vs remote mode, database, embedding provider. Use when helping users set up Memoria.
 ---
 
 ## Decision Tree
@@ -14,12 +14,13 @@ Ask: "Are you setting up your own instance, or connecting to an existing Memoria
 
 ### Step 2: Which AI tool?
 
-Ask: "Kiro, Cursor, or Claude Code?"
+Ask: "Kiro, Cursor, Claude Code, or Codex?"
 
 Config files generated:
 - Kiro: `.kiro/settings/mcp.json` + `.kiro/steering/memory.md`
 - Cursor: `.cursor/mcp.json` + `.cursor/rules/memory.mdc`
 - Claude: `.mcp.json` + `CLAUDE.md`
+- Codex: `~/.codex/config.toml` + `AGENTS.md`
 
 ### Step 3: MatrixOne database?
 
@@ -42,8 +43,8 @@ Ask: "Do you have an OpenAI-compatible embedding endpoint?"
 
 ```bash
 # Linux x86_64
-curl -LO https://github.com/matrixorigin/Memoria/releases/latest/download/memoria-x86_64-unknown-linux-gnu.tar.gz
-tar xzf memoria-x86_64-unknown-linux-gnu.tar.gz && sudo mv memoria /usr/local/bin/
+curl -LO https://github.com/matrixorigin/Memoria/releases/latest/download/memoria-x86_64-unknown-linux-musl.tar.gz
+tar xzf memoria-x86_64-unknown-linux-musl.tar.gz && sudo mv memoria /usr/local/bin/
 
 # macOS Apple Silicon
 curl -LO https://github.com/matrixorigin/Memoria/releases/latest/download/memoria-aarch64-apple-darwin.tar.gz
@@ -108,7 +109,7 @@ Tell user to restart their AI tool. Verify: `memory_retrieve("test")` → "No re
 ## Post-Setup
 
 ```bash
-memoria update-rules    # After upgrading binary, sync steering rules
+memoria rules --force   # After upgrading binary, sync steering rules
 ```
 
 ## MCP Server Modes

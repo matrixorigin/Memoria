@@ -1,4 +1,4 @@
-[target.aarch64-unknown-linux-gnu]
+[target.aarch64-unknown-linux-musl]
 # No special setup needed — we use rustls (pure Rust TLS), no system OpenSSL required.
 
 [build.env]

@@ -225,7 +225,7 @@ async fn generate_and_store(
 
 pub async fn create_session_summary(
     State(state): State<AppState>,
-    AuthUser(user_id): AuthUser,
+    AuthUser { user_id, .. }: AuthUser,
     Path(session_id): Path<String>,
     Json(req): Json<SessionSummaryRequest>,
 ) -> Result<Json<SessionSummaryResponse>, (StatusCode, String)> {
@@ -265,7 +265,7 @@ pub async fn create_session_summary(
 
     let task_id = uuid::Uuid::new_v4().simple().to_string();
     task_store
-        .create_task(&task_id, &state.instance_id)
+        .create_task(&task_id, &state.instance_id, &user_id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -312,7 +312,7 @@ pub async fn create_session_summary(
 
 pub async fn get_task_status(
     State(state): State<AppState>,
-    AuthUser(_): AuthUser,
+    AuthUser { user_id, is_master }: AuthUser,
     Path(task_id): Path<String>,
 ) -> Result<Json<TaskStatus>, (StatusCode, String)> {
     let task_store = state.task_store.as_ref().ok_or((
@@ -326,14 +326,19 @@ pub async fn get_task_status(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     match task {
-        Some(t) => Ok(Json(TaskStatus {
-            task_id: t.task_id,
-            status: t.status,
-            created_at: t.created_at,
-            updated_at: t.updated_at,
-            result: t.result,
-            error: t.error,
-        })),
+        Some(t) => {
+            if !is_master && t.user_id != user_id {
+                return Err((StatusCode::FORBIDDEN, "Not your task".to_string()));
+            }
+            Ok(Json(TaskStatus {
+                task_id: t.task_id,
+                status: t.status,
+                created_at: t.created_at,
+                updated_at: t.updated_at,
+                result: t.result,
+                error: t.error,
+            }))
+        }
         None => Err((StatusCode::NOT_FOUND, format!("Task {task_id} not found"))),
     }
 }
