@@ -84,6 +84,28 @@ memory_branch_delete(name="approach_a")
 memory_branch_delete(name="approach_b")
 ```
 
+## Pattern 4: Selective Apply
+
+When only part of a branch should land on `main`, or you want conflict-by-conflict control, prefer `memory_apply` over merging the whole branch.
+
+```
+memory_diff(source="experiment_notes")
+
+# Promote only the selected changes
+memory_apply(
+  source="experiment_notes",
+  adds=["mem_new_1"],
+  updates=[{"old_id": "mem_old_1", "new_id": "mem_new_1"}],
+  removes=["mem_delete_1"],
+  accept_branch_conflicts=["mem_conflict_1"]
+)
+```
+
+Rules:
+- Omit an item from `adds` / `updates` / `removes` to leave `main` unchanged for that item.
+- Omit a conflict from `accept_branch_conflicts` to keep the `main` version.
+- Use `memory_merge` only when the entire branch should land together.
+
 ## When to Branch
 
 - ✅ Evaluating a technology, framework, or architecture change
@@ -109,4 +131,4 @@ Always delete branches after merge or abandonment. Check with `memory_branches()
 - `replace` (default, also called `accept`): branch wins on conflicts — if the same memory exists on both main and branch, the branch version replaces main's
 - `append`: skip-on-conflict — only adds new memories from branch, never overwrites existing main memories
 
-Use `replace` when the branch contains validated corrections. Use `append` when the branch only adds new information and you want to preserve main's existing state.
+Use `replace` when the branch contains validated corrections. Use `append` when the branch only adds new information and you want to preserve main's existing state. If you only want part of a branch, use `memory_apply` instead of either merge strategy.

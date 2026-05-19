@@ -1,4 +1,3 @@
-import { spawnSync } from "node:child_process";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
@@ -44,8 +43,6 @@ const MEMORIA_AGENT_GUIDANCE = [
 ].join("\n");
 
 const PLUGIN_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const INSTALLER_SCRIPT = path.join(PLUGIN_ROOT, "scripts", "install-openclaw-memoria.sh");
-const VERIFY_SCRIPT = path.join(PLUGIN_ROOT, "scripts", "verify_plugin_install.mjs");
 
 function resolveOpenClawBinFromProcess(): string {
   return typeof process.argv[1] === "string" && process.argv[1].trim()
@@ -54,28 +51,15 @@ function resolveOpenClawBinFromProcess(): string {
 }
 
 function resolveOpenClawConfigFile(): string {
-  const openclawHome = typeof process.env.OPENCLAW_HOME === "string" ? process.env.OPENCLAW_HOME : "";
+  const home = process.env.HOME ?? "";
+  const explicitConfigPath = process.env.OPENCLAW_CONFIG_PATH?.trim() ?? "";
+  if (explicitConfigPath) {
+    return explicitConfigPath.replace(/^~(?=$|\/|\\)/, home);
+  }
+  const openclawHome = process.env.OPENCLAW_HOME?.trim() ?? "";
   return openclawHome
     ? path.join(openclawHome, ".openclaw", "openclaw.json")
-    : path.join(process.env.HOME ?? "", ".openclaw", "openclaw.json");
-}
-
-function runLocalCommand(command: string, args: string[]) {
-  const result = spawnSync(command, args, {
-    cwd: PLUGIN_ROOT,
-    env: process.env,
-    stdio: "inherit",
-  });
-
-  if (result.error) {
-    throw result.error;
-  }
-  if (typeof result.status === "number" && result.status !== 0) {
-    throw new Error(`${path.basename(command)} exited with status ${result.status}`);
-  }
-  if (result.signal) {
-    throw new Error(`${path.basename(command)} terminated by signal ${result.signal}`);
-  }
+    : path.join(home, ".openclaw", "openclaw.json");
 }
 
 function objectSchema(
@@ -309,8 +293,6 @@ function buildMemoryPath(memoryId: string): string {
   return `memoria://${memoryId}`;
 }
 
-const EMBEDDED_ONLY_TOOL_NAMES: string[] = [];
-
 const CLI_COMMAND_NAMES = ["memoria", "ltm"] as const;
 
 const MEMORY_TOOL_ALIASES: Record<string, string> = {
@@ -356,9 +338,9 @@ function buildCapabilitiesPayload(config: MemoriaPluginConfig): Record<string, u
     userIdStrategy: config.userIdStrategy,
     autoRecall: config.autoRecall,
     autoObserve: config.autoObserve,
-    llmConfigured: Boolean(config.llmApiKey || config.backend === "http"),
+    llmConfigured: Boolean(config.llmApiKey || config.backend === "api"),
     tools: supportedToolNames(),
-    embeddedOnly: [...EMBEDDED_ONLY_TOOL_NAMES],
+    embeddedOnly: [],
     cliCommands: [...CLI_COMMAND_NAMES],
     aliases: MEMORY_TOOL_ALIASES,
     backendFeatures: {
@@ -461,10 +443,38 @@ function hasMessageError(value: unknown): value is Record<string, unknown> & { m
   return Boolean(record && "error" in record && typeof record.message === "string");
 }
 
+function hasNonEmptyString(value: unknown): boolean {
+  return typeof value === "string" && value.trim().length > 0;
+}
+
+function shouldShowOnboardingHint(rawPluginConfig: unknown): boolean {
+  const raw = asRecord(rawPluginConfig);
+  if (!raw) {
+    return true;
+  }
+
+  const backend = hasNonEmptyString(raw.backend) ? String(raw.backend).trim().toLowerCase() : "";
+  const hasCloudConfig = hasNonEmptyString(raw.apiUrl) || hasNonEmptyString(raw.apiKey);
+  const hasLocalConfig = hasNonEmptyString(raw.dbUrl);
+
+  return !(backend === "api" || hasCloudConfig || hasLocalConfig);
+}
+
+const ONBOARDING_HINT_ONCE_KEY = "__memory_memoria_onboarding_hint_logged__";
+
+function shouldLogOnboardingHintOnce(): boolean {
+  const state = globalThis as Record<string, unknown>;
+  if (state[ONBOARDING_HINT_ONCE_KEY] === true) {
+    return false;
+  }
+  state[ONBOARDING_HINT_ONCE_KEY] = true;
+  return true;
+}
+
 const plugin = {
-  id: "memory-memoria",
+  id: "thememoria",
   name: "Memory (Memoria)",
-  description: "Memoria-backed long-term memory plugin for OpenClaw powered by the Rust memoria CLI and API.",
+  description: "Memoria-backed long-term memory plugin for OpenClaw. Uses direct HTTP API mode (no binary required).",
   kind: "memory" as const,
   configSchema: memoriaPluginConfigSchema,
 
@@ -472,7 +482,32 @@ const plugin = {
     const config = parseMemoriaPluginConfig(api.pluginConfig);
     const client = new MemoriaClient(config);
 
-    api.logger.info(`memory-memoria: registered (${config.backend})`);
+    const needsSetup = shouldShowOnboardingHint(api.pluginConfig);
+    const isFirstRegister = shouldLogOnboardingHintOnce();
+
+    if (isFirstRegister) {
+      api.logger.info(
+        `thememoria: registered (${needsSetup ? "pending setup" : config.backend})`,
+      );
+
+      const isEnableCommand =
+        process.argv.some((arg) => arg === "enable") &&
+        process.argv.some((arg) => arg === "plugins");
+      if (needsSetup && isEnableCommand) {
+        api.logger.info(
+          "🧠 Memoria next step (Cloud, recommended): openclaw memoria setup --mode cloud --api-url <MEMORIA_API_URL> --api-key <MEMORIA_API_KEY>",
+        );
+        api.logger.info(
+          "🧩 Local quick start: openclaw memoria setup --mode local --install-memoria --embedding-api-key <EMBEDDING_API_KEY>",
+        );
+        api.logger.info(
+          "📘 More options: openclaw memoria setup --help",
+        );
+        api.logger.info(
+          "🧪 Verify with: openclaw memoria health",
+        );
+      }
+    }
 
     api.on("before_prompt_build", async () => ({
       appendSystemContext: MEMORIA_AGENT_GUIDANCE,
@@ -1501,53 +1536,6 @@ const plugin = {
           };
         };
 
-        const runMemoriaInstaller = (opts: {
-          memoriaBin?: string;
-          memoriaVersion?: string;
-          memoriaInstallDir?: string;
-          skipMemoriaInstall?: boolean;
-          verify?: boolean;
-        }) => {
-          const args = [
-            INSTALLER_SCRIPT,
-            "--source-dir",
-            PLUGIN_ROOT,
-            "--openclaw-bin",
-            resolveOpenClawBinFromProcess(),
-            "--skip-plugin-install",
-          ];
-          if (opts.memoriaBin) {
-            args.push("--memoria-bin", opts.memoriaBin);
-          }
-          if (opts.memoriaVersion) {
-            args.push("--memoria-version", opts.memoriaVersion);
-          }
-          if (opts.memoriaInstallDir) {
-            args.push("--memoria-install-dir", opts.memoriaInstallDir);
-          }
-          if (opts.skipMemoriaInstall) {
-            args.push("--skip-memoria-install");
-          }
-          if (opts.verify !== false) {
-            args.push("--verify");
-          }
-          runLocalCommand("bash", args);
-        };
-
-        const runMemoriaVerifier = (opts: { memoriaBin?: string }) => {
-          const args = [
-            VERIFY_SCRIPT,
-            "--openclaw-bin",
-            resolveOpenClawBinFromProcess(),
-            "--config-file",
-            resolveOpenClawConfigFile(),
-          ];
-          if (opts.memoriaBin) {
-            args.push("--memoria-bin", opts.memoriaBin);
-          }
-          runLocalCommand("node", args);
-        };
-
         memoria
           .command("health")
           .description("Check Memoria connectivity")
@@ -1651,43 +1639,50 @@ const plugin = {
           }));
 
         memoria
-          .command("install")
-          .description("Install or repair the local Memoria runtime and plugin config")
-          .option("--memoria-bin <path>", "Use an existing memoria executable")
-          .option("--memoria-version <tag>", "Rust Memoria release tag to install")
-          .option("--memoria-install-dir <path>", "Where to install memoria if it is missing")
-          .option("--skip-memoria-install", "Require an existing memoria executable", false)
-          .option("--no-verify", "Skip post-install verification")
+          .command("setup")
+          .description("Configure Memoria cloud API backend")
+          .option("--mode <mode>", "Backend mode (only 'cloud' is supported)", "cloud")
+          .option("--api-url <url>", "Memoria API URL")
+          .option("--api-key <token>", "Memoria API token")
+          .option("--user-id <user>", "Default Memoria user id")
           .action(withCliClient(async (opts) => {
-            runMemoriaInstaller({
-              memoriaBin:
-                typeof opts.memoriaBin === "string" && opts.memoriaBin.trim()
-                  ? opts.memoriaBin.trim()
-                  : undefined,
-              memoriaVersion:
-                typeof opts.memoriaVersion === "string" && opts.memoriaVersion.trim()
-                  ? opts.memoriaVersion.trim()
-                  : undefined,
-              memoriaInstallDir:
-                typeof opts.memoriaInstallDir === "string" && opts.memoriaInstallDir.trim()
-                  ? opts.memoriaInstallDir.trim()
-                  : undefined,
-              skipMemoriaInstall: Boolean(opts.skipMemoriaInstall),
-              verify: opts.verify !== false,
-            });
-          }));
-
-        memoria
-          .command("verify")
-          .description("Validate the current Memoria plugin install and backend status")
-          .option("--memoria-bin <path>", "Use an explicit memoria executable for verification")
-          .action(withCliClient(async (opts) => {
-            runMemoriaVerifier({
-              memoriaBin:
-                typeof opts.memoriaBin === "string" && opts.memoriaBin.trim()
-                  ? opts.memoriaBin.trim()
-                  : undefined,
-            });
+            const mode = typeof opts.mode === "string" ? opts.mode.trim().toLowerCase() : "cloud";
+            if (mode !== "cloud") {
+              throw new Error("Only cloud mode is supported. Example: openclaw memoria setup --mode cloud --api-url <URL> --api-key <KEY>");
+            }
+            const apiUrl = typeof opts.apiUrl === "string" ? opts.apiUrl.trim().replace(/\/+$/, "") : "";
+            const apiKey = typeof opts.apiKey === "string" ? opts.apiKey.trim() : "";
+            if (!apiUrl || !apiKey) {
+              throw new Error("--api-url and --api-key are required. Example: openclaw memoria setup --mode cloud --api-url <URL> --api-key <KEY>");
+            }
+            const userId = typeof opts.userId === "string" && opts.userId.trim() ? opts.userId.trim() : undefined;
+            const configFile = resolveOpenClawConfigFile();
+            const fs = await import("node:fs");
+            let data: Record<string, unknown> = {};
+            if (fs.existsSync(configFile)) {
+              data = JSON.parse(fs.readFileSync(configFile, "utf8"));
+            } else {
+              const dir = path.dirname(configFile);
+              fs.mkdirSync(dir, { recursive: true });
+            }
+            const plugins = (data.plugins ?? {}) as Record<string, unknown>;
+            const entries = (plugins.entries ?? {}) as Record<string, unknown>;
+            const entry = (entries.thememoria ?? {}) as Record<string, unknown>;
+            const pluginConfig = (entry.config ?? {}) as Record<string, unknown>;
+            pluginConfig.backend = "api";
+            pluginConfig.apiUrl = apiUrl;
+            pluginConfig.apiKey = apiKey;
+            if (userId) pluginConfig.defaultUserId = userId;
+            entry.enabled = true;
+            entry.config = pluginConfig;
+            entries.thememoria = entry;
+            plugins.entries = entries;
+            const slots = (plugins.slots ?? {}) as Record<string, unknown>;
+            slots.memory = "thememoria";
+            plugins.slots = slots;
+            data.plugins = plugins;
+            fs.writeFileSync(configFile, `${JSON.stringify(data, null, 2)}\n`, "utf8");
+            printJson({ ok: true, configFile, apiUrl, apiKeySet: true });
           }));
 
         ltm
@@ -1773,7 +1768,7 @@ const plugin = {
     const handleAutoRecall = async (
       prompt: string,
       ctx: PluginIdentityContext,
-    ): Promise<{ prependContext?: string } | void> => {
+    ): Promise<{ appendSystemContext?: string } | void> => {
       const trimmed = prompt.trim();
       if (trimmed.length < config.recallMinPromptLength) {
         return;
@@ -1793,21 +1788,17 @@ const plugin = {
         if (memories.length === 0) {
           return;
         }
-        api.logger.info(`memory-memoria: recalled ${memories.length} memories`);
+        api.logger.info(`thememoria: recalled ${memories.length} memories`);
         return {
-          prependContext: formatRelevantMemoriesContext(memories),
+          appendSystemContext: formatRelevantMemoriesContext(memories),
         };
       } catch (error) {
-        api.logger.warn(`memory-memoria: auto-recall failed: ${String(error)}`);
+        api.logger.warn(`thememoria: auto-recall failed: ${String(error)}`);
       }
     };
 
     if (config.autoRecall) {
       api.on("before_prompt_build", async (event, ctx) => {
-        return await handleAutoRecall(event.prompt, ctx);
-      });
-
-      api.on("before_agent_start", async (event, ctx) => {
         return await handleAutoRecall(event.prompt, ctx);
       });
     }
@@ -1835,10 +1826,10 @@ const plugin = {
             sessionId: ctx.sessionId,
           });
           if (created.length > 0) {
-            api.logger.info(`memory-memoria: observed ${created.length} new memories`);
+            api.logger.info(`thememoria: observed ${created.length} new memories`);
           }
         } catch (error) {
-          api.logger.warn(`memory-memoria: auto-observe failed: ${String(error)}`);
+          api.logger.warn(`thememoria: auto-observe failed: ${String(error)}`);
         }
       });
 
@@ -1866,34 +1857,34 @@ const plugin = {
           });
           if (created.length > 0) {
             api.logger.info(
-              `memory-memoria: observed ${created.length} new memories before reset`,
+              `thememoria: observed ${created.length} new memories before reset`,
             );
           }
         } catch (error) {
-          api.logger.warn(`memory-memoria: before_reset observe failed: ${String(error)}`);
+          api.logger.warn(`thememoria: before_reset observe failed: ${String(error)}`);
         }
       });
     }
 
     api.on("after_compaction", async () => {
       api.logger.info(
-        "memory-memoria: compaction finished; next prompt will use live Memoria recall",
+        "thememoria: compaction finished; next prompt will use live Memoria recall",
       );
     });
 
     api.registerService({
-      id: "memory-memoria",
+      id: "thememoria",
       async start() {
         try {
           const result = await client.health(config.defaultUserId);
-          api.logger.info(`memory-memoria: connected (${String(result.status ?? "ok")})`);
+          api.logger.info(`thememoria: connected (${String(result.status ?? "ok")})`);
         } catch (error) {
-          api.logger.warn(`memory-memoria: health check failed: ${String(error)}`);
+          api.logger.warn(`thememoria: health check failed: ${String(error)}`);
         }
       },
       stop() {
         client.close();
-        api.logger.info("memory-memoria: stopped");
+        api.logger.info("thememoria: stopped");
       },
     });
   },

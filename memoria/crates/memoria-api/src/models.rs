@@ -33,9 +33,7 @@ pub struct RetrieveRequest {
     #[serde(default = "default_top_k")]
     pub top_k: i64,
     pub session_id: Option<String>,
-    /// When false and session_id is set, only return memories from that session.
-    #[serde(default = "default_true")]
-    pub include_cross_session: bool,
+    pub session_scope: Option<String>,
     /// Explain level: false/"none" = off, true/"basic" = basic, "verbose" = per-candidate scores, "analyze" = full
     #[serde(default, deserialize_with = "deserialize_explain")]
     pub explain: String,
@@ -43,8 +41,66 @@ pub struct RetrieveRequest {
 fn default_top_k() -> i64 {
     5
 }
-fn default_true() -> bool {
-    true
+fn default_search_top_k() -> i64 {
+    10
+}
+fn parse_session_scope(
+    value: Option<&str>,
+) -> Result<Option<memoria_service::SessionScope>, String> {
+    value
+        .map(memoria_service::SessionScope::from_str)
+        .transpose()
+}
+
+impl RetrieveRequest {
+    pub fn session_scope(&self) -> Result<Option<memoria_service::SessionScope>, String> {
+        parse_session_scope(self.session_scope.as_deref())
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.session_scope.is_some() && self.session_id.is_none() {
+            return Err("session_id is required when session_scope is set".to_string());
+        }
+        Ok(())
+    }
+
+    pub fn retrieve_options(&self) -> Result<memoria_service::RetrieveOptions, String> {
+        Ok(memoria_service::RetrieveOptions::from_session_scope(
+            self.session_id.as_deref(),
+            self.session_scope()?,
+        ))
+    }
+}
+
+#[derive(Deserialize)]
+pub struct SearchRequest {
+    pub query: String,
+    #[serde(default = "default_search_top_k")]
+    pub top_k: i64,
+    pub session_id: Option<String>,
+    pub session_scope: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_explain")]
+    pub explain: String,
+}
+
+impl SearchRequest {
+    pub fn session_scope(&self) -> Result<Option<memoria_service::SessionScope>, String> {
+        parse_session_scope(self.session_scope.as_deref())
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.session_scope.is_some() && self.session_id.is_none() {
+            return Err("session_id is required when session_scope is set".to_string());
+        }
+        Ok(())
+    }
+
+    pub fn retrieve_options(&self) -> Result<memoria_service::RetrieveOptions, String> {
+        Ok(memoria_service::RetrieveOptions::from_session_scope(
+            self.session_id.as_deref(),
+            self.session_scope()?,
+        ))
+    }
 }
 
 fn deserialize_explain<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
@@ -72,20 +128,102 @@ pub struct CorrectRequest {
 pub struct CorrectByQueryRequest {
     pub query: String,
     pub new_content: String,
+    pub session_id: Option<String>,
+    pub session_scope: Option<String>,
     pub reason: Option<String>,
+}
+
+impl CorrectByQueryRequest {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.session_scope.is_some() && self.session_id.is_none() {
+            return Err("session_id is required when session_scope is set".to_string());
+        }
+        Ok(())
+    }
+
+    pub fn retrieve_options(&self) -> Result<memoria_service::RetrieveOptions, String> {
+        Ok(memoria_service::RetrieveOptions::from_session_scope(
+            self.session_id.as_deref(),
+            parse_session_scope(self.session_scope.as_deref())?,
+        ))
+    }
 }
 
 #[derive(Deserialize)]
 pub struct PurgeRequest {
     pub memory_ids: Option<Vec<String>>,
     pub topic: Option<String>,
+    pub session_id: Option<String>,
+    pub memory_types: Option<Vec<String>>,
     pub reason: Option<String>,
+}
+
+pub enum PurgeSelector {
+    MemoryIds(Vec<String>),
+    Topic(String),
+    Session {
+        session_id: String,
+        memory_types: Option<Vec<MemoryType>>,
+    },
+    None,
+}
+
+impl PurgeRequest {
+    pub fn selector(&self) -> Result<PurgeSelector, String> {
+        let memory_ids = self.memory_ids.as_ref().filter(|ids| !ids.is_empty());
+        let memory_types = self.memory_types.as_ref().filter(|types| !types.is_empty());
+        let topic = self
+            .topic
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let session_id = self
+            .session_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        if memory_types.is_some() && session_id.is_none() {
+            return Err("memory_types requires session_id".to_string());
+        }
+
+        let selector_count = usize::from(memory_ids.is_some())
+            + usize::from(topic.is_some())
+            + usize::from(session_id.is_some());
+        if selector_count > 1 {
+            return Err("provide only one of memory_ids, topic, or session_id".to_string());
+        }
+
+        if let Some(ids) = memory_ids {
+            return Ok(PurgeSelector::MemoryIds(ids.clone()));
+        }
+        if let Some(topic) = topic {
+            return Ok(PurgeSelector::Topic(topic.to_string()));
+        }
+        if let Some(session_id) = session_id {
+            let memory_types = memory_types
+                .map(|types| {
+                    types
+                        .iter()
+                        .map(|memory_type| parse_memory_type(memory_type))
+                        .collect::<Result<Vec<_>, _>>()
+                })
+                .transpose()?
+                .filter(|types| !types.is_empty());
+            return Ok(PurgeSelector::Session {
+                session_id: session_id.to_string(),
+                memory_types,
+            });
+        }
+        Ok(PurgeSelector::None)
+    }
 }
 
 #[derive(Serialize)]
 pub struct MemoryResponse {
     pub memory_id: String,
     pub user_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub author_id: Option<String>,
     pub memory_type: String,
     pub content: String,
     pub trust_tier: String,
@@ -102,6 +240,7 @@ impl From<Memory> for MemoryResponse {
         Self {
             memory_id: m.memory_id,
             user_id: m.user_id,
+            author_id: m.author_id,
             memory_type: m.memory_type.to_string(),
             content: m.content,
             trust_tier: m.trust_tier.to_string(),
@@ -209,6 +348,84 @@ fn default_strategy() -> String {
     "accept".to_string()
 }
 
+#[derive(Debug, Deserialize, Serialize)]
+pub struct PickRequest {
+    /// Target branch for the selected changes. Defaults to main.
+    #[serde(default = "default_pick_target")]
+    pub target: String,
+    /// Conflict strategy for selected changes: fail | skip | accept. Defaults to fail.
+    #[serde(default = "default_pick_strategy")]
+    pub strategy: String,
+    /// Selector that decides which branch changes are eligible to apply.
+    pub selector: PickSelector,
+    /// Optional dry-run preview settings. When present, returns a preview instead of mutating state.
+    pub dry_run: Option<PickDryRunOptions>,
+}
+
+fn default_pick_target() -> String {
+    "main".to_string()
+}
+
+fn default_pick_strategy() -> String {
+    "fail".to_string()
+}
+
+fn default_pick_top_k() -> i64 {
+    5
+}
+
+fn default_pick_preview_limit() -> i64 {
+    10
+}
+
+fn default_pick_include_content_preview() -> bool {
+    true
+}
+
+fn default_pick_include_scores() -> bool {
+    true
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct PickDryRunOptions {
+    /// Maximum number of preview candidates to return.
+    #[serde(default = "default_pick_preview_limit")]
+    pub limit: i64,
+    /// Preview pagination offset.
+    #[serde(default)]
+    pub offset: i64,
+    /// Include a short content_preview for each candidate. Embeddings are never returned.
+    #[serde(default = "default_pick_include_content_preview")]
+    pub include_content_preview: bool,
+    /// Include retrieve scores when available. Non-retrieve selectors omit scores.
+    #[serde(default = "default_pick_include_scores")]
+    pub include_scores: bool,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum PickSelector {
+    KeyList {
+        /// Explicit memory_ids from the source branch to apply.
+        keys: Vec<String>,
+    },
+    SnapshotRange {
+        /// Start snapshot name in the source branch history.
+        from_snapshot: String,
+        /// End snapshot name in the source branch history.
+        to_snapshot: String,
+    },
+    Retrieve {
+        /// Natural-language query used to rank changed source rows.
+        query: String,
+        /// Maximum number of ranked rows eligible for application.
+        #[serde(default = "default_pick_top_k")]
+        top_k: i64,
+        /// Optional retrieve threshold. Rows below this score are excluded.
+        min_score: Option<f64>,
+    },
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 pub fn parse_memory_type(s: &str) -> Result<MemoryType, String> {
@@ -217,4 +434,44 @@ pub fn parse_memory_type(s: &str) -> Result<MemoryType, String> {
 
 pub fn parse_trust_tier(s: &str) -> Result<TrustTier, String> {
     TrustTier::from_str(s).map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PurgeRequest, PurgeSelector};
+
+    #[test]
+    fn purge_selector_ignores_empty_arrays() {
+        let request = PurgeRequest {
+            memory_ids: Some(vec![]),
+            topic: None,
+            session_id: Some("sess-1".to_string()),
+            memory_types: Some(vec![]),
+            reason: None,
+        };
+
+        match request.selector().unwrap() {
+            PurgeSelector::Session {
+                session_id,
+                memory_types,
+            } => {
+                assert_eq!(session_id, "sess-1");
+                assert!(memory_types.is_none());
+            }
+            _ => panic!("expected session selector"),
+        }
+    }
+
+    #[test]
+    fn purge_selector_empty_memory_types_do_not_require_session() {
+        let request = PurgeRequest {
+            memory_ids: None,
+            topic: None,
+            session_id: None,
+            memory_types: Some(vec![]),
+            reason: None,
+        };
+
+        assert!(matches!(request.selector().unwrap(), PurgeSelector::None));
+    }
 }

@@ -3,6 +3,10 @@
 ///
 /// Run: DATABASE_URL=mysql://root:111@localhost:6001/memoria \
 ///      cargo test -p memoria-mcp --test feedback_e2e -- --nocapture
+mod support;
+
+use memoria_core::interfaces::EmbeddingProvider;
+use memoria_embedding::MockEmbedder;
 use memoria_service::MemoryService;
 use memoria_storage::SqlMemoryStore;
 use serde_json::{json, Value};
@@ -15,22 +19,35 @@ fn test_dim() -> usize {
         .and_then(|s| s.parse().ok())
         .unwrap_or(1024)
 }
-fn db_url() -> String {
-    std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "mysql://root:111@localhost:6001/memoria".to_string())
-}
 fn uid() -> String {
     format!("fb_{}", &Uuid::new_v4().simple().to_string()[..8])
 }
 
-async fn setup() -> (Arc<MemoryService>, Arc<SqlMemoryStore>, String) {
-    let store = SqlMemoryStore::connect(&db_url(), test_dim(), uuid::Uuid::new_v4().to_string())
-        .await
-        .expect("connect");
-    store.migrate().await.expect("migrate");
-    let store = Arc::new(store);
-    let svc = Arc::new(MemoryService::new_sql_with_llm(store.clone(), None, None));
-    (svc, store, uid())
+async fn setup() -> (
+    Arc<MemoryService>,
+    Arc<SqlMemoryStore>,
+    String,
+    support::multi_db::McpTestContext,
+) {
+    let ctx = support::multi_db::setup_mcp_context("feedback_e2e", test_dim(), None, None).await;
+    let uid = uid();
+    let store = ctx.user_store(&uid).await;
+    (ctx.service(), store, uid, ctx)
+}
+
+async fn setup_with_mock_embedder() -> (
+    Arc<MemoryService>,
+    Arc<SqlMemoryStore>,
+    String,
+    support::multi_db::McpTestContext,
+) {
+    let embedder: Option<Arc<dyn EmbeddingProvider>> =
+        Some(Arc::new(MockEmbedder::new(test_dim())));
+    let ctx =
+        support::multi_db::setup_mcp_context("feedback_e2e_mock", test_dim(), embedder, None).await;
+    let uid = uid();
+    let store = ctx.user_store(&uid).await;
+    (ctx.service(), store, uid, ctx)
 }
 
 async fn call(name: &str, args: Value, svc: &Arc<MemoryService>, uid: &str) -> Value {
@@ -46,7 +63,7 @@ fn text(v: &Value) -> &str {
 
 #[tokio::test]
 async fn test_feedback_basic_flow() {
-    let (svc, _store, uid) = setup().await;
+    let (svc, _store, uid, _ctx) = setup().await;
 
     // Store a memory first
     let r = call(
@@ -86,7 +103,7 @@ async fn test_feedback_basic_flow() {
 
 #[tokio::test]
 async fn test_feedback_all_signals() {
-    let (svc, _store, uid) = setup().await;
+    let (svc, _store, uid, _ctx) = setup().await;
 
     // Store memories for each signal type
     let signals = ["useful", "irrelevant", "outdated", "wrong"];
@@ -132,7 +149,7 @@ async fn test_feedback_all_signals() {
 
 #[tokio::test]
 async fn test_feedback_with_context() {
-    let (svc, _store, uid) = setup().await;
+    let (svc, _store, uid, _ctx) = setup().await;
 
     // Store a memory
     let r = call(
@@ -170,7 +187,7 @@ async fn test_feedback_with_context() {
 
 #[tokio::test]
 async fn test_feedback_invalid_signal() {
-    let (svc, _store, uid) = setup().await;
+    let (svc, _store, uid, _ctx) = setup().await;
 
     // Store a memory
     let r = call(
@@ -209,7 +226,7 @@ async fn test_feedback_invalid_signal() {
 
 #[tokio::test]
 async fn test_feedback_nonexistent_memory() {
-    let (svc, _store, uid) = setup().await;
+    let (svc, _store, uid, _ctx) = setup().await;
 
     let result = memoria_mcp::tools::call(
         "memory_feedback",
@@ -233,7 +250,7 @@ async fn test_feedback_nonexistent_memory() {
 
 #[tokio::test]
 async fn test_feedback_other_users_memory() {
-    let (svc, _store, uid1) = setup().await;
+    let (svc, _store, uid1, _ctx) = setup().await;
     let uid2 = uid(); // Different user
 
     // User 1 stores a memory
@@ -273,7 +290,7 @@ async fn test_feedback_other_users_memory() {
 
 #[tokio::test]
 async fn test_feedback_stats() {
-    let (svc, store, uid) = setup().await;
+    let (svc, store, uid, _ctx) = setup().await;
 
     // Store multiple memories and give feedback
     let mut memory_ids = Vec::new();
@@ -330,7 +347,7 @@ async fn test_feedback_stats() {
 
 #[tokio::test]
 async fn test_feedback_by_tier() {
-    let (svc, store, uid) = setup().await;
+    let (svc, store, uid, _ctx) = setup().await;
 
     // Store memories with different trust tiers
     let tiers = ["T1", "T2", "T3", "T4"];
@@ -398,7 +415,7 @@ async fn test_feedback_by_tier() {
 
 #[tokio::test]
 async fn test_service_record_feedback() {
-    let (svc, _store, uid) = setup().await;
+    let (svc, _store, uid, _ctx) = setup().await;
 
     // Store a memory
     let r = call(
@@ -433,7 +450,7 @@ async fn test_service_record_feedback() {
 
 #[tokio::test]
 async fn test_multiple_feedback_same_memory() {
-    let (svc, store, uid) = setup().await;
+    let (svc, store, uid, _ctx) = setup().await;
 
     // Store a memory
     let r = call(
@@ -466,12 +483,11 @@ async fn test_multiple_feedback_same_memory() {
     println!("✅ test_multiple_feedback_same_memory");
 }
 
-
 // ── 11. DB verification: check actual table values ────────────────────────────
 
 #[tokio::test]
 async fn test_feedback_db_verification() {
-    let (svc, store, uid) = setup().await;
+    let (svc, store, uid, _ctx) = setup().await;
 
     // Store a memory
     let r = call(
@@ -511,9 +527,10 @@ async fn test_feedback_db_verification() {
     // ── Direct DB verification ────────────────────────────────────────────────
 
     // 1. Verify feedback record exists in mem_retrieval_feedback
-    let row: Option<(String, String, String, String, Option<String>)> = sqlx::query_as(
-        "SELECT id, user_id, memory_id, signal, context FROM mem_retrieval_feedback WHERE id = ?",
-    )
+    let feedback_table = store.t("mem_retrieval_feedback");
+    let row: Option<(String, String, String, String, Option<String>)> = sqlx::query_as(&format!(
+        "SELECT id, user_id, memory_id, signal, context FROM {feedback_table} WHERE id = ?"
+    ))
     .bind(feedback_id)
     .fetch_optional(store.pool())
     .await
@@ -533,9 +550,10 @@ async fn test_feedback_db_verification() {
     );
 
     // 2. Verify memory exists and has correct trust_tier
-    let mem_row: Option<(String, String)> = sqlx::query_as(
-        "SELECT memory_id, trust_tier FROM mem_memories WHERE memory_id = ?",
-    )
+    let memories_table = store.t("mem_memories");
+    let mem_row: Option<(String, String)> = sqlx::query_as(&format!(
+        "SELECT memory_id, trust_tier FROM {memories_table} WHERE memory_id = ?"
+    ))
     .bind(memory_id)
     .fetch_optional(store.pool())
     .await
@@ -570,15 +588,16 @@ async fn test_feedback_db_verification() {
         .unwrap();
 
     // 4. Verify aggregated stats via direct SQL
-    let stats_row: (i64, i64, i64, i64, i64) = sqlx::query_as(
+    let feedback_table = store.t("mem_retrieval_feedback");
+    let stats_row: (i64, i64, i64, i64, i64) = sqlx::query_as(&format!(
         "SELECT \
            COUNT(*) as total, \
            SUM(CASE WHEN signal = 'useful' THEN 1 ELSE 0 END) as useful, \
            SUM(CASE WHEN signal = 'irrelevant' THEN 1 ELSE 0 END) as irrelevant, \
            SUM(CASE WHEN signal = 'outdated' THEN 1 ELSE 0 END) as outdated, \
            SUM(CASE WHEN signal = 'wrong' THEN 1 ELSE 0 END) as wrong \
-         FROM mem_retrieval_feedback WHERE user_id = ?",
-    )
+         FROM {feedback_table} WHERE user_id = ?"
+    ))
     .bind(&uid)
     .fetch_one(store.pool())
     .await
@@ -591,14 +610,15 @@ async fn test_feedback_db_verification() {
     assert_eq!(stats_row.4, 0, "wrong count");
 
     // 5. Verify feedback by tier via direct SQL
-    let tier_rows: Vec<(String, String, i64)> = sqlx::query_as(
+    let memories_table = store.t("mem_memories");
+    let tier_rows: Vec<(String, String, i64)> = sqlx::query_as(&format!(
         "SELECT m.trust_tier, f.signal, COUNT(*) as cnt \
-         FROM mem_retrieval_feedback f \
-         JOIN mem_memories m ON f.memory_id = m.memory_id \
+         FROM {feedback_table} f \
+         JOIN {memories_table} m ON f.memory_id = m.memory_id \
          WHERE f.user_id = ? \
          GROUP BY m.trust_tier, f.signal \
-         ORDER BY m.trust_tier, f.signal",
-    )
+         ORDER BY m.trust_tier, f.signal"
+    ))
     .bind(&uid)
     .fetch_all(store.pool())
     .await
@@ -607,7 +627,9 @@ async fn test_feedback_db_verification() {
     // Should have: T2/useful, T2/outdated, T3/irrelevant
     assert_eq!(tier_rows.len(), 3, "should have 3 tier/signal combinations");
 
-    let t2_useful = tier_rows.iter().find(|(t, s, _)| t == "T2" && s == "useful");
+    let t2_useful = tier_rows
+        .iter()
+        .find(|(t, s, _)| t == "T2" && s == "useful");
     assert!(t2_useful.is_some(), "should have T2/useful");
     assert_eq!(t2_useful.unwrap().2, 1, "T2/useful count");
 
@@ -624,9 +646,14 @@ async fn test_feedback_db_verification() {
     assert_eq!(t3_irrelevant.unwrap().2, 1, "T3/irrelevant count");
 
     println!("✅ test_feedback_db_verification: all DB values verified");
-    println!("   - feedback record: id={}, signal={}, context={:?}", db_id, db_signal, db_context);
-    println!("   - stats: total={}, useful={}, irrelevant={}, outdated={}, wrong={}",
-             stats_row.0, stats_row.1, stats_row.2, stats_row.3, stats_row.4);
+    println!(
+        "   - feedback record: id={}, signal={}, context={:?}",
+        db_id, db_signal, db_context
+    );
+    println!(
+        "   - stats: total={}, useful={}, irrelevant={}, outdated={}, wrong={}",
+        stats_row.0, stats_row.1, stats_row.2, stats_row.3, stats_row.4
+    );
     println!("   - tier breakdown: {:?}", tier_rows);
 }
 
@@ -634,7 +661,7 @@ async fn test_feedback_db_verification() {
 
 #[tokio::test]
 async fn test_feedback_closed_loop() {
-    let (svc, store, uid) = setup().await;
+    let (svc, store, uid, _ctx) = setup().await;
 
     // 1. Store multiple memories with different tiers
     let memories = vec![
@@ -666,15 +693,30 @@ async fn test_feedback_closed_loop() {
     //    - T2 memory: irrelevant (medium tier, bad retrieval)
     //    - T4 memory: wrong (low tier, very bad retrieval)
     store
-        .record_feedback(&uid, &memory_ids[0], "useful", Some("exactly what I needed"))
+        .record_feedback(
+            &uid,
+            &memory_ids[0],
+            "useful",
+            Some("exactly what I needed"),
+        )
         .await
         .unwrap();
     store
-        .record_feedback(&uid, &memory_ids[1], "irrelevant", Some("not related to my query"))
+        .record_feedback(
+            &uid,
+            &memory_ids[1],
+            "irrelevant",
+            Some("not related to my query"),
+        )
         .await
         .unwrap();
     store
-        .record_feedback(&uid, &memory_ids[2], "wrong", Some("completely incorrect info"))
+        .record_feedback(
+            &uid,
+            &memory_ids[2],
+            "wrong",
+            Some("completely incorrect info"),
+        )
         .await
         .unwrap();
 
@@ -706,12 +748,11 @@ async fn test_feedback_closed_loop() {
     println!("   This data enables adaptive tuning of retrieval weights by tier");
 }
 
-
 // ── 13. Denormalized feedback counters in mem_memories_stats ──────────────────
 
 #[tokio::test]
 async fn test_feedback_denormalized_counters() {
-    let (svc, store, uid) = setup().await;
+    let (svc, store, uid, _ctx) = setup().await;
 
     // Store a memory
     let r = call(
@@ -735,9 +776,18 @@ async fn test_feedback_denormalized_counters() {
     assert_eq!(fb.wrong, 0);
 
     // Add feedback and verify counters update
-    store.record_feedback(&uid, memory_id, "useful", None).await.unwrap();
-    store.record_feedback(&uid, memory_id, "useful", None).await.unwrap();
-    store.record_feedback(&uid, memory_id, "irrelevant", None).await.unwrap();
+    store
+        .record_feedback(&uid, memory_id, "useful", None)
+        .await
+        .unwrap();
+    store
+        .record_feedback(&uid, memory_id, "useful", None)
+        .await
+        .unwrap();
+    store
+        .record_feedback(&uid, memory_id, "irrelevant", None)
+        .await
+        .unwrap();
 
     let fb = store.get_memory_feedback(memory_id).await.unwrap();
     assert_eq!(fb.useful, 2, "useful count");
@@ -746,10 +796,11 @@ async fn test_feedback_denormalized_counters() {
     assert_eq!(fb.wrong, 0, "wrong count");
 
     // Verify via direct SQL (no JOIN needed)
-    let row: (i32, i32, i32, i32) = sqlx::query_as(
+    let stats_table = store.t("mem_memories_stats");
+    let row: (i32, i32, i32, i32) = sqlx::query_as(&format!(
         "SELECT feedback_useful, feedback_irrelevant, feedback_outdated, feedback_wrong \
-         FROM mem_memories_stats WHERE memory_id = ?",
-    )
+         FROM {stats_table} WHERE memory_id = ?"
+    ))
     .bind(memory_id)
     .fetch_one(store.pool())
     .await
@@ -761,16 +812,17 @@ async fn test_feedback_denormalized_counters() {
     assert_eq!(row.3, 0, "DB feedback_wrong");
 
     println!("✅ test_feedback_denormalized_counters: no JOIN needed for per-memory feedback");
-    println!("   Memory {}: useful={}, irrelevant={}, outdated={}, wrong={}",
-             memory_id, fb.useful, fb.irrelevant, fb.outdated, fb.wrong);
+    println!(
+        "   Memory {}: useful={}, irrelevant={}, outdated={}, wrong={}",
+        memory_id, fb.useful, fb.irrelevant, fb.outdated, fb.wrong
+    );
 }
-
 
 // ── 14. Feedback affects retrieval ranking (closed-loop verification) ─────────
 
 #[tokio::test]
 async fn test_feedback_affects_retrieval_ranking() {
-    let (svc, store, uid) = setup().await;
+    let (svc, store, uid, _ctx) = setup_with_mock_embedder().await;
 
     // Store 3 memories with similar content but different trust tiers
     let memories = vec![
@@ -798,11 +850,23 @@ async fn test_feedback_affects_retrieval_ranking() {
     }
 
     // Give feedback: A=useful(2), B=no feedback, C=wrong(2)
-    store.record_feedback(&uid, &memory_ids[0], "useful", None).await.unwrap();
-    store.record_feedback(&uid, &memory_ids[0], "useful", None).await.unwrap();
+    store
+        .record_feedback(&uid, &memory_ids[0], "useful", None)
+        .await
+        .unwrap();
+    store
+        .record_feedback(&uid, &memory_ids[0], "useful", None)
+        .await
+        .unwrap();
     // B has no feedback
-    store.record_feedback(&uid, &memory_ids[2], "wrong", None).await.unwrap();
-    store.record_feedback(&uid, &memory_ids[2], "wrong", None).await.unwrap();
+    store
+        .record_feedback(&uid, &memory_ids[2], "wrong", None)
+        .await
+        .unwrap();
+    store
+        .record_feedback(&uid, &memory_ids[2], "wrong", None)
+        .await
+        .unwrap();
 
     // Verify feedback is recorded in DB
     let fb_a = store.get_memory_feedback(&memory_ids[0]).await.unwrap();
@@ -813,7 +877,10 @@ async fn test_feedback_affects_retrieval_ranking() {
     assert_eq!(fb_b.useful, 0, "B should have 0 feedback");
     assert_eq!(fb_c.wrong, 2, "C should have 2 wrong");
 
-    println!("✅ Feedback recorded: A={:?}, B={:?}, C={:?}", fb_a, fb_b, fb_c);
+    println!(
+        "✅ Feedback recorded: A={:?}, B={:?}, C={:?}",
+        fb_a, fb_b, fb_c
+    );
 
     // Now retrieve and check ranking
     // Expected order: A (boosted by useful) > B (neutral) > C (penalized by wrong)
@@ -846,8 +913,15 @@ async fn test_feedback_affects_retrieval_ranking() {
     let pos_c = order.iter().position(|&c| c == 'C');
 
     if let (Some(a), Some(c)) = (pos_a, pos_c) {
-        assert!(a < c, "Memory A (useful feedback) should rank higher than C (wrong feedback). Order: {:?}", order);
-        println!("✅ Feedback affects ranking: A(useful) at position {}, C(wrong) at position {}", a, c);
+        assert!(
+            a < c,
+            "Memory A (useful feedback) should rank higher than C (wrong feedback). Order: {:?}",
+            order
+        );
+        println!(
+            "✅ Feedback affects ranking: A(useful) at position {}, C(wrong) at position {}",
+            a, c
+        );
     } else {
         println!("⚠️ Could not determine positions, order: {:?}", order);
     }
@@ -857,7 +931,7 @@ async fn test_feedback_affects_retrieval_ranking() {
 
 #[tokio::test]
 async fn test_feedback_score_multiplier_db_verification() {
-    let (svc, store, uid) = setup().await;
+    let (svc, store, uid, _ctx) = setup_with_mock_embedder().await;
 
     // Store a memory
     let r = call(
@@ -883,8 +957,14 @@ async fn test_feedback_score_multiplier_db_verification() {
     println!("Baseline score (no feedback): {:?}", baseline_score);
 
     // Add positive feedback
-    store.record_feedback(&uid, memory_id, "useful", None).await.unwrap();
-    store.record_feedback(&uid, memory_id, "useful", None).await.unwrap();
+    store
+        .record_feedback(&uid, memory_id, "useful", None)
+        .await
+        .unwrap();
+    store
+        .record_feedback(&uid, memory_id, "useful", None)
+        .await
+        .unwrap();
 
     // Verify feedback in DB
     let fb = store.get_memory_feedback(memory_id).await.unwrap();
@@ -904,15 +984,33 @@ async fn test_feedback_score_multiplier_db_verification() {
         // Expected: boost = base * (1 + 0.1 * 2) = base * 1.2
         let expected_ratio = 1.2;
         let actual_ratio = boost / base;
-        println!("Score ratio: {:.4} (expected ~{:.4})", actual_ratio, expected_ratio);
-        assert!(actual_ratio > 1.0, "Boosted score should be higher than baseline");
-        assert!(actual_ratio < 1.5, "Boost should be reasonable (not too extreme)");
+        println!(
+            "Score ratio: {:.4} (expected ~{:.4})",
+            actual_ratio, expected_ratio
+        );
+        assert!(
+            actual_ratio > 1.0,
+            "Boosted score should be higher than baseline"
+        );
+        assert!(
+            actual_ratio < 1.5,
+            "Boost should be reasonable (not too extreme)"
+        );
     }
 
     // Now add negative feedback and verify penalty
-    store.record_feedback(&uid, memory_id, "wrong", None).await.unwrap();
-    store.record_feedback(&uid, memory_id, "wrong", None).await.unwrap();
-    store.record_feedback(&uid, memory_id, "wrong", None).await.unwrap();
+    store
+        .record_feedback(&uid, memory_id, "wrong", None)
+        .await
+        .unwrap();
+    store
+        .record_feedback(&uid, memory_id, "wrong", None)
+        .await
+        .unwrap();
+    store
+        .record_feedback(&uid, memory_id, "wrong", None)
+        .await
+        .unwrap();
 
     let fb_after = store.get_memory_feedback(memory_id).await.unwrap();
     assert_eq!(fb_after.useful, 2, "Still 2 useful");
@@ -936,24 +1034,37 @@ async fn test_feedback_score_multiplier_db_verification() {
         assert!(ratio < 1.3, "Mixed feedback should not heavily boost");
     }
 
-    println!("✅ test_feedback_score_multiplier_db_verification: feedback affects scores correctly");
+    println!(
+        "✅ test_feedback_score_multiplier_db_verification: feedback affects scores correctly"
+    );
 }
-
 
 // ── 16. memory_get_retrieval_params: get default params ───────────────────────
 
 #[tokio::test]
 async fn test_get_retrieval_params_default() {
-    let (svc, _store, uid) = setup().await;
+    let (svc, _store, uid, _ctx) = setup().await;
 
     let result = call("memory_get_retrieval_params", json!({}), &svc, &uid).await;
     let text = text(&result);
 
     // Should return default params
-    assert!(text.contains("feedback_weight"), "Should show feedback_weight");
-    assert!(text.contains("0.1"), "Default feedback_weight should be 0.1");
-    assert!(text.contains("temporal_decay_hours"), "Should show temporal_decay_hours");
-    assert!(text.contains("168"), "Default temporal_decay_hours should be 168");
+    assert!(
+        text.contains("feedback_weight"),
+        "Should show feedback_weight"
+    );
+    assert!(
+        text.contains("0.1"),
+        "Default feedback_weight should be 0.1"
+    );
+    assert!(
+        text.contains("temporal_decay_hours"),
+        "Should show temporal_decay_hours"
+    );
+    assert!(
+        text.contains("168"),
+        "Default temporal_decay_hours should be 168"
+    );
 
     println!("✅ test_get_retrieval_params_default: {}", text);
 }
@@ -962,7 +1073,7 @@ async fn test_get_retrieval_params_default() {
 
 #[tokio::test]
 async fn test_tune_params_insufficient_feedback() {
-    let (svc, _store, uid) = setup().await;
+    let (svc, _store, uid, _ctx) = setup().await;
 
     // No feedback yet, should not tune
     let result = call("memory_tune_params", json!({}), &svc, &uid).await;
@@ -981,7 +1092,7 @@ async fn test_tune_params_insufficient_feedback() {
 
 #[tokio::test]
 async fn test_tune_params_with_feedback() {
-    let (svc, store, uid) = setup().await;
+    let (svc, store, uid, _ctx) = setup().await;
 
     // Create a memory via MCP tool
     let result = call(
@@ -1008,7 +1119,10 @@ async fn test_tune_params_with_feedback() {
 
     // Get params before tuning
     let before = store.get_user_retrieval_params(&uid).await.unwrap();
-    println!("Before tuning: feedback_weight={:.3}", before.feedback_weight);
+    println!(
+        "Before tuning: feedback_weight={:.3}",
+        before.feedback_weight
+    );
 
     // Trigger tuning
     let result = call("memory_tune_params", json!({}), &svc, &uid).await;
@@ -1040,7 +1154,7 @@ async fn test_tune_params_with_feedback() {
 
 #[tokio::test]
 async fn test_tuning_db_verification() {
-    let (_svc, store, uid) = setup().await;
+    let (_svc, store, uid, _ctx) = setup().await;
 
     // Set custom params
     let custom = memoria_storage::UserRetrievalParams {
@@ -1053,20 +1167,31 @@ async fn test_tuning_db_verification() {
 
     // Verify stored correctly
     let loaded = store.get_user_retrieval_params(&uid).await.unwrap();
-    assert!((loaded.feedback_weight - 0.15).abs() < 0.001, "feedback_weight mismatch");
-    assert!((loaded.temporal_decay_hours - 200.0).abs() < 0.1, "temporal_decay_hours mismatch");
-    assert!((loaded.confidence_weight - 0.2).abs() < 0.001, "confidence_weight mismatch");
+    assert!(
+        (loaded.feedback_weight - 0.15).abs() < 0.001,
+        "feedback_weight mismatch"
+    );
+    assert!(
+        (loaded.temporal_decay_hours - 200.0).abs() < 0.1,
+        "temporal_decay_hours mismatch"
+    );
+    assert!(
+        (loaded.confidence_weight - 0.2).abs() < 0.001,
+        "confidence_weight mismatch"
+    );
 
     println!("✅ test_tuning_db_verification: params stored and loaded correctly");
-    println!("   feedback_weight={:.3}, temporal_decay_hours={:.1}, confidence_weight={:.3}",
-        loaded.feedback_weight, loaded.temporal_decay_hours, loaded.confidence_weight);
+    println!(
+        "   feedback_weight={:.3}, temporal_decay_hours={:.1}, confidence_weight={:.3}",
+        loaded.feedback_weight, loaded.temporal_decay_hours, loaded.confidence_weight
+    );
 }
 
 // ── 20. Tuning affects scoring: verify end-to-end ─────────────────────────────
 
 #[tokio::test]
 async fn test_tuning_affects_scoring() {
-    let (svc, store, uid) = setup().await;
+    let (svc, store, uid, _ctx) = setup_with_mock_embedder().await;
 
     // Use highly unique content to avoid cross-test interference
     let unique = format!("xyzzy_tuning_test_{}", uid);
@@ -1084,8 +1209,14 @@ async fn test_tuning_affects_scoring() {
         .unwrap_or("unknown");
 
     // Add feedback
-    store.record_feedback(&uid, mem_id, "useful", None).await.unwrap();
-    store.record_feedback(&uid, mem_id, "useful", None).await.unwrap();
+    store
+        .record_feedback(&uid, mem_id, "useful", None)
+        .await
+        .unwrap();
+    store
+        .record_feedback(&uid, mem_id, "useful", None)
+        .await
+        .unwrap();
 
     // MatrixOne fulltext index needs time to become consistent after INSERT
     tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
@@ -1103,20 +1234,35 @@ async fn test_tuning_affects_scoring() {
     // MatrixOne fulltext index flakiness on consecutive retrieves
     use memoria_service::scoring::{DefaultScoringPlugin, ScoringPlugin};
     let plugin = DefaultScoringPlugin;
-    let fb = memoria_storage::MemoryFeedback { useful: 2, ..Default::default() };
+    let fb = memoria_storage::MemoryFeedback {
+        useful: 2,
+        ..Default::default()
+    };
 
     let default_params = memoria_storage::UserRetrievalParams::default();
     let custom_params = memoria_storage::UserRetrievalParams {
-        feedback_weight: 0.2, ..Default::default()
+        feedback_weight: 0.2,
+        ..Default::default()
     };
 
     let base = 1.0;
     let score_default = plugin.adjust_score(base, &fb, &default_params);
     let score_custom = plugin.adjust_score(base, &fb, &custom_params);
 
-    assert!((score_default - 1.2).abs() < 0.001, "Default: {}", score_default);
-    assert!((score_custom - 1.4).abs() < 0.001, "Custom: {}", score_custom);
-    assert!(score_custom > score_default, "Custom params should produce higher score");
+    assert!(
+        (score_default - 1.2).abs() < 0.001,
+        "Default: {}",
+        score_default
+    );
+    assert!(
+        (score_custom - 1.4).abs() < 0.001,
+        "Custom: {}",
+        score_custom
+    );
+    assert!(
+        score_custom > score_default,
+        "Custom params should produce higher score"
+    );
 
     // Verify per-user params round-trip through DB
     let high_weight = memoria_storage::UserRetrievalParams {
@@ -1129,8 +1275,10 @@ async fn test_tuning_affects_scoring() {
     let loaded = store.get_user_retrieval_params(&uid).await.unwrap();
     assert!((loaded.feedback_weight - 0.2).abs() < 0.001);
 
-    println!("Default score: {:.4}, adjust(0.1)={:.4}, adjust(0.2)={:.4}",
-        default_score, score_default, score_custom);
+    println!(
+        "Default score: {:.4}, adjust(0.1)={:.4}, adjust(0.2)={:.4}",
+        default_score, score_default, score_custom
+    );
     println!("✅ test_tuning_affects_scoring: per-user params affect scoring math");
 }
 
@@ -1143,7 +1291,7 @@ async fn test_governance_daily_tunes_params_in_db() {
         GovernanceStrategy,
     };
 
-    let (_svc, store, uid) = setup().await;
+    let (_svc, store, uid, ctx) = setup().await;
 
     // Store a memory and add 12 useful feedback signals (above MIN_FEEDBACK_FOR_TUNING=10)
     let result = call(
@@ -1160,7 +1308,10 @@ async fn test_governance_daily_tunes_params_in_db() {
         .to_string();
 
     for _ in 0..12 {
-        store.record_feedback(&uid, &mem_id, "useful", None).await.unwrap();
+        store
+            .record_feedback(&uid, &mem_id, "useful", None)
+            .await
+            .unwrap();
     }
 
     // Capture baseline
@@ -1168,7 +1319,10 @@ async fn test_governance_daily_tunes_params_in_db() {
 
     // Run governance daily task directly (no scheduler needed)
     let strategy: Arc<dyn GovernanceStrategy> = Arc::new(DefaultGovernanceStrategy);
-    let execution = strategy.run(store.as_ref(), GovernanceTask::Daily).await.unwrap();
+    let execution = strategy
+        .run(ctx.shared_store().as_ref(), GovernanceTask::Daily)
+        .await
+        .unwrap();
 
     // Verify the task reported tuning
     assert!(
@@ -1205,11 +1359,8 @@ async fn test_duplicate_instance_id_lock_is_exclusive() {
     use memoria_service::distributed::DistributedLock;
     use std::time::Duration;
 
-    let store = SqlMemoryStore::connect(&db_url(), test_dim(), uuid::Uuid::new_v4().to_string())
-        .await
-        .expect("connect");
-    store.migrate().await.expect("migrate");
-    let store = Arc::new(store);
+    let ctx = support::multi_db::setup_mcp_context("feedback_lock", test_dim(), None, None).await;
+    let store = ctx.shared_store();
 
     let lock_key = format!("test:dup_instance:{}", uid());
 
@@ -1247,5 +1398,7 @@ async fn test_duplicate_instance_id_lock_is_exclusive() {
     );
 
     store.release(&lock_key, holder_a).await.unwrap();
-    println!("✅ test_duplicate_instance_id_lock_is_exclusive: PID suffix prevents duplicate-ID bypass");
+    println!(
+        "✅ test_duplicate_instance_id_lock_is_exclusive: PID suffix prevents duplicate-ID bypass"
+    );
 }

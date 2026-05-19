@@ -10,18 +10,24 @@ use axum::{
     extract::FromRequestParts,
     http::{request::Parts, StatusCode},
 };
+use memoria_service::MemoryService;
 use serde::Deserialize;
-use sha2::{Sha256, Digest};
+use sha2::{Digest, Sha256};
 use sqlx::Row;
 use std::collections::HashSet;
 use std::sync::Mutex;
 use subtle::ConstantTimeEq;
 use tracing::warn;
 
-use crate::state::AppState;
+use crate::state::{AppState, CachedApiKeyPrincipal};
 
 pub struct AuthUser {
     pub user_id: String,
+    /// Routing scope: equals `user_id` in personal mode, `group_id` (e.g. `grp_xxx`)
+    /// in group mode.  Passed to service-layer methods to select the correct
+    /// physical database via `DbRouter::scope_store()`.
+    pub scope_id: String,
+    pub group_id: Option<String>,
     pub is_master: bool,
 }
 
@@ -33,6 +39,233 @@ impl AuthUser {
             Ok(())
         }
     }
+
+    pub fn scope_id(&self) -> &str {
+        &self.scope_id
+    }
+
+    pub fn is_group_scoped(&self) -> bool {
+        self.group_id.is_some()
+    }
+}
+
+async fn cached_or_db_principal(token: &str, state: &AppState) -> Option<CachedApiKeyPrincipal> {
+    let key_hash = format!("{:x}", Sha256::digest(token.as_bytes()));
+    if let Some(principal) = state.api_key_cache.get(&key_hash) {
+        return Some(principal);
+    }
+
+    let pool = state
+        .auth_pool
+        .as_ref()
+        .or_else(|| state.service.sql_store.as_ref().map(|s| s.pool()))?;
+
+    let row = sqlx::query(
+        "SELECT user_id, group_id FROM mem_api_keys \
+         WHERE key_hash = ? AND is_active = 1 \
+         AND (expires_at IS NULL OR expires_at > NOW(6))",
+    )
+    .bind(&key_hash)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| warn!("cached_or_db_principal: DB query failed: {e}"))
+    .ok()??;
+
+    let principal = CachedApiKeyPrincipal {
+        user_id: row.try_get("user_id").ok()?,
+        group_id: row.try_get("group_id").ok().flatten(),
+    };
+    state.api_key_cache.insert(
+        key_hash,
+        principal.user_id.clone(),
+        principal.group_id.clone(),
+    );
+    Some(principal)
+}
+
+pub(crate) async fn group_main_write_allowed_for_solo_owner(
+    state: &AppState,
+    group_id: &str,
+    user_id: &str,
+) -> bool {
+    let Some(pool) = state
+        .auth_pool
+        .as_ref()
+        .or_else(|| state.service.sql_store.as_ref().map(|s| s.pool()))
+    else {
+        return false;
+    };
+
+    let row = match sqlx::query(
+        "SELECT g.owner_user_id, CAST(COUNT(m.user_id) AS SIGNED) AS active_member_count \
+         FROM mem_groups g \
+         JOIN mem_group_members m ON g.group_id = m.group_id AND m.is_active = 1 \
+         WHERE g.group_id = ? AND g.status = 'active' \
+         GROUP BY g.owner_user_id \
+         LIMIT 1",
+    )
+    .bind(group_id)
+    .fetch_optional(pool)
+    .await
+    {
+        Ok(row) => row,
+        Err(e) => {
+            warn!("group_main_write_allowed_for_solo_owner: DB query failed: {e}");
+            return false;
+        }
+    };
+
+    let Some(row) = row else {
+        return false;
+    };
+
+    let Ok(owner_user_id) = row.try_get::<String, _>("owner_user_id") else {
+        return false;
+    };
+    let Ok(active_member_count) = row.try_get::<i64, _>("active_member_count") else {
+        return false;
+    };
+
+    owner_user_id == user_id && active_member_count == 1
+}
+
+// ── Group main-write guard (middleware) ──────────────────────────────────────
+
+/// Axum middleware that rejects write requests to `main` in group mode.
+///
+/// Applied as a route-layer on all memory-write endpoints so that individual
+/// handlers never need to call `reject_group_main_writes` manually.
+/// The token is resolved from the in-memory cache (no extra DB round-trip
+/// for the auth lookup itself).
+pub async fn group_main_write_guard(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    req: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
+    // Extract bearer token from Authorization header
+    let principal = req
+        .headers()
+        .get("Authorization")
+        .and_then(|v| v.to_str().ok())
+        .filter(|v| v.starts_with("Bearer "))
+        .map(|v| v[7..].to_string());
+
+    if let Some(token) = principal {
+        let master_match = !state.master_key.is_empty()
+            && token.len() == state.master_key.len()
+            && token.as_bytes().ct_eq(state.master_key.as_bytes()).into();
+        if master_match {
+            return next.run(req).await;
+        }
+        if let Some(p) = cached_or_db_principal(&token, &state)
+            .await
+            .filter(|p| p.group_id.is_some())
+        {
+            let gid = p.group_id.as_ref().unwrap();
+            // Set task-local so active_branch_name resolves per-member state
+            let user_id = p.user_id.clone();
+            // Check whether the user's active branch is `main`
+            if let Ok(sql) = state.service.user_sql_store(gid).await {
+                let branch = memoria_storage::ACTOR_USER_ID
+                    .scope(user_id, sql.active_branch_name(gid))
+                    .await;
+                if let Ok(branch) = branch {
+                    if branch == "main" {
+                        if group_main_write_allowed_for_solo_owner(&state, gid, &p.user_id).await {
+                            return next.run(req).await;
+                        }
+                        return (
+                            StatusCode::FORBIDDEN,
+                            "main is read-only in group mode; \
+                             create or checkout a branch, then use selective apply"
+                                .to_string(),
+                        )
+                            .into_response();
+                    }
+                }
+            }
+        }
+    }
+
+    next.run(req).await
+}
+
+/// Axum middleware that blocks native merge in group mode.
+///
+/// Applied only to the `/v1/branches/:name/merge` route.
+pub async fn group_merge_guard(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    req: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
+    let token = req
+        .headers()
+        .get("Authorization")
+        .and_then(|v| v.to_str().ok())
+        .filter(|v| v.starts_with("Bearer "))
+        .map(|v| v[7..].to_string());
+
+    if let Some(token) = token {
+        let master_match = !state.master_key.is_empty()
+            && token.len() == state.master_key.len()
+            && token.as_bytes().ct_eq(state.master_key.as_bytes()).into();
+        if !master_match
+            && cached_or_db_principal(&token, &state)
+                .await
+                .and_then(|p| p.group_id)
+                .is_some()
+        {
+            return (
+                StatusCode::FORBIDDEN,
+                "native branch merge is disabled in group mode; use selective apply instead"
+                    .to_string(),
+            )
+                .into_response();
+        }
+    }
+
+    next.run(req).await
+}
+
+// ── Actor scope middleware ───────────────────────────────────────────────────
+
+/// Axum middleware that sets the `ACTOR_USER_ID` task-local for group-scoped
+/// requests.  This lets the storage layer key per-user state (active branch)
+/// on the real human user rather than the group scope ID.
+pub async fn actor_scope_layer(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    req: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let token = req
+        .headers()
+        .get("Authorization")
+        .and_then(|v| v.to_str().ok())
+        .filter(|v| v.starts_with("Bearer "))
+        .map(|v| v[7..].to_string());
+
+    if let Some(token) = token {
+        let master_match = !state.master_key.is_empty()
+            && token.len() == state.master_key.len()
+            && token.as_bytes().ct_eq(state.master_key.as_bytes()).into();
+        if master_match {
+            return next.run(req).await;
+        }
+        if let Some(uid) = cached_or_db_principal(&token, &state)
+            .await
+            .and_then(|p| p.group_id.as_ref().map(|_| p.user_id))
+        {
+            return memoria_storage::ACTOR_USER_ID
+                .scope(uid, next.run(req))
+                .await;
+        }
+    }
+
+    next.run(req).await
 }
 
 #[derive(Deserialize)]
@@ -92,7 +325,10 @@ impl LastUsedBatcher {
                 query = query.bind(h);
             }
             if let Err(e) = query.execute(pool).await {
-                warn!("last_used_at batch flush failed ({} keys): {e}", chunk.len());
+                warn!(
+                    "last_used_at batch flush failed ({} keys): {e}",
+                    chunk.len()
+                );
             }
         }
     }
@@ -102,15 +338,548 @@ impl LastUsedBatcher {
 pub fn spawn_last_used_flusher(
     batcher: std::sync::Arc<LastUsedBatcher>,
     pool: sqlx::MySqlPool,
-) {
+    mut shutdown: tokio::sync::watch::Receiver<()>,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
         interval.tick().await; // skip immediate
         loop {
-            interval.tick().await;
+            tokio::select! {
+                _ = interval.tick() => {}
+                _ = shutdown.changed() => {
+                    batcher.flush(&pool).await;
+                    break;
+                }
+            }
             batcher.flush(&pool).await;
         }
-    });
+        tracing::debug!("last_used flusher exiting");
+    })
+}
+
+// ── Tool usage tracking ───────────────────────────────────────────────────────
+
+use chrono::{DateTime, Utc};
+
+type ToolUsageMap = std::collections::HashMap<(String, String), (DateTime<Utc>, bool)>;
+
+/// In-memory cache of per-user tool access times, periodically flushed to DB.
+/// On startup, rebuilt from `mem_tool_usage` so restarts don't lose data.
+pub struct ToolUsageBatcher {
+    /// (user_id, tool_name) → (last_used_at, dirty)
+    entries: Mutex<ToolUsageMap>,
+}
+
+impl Default for ToolUsageBatcher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ToolUsageBatcher {
+    pub fn new() -> Self {
+        Self {
+            entries: Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    fn merge_rebuilt_entries(&self, rebuilt: ToolUsageMap) {
+        use std::collections::hash_map::Entry;
+
+        let Ok(mut map) = self.entries.lock() else {
+            return;
+        };
+        for (key, (rebuilt_ts, _)) in rebuilt {
+            match map.entry(key) {
+                Entry::Vacant(entry) => {
+                    entry.insert((rebuilt_ts, false));
+                }
+                Entry::Occupied(mut entry) => {
+                    let (current_ts, dirty) = *entry.get();
+                    if dirty || current_ts >= rebuilt_ts {
+                        continue;
+                    }
+                    entry.insert((rebuilt_ts, false));
+                }
+            }
+        }
+    }
+
+    /// Record a tool access. Cheap in-memory write.
+    pub fn mark_used(&self, user_id: String, tool: String) {
+        if let Ok(mut map) = self.entries.lock() {
+            map.insert((user_id, tool), (Utc::now(), true));
+        }
+    }
+
+    /// Query last access times for a user. Returns from memory, no DB hit.
+    pub fn get_user_tool_usage(&self, user_id: &str) -> Vec<(String, DateTime<Utc>)> {
+        let map = match self.entries.lock() {
+            Ok(m) => m,
+            Err(_) => return vec![],
+        };
+        map.iter()
+            .filter(|((uid, _), _)| uid == user_id)
+            .map(|((_, tool), (ts, _))| (tool.clone(), *ts))
+            .collect()
+    }
+
+    /// Rebuild cache from DB. Call once at startup.
+    pub async fn rebuild_from_db(&self, service: &MemoryService) {
+        let mut rebuilt = std::collections::HashMap::new();
+        let Some(sql) = service.sql_store.as_ref() else {
+            return;
+        };
+
+        if let Some(router) = sql.db_router() {
+            let user_ids = match router.list_active_users().await {
+                Ok(user_ids) => user_ids,
+                Err(e) => {
+                    warn!("tool_usage rebuild failed to list users: {e}");
+                    return;
+                }
+            };
+            for user_id in user_ids {
+                let user_store = match service.user_sql_store(&user_id).await {
+                    Ok(user_store) => user_store,
+                    Err(e) => {
+                        warn!("tool_usage rebuild failed to route user {user_id}: {e}");
+                        continue;
+                    }
+                };
+                let tool_usage_table = user_store.t("mem_tool_usage");
+                let rows = match sqlx::query(&format!(
+                    "SELECT user_id, tool_name, last_used_at FROM {tool_usage_table}",
+                ))
+                .fetch_all(user_store.pool())
+                .await
+                {
+                    Ok(rows) => rows,
+                    Err(e) => {
+                        warn!("tool_usage rebuild failed for user {user_id}: {e}");
+                        continue;
+                    }
+                };
+                for row in &rows {
+                    let uid: String = row.get("user_id");
+                    let tool: String = row.get("tool_name");
+                    let ts: DateTime<Utc> = row.get("last_used_at");
+                    rebuilt.insert((uid, tool), (ts, false));
+                }
+            }
+        } else {
+            let rows =
+                match sqlx::query("SELECT user_id, tool_name, last_used_at FROM mem_tool_usage")
+                    .fetch_all(sql.pool())
+                    .await
+                {
+                    Ok(rows) => rows,
+                    Err(e) => {
+                        warn!("tool_usage rebuild failed: {e}");
+                        return;
+                    }
+                };
+            for row in &rows {
+                let uid: String = row.get("user_id");
+                let tool: String = row.get("tool_name");
+                let ts: DateTime<Utc> = row.get("last_used_at");
+                rebuilt.insert((uid, tool), (ts, false));
+            }
+        }
+
+        self.merge_rebuilt_entries(rebuilt);
+    }
+
+    /// Load one user's persisted tool usage on demand without fan-out across all user DBs.
+    pub async fn load_user_from_db(&self, service: &MemoryService, user_id: &str) {
+        let Some(sql) = service.sql_store.as_ref() else {
+            return;
+        };
+        let mut rebuilt = std::collections::HashMap::new();
+
+        if sql.db_router().is_some() {
+            let user_store = match service.user_sql_store(user_id).await {
+                Ok(user_store) => user_store,
+                Err(e) => {
+                    warn!("tool_usage lazy load failed to route user {user_id}: {e}");
+                    return;
+                }
+            };
+            let tool_usage_table = user_store.t("mem_tool_usage");
+            let rows = match sqlx::query(&format!(
+                "SELECT user_id, tool_name, last_used_at FROM {tool_usage_table}"
+            ))
+            .fetch_all(user_store.pool())
+            .await
+            {
+                Ok(rows) => rows,
+                Err(e) => {
+                    warn!("tool_usage lazy load failed for user {user_id}: {e}");
+                    return;
+                }
+            };
+            for row in &rows {
+                let uid: String = row.get("user_id");
+                let tool: String = row.get("tool_name");
+                let ts: DateTime<Utc> = row.get("last_used_at");
+                rebuilt.insert((uid, tool), (ts, false));
+            }
+        } else {
+            let rows = match sqlx::query(
+                "SELECT user_id, tool_name, last_used_at FROM mem_tool_usage WHERE user_id = ?",
+            )
+            .bind(user_id)
+            .fetch_all(sql.pool())
+            .await
+            {
+                Ok(rows) => rows,
+                Err(e) => {
+                    warn!("tool_usage lazy load failed for user {user_id}: {e}");
+                    return;
+                }
+            };
+            for row in &rows {
+                let uid: String = row.get("user_id");
+                let tool: String = row.get("tool_name");
+                let ts: DateTime<Utc> = row.get("last_used_at");
+                rebuilt.insert((uid, tool), (ts, false));
+            }
+        }
+
+        self.merge_rebuilt_entries(rebuilt);
+    }
+
+    /// Flush dirty entries to DB.
+    pub async fn flush(&self, service: &MemoryService) {
+        let dirty: Vec<(String, String, DateTime<Utc>)> = {
+            let map = match self.entries.lock() {
+                Ok(m) => m,
+                Err(_) => return,
+            };
+            map.iter()
+                .filter(|(_, (_, d))| *d)
+                .map(|((uid, tool), (ts, _))| (uid.clone(), tool.clone(), *ts))
+                .collect()
+        };
+        if dirty.is_empty() {
+            return;
+        }
+
+        let Some(sql) = service.sql_store.as_ref() else {
+            return;
+        };
+        if let Some(_router) = sql.db_router() {
+            let mut by_user: std::collections::HashMap<
+                String,
+                Vec<(String, String, DateTime<Utc>)>,
+            > = std::collections::HashMap::new();
+            for (uid, tool, ts) in &dirty {
+                by_user
+                    .entry(uid.clone())
+                    .or_default()
+                    .push((uid.clone(), tool.clone(), *ts));
+            }
+            for (user_id, entries) in by_user {
+                let user_store = match service.user_sql_store(&user_id).await {
+                    Ok(user_store) => user_store,
+                    Err(e) => {
+                        warn!("tool_usage flush failed to route user {user_id}: {e}");
+                        return;
+                    }
+                };
+                let table = user_store.t("mem_tool_usage");
+                if let Err(e) = flush_tool_usage_chunked(user_store.pool(), &table, &entries).await
+                {
+                    warn!("tool_usage batch flush failed for user {user_id}: {e}");
+                    return;
+                }
+            }
+        } else if let Err(e) = flush_tool_usage_chunked(sql.pool(), "mem_tool_usage", &dirty).await
+        {
+            warn!(
+                "tool_usage batch flush failed ({} entries): {e}",
+                dirty.len()
+            );
+            return;
+        }
+
+        // Only clear dirty flags after all chunks succeed.
+        if let Ok(mut map) = self.entries.lock() {
+            for (uid, tool, _) in &dirty {
+                if let Some((_, d)) = map.get_mut(&(uid.clone(), tool.clone())) {
+                    *d = false;
+                }
+            }
+        }
+    }
+}
+
+async fn flush_tool_usage_chunked(
+    pool: &sqlx::MySqlPool,
+    table: &str,
+    dirty: &[(String, String, DateTime<Utc>)],
+) -> Result<(), sqlx::Error> {
+    for chunk in dirty.chunks(500) {
+        let placeholders: String = chunk
+            .iter()
+            .map(|_| "(?, ?, ?)")
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "INSERT INTO {table} (user_id, tool_name, last_used_at) VALUES {placeholders} \
+                 ON DUPLICATE KEY UPDATE last_used_at = VALUES(last_used_at)"
+        );
+        let mut query = sqlx::query(&sql);
+        for (uid, tool, ts) in chunk {
+            query = query.bind(uid).bind(tool).bind(ts);
+        }
+        query.execute(pool).await?;
+    }
+    Ok(())
+}
+
+/// Spawn the background tool-usage flush loop (10-minute interval).
+pub fn spawn_tool_usage_flusher(
+    batcher: std::sync::Arc<ToolUsageBatcher>,
+    service: std::sync::Arc<MemoryService>,
+    mut shutdown: tokio::sync::watch::Receiver<()>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(10 * 60));
+        interval.tick().await; // skip immediate
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {}
+                _ = shutdown.changed() => {
+                    batcher.flush(&service).await;
+                    break;
+                }
+            }
+            batcher.flush(&service).await;
+        }
+        tracing::debug!("tool_usage flusher exiting");
+    })
+}
+
+// ── API call log tracking ─────────────────────────────────────────────────────
+
+/// Request-scoped context shared between the call-log middleware and the AuthUser
+/// extractor.  The middleware inserts this into request extensions before calling
+/// `next`; the extractor fills in the resolved `user_id` so the middleware can
+/// record the call after the handler returns.
+#[derive(Clone, Default)]
+pub struct CallLogContext(pub std::sync::Arc<Mutex<Option<String>>>);
+
+/// RPC-level outcome metadata for `/mcp` calls.
+/// Kept separate from the HTTP status so the two observability dimensions
+/// (transport health vs. business logic errors) don't pollute each other.
+pub struct RpcMeta {
+    /// false when the JSON-RPC dispatch returned an error result.
+    pub success: bool,
+    /// JSON-RPC error code (e.g. -32601) when success = false; None otherwise.
+    pub error_code: Option<i32>,
+}
+
+impl RpcMeta {
+    pub fn ok() -> Self {
+        Self {
+            success: true,
+            error_code: None,
+        }
+    }
+    pub fn err(code: i32) -> Self {
+        Self {
+            success: false,
+            error_code: Some(code),
+        }
+    }
+}
+
+/// A single pending call log entry buffered in memory.
+struct CallLogEntry {
+    user_id: String,
+    method: String,
+    path: String,
+    status_code: u16,
+    latency_ms: u32,
+    /// Always true for /v1/* REST calls.
+    /// For /mcp JSON-RPC calls: false when the dispatch returned an error result.
+    rpc_success: bool,
+    /// JSON-RPC error code (e.g. -32601) when rpc_success = false; NULL otherwise.
+    rpc_error_code: Option<i32>,
+}
+
+/// Accumulates call log entries in memory and flushes them in batches to DB.
+pub struct CallLogBatcher {
+    pending: Mutex<Vec<CallLogEntry>>,
+}
+
+impl Default for CallLogBatcher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CallLogBatcher {
+    pub fn new() -> Self {
+        Self {
+            pending: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Enqueue a REST call log entry (`/v1/*`). RPC fields default to success.
+    pub fn record(
+        &self,
+        user_id: String,
+        method: String,
+        path: String,
+        status_code: u16,
+        latency_ms: u32,
+    ) {
+        self.record_rpc(
+            user_id,
+            method,
+            path,
+            status_code,
+            latency_ms,
+            RpcMeta::ok(),
+        );
+    }
+
+    /// Enqueue a call log entry with explicit JSON-RPC success/error metadata.
+    /// Use this for `/mcp` calls so that HTTP status (always 200 for JSON-RPC)
+    /// and business-level error tracking are kept separate.
+    pub fn record_rpc(
+        &self,
+        user_id: String,
+        method: String,
+        path: String,
+        status_code: u16,
+        latency_ms: u32,
+        rpc: RpcMeta,
+    ) {
+        if let Ok(mut v) = self.pending.lock() {
+            v.push(CallLogEntry {
+                user_id,
+                method,
+                path,
+                status_code,
+                latency_ms,
+                rpc_success: rpc.success,
+                rpc_error_code: rpc.error_code,
+            });
+        }
+    }
+
+    /// Drain pending entries and write them to `mem_api_call_log` in chunks.
+    pub async fn flush(&self, service: &MemoryService) {
+        let entries: Vec<CallLogEntry> = {
+            let mut v = match self.pending.lock() {
+                Ok(v) => v,
+                Err(_) => return,
+            };
+            if v.is_empty() {
+                return;
+            }
+            v.drain(..).collect()
+        };
+
+        let Some(sql) = service.sql_store.as_ref() else {
+            return;
+        };
+        if let Some(_router) = sql.db_router() {
+            let mut by_user: std::collections::HashMap<String, Vec<CallLogEntry>> =
+                std::collections::HashMap::new();
+            for entry in entries {
+                by_user
+                    .entry(entry.user_id.clone())
+                    .or_default()
+                    .push(entry);
+            }
+            let mut retry_entries = Vec::new();
+            for (user_id, entries) in by_user {
+                let user_store = match service.user_sql_store(&user_id).await {
+                    Ok(user_store) => user_store,
+                    Err(e) => {
+                        warn!("call_log flush failed to route user {user_id}: {e}");
+                        retry_entries.extend(entries);
+                        continue;
+                    }
+                };
+                let table = user_store.t("mem_api_call_log");
+                if let Err(e) = flush_call_log_chunked(user_store.pool(), &table, &entries).await {
+                    warn!("call_log batch flush failed for user {user_id}: {e}");
+                }
+            }
+            if !retry_entries.is_empty() {
+                if let Ok(mut pending) = self.pending.lock() {
+                    pending.extend(retry_entries);
+                }
+            }
+            return;
+        }
+        if let Err(e) = flush_call_log_chunked(sql.pool(), "mem_api_call_log", &entries).await {
+            warn!(
+                "call_log batch flush failed ({} entries): {e}",
+                entries.len()
+            );
+        }
+    }
+}
+
+async fn flush_call_log_chunked(
+    pool: &sqlx::MySqlPool,
+    table: &str,
+    entries: &[CallLogEntry],
+) -> Result<(), sqlx::Error> {
+    for chunk in entries.chunks(200) {
+        let placeholders: String = chunk
+            .iter()
+            .map(|_| "(?, ?, ?, ?, ?, ?, ?)")
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "INSERT INTO {table} \
+                 (user_id, method, path, status_code, latency_ms, rpc_success, rpc_error_code) \
+                 VALUES {placeholders}"
+        );
+        let mut query = sqlx::query(&sql);
+        for e in chunk {
+            query = query
+                .bind(&e.user_id)
+                .bind(&e.method)
+                .bind(&e.path)
+                .bind(e.status_code as i16)
+                .bind(e.latency_ms as i32)
+                .bind(e.rpc_success as i8)
+                .bind(e.rpc_error_code);
+        }
+        query.execute(pool).await?;
+    }
+    Ok(())
+}
+
+/// Spawn the background call-log flush loop (5-second interval).
+pub fn spawn_call_log_flusher(
+    batcher: std::sync::Arc<CallLogBatcher>,
+    service: std::sync::Arc<MemoryService>,
+    mut shutdown: tokio::sync::watch::Receiver<()>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+        interval.tick().await; // skip immediate first tick
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {}
+                _ = shutdown.changed() => {
+                    batcher.flush(&service).await;
+                    break;
+                }
+            }
+            batcher.flush(&service).await;
+        }
+        tracing::debug!("call_log flusher exiting");
+    })
 }
 
 #[axum::async_trait]
@@ -121,6 +890,18 @@ impl FromRequestParts<AppState> for AuthUser {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
+        // Extract optional tool/agent name for usage tracking (skip empty values).
+        // Agents send X-Memoria-Tool with their name: cursor / kiro / claude / codex / openclaw.
+        // Fall back to X-Tool-Name for backwards compatibility with older clients.
+        // Any non-empty value is accepted — no whitelist, so new agents work automatically.
+        let tool_name = parts
+            .headers
+            .get("X-Memoria-Tool")
+            .or_else(|| parts.headers.get("X-Tool-Name"))
+            .and_then(|v| v.to_str().ok())
+            .filter(|v| !v.is_empty())
+            .map(String::from);
+
         let bearer = parts
             .headers
             .get("Authorization")
@@ -137,10 +918,27 @@ impl FromRequestParts<AppState> for AuthUser {
                 // fall through
             }
             // 2) API key — user_id resolved from DB, never master
-            else if let Some(uid) = validate_api_key(token, state).await {
-                return Ok(AuthUser { user_id: uid, is_master: false });
+            else if let Some((uid, group_id)) = validate_api_key(token, state).await {
+                if let Some(tool) = tool_name {
+                    state.tool_usage_batcher.mark_used(uid.clone(), tool);
+                }
+                // Notify call-log middleware (if present) of the resolved user_id.
+                // The middleware inserted CallLogContext into extensions before calling next;
+                // we fill in the user_id so it can record the call after the handler returns.
+                if let Some(ctx) = parts.extensions.get::<CallLogContext>() {
+                    if let Ok(mut guard) = ctx.0.lock() {
+                        *guard = Some(uid.clone());
+                    }
+                }
+                let scope_id = group_id.clone().unwrap_or_else(|| uid.clone());
+                return Ok(AuthUser {
+                    user_id: uid,
+                    scope_id,
+                    group_id,
+                    is_master: false,
+                });
             } else {
-                crate::routes::metrics::AUTH_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                crate::metrics::registry().security.auth_failures.inc();
                 warn!(
                     token_prefix = &token[..token.len().min(8)],
                     "auth: invalid token"
@@ -149,7 +947,7 @@ impl FromRequestParts<AppState> for AuthUser {
             }
         } else if !state.master_key.is_empty() {
             // master_key is configured but caller sent no Bearer token
-            crate::routes::metrics::AUTH_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            crate::metrics::registry().security.auth_failures.inc();
             warn!("auth: missing Bearer token");
             return Err((StatusCode::UNAUTHORIZED, "Missing Bearer token".to_string()));
         }
@@ -169,40 +967,61 @@ impl FromRequestParts<AppState> for AuthUser {
             })
             .unwrap_or_else(|| "default".to_string());
 
-        Ok(AuthUser { user_id, is_master: true })
+        if let Some(tool) = tool_name {
+            state.tool_usage_batcher.mark_used(user_id.clone(), tool);
+        }
+
+        if let Some(ctx) = parts.extensions.get::<CallLogContext>() {
+            if let Ok(mut guard) = ctx.0.lock() {
+                *guard = Some(user_id.clone());
+            }
+        }
+
+        Ok(AuthUser {
+            scope_id: user_id.clone(),
+            group_id: None,
+            user_id,
+            is_master: true,
+        })
     }
 }
 
 /// Hash the raw API key and look it up in mem_api_keys.
 /// Returns Some(user_id) if valid, None otherwise.
 ///
-/// Uses a dedicated auth connection pool (2 connections, 2s timeout) so that
-/// auth validation is never blocked by slow business queries on the main pool.
+/// Uses a dedicated auth connection pool so that auth validation is never
+/// blocked by slow business queries on the main pool.
 /// `last_used_at` is updated via batched writes (see [`LastUsedBatcher`]).
-async fn validate_api_key(token: &str, state: &AppState) -> Option<String> {
-    let sql = state.service.sql_store.as_ref()?;
+async fn validate_api_key(token: &str, state: &AppState) -> Option<(String, Option<String>)> {
+    state.service.sql_store.as_ref()?;
     let key_hash = format!("{:x}", Sha256::digest(token.as_bytes()));
 
     // Rate limit check (before cache, to count all attempts)
     if !state.rate_limiter.allow(&key_hash).await {
-        crate::routes::metrics::AUTH_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        crate::metrics::registry().security.auth_failures.inc();
         return None;
     }
 
-    // Check cache first — no DB hit at all
-    if let Some(user_id) = state.api_key_cache.get(&key_hash).await {
+    // Check cache first — no DB hit at all.
+    // Note: cached entries skip the membership check below.  This is acceptable
+    // because (a) cache TTL is 5 min, and (b) remove_member / delete_group invalidate
+    // the cache for revoked keys.  The DB-level check on cache miss is the
+    // authoritative membership gate.
+    if let Some(principal) = state.api_key_cache.get(&key_hash) {
         // Still enqueue last_used_at update (batched, no DB pressure)
         state.last_used_batcher.mark_used(key_hash);
-        return Some(user_id);
+        return Some((principal.user_id, principal.group_id));
     }
 
-    // Use dedicated auth pool if available, fall back to main pool
-    let pool = state.auth_pool.as_ref().unwrap_or(sql.pool());
+    let Some(pool) = state.auth_pool.as_ref() else {
+        warn!("validate_api_key: dedicated auth pool unavailable");
+        return None;
+    };
 
     let row = sqlx::query(
-        "SELECT user_id FROM mem_api_keys \
+        "SELECT user_id, group_id FROM mem_api_keys \
          WHERE key_hash = ? AND is_active = 1 \
-         AND (expires_at IS NULL OR expires_at > NOW(6))"
+         AND (expires_at IS NULL OR expires_at > NOW(6))",
     )
     .bind(&key_hash)
     .fetch_optional(pool)
@@ -211,12 +1030,126 @@ async fn validate_api_key(token: &str, state: &AppState) -> Option<String> {
     .ok()??;
 
     let user_id: String = row.try_get("user_id").ok()?;
+    let group_id: Option<String> = row.try_get("group_id").ok().flatten();
+
+    // Enforce real-time group membership: even if the key references a group,
+    // the user must still be an active member in `mem_group_members` and the
+    // group must be active.  This prevents access after member removal (the
+    // key-revocation path is eventually-consistent; this check is the
+    // authoritative gate).
+    if let Some(gid) = &group_id {
+        let cnt: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM mem_groups g \
+             JOIN mem_group_members m ON g.group_id = m.group_id \
+             WHERE g.group_id = ? AND g.status = 'active' \
+             AND m.user_id = ? AND m.is_active = 1",
+        )
+        .bind(gid)
+        .bind(&user_id)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| warn!("validate_api_key: membership check failed: {e}"))
+        .ok()?;
+        if cnt == 0 {
+            warn!(
+                user_id = %user_id,
+                group_id = %gid,
+                "auth: user not a member of group (or group inactive)"
+            );
+            return None;
+        }
+    }
 
     // Cache the result (TTL 5 min)
-    state.api_key_cache.insert(key_hash.clone(), user_id.clone()).await;
+    state
+        .api_key_cache
+        .insert(key_hash.clone(), user_id.clone(), group_id.clone());
 
     // Enqueue batched last_used_at update — zero DB pressure on hot path
     state.last_used_batcher.mark_used(key_hash);
 
-    Some(user_id)
+    Some((user_id, group_id))
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_tool_usage_mark_and_query() {
+        let b = ToolUsageBatcher::new();
+        b.mark_used("alice".into(), "memory_store".into());
+        b.mark_used("alice".into(), "memory_retrieve".into());
+        b.mark_used("bob".into(), "memory_store".into());
+
+        let alice = b.get_user_tool_usage("alice");
+        assert_eq!(alice.len(), 2);
+        let tools: Vec<&str> = alice.iter().map(|(t, _)| t.as_str()).collect();
+        assert!(tools.contains(&"memory_store"));
+        assert!(tools.contains(&"memory_retrieve"));
+
+        let bob = b.get_user_tool_usage("bob");
+        assert_eq!(bob.len(), 1);
+        assert_eq!(bob[0].0, "memory_store");
+
+        assert!(b.get_user_tool_usage("nobody").is_empty());
+    }
+
+    #[test]
+    fn test_tool_usage_overwrite_updates_time() {
+        let b = ToolUsageBatcher::new();
+        b.mark_used("alice".into(), "memory_store".into());
+        let t1 = b.get_user_tool_usage("alice")[0].1;
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        b.mark_used("alice".into(), "memory_store".into());
+        let t2 = b.get_user_tool_usage("alice")[0].1;
+
+        assert!(t2 > t1);
+    }
+
+    #[test]
+    fn test_tool_usage_empty_tool_not_stored() {
+        // Simulates what the AuthUser extractor does: filter(|v| !v.is_empty())
+        let raw = "";
+        let tool_name = Some(raw).filter(|v| !v.is_empty()).map(String::from);
+        assert!(tool_name.is_none());
+    }
+
+    #[test]
+    fn test_tool_usage_rebuild_merge_fills_missing_entry() {
+        let b = ToolUsageBatcher::new();
+        let ts = Utc::now() - chrono::Duration::minutes(5);
+        let mut rebuilt = std::collections::HashMap::new();
+        rebuilt.insert(
+            ("alice".to_string(), "memory_store".to_string()),
+            (ts, false),
+        );
+
+        b.merge_rebuilt_entries(rebuilt);
+
+        let usage = b.get_user_tool_usage("alice");
+        assert_eq!(usage.len(), 1);
+        assert_eq!(usage[0].0, "memory_store");
+        assert_eq!(usage[0].1, ts);
+    }
+
+    #[test]
+    fn test_tool_usage_rebuild_merge_preserves_dirty_entry() {
+        let b = ToolUsageBatcher::new();
+        b.mark_used("alice".into(), "memory_store".into());
+        let dirty_ts = b.get_user_tool_usage("alice")[0].1;
+
+        let mut rebuilt = std::collections::HashMap::new();
+        rebuilt.insert(
+            ("alice".to_string(), "memory_store".to_string()),
+            (dirty_ts + chrono::Duration::minutes(5), false),
+        );
+
+        b.merge_rebuilt_entries(rebuilt);
+
+        let usage = b.get_user_tool_usage("alice");
+        assert_eq!(usage.len(), 1);
+        assert_eq!(usage[0].0, "memory_store");
+        assert_eq!(usage[0].1, dirty_ts);
+    }
 }

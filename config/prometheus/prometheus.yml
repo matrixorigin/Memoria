@@ -1,0 +1,14 @@
+# Prometheus scrape config for Memoria API server.
+# Used by the monitoring profile in docker-compose.yml.
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: "memoria-api"
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["memoria-api:8100"]
+        labels:
+          service: "memoria"

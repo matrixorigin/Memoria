@@ -86,32 +86,37 @@ fn extract_json(text: &str) -> &str {
 
 async fn generate_and_store(
     state: &AppState,
-    user_id: &str,
+    scope_id: &str,
     session_id: &str,
     mode: &str,
     focus_topics: Option<&[String]>,
 ) -> Result<(String, String, bool, serde_json::Value), String> {
     let sql = state
         .service
-        .sql_store
-        .as_ref()
-        .ok_or("SQL store required")?;
+        .user_sql_store(scope_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    let table = sql
+        .active_table(scope_id)
+        .await
+        .map_err(|e| e.to_string())?;
     let llm = state
         .service
         .llm
         .as_ref()
         .ok_or("LLM not configured — set LLM_API_KEY")?;
 
-    let rows = sqlx::query(
-        "SELECT memory_id, content, memory_type FROM mem_memories \
+    let query = format!(
+        "SELECT memory_id, content, memory_type FROM {table} \
          WHERE user_id = ? AND session_id = ? AND is_active = 1 \
-         ORDER BY created_at ASC",
-    )
-    .bind(user_id)
-    .bind(session_id)
-    .fetch_all(sql.pool())
-    .await
-    .map_err(|e| e.to_string())?;
+         ORDER BY created_at ASC"
+    );
+    let rows = sqlx::query(&query)
+        .bind(scope_id)
+        .bind(session_id)
+        .fetch_all(sql.pool())
+        .await
+        .map_err(|e| e.to_string())?;
 
     if rows.is_empty() {
         return Err(format!("No memories found for session {session_id}"));
@@ -161,9 +166,10 @@ async fn generate_and_store(
         let m = state
             .service
             .store_memory(
-                user_id,
+                scope_id,
                 &content,
                 memoria_core::MemoryType::Episodic,
+                None,
                 None,
                 None,
                 None,
@@ -207,9 +213,10 @@ async fn generate_and_store(
         let m = state
             .service
             .store_memory(
-                user_id,
+                scope_id,
                 &content,
                 memoria_core::MemoryType::Episodic,
+                None,
                 None,
                 None,
                 None,
@@ -225,7 +232,7 @@ async fn generate_and_store(
 
 pub async fn create_session_summary(
     State(state): State<AppState>,
-    AuthUser { user_id, .. }: AuthUser,
+    auth: AuthUser,
     Path(session_id): Path<String>,
     Json(req): Json<SessionSummaryRequest>,
 ) -> Result<Json<SessionSummaryResponse>, (StatusCode, String)> {
@@ -239,7 +246,7 @@ pub async fn create_session_summary(
     if req.sync {
         let result = generate_and_store(
             &state,
-            &user_id,
+            auth.scope_id(),
             &session_id,
             &req.mode,
             req.focus_topics.as_deref(),
@@ -265,13 +272,13 @@ pub async fn create_session_summary(
 
     let task_id = uuid::Uuid::new_v4().simple().to_string();
     task_store
-        .create_task(&task_id, &state.instance_id, &user_id)
+        .create_task(&task_id, &state.instance_id, &auth.user_id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     let state_clone = state.clone();
     let tid = task_id.clone();
-    let uid = user_id.clone();
+    let uid = auth.scope_id().to_string();
     let sid = session_id.clone();
     let mode = req.mode.clone();
     let focus = req.focus_topics.clone();
@@ -312,7 +319,7 @@ pub async fn create_session_summary(
 
 pub async fn get_task_status(
     State(state): State<AppState>,
-    AuthUser { user_id, is_master }: AuthUser,
+    auth: AuthUser,
     Path(task_id): Path<String>,
 ) -> Result<Json<TaskStatus>, (StatusCode, String)> {
     let task_store = state.task_store.as_ref().ok_or((
@@ -327,7 +334,7 @@ pub async fn get_task_status(
 
     match task {
         Some(t) => {
-            if !is_master && t.user_id != user_id {
+            if !auth.is_master && t.user_id != auth.user_id {
                 return Err((StatusCode::FORBIDDEN, "Not your task".to_string()));
             }
             Ok(Json(TaskStatus {

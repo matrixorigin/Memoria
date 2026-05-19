@@ -1,11 +1,27 @@
 use crate::{git_tools, remote::RemoteClient, tools};
 use anyhow::Result;
 use memoria_git::GitForDataService;
-use memoria_service::MemoryService;
+use memoria_service::{shutdown_signal, MemoryService};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+/// Structured JSON-RPC error returned by [`dispatch`] and [`dispatch_http`].
+/// Carries the standard error code so callers can forward it verbatim.
+#[derive(Debug)]
+pub struct McpRpcError {
+    pub code: i32,
+    pub message: String,
+}
+
+impl std::fmt::Display for McpRpcError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl std::error::Error for McpRpcError {}
 
 #[derive(Deserialize)]
 struct Request {
@@ -26,6 +42,75 @@ struct Response {
     result: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<Value>,
+}
+
+enum RpcMethod {
+    Initialize,
+    ToolsList,
+    ToolsCall,
+    NotificationsInitialized,
+    Unknown(String),
+}
+
+const GIT_TOOL_NAMES: &[&str] = &[
+    "memory_snapshot",
+    "memory_snapshots",
+    "memory_snapshot_delete",
+    "memory_rollback",
+    "memory_branch",
+    "memory_branches",
+    "memory_checkout",
+    "memory_merge",
+    "memory_pick",
+    "memory_diff",
+    "memory_apply",
+    "memory_branch_delete",
+];
+
+fn is_git_tool(name: &str) -> bool {
+    GIT_TOOL_NAMES.contains(&name)
+}
+
+/// Dispatch a single JSON-RPC method in embedded mode.
+/// Used by the server-side Streamable HTTP MCP endpoint.
+pub async fn dispatch_http(
+    method: String,
+    params: Option<Value>,
+    service: Arc<MemoryService>,
+    git: Arc<GitForDataService>,
+    user_id: String,
+) -> Result<Value, McpRpcError> {
+    let handle = tokio::runtime::Handle::current();
+
+    // `spawn_blocking` runs on a separate thread-pool thread and does NOT inherit
+    // Tokio task-local variables.  In group/space mode the `actor_scope_layer`
+    // middleware sets `ACTOR_USER_ID` to the real human user_id so that per-user
+    // state (active branch) is keyed on the individual rather than the group scope.
+    // Without propagating it here, MCP tool calls inside `spawn_blocking` fall back
+    // to `scope_id` (the group id), causing a mismatch: the Dashboard REST checkout
+    // writes `mem_user_state.user_id = real_user_id` while the MCP code-agent reads
+    // `mem_user_state.user_id = grp_xxx` — two different rows, always out of sync.
+    let actor_user_id = memoria_storage::ACTOR_USER_ID
+        .try_with(|id| id.clone())
+        .ok();
+
+    tokio::task::spawn_blocking(move || {
+        let fut = dispatch_embedded_owned(method, params, service, git, user_id);
+        // Restore ACTOR_USER_ID inside the blocking thread so storage methods
+        // (`active_branch_name`, `set_active_branch`, `active_table`) see the
+        // same per-user scope they would in the original async task.
+        match actor_user_id {
+            Some(actor_id) => handle.block_on(
+                memoria_storage::ACTOR_USER_ID.scope(actor_id, fut)
+            ),
+            None => handle.block_on(fut),
+        }
+    })
+    .await
+    .map_err(|e| McpRpcError {
+        code: -32000,
+        message: e.to_string(),
+    })?
 }
 
 /// Run in embedded mode (direct DB).
@@ -99,11 +184,17 @@ pub async fn run_sse(
             let id = req["id"].clone();
             let method = req["method"].as_str().unwrap_or("").to_string();
             let params = req["params"].clone();
-            let mode = Mode::Embedded { service: s.service.clone(), git: s.git.clone() };
-            let result = dispatch(&method, Some(params), &mode, &s.user_id).await;
+            let result = dispatch_http(
+                method,
+                Some(params),
+                s.service.clone(),
+                s.git.clone(),
+                s.user_id.clone(),
+            )
+            .await;
             let resp = match result {
                 Ok(v) => serde_json::json!({"jsonrpc":"2.0","id":id,"result":if v.is_null(){serde_json::json!({})}else{v}}),
-                Err(e) => serde_json::json!({"jsonrpc":"2.0","id":id,"error":{"code":-32000,"message":e.to_string()}}),
+                Err(e) => serde_json::json!({"jsonrpc":"2.0","id":id,"error":{"code":e.code,"message":e.message}}),
             };
             let _ = s.tx.send(serde_json::to_string(&resp).unwrap_or_default());
         }))
@@ -112,7 +203,9 @@ pub async fn run_sse(
     let addr = format!("0.0.0.0:{port}");
     tracing::info!("Memoria MCP SSE transport listening on {addr}");
     let listener = tokio::net::TcpListener::bind(&addr).await?;
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
     Ok(())
 }
 
@@ -129,7 +222,16 @@ async fn run_loop(mode: Mode, user_id: String) -> Result<()> {
     let mut stdout = tokio::io::stdout();
     let mut reader = BufReader::new(stdin).lines();
 
-    while let Some(line) = reader.next_line().await? {
+    loop {
+        let line = tokio::select! {
+            result = reader.next_line() => {
+                match result? {
+                    Some(l) => l,
+                    None => break, // EOF
+                }
+            }
+            _ = shutdown_signal() => break,
+        };
         let line = line.trim().to_string();
         if line.is_empty() {
             continue;
@@ -168,7 +270,7 @@ async fn run_loop(mode: Mode, user_id: String) -> Result<()> {
                 jsonrpc: "2.0",
                 id,
                 result: None,
-                error: Some(json!({"code": -32000, "message": e.to_string()})),
+                error: Some(json!({"code": e.code, "message": e.message})),
             },
         };
         write_line(&mut stdout, &resp).await?;
@@ -189,48 +291,144 @@ async fn dispatch(
     params: Option<Value>,
     mode: &Mode,
     user_id: &str,
-) -> Result<Value> {
+) -> Result<Value, McpRpcError> {
     let p = params.unwrap_or(Value::Null);
+    let method = match method {
+        "initialize" => RpcMethod::Initialize,
+        "tools/list" => RpcMethod::ToolsList,
+        "tools/call" => RpcMethod::ToolsCall,
+        "notifications/initialized" => RpcMethod::NotificationsInitialized,
+        _ => RpcMethod::Unknown(method.to_string()),
+    };
     match method {
-        "initialize" => Ok(json!({
+        RpcMethod::Initialize => Ok(json!({
             "protocolVersion": "2024-11-05",
             "capabilities": {"tools": {}},
             "serverInfo": {"name": "memoria-mcp-rs", "version": "0.1.0"}
         })),
-        "tools/list" => {
+        RpcMethod::ToolsList => {
             let mut all_tools = tools::list().as_array().unwrap().clone();
             all_tools.extend(git_tools::list().as_array().unwrap().clone());
             Ok(json!({"tools": all_tools}))
         }
-        "tools/call" => {
+        RpcMethod::ToolsCall => {
             let name = p["name"].as_str().unwrap_or("").to_string();
             let args = p["arguments"].clone();
+            let internal_err = |e: anyhow::Error| McpRpcError {
+                code: -32000,
+                message: e.to_string(),
+            };
             match mode {
-                Mode::Remote(client) => client.call(&name, args).await,
+                Mode::Remote(client) => client.call(&name, args).await.map_err(internal_err),
                 Mode::Embedded { service, git } => {
-                    let git_tool_names = [
-                        "memory_snapshot",
-                        "memory_snapshots",
-                        "memory_snapshot_delete",
-                        "memory_rollback",
-                        "memory_branch",
-                        "memory_branches",
-                        "memory_checkout",
-                        "memory_merge",
-                        "memory_diff",
-                        "memory_branch_delete",
-                    ];
-                    if git_tool_names.contains(&name.as_str()) {
+                    if is_git_tool(&name) {
                         git_tools::call(&name, args, git, service, user_id)
                             .await
-                            .map_err(|e| anyhow::anyhow!("{e}"))
+                            .map_err(|e| McpRpcError {
+                                code: -32000,
+                                message: e.to_string(),
+                            })
                     } else {
-                        tools::call(&name, args, service, user_id).await
+                        tools::call(&name, args, service, user_id)
+                            .await
+                            .map_err(internal_err)
                     }
                 }
             }
         }
-        "notifications/initialized" => Ok(Value::Null),
-        _ => Err(anyhow::anyhow!("Method not found: {method}")),
+        RpcMethod::NotificationsInitialized => Ok(Value::Null),
+        RpcMethod::Unknown(method) => Err(McpRpcError {
+            code: -32601,
+            message: format!("Method not found: {method}"),
+        }),
+    }
+}
+
+async fn dispatch_embedded_owned(
+    method: String,
+    params: Option<Value>,
+    service: Arc<MemoryService>,
+    git: Arc<GitForDataService>,
+    user_id: String,
+) -> Result<Value, McpRpcError> {
+    let p = params.unwrap_or(Value::Null);
+    let method = match method.as_str() {
+        "initialize" => RpcMethod::Initialize,
+        "tools/list" => RpcMethod::ToolsList,
+        "tools/call" => RpcMethod::ToolsCall,
+        "notifications/initialized" => RpcMethod::NotificationsInitialized,
+        _ => RpcMethod::Unknown(method),
+    };
+    match method {
+        RpcMethod::Initialize => Ok(json!({
+            "protocolVersion": "2024-11-05",
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": "memoria-mcp-rs", "version": "0.1.0"}
+        })),
+        RpcMethod::ToolsList => {
+            let mut all_tools = tools::list().as_array().unwrap().clone();
+            all_tools.extend(git_tools::list().as_array().unwrap().clone());
+            Ok(json!({"tools": all_tools}))
+        }
+        RpcMethod::ToolsCall => {
+            let name = p["name"].as_str().unwrap_or("").to_string();
+            let args = p["arguments"].clone();
+            let internal_err = |e: anyhow::Error| McpRpcError {
+                code: -32000,
+                message: e.to_string(),
+            };
+            if is_git_tool(&name) {
+                git_tools::call_owned(name, args, git, service, user_id)
+                    .await
+                    .map_err(|e| McpRpcError {
+                        code: -32000,
+                        message: e.to_string(),
+                    })
+            } else {
+                tools::call_owned(name, args, service, user_id)
+                    .await
+                    .map_err(internal_err)
+            }
+        }
+        RpcMethod::NotificationsInitialized => Ok(Value::Null),
+        RpcMethod::Unknown(method) => Err(McpRpcError {
+            code: -32601,
+            message: format!("Method not found: {method}"),
+        }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_git_tool, GIT_TOOL_NAMES};
+
+    #[test]
+    fn git_dispatch_list_includes_memory_apply() {
+        assert!(is_git_tool("memory_apply"));
+    }
+
+    #[test]
+    fn git_tool_dispatch_matches_declared_git_tools() {
+        let declared_names: Vec<String> = crate::git_tools::list()
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|tool| tool.get("name").and_then(|name| name.as_str()))
+            .map(str::to_string)
+            .collect();
+
+        for name in GIT_TOOL_NAMES {
+            assert!(
+                declared_names.iter().any(|declared| declared == name),
+                "dispatch marked '{name}' as a git tool but git_tools::list() does not declare it"
+            );
+        }
+
+        for name in declared_names {
+            assert!(
+                is_git_tool(&name),
+                "git_tools::list() declares '{name}' but server dispatch does not route it"
+            );
+        }
     }
 }

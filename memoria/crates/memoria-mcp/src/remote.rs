@@ -1,6 +1,7 @@
 //! Remote mode: proxy all MCP tool calls to a Memoria REST API server.
 //! Mirrors Python's HTTPBackend.
 
+use crate::purge_args::parse_memory_purge_args;
 use anyhow::Result;
 use reqwest::Client;
 use serde_json::{json, Value};
@@ -55,6 +56,50 @@ impl RemoteClient {
         Self::mcp_text(&serde_json::to_string_pretty(v).unwrap_or_default())
     }
 
+    fn expect_tool_args<'a>(
+        args: &'a Value,
+        tool: &str,
+        allowed: &[&str],
+    ) -> Result<&'a serde_json::Map<String, Value>> {
+        let map = args
+            .as_object()
+            .ok_or_else(|| anyhow::anyhow!("Invalid {tool} arguments: expected object"))?;
+        for key in map.keys() {
+            if !allowed.iter().any(|allowed_key| allowed_key == key) {
+                anyhow::bail!("Invalid {tool} argument '{key}': unknown field");
+            }
+        }
+        Ok(map)
+    }
+
+    fn required_string_arg(args: &Value, tool: &str, field: &str) -> Result<String> {
+        args.get(field)
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .ok_or_else(|| anyhow::anyhow!("Invalid {tool} '{field}': expected non-empty string"))
+    }
+
+    fn optional_i64_arg(args: &Value, tool: &str, field: &str, default: i64) -> Result<i64> {
+        match args.get(field) {
+            None => Ok(default),
+            Some(value) => value
+                .as_i64()
+                .ok_or_else(|| anyhow::anyhow!("Invalid {tool} '{field}': expected integer")),
+        }
+    }
+
+    fn json_array_arg(args: &Value, field: &str) -> Result<Value> {
+        match args.get(field) {
+            None => Ok(Value::Array(Vec::new())),
+            Some(Value::Array(values)) => Ok(Value::Array(values.clone())),
+            Some(other) => anyhow::bail!(
+                "Invalid memory_apply '{field}': expected array, got {}",
+                other
+            ),
+        }
+    }
+
     #[allow(dead_code)]
     fn mcp_err(e: impl std::fmt::Display) -> Value {
         Self::mcp_text(&format!("Error: {e}"))
@@ -66,7 +111,11 @@ impl RemoteClient {
             return Ok(r.json().await?);
         }
         let body = r.text().await.unwrap_or_default();
-        let msg = if body.is_empty() { status.to_string() } else { body };
+        let msg = if body.is_empty() {
+            status.to_string()
+        } else {
+            body
+        };
         anyhow::bail!("API error {status}: {msg}")
     }
 
@@ -98,14 +147,25 @@ impl RemoteClient {
                 } else {
                     "/v1/memories/retrieve"
                 };
+                let mut payload = json!({
+                    "query": args["query"],
+                    "top_k": if name == "memory_search" {
+                        args["top_k"].as_i64().unwrap_or(10)
+                    } else {
+                        args["top_k"].as_i64().unwrap_or(5)
+                    },
+                    "session_id": args["session_id"],
+                });
+                if let Some(session_scope) = args
+                    .get("session_scope")
+                    .and_then(serde_json::Value::as_str)
+                {
+                    payload["session_scope"] = json!(session_scope);
+                }
                 let r = self
                     .client
                     .post(self.url(path))
-                    .json(&json!({
-                        "query": args["query"],
-                        "top_k": args["top_k"].as_i64().unwrap_or(5),
-                        "session_id": args["session_id"],
-                    }))
+                    .json(&payload)
                     .send()
                     .await?;
                 let body = Self::parse_response(r).await?;
@@ -139,9 +199,17 @@ impl RemoteClient {
                         .send()
                         .await?
                 } else {
-                    self.client.post(self.url("/v1/memories/correct"))
-                        .json(&json!({"query": query, "new_content": new_content, "reason": args["reason"]}))
-                        .send().await?
+                    self.client
+                        .post(self.url("/v1/memories/correct"))
+                        .json(&json!({
+                            "query": query,
+                            "new_content": new_content,
+                            "session_id": args["session_id"],
+                            "session_scope": args["session_scope"],
+                            "reason": args["reason"]
+                        }))
+                        .send()
+                        .await?
                 };
                 let body = Self::parse_response(r).await?;
                 if let Some(_err) = body.get("error") {
@@ -157,9 +225,8 @@ impl RemoteClient {
             }
 
             "memory_purge" => {
-                let memory_id = args["memory_id"].as_str().unwrap_or("");
-                let topic = args["topic"].as_str().unwrap_or("");
-                if !memory_id.is_empty() {
+                let purge_args = parse_memory_purge_args(&args)?;
+                if let Some(memory_id) = purge_args.memory_id {
                     let ids: Vec<&str> = memory_id
                         .split(',')
                         .map(str::trim)
@@ -177,7 +244,7 @@ impl RemoteClient {
                         "Purged {} memory(s)",
                         body["purged"].as_i64().unwrap_or(count as i64)
                     )))
-                } else if !topic.is_empty() {
+                } else if let Some(topic) = purge_args.topic {
                     let r = self
                         .client
                         .post(self.url("/v1/memories/purge"))
@@ -189,8 +256,29 @@ impl RemoteClient {
                         "Purged {} memory(s) matching '{topic}'",
                         body["purged"].as_i64().unwrap_or(0)
                     )))
+                } else if let Some(session_id) = purge_args.session_id {
+                    let r = self
+                        .client
+                        .post(self.url("/v1/memories/purge"))
+                        .json(&json!({
+                            "session_id": session_id,
+                            "memory_types": purge_args.memory_types.map(|memory_types| {
+                                memory_types
+                                    .into_iter()
+                                    .map(|memory_type| memory_type.to_string())
+                                    .collect::<Vec<_>>()
+                            }),
+                        }))
+                        .send()
+                        .await?;
+                    let body = Self::parse_response(r).await?;
+                    Ok(Self::mcp_text(&format!(
+                        "Purged {} memory(s) for session '{}'",
+                        body["purged"].as_i64().unwrap_or(0),
+                        session_id
+                    )))
                 } else {
-                    Ok(Self::mcp_text("Provide memory_id or topic"))
+                    Ok(Self::mcp_text("Provide memory_id, topic, or session_id"))
                 }
             }
 
@@ -207,12 +295,19 @@ impl RemoteClient {
 
             "memory_list" => {
                 let limit = args["limit"].as_i64().unwrap_or(20);
-                let r = self
+                let memory_type = args.get("memory_type").and_then(Value::as_str);
+                let session_id = args.get("session_id").and_then(Value::as_str);
+                let mut req = self
                     .client
-                    .get(self.url(&format!("/v1/memories?limit={limit}")))
-                    .send()
-                    .await?;
-                let body = Self::parse_response(r).await?;
+                    .get(self.url("/v1/memories"))
+                    .query(&[("limit", limit)]);
+                if let Some(memory_type) = memory_type {
+                    req = req.query(&[("memory_type", memory_type)]);
+                }
+                if let Some(session_id) = session_id {
+                    req = req.query(&[("session_id", session_id)]);
+                }
+                let body = Self::parse_response(req.send().await?).await?;
                 let items = body["items"].as_array().cloned().unwrap_or_default();
                 if items.is_empty() {
                     return Ok(Self::mcp_text("No memories found."));
@@ -232,16 +327,17 @@ impl RemoteClient {
                 Ok(Self::mcp_text(&text))
             }
 
-            "memory_capabilities" => Ok(Self::mcp_text(
-                "Available tools: memory_store, memory_retrieve, memory_search, \
-                 memory_correct, memory_purge, memory_profile, memory_list, \
-                 memory_capabilities, memory_governance, memory_consolidate, \
-                 memory_reflect, memory_feedback \
-                 [remote mode — connected to Memoria API server]",
-            )),
+            "memory_capabilities" => Ok(Self::mcp_text(&format!(
+                "{}\n[remote mode — connected to Memoria API server]",
+                crate::tools::MEMORY_CAPABILITIES_TEXT
+            ))),
 
             "memory_get_retrieval_params" => {
-                let r = self.client.get(self.url("/v1/retrieval-params")).send().await?;
+                let r = self
+                    .client
+                    .get(self.url("/v1/retrieval-params"))
+                    .send()
+                    .await?;
                 let body = Self::parse_response(r).await?;
                 Ok(Self::mcp_text(&serde_json::to_string_pretty(&body)?))
             }
@@ -267,7 +363,9 @@ impl RemoteClient {
                     )))
                 } else {
                     Ok(Self::mcp_text(
-                        body["message"].as_str().unwrap_or("Not enough feedback to tune parameters")
+                        body["message"]
+                            .as_str()
+                            .unwrap_or("Not enough feedback to tune parameters"),
                     ))
                 }
             }
@@ -514,11 +612,64 @@ impl RemoteClient {
                 Ok(Self::mcp_json(&body))
             }
 
-            "memory_diff" => {
+            "memory_pick" => {
                 let source = args["source"].as_str().unwrap_or("");
+                let target = args["target"].as_str().unwrap_or("main");
+                let strategy = args["strategy"].as_str().unwrap_or("fail");
                 let r = self
                     .client
-                    .get(self.url(&format!("/v1/branches/{source}/diff")))
+                    .post(self.url(&format!("/v1/branches/{source}/pick")))
+                    .json(&json!({
+                        "target": target,
+                        "strategy": strategy,
+                        "selector": args["selector"],
+                        "dry_run": args.get("dry_run").cloned().unwrap_or(Value::Null),
+                    }))
+                    .send()
+                    .await?;
+                let body = Self::parse_response(r).await?;
+                if body["dry_run"].as_bool().unwrap_or(false) {
+                    Ok(Self::mcp_json(&body))
+                } else {
+                    Ok(Self::mcp_text(body["result"].as_str().unwrap_or("")))
+                }
+            }
+
+            "memory_diff" => {
+                Self::expect_tool_args(&args, "memory_diff", &["source", "limit"])?;
+                let source = Self::required_string_arg(&args, "memory_diff", "source")?;
+                let limit = Self::optional_i64_arg(&args, "memory_diff", "limit", 50)?;
+                let r = self
+                    .client
+                    .get(self.url(&format!("/v1/branches/{source}/diff?limit={limit}")))
+                    .send()
+                    .await?;
+                let body = Self::parse_response(r).await?;
+                Ok(Self::mcp_json(&body))
+            }
+
+            "memory_apply" => {
+                Self::expect_tool_args(
+                    &args,
+                    "memory_apply",
+                    &[
+                        "source",
+                        "adds",
+                        "updates",
+                        "removes",
+                        "accept_branch_conflicts",
+                    ],
+                )?;
+                let source = Self::required_string_arg(&args, "memory_apply", "source")?;
+                let r = self
+                    .client
+                    .post(self.url(&format!("/v1/branches/{source}/apply")))
+                    .json(&json!({
+                        "adds": Self::json_array_arg(&args, "adds")?,
+                        "updates": Self::json_array_arg(&args, "updates")?,
+                        "removes": Self::json_array_arg(&args, "removes")?,
+                        "accept_branch_conflicts": Self::json_array_arg(&args, "accept_branch_conflicts")?,
+                    }))
                     .send()
                     .await?;
                 let body = Self::parse_response(r).await?;
@@ -571,5 +722,195 @@ impl RemoteClient {
 
             _ => Ok(Self::mcp_text(&format!("Unknown tool: {name}"))),
         }
+    }
+
+    pub async fn call_owned(self, name: String, args: Value) -> Result<Value> {
+        self.call(&name, args).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RemoteClient;
+    use axum::{
+        extract::{Path, State},
+        routing::post,
+        Json, Router,
+    };
+    use serde_json::{json, Value};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone)]
+    struct ApplyCapture {
+        branch: Arc<Mutex<Option<String>>>,
+        body: Arc<Mutex<Option<Value>>>,
+    }
+
+    #[tokio::test]
+    async fn memory_apply_remote_call_uses_branch_apply_endpoint() {
+        let capture = ApplyCapture {
+            branch: Arc::new(Mutex::new(None)),
+            body: Arc::new(Mutex::new(None)),
+        };
+
+        let app = Router::new()
+            .route(
+                "/v1/branches/:source/apply",
+                post(
+                    |State(capture): State<ApplyCapture>,
+                     Path(source): Path<String>,
+                     Json(payload): Json<Value>| async move {
+                        *capture.branch.lock().unwrap() = Some(source);
+                        *capture.body.lock().unwrap() = Some(payload);
+                        Json(json!({
+                            "applied_adds": ["new-id"],
+                            "applied_updates": [],
+                            "applied_removes": [],
+                            "applied_conflicts": []
+                        }))
+                    },
+                ),
+            )
+            .with_state(capture.clone());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let addr = listener.local_addr().expect("local addr");
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+                .expect("serve test router");
+        });
+
+        let remote = RemoteClient::new(
+            &format!("http://{addr}"),
+            Some("sk-test"),
+            "default".to_string(),
+            Some("kiro"),
+        );
+        let result = remote
+            .call(
+                "memory_apply",
+                json!({
+                    "source": "feature-1",
+                    "adds": ["new-id"],
+                    "updates": [{"old_id": "old-id", "new_id": "new-id"}],
+                    "removes": ["gone-id"],
+                    "accept_branch_conflicts": ["conflict-id"],
+                }),
+            )
+            .await
+            .expect("memory_apply should succeed");
+
+        let text = result["content"][0]["text"].as_str().expect("text result");
+        assert!(text.contains("applied_adds"));
+        assert_eq!(capture.branch.lock().unwrap().as_deref(), Some("feature-1"));
+        assert_eq!(
+            capture.body.lock().unwrap().clone(),
+            Some(json!({
+                "adds": ["new-id"],
+                "updates": [{"old_id": "old-id", "new_id": "new-id"}],
+                "removes": ["gone-id"],
+                "accept_branch_conflicts": ["conflict-id"],
+            }))
+        );
+
+        let _ = shutdown_tx.send(());
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn memory_apply_remote_defaults_missing_arrays_to_empty() {
+        let capture = ApplyCapture {
+            branch: Arc::new(Mutex::new(None)),
+            body: Arc::new(Mutex::new(None)),
+        };
+
+        let app = Router::new()
+            .route(
+                "/v1/branches/:source/apply",
+                post(
+                    |State(capture): State<ApplyCapture>,
+                     Path(source): Path<String>,
+                     Json(payload): Json<Value>| async move {
+                        *capture.branch.lock().unwrap() = Some(source);
+                        *capture.body.lock().unwrap() = Some(payload);
+                        Json(json!({
+                            "applied_adds": [],
+                            "applied_updates": [],
+                            "applied_removes": [],
+                            "applied_conflicts": []
+                        }))
+                    },
+                ),
+            )
+            .with_state(capture.clone());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let addr = listener.local_addr().expect("local addr");
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+                .expect("serve test router");
+        });
+
+        let remote = RemoteClient::new(
+            &format!("http://{addr}"),
+            Some("sk-test"),
+            "default".to_string(),
+            Some("kiro"),
+        );
+        remote
+            .call("memory_apply", json!({"source": "feature-2"}))
+            .await
+            .expect("memory_apply should succeed with missing arrays");
+
+        assert_eq!(
+            capture.body.lock().unwrap().clone(),
+            Some(json!({
+                "adds": [],
+                "updates": [],
+                "removes": [],
+                "accept_branch_conflicts": [],
+            }))
+        );
+
+        let _ = shutdown_tx.send(());
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn memory_diff_remote_rejects_unknown_fields() {
+        let remote = RemoteClient::new(
+            "http://127.0.0.1:9",
+            Some("sk-test"),
+            "default".to_string(),
+            Some("kiro"),
+        );
+        let err = remote
+            .call(
+                "memory_diff",
+                json!({
+                    "source": "feature-3",
+                    "adds": ["unexpected"]
+                }),
+            )
+            .await
+            .expect_err("memory_diff should reject unknown fields before sending");
+
+        assert!(err
+            .to_string()
+            .contains("Invalid memory_diff argument 'adds': unknown field"));
     }
 }

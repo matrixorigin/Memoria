@@ -43,6 +43,24 @@ impl<'de> Deserialize<'de> for MemoryType {
     }
 }
 
+impl MemoryType {
+    /// Canonical set of all memory-type names as lowercase strings.
+    /// Used by metrics validation to prevent bucket drift.
+    pub const ALL_NAMES: &[&str] = &[
+        "semantic",
+        "working",
+        "episodic",
+        "profile",
+        "tool_result",
+        "procedural",
+    ];
+}
+
+/// Canonical feedback signal names accepted by the product.
+/// Must stay in sync with `FeedbackStats` fields in `memoria-storage`
+/// and the `record_feedback` API in `memoria-service`.
+pub const FEEDBACK_SIGNALS: &[&str] = &["useful", "irrelevant", "outdated", "wrong"];
+
 impl std::fmt::Display for MemoryType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let s = match self {
@@ -137,6 +155,9 @@ impl std::str::FromStr for TrustTier {
 pub struct Memory {
     pub memory_id: String,
     pub user_id: String,
+    /// Real author in group mode (the human who created the memory).
+    /// `None` in personal mode (user_id is already the author).
+    pub author_id: Option<String>,
     pub memory_type: MemoryType,
     pub content: String,
     pub initial_confidence: f64,
@@ -170,6 +191,50 @@ impl Memory {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_memory_type_has_six_variants() {
+        let types = [
+            MemoryType::Semantic,
+            MemoryType::Working,
+            MemoryType::Episodic,
+            MemoryType::Profile,
+            MemoryType::ToolResult,
+            MemoryType::Procedural,
+        ];
+        assert_eq!(types.len(), 6);
+    }
+
+    #[test]
+    fn all_names_matches_display() {
+        let display_names: Vec<String> = [
+            MemoryType::Semantic,
+            MemoryType::Working,
+            MemoryType::Episodic,
+            MemoryType::Profile,
+            MemoryType::ToolResult,
+            MemoryType::Procedural,
+        ]
+        .iter()
+        .map(|t| t.to_string())
+        .collect();
+        let mut sorted_display: Vec<&str> = display_names.iter().map(|s| s.as_str()).collect();
+        sorted_display.sort();
+        let mut sorted_all: Vec<&str> = MemoryType::ALL_NAMES.to_vec();
+        sorted_all.sort();
+        assert_eq!(
+            sorted_all, sorted_display,
+            "MemoryType::ALL_NAMES drifted from Display impl"
+        );
+    }
+
+    #[test]
+    fn feedback_signals_is_non_empty() {
+        assert!(!super::FEEDBACK_SIGNALS.is_empty());
+        for s in super::FEEDBACK_SIGNALS {
+            assert!(!s.is_empty(), "empty string in FEEDBACK_SIGNALS");
+        }
+    }
 
     #[test]
     fn test_builtin_types_roundtrip() {

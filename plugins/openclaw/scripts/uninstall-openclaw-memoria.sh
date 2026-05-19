@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PLUGIN_ID="memory-memoria"
+PLUGIN_ID="thememoria"
 DEFAULT_INSTALL_DIR="${HOME}/.local/share/openclaw-plugins/openclaw-memoria"
 
 MEMORIA_TOOL_NAMES=(
@@ -37,11 +37,11 @@ MEMORIA_TOOL_NAMES=(
 )
 
 log() {
-  printf '[memory-memoria] %s\n' "$*"
+  printf '[thememoria] %s\n' "$*"
 }
 
 fail() {
-  printf '[memory-memoria] error: %s\n' "$*" >&2
+  printf '[thememoria] error: %s\n' "$*" >&2
   exit 1
 }
 
@@ -66,9 +66,9 @@ Environment overrides:
   OPENCLAW_HOME        Optional target OpenClaw home.
 
 What gets removed by default:
-  - plugins.entries["memory-memoria"]
-  - plugins.installs["memory-memoria"]
-  - plugins.allow entry for memory-memoria
+  - plugins.entries["thememoria"]
+  - plugins.installs["thememoria"]
+  - plugins.allow entry for thememoria
   - plugins.load.paths entries that point at this plugin
   - tool policy entries for the Memoria tool surface
   - managed companion skills in ~/.openclaw/skills: memoria-memory, memoria-recovery
@@ -357,6 +357,6 @@ Config file: ${CONFIG_FILE}
 
 Recommended follow-up checks:
   cd ~
-  openclaw plugins list --json | rg 'memory-memoria|openclaw-memoria' || true
+  openclaw plugins list --json | rg 'thememoria|openclaw-memoria' || true
   openclaw config get 'plugins.slots.memory'
 EOF

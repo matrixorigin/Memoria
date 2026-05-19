@@ -1,0 +1,37 @@
+# docker-compose.remote.yml
+#
+# Override for using a remote MatrixOne instance instead of the bundled one.
+# Stubs out the local matrixone services and removes the health-check wait,
+# so the api container starts directly against DATABASE_URL.
+#
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.remote.yml \
+#     --profile monitoring up -d
+
+services:
+  matrixone-init:
+    image: busybox:latest
+    entrypoint: []
+    command: ["sh", "-c", "echo 'remote MO mode — skipping init' && exit 0"]
+    volumes: []
+    networks:
+      - memoria-net
+
+  matrixone:
+    image: busybox:latest
+    entrypoint: []
+    command: ["sh", "-c", "echo 'remote MO mode — skipping matrixone' && sleep infinity"]
+    healthcheck:
+      test: ["CMD", "true"]
+      interval: 1s
+      timeout: 1s
+      retries: 1
+    ports: !reset []
+    volumes: []
+    networks:
+      - memoria-net
+
+  api:
+    depends_on:
+      matrixone:
+        condition: service_healthy

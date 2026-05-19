@@ -9,6 +9,7 @@ pub mod rebuild_worker;
 pub mod scheduler;
 pub mod scoring;
 pub mod service;
+pub mod stats_reporter;
 pub mod strategy;
 pub mod strategy_domain;
 pub mod vector_index_monitor;
@@ -43,6 +44,29 @@ pub use scheduler::GovernanceScheduler;
 pub use scoring::{
     DefaultScoringPlugin, FeedbackTotals, ScoringPlugin, ScoringStore, TuningResult,
 };
-pub use service::{CandidateScore, ExplainLevel, MemoryService, PurgeResult, RetrievalExplain};
+pub use service::{
+    CandidateScore, ExplainLevel, InMemoryFlusher, MemoryService, PurgeResult, RetrievalExplain,
+    RetrieveOptions, SessionScope, ENTITY_EXTRACTION_DROPS,
+};
+pub use stats_reporter::StatsReporter;
+
+/// Wait for SIGTERM or Ctrl-C. Shared across CLI, MCP, and API servers.
+pub async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("install SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = terminate.recv() => {}
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
 pub use strategy::{RetrievalStrategy, StrategyRegistry};
 pub use strategy_domain::{StrategyDecision, StrategyEvidence, StrategyReport, StrategyStatus};

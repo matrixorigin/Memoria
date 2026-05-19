@@ -1,42 +1,140 @@
 //! 8 core MCP tools for Phase 2.
 //! Phase 4 will add 14 more (Git-for-Data, admin, graph).
 
+use crate::purge_args::parse_memory_purge_args;
 use anyhow::Result;
 use memoria_core::{MemoryType, TrustTier};
+use memoria_git::GitForDataService;
 use memoria_service::{
     ConsolidationInput, ConsolidationStrategy, DefaultConsolidationStrategy, MemoryService,
 };
+use memoria_storage::SqlMemoryStore;
 use serde_json::{json, Value};
 use sqlx::Row;
 use std::str::FromStr;
 use std::sync::Arc;
 use uuid::Uuid;
 
+async fn user_sql_store(
+    service: &Arc<MemoryService>,
+    user_id: &str,
+) -> Result<Arc<SqlMemoryStore>> {
+    service
+        .user_sql_store(user_id)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+fn git_for_store(sql: &Arc<SqlMemoryStore>) -> Option<GitForDataService> {
+    sql.database_name()
+        .map(|db_name| GitForDataService::new(sql.pool().clone(), db_name.to_string()))
+}
+
+fn parse_session_scope_arg(args: &Value) -> Result<Option<memoria_service::SessionScope>> {
+    args.get("session_scope")
+        .and_then(Value::as_str)
+        .map(memoria_service::SessionScope::from_str)
+        .transpose()
+        .map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+fn parse_retrieve_options_arg(args: &Value) -> Result<memoria_service::RetrieveOptions> {
+    let session_id = args
+        .get("session_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty());
+    let session_scope = parse_session_scope_arg(args)?;
+    if session_scope.is_some() && session_id.is_none() {
+        anyhow::bail!("session_id is required when session_scope is set");
+    }
+    Ok(memoria_service::RetrieveOptions::from_session_scope(
+        session_id,
+        session_scope,
+    ))
+}
+
+enum ToolCallName {
+    MemoryStore,
+    MemoryRetrieve,
+    MemorySearch,
+    MemoryCorrect,
+    MemoryPurge,
+    MemoryProfile,
+    MemoryList,
+    MemoryCapabilities,
+    MemoryGovernance,
+    MemoryRebuildIndex,
+    MemoryConsolidate,
+    MemoryReflect,
+    MemoryExtractEntities,
+    MemoryLinkEntities,
+    MemoryFeedback,
+    MemoryGetRetrievalParams,
+    MemoryTuneParams,
+    MemoryObserve,
+    Unknown(String),
+}
+
+const MEMORY_STORE_DESCRIPTION: &str = concat!(
+    "Store a new memory. Set trust_tier explicitly when certainty matters: ",
+    "T1 for directly stated or explicitly confirmed facts/preferences/decisions, ",
+    "T2 for curated or corrected records, T3 for inferred summaries or soft conclusions ",
+    "(prefer T3 if unsure), T4 for speculative or unverified hypotheses."
+);
+
+const TRUST_TIER_DESCRIPTION: &str = concat!(
+    "Use exact values T1/T2/T3/T4 only. ",
+    "T1 = direct user-stated or explicitly confirmed fact/preference/decision. ",
+    "T2 = curated or corrected memory replacing an older record. ",
+    "T3 = inferred summary, extracted pattern, or soft conclusion not explicitly confirmed; ",
+    "prefer T3 if unsure. ",
+    "T4 = speculative, reflective, or otherwise unverified hypothesis."
+);
+
+pub(crate) const MEMORY_CAPABILITIES_TEXT: &str = concat!(
+    "Available tools: memory_store, memory_retrieve, memory_search, ",
+    "memory_correct, memory_purge, memory_profile, memory_list, ",
+    "memory_capabilities, memory_governance, memory_consolidate, ",
+    "memory_reflect, memory_feedback",
+    "\n\nmemory_store trust_tier guide:",
+    "\n- T1 (Verified): directly stated or explicitly confirmed facts, preferences, or decisions.",
+    "\n- T2 (Curated): corrected or manually curated memory replacing an older record.",
+    "\n- T3 (Inferred): summaries, extracted patterns, or soft conclusions not explicitly confirmed. Prefer T3 if unsure.",
+    "\n- T4 (Unverified): speculative, reflective, or otherwise unverified hypotheses.",
+    "\nUse exact values T1/T2/T3/T4; natural-language labels like 'verified' are invalid."
+);
+
 pub fn list() -> Value {
     json!([
         {
             "name": "memory_store",
-            "description": "Store a new memory",
+            "description": MEMORY_STORE_DESCRIPTION,
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "content": {"type": "string"},
                     "memory_type": {"type": "string", "default": "semantic"},
                     "session_id": {"type": "string"},
-                    "trust_tier": {"type": "string"}
+                    "trust_tier": {
+                        "type": "string",
+                        "enum": ["T1", "T2", "T3", "T4"],
+                        "description": TRUST_TIER_DESCRIPTION
+                    }
                 },
                 "required": ["content"]
             }
         },
         {
             "name": "memory_retrieve",
-            "description": "Retrieve relevant memories for a query",
+            "description": "Retrieve relevant memories for a query, optionally scoped to a session",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "query": {"type": "string"},
                     "top_k": {"type": "integer", "default": 5},
                     "session_id": {"type": "string"},
+                    "session_scope": {"type": "string", "enum": ["prefer", "only"], "description": "How to use session_id: prefer=non-strict retrieval using the provided session_id as context; only=limit results to that session plus unscoped memories"},
                     "explain": {"type": ["boolean", "string"], "default": false, "description": "Explain level: false/\"none\"=off, true/\"basic\"=timing+path, \"verbose\"=+per-candidate scores, \"analyze\"=full"}
                 },
                 "required": ["query"]
@@ -44,12 +142,14 @@ pub fn list() -> Value {
         },
         {
             "name": "memory_search",
-            "description": "Semantic search across all memories",
+            "description": "Semantic search across memories, optionally scoped to a session",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "query": {"type": "string"},
                     "top_k": {"type": "integer", "default": 10},
+                    "session_id": {"type": "string"},
+                    "session_scope": {"type": "string", "enum": ["prefer", "only"], "description": "How to use session_id: prefer=non-strict search using the provided session_id as context; only=limit results to that session plus unscoped memories"},
                     "explain": {"type": ["boolean", "string"], "default": false, "description": "Explain level: false/\"none\"=off, true/\"basic\"=timing+path, \"verbose\"=+per-candidate scores, \"analyze\"=full"}
                 },
                 "required": ["query"]
@@ -64,6 +164,8 @@ pub fn list() -> Value {
                     "memory_id": {"type": "string"},
                     "query": {"type": "string", "description": "Semantic search to find memory to correct"},
                     "new_content": {"type": "string"},
+                    "session_id": {"type": "string", "description": "Optional session to use when resolving query-based correction"},
+                    "session_scope": {"type": "string", "enum": ["prefer", "only"], "description": "Only used with query-based correction. prefer=non-strict lookup using the provided session_id as context; only=restrict lookup to the given session plus unscoped memories"},
                     "reason": {"type": "string"}
                 },
                 "required": ["new_content"]
@@ -71,12 +173,14 @@ pub fn list() -> Value {
         },
         {
             "name": "memory_purge",
-            "description": "Delete memories by ID (single or comma-separated batch) or by topic keyword",
+            "description": "Delete memories by ID, by topic keyword, or by exact session_id with optional memory type filtering",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "memory_id": {"type": "string", "description": "Single ID or comma-separated batch"},
                     "topic": {"type": "string", "description": "Keyword — bulk-delete all matching memories"},
+                    "session_id": {"type": "string", "description": "Exact session identifier — bulk-delete memories from that session"},
+                    "memory_types": {"type": "array", "items": {"type": "string", "enum": ["semantic", "working", "episodic", "profile", "tool_result", "procedural"]}, "description": "Optional memory type filter. Only valid with session_id"},
                     "reason": {"type": "string"}
                 }
             }
@@ -93,11 +197,13 @@ pub fn list() -> Value {
         },
         {
             "name": "memory_list",
-            "description": "List active memories for the user",
+            "description": "List active memories for the user, with optional exact session filtering",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "limit": {"type": "integer", "default": 20}
+                    "limit": {"type": "integer", "default": 20},
+                    "memory_type": {"type": "string"},
+                    "session_id": {"type": "string", "description": "Exact session identifier — only list memories from that session"}
                 }
             }
         },
@@ -155,8 +261,29 @@ pub async fn call(
     user_id: &str,
 ) -> Result<Value> {
     tracing::debug!(tool = name, user_id, "MCP tool call");
-    match name {
-        "memory_store" => {
+    let tool = match name {
+        "memory_store" => ToolCallName::MemoryStore,
+        "memory_retrieve" => ToolCallName::MemoryRetrieve,
+        "memory_search" => ToolCallName::MemorySearch,
+        "memory_correct" => ToolCallName::MemoryCorrect,
+        "memory_purge" => ToolCallName::MemoryPurge,
+        "memory_profile" => ToolCallName::MemoryProfile,
+        "memory_list" => ToolCallName::MemoryList,
+        "memory_capabilities" => ToolCallName::MemoryCapabilities,
+        "memory_governance" => ToolCallName::MemoryGovernance,
+        "memory_rebuild_index" => ToolCallName::MemoryRebuildIndex,
+        "memory_consolidate" => ToolCallName::MemoryConsolidate,
+        "memory_reflect" => ToolCallName::MemoryReflect,
+        "memory_extract_entities" => ToolCallName::MemoryExtractEntities,
+        "memory_link_entities" => ToolCallName::MemoryLinkEntities,
+        "memory_feedback" => ToolCallName::MemoryFeedback,
+        "memory_get_retrieval_params" => ToolCallName::MemoryGetRetrievalParams,
+        "memory_tune_params" => ToolCallName::MemoryTuneParams,
+        "memory_observe" => ToolCallName::MemoryObserve,
+        _ => ToolCallName::Unknown(name.to_string()),
+    };
+    match tool {
+        ToolCallName::MemoryStore => {
             let content = args["content"].as_str().unwrap_or("").to_string();
             let memory_type = args["memory_type"].as_str().unwrap_or("semantic");
             let session_id = args["session_id"].as_str().map(String::from);
@@ -164,8 +291,7 @@ pub async fn call(
                 .as_str()
                 .map(TrustTier::from_str)
                 .transpose()
-                .ok()
-                .flatten();
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
             let mt = memory_type.parse::<MemoryType>().unwrap();
             let m = match service
                 .store_memory(
@@ -174,6 +300,7 @@ pub async fn call(
                     mt,
                     session_id.clone(),
                     trust_tier,
+                    None,
                     None,
                     None,
                 )
@@ -187,7 +314,7 @@ pub async fn call(
             };
 
             // Graph sync: create SEMANTIC node + auto entity extraction (best-effort)
-            if let Some(sql) = &service.sql_store {
+            if let Ok(sql) = user_sql_store(service, user_id).await {
                 let graph = sql.graph_store();
                 let node = memoria_storage::GraphNode {
                     node_id: uuid::Uuid::new_v4().simple().to_string()[..32].to_string(),
@@ -228,9 +355,7 @@ pub async fn call(
                         .iter()
                         .map(|(m, e, s)| (m.as_str(), e.as_str(), *s))
                         .collect();
-                    let _ = graph
-                        .batch_upsert_memory_entity_links(user_id, &refs)
-                        .await;
+                    let _ = graph.batch_upsert_memory_entity_links(user_id, &refs).await;
                 }
             }
 
@@ -240,9 +365,14 @@ pub async fn call(
             )))
         }
 
-        "memory_retrieve" | "memory_search" => {
+        ToolCallName::MemoryRetrieve | ToolCallName::MemorySearch => {
             let query = args["query"].as_str().unwrap_or("").to_string();
-            let top_k = args["top_k"].as_i64().unwrap_or(5);
+            let top_k = if matches!(tool, ToolCallName::MemorySearch) {
+                args["top_k"].as_i64().unwrap_or(10)
+            } else {
+                args["top_k"].as_i64().unwrap_or(5)
+            };
+            let retrieve_options = parse_retrieve_options_arg(&args)?;
             // explain accepts bool or string: true/"basic"/"verbose"/"analyze"
             let explain_str = match &args["explain"] {
                 serde_json::Value::Bool(true) => "basic",
@@ -253,7 +383,13 @@ pub async fn call(
 
             if level != memoria_service::ExplainLevel::None {
                 let (results, stats) = service
-                    .retrieve_explain_level(user_id, &query, top_k, level)
+                    .retrieve_explain_level_with_options(
+                        user_id,
+                        &query,
+                        top_k,
+                        level,
+                        &retrieve_options,
+                    )
                     .await?;
                 if results.is_empty() {
                     let explain_json = serde_json::to_string_pretty(&stats).unwrap_or_default();
@@ -271,7 +407,9 @@ pub async fn call(
                     "{text}\n\n--- explain ---\n{explain_json}"
                 )))
             } else {
-                let results = service.retrieve(user_id, &query, top_k).await?;
+                let results = service
+                    .retrieve_with_options(user_id, &query, top_k, &retrieve_options)
+                    .await?;
                 if results.is_empty() {
                     return Ok(mcp_text("No relevant memories found."));
                 }
@@ -284,7 +422,7 @@ pub async fn call(
             }
         }
 
-        "memory_correct" => {
+        ToolCallName::MemoryCorrect => {
             let new_content = args["new_content"].as_str().unwrap_or("");
             if new_content.is_empty() {
                 return Ok(mcp_text("new_content is required"));
@@ -296,7 +434,10 @@ pub async fn call(
             let old_mid = if !memory_id.is_empty() {
                 memory_id.to_string()
             } else if !query.is_empty() {
-                let results = service.retrieve(user_id, query, 1).await?;
+                let retrieve_options = parse_retrieve_options_arg(&args)?;
+                let results = service
+                    .retrieve_with_options(user_id, query, 1, &retrieve_options)
+                    .await?;
                 match results.into_iter().next() {
                     Some(found) => found.memory_id,
                     None => return Ok(mcp_text("No matching memory found for query")),
@@ -305,26 +446,17 @@ pub async fn call(
                 return Ok(mcp_text("Provide memory_id or query"));
             };
 
-            let m = service.correct(&old_mid, new_content).await?;
+            let m = service.correct(user_id, &old_mid, new_content).await?;
 
-            // Graph sync: deactivate old node, create/update new node
-            if let Some(sql) = &service.sql_store {
-                let graph = sql.graph_store();
-                let _ = graph.deactivate_by_memory_id(&old_mid).await;
-                let _ = graph
-                    .update_content_by_memory_id(&m.memory_id, &m.content)
-                    .await;
-            }
             Ok(mcp_text(&format!(
                 "Corrected memory {}: {}",
                 m.memory_id, m.content
             )))
         }
 
-        "memory_purge" => {
-            let memory_id = args["memory_id"].as_str().unwrap_or("");
-            let topic = args["topic"].as_str().unwrap_or("");
-            if !memory_id.is_empty() {
+        ToolCallName::MemoryPurge => {
+            let purge_args = parse_memory_purge_args(&args)?;
+            if let Some(memory_id) = purge_args.memory_id {
                 // Batch: comma-separated IDs
                 let ids: Vec<&str> = memory_id
                     .split(',')
@@ -332,29 +464,34 @@ pub async fn call(
                     .filter(|s| !s.is_empty())
                     .collect();
                 let result = service.purge_batch(user_id, &ids).await?;
-                for id in &ids {
-                    // Graph sync: deactivate graph node (best-effort)
-                    if let Some(sql) = &service.sql_store {
-                        let _ = sql.graph_store().deactivate_by_memory_id(id).await;
-                    }
-                }
                 Ok(mcp_text(&format_purge_msg(
                     &format!("Purged {} memory(s)", result.purged),
                     &result,
                 )))
-            } else if !topic.is_empty() {
+            } else if let Some(topic) = purge_args.topic {
                 // Bulk by keyword: exact text match then purge
-                let result = service.purge_by_topic(user_id, topic).await?;
+                let result = service.purge_by_topic(user_id, &topic).await?;
                 Ok(mcp_text(&format_purge_msg(
                     &format!("Purged {} memory(s) matching '{topic}'", result.purged),
                     &result,
                 )))
+            } else if let Some(session_id) = purge_args.session_id {
+                let result = service
+                    .purge_by_session_id(user_id, &session_id, purge_args.memory_types.as_deref())
+                    .await?;
+                Ok(mcp_text(&format_purge_msg(
+                    &format!(
+                        "Purged {} memory(s) for session '{session_id}'",
+                        result.purged
+                    ),
+                    &result,
+                )))
             } else {
-                Ok(mcp_text("Provide memory_id or topic"))
+                Ok(mcp_text("Provide memory_id, topic, or session_id"))
             }
         }
 
-        "memory_profile" => {
+        ToolCallName::MemoryProfile => {
             let memories = service.list_active(user_id, 50).await?;
             let profile_mems: Vec<_> = memories
                 .iter()
@@ -371,9 +508,18 @@ pub async fn call(
             Ok(mcp_text(&text))
         }
 
-        "memory_list" => {
+        ToolCallName::MemoryList => {
             let limit = args["limit"].as_i64().unwrap_or(20);
-            let memories = service.list_active(user_id, limit).await?;
+            let memories = service
+                .list_active_filtered(
+                    user_id,
+                    limit,
+                    args.get("memory_type").and_then(Value::as_str),
+                    args.get("session_id").and_then(Value::as_str),
+                    args.get("trust_tier").and_then(Value::as_str),
+                    None,
+                )
+                .await?;
             if memories.is_empty() {
                 return Ok(mcp_text("No memories found."));
             }
@@ -385,19 +531,11 @@ pub async fn call(
             Ok(mcp_text(&text))
         }
 
-        "memory_capabilities" => Ok(mcp_text(
-            "Available tools: memory_store, memory_retrieve, memory_search, \
-             memory_correct, memory_purge, memory_profile, memory_list, \
-             memory_capabilities, memory_governance, memory_consolidate, \
-             memory_reflect, memory_feedback",
-        )),
+        ToolCallName::MemoryCapabilities => Ok(mcp_text(MEMORY_CAPABILITIES_TEXT)),
 
-        "memory_governance" => {
+        ToolCallName::MemoryGovernance => {
             let force = args["force"].as_bool().unwrap_or(false);
-            let sql = match &service.sql_store {
-                Some(s) => s.clone(),
-                None => return Ok(mcp_text("Governance requires SQL store")),
-            };
+            let sql = user_sql_store(service, user_id).await?;
             const COOLDOWN_SECS: i64 = 3600; // 1 hour
             if !force {
                 if let Some(remaining) = sql
@@ -416,41 +554,41 @@ pub async fn call(
             // Audit log for quarantine/cleanup
             if quarantined > 0 {
                 let payload = serde_json::json!({"quarantined": quarantined}).to_string();
-                sql.log_edit(
+                service.send_edit_log(
                     user_id,
                     "governance:quarantine",
                     None,
                     Some(&payload),
                     &format!("quarantined {quarantined}"),
                     None,
-                )
-                .await;
+                );
             }
             if cleaned > 0 {
                 let payload = serde_json::json!({"cleaned_stale": cleaned}).to_string();
-                sql.log_edit(
+                service.send_edit_log(
                     user_id,
                     "governance:cleanup",
                     None,
                     Some(&payload),
                     &format!("cleaned_stale {cleaned}"),
                     None,
-                )
-                .await;
+                );
             }
 
             // Snapshot health
             let snap_health = {
-                let snaps = sqlx::query("SHOW SNAPSHOTS")
-                    .fetch_all(sql.pool())
-                    .await
-                    .unwrap_or_default();
+                let snaps = git_for_store(&sql)
+                    .map(|git| async move { git.list_snapshots().await.unwrap_or_default() });
+                let snaps = match snaps {
+                    Some(fut) => fut.await,
+                    None => Vec::new(),
+                };
                 let total = snaps.len();
                 let auto = snaps
                     .iter()
-                    .filter(|r| {
-                        let name: String = r.try_get("SNAPSHOT_NAME").unwrap_or_default();
-                        name.starts_with("mem_milestone_") || name.starts_with("mem_snap_pre_")
+                    .filter(|snap| {
+                        snap.snapshot_name.starts_with("mem_milestone_")
+                            || snap.snapshot_name.contains("_pre_")
                     })
                     .count();
                 let ratio = if total > 0 {
@@ -469,17 +607,14 @@ pub async fn call(
             )))
         }
 
-        "memory_rebuild_index" => {
+        ToolCallName::MemoryRebuildIndex => {
             let table = args["table"].as_str().unwrap_or("mem_memories");
             if !["mem_memories", "memory_graph_nodes"].contains(&table) {
                 return Ok(mcp_text(&format!(
                     "Invalid table '{table}'. Use mem_memories or memory_graph_nodes"
                 )));
             }
-            let sql = match &service.sql_store {
-                Some(s) => s.clone(),
-                None => return Ok(mcp_text("Rebuild index requires SQL store")),
-            };
+            let sql = user_sql_store(service, user_id).await?;
             let total_rows = sql
                 .rebuild_vector_index(table)
                 .await
@@ -489,12 +624,9 @@ pub async fn call(
             )))
         }
 
-        "memory_consolidate" => {
+        ToolCallName::MemoryConsolidate => {
             let force = args["force"].as_bool().unwrap_or(false);
-            let sql = match &service.sql_store {
-                Some(s) => s.clone(),
-                None => return Ok(mcp_text("Consolidate requires SQL store")),
-            };
+            let sql = user_sql_store(service, user_id).await?;
             const COOLDOWN_SECS: i64 = 1800; // 30 minutes
             if !force {
                 if let Some(remaining) = sql
@@ -528,13 +660,10 @@ pub async fn call(
             Ok(mcp_text(&msg))
         }
 
-        "memory_reflect" => {
+        ToolCallName::MemoryReflect => {
             let force = args["force"].as_bool().unwrap_or(false);
             let mode = args["mode"].as_str().unwrap_or("auto");
-            let sql = match &service.sql_store {
-                Some(s) => s.clone(),
-                None => return Ok(mcp_text("Reflect requires SQL store")),
-            };
+            let sql = user_sql_store(service, user_id).await?;
 
             if mode == "internal" && service.llm.is_none() {
                 return Ok(mcp_text(
@@ -588,16 +717,18 @@ pub async fn call(
             // auto/internal mode: use LLM to synthesize insights
             let llm = service.llm.as_ref().unwrap();
             let mut scenes_created = 0usize;
+            let table = sql.active_table(user_id).await?;
 
             // Get existing high-confidence memories as "existing knowledge"
-            let existing_rows = sqlx::query(
-                "SELECT content FROM mem_memories WHERE user_id = ? AND is_active = 1 \
-                 AND trust_tier IN ('T1','T2') ORDER BY created_at DESC LIMIT 10",
-            )
-            .bind(user_id)
-            .fetch_all(sql.pool())
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let existing_sql = format!(
+                "SELECT content FROM {table} WHERE user_id = ? AND is_active = 1 \
+                 AND trust_tier IN ('T1','T2') ORDER BY created_at DESC LIMIT 10"
+            );
+            let existing_rows = sqlx::query(&existing_sql)
+                .bind(user_id)
+                .fetch_all(sql.pool())
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
             let existing_knowledge = existing_rows
                 .iter()
                 .filter_map(|r| r.try_get::<String, _>("content").ok())
@@ -653,6 +784,7 @@ pub async fn call(
                             Some(TrustTier::from_str("T4").unwrap_or(TrustTier::T4Unverified)),
                             None,
                             None,
+                            None,
                         )
                         .await;
                     scenes_created += 1;
@@ -667,12 +799,9 @@ pub async fn call(
             )))
         }
 
-        "memory_extract_entities" => {
+        ToolCallName::MemoryExtractEntities => {
             let mode = args["mode"].as_str().unwrap_or("auto");
-            let sql = match &service.sql_store {
-                Some(s) => s.clone(),
-                None => return Ok(mcp_text("Extract entities requires SQL store")),
-            };
+            let sql = user_sql_store(service, user_id).await?;
 
             if mode == "internal" && service.llm.is_none() {
                 return Ok(mcp_text(
@@ -740,9 +869,7 @@ pub async fn call(
                                 .iter()
                                 .map(|(m, e, s)| (m.as_str(), e.as_str(), *s))
                                 .collect();
-                            let _ = graph
-                                .batch_upsert_memory_entity_links(user_id, &refs)
-                                .await;
+                            let _ = graph.batch_upsert_memory_entity_links(user_id, &refs).await;
                         }
                     }
 
@@ -775,12 +902,9 @@ pub async fn call(
             }))?))
         }
 
-        "memory_link_entities" => {
+        ToolCallName::MemoryLinkEntities => {
             let entities_str = args["entities"].as_str().unwrap_or("");
-            let sql = match &service.sql_store {
-                Some(s) => s.clone(),
-                None => return Ok(mcp_text("Link entities requires SQL store")),
-            };
+            let sql = user_sql_store(service, user_id).await?;
 
             let parsed: Vec<serde_json::Value> = match serde_json::from_str(entities_str) {
                 Ok(v) => v,
@@ -852,7 +976,7 @@ pub async fn call(
             }))?))
         }
 
-        "memory_feedback" => {
+        ToolCallName::MemoryFeedback => {
             let memory_id = args["memory_id"]
                 .as_str()
                 .ok_or_else(|| anyhow::anyhow!("memory_id is required"))?;
@@ -871,22 +995,16 @@ pub async fn call(
             )))
         }
 
-        "memory_get_retrieval_params" => {
-            let sql = service
-                .sql_store
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("SQL store not available"))?;
+        ToolCallName::MemoryGetRetrievalParams => {
+            let sql = user_sql_store(service, user_id).await?;
             let params = sql.get_user_retrieval_params(user_id).await?;
             Ok(mcp_text(&serde_json::to_string_pretty(&params)?))
         }
 
-        "memory_tune_params" => {
+        ToolCallName::MemoryTuneParams => {
             use memoria_service::scoring::{DefaultScoringPlugin, ScoringPlugin};
 
-            let sql = service
-                .sql_store
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("SQL store not available"))?;
+            let sql = user_sql_store(service, user_id).await?;
 
             let old_params = sql.get_user_retrieval_params(user_id).await?;
             let plugin = DefaultScoringPlugin;
@@ -903,7 +1021,7 @@ pub async fn call(
             }
         }
 
-        "memory_observe" => {
+        ToolCallName::MemoryObserve => {
             let messages = args["messages"].as_array().cloned().unwrap_or_default();
             let session_id = args["session_id"].as_str().map(String::from);
 
@@ -912,9 +1030,12 @@ pub async fn call(
                 .await?;
 
             // Graph sync (best-effort) for each stored memory
+            let graph = user_sql_store(service, user_id)
+                .await
+                .ok()
+                .map(|sql| sql.graph_store());
             for m in &memories {
-                if let Some(sql) = &service.sql_store {
-                    let graph = sql.graph_store();
+                if let Some(graph) = graph.as_ref() {
                     let node = memoria_storage::GraphNode {
                         node_id: Uuid::new_v4().simple().to_string()[..32].to_string(),
                         user_id: user_id.to_string(),
@@ -952,9 +1073,7 @@ pub async fn call(
                             .iter()
                             .map(|(m, e, s)| (m.as_str(), e.as_str(), *s))
                             .collect();
-                        let _ = graph
-                            .batch_upsert_memory_entity_links(user_id, &refs)
-                            .await;
+                        let _ = graph.batch_upsert_memory_entity_links(user_id, &refs).await;
                     }
                 }
             }
@@ -978,8 +1097,17 @@ pub async fn call(
             Ok(mcp_text(&serde_json::to_string_pretty(&result)?))
         }
 
-        _ => Err(anyhow::anyhow!("Unknown tool: {name}")),
+        ToolCallName::Unknown(name) => Err(anyhow::anyhow!("Unknown tool: {name}")),
     }
+}
+
+pub async fn call_owned(
+    name: String,
+    args: Value,
+    service: Arc<MemoryService>,
+    user_id: String,
+) -> Result<Value> {
+    call(&name, args, &service, &user_id).await
 }
 
 fn mcp_text(text: &str) -> Value {

@@ -74,7 +74,7 @@ impl MemoryPipeline {
                 }
             };
             validated.push(Memory {
-                memory_id: Uuid::new_v4().simple().to_string(),
+                memory_id: Uuid::now_v7().simple().to_string(),
                 user_id: user_id.to_string(),
                 memory_type: mtype,
                 content,
@@ -94,6 +94,7 @@ impl MemoryPipeline {
                 extra_metadata: None,
                 trust_tier: tier.unwrap_or_default(),
                 retrieval_score: None,
+                author_id: None,
             });
         }
 
@@ -112,7 +113,14 @@ impl MemoryPipeline {
         }
 
         // Phase 3: Persist
-        if let Some(sql) = &self.service.sql_store {
+        if self.service.sql_store.is_some() {
+            let sql = match self.service.user_sql_store(user_id).await {
+                Ok(sql) => sql,
+                Err(e) => {
+                    result.errors.push(e.to_string());
+                    return result;
+                }
+            };
             let table = match sql.active_table(user_id).await {
                 Ok(t) => t,
                 Err(e) => {

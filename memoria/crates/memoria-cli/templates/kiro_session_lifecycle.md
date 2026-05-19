@@ -45,7 +45,7 @@ When the conversation is winding down (user says thanks, goodbye, or stops engag
 ### 1. Clean up working memories
 
 ```
-memory_purge(topic="<task keyword>", reason="session complete")
+memory_purge(session_id="<session_id>", memory_types=["working"], reason="session complete")
 ```
 
 Only purge working memories for tasks that are actually done. Leave active task working memories for next session.

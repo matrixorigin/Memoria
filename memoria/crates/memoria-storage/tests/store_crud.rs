@@ -54,6 +54,7 @@ fn make_memory(id: &str, content: &str, user_id: &str) -> Memory {
         extra_metadata: None,
         trust_tier: TrustTier::T3Inferred,
         retrieval_score: None,
+        author_id: None,
     }
 }
 
@@ -182,7 +183,7 @@ async fn test_search_vector() {
     m1.embedding = Some(dim_vec(0, 1.0));
     let mut m2 = make_memory(&format!("vec-2-{uid}"), "far from query", &uid);
     m2.embedding = Some(dim_vec(1, 1.0));
-    
+
     store.insert(&m1).await.unwrap();
     store.insert(&m2).await.unwrap();
 
@@ -191,10 +192,209 @@ async fn test_search_vector() {
         .search_vector(&uid, &query, 2)
         .await
         .expect("vector search");
-    
+
     assert!(!results.is_empty(), "Expected vector search results");
     assert!(results[0].memory_id.contains("vec-1"));
     println!("✅ search_vector: nearest={}", results[0].memory_id);
+}
+
+#[tokio::test]
+async fn test_search_vector_sets_retrieval_score() {
+    let (store, uid) = setup().await;
+
+    sqlx::query("DELETE FROM mem_memories WHERE user_id = ?")
+        .bind(&uid)
+        .execute(store.pool())
+        .await
+        .unwrap();
+
+    let mut near = make_memory(&format!("vec-score-1-{uid}"), "near query", &uid);
+    near.embedding = Some(dim_vec(0, 1.0));
+    let mut far = make_memory(&format!("vec-score-2-{uid}"), "far query", &uid);
+    far.embedding = Some(dim_vec(1, 1.0));
+
+    store.insert(&near).await.unwrap();
+    store.insert(&far).await.unwrap();
+
+    let results = store
+        .search_vector(&uid, &dim_vec(0, 1.0), 2)
+        .await
+        .expect("vector search");
+
+    assert!(!results.is_empty(), "Expected vector search results");
+    let top_score = results[0]
+        .retrieval_score
+        .expect("vector search should propagate similarity score");
+    assert!(
+        top_score > 0.0,
+        "retrieval_score should reflect vector similarity, got {top_score}"
+    );
+    println!("✅ search_vector_sets_retrieval_score: top_score={top_score:.4}");
+}
+
+#[tokio::test]
+async fn test_search_vector_from_filtered_scoped_prefilters_by_session() {
+    let (store, uid) = setup().await;
+
+    sqlx::query("DELETE FROM mem_memories WHERE user_id = ?")
+        .bind(&uid)
+        .execute(store.pool())
+        .await
+        .unwrap();
+
+    let mk_vec = |x: f32, y: f32, z: f32| {
+        let mut v = vec![0.0; test_dim()];
+        v[0] = x;
+        v[1] = y;
+        v[2] = z;
+        v
+    };
+
+    let mut target = make_memory(&format!("vec-scope-1-{uid}"), "target session", &uid);
+    target.session_id = Some("sess-target".to_string());
+    target.embedding = Some(mk_vec(0.0, 1.0, 0.0));
+
+    let mut other = make_memory(&format!("vec-scope-2-{uid}"), "other session", &uid);
+    other.session_id = Some("sess-other".to_string());
+    other.embedding = Some(mk_vec(1.0, 0.0, 0.0));
+
+    let mut global_mem = make_memory(&format!("vec-scope-3-{uid}"), "global session", &uid);
+    global_mem.session_id = None;
+    global_mem.embedding = Some(mk_vec(0.7, 0.0, 0.7));
+
+    store.insert(&target).await.unwrap();
+    store.insert(&other).await.unwrap();
+    store.insert(&global_mem).await.unwrap();
+
+    let global_results = store
+        .search_vector_from_filtered_scoped("mem_memories", &uid, &mk_vec(1.0, 0.0, 0.0), 1, None, None)
+        .await
+        .expect("global vector search");
+    assert_eq!(
+        global_results.first().map(|m| m.memory_id.as_str()),
+        Some(other.memory_id.as_str()),
+        "global search should return the nearest cross-session memory",
+    );
+
+    let scoped = store
+        .search_vector_from_filtered_scoped(
+            "mem_memories",
+            &uid,
+            &mk_vec(1.0, 0.0, 0.0),
+            1,
+            None,
+            Some("sess-target"),
+        )
+        .await
+        .expect("session-scoped vector search");
+    assert_eq!(
+        scoped.len(),
+        1,
+        "strict session search should still return a candidate"
+    );
+    assert_eq!(
+        scoped.first().map(|m| m.memory_id.as_str()),
+        Some(global_mem.memory_id.as_str()),
+        "strict session search should rank within the target-session plus unscoped candidate set",
+    );
+}
+
+#[tokio::test]
+async fn test_search_vector_from_filtered_scoped_fills_limit_with_session_candidates() {
+    let (store, uid) = setup().await;
+
+    let mk_vec = |x: f32, y: f32, z: f32| {
+        let mut v = vec![0.0; test_dim()];
+        v[0] = x;
+        v[1] = y;
+        v[2] = z;
+        v
+    };
+
+    let mut target_a = make_memory(&format!("vec-scope-fill-1-{uid}"), "scoped a", &uid);
+    target_a.session_id = Some("sess-target".to_string());
+    target_a.embedding = Some(mk_vec(0.95, 0.2, 0.0));
+
+    let mut target_b = make_memory(&format!("vec-scope-fill-2-{uid}"), "scoped b", &uid);
+    target_b.session_id = Some("sess-target".to_string());
+    target_b.embedding = Some(mk_vec(0.7, 0.7, 0.0));
+
+    let mut other_a = make_memory(&format!("vec-scope-fill-3-{uid}"), "global a", &uid);
+    other_a.session_id = Some("sess-other".to_string());
+    other_a.embedding = Some(mk_vec(0.0, 1.0, 0.0));
+
+    let mut other_b = make_memory(&format!("vec-scope-fill-4-{uid}"), "global b", &uid);
+    other_b.session_id = Some("sess-other".to_string());
+    other_b.embedding = Some(mk_vec(0.0, 0.0, 1.0));
+
+    let mut global = make_memory(&format!("vec-scope-fill-5-{uid}"), "unscoped shared", &uid);
+    global.session_id = None;
+    global.embedding = Some(mk_vec(0.6, 0.0, 0.8));
+
+    store.insert(&target_a).await.unwrap();
+    store.insert(&target_b).await.unwrap();
+    store.insert(&other_a).await.unwrap();
+    store.insert(&other_b).await.unwrap();
+    store.insert(&global).await.unwrap();
+
+    let scoped = store
+        .search_vector_from_filtered_scoped(
+            "mem_memories",
+            &uid,
+            &mk_vec(1.0, 0.0, 0.0),
+            3,
+            None,
+            Some("sess-target"),
+        )
+        .await
+        .expect("session-scoped vector search");
+    assert_eq!(
+        scoped.len(),
+        3,
+        "strict session search should fill top_k from the target-session plus unscoped candidate set",
+    );
+    let scoped_ids: std::collections::HashSet<&str> =
+        scoped.iter().map(|m| m.memory_id.as_str()).collect();
+    assert_eq!(
+        scoped_ids,
+        std::collections::HashSet::from([
+            target_a.memory_id.as_str(),
+            target_b.memory_id.as_str(),
+            global.memory_id.as_str(),
+        ]),
+        "strict session vector search should return session-local plus unscoped candidates",
+    );
+}
+
+#[tokio::test]
+async fn test_search_hybrid_access_count_stays_tiebreaker() {
+    let (store, uid) = setup().await;
+
+    let mut relevant = make_memory(&format!("hybrid-relevant-{uid}"), "fresh relevant", &uid);
+    relevant.embedding = Some(dim_vec(0, 1.0));
+
+    let mut popular = make_memory(&format!("hybrid-popular-{uid}"), "stale popular", &uid);
+    popular.embedding = Some(dim_vec(0, 0.8));
+
+    store.insert(&relevant).await.unwrap();
+    store.insert(&popular).await.unwrap();
+
+    sqlx::query("INSERT INTO mem_memories_stats (memory_id, access_count) VALUES (?, 40)")
+        .bind(&popular.memory_id)
+        .execute(store.pool())
+        .await
+        .unwrap();
+
+    let (results, _) = store
+        .search_hybrid_from_scored("mem_memories", &uid, &dim_vec(0, 1.0), "zzzzzz", 2, 0.0)
+        .await
+        .expect("hybrid search");
+
+    assert_eq!(
+        results.first().map(|m| m.memory_id.as_str()),
+        Some(relevant.memory_id.as_str()),
+        "access_count should not outrank the stronger semantic match"
+    );
 }
 
 // ── Field round-trip: every column written and read back ─────────────────────
@@ -227,6 +427,7 @@ async fn test_all_fields_round_trip() {
         extra_metadata: Some(meta),
         trust_tier: TrustTier::T1Verified,
         retrieval_score: None,
+        author_id: None,
     };
     store.insert(&m).await.expect("insert");
 
@@ -333,6 +534,7 @@ async fn test_null_optional_fields() {
         extra_metadata: None, // NULL JSON
         trust_tier: TrustTier::T3Inferred,
         retrieval_score: None,
+        author_id: None,
     };
     store.insert(&m).await.expect("insert with nulls");
 
@@ -369,7 +571,10 @@ async fn test_insert_entity_links_batch() {
         ("MatrixOne".to_string(), "tech".to_string()),
         ("Memoria".to_string(), "project".to_string()),
     ];
-    let (created, reused) = store.insert_entity_links(&uid, &mid, &entities).await.unwrap();
+    let (created, reused) = store
+        .insert_entity_links(&uid, &mid, &entities)
+        .await
+        .unwrap();
     assert_eq!(created, 3);
     assert_eq!(reused, 0);
 
@@ -377,7 +582,10 @@ async fn test_insert_entity_links_batch() {
     let rows = sqlx::query("SELECT entity_name FROM mem_entity_links WHERE user_id = ? AND memory_id = ? ORDER BY entity_name")
         .bind(&uid).bind(&mid)
         .fetch_all(store.pool()).await.unwrap();
-    let names: Vec<String> = rows.iter().map(|r| sqlx::Row::get::<String, _>(r, "entity_name")).collect();
+    let names: Vec<String> = rows
+        .iter()
+        .map(|r| sqlx::Row::get::<String, _>(r, "entity_name"))
+        .collect();
     assert_eq!(names, vec!["matrixone", "memoria", "rust"]);
     println!("✅ insert_entity_links: batch of 3 inserted in single statement");
 }
@@ -390,21 +598,32 @@ async fn test_insert_entity_links_dedup_existing() {
         ("Rust".to_string(), "tech".to_string()),
         ("Go".to_string(), "tech".to_string()),
     ];
-    let (created, _) = store.insert_entity_links(&uid, &mid, &entities).await.unwrap();
+    let (created, _) = store
+        .insert_entity_links(&uid, &mid, &entities)
+        .await
+        .unwrap();
     assert_eq!(created, 2);
 
     // Insert again with overlap + new
     let entities2 = vec![
         ("Rust".to_string(), "tech".to_string()),   // existing
-        ("Python".to_string(), "tech".to_string()),  // new
+        ("Python".to_string(), "tech".to_string()), // new
     ];
-    let (created2, reused2) = store.insert_entity_links(&uid, &mid, &entities2).await.unwrap();
+    let (created2, reused2) = store
+        .insert_entity_links(&uid, &mid, &entities2)
+        .await
+        .unwrap();
     assert_eq!(created2, 1, "only Python should be new");
     assert_eq!(reused2, 1, "Rust should be reused");
 
-    let rows = sqlx::query("SELECT COUNT(*) as cnt FROM mem_entity_links WHERE user_id = ? AND memory_id = ?")
-        .bind(&uid).bind(&mid)
-        .fetch_one(store.pool()).await.unwrap();
+    let rows = sqlx::query(
+        "SELECT COUNT(*) as cnt FROM mem_entity_links WHERE user_id = ? AND memory_id = ?",
+    )
+    .bind(&uid)
+    .bind(&mid)
+    .fetch_one(store.pool())
+    .await
+    .unwrap();
     let cnt: i64 = sqlx::Row::get(&rows, "cnt");
     assert_eq!(cnt, 3, "total should be 3 (rust, go, python)");
     println!("✅ insert_entity_links: dedup existing entities correctly");
@@ -420,7 +639,10 @@ async fn test_insert_entity_links_dedup_within_batch() {
         ("rust".to_string(), "tech".to_string()),
         ("RUST".to_string(), "tech".to_string()),
     ];
-    let (created, reused) = store.insert_entity_links(&uid, &mid, &entities).await.unwrap();
+    let (created, reused) = store
+        .insert_entity_links(&uid, &mid, &entities)
+        .await
+        .unwrap();
     assert_eq!(created, 1, "only one 'rust' should be inserted");
     assert_eq!(reused, 2, "two duplicates within batch");
     println!("✅ insert_entity_links: dedup within batch (case-insensitive)");
@@ -431,12 +653,19 @@ async fn test_insert_entity_links_case_insensitive() {
     let (store, uid) = setup().await;
     let mid = Uuid::new_v4().simple().to_string();
     let entities = vec![("MatrixOne".to_string(), "tech".to_string())];
-    store.insert_entity_links(&uid, &mid, &entities).await.unwrap();
+    store
+        .insert_entity_links(&uid, &mid, &entities)
+        .await
+        .unwrap();
 
     // Query back — should be lowercased
-    let rows = sqlx::query("SELECT entity_name FROM mem_entity_links WHERE user_id = ? AND memory_id = ?")
-        .bind(&uid).bind(&mid)
-        .fetch_all(store.pool()).await.unwrap();
+    let rows =
+        sqlx::query("SELECT entity_name FROM mem_entity_links WHERE user_id = ? AND memory_id = ?")
+            .bind(&uid)
+            .bind(&mid)
+            .fetch_all(store.pool())
+            .await
+            .unwrap();
     let name: String = sqlx::Row::get(&rows[0], "entity_name");
     assert_eq!(name, "matrixone", "entity name should be lowercased");
     println!("✅ insert_entity_links: names stored as lowercase");
@@ -450,14 +679,88 @@ async fn test_insert_entity_links_large_batch_chunking() {
     let entities: Vec<(String, String)> = (0..120)
         .map(|i| (format!("entity_{i}"), "concept".to_string()))
         .collect();
-    let (created, reused) = store.insert_entity_links(&uid, &mid, &entities).await.unwrap();
+    let (created, reused) = store
+        .insert_entity_links(&uid, &mid, &entities)
+        .await
+        .unwrap();
     assert_eq!(created, 120);
     assert_eq!(reused, 0);
 
-    let rows = sqlx::query("SELECT COUNT(*) as cnt FROM mem_entity_links WHERE user_id = ? AND memory_id = ?")
-        .bind(&uid).bind(&mid)
-        .fetch_one(store.pool()).await.unwrap();
+    let rows = sqlx::query(
+        "SELECT COUNT(*) as cnt FROM mem_entity_links WHERE user_id = ? AND memory_id = ?",
+    )
+    .bind(&uid)
+    .bind(&mid)
+    .fetch_one(store.pool())
+    .await
+    .unwrap();
     let cnt: i64 = sqlx::Row::get(&rows, "cnt");
     assert_eq!(cnt, 120);
     println!("✅ insert_entity_links: 120 entities chunked correctly");
+}
+
+#[tokio::test]
+async fn test_list_active_lite() {
+    let (store, uid) = setup().await;
+    // Insert 3 memories with embeddings
+    for i in 0..3 {
+        let m = make_memory(
+            &format!("lite-{i}-{uid}"),
+            &format!("lite memory {i}"),
+            &uid,
+        );
+        store.insert(&m).await.expect("insert");
+    }
+    store
+        .soft_delete(&format!("lite-1-{uid}"))
+        .await
+        .expect("soft_delete");
+
+    let results = store
+        .list_active_lite("mem_memories", &uid, 10, None, None, None, None)
+        .await
+        .expect("list_active_lite");
+    assert_eq!(results.len(), 2, "should exclude soft-deleted");
+    // lite results must NOT carry embedding or source_event_ids
+    for m in &results {
+        assert!(m.embedding.is_none(), "lite should skip embedding");
+        assert!(
+            m.source_event_ids.is_empty(),
+            "lite should skip source_event_ids"
+        );
+        assert!(
+            m.extra_metadata.is_none(),
+            "lite should skip extra_metadata"
+        );
+        assert!(!m.content.is_empty(), "content must be present");
+    }
+    // Verify ordering: newest first
+    assert!(results[0].created_at >= results[1].created_at);
+    println!(
+        "✅ list_active_lite: {} results, no embedding",
+        results.len()
+    );
+}
+
+#[tokio::test]
+async fn test_list_active_lite_limit_cap() {
+    let (store, uid) = setup().await;
+    for i in 0..5 {
+        let m = make_memory(&format!("cap-{i}-{uid}"), &format!("cap memory {i}"), &uid);
+        store.insert(&m).await.expect("insert");
+    }
+    // Request limit=2, should only get 2
+    let results = store
+        .list_active_lite("mem_memories", &uid, 2, None, None, None, None)
+        .await
+        .expect("list_active_lite");
+    assert_eq!(results.len(), 2, "should respect limit");
+
+    // Request absurdly large limit — capped at 500 internally
+    let results = store
+        .list_active_lite("mem_memories", &uid, 999999, None, None, None, None)
+        .await
+        .expect("list_active_lite");
+    assert!(results.len() <= 501, "should cap at 501");
+    println!("✅ list_active_lite_limit_cap");
 }

@@ -78,14 +78,14 @@ if (!fs.existsSync(configFile)) {
 }
 
 const config = JSON.parse(fs.readFileSync(configFile, "utf8"));
-const pluginEntry = config?.plugins?.entries?.["memory-memoria"];
+const pluginEntry = config?.plugins?.entries?.["thememoria"];
 if (!pluginEntry || pluginEntry.enabled !== true) {
-  throw new Error("plugins.entries.memory-memoria is not enabled");
+  throw new Error("plugins.entries.thememoria is not enabled");
 }
 
 const pluginConfig = pluginEntry.config ?? {};
 if (pluginConfig.memoriaExecutable == null) {
-  throw new Error("plugins.entries.memory-memoria.config.memoriaExecutable is missing");
+  throw new Error("plugins.entries.thememoria.config.memoriaExecutable is missing");
 }
 
 const resolvedMemoriaBin = pluginConfig.memoriaExecutable || memoriaBin;

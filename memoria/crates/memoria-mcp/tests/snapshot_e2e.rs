@@ -4,13 +4,14 @@
 /// IMPORTANT: These tests MUST run serially because:
 /// - MO#23860: concurrent DELETE + INSERT FROM SNAPSHOT causes w-w conflict
 /// - MO#23861: concurrent snapshot restore loses FULLTEXT INDEX secondary tables
+mod support;
+
 use memoria_git::GitForDataService;
 use memoria_service::MemoryService;
-use memoria_storage::SqlMemoryStore;
 use serde_json::{json, Value};
 use serial_test::serial;
-use sqlx::mysql::MySqlPool;
 use std::sync::Arc;
+use tokio::sync::Barrier;
 use uuid::Uuid;
 
 fn test_dim() -> usize {
@@ -18,11 +19,6 @@ fn test_dim() -> usize {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(1024)
-}
-
-fn db_url() -> String {
-    std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "mysql://root:111@localhost:6001/memoria".to_string())
 }
 
 fn uid() -> String {
@@ -52,16 +48,94 @@ fn sanitize_name(name: &str) -> String {
     clean
 }
 
-async fn setup() -> (Arc<MemoryService>, Arc<GitForDataService>, String) {
-    let pool = MySqlPool::connect(&db_url()).await.expect("pool");
-    let db_name = db_url().rsplit('/').next().unwrap_or("memoria").to_string();
-    let store = SqlMemoryStore::connect(&db_url(), test_dim(), uuid::Uuid::new_v4().to_string())
-        .await
-        .expect("store");
-    store.migrate().await.expect("migrate");
-    let git = Arc::new(GitForDataService::new(pool, &db_name));
-    let svc = Arc::new(MemoryService::new_sql_with_llm(Arc::new(store), None, None));
-    (svc, git, uid())
+fn sanitize_snapshot_scope(scope: &str) -> String {
+    compact_identifier_fragment(scope, 11)
+}
+
+fn sanitize_identifier_fragment(value: &str) -> String {
+    let sanitized = value
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('_')
+        .to_string();
+    if sanitized.is_empty() {
+        "db".to_string()
+    } else {
+        sanitized
+    }
+}
+
+fn compact_identifier_fragment(value: &str, max_len: usize) -> String {
+    let sanitized = sanitize_identifier_fragment(value);
+    if sanitized.len() <= max_len {
+        return sanitized;
+    }
+    if max_len <= 4 {
+        return sanitized.chars().take(max_len).collect();
+    }
+    let head_len = (max_len - 1) / 2;
+    let tail_len = max_len - head_len - 1;
+    let head: String = sanitized.chars().take(head_len).collect();
+    let tail_chars: Vec<char> = sanitized.chars().collect();
+    let tail: String = tail_chars[tail_chars.len().saturating_sub(tail_len)..]
+        .iter()
+        .collect();
+    format!("{head}_{tail}")
+}
+
+/// Mirror of git_tools::snap_internal so white-box assertions follow scoped names.
+fn internal_snapshot_name(db_name: &str, name: &str) -> String {
+    const SNAP_PREFIX: &str = "mem_snap_";
+    const MILESTONE_PREFIX: &str = "mem_milestone_";
+
+    if name.starts_with(SNAP_PREFIX) || name.starts_with(MILESTONE_PREFIX) {
+        name.to_string()
+    } else {
+        let scope = sanitize_snapshot_scope(db_name);
+        format!(
+            "{SNAP_PREFIX}{}_{scope}_{}",
+            scope.len(),
+            sanitize_name(name)
+        )
+    }
+}
+
+async fn setup() -> (
+    Arc<MemoryService>,
+    Arc<GitForDataService>,
+    String,
+    String,
+    support::multi_db::McpTestContext,
+) {
+    let ctx = support::multi_db::setup_mcp_context("snapshot_e2e", test_dim(), None, None).await;
+    let uid = uid();
+    let db_name = ctx.user_db_name(&uid).await;
+    (ctx.service(), ctx.git(), uid, db_name, ctx)
+}
+
+async fn setup_multi_db() -> (
+    Arc<MemoryService>,
+    String,
+    String,
+    String,
+    String,
+    Arc<GitForDataService>,
+    support::multi_db::McpTestContext,
+) {
+    let ctx =
+        support::multi_db::setup_mcp_context("snapshot_e2e_multi", test_dim(), None, None).await;
+    let user_a = uid();
+    let user_b = uid();
+    let db_a = ctx.user_db_name(&user_a).await;
+    let db_b = ctx.user_db_name(&user_b).await;
+    (ctx.service(), user_a, user_b, db_a, db_b, ctx.git(), ctx)
 }
 
 async fn git_call(
@@ -82,6 +156,14 @@ async fn store(content: &str, svc: &Arc<MemoryService>, uid: &str) {
         .expect("store");
 }
 
+async fn git_for_user(svc: &Arc<MemoryService>, uid: &str) -> GitForDataService {
+    let sql = svc.user_sql_store(uid).await.expect("user sql store");
+    GitForDataService::new(
+        sql.pool().clone(),
+        sql.database_name().expect("user db name").to_string(),
+    )
+}
+
 fn text(v: &Value) -> &str {
     v["content"][0]["text"].as_str().unwrap_or("")
 }
@@ -91,7 +173,7 @@ fn text(v: &Value) -> &str {
 #[tokio::test]
 #[serial]
 async fn test_snapshot_rollback_restores_state() {
-    let (svc, git, uid) = setup().await;
+    let (svc, git, uid, db_name, _ctx) = setup().await;
     let snap_name = snap("basic");
 
     // Store 2 memories
@@ -159,7 +241,7 @@ async fn test_snapshot_rollback_restores_state() {
 #[tokio::test]
 #[serial]
 async fn test_rollback_nonexistent_snapshot_errors() {
-    let (svc, git, uid) = setup().await;
+    let (svc, git, uid, db_name, _ctx) = setup().await;
     let result = memoria_mcp::git_tools::call(
         "memory_rollback",
         json!({"name": "does_not_exist_xyz"}),
@@ -177,7 +259,7 @@ async fn test_rollback_nonexistent_snapshot_errors() {
 #[tokio::test]
 #[serial]
 async fn test_multiple_snapshots_rollback_to_earlier() {
-    let (svc, git, uid) = setup().await;
+    let (svc, git, uid, db_name, _ctx) = setup().await;
     let snap1 = snap("v1");
     let snap2 = snap("v2");
 
@@ -212,7 +294,7 @@ async fn test_multiple_snapshots_rollback_to_earlier() {
 #[tokio::test]
 #[serial]
 async fn test_snapshots_pagination() {
-    let (svc, git, uid) = setup().await;
+    let (svc, git, uid, db_name, _ctx) = setup().await;
     let names: Vec<String> = (0..5).map(|i| snap(&format!("pg{i}"))).collect();
 
     for n in &names {
@@ -262,7 +344,7 @@ async fn test_snapshots_pagination() {
 #[tokio::test]
 #[serial]
 async fn test_snapshot_delete_by_prefix() {
-    let (svc, git, uid) = setup().await;
+    let (svc, git, uid, db_name, _ctx) = setup().await;
     let prefix = format!("pre_{}", &uid[5..]);
     let s1 = format!("{prefix}_a");
     let s2 = format!("{prefix}_b");
@@ -289,10 +371,11 @@ async fn test_snapshot_delete_by_prefix() {
     println!("✅ delete by prefix: {}", text(&r));
 
     // keeper should still exist (check by internal name)
-    let snaps = git.list_snapshots().await.unwrap();
-    let keeper_internal = format!("mem_snap_{}", keeper);
-    let s1_internal = format!("mem_snap_{}", sanitize_name(&s1));
-    let s2_internal = format!("mem_snap_{}", sanitize_name(&s2));
+    let user_git = git_for_user(&svc, &uid).await;
+    let snaps = user_git.list_snapshots().await.unwrap();
+    let keeper_internal = internal_snapshot_name(&db_name, &keeper);
+    let s1_internal = internal_snapshot_name(&db_name, &s1);
+    let s2_internal = internal_snapshot_name(&db_name, &s2);
     assert!(
         snaps.iter().any(|s| s.snapshot_name == keeper_internal),
         "keeper should survive"
@@ -322,7 +405,7 @@ async fn test_snapshot_delete_by_prefix() {
 #[tokio::test]
 #[serial]
 async fn test_snapshot_delete_batch_names() {
-    let (svc, git, uid) = setup().await;
+    let (svc, git, uid, db_name, _ctx) = setup().await;
     let s1 = snap("b1");
     let s2 = snap("b2");
     let s3 = snap("b3");
@@ -346,10 +429,11 @@ async fn test_snapshot_delete_batch_names() {
         text(&r)
     );
 
-    let snaps = git.list_snapshots().await.unwrap();
-    let s1i = format!("mem_snap_{s1}");
-    let s2i = format!("mem_snap_{s2}");
-    let s3i = format!("mem_snap_{s3}");
+    let user_git = git_for_user(&svc, &uid).await;
+    let snaps = user_git.list_snapshots().await.unwrap();
+    let s1i = internal_snapshot_name(&db_name, &s1);
+    let s2i = internal_snapshot_name(&db_name, &s2);
+    let s3i = internal_snapshot_name(&db_name, &s3);
     assert!(!snaps.iter().any(|s| s.snapshot_name == s1i));
     assert!(
         snaps.iter().any(|s| s.snapshot_name == s2i),
@@ -373,7 +457,7 @@ async fn test_snapshot_delete_batch_names() {
 #[tokio::test]
 #[serial]
 async fn test_snapshot_and_branch_independent() {
-    let (svc, git, uid) = setup().await;
+    let (svc, git, uid, db_name, _ctx) = setup().await;
     let snap_name = snap("pre_branch");
     let branch = format!("br_{}", &uid[5..]);
 
@@ -441,15 +525,15 @@ async fn test_snapshot_and_branch_independent() {
     .await;
 }
 
-// ── 8. Duplicate snapshot name is rejected ───────────────────────────────────
+// ── 8. Duplicate snapshot name is handled without creating a second snapshot ─
 
 #[tokio::test]
 #[serial]
 async fn test_duplicate_snapshot_name_rejected() {
-    let (svc, git, uid) = setup().await;
+    let (svc, git, uid, db_name, _ctx) = setup().await;
     let snap_name = snap("dup");
 
-    git_call(
+    let first = git_call(
         "memory_snapshot",
         json!({"name": snap_name}),
         &git,
@@ -457,9 +541,10 @@ async fn test_duplicate_snapshot_name_rejected() {
         &uid,
     )
     .await;
+    assert!(text(&first).contains("created"), "got: {}", text(&first));
 
-    // Second create with same name should error
-    let result = memoria_mcp::git_tools::call(
+    // Second create with same name should return an explicit duplicate message
+    let second = git_call(
         "memory_snapshot",
         json!({"name": snap_name}),
         &git,
@@ -467,8 +552,20 @@ async fn test_duplicate_snapshot_name_rejected() {
         &uid,
     )
     .await;
-    assert!(result.is_err(), "duplicate snapshot should fail");
-    println!("✅ duplicate snapshot rejected: {:?}", result.unwrap_err());
+    assert!(
+        text(&second).contains("already exists"),
+        "got: {}",
+        text(&second)
+    );
+
+    let sql = svc.user_sql_store(&uid).await.unwrap();
+    let regs = sql.list_snapshot_registrations(&uid).await.unwrap();
+    let count = regs.iter().filter(|reg| reg.name == snap_name).count();
+    assert_eq!(count, 1, "duplicate create should not register twice");
+    println!(
+        "✅ duplicate snapshot rejected without 500: {}",
+        text(&second)
+    );
 
     git_call(
         "memory_snapshot_delete",
@@ -480,12 +577,145 @@ async fn test_duplicate_snapshot_name_rejected() {
     .await;
 }
 
+#[tokio::test]
+#[serial]
+async fn test_concurrent_duplicate_snapshot_name_is_coalesced() {
+    let (svc, git, uid, db_name, _ctx) = setup().await;
+    let snap_name = snap("dupcon");
+    let barrier = Arc::new(Barrier::new(3));
+
+    let mut handles = Vec::new();
+    for _ in 0..2 {
+        let svc = svc.clone();
+        let git = git.clone();
+        let uid = uid.clone();
+        let snap_name = snap_name.clone();
+        let barrier = barrier.clone();
+        handles.push(tokio::spawn(async move {
+            barrier.wait().await;
+            git_call(
+                "memory_snapshot",
+                json!({"name": snap_name}),
+                &git,
+                &svc,
+                &uid,
+            )
+            .await
+        }));
+    }
+
+    barrier.wait().await;
+    let first = handles.remove(0).await.expect("first task join");
+    let second = handles.remove(0).await.expect("second task join");
+    let results = [text(&first).to_string(), text(&second).to_string()];
+
+    assert!(
+        results.iter().any(|result| result.contains("created")),
+        "expected one create result, got {results:?}"
+    );
+    assert!(
+        results
+            .iter()
+            .any(|result| result.contains("already exists")),
+        "expected one duplicate result, got {results:?}"
+    );
+
+    let sql = svc.user_sql_store(&uid).await.unwrap();
+    let regs = sql.list_snapshot_registrations(&uid).await.unwrap();
+    let count = regs.iter().filter(|reg| reg.name == snap_name).count();
+    assert_eq!(count, 1, "concurrent create should register once");
+
+    let internal = internal_snapshot_name(&db_name, &snap_name);
+    let user_git = git_for_user(&svc, &uid).await;
+    let snaps = user_git.list_snapshots().await.unwrap();
+    let internal_count = snaps
+        .iter()
+        .filter(|snapshot| snapshot.snapshot_name == internal)
+        .count();
+    assert_eq!(
+        internal_count, 1,
+        "concurrent create should create one snapshot"
+    );
+
+    git_call(
+        "memory_snapshot_delete",
+        json!({"names": snap_name}),
+        &git,
+        &svc,
+        &uid,
+    )
+    .await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_multi_db_snapshot_rollback_isolates_users() {
+    let (svc, user_a, user_b, db_a, db_b, git, _ctx) = setup_multi_db().await;
+    let snap_name = snap("multi");
+
+    store("alice before snapshot", &svc, &user_a).await;
+    store("bob steady state", &svc, &user_b).await;
+
+    assert_ne!(
+        db_a, db_b,
+        "multi-db test must route users to different databases"
+    );
+
+    let created = git_call(
+        "memory_snapshot",
+        json!({"name": snap_name}),
+        &git,
+        &svc,
+        &user_a,
+    )
+    .await;
+    assert!(
+        text(&created).contains("created"),
+        "got: {}",
+        text(&created)
+    );
+
+    store("alice after snapshot", &svc, &user_a).await;
+    assert_eq!(svc.list_active(&user_a, 10).await.unwrap().len(), 2);
+    assert_eq!(svc.list_active(&user_b, 10).await.unwrap().len(), 1);
+
+    let rolled_back = git_call(
+        "memory_rollback",
+        json!({"name": snap_name}),
+        &git,
+        &svc,
+        &user_a,
+    )
+    .await;
+    assert!(
+        text(&rolled_back).contains("Rolled back"),
+        "got: {}",
+        text(&rolled_back)
+    );
+
+    let alice = svc.list_active(&user_a, 10).await.unwrap();
+    let bob = svc.list_active(&user_b, 10).await.unwrap();
+    assert_eq!(alice.len(), 1);
+    assert_eq!(bob.len(), 1);
+    assert_eq!(alice[0].content, "alice before snapshot");
+    assert_eq!(bob[0].content, "bob steady state");
+
+    git_call(
+        "memory_snapshot_delete",
+        json!({"names": snap_name}),
+        &git,
+        &svc,
+        &user_a,
+    )
+    .await;
+}
+
 // ── 9. Multi-user isolation: user A's rollback doesn't affect user B ──────────
 
 #[tokio::test]
 #[serial]
 async fn test_multiuser_snapshot_isolation() {
-    let (svc, git, _) = setup().await;
+    let (svc, git, _, _db_name, _ctx) = setup().await;
     let uid_a = uid();
     let uid_b = uid();
     let snap_a = snap("ua");
@@ -522,23 +752,18 @@ async fn test_multiuser_snapshot_isolation() {
     assert_eq!(a_list.len(), 1);
     assert_eq!(a_list[0].content, "user A memory");
 
-    // User B's memories must be untouched — rollback is full-table but user_id filters retrieval
-    // NOTE: rollback replaces all rows in mem_memories from snapshot, so B's rows are gone too.
-    // This is a known limitation: snapshot/rollback is account-level, not per-user.
-    // Document this behavior explicitly.
+    // In multi-db mode user B lives in a different database, so A's rollback must not affect B.
     let b_list = svc.list_active(&uid_b, 10).await.unwrap();
-    // After rollback, B's memories are gone (snapshot was taken before B stored anything)
-    // This is expected behavior — same as Python version.
     println!(
-        "ℹ️  After A's rollback, B has {} memories (expected 0 — account-level rollback)",
+        "ℹ️  After A's rollback, B has {} memories (expected 2 — isolated user DB)",
         b_list.len()
     );
     assert_eq!(
         b_list.len(),
-        0,
-        "Account-level rollback removes all users' data not in snapshot — known limitation"
+        2,
+        "multi-db rollback should leave other users' data untouched"
     );
-    println!("✅ multiuser: account-level rollback behavior documented");
+    println!("✅ multiuser: rollback isolated to the initiating user's DB");
 
     git_call(
         "memory_snapshot_delete",
@@ -553,7 +778,7 @@ async fn test_multiuser_snapshot_isolation() {
 #[tokio::test]
 #[serial]
 async fn test_snapshot_limit_is_per_user_and_capped_at_20() {
-    let (svc, git, _) = setup().await;
+    let (svc, git, _, _db_name, _ctx) = setup().await;
     let uid_a = uid();
     let uid_b = uid();
 
@@ -626,7 +851,7 @@ async fn test_snapshot_limit_is_per_user_and_capped_at_20() {
 #[tokio::test]
 #[serial]
 async fn test_snapshot_delete_is_scoped_to_owner() {
-    let (svc, git, _) = setup().await;
+    let (svc, git, _, _db_name, _ctx) = setup().await;
     let uid_a = uid();
     let uid_b = uid();
     let snap_a = snap("owned");
@@ -676,7 +901,7 @@ async fn test_snapshot_delete_is_scoped_to_owner() {
 #[tokio::test]
 #[serial]
 async fn test_snapshot_delete_older_than() {
-    let (svc, git, uid) = setup().await;
+    let (svc, git, uid, db_name, _ctx) = setup().await;
     let s1 = snap("old1");
     let s2 = snap("old2");
     let s3 = snap("keep");
@@ -701,13 +926,13 @@ async fn test_snapshot_delete_older_than() {
             let snaps = git.list_snapshots().await.unwrap();
             !snaps
                 .iter()
-                .any(|s| s.snapshot_name == format!("mem_snap_{s1}"))
+                .any(|s| s.snapshot_name == internal_snapshot_name(&db_name, &s1))
                 && !snaps
                     .iter()
-                    .any(|s| s.snapshot_name == format!("mem_snap_{s2}"))
+                    .any(|s| s.snapshot_name == internal_snapshot_name(&db_name, &s2))
                 && !snaps
                     .iter()
-                    .any(|s| s.snapshot_name == format!("mem_snap_{s3}"))
+                    .any(|s| s.snapshot_name == internal_snapshot_name(&db_name, &s3))
         },
         "expected all 3 deleted, got: {t}"
     );
@@ -733,7 +958,7 @@ async fn test_snapshot_delete_older_than() {
 #[tokio::test]
 #[serial]
 async fn test_snapshot_list_filters_system_snapshots() {
-    let (svc, git, uid) = setup().await;
+    let (svc, git, uid, db_name, _ctx) = setup().await;
     let s1 = snap("mysnap");
     git_call("memory_snapshot", json!({"name": s1}), &git, &svc, &uid).await;
 
@@ -765,7 +990,7 @@ async fn test_snapshot_list_filters_system_snapshots() {
 #[tokio::test]
 #[serial]
 async fn test_chained_snapshot_rollback() {
-    let (svc, git, uid) = setup().await;
+    let (svc, git, uid, db_name, _ctx) = setup().await;
     let snap_v1 = snap("v1");
     let snap_v2 = snap("v2");
 
@@ -834,7 +1059,7 @@ async fn test_chained_snapshot_rollback() {
 #[tokio::test]
 #[serial]
 async fn test_branch_limit_enforced() {
-    let (svc, git, uid) = setup().await;
+    let (svc, git, uid, db_name, _ctx) = setup().await;
 
     // Create branches up to limit (MAX_BRANCHES = 20)
     // We'll create a few and verify the limit message, not exhaust the full 20
@@ -874,7 +1099,7 @@ async fn test_branch_limit_enforced() {
 #[tokio::test]
 #[serial]
 async fn test_branch_from_snapshot() {
-    let (svc, git, uid) = setup().await;
+    let (svc, git, uid, db_name, _ctx) = setup().await;
     let snap_name = snap("forsplit");
     let branch = format!("bfs_{}", &uid[5..]);
 
@@ -950,37 +1175,59 @@ async fn test_branch_from_snapshot() {
 #[tokio::test]
 #[serial]
 async fn test_milestone_snapshot_not_counted_towards_limit() {
-    let (svc, git, _) = setup().await;
+    let (svc, git, _, _db_name, _ctx) = setup().await;
     let uid_a = uid();
 
     // Create 20 user snapshots (at the limit)
     let names: Vec<String> = (0..20).map(|i| snap(&format!("ms_{i}"))).collect();
     for name in &names {
         let r = git_call("memory_snapshot", json!({"name": name}), &git, &svc, &uid_a).await;
-        assert!(text(&r).contains("created"), "A create failed: {}", text(&r));
+        assert!(
+            text(&r).contains("created"),
+            "A create failed: {}",
+            text(&r)
+        );
     }
 
-    // Create a milestone snapshot directly via git (simulating system-created milestone)
-    let milestone_name = "mem_milestone_test_milestone";
-    git.create_snapshot(milestone_name).await.expect("create milestone");
+    // Create a milestone snapshot directly in user A's DB (simulating system-created milestone)
+    let milestone_suffix = &Uuid::new_v4().simple().to_string()[..6];
+    let milestone_name = format!("mem_milestone_test_milestone_{milestone_suffix}");
+    let user_git = git_for_user(&svc, &uid_a).await;
+    user_git
+        .create_snapshot(&milestone_name)
+        .await
+        .expect("create milestone");
 
     // User should still be able to create one more snapshot (milestone doesn't count)
     let extra = snap("after_milestone");
-    let r = git_call("memory_snapshot", json!({"name": extra}), &git, &svc, &uid_a).await;
+    let r = git_call(
+        "memory_snapshot",
+        json!({"name": extra}),
+        &git,
+        &svc,
+        &uid_a,
+    )
+    .await;
     assert!(
         text(&r).contains("Snapshot limit reached"),
         "user should be at limit, got: {}",
         text(&r)
     );
 
-    // But user B should see the milestone in their list
-    let uid_b = uid();
-    let r = git_call("memory_snapshots", json!({"limit": 50}), &git, &svc, &uid_b).await;
+    // User A should see the milestone in their list.
+    let r = git_call("memory_snapshots", json!({"limit": 50}), &git, &svc, &uid_a).await;
     let t = text(&r);
-    assert!(t.contains("auto:test_milestone"), "B should see milestone: {}", t);
+    assert!(
+        t.contains("auto:test_milestone"),
+        "A should see milestone in the same DB: {}",
+        t
+    );
 
     // Cleanup
-    git.drop_snapshot(milestone_name).await.expect("drop milestone");
+    user_git
+        .drop_snapshot(&milestone_name)
+        .await
+        .expect("drop milestone");
     git_call(
         "memory_snapshot_delete",
         json!({"names": names.join(",")}),
@@ -996,7 +1243,7 @@ async fn test_milestone_snapshot_not_counted_towards_limit() {
 #[tokio::test]
 #[serial]
 async fn test_delete_releases_quota() {
-    let (svc, git, _) = setup().await;
+    let (svc, git, _, _db_name, _ctx) = setup().await;
     let uid_a = uid();
 
     // Create 20 snapshots (at limit)
@@ -1008,8 +1255,18 @@ async fn test_delete_releases_quota() {
 
     // Verify at limit
     let overflow = snap("overflow");
-    let r = git_call("memory_snapshot", json!({"name": overflow}), &git, &svc, &uid_a).await;
-    assert!(text(&r).contains("Snapshot limit reached"), "should be at limit");
+    let r = git_call(
+        "memory_snapshot",
+        json!({"name": overflow}),
+        &git,
+        &svc,
+        &uid_a,
+    )
+    .await;
+    assert!(
+        text(&r).contains("Snapshot limit reached"),
+        "should be at limit"
+    );
 
     // Delete 5 snapshots
     let to_delete: Vec<String> = names.iter().take(5).cloned().collect();
@@ -1025,7 +1282,14 @@ async fn test_delete_releases_quota() {
     // Now should be able to create 5 new snapshots
     for i in 0..5 {
         let new_snap = snap(&format!("new_{i}"));
-        let r = git_call("memory_snapshot", json!({"name": new_snap}), &git, &svc, &uid_a).await;
+        let r = git_call(
+            "memory_snapshot",
+            json!({"name": new_snap}),
+            &git,
+            &svc,
+            &uid_a,
+        )
+        .await;
         assert!(
             text(&r).contains("created"),
             "should create after delete, got: {}",
@@ -1034,8 +1298,18 @@ async fn test_delete_releases_quota() {
     }
 
     // 6th should fail again
-    let r = git_call("memory_snapshot", json!({"name": overflow}), &git, &svc, &uid_a).await;
-    assert!(text(&r).contains("Snapshot limit reached"), "should be at limit again");
+    let r = git_call(
+        "memory_snapshot",
+        json!({"name": overflow}),
+        &git,
+        &svc,
+        &uid_a,
+    )
+    .await;
+    assert!(
+        text(&r).contains("Snapshot limit reached"),
+        "should be at limit again"
+    );
 
     // Cleanup remaining
     let remaining: Vec<String> = names.iter().skip(5).cloned().collect();
@@ -1058,32 +1332,43 @@ async fn test_delete_releases_quota() {
     .await;
 }
 
-// ── 17. Safety snapshots (mem_snap_pre_*) are globally visible ─────────────────
+// ── 17. Safety snapshots (mem_snap_pre_*) are visible within the same user DB ──
 
 #[tokio::test]
 #[serial]
 async fn test_safety_snapshot_globally_visible() {
-    let (svc, git, _) = setup().await;
+    let (svc, git, _, _db_name, _ctx) = setup().await;
     let uid_a = uid();
     let uid_b = uid();
 
-    // Create a safety snapshot directly via git (use unique name)
+    // Create a safety snapshot directly in user A's DB (use unique name)
     let unique_id = &Uuid::new_v4().simple().to_string()[..6];
     let safety_name = format!("mem_snap_pre_safety_{unique_id}");
     let display_name = format!("pre_safety_{unique_id}"); // snap_display strips mem_snap_ prefix
-    git.create_snapshot(&safety_name).await.expect("create safety");
+    let user_git = git_for_user(&svc, &uid_a).await;
+    user_git
+        .create_snapshot(&safety_name)
+        .await
+        .expect("create safety");
 
-    // Both users should see it in their list (by display name)
+    // User A should see it in their list (by display name)
     let r_a = git_call("memory_snapshots", json!({"limit": 50}), &git, &svc, &uid_a).await;
     let t_a = text(&r_a);
-    assert!(t_a.contains(&display_name), "A should see safety snapshot: {}", t_a);
+    assert!(
+        t_a.contains(&display_name),
+        "A should see safety snapshot: {}",
+        t_a
+    );
 
     let r_b = git_call("memory_snapshots", json!({"limit": 50}), &git, &svc, &uid_b).await;
     let t_b = text(&r_b);
-    assert!(t_b.contains(&display_name), "B should see safety snapshot: {}", t_b);
+    assert!(
+        !t_b.contains(&display_name),
+        "B should not see safety snapshot from another DB: {}",
+        t_b
+    );
 
-    // Safety snapshots are globally visible and can be deleted by any user
-    // (they are not protected, just not registered to any specific user)
+    // Safety snapshots are deletable by the user in the same DB.
     let r = git_call(
         "memory_snapshot_delete",
         json!({"names": &display_name}),
@@ -1092,6 +1377,10 @@ async fn test_safety_snapshot_globally_visible() {
         &uid_a,
     )
     .await;
-    assert!(text(&r).contains("Deleted 1"), "should delete safety snapshot: {}", text(&r));
+    assert!(
+        text(&r).contains("Deleted 1"),
+        "should delete safety snapshot: {}",
+        text(&r)
+    );
     println!("✅ safety snapshot deleted by user: {}", text(&r));
 }

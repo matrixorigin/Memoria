@@ -107,6 +107,10 @@ pub trait GovernanceStore: Send + Sync {
     /// Remove orphaned stats records (stats without corresponding memory).
     async fn cleanup_orphan_stats(&self) -> Result<i64, MemoriaError>;
 
+    /// Remove orphaned entity links (mem_entity_links + mem_memory_entity_links)
+    /// and deactivate orphaned graph nodes whose memory is inactive.
+    async fn cleanup_orphan_graph_data(&self) -> Result<i64, MemoriaError>;
+
     /// Delete old audit-log rows, keeping only the last `retain_days` days.
     async fn cleanup_edit_log(&self, retain_days: i64) -> Result<i64, MemoriaError>;
 
@@ -163,9 +167,48 @@ pub trait GovernanceStore: Send + Sync {
     }
 }
 
+fn routed_user_store(
+    store: &SqlMemoryStore,
+    user_id: &str,
+) -> Result<Option<SqlMemoryStore>, MemoriaError> {
+    match store.db_router() {
+        Some(router) => Ok(Some(router.routed_store_for_user(user_id)?)),
+        None => Ok(None),
+    }
+}
+
+async fn routed_user_stores(
+    store: &SqlMemoryStore,
+) -> Result<Option<Vec<(String, SqlMemoryStore)>>, MemoriaError> {
+    let Some(router) = store.db_router() else {
+        return Ok(None);
+    };
+    let shared_pool = router.shared_pool().clone();
+    let user_ids: Vec<(String,)> =
+        sqlx::query_as("SELECT user_id FROM mem_user_registry WHERE status = 'active'")
+            .fetch_all(&shared_pool)
+            .await
+            .map_err(|e| MemoriaError::Database(e.to_string()))?;
+    let mut stores = Vec::with_capacity(user_ids.len());
+    for (user_id,) in user_ids {
+        let user_store = router.routed_store_for_user(&user_id)?;
+        stores.push((user_id, user_store));
+    }
+    Ok(Some(stores))
+}
+
 #[async_trait]
 impl GovernanceStore for SqlMemoryStore {
     async fn list_active_users(&self) -> Result<Vec<String>, MemoriaError> {
+        if let Some(router) = self.db_router() {
+            let shared_pool = router.shared_pool().clone();
+            let users: Vec<(String,)> =
+                sqlx::query_as("SELECT user_id FROM mem_user_registry WHERE status = 'active'")
+                    .fetch_all(&shared_pool)
+                    .await
+                    .map_err(|e| MemoriaError::Database(e.to_string()))?;
+            return Ok(users.into_iter().map(|(user_id,)| user_id).collect());
+        }
         let users: Vec<(String,)> =
             sqlx::query_as("SELECT DISTINCT user_id FROM mem_memories WHERE is_active > 0")
                 .fetch_all(self.pool())
@@ -175,7 +218,15 @@ impl GovernanceStore for SqlMemoryStore {
     }
 
     async fn cleanup_tool_results(&self, ttl_hours: i64) -> Result<i64, MemoriaError> {
-        SqlMemoryStore::cleanup_tool_results(self, ttl_hours).await
+        let store = self.clone();
+        if let Some(user_stores) = routed_user_stores(&store).await? {
+            let mut total = 0i64;
+            for (_, store) in user_stores {
+                total += SqlMemoryStore::cleanup_tool_results(&store, ttl_hours).await?;
+            }
+            return Ok(total);
+        }
+        SqlMemoryStore::cleanup_tool_results(&store, ttl_hours).await
     }
 
     async fn cleanup_async_tasks(&self, ttl_hours: i64) -> Result<i64, MemoriaError> {
@@ -194,15 +245,31 @@ impl GovernanceStore for SqlMemoryStore {
         &self,
         stale_hours: i64,
     ) -> Result<Vec<(String, i64)>, MemoriaError> {
-        SqlMemoryStore::archive_stale_working(self, stale_hours).await
+        let store = self.clone();
+        if let Some(user_stores) = routed_user_stores(&store).await? {
+            let mut results = Vec::new();
+            for (_, store) in user_stores {
+                results.extend(SqlMemoryStore::archive_stale_working(&store, stale_hours).await?);
+            }
+            return Ok(results);
+        }
+        SqlMemoryStore::archive_stale_working(&store, stale_hours).await
     }
 
     async fn cleanup_stale(&self, user_id: &str) -> Result<i64, MemoriaError> {
-        SqlMemoryStore::cleanup_stale(self, user_id).await
+        let store = self.clone();
+        if let Some(user_store) = routed_user_store(&store, user_id)? {
+            return SqlMemoryStore::cleanup_stale(&user_store, user_id).await;
+        }
+        SqlMemoryStore::cleanup_stale(&store, user_id).await
     }
 
     async fn quarantine_low_confidence(&self, user_id: &str) -> Result<i64, MemoriaError> {
-        SqlMemoryStore::quarantine_low_confidence(self, user_id).await
+        let store = self.clone();
+        if let Some(user_store) = routed_user_store(&store, user_id)? {
+            return SqlMemoryStore::quarantine_low_confidence(&user_store, user_id).await;
+        }
+        SqlMemoryStore::quarantine_low_confidence(&store, user_id).await
     }
 
     async fn compress_redundant(
@@ -212,8 +279,19 @@ impl GovernanceStore for SqlMemoryStore {
         window_days: i64,
         max_pairs: usize,
     ) -> Result<i64, MemoriaError> {
+        let store = self.clone();
+        if let Some(user_store) = routed_user_store(&store, user_id)? {
+            return SqlMemoryStore::compress_redundant(
+                &user_store,
+                user_id,
+                similarity_threshold,
+                window_days,
+                max_pairs,
+            )
+            .await;
+        }
         SqlMemoryStore::compress_redundant(
-            self,
+            &store,
             user_id,
             similarity_threshold,
             window_days,
@@ -227,35 +305,161 @@ impl GovernanceStore for SqlMemoryStore {
         user_id: &str,
         older_than_hours: i64,
     ) -> Result<i64, MemoriaError> {
-        SqlMemoryStore::cleanup_orphaned_incrementals(self, user_id, older_than_hours).await
+        let store = self.clone();
+        if let Some(user_store) = routed_user_store(&store, user_id)? {
+            return SqlMemoryStore::cleanup_orphaned_incrementals(
+                &user_store,
+                user_id,
+                older_than_hours,
+            )
+            .await;
+        }
+        SqlMemoryStore::cleanup_orphaned_incrementals(&store, user_id, older_than_hours).await
     }
 
     async fn rebuild_vector_index(&self, table: &str) -> Result<i64, MemoriaError> {
-        SqlMemoryStore::rebuild_vector_index(self, table).await
+        let store = self.clone();
+        if matches!(table, "mem_memories" | "memory_graph_nodes") {
+            if let Some(user_stores) = routed_user_stores(&store).await? {
+                let mut total = 0i64;
+                for (_, store) in user_stores {
+                    total += SqlMemoryStore::rebuild_vector_index(&store, table).await?;
+                }
+                return Ok(total);
+            }
+        }
+        SqlMemoryStore::rebuild_vector_index(&store, table).await
     }
 
     async fn cleanup_snapshots(&self, keep_last_n: usize) -> Result<i64, MemoriaError> {
-        SqlMemoryStore::cleanup_snapshots(self, keep_last_n).await
+        let store = self.clone();
+        if let Some(user_stores) = routed_user_stores(&store).await? {
+            let mut total = 0i64;
+            for (_, store) in user_stores {
+                total += SqlMemoryStore::cleanup_snapshots(&store, keep_last_n).await?;
+            }
+            return Ok(total);
+        }
+        SqlMemoryStore::cleanup_snapshots(&store, keep_last_n).await
     }
 
     async fn cleanup_orphan_branches(&self) -> Result<i64, MemoriaError> {
-        SqlMemoryStore::cleanup_orphan_branches(self).await
+        let store = self.clone();
+        if let Some(user_stores) = routed_user_stores(&store).await? {
+            let mut total = 0i64;
+            for (_, store) in user_stores {
+                total += SqlMemoryStore::cleanup_orphan_branches(&store).await?;
+            }
+            return Ok(total);
+        }
+        SqlMemoryStore::cleanup_orphan_branches(&store).await
     }
 
     async fn cleanup_orphan_stats(&self) -> Result<i64, MemoriaError> {
-        SqlMemoryStore::cleanup_orphan_stats(self).await
+        let store = self.clone();
+        if let Some(user_stores) = routed_user_stores(&store).await? {
+            let mut total = 0i64;
+            for (_, store) in user_stores {
+                total += SqlMemoryStore::cleanup_orphan_stats(&store).await?;
+            }
+            return Ok(total);
+        }
+        SqlMemoryStore::cleanup_orphan_stats(&store).await
+    }
+
+    async fn cleanup_orphan_graph_data(&self) -> Result<i64, MemoriaError> {
+        let store = self.clone();
+        if let Some(user_stores) = routed_user_stores(&store).await? {
+            let mut total = 0i64;
+            for (_, store) in user_stores {
+                total +=
+                    <SqlMemoryStore as GovernanceStore>::cleanup_orphan_graph_data(&store).await?;
+            }
+            return Ok(total);
+        }
+        let graph = store.graph_store();
+        let mut total = 0i64;
+        let mut errors = Vec::new();
+        // 1. Orphaned mem_entity_links
+        match SqlMemoryStore::cleanup_orphan_entity_links(&store).await {
+            Ok(n) => total += n,
+            Err(e) => errors.push(format!("entity_links: {e}")),
+        }
+        // 2. Orphaned mem_memory_entity_links
+        match graph.cleanup_orphan_memory_entity_links().await {
+            Ok(n) => total += n,
+            Err(e) => errors.push(format!("memory_entity_links: {e}")),
+        }
+        // 3. Orphaned graph nodes (memory inactive but node still active)
+        match graph.cleanup_orphan_graph_nodes().await {
+            Ok(n) => total += n,
+            Err(e) => errors.push(format!("graph_nodes: {e}")),
+        }
+        if errors.is_empty() {
+            Ok(total)
+        } else {
+            Err(MemoriaError::Internal(format!(
+                "partial graph cleanup ({total} removed, {} failed): {}",
+                errors.len(),
+                errors.join("; ")
+            )))
+        }
     }
 
     async fn cleanup_edit_log(&self, retain_days: i64) -> Result<i64, MemoriaError> {
-        SqlMemoryStore::cleanup_edit_log(self, retain_days).await
+        let store = self.clone();
+        if let Some(user_stores) = routed_user_stores(&store).await? {
+            let mut total = 0i64;
+            for (_, store) in user_stores {
+                total += SqlMemoryStore::cleanup_edit_log(&store, retain_days).await?;
+            }
+            return Ok(total);
+        }
+        SqlMemoryStore::cleanup_edit_log(&store, retain_days).await
     }
 
     async fn cleanup_feedback(&self, retain_days: i64) -> Result<i64, MemoriaError> {
-        SqlMemoryStore::cleanup_feedback(self, retain_days).await
+        let store = self.clone();
+        if let Some(user_stores) = routed_user_stores(&store).await? {
+            let mut total = 0i64;
+            for (_, store) in user_stores {
+                total += SqlMemoryStore::cleanup_feedback(&store, retain_days).await?;
+            }
+            return Ok(total);
+        }
+        SqlMemoryStore::cleanup_feedback(&store, retain_days).await
     }
 
     async fn create_safety_snapshot(&self, operation: &str) -> (Option<String>, Option<String>) {
-        SqlMemoryStore::create_safety_snapshot(self, operation).await
+        let store = self.clone();
+        if let Ok(Some(user_stores)) = routed_user_stores(&store).await {
+            let mut created = 0usize;
+            let mut warnings = Vec::new();
+            for (user_id, store) in user_stores {
+                let (snapshot, warning) =
+                    SqlMemoryStore::create_safety_snapshot(&store, operation).await;
+                if snapshot.is_some() {
+                    created += 1;
+                }
+                if let Some(warning) = warning {
+                    warnings.push(format!("{user_id}: {warning}"));
+                }
+            }
+            if created > 0 {
+                let mut summary = format!(
+                    "⚠️ Created per-user governance safety snapshots in {created} user DB(s). \
+                     Rollback requires restoring each affected user DB snapshot separately."
+                );
+                if !warnings.is_empty() {
+                    summary.push_str(&format!(" Warnings: {}", warnings.join(" | ")));
+                }
+                return (Some("multi-db-safety-snapshots".to_string()), Some(summary));
+            }
+            if !warnings.is_empty() {
+                return (None, Some(warnings.join(" | ")));
+            }
+        }
+        SqlMemoryStore::create_safety_snapshot(&store, operation).await
     }
 
     async fn log_edit(
@@ -267,7 +471,17 @@ impl GovernanceStore for SqlMemoryStore {
         reason: &str,
         snapshot_before: Option<&str>,
     ) {
-        SqlMemoryStore::log_edit(self, user_id, operation, memory_id, payload, reason, snapshot_before).await;
+        let store = self.clone();
+        SqlMemoryStore::log_edit(
+            &store,
+            user_id,
+            operation,
+            memory_id,
+            payload,
+            reason,
+            snapshot_before,
+        )
+        .await;
     }
 
     async fn check_shared_breaker(
@@ -306,8 +520,17 @@ impl GovernanceStore for SqlMemoryStore {
     async fn tune_user_retrieval_params(&self, user_id: &str) -> Result<bool, MemoriaError> {
         use crate::scoring::{DefaultScoringPlugin, ScoringPlugin};
 
+        let store = self.clone();
+        if let Some(user_store) = routed_user_store(&store, user_id)? {
+            return <SqlMemoryStore as GovernanceStore>::tune_user_retrieval_params(
+                &user_store,
+                user_id,
+            )
+            .await;
+        }
+
         let plugin = DefaultScoringPlugin;
-        match plugin.tune_params(self, user_id).await? {
+        match plugin.tune_params(&store, user_id).await? {
             Some(_) => Ok(true),
             None => Ok(false),
         }
@@ -453,7 +676,10 @@ impl DefaultGovernanceStrategy {
                                 &user_id,
                                 "governance:archive_working",
                                 None,
-                                Some(&format!("{{\"archived\":{count},\"threshold_hours\":{}}}", Self::STALE_WORKING_HOURS)),
+                                Some(&format!(
+                                    "{{\"archived\":{count},\"threshold_hours\":{}}}",
+                                    Self::STALE_WORKING_HOURS
+                                )),
                                 &format!(
                                     "archived {count} stale working memories (>{}h)",
                                     Self::STALE_WORKING_HOURS
@@ -886,6 +1112,37 @@ impl DefaultGovernanceStrategy {
         }
     }
 
+    async fn cleanup_orphan_graph_data_operation(
+        &self,
+        plan: &GovernancePlan,
+        store: &dyn GovernanceStore,
+        state: &mut ExecutionState,
+    ) {
+        match store.cleanup_orphan_graph_data().await {
+            Ok(value) => {
+                state.decisions.push(governance_decision(
+                    GovernanceTask::Weekly,
+                    "cleanup_orphan_graph_data",
+                    format!("Removed {value} orphaned graph/entity-link rows"),
+                    Some(if value > 0 { 1.0 } else { 0.0 }),
+                    vec![task_evidence(
+                        GovernanceTask::Weekly,
+                        &plan.users,
+                        "Weekly graph data cleanup completed".to_string(),
+                    )],
+                    state.snapshot_before.as_deref(),
+                ));
+            }
+            Err(err) => record_warning(
+                GovernanceTask::Weekly,
+                None,
+                "cleanup_orphan_graph_data",
+                &err,
+                &mut state.warnings,
+            ),
+        }
+    }
+
     async fn cleanup_edit_log_operation(
         &self,
         store: &dyn GovernanceStore,
@@ -896,7 +1153,10 @@ impl DefaultGovernanceStrategy {
                 state.decisions.push(governance_decision(
                     GovernanceTask::Weekly,
                     "cleanup_edit_log",
-                    format!("Deleted {deleted} audit-log rows older than {} days", Self::EDIT_LOG_RETAIN_DAYS),
+                    format!(
+                        "Deleted {deleted} audit-log rows older than {} days",
+                        Self::EDIT_LOG_RETAIN_DAYS
+                    ),
                     Some(if deleted > 0 { 1.0 } else { 0.0 }),
                     vec![],
                     state.snapshot_before.as_deref(),
@@ -922,7 +1182,10 @@ impl DefaultGovernanceStrategy {
                 state.decisions.push(governance_decision(
                     GovernanceTask::Weekly,
                     "cleanup_feedback",
-                    format!("Deleted {deleted} feedback rows older than {} days", Self::FEEDBACK_RETAIN_DAYS),
+                    format!(
+                        "Deleted {deleted} feedback rows older than {} days",
+                        Self::FEEDBACK_RETAIN_DAYS
+                    ),
                     Some(if deleted > 0 { 1.0 } else { 0.0 }),
                     vec![],
                     state.snapshot_before.as_deref(),
@@ -995,6 +1258,10 @@ impl DefaultGovernanceStrategy {
             .await;
         self.compress_redundant_operation(&plan.users, store, state)
             .await;
+        // Orphan graph cleanup runs after physical deletions (quarantine, cleanup_stale,
+        // compress_redundant) so it catches all newly-orphaned graph nodes in one pass.
+        self.cleanup_orphan_graph_data_operation(plan, store, state)
+            .await;
         self.cleanup_orphaned_incrementals_operation(&plan.users, store, state)
             .await;
         self.cleanup_async_tasks_operation(store, state).await;
@@ -1014,6 +1281,9 @@ impl DefaultGovernanceStrategy {
         self.cleanup_orphan_branches_operation(plan, store, state)
             .await;
         self.cleanup_orphan_stats_operation(plan, store, state)
+            .await;
+        // Also runs in run_daily; weekly pass catches orphans from rollback/branch drops.
+        self.cleanup_orphan_graph_data_operation(plan, store, state)
             .await;
         self.cleanup_edit_log_operation(store, state).await;
         self.cleanup_feedback_operation(store, state).await;
@@ -1220,8 +1490,14 @@ fn governance_decision(
         confidence,
         rationale,
         evidence,
-        rollback_hint: snapshot_before
-            .map(|snapshot| format!("Restore affected tables from snapshot {snapshot}")),
+        rollback_hint: snapshot_before.map(|snapshot| {
+            if snapshot == "multi-db-safety-snapshots" {
+                "Restore each affected user DB from its per-user governance safety snapshot."
+                    .to_string()
+            } else {
+                format!("Restore affected tables from snapshot {snapshot}")
+            }
+        }),
     }
 }
 
@@ -1442,8 +1718,18 @@ mod tests {
             Ok(0)
         }
 
-        async fn cleanup_edit_log(&self, _: i64) -> Result<i64, MemoriaError> { Ok(0) }
-        async fn cleanup_feedback(&self, _: i64) -> Result<i64, MemoriaError> { Ok(0) }
+        async fn cleanup_orphan_graph_data(&self) -> Result<i64, MemoriaError> {
+            self.record("cleanup_orphan_graph_data");
+            self.fail_if_requested("cleanup_orphan_graph_data")?;
+            Ok(0)
+        }
+
+        async fn cleanup_edit_log(&self, _: i64) -> Result<i64, MemoriaError> {
+            Ok(0)
+        }
+        async fn cleanup_feedback(&self, _: i64) -> Result<i64, MemoriaError> {
+            Ok(0)
+        }
 
         async fn create_safety_snapshot(
             &self,
@@ -1702,23 +1988,79 @@ mod tests {
             async fn list_active_users(&self) -> Result<Vec<String>, MemoriaError> {
                 Ok(self.users.clone())
             }
-            async fn cleanup_tool_results(&self, _: i64) -> Result<i64, MemoriaError> { Ok(0) }
-            async fn cleanup_async_tasks(&self, _: i64) -> Result<i64, MemoriaError> { Ok(0) }
-            async fn archive_stale_working(&self, _: i64) -> Result<Vec<(String, i64)>, MemoriaError> { Ok(vec![]) }
-            async fn cleanup_stale(&self, _: &str) -> Result<i64, MemoriaError> { Ok(0) }
-            async fn quarantine_low_confidence(&self, _: &str) -> Result<i64, MemoriaError> { Ok(0) }
-            async fn compress_redundant(&self, _: &str, _: f64, _: i64, _: usize) -> Result<i64, MemoriaError> { Ok(0) }
-            async fn cleanup_orphaned_incrementals(&self, _: &str, _: i64) -> Result<i64, MemoriaError> { Ok(0) }
-            async fn rebuild_vector_index(&self, _: &str) -> Result<i64, MemoriaError> { Ok(0) }
-            async fn cleanup_snapshots(&self, _: usize) -> Result<i64, MemoriaError> { Ok(0) }
-            async fn cleanup_orphan_branches(&self) -> Result<i64, MemoriaError> { Ok(0) }
-            async fn cleanup_orphan_stats(&self) -> Result<i64, MemoriaError> { Ok(0) }
-            async fn cleanup_edit_log(&self, _: i64) -> Result<i64, MemoriaError> { Ok(0) }
-        async fn cleanup_feedback(&self, _: i64) -> Result<i64, MemoriaError> { Ok(0) }
-            async fn create_safety_snapshot(&self, _: &str) -> (Option<String>, Option<String>) { (None, None) }
-            async fn log_edit(&self, _: &str, _: &str, _: Option<&str>, _: Option<&str>, _: &str, _: Option<&str>) {}
+            async fn cleanup_tool_results(&self, _: i64) -> Result<i64, MemoriaError> {
+                Ok(0)
+            }
+            async fn cleanup_async_tasks(&self, _: i64) -> Result<i64, MemoriaError> {
+                Ok(0)
+            }
+            async fn archive_stale_working(
+                &self,
+                _: i64,
+            ) -> Result<Vec<(String, i64)>, MemoriaError> {
+                Ok(vec![])
+            }
+            async fn cleanup_stale(&self, _: &str) -> Result<i64, MemoriaError> {
+                Ok(0)
+            }
+            async fn quarantine_low_confidence(&self, _: &str) -> Result<i64, MemoriaError> {
+                Ok(0)
+            }
+            async fn compress_redundant(
+                &self,
+                _: &str,
+                _: f64,
+                _: i64,
+                _: usize,
+            ) -> Result<i64, MemoriaError> {
+                Ok(0)
+            }
+            async fn cleanup_orphaned_incrementals(
+                &self,
+                _: &str,
+                _: i64,
+            ) -> Result<i64, MemoriaError> {
+                Ok(0)
+            }
+            async fn rebuild_vector_index(&self, _: &str) -> Result<i64, MemoriaError> {
+                Ok(0)
+            }
+            async fn cleanup_snapshots(&self, _: usize) -> Result<i64, MemoriaError> {
+                Ok(0)
+            }
+            async fn cleanup_orphan_branches(&self) -> Result<i64, MemoriaError> {
+                Ok(0)
+            }
+            async fn cleanup_orphan_stats(&self) -> Result<i64, MemoriaError> {
+                Ok(0)
+            }
+            async fn cleanup_orphan_graph_data(&self) -> Result<i64, MemoriaError> {
+                Ok(0)
+            }
+            async fn cleanup_edit_log(&self, _: i64) -> Result<i64, MemoriaError> {
+                Ok(0)
+            }
+            async fn cleanup_feedback(&self, _: i64) -> Result<i64, MemoriaError> {
+                Ok(0)
+            }
+            async fn create_safety_snapshot(&self, _: &str) -> (Option<String>, Option<String>) {
+                (None, None)
+            }
+            async fn log_edit(
+                &self,
+                _: &str,
+                _: &str,
+                _: Option<&str>,
+                _: Option<&str>,
+                _: &str,
+                _: Option<&str>,
+            ) {
+            }
 
-            async fn tune_user_retrieval_params(&self, user_id: &str) -> Result<bool, MemoriaError> {
+            async fn tune_user_retrieval_params(
+                &self,
+                user_id: &str,
+            ) -> Result<bool, MemoriaError> {
                 if user_id == self.failing_user {
                     return Err(MemoriaError::Database("tune exploded".into()));
                 }
@@ -1747,6 +2089,10 @@ mod tests {
 
         // Report should be degraded with a warning about u2
         assert_eq!(execution.report.status, StrategyStatus::Degraded);
-        assert!(execution.report.warnings.iter().any(|w| w.contains("tune_retrieval_params") && w.contains("u2")));
+        assert!(execution
+            .report
+            .warnings
+            .iter()
+            .any(|w| w.contains("tune_retrieval_params") && w.contains("u2")));
     }
 }

@@ -3,7 +3,7 @@
 
 use crate::graph::types::{edge_type, GraphEdge, GraphNode, NodeType};
 use crate::store::db_err;
-use memoria_core::MemoriaError;
+use memoria_core::{nullable_str, nullable_str_from_row, MemoriaError};
 use sqlx::{MySqlPool, Row};
 use uuid::Uuid;
 
@@ -17,20 +17,45 @@ const NODE_COLS_NO_EMB: &str = "node_id, user_id, node_type, content, entity_typ
     conflict_resolution, access_count, cross_session_count, is_active, superseded_by, created_at";
 
 /// Columns for GraphNode (including embedding)
-const NODE_COLS_WITH_EMB: &str = "node_id, user_id, node_type, content, entity_type, embedding, memory_id, \
+const NODE_COLS_WITH_EMB: &str =
+    "node_id, user_id, node_type, content, entity_type, embedding, memory_id, \
     session_id, confidence, trust_tier, importance, source_nodes, conflicts_with, \
     conflict_resolution, access_count, cross_session_count, is_active, superseded_by, created_at";
 
 pub struct GraphStore {
     pool: MySqlPool,
+    /// When Some, table names are qualified with this database name.
+    db_name: Option<String>,
     embedding_dim: usize,
+    /// Cache: user_id → node count (TTL 2 min)
+    node_count_cache: moka::sync::Cache<String, i64>,
 }
 
 impl GraphStore {
     pub fn new(pool: MySqlPool, embedding_dim: usize) -> Self {
         Self {
             pool,
+            db_name: None,
             embedding_dim,
+            node_count_cache: moka::sync::Cache::builder()
+                .max_capacity(10_000)
+                .time_to_live(std::time::Duration::from_secs(120))
+                .build(),
+        }
+    }
+
+    /// Create with a shared node-count cache (used by SqlMemoryStore to share
+    /// the cache across multiple GraphStore instances).
+    pub fn with_node_count_cache(
+        pool: MySqlPool,
+        embedding_dim: usize,
+        node_count_cache: moka::sync::Cache<String, i64>,
+    ) -> Self {
+        Self {
+            pool,
+            db_name: None,
+            embedding_dim,
+            node_count_cache,
         }
     }
 
@@ -38,12 +63,27 @@ impl GraphStore {
         &self.pool
     }
 
+    pub fn set_db_name(&mut self, name: String) {
+        self.db_name = Some(name);
+    }
+
+    /// Qualify a table name with the database prefix when `db_name` is set.
+    pub fn t(&self, table: &str) -> String {
+        if table.contains('.') || table.contains('`') {
+            return table.to_string();
+        }
+        match &self.db_name {
+            None => table.to_string(),
+            Some(db) => format!("`{}`.{}", db.replace('`', "``"), table),
+        }
+    }
+
     // ── DDL ──────────────────────────────────────────────────────────────────
 
     pub async fn migrate(&self) -> Result<(), MemoriaError> {
         // memory_graph_nodes
         let sql = format!(
-            r#"CREATE TABLE IF NOT EXISTS memory_graph_nodes (
+            r#"CREATE TABLE IF NOT EXISTS {} (
                 node_id             VARCHAR(32)  NOT NULL,
                 user_id             VARCHAR(64)  NOT NULL,
                 node_type           VARCHAR(10)  NOT NULL,
@@ -69,6 +109,7 @@ impl GraphStore {
                 KEY idx_graph_user_active (user_id, is_active, node_type),
                 FULLTEXT ft_graph_content (content) WITH PARSER ngram
             )"#,
+            self.t("memory_graph_nodes"),
             dim = self.embedding_dim
         );
         sqlx::query(&sql)
@@ -77,8 +118,8 @@ impl GraphStore {
             .map_err(db_err)?;
 
         // memory_graph_edges
-        sqlx::query(
-            r#"CREATE TABLE IF NOT EXISTS memory_graph_edges (
+        sqlx::query(&format!(
+            r#"CREATE TABLE IF NOT EXISTS {} (
                 source_id  VARCHAR(32)  NOT NULL,
                 target_id  VARCHAR(32)  NOT NULL,
                 edge_type  VARCHAR(15)  NOT NULL,
@@ -88,14 +129,15 @@ impl GraphStore {
                 KEY idx_edge_user (user_id),
                 KEY idx_edge_target (target_id)
             )"#,
-        )
+            self.t("memory_graph_edges"),
+        ))
         .execute(&self.pool)
         .await
         .map_err(db_err)?;
 
         // mem_entities
         let sql2 = format!(
-            r#"CREATE TABLE IF NOT EXISTS mem_entities (
+            r#"CREATE TABLE IF NOT EXISTS {} (
                 entity_id    VARCHAR(32)  NOT NULL,
                 user_id      VARCHAR(64)  NOT NULL,
                 name         VARCHAR(200) NOT NULL,
@@ -107,6 +149,7 @@ impl GraphStore {
                 UNIQUE KEY uidx_entity_user_name (user_id, name),
                 KEY idx_entity_user (user_id)
             )"#,
+            self.t("mem_entities"),
             dim = self.embedding_dim
         );
         sqlx::query(&sql2)
@@ -115,8 +158,8 @@ impl GraphStore {
             .map_err(db_err)?;
 
         // mem_memory_entity_links
-        sqlx::query(
-            r#"CREATE TABLE IF NOT EXISTS mem_memory_entity_links (
+        sqlx::query(&format!(
+            r#"CREATE TABLE IF NOT EXISTS {} (
                 memory_id  VARCHAR(64) NOT NULL,
                 entity_id  VARCHAR(32) NOT NULL,
                 user_id    VARCHAR(64) NOT NULL,
@@ -127,7 +170,8 @@ impl GraphStore {
                 KEY idx_link_user_entity (user_id, entity_id),
                 KEY idx_link_entity_user (entity_id, user_id)
             )"#,
-        )
+            self.t("mem_memory_entity_links"),
+        ))
         .execute(&self.pool)
         .await
         .map_err(db_err)?;
@@ -138,11 +182,14 @@ impl GraphStore {
     // ── Node reads ───────────────────────────────────────────────────────────
 
     pub async fn get_node(&self, node_id: &str) -> Result<Option<GraphNode>, MemoriaError> {
-        let row = sqlx::query(&format!("SELECT {NODE_COLS_WITH_EMB} FROM memory_graph_nodes WHERE node_id = ?"))
-            .bind(node_id)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(db_err)?;
+        let row = sqlx::query(&format!(
+            "SELECT {NODE_COLS_WITH_EMB} FROM {} WHERE node_id = ?",
+            self.t("memory_graph_nodes"),
+        ))
+        .bind(node_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
         Ok(row.map(|r| row_to_node(&r)))
     }
 
@@ -151,7 +198,10 @@ impl GraphStore {
             return Ok(vec![]);
         }
         let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-        let sql = format!("SELECT {NODE_COLS_NO_EMB} FROM memory_graph_nodes WHERE node_id IN ({placeholders})");
+        let sql = format!(
+            "SELECT {NODE_COLS_NO_EMB} FROM {} WHERE node_id IN ({placeholders})",
+            self.t("memory_graph_nodes"),
+        );
         let mut q = sqlx::query(&sql);
         for id in ids {
             q = q.bind(id);
@@ -165,7 +215,8 @@ impl GraphStore {
         memory_id: &str,
     ) -> Result<Option<GraphNode>, MemoriaError> {
         let row = sqlx::query(&format!(
-            "SELECT {NODE_COLS_NO_EMB} FROM memory_graph_nodes WHERE memory_id = ? AND is_active = 1 LIMIT 1",
+            "SELECT {NODE_COLS_NO_EMB} FROM {} WHERE memory_id = ? AND is_active = 1 LIMIT 1",
+            self.t("memory_graph_nodes"),
         ))
         .bind(memory_id)
         .fetch_optional(&self.pool)
@@ -191,8 +242,9 @@ impl GraphStore {
              memory_id, session_id, confidence, trust_tier, importance, \
              source_nodes, conflicts_with, conflict_resolution, \
              access_count, cross_session_count, is_active, superseded_by, created_at \
-             FROM memory_graph_nodes \
-             WHERE user_id = ? AND node_type = ?{active_clause}"
+             FROM {} \
+             WHERE user_id = ? AND node_type = ?{active_clause}",
+            self.t("memory_graph_nodes"),
         );
         let rows = sqlx::query(&sql)
             .bind(user_id)
@@ -212,15 +264,18 @@ impl GraphStore {
         limit: i64,
     ) -> Result<Vec<GraphNode>, MemoriaError> {
         // Must alias embedding to force MO to return vecf32 as text
-        let sql = "SELECT node_id, user_id, node_type, content, entity_type, \
-                   embedding AS embedding, memory_id, session_id, confidence, trust_tier, importance, \
-                   source_nodes, conflicts_with, conflict_resolution, \
-                   access_count, cross_session_count, is_active, superseded_by, created_at \
-                   FROM memory_graph_nodes \
-                   WHERE user_id = ? AND is_active = 1 \
-                     AND embedding IS NOT NULL AND vector_dims(embedding) > 0 \
-                   LIMIT ?";
-        let rows = sqlx::query(sql)
+        let sql = format!(
+            "SELECT node_id, user_id, node_type, content, entity_type, \
+             embedding AS embedding, memory_id, session_id, confidence, trust_tier, importance, \
+             source_nodes, conflicts_with, conflict_resolution, \
+             access_count, cross_session_count, is_active, superseded_by, created_at \
+             FROM {} \
+             WHERE user_id = ? AND is_active = 1 \
+               AND embedding IS NOT NULL AND vector_dims(embedding) > 0 \
+             LIMIT ?",
+            self.t("memory_graph_nodes"),
+        );
+        let rows = sqlx::query(&sql)
             .bind(user_id)
             .bind(limit)
             .fetch_all(&self.pool)
@@ -249,41 +304,44 @@ impl GraphStore {
         });
         let sql = if let Some(emb) = &emb_lit {
             format!(
-                "INSERT INTO memory_graph_nodes \
+                "INSERT INTO {} \
                  (node_id, user_id, node_type, content, entity_type, embedding, \
                   memory_id, session_id, confidence, trust_tier, importance, \
                   source_nodes, conflicts_with, conflict_resolution, \
                   access_count, cross_session_count, is_active, superseded_by, created_at) \
                  VALUES (?,?,?,?,?,'{}',?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                self.t("memory_graph_nodes"),
                 emb
             )
         } else {
-            "INSERT INTO memory_graph_nodes \
-             (node_id, user_id, node_type, content, entity_type, \
-              memory_id, session_id, confidence, trust_tier, importance, \
-              source_nodes, conflicts_with, conflict_resolution, \
-              access_count, cross_session_count, is_active, superseded_by, created_at) \
-             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
-                .to_string()
+            format!(
+                "INSERT INTO {} \
+                 (node_id, user_id, node_type, content, entity_type, \
+                  memory_id, session_id, confidence, trust_tier, importance, \
+                  source_nodes, conflicts_with, conflict_resolution, \
+                  access_count, cross_session_count, is_active, superseded_by, created_at) \
+                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                self.t("memory_graph_nodes"),
+            )
         };
         sqlx::query(&sql)
             .bind(&node.node_id)
             .bind(&node.user_id)
             .bind(node.node_type.as_str())
             .bind(&node.content)
-            .bind(&node.entity_type)
-            .bind(&node.memory_id)
-            .bind(&node.session_id)
+            .bind(nullable_str(&node.entity_type))
+            .bind(nullable_str(&node.memory_id))
+            .bind(nullable_str(&node.session_id))
             .bind(node.confidence)
             .bind(&node.trust_tier)
             .bind(node.importance)
             .bind(source_nodes_str)
-            .bind(&node.conflicts_with)
-            .bind(&node.conflict_resolution)
+            .bind(nullable_str(&node.conflicts_with))
+            .bind(nullable_str(&node.conflict_resolution))
             .bind(node.access_count)
             .bind(node.cross_session_count)
             .bind(if node.is_active { 1i8 } else { 0i8 })
-            .bind(&node.superseded_by)
+            .bind(nullable_str(&node.superseded_by))
             .bind(now)
             .execute(&self.pool)
             .await
@@ -292,21 +350,27 @@ impl GraphStore {
     }
 
     pub async fn deactivate_node(&self, node_id: &str) -> Result<(), MemoriaError> {
-        sqlx::query("UPDATE memory_graph_nodes SET is_active = 0 WHERE node_id = ?")
-            .bind(node_id)
-            .execute(&self.pool)
-            .await
-            .map_err(db_err)?;
+        sqlx::query(&format!(
+            "UPDATE {} SET is_active = 0 WHERE node_id = ?",
+            self.t("memory_graph_nodes")
+        ))
+        .bind(node_id)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
         Ok(())
     }
 
     /// Deactivate all graph nodes linked to a memory_id.
     pub async fn deactivate_by_memory_id(&self, memory_id: &str) -> Result<(), MemoriaError> {
-        sqlx::query("UPDATE memory_graph_nodes SET is_active = 0 WHERE memory_id = ?")
-            .bind(memory_id)
-            .execute(&self.pool)
-            .await
-            .map_err(db_err)?;
+        sqlx::query(&format!(
+            "UPDATE {} SET is_active = 0 WHERE memory_id = ?",
+            self.t("memory_graph_nodes")
+        ))
+        .bind(memory_id)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
         Ok(())
     }
 
@@ -316,9 +380,10 @@ impl GraphStore {
         memory_id: &str,
         new_content: &str,
     ) -> Result<(), MemoriaError> {
-        sqlx::query(
-            "UPDATE memory_graph_nodes SET content = ? WHERE memory_id = ? AND is_active = 1",
-        )
+        sqlx::query(&format!(
+            "UPDATE {} SET content = ? WHERE memory_id = ? AND is_active = 1",
+            self.t("memory_graph_nodes"),
+        ))
         .bind(new_content)
         .bind(memory_id)
         .execute(&self.pool)
@@ -333,9 +398,10 @@ impl GraphStore {
         confidence: f32,
         tier: &str,
     ) -> Result<(), MemoriaError> {
-        sqlx::query(
-            "UPDATE memory_graph_nodes SET confidence = ?, trust_tier = ? WHERE node_id = ?",
-        )
+        sqlx::query(&format!(
+            "UPDATE {} SET confidence = ?, trust_tier = ? WHERE node_id = ?",
+            self.t("memory_graph_nodes"),
+        ))
         .bind(confidence)
         .bind(tier)
         .bind(node_id)
@@ -353,11 +419,12 @@ impl GraphStore {
         old_confidence: f32,
     ) -> Result<(), MemoriaError> {
         // Mark older as conflicting with newer, reduce confidence
-        sqlx::query(
-            "UPDATE memory_graph_nodes \
+        sqlx::query(&format!(
+            "UPDATE {} \
              SET conflicts_with = ?, confidence = ? \
              WHERE node_id = ?",
-        )
+            self.t("memory_graph_nodes"),
+        ))
         .bind(newer_id)
         .bind(old_confidence * confidence_factor)
         .bind(older_id)
@@ -379,18 +446,21 @@ impl GraphStore {
         max_current_sim: f32,
     ) -> Result<Vec<(String, String, f32, f32)>, MemoriaError> {
         // MatrixOne doesn't support HAVING on computed aliases — use subquery
-        let rows = sqlx::query(
+        let rows = sqlx::query(&format!(
             "SELECT source_id, target_id, edge_weight, cur_sim FROM ( \
                SELECT e.source_id, e.target_id, e.weight as edge_weight, \
                cosine_similarity(n1.embedding, n2.embedding) as cur_sim \
-               FROM memory_graph_edges e \
-               JOIN memory_graph_nodes n1 ON e.source_id = n1.node_id \
-               JOIN memory_graph_nodes n2 ON e.target_id = n2.node_id \
+               FROM {} e \
+               JOIN {} n1 ON e.source_id = n1.node_id \
+               JOIN {} n2 ON e.target_id = n2.node_id \
                WHERE e.user_id = ? AND e.edge_type = ? AND e.weight >= ? \
                AND n1.embedding IS NOT NULL AND n2.embedding IS NOT NULL \
                AND vector_dims(n1.embedding) > 0 AND vector_dims(n2.embedding) > 0 \
              ) t WHERE t.cur_sim <= ?",
-        )
+            self.t("memory_graph_edges"),
+            self.t("memory_graph_nodes"),
+            self.t("memory_graph_nodes"),
+        ))
         .bind(user_id)
         .bind(edge_type::ASSOCIATION)
         .bind(min_edge_weight)
@@ -414,11 +484,12 @@ impl GraphStore {
     // ── Edge writes ──────────────────────────────────────────────────────────
 
     pub async fn add_edge(&self, edge: &GraphEdge) -> Result<(), MemoriaError> {
-        sqlx::query(
-            "INSERT INTO memory_graph_edges (source_id, target_id, edge_type, weight, user_id) \
+        sqlx::query(&format!(
+            "INSERT INTO {} (source_id, target_id, edge_type, weight, user_id) \
              VALUES (?,?,?,?,?) \
              ON DUPLICATE KEY UPDATE weight = VALUES(weight)",
-        )
+            self.t("memory_graph_edges"),
+        ))
         .bind(&edge.source_id)
         .bind(&edge.target_id)
         .bind(&edge.edge_type)
@@ -441,30 +512,115 @@ impl GraphStore {
         entity_type: &str,
     ) -> Result<(String, bool), MemoriaError> {
         // Try INSERT first; on duplicate (user_id, name) catch the error and SELECT.
-        let entity_id = new_id()[..32].to_string();
+        let entity_id = new_id();
         let now = chrono::Utc::now().naive_utc();
-        let res = sqlx::query(
-            "INSERT INTO mem_entities (entity_id, user_id, name, display_name, entity_type, created_at) \
-             VALUES (?,?,?,?,?,?)"
-        )
-        .bind(&entity_id).bind(user_id).bind(name).bind(display_name)
-        .bind(entity_type).bind(now)
-        .execute(&self.pool).await;
+        let res = sqlx::query(&format!(
+            "INSERT INTO {} (entity_id, user_id, name, display_name, entity_type, created_at) \
+             VALUES (?,?,?,?,?,?)",
+            self.t("mem_entities"),
+        ))
+        .bind(&entity_id)
+        .bind(user_id)
+        .bind(name)
+        .bind(display_name)
+        .bind(entity_type)
+        .bind(now)
+        .execute(&self.pool)
+        .await;
 
         match res {
             Ok(_) => Ok((entity_id, true)),
-            Err(sqlx::Error::Database(e))
-                if e.message().contains("Duplicate entry") =>
-            {
+            Err(sqlx::Error::Database(e)) if e.message().contains("Duplicate entry") => {
                 // Duplicate on unique key — fetch existing
-                let row = sqlx::query("SELECT entity_id FROM mem_entities WHERE user_id = ? AND name = ?")
-                    .bind(user_id).bind(name)
-                    .fetch_one(&self.pool).await.map_err(db_err)?;
+                let row = sqlx::query(&format!(
+                    "SELECT entity_id FROM {} WHERE user_id = ? AND name = ?",
+                    self.t("mem_entities"),
+                ))
+                .bind(user_id)
+                .bind(name)
+                .fetch_one(&self.pool)
+                .await
+                .map_err(db_err)?;
                 let id: String = row.try_get("entity_id").map_err(db_err)?;
                 Ok((id, false))
             }
             Err(e) => Err(db_err(e)),
         }
+    }
+
+    /// Batch-upsert entities, return vec of (name, entity_id).
+    /// Uses multi-row INSERT IGNORE + single SELECT to resolve IDs in 2 round-trips.
+    /// Duplicate names in the input are handled gracefully: INSERT IGNORE skips the
+    /// second row (wasting only a generated UUID), and the SELECT returns one row per
+    /// unique (user_id, name). Callers use the returned name→id map, so duplicates
+    /// resolve to the same entity_id automatically.
+    const UPSERT_CHUNK_SIZE: usize = 50;
+
+    pub async fn batch_upsert_entities(
+        &self,
+        user_id: &str,
+        entities: &[(&str, &str, &str)], // (name, display_name, entity_type)
+    ) -> Result<Vec<(String, String)>, MemoriaError> {
+        if entities.is_empty() {
+            return Ok(Vec::new());
+        }
+        let now = chrono::Utc::now().naive_utc();
+
+        // 1. Bulk INSERT IGNORE — inserts new, silently skips duplicates
+        for chunk in entities.chunks(Self::UPSERT_CHUNK_SIZE) {
+            let placeholders = chunk
+                .iter()
+                .map(|_| "(?,?,?,?,?,?)")
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "INSERT IGNORE INTO {} \
+                 (entity_id, user_id, name, display_name, entity_type, created_at) \
+                 VALUES {placeholders}",
+                self.t("mem_entities"),
+            );
+            let mut q = sqlx::query(&sql);
+            for (name, display, etype) in chunk {
+                let eid = new_id();
+                q = q
+                    .bind(eid)
+                    .bind(user_id)
+                    .bind(*name)
+                    .bind(*display)
+                    .bind(*etype)
+                    .bind(now);
+            }
+            q.execute(&self.pool).await.map_err(db_err)?;
+        }
+
+        // 2. SELECT to resolve all entity_ids (deduplicate names, chunk to avoid
+        //    overly long IN clauses on very large batches)
+        let mut seen = std::collections::HashSet::new();
+        let names: Vec<&str> = entities
+            .iter()
+            .map(|(n, _, _)| *n)
+            .filter(|n| seen.insert(*n))
+            .collect();
+
+        let mut result = Vec::with_capacity(names.len());
+        for chunk in names.chunks(Self::UPSERT_CHUNK_SIZE) {
+            let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+            let sql = format!(
+                "SELECT name, entity_id FROM {} WHERE user_id = ? AND name IN ({placeholders})",
+                self.t("mem_entities"),
+            );
+            let mut q = sqlx::query(&sql).bind(user_id);
+            for name in chunk {
+                q = q.bind(*name);
+            }
+            let rows = q.fetch_all(&self.pool).await.map_err(db_err)?;
+            for r in rows {
+                let name: String = r.try_get("name").unwrap_or_default();
+                let eid: String = r.try_get("entity_id").unwrap_or_default();
+                result.push((name, eid));
+            }
+        }
+        Ok(result)
     }
 
     pub async fn upsert_memory_entity_link(
@@ -481,12 +637,13 @@ impl GraphStore {
             "llm" => 0.9,
             _ => 0.8, // regex, unknown
         };
-        sqlx::query(
-            "INSERT INTO mem_memory_entity_links \
+        sqlx::query(&format!(
+            "INSERT INTO {} \
              (memory_id, entity_id, user_id, source, weight, created_at) \
              VALUES (?,?,?,?,?,?) \
              ON DUPLICATE KEY UPDATE source = VALUES(source), weight = VALUES(weight)",
-        )
+            self.t("mem_memory_entity_links"),
+        ))
         .bind(memory_id)
         .bind(entity_id)
         .bind(user_id)
@@ -511,17 +668,18 @@ impl GraphStore {
             return Ok(());
         }
         let now = chrono::Utc::now().naive_utc();
-        for chunk in links.chunks(50) {
+        for chunk in links.chunks(Self::UPSERT_CHUNK_SIZE) {
             let placeholders = chunk
                 .iter()
                 .map(|_| "(?,?,?,?,?,?)")
                 .collect::<Vec<_>>()
                 .join(", ");
             let sql = format!(
-                "INSERT INTO mem_memory_entity_links \
+                "INSERT INTO {} \
                  (memory_id, entity_id, user_id, source, weight, created_at) \
                  VALUES {placeholders} \
-                 ON DUPLICATE KEY UPDATE source = VALUES(source), weight = VALUES(weight)"
+                 ON DUPLICATE KEY UPDATE source = VALUES(source), weight = VALUES(weight)",
+                self.t("mem_memory_entity_links"),
             );
             let mut q = sqlx::query(&sql);
             for (memory_id, entity_id, source) in chunk {
@@ -550,13 +708,15 @@ impl GraphStore {
         limit: i64,
     ) -> Result<Vec<(String, String)>, MemoriaError> {
         // Memories that have no entry in mem_memory_entity_links
-        let rows = sqlx::query(
-            "SELECT m.memory_id, m.content FROM mem_memories m \
+        let rows = sqlx::query(&format!(
+            "SELECT m.memory_id, m.content FROM {} m \
              WHERE m.user_id = ? AND m.is_active = 1 \
-             AND NOT EXISTS (SELECT 1 FROM mem_memory_entity_links l \
+             AND NOT EXISTS (SELECT 1 FROM {} l \
                              WHERE l.memory_id = m.memory_id AND l.user_id = m.user_id) \
              ORDER BY m.created_at DESC LIMIT ?",
-        )
+            self.t("mem_memories"),
+            self.t("mem_memory_entity_links"),
+        ))
         .bind(user_id)
         .bind(limit)
         .fetch_all(&self.pool)
@@ -576,9 +736,10 @@ impl GraphStore {
         &self,
         user_id: &str,
     ) -> Result<Vec<(String, String)>, MemoriaError> {
-        let rows = sqlx::query(
-            "SELECT name, entity_type FROM mem_entities WHERE user_id = ? ORDER BY name",
-        )
+        let rows = sqlx::query(&format!(
+            "SELECT name, entity_type FROM {} WHERE user_id = ? ORDER BY name",
+            self.t("mem_entities"),
+        ))
         .bind(user_id)
         .fetch_all(&self.pool)
         .await
@@ -612,11 +773,12 @@ impl GraphStore {
         );
         let sql = format!(
             "SELECT {NODE_COLS_NO_EMB}, l2_distance(embedding, '{vec_lit}') AS l2_dist \
-             FROM memory_graph_nodes \
+             FROM {} \
              WHERE user_id = ? AND is_active = 1 \
                AND embedding IS NOT NULL AND vector_dims(embedding) > 0 \
              ORDER BY l2_dist ASC \
-             LIMIT ? by rank with option 'mode=post'"
+             LIMIT ? by rank with option 'mode=post'",
+            self.t("memory_graph_nodes"),
         );
         let rows = sqlx::query(&sql)
             .bind(user_id)
@@ -661,10 +823,11 @@ impl GraphStore {
         }
         let sql = format!(
             "SELECT {NODE_COLS_NO_EMB}, MATCH(content) AGAINST('{safe}' IN BOOLEAN MODE) AS ft_score \
-             FROM memory_graph_nodes \
+             FROM {} \
              WHERE user_id = ? AND is_active = 1 \
              AND MATCH(content) AGAINST('{safe}' IN BOOLEAN MODE) \
-             ORDER BY ft_score DESC LIMIT ?"
+             ORDER BY ft_score DESC LIMIT ?",
+            self.t("memory_graph_nodes"),
         );
         let rows = match sqlx::query(&sql)
             .bind(user_id)
@@ -696,13 +859,90 @@ impl GraphStore {
         user_id: &str,
         name: &str,
     ) -> Result<Option<String>, MemoriaError> {
-        let row = sqlx::query("SELECT entity_id FROM mem_entities WHERE user_id = ? AND name = ?")
+        let row = sqlx::query(&format!(
+            "SELECT entity_id FROM {} WHERE user_id = ? AND name = ?",
+            self.t("mem_entities")
+        ))
+        .bind(user_id)
+        .bind(name)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(row.and_then(|r| r.try_get("entity_id").ok()))
+    }
+
+    /// Batch find entity_ids by names. Returns name → entity_id map.
+    pub async fn find_entities_by_names(
+        &self,
+        user_id: &str,
+        names: &[&str],
+    ) -> Result<std::collections::HashMap<String, String>, MemoriaError> {
+        let mut map = std::collections::HashMap::new();
+        if names.is_empty() {
+            return Ok(map);
+        }
+        for chunk in names.chunks(100) {
+            let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let sql = format!(
+                "SELECT name, entity_id FROM {} WHERE user_id = ? AND name IN ({placeholders})",
+                self.t("mem_entities"),
+            );
+            let mut q = sqlx::query(&sql).bind(user_id);
+            for name in chunk {
+                q = q.bind(*name);
+            }
+            let rows = q.fetch_all(&self.pool).await.map_err(db_err)?;
+            for r in &rows {
+                let n: String = r.try_get("name").unwrap_or_default();
+                let eid: String = r.try_get("entity_id").unwrap_or_default();
+                map.insert(n, eid);
+            }
+        }
+        Ok(map)
+    }
+
+    /// Batch reverse lookup: multiple entity_ids → memory_ids with weights.
+    /// `limit_per_entity` caps results per entity; total LIMIT = limit_per_entity × entity count.
+    pub async fn get_memories_by_entities(
+        &self,
+        entity_ids: &[&str],
+        user_id: &str,
+        limit_per_entity: i64,
+    ) -> Result<Vec<(String, f32)>, MemoriaError> {
+        if entity_ids.is_empty() {
+            return Ok(vec![]);
+        }
+        let total_limit = limit_per_entity * entity_ids.len() as i64;
+        let placeholders = entity_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT l.memory_id, l.weight \
+             FROM {} l \
+             JOIN {} m ON l.memory_id = m.memory_id \
+             WHERE l.entity_id IN ({placeholders}) AND l.user_id = ? AND m.is_active = 1 \
+             ORDER BY l.weight DESC, m.created_at DESC \
+             LIMIT ?",
+            self.t("mem_memory_entity_links"),
+            self.t("mem_memories"),
+            placeholders = placeholders
+        );
+        let mut q = sqlx::query(&sql);
+        for eid in entity_ids {
+            q = q.bind(*eid);
+        }
+        let rows = q
             .bind(user_id)
-            .bind(name)
-            .fetch_optional(&self.pool)
+            .bind(total_limit)
+            .fetch_all(&self.pool)
             .await
             .map_err(db_err)?;
-        Ok(row.and_then(|r| r.try_get("entity_id").ok()))
+        Ok(rows
+            .iter()
+            .filter_map(|r| {
+                let mid: String = r.try_get("memory_id").ok()?;
+                let w: f32 = r.try_get("weight").ok()?;
+                Some((mid, w))
+            })
+            .collect())
     }
 
     /// Reverse lookup: entity → memory_ids with weights.
@@ -712,14 +952,16 @@ impl GraphStore {
         user_id: &str,
         limit: i64,
     ) -> Result<Vec<(String, f32)>, MemoriaError> {
-        let rows = sqlx::query(
+        let rows = sqlx::query(&format!(
             "SELECT l.memory_id, l.weight \
-             FROM mem_memory_entity_links l \
-             JOIN mem_memories m ON l.memory_id = m.memory_id \
+             FROM {} l \
+             JOIN {} m ON l.memory_id = m.memory_id \
              WHERE l.entity_id = ? AND l.user_id = ? AND m.is_active = 1 \
              ORDER BY l.weight DESC, m.created_at DESC \
              LIMIT ?",
-        )
+            self.t("mem_memory_entity_links"),
+            self.t("mem_memories"),
+        ))
         .bind(entity_id)
         .bind(user_id)
         .bind(limit)
@@ -756,14 +998,18 @@ impl GraphStore {
         // Incoming: target_id IN node_ids, peer = source_id
         let sql = format!(
             "SELECT e.source_id, e.target_id, e.edge_type, e.weight, 0 AS direction \
-             FROM memory_graph_edges e \
-             JOIN memory_graph_nodes n ON n.node_id = e.target_id AND n.is_active = 1 \
+             FROM {} e \
+             JOIN {} n ON n.node_id = e.target_id AND n.is_active = 1 \
              WHERE e.source_id IN ({ph}) \
              UNION ALL \
              SELECT e.source_id, e.target_id, e.edge_type, e.weight, 1 AS direction \
-             FROM memory_graph_edges e \
-             JOIN memory_graph_nodes n ON n.node_id = e.source_id AND n.is_active = 1 \
-             WHERE e.target_id IN ({ph})"
+             FROM {} e \
+             JOIN {} n ON n.node_id = e.source_id AND n.is_active = 1 \
+             WHERE e.target_id IN ({ph})",
+            self.t("memory_graph_edges"),
+            self.t("memory_graph_nodes"),
+            self.t("memory_graph_edges"),
+            self.t("memory_graph_nodes"),
         );
         let mut q = sqlx::query(&sql);
         for id in node_ids {
@@ -795,16 +1041,105 @@ impl GraphStore {
         Ok((incoming, outgoing))
     }
 
-    /// Count active nodes for a user.
+    /// Deactivate entity links in `mem_memory_entity_links` for a memory_id.
+    pub async fn delete_memory_entity_links(&self, memory_id: &str) -> Result<i64, MemoriaError> {
+        let r = sqlx::query(&format!(
+            "DELETE FROM {} WHERE memory_id = ?",
+            self.t("mem_memory_entity_links")
+        ))
+        .bind(memory_id)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(r.rows_affected() as i64)
+    }
+
+    /// Remove orphaned rows from `mem_memory_entity_links` whose memory_id
+    /// no longer exists or is inactive in `mem_memories`. Idempotent, batch-safe.
+    pub async fn cleanup_orphan_memory_entity_links(&self) -> Result<i64, MemoriaError> {
+        // Two-step: find orphan memory_ids, then delete by primary key.
+        let orphans: Vec<(String, String)> = sqlx::query_as(&format!(
+            "SELECT l.memory_id, l.entity_id FROM {} l \
+             LEFT JOIN {} m ON l.memory_id = m.memory_id AND m.is_active = 1 \
+             WHERE m.memory_id IS NULL LIMIT 5000",
+            self.t("mem_memory_entity_links"),
+            self.t("mem_memories"),
+        ))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        if orphans.is_empty() {
+            return Ok(0);
+        }
+        let mut total = 0i64;
+        for chunk in orphans.chunks(100) {
+            let conds = chunk
+                .iter()
+                .map(|_| "(memory_id = ? AND entity_id = ?)")
+                .collect::<Vec<_>>()
+                .join(" OR ");
+            let sql = format!(
+                "DELETE FROM {} WHERE {conds}",
+                self.t("mem_memory_entity_links")
+            );
+            let mut q = sqlx::query(&sql);
+            for (mid, eid) in chunk {
+                q = q.bind(mid).bind(eid);
+            }
+            let r = q.execute(&self.pool).await.map_err(db_err)?;
+            total += r.rows_affected() as i64;
+        }
+        Ok(total)
+    }
+
+    /// Deactivate graph nodes whose memory_id is inactive in `mem_memories`.
+    /// Idempotent fallback for crash recovery.
+    pub async fn cleanup_orphan_graph_nodes(&self) -> Result<i64, MemoriaError> {
+        // Two-step: find orphan node_ids, then update by primary key.
+        let orphans: Vec<(String,)> = sqlx::query_as(&format!(
+            "SELECT g.node_id FROM {} g \
+             LEFT JOIN {} m ON g.memory_id = m.memory_id \
+             WHERE g.is_active = 1 AND g.memory_id IS NOT NULL \
+               AND (m.is_active = 0 OR m.memory_id IS NULL) \
+             LIMIT 5000",
+            self.t("memory_graph_nodes"),
+            self.t("mem_memories"),
+        ))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        if orphans.is_empty() {
+            return Ok(0);
+        }
+        let placeholders = orphans.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "UPDATE {} SET is_active = 0 WHERE node_id IN ({placeholders})",
+            self.t("memory_graph_nodes"),
+        );
+        let mut q = sqlx::query(&sql);
+        for (nid,) in &orphans {
+            q = q.bind(nid);
+        }
+        let r = q.execute(&self.pool).await.map_err(db_err)?;
+        Ok(r.rows_affected() as i64)
+    }
+
+    /// Count active nodes for a user (cached, TTL 2 min).
     pub async fn count_user_nodes(&self, user_id: &str) -> Result<i64, MemoriaError> {
-        let row = sqlx::query(
-            "SELECT COUNT(*) as cnt FROM memory_graph_nodes WHERE user_id = ? AND is_active = 1",
-        )
+        if let Some(cached) = self.node_count_cache.get(user_id) {
+            return Ok(cached);
+        }
+        let row = sqlx::query(&format!(
+            "SELECT COUNT(*) as cnt FROM {} WHERE user_id = ? AND is_active = 1",
+            self.t("memory_graph_nodes"),
+        ))
         .bind(user_id)
         .fetch_one(&self.pool)
         .await
         .map_err(db_err)?;
-        Ok(row.try_get("cnt").unwrap_or(0))
+        let cnt: i64 = row.try_get("cnt").unwrap_or(0);
+        self.node_count_cache.insert(user_id.to_string(), cnt);
+        Ok(cnt)
     }
 
     /// Get edges between a set of node IDs (for connected components).
@@ -817,8 +1152,9 @@ impl GraphStore {
         }
         let placeholders = node_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
         let sql = format!(
-            "SELECT source_id, target_id FROM memory_graph_edges \
-             WHERE source_id IN ({placeholders}) OR target_id IN ({placeholders})"
+            "SELECT source_id, target_id FROM {} \
+             WHERE source_id IN ({placeholders}) OR target_id IN ({placeholders})",
+            self.t("memory_graph_edges"),
         );
         let mut q = sqlx::query(&sql);
         for id in node_ids {
@@ -862,20 +1198,38 @@ fn row_to_node_inner(r: &sqlx::mysql::MySqlRow, embedding: Option<Vec<f32>>) -> 
         user_id: r.try_get("user_id").unwrap_or_default(),
         node_type: node_type_str.parse().unwrap(),
         content: r.try_get("content").unwrap_or_default(),
-        entity_type: r.try_get("entity_type").ok().flatten(),
+        entity_type: nullable_str_from_row(
+            r.try_get::<Option<String>, _>("entity_type").ok().flatten(),
+        ),
         embedding,
-        memory_id: r.try_get("memory_id").ok().flatten(),
-        session_id: r.try_get("session_id").ok().flatten(),
+        memory_id: nullable_str_from_row(
+            r.try_get::<Option<String>, _>("memory_id").ok().flatten(),
+        ),
+        session_id: nullable_str_from_row(
+            r.try_get::<Option<String>, _>("session_id").ok().flatten(),
+        ),
         confidence: r.try_get::<f32, _>("confidence").unwrap_or(0.75),
         trust_tier: r.try_get("trust_tier").unwrap_or_else(|_| "T3".to_string()),
         importance: r.try_get::<f32, _>("importance").unwrap_or(0.0),
         source_nodes,
-        conflicts_with: r.try_get("conflicts_with").ok().flatten(),
-        conflict_resolution: r.try_get("conflict_resolution").ok().flatten(),
+        conflicts_with: nullable_str_from_row(
+            r.try_get::<Option<String>, _>("conflicts_with")
+                .ok()
+                .flatten(),
+        ),
+        conflict_resolution: nullable_str_from_row(
+            r.try_get::<Option<String>, _>("conflict_resolution")
+                .ok()
+                .flatten(),
+        ),
         access_count: r.try_get::<i32, _>("access_count").unwrap_or(0),
         cross_session_count: r.try_get::<i32, _>("cross_session_count").unwrap_or(0),
         is_active: r.try_get::<i16, _>("is_active").unwrap_or(1) != 0,
-        superseded_by: r.try_get("superseded_by").ok().flatten(),
+        superseded_by: nullable_str_from_row(
+            r.try_get::<Option<String>, _>("superseded_by")
+                .ok()
+                .flatten(),
+        ),
         created_at: r.try_get("created_at").ok(),
     }
 }
