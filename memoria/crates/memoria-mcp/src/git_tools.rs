@@ -191,6 +191,7 @@ fn safety_display_name(internal: &str) -> Option<String> {
 pub struct VisibleSnapshot {
     pub display_name: String,
     pub internal_name: String,
+    pub memory_count: Option<i64>,
     pub timestamp: Option<NaiveDateTime>,
     pub registered: bool,
 }
@@ -355,14 +356,34 @@ fn git_for_store(
     ))
 }
 
+pub async fn count_active_memories_at_snapshot(
+    sql: &Arc<memoria_storage::SqlMemoryStore>,
+    user_id: &str,
+    snapshot_name: &str,
+) -> Result<i64, MemoriaError> {
+    let snapshot_name = validate_identifier(snapshot_name)?;
+    let table = sql.t("mem_memories");
+    let count_sql = format!(
+        "SELECT COUNT(*) as cnt FROM {table} {{SNAPSHOT = '{snapshot_name}'}} WHERE user_id = ? AND is_active > 0"
+    );
+    sqlx::query_scalar(&count_sql)
+        .bind(user_id)
+        .fetch_one(sql.pool())
+        .await
+        .map_err(db_err)
+}
+
 pub async fn visible_snapshots_for_user(
     svc: &Arc<MemoryService>,
     user_id: &str,
 ) -> Result<Vec<VisibleSnapshot>, MemoriaError> {
+    let started = std::time::Instant::now();
     let sql = snapshot_store(svc, user_id).await?;
     let db_name = sql.database_name();
     let git = git_for_store(&sql)?;
+    let list_started = std::time::Instant::now();
     let all = git.list_snapshots().await.map_err(git_err)?;
+    let list_elapsed_ms = list_started.elapsed().as_millis();
     let actual_by_name: HashMap<String, memoria_git::Snapshot> = all
         .into_iter()
         .filter(|s| {
@@ -374,12 +395,16 @@ pub async fn visible_snapshots_for_user(
 
     let mut snapshots = Vec::new();
     let mut seen_internal = HashSet::new();
-    for reg in sql.list_snapshot_registrations(user_id).await? {
+    let registrations_started = std::time::Instant::now();
+    let registrations = sql.list_snapshot_registrations(user_id).await?;
+    let registrations_elapsed_ms = registrations_started.elapsed().as_millis();
+    for reg in registrations {
         if let Some(actual) = actual_by_name.get(&reg.snapshot_name) {
             seen_internal.insert(reg.snapshot_name.clone());
             snapshots.push(VisibleSnapshot {
                 display_name: reg.name,
                 internal_name: reg.snapshot_name,
+                memory_count: memoria_storage::snapshot_extra_memory_count(reg.extra.as_ref()),
                 timestamp: actual.timestamp.or(Some(reg.created_at)),
                 registered: true,
             });
@@ -399,6 +424,7 @@ pub async fn visible_snapshots_for_user(
                     snap_display(&actual.snapshot_name)
                 },
                 internal_name: actual.snapshot_name.clone(),
+                memory_count: None,
                 timestamp: actual.timestamp,
                 registered: false,
             });
@@ -406,6 +432,30 @@ pub async fn visible_snapshots_for_user(
     }
 
     snapshots.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+    let total_elapsed_ms = started.elapsed().as_millis();
+    if total_elapsed_ms >= 100 {
+        tracing::info!(
+            user_id = %user_id,
+            db_name = ?db_name,
+            actual_snapshot_count = actual_by_name.len(),
+            visible_snapshot_count = snapshots.len(),
+            show_snapshots_elapsed_ms = list_elapsed_ms,
+            registrations_elapsed_ms,
+            total_elapsed_ms,
+            "snapshot_list_phase: visible_snapshots_for_user"
+        );
+    } else {
+        tracing::debug!(
+            user_id = %user_id,
+            db_name = ?db_name,
+            actual_snapshot_count = actual_by_name.len(),
+            visible_snapshot_count = snapshots.len(),
+            show_snapshots_elapsed_ms = list_elapsed_ms,
+            registrations_elapsed_ms,
+            total_elapsed_ms,
+            "snapshot_list_phase: visible_snapshots_for_user"
+        );
+    }
     Ok(snapshots)
 }
 
@@ -816,7 +866,10 @@ pub async fn call(
                         return Err(git_err(err));
                     }
                 };
-                sql.register_snapshot(user_id, &display, &snap.snapshot_name)
+                let memory_count =
+                    count_active_memories_at_snapshot(&sql, user_id, &snap.snapshot_name).await?;
+                let extra = memoria_storage::snapshot_extra_with_memory_count(memory_count);
+                sql.register_snapshot(user_id, &display, &snap.snapshot_name, Some(&extra))
                     .await?;
                 Ok(mcp_text(&format!(
                     "Snapshot '{}' created at {:?}",

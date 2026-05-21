@@ -544,37 +544,59 @@ impl GitForDataService {
     }
 
     pub async fn list_snapshots(&self) -> Result<Vec<Snapshot>, MemoriaError> {
-        let rows = sqlx::query("SHOW SNAPSHOTS")
+        let started = std::time::Instant::now();
+        let show_sql = format!(
+            "SHOW SNAPSHOTS WHERE DATABASE_NAME = '{}'",
+            quote_sql_literal(&self.db_name)
+        );
+        let rows = sqlx::query(&show_sql)
             .fetch_all(&self.pool)
             .await
             .map_err(db_err)?;
-        rows.iter()
+        let show_elapsed_ms = started.elapsed().as_millis();
+        let snapshots: Vec<Snapshot> = rows
+            .iter()
             .map(|r| {
-                // Try NaiveDateTime directly first, then fall back to string parsing
-                let timestamp = r.try_get::<NaiveDateTime, _>("TIMESTAMP").ok().or_else(|| {
-                    r.try_get::<String, _>("TIMESTAMP").ok().and_then(|s| {
+                // `SHOW SNAPSHOTS WHERE ...` is rewritten through a SELECT wrapper in
+                // MatrixOne and returns lower-case output column names.
+                let timestamp = r.try_get::<NaiveDateTime, _>("timestamp").ok().or_else(|| {
+                    r.try_get::<String, _>("timestamp").ok().and_then(|s| {
                         NaiveDateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S%.f")
                             .ok()
                             .or_else(|| NaiveDateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S").ok())
                     })
                 });
                 Ok(Snapshot {
-                    snapshot_name: r.try_get("SNAPSHOT_NAME").map_err(db_err)?,
+                    snapshot_name: r.try_get("snapshot_name").map_err(db_err)?,
                     timestamp,
-                    snapshot_level: r.try_get("SNAPSHOT_LEVEL").map_err(db_err)?,
-                    account_name: r.try_get("ACCOUNT_NAME").map_err(db_err)?,
-                    database_name: r.try_get("DATABASE_NAME").ok(),
-                    table_name: r.try_get("TABLE_NAME").ok(),
+                    snapshot_level: r.try_get("snapshot_level").map_err(db_err)?,
+                    account_name: r.try_get("account_name").map_err(db_err)?,
+                    database_name: r.try_get("database_name").ok(),
+                    table_name: r.try_get("table_name").ok(),
                 })
             })
-            .filter(|result| {
-                result
-                    .as_ref()
-                    .ok()
-                    .and_then(|snapshot| snapshot.database_name.as_ref())
-                    .is_some_and(|db_name| db_name == &self.db_name)
-            })
-            .collect()
+            .collect::<Result<Vec<Snapshot>, MemoriaError>>()?;
+        let total_elapsed_ms = started.elapsed().as_millis();
+        if total_elapsed_ms >= 100 {
+            tracing::info!(
+                db_name = %self.db_name,
+                show_rows = rows.len(),
+                filtered_rows = snapshots.len(),
+                show_elapsed_ms,
+                total_elapsed_ms,
+                "snapshot_list_phase: show_snapshots"
+            );
+        } else {
+            tracing::debug!(
+                db_name = %self.db_name,
+                show_rows = rows.len(),
+                filtered_rows = snapshots.len(),
+                show_elapsed_ms,
+                total_elapsed_ms,
+                "snapshot_list_phase: show_snapshots"
+            );
+        }
+        Ok(snapshots)
     }
 
     pub async fn get_snapshot(&self, name: &str) -> Result<Option<Snapshot>, MemoriaError> {
