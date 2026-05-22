@@ -267,7 +267,14 @@ async fn test_search_vector_from_filtered_scoped_prefilters_by_session() {
     store.insert(&global_mem).await.unwrap();
 
     let global_results = store
-        .search_vector_from_filtered_scoped("mem_memories", &uid, &mk_vec(1.0, 0.0, 0.0), 1, None, None)
+        .search_vector_from_filtered_scoped(
+            "mem_memories",
+            &uid,
+            &mk_vec(1.0, 0.0, 0.0),
+            1,
+            None,
+            None,
+        )
         .await
         .expect("global vector search");
     assert_eq!(

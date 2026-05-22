@@ -860,7 +860,9 @@ pub async fn list_branches(
         "name": "main",
         "active": active_branch == "main",
     })];
-    for (name, _table_name, created_at) in sql.list_branches(auth.scope_id()).await.map_err(api_err)? {
+    for (name, _table_name, created_at) in
+        sql.list_branches(auth.scope_id()).await.map_err(api_err)?
+    {
         let created_at_str = format_snapshot_timestamp(created_at);
         branches.push(json!({
             "name": name,

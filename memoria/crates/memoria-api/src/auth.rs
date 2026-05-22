@@ -142,6 +142,7 @@ pub async fn group_main_write_guard(
     req: axum::http::Request<axum::body::Body>,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
+    use axum::body::{to_bytes, Body};
     use axum::response::IntoResponse;
 
     // Extract bearer token from Authorization header
@@ -174,6 +175,75 @@ pub async fn group_main_write_guard(
                 if let Ok(branch) = branch {
                     if branch == "main" {
                         if group_main_write_allowed_for_solo_owner(&state, gid, &p.user_id).await {
+                            return next.run(req).await;
+                        }
+                        let path = req.uri().path();
+                        let explicit_query_branch = req
+                            .uri()
+                            .query()
+                            .and_then(|query| {
+                                serde_urlencoded::from_str::<
+                                    std::collections::HashMap<String, String>,
+                                >(query)
+                                .ok()
+                            })
+                            .and_then(|query| query.get("branch").cloned())
+                            .map(|branch| {
+                                let branch = branch.trim();
+                                !branch.is_empty() && branch != "main"
+                            })
+                            .unwrap_or(false);
+                        if req.method() == axum::http::Method::DELETE
+                            && path.starts_with("/v1/memories/")
+                            && !path.ends_with("/correct")
+                            && explicit_query_branch
+                        {
+                            return next.run(req).await;
+                        }
+                        let branch_aware_body_route = matches!(
+                            path,
+                            "/v1/memories"
+                                | "/v1/memories/batch"
+                                | "/v1/memories/correct"
+                                | "/v1/memories/purge"
+                                | "/v1/observe"
+                        ) || (path.starts_with("/v1/memories/")
+                            && path.ends_with("/correct"));
+                        if !branch_aware_body_route {
+                            return (
+                                StatusCode::FORBIDDEN,
+                                "main is read-only in group mode; \
+                                 create or checkout a branch, then use selective apply"
+                                    .to_string(),
+                            )
+                                .into_response();
+                        }
+                        let (parts, body) = req.into_parts();
+                        let bytes = match to_bytes(body, 8 * 1024 * 1024).await {
+                            Ok(bytes) => bytes,
+                            Err(e) => {
+                                return (
+                                    StatusCode::PAYLOAD_TOO_LARGE,
+                                    format!("request body could not be buffered: {e}"),
+                                )
+                                    .into_response();
+                            }
+                        };
+                        let explicit_non_main_branch =
+                            serde_json::from_slice::<serde_json::Value>(&bytes)
+                                .ok()
+                                .and_then(|body| {
+                                    body.get("branch")
+                                        .and_then(|branch| branch.as_str())
+                                        .map(str::to_string)
+                                })
+                                .map(|branch| {
+                                    let branch = branch.trim();
+                                    !branch.is_empty() && branch != "main"
+                                })
+                                .unwrap_or(false);
+                        if explicit_non_main_branch {
+                            let req = axum::http::Request::from_parts(parts, Body::from(bytes));
                             return next.run(req).await;
                         }
                         return (

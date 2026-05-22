@@ -856,7 +856,10 @@ pub async fn user_branch_stats(
         if name == "main" || raw_table_name.is_empty() {
             continue;
         }
-        if !raw_table_name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        if !raw_table_name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
             tracing::warn!(
                 user_id = %user_id,
                 branch = %name,
@@ -867,11 +870,10 @@ pub async fn user_branch_stats(
             continue;
         }
         let bt = user_store.t(raw_table_name);
-        let count_result = sqlx::query_scalar::<_, i64>(&format!(
-            "SELECT COUNT(*) FROM {bt} WHERE is_active > 0"
-        ))
-        .fetch_one(user_store.pool())
-        .await;
+        let count_result =
+            sqlx::query_scalar::<_, i64>(&format!("SELECT COUNT(*) FROM {bt} WHERE is_active > 0"))
+                .fetch_one(user_store.pool())
+                .await;
         let count = match count_result {
             Ok(n) => n,
             Err(e) => {

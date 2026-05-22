@@ -45,8 +45,8 @@ pub use scoring::{
     DefaultScoringPlugin, FeedbackTotals, ScoringPlugin, ScoringStore, TuningResult,
 };
 pub use service::{
-    CandidateScore, ExplainLevel, InMemoryFlusher, MemoryService, PurgeResult, RetrievalExplain,
-    RetrieveOptions, SessionScope, ENTITY_EXTRACTION_DROPS,
+    CandidateScore, ExplainLevel, InMemoryFlusher, ListActiveOptions, MemoryService, PurgeResult,
+    RetrievalExplain, RetrieveOptions, SessionScope, ENTITY_EXTRACTION_DROPS,
 };
 pub use stats_reporter::StatsReporter;
 

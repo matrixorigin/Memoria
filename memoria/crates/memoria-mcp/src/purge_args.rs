@@ -8,6 +8,7 @@ pub(crate) struct MemoryPurgeArgs {
     pub(crate) topic: Option<String>,
     pub(crate) session_id: Option<String>,
     pub(crate) memory_types: Option<Vec<MemoryType>>,
+    pub(crate) branch: Option<String>,
 }
 
 pub(crate) fn parse_memory_purge_args(args: &Value) -> Result<MemoryPurgeArgs> {
@@ -22,6 +23,11 @@ pub(crate) fn parse_memory_purge_args(args: &Value) -> Result<MemoryPurgeArgs> {
         .filter(|s| !s.is_empty())
         .map(str::to_string);
     let session_id = args["session_id"]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let branch = args["branch"]
         .as_str()
         .map(str::trim)
         .filter(|s| !s.is_empty())
@@ -60,5 +66,6 @@ pub(crate) fn parse_memory_purge_args(args: &Value) -> Result<MemoryPurgeArgs> {
         topic,
         session_id,
         memory_types,
+        branch,
     })
 }

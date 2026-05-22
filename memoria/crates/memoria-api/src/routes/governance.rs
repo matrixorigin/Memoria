@@ -5,13 +5,28 @@ use memoria_service::{
 use serde_json::json;
 use tracing::warn;
 
-use crate::{auth::AuthUser, models::*, routes::memory::api_err, state::AppState};
+use crate::{
+    auth::{group_main_write_allowed_for_solo_owner, AuthUser},
+    models::*,
+    routes::memory::api_err,
+    state::AppState,
+};
 
 pub async fn governance(
     State(state): State<AppState>,
     auth: AuthUser,
     Json(req): Json<GovernanceRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    if let Some(group_id) = auth.group_id.as_deref() {
+        if !group_main_write_allowed_for_solo_owner(&state, group_id, &auth.user_id).await {
+            return Err((
+                StatusCode::FORBIDDEN,
+                "governance is disabled in group mode because it mutates main memory state"
+                    .to_string(),
+            ));
+        }
+    }
+
     let sql = state
         .service
         .user_sql_store(auth.scope_id())

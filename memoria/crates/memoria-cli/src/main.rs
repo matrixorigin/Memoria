@@ -647,10 +647,7 @@ fn normalize_tool_name(tool: Option<String>) -> Option<String> {
         // trim, lowercase, collapse whitespace runs into a single hyphen.
         // "My Agent" → "my-agent", "cursor" → "cursor".
         let lower = raw.trim().to_ascii_lowercase();
-        let normalized = lower
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join("-");
+        let normalized = lower.split_whitespace().collect::<Vec<_>>().join("-");
         if normalized.is_empty() {
             None
         } else {

@@ -100,9 +100,7 @@ pub async fn dispatch_http(
         // (`active_branch_name`, `set_active_branch`, `active_table`) see the
         // same per-user scope they would in the original async task.
         match actor_user_id {
-            Some(actor_id) => handle.block_on(
-                memoria_storage::ACTOR_USER_ID.scope(actor_id, fut)
-            ),
+            Some(actor_id) => handle.block_on(memoria_storage::ACTOR_USER_ID.scope(actor_id, fut)),
             None => handle.block_on(fut),
         }
     })

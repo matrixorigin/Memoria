@@ -1611,12 +1611,14 @@ impl SqlMemoryStore {
                 Err(e) if is_duplicate_column(e) => tracing::info!(
                     "migration: author_id column already exists in {memories_table}, skipping"
                 ),
-                Err(e) => tracing::error!(
-                    "migration: failed to add author_id to {memories_table}: {e}"
-                ),
+                Err(e) => {
+                    tracing::error!("migration: failed to add author_id to {memories_table}: {e}")
+                }
             }
         } else {
-            tracing::debug!("migration: author_id column already exists in {memories_table}, skipping");
+            tracing::debug!(
+                "migration: author_id column already exists in {memories_table}, skipping"
+            );
         }
         // Ensure the index exists even when the column already existed before this migration.
         // This covers partially-migrated databases where `author_id` is present but
@@ -1661,15 +1663,17 @@ impl SqlMemoryStore {
         for bt_raw in &branch_table_names {
             // bt_raw is the raw table name (e.g. br_abc123_my_branch) without DB prefix.
             // Validate against a strict allowlist before interpolating into DDL.
-            if !bt_raw.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            if !bt_raw
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_')
+            {
                 tracing::warn!(
                     "migration: skipping branch table with invalid identifier '{bt_raw}'"
                 );
                 continue;
             }
             let bt_full = self.t(bt_raw);
-            let has_col =
-                info_schema_column_exists(pool, schema_name, bt_raw, "author_id").await;
+            let has_col = info_schema_column_exists(pool, schema_name, bt_raw, "author_id").await;
             if !has_col {
                 let r = exec_ddl_with_retry(
                     pool,
@@ -1692,8 +1696,7 @@ impl SqlMemoryStore {
             // Always ensure the index exists regardless of whether the column was just
             // added or was already present (handles "column exists but index is missing"
             // on older databases). The error is expected when the index already exists.
-            let has_idx =
-                info_schema_index_exists(pool, schema_name, bt_raw, "idx_author").await;
+            let has_idx = info_schema_index_exists(pool, schema_name, bt_raw, "idx_author").await;
             if !has_idx {
                 let _ = exec_ddl_with_retry(
                     pool,
@@ -2509,6 +2512,43 @@ impl SqlMemoryStore {
         }
     }
 
+    /// Resolve a memory table for an optional explicit branch.
+    ///
+    /// `None` preserves checkout-based behavior via `active_table`.  A concrete
+    /// branch name bypasses `mem_user_state`, so concurrent agents can read/write
+    /// different branches without racing on the active-branch pointer.
+    pub async fn table_for_branch(
+        &self,
+        user_id: &str,
+        branch: Option<&str>,
+    ) -> Result<String, MemoriaError> {
+        let Some(branch) = branch.map(str::trim).filter(|branch| !branch.is_empty()) else {
+            return self.active_table(user_id).await;
+        };
+
+        if branch == "main" {
+            return Ok(self.t("mem_memories"));
+        }
+
+        let branches_table = self.t("mem_branches");
+        let branch_row = sqlx::query(&format!(
+            "SELECT table_name FROM {branches_table} WHERE user_id = ? AND name = ? AND status = 'active'"
+        ))
+        .bind(user_id)
+        .bind(branch)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+
+        match branch_row {
+            Some(r) => {
+                let raw = r.try_get::<String, _>("table_name").map_err(db_err)?;
+                Ok(self.t(&raw))
+            }
+            None => Err(MemoriaError::NotFound(format!("Branch '{branch}'"))),
+        }
+    }
+
     pub async fn set_active_branch(&self, user_id: &str, branch: &str) -> Result<(), MemoriaError> {
         let state_user = self.state_user(user_id);
         let user_state_table = self.t("mem_user_state");
@@ -2617,7 +2657,9 @@ impl SqlMemoryStore {
                     // Lenient: a corrupt/NULL timestamp yields None rather than failing the
                     // entire branch list. name and table_name are strict because they drive
                     // branch operations.
-                    r.try_get::<Option<chrono::NaiveDateTime>, _>("created_at").ok().flatten(),
+                    r.try_get::<Option<chrono::NaiveDateTime>, _>("created_at")
+                        .ok()
+                        .flatten(),
                 ))
             })
             .collect()

@@ -120,6 +120,27 @@ impl RetrieveOptions {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ListActiveOptions<'a> {
+    pub limit: i64,
+    pub memory_type: Option<&'a str>,
+    pub session_id: Option<&'a str>,
+    pub trust_tier: Option<&'a str>,
+    pub cursor: Option<&'a str>,
+}
+
+impl ListActiveOptions<'_> {
+    pub fn new(limit: i64) -> Self {
+        Self {
+            limit,
+            memory_type: None,
+            session_id: None,
+            trust_tier: None,
+            cursor: None,
+        }
+    }
+}
+
 /// Per-candidate scoring breakdown — answers "why is this memory ranked here?"
 /// Only populated at Verbose/Analyze level.
 #[derive(Debug, serde::Serialize)]
@@ -1127,10 +1148,37 @@ impl MemoryService {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[tracing::instrument(skip(self, content), fields(user_id))]
     pub async fn store_memory(
         &self,
         user_id: &str,
+        content: &str,
+        memory_type: MemoryType,
+        session_id: Option<String>,
+        trust_tier: Option<TrustTier>,
+        observed_at: Option<DateTime<Utc>>,
+        initial_confidence: Option<f64>,
+        author_id: Option<String>,
+    ) -> Result<Memory, MemoriaError> {
+        self.store_memory_on_branch(
+            user_id,
+            None,
+            content,
+            memory_type,
+            session_id,
+            trust_tier,
+            observed_at,
+            initial_confidence,
+            author_id,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[tracing::instrument(skip(self, content), fields(user_id, branch))]
+    pub async fn store_memory_on_branch(
+        &self,
+        user_id: &str,
+        branch: Option<&str>,
         content: &str,
         memory_type: MemoryType,
         session_id: Option<String>,
@@ -1178,7 +1226,7 @@ impl MemoryService {
         // TODO(concurrency): race between dedup check and insert can create duplicates
         if self.sql_store.is_some() {
             let sql = self.user_sql_store(user_id).await?;
-            let table = sql.active_table(user_id).await?;
+            let table = sql.table_for_branch(user_id, branch).await?;
             if let Some(ref emb) = memory.embedding {
                 // L2 threshold from cosine similarity 0.95: sqrt(2*(1-0.95)) ≈ 0.3162
                 // Only supersede near-identical memories, not contradictions.
@@ -1390,8 +1438,20 @@ impl MemoryService {
         top_k: i64,
         options: &RetrieveOptions,
     ) -> Result<Vec<Memory>, MemoriaError> {
+        self.retrieve_with_options_on_branch(user_id, None, query, top_k, options)
+            .await
+    }
+
+    pub async fn retrieve_with_options_on_branch(
+        &self,
+        user_id: &str,
+        branch: Option<&str>,
+        query: &str,
+        top_k: i64,
+        options: &RetrieveOptions,
+    ) -> Result<Vec<Memory>, MemoriaError> {
         let (mems, _) = self
-            .retrieve_inner(user_id, query, top_k, ExplainLevel::None, options)
+            .retrieve_inner(user_id, branch, query, top_k, ExplainLevel::None, options)
             .await?;
         self.bump_access_counts(&mems);
         Ok(mems)
@@ -1407,6 +1467,7 @@ impl MemoryService {
         let (mems, explain) = self
             .retrieve_inner(
                 user_id,
+                None,
                 query,
                 top_k,
                 ExplainLevel::Basic,
@@ -1443,9 +1504,24 @@ impl MemoryService {
         level: ExplainLevel,
         options: &RetrieveOptions,
     ) -> Result<(Vec<Memory>, RetrievalExplain), MemoriaError> {
+        self.retrieve_explain_level_with_options_on_branch(
+            user_id, None, query, top_k, level, options,
+        )
+        .await
+    }
+
+    pub async fn retrieve_explain_level_with_options_on_branch(
+        &self,
+        user_id: &str,
+        branch: Option<&str>,
+        query: &str,
+        top_k: i64,
+        level: ExplainLevel,
+        options: &RetrieveOptions,
+    ) -> Result<(Vec<Memory>, RetrievalExplain), MemoriaError> {
         let start = std::time::Instant::now();
         let (mems, explain) = self
-            .retrieve_inner(user_id, query, top_k, level, options)
+            .retrieve_inner(user_id, branch, query, top_k, level, options)
             .await?;
         self.bump_access_counts(&mems);
 
@@ -1473,6 +1549,7 @@ impl MemoryService {
     async fn retrieve_inner(
         &self,
         user_id: &str,
+        branch: Option<&str>,
         query: &str,
         top_k: i64,
         level: ExplainLevel,
@@ -1486,7 +1563,7 @@ impl MemoryService {
 
         if self.sql_store.is_some() {
             let sql = self.user_sql_store(user_id).await?;
-            let table = sql.active_table(user_id).await?;
+            let table = sql.table_for_branch(user_id, branch).await?;
             let strict_session_id = options.strict_session_id();
             // Load per-user feedback_weight lazily — only when needed for scoring
             // (avoids extra DB query when fulltext fallback has no feedback to apply)
@@ -1497,7 +1574,8 @@ impl MemoryService {
             explain.embedding_ms = p0_start.elapsed().as_secs_f64() * 1000.0;
 
             // Phase 1: graph retrieval (activation-based)
-            if strict_session_id.is_none() {
+            let main_table = sql.t("mem_memories");
+            if strict_session_id.is_none() && table == main_table {
                 if let Some(ref embedding) = emb {
                     explain.graph_attempted = true;
                     let g_start = std::time::Instant::now();
@@ -1767,6 +1845,7 @@ impl MemoryService {
     ) -> Result<(Vec<Memory>, RetrievalExplain), MemoriaError> {
         self.retrieve_inner(
             user_id,
+            None,
             query,
             top_k,
             ExplainLevel::Basic,
@@ -1782,8 +1861,15 @@ impl MemoryService {
         top_k: i64,
         level: ExplainLevel,
     ) -> Result<(Vec<Memory>, RetrievalExplain), MemoriaError> {
-        self.retrieve_inner(user_id, query, top_k, level, &RetrieveOptions::default())
-            .await
+        self.retrieve_inner(
+            user_id,
+            None,
+            query,
+            top_k,
+            level,
+            &RetrieveOptions::default(),
+        )
+        .await
     }
 
     // TODO(concurrency): concurrent correct on same memory_id can create duplicate
@@ -1791,6 +1877,17 @@ impl MemoryService {
     pub async fn correct(
         &self,
         user_id: &str,
+        memory_id: &str,
+        new_content: &str,
+    ) -> Result<Memory, MemoriaError> {
+        self.correct_on_branch(user_id, None, memory_id, new_content)
+            .await
+    }
+
+    pub async fn correct_on_branch(
+        &self,
+        user_id: &str,
+        branch: Option<&str>,
         memory_id: &str,
         new_content: &str,
     ) -> Result<Memory, MemoriaError> {
@@ -1810,7 +1907,7 @@ impl MemoryService {
         // Branch-aware: resolve table and fetch old memory from correct table
         if self.sql_store.is_some() {
             let sql = self.user_sql_store(user_id).await?;
-            let table = sql.active_table(user_id).await?;
+            let table = sql.table_for_branch(user_id, branch).await?;
             let old = sql
                 .get_from(&table, memory_id)
                 .await?
@@ -1913,11 +2010,20 @@ impl MemoryService {
     }
 
     pub async fn purge(&self, user_id: &str, memory_id: &str) -> Result<PurgeResult, MemoriaError> {
+        self.purge_on_branch(user_id, None, memory_id).await
+    }
+
+    pub async fn purge_on_branch(
+        &self,
+        user_id: &str,
+        branch: Option<&str>,
+        memory_id: &str,
+    ) -> Result<PurgeResult, MemoriaError> {
         if self.sql_store.is_some() {
             let sql = self.user_sql_store(user_id).await?;
             let (snap, warning) = sql.create_safety_snapshot("purge").await;
             self.send_edit_log(user_id, "purge", Some(memory_id), None, "", snap.as_deref());
-            let table = sql.active_table(user_id).await?;
+            let table = sql.table_for_branch(user_id, branch).await?;
             let deactivated = sql.soft_delete_from(&table, memory_id).await?;
             if deactivated > 0 {
                 self.report(StatsEvent::MemoryDeactivated {
@@ -1947,10 +2053,19 @@ impl MemoryService {
         user_id: &str,
         ids: &[&str],
     ) -> Result<PurgeResult, MemoriaError> {
+        self.purge_batch_on_branch(user_id, None, ids).await
+    }
+
+    pub async fn purge_batch_on_branch(
+        &self,
+        user_id: &str,
+        branch: Option<&str>,
+        ids: &[&str],
+    ) -> Result<PurgeResult, MemoriaError> {
         if self.sql_store.is_some() {
             let sql = self.user_sql_store(user_id).await?;
             let (snap, warning) = sql.create_safety_snapshot("purge").await;
-            let table = sql.active_table(user_id).await?;
+            let table = sql.table_for_branch(user_id, branch).await?;
             for id in ids {
                 let deactivated = sql.soft_delete_from(&table, id).await?;
                 self.send_edit_log(user_id, "purge", Some(id), None, "", snap.as_deref());
@@ -1984,10 +2099,19 @@ impl MemoryService {
         user_id: &str,
         topic: &str,
     ) -> Result<PurgeResult, MemoriaError> {
+        self.purge_by_topic_on_branch(user_id, None, topic).await
+    }
+
+    pub async fn purge_by_topic_on_branch(
+        &self,
+        user_id: &str,
+        branch: Option<&str>,
+        topic: &str,
+    ) -> Result<PurgeResult, MemoriaError> {
         if self.sql_store.is_some() {
             let sql = self.user_sql_store(user_id).await?;
             let (snap, warning) = sql.create_safety_snapshot("purge").await;
-            let table = sql.active_table(user_id).await?;
+            let table = sql.table_for_branch(user_id, branch).await?;
             let ids = sql.find_ids_by_topic(&table, user_id, topic).await?;
             let reason = format!("topic:{topic}");
             self.purge_sql_ids(
@@ -2019,10 +2143,21 @@ impl MemoryService {
         session_id: &str,
         memory_types: Option<&[MemoryType]>,
     ) -> Result<PurgeResult, MemoriaError> {
+        self.purge_by_session_id_on_branch(user_id, None, session_id, memory_types)
+            .await
+    }
+
+    pub async fn purge_by_session_id_on_branch(
+        &self,
+        user_id: &str,
+        branch: Option<&str>,
+        session_id: &str,
+        memory_types: Option<&[MemoryType]>,
+    ) -> Result<PurgeResult, MemoriaError> {
         if self.sql_store.is_some() {
             let sql = self.user_sql_store(user_id).await?;
             let (snap, warning) = sql.create_safety_snapshot("purge").await;
-            let table = sql.active_table(user_id).await?;
+            let table = sql.table_for_branch(user_id, branch).await?;
             let ids = sql
                 .find_ids_by_session_id(&table, user_id, session_id, memory_types)
                 .await?;
@@ -2100,9 +2235,18 @@ impl MemoryService {
         user_id: &str,
         memory_id: &str,
     ) -> Result<Option<Memory>, MemoriaError> {
+        self.get_for_user_on_branch(user_id, None, memory_id).await
+    }
+
+    pub async fn get_for_user_on_branch(
+        &self,
+        user_id: &str,
+        branch: Option<&str>,
+        memory_id: &str,
+    ) -> Result<Option<Memory>, MemoriaError> {
         if self.sql_store.is_some() {
             let sql = self.user_sql_store(user_id).await?;
-            let table = sql.active_table(user_id).await?;
+            let table = sql.table_for_branch(user_id, branch).await?;
             return sql.get_from(&table, memory_id).await;
         }
         self.store.get(memory_id).await
@@ -2131,6 +2275,16 @@ impl MemoryService {
             .await
     }
 
+    pub async fn list_active_paged_on_branch(
+        &self,
+        user_id: &str,
+        branch: Option<&str>,
+        options: ListActiveOptions<'_>,
+    ) -> Result<Vec<Memory>, MemoriaError> {
+        self.list_active_filtered_on_branch(user_id, branch, options)
+            .await
+    }
+
     pub async fn list_active_filtered(
         &self,
         user_id: &str,
@@ -2140,26 +2294,54 @@ impl MemoryService {
         trust_tier: Option<&str>,
         cursor: Option<&str>,
     ) -> Result<Vec<Memory>, MemoriaError> {
+        self.list_active_filtered_on_branch(
+            user_id,
+            None,
+            ListActiveOptions {
+                limit,
+                memory_type,
+                session_id,
+                trust_tier,
+                cursor,
+            },
+        )
+        .await
+    }
+
+    pub async fn list_active_filtered_on_branch(
+        &self,
+        user_id: &str,
+        branch: Option<&str>,
+        options: ListActiveOptions<'_>,
+    ) -> Result<Vec<Memory>, MemoriaError> {
         if self.sql_store.is_some() {
             let sql = self.user_sql_store(user_id).await?;
-            let table = sql.active_table(user_id).await?;
+            let table = sql.table_for_branch(user_id, branch).await?;
             return sql
-                .list_active_lite(&table, user_id, limit, memory_type, session_id, trust_tier, cursor)
+                .list_active_lite(
+                    &table,
+                    user_id,
+                    options.limit,
+                    options.memory_type,
+                    options.session_id,
+                    options.trust_tier,
+                    options.cursor,
+                )
                 .await;
         }
         // Fallback: trait path — no SQL store means no server-side filter/cursor.
         // Production always uses SQL store; this path is for trait-only test doubles.
-        let mut mems = self.store.list_active(user_id, limit).await?;
-        if let Some(mt) = memory_type {
+        let mut mems = self.store.list_active(user_id, options.limit).await?;
+        if let Some(mt) = options.memory_type {
             mems.retain(|m| m.memory_type.to_string() == mt);
         }
-        if let Some(session_id) = session_id {
+        if let Some(session_id) = options.session_id {
             mems.retain(|m| m.session_id.as_deref() == Some(session_id));
         }
-        if let Some(tt) = trust_tier {
+        if let Some(tt) = options.trust_tier {
             mems.retain(|m| m.trust_tier.to_string() == tt);
         }
-        if let Some(cursor_id) = cursor {
+        if let Some(cursor_id) = options.cursor {
             mems.retain(|m| m.memory_id.as_str() < cursor_id);
         }
         Ok(mems)
@@ -2219,6 +2401,18 @@ impl MemoryService {
         items: Vec<(String, MemoryType, Option<String>, Option<TrustTier>)>,
         author_id: Option<String>,
     ) -> Result<Vec<Memory>, MemoriaError> {
+        self.store_batch_on_branch(user_id, None, items, author_id)
+            .await
+    }
+
+    /// Batch store with a single embedding API call, targeting an optional branch.
+    pub async fn store_batch_on_branch(
+        &self,
+        user_id: &str,
+        branch: Option<&str>,
+        items: Vec<(String, MemoryType, Option<String>, Option<TrustTier>)>,
+        author_id: Option<String>,
+    ) -> Result<Vec<Memory>, MemoriaError> {
         if items.is_empty() {
             return Ok(vec![]);
         }
@@ -2270,7 +2464,7 @@ impl MemoryService {
         }
         if self.sql_store.is_some() {
             let sql = self.user_sql_store(user_id).await?;
-            let table = sql.active_table(user_id).await?;
+            let table = sql.table_for_branch(user_id, branch).await?;
             let refs: Vec<&Memory> = results.iter().collect();
             sql.batch_insert_into(&table, &refs).await?;
             let payloads: Vec<String> = results
@@ -2309,6 +2503,17 @@ impl MemoryService {
         messages: &[serde_json::Value],
         session_id: Option<String>,
     ) -> Result<(Vec<Memory>, bool), MemoriaError> {
+        self.observe_turn_on_branch(user_id, None, messages, session_id)
+            .await
+    }
+
+    pub async fn observe_turn_on_branch(
+        &self,
+        user_id: &str,
+        branch: Option<&str>,
+        messages: &[serde_json::Value],
+        session_id: Option<String>,
+    ) -> Result<(Vec<Memory>, bool), MemoriaError> {
         let has_llm = self.llm.is_some();
 
         let candidates = if let Some(llm) = &self.llm {
@@ -2330,7 +2535,7 @@ impl MemoryService {
 
         let mut stored = Vec::with_capacity(candidates.len());
         for mem in candidates {
-            match self.persist_with_dedup(user_id, mem).await {
+            match self.persist_with_dedup(user_id, branch, mem).await {
                 Ok(m) => stored.push(m),
                 Err(MemoriaError::Blocked(_)) => continue,
                 Err(e) => return Err(e),
@@ -2448,6 +2653,7 @@ impl MemoryService {
     async fn persist_with_dedup(
         &self,
         user_id: &str,
+        branch: Option<&str>,
         mut mem: Memory,
     ) -> Result<Memory, MemoriaError> {
         let sensitivity = check_sensitivity(&mem.content);
@@ -2465,7 +2671,7 @@ impl MemoryService {
 
         if self.sql_store.is_some() {
             let sql = self.user_sql_store(user_id).await?;
-            let table = sql.active_table(user_id).await?;
+            let table = sql.table_for_branch(user_id, branch).await?;
             if let Some(ref emb) = mem.embedding {
                 let l2_threshold = 0.3162;
                 let mtype = mem.memory_type.to_string();

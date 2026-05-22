@@ -1079,7 +1079,11 @@ impl GitForDataService {
             // Cannot use INSERT...ON DUPLICATE KEY UPDATE because MatrixOne branch tables are
             // read-only views in some builds. Instead: DELETE + INSERT.
             if !restore_adds.is_empty() {
-                let ph = restore_adds.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+                let ph = restore_adds
+                    .iter()
+                    .map(|_| "?")
+                    .collect::<Vec<_>>()
+                    .join(",");
                 let delete_sql = format!(
                     "DELETE FROM {main_table_ref} WHERE user_id = ? AND memory_id IN ({ph})"
                 );

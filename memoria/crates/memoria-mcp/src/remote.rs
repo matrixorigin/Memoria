@@ -130,6 +130,7 @@ impl RemoteClient {
                         "memory_type": args["memory_type"].as_str().unwrap_or("semantic"),
                         "session_id": args["session_id"],
                         "trust_tier": args["trust_tier"],
+                        "branch": args["branch"],
                     }))
                     .send()
                     .await?;
@@ -155,6 +156,7 @@ impl RemoteClient {
                         args["top_k"].as_i64().unwrap_or(5)
                     },
                     "session_id": args["session_id"],
+                    "branch": args["branch"],
                 });
                 if let Some(session_scope) = args
                     .get("session_scope")
@@ -195,7 +197,11 @@ impl RemoteClient {
                 let r = if !memory_id.is_empty() {
                     self.client
                         .put(self.url(&format!("/v1/memories/{memory_id}/correct")))
-                        .json(&json!({"new_content": new_content, "reason": args["reason"]}))
+                        .json(&json!({
+                            "new_content": new_content,
+                            "reason": args["reason"],
+                            "branch": args["branch"]
+                        }))
                         .send()
                         .await?
                 } else {
@@ -206,7 +212,8 @@ impl RemoteClient {
                             "new_content": new_content,
                             "session_id": args["session_id"],
                             "session_scope": args["session_scope"],
-                            "reason": args["reason"]
+                            "reason": args["reason"],
+                            "branch": args["branch"]
                         }))
                         .send()
                         .await?
@@ -236,7 +243,7 @@ impl RemoteClient {
                     let r = self
                         .client
                         .post(self.url("/v1/memories/purge"))
-                        .json(&json!({"memory_ids": ids}))
+                        .json(&json!({"memory_ids": ids, "branch": purge_args.branch}))
                         .send()
                         .await?;
                     let body = Self::parse_response(r).await?;
@@ -248,7 +255,7 @@ impl RemoteClient {
                     let r = self
                         .client
                         .post(self.url("/v1/memories/purge"))
-                        .json(&json!({"topic": topic}))
+                        .json(&json!({"topic": topic, "branch": purge_args.branch}))
                         .send()
                         .await?;
                     let body = Self::parse_response(r).await?;
@@ -268,6 +275,7 @@ impl RemoteClient {
                                     .map(|memory_type| memory_type.to_string())
                                     .collect::<Vec<_>>()
                             }),
+                            "branch": purge_args.branch,
                         }))
                         .send()
                         .await?;
@@ -306,6 +314,9 @@ impl RemoteClient {
                 }
                 if let Some(session_id) = session_id {
                     req = req.query(&[("session_id", session_id)]);
+                }
+                if let Some(branch) = args.get("branch").and_then(Value::as_str) {
+                    req = req.query(&[("branch", branch)]);
                 }
                 let body = Self::parse_response(req.send().await?).await?;
                 let items = body["items"].as_array().cloned().unwrap_or_default();
@@ -688,10 +699,11 @@ impl RemoteClient {
             "memory_observe" => {
                 let r = self
                     .client
-                    .post(self.url("/v1/memories/observe"))
+                    .post(self.url("/v1/observe"))
                     .json(&json!({
                         "messages": args["messages"],
                         "session_id": args["session_id"],
+                        "branch": args["branch"],
                     }))
                     .send()
                     .await?;

@@ -95,6 +95,26 @@ const GROUP_MAIN_WRITE_BLOCKED: &[&str] = &[
     "memory_rollback",
 ];
 
+fn mcp_explicit_non_main_branch(params: Option<&serde_json::Value>) -> bool {
+    params
+        .and_then(|params| params.get("arguments"))
+        .and_then(|args| args.get("branch"))
+        .and_then(|branch| branch.as_str())
+        .map(str::trim)
+        .is_some_and(|branch| !branch.is_empty() && branch != "main")
+}
+
+fn mcp_tool_supports_explicit_branch(tool: &str) -> bool {
+    matches!(
+        tool,
+        "memory_store" | "memory_correct" | "memory_purge" | "memory_observe"
+    )
+}
+
+fn mcp_tool_mutates_main_regardless_checkout(tool: &str) -> bool {
+    matches!(tool, "memory_governance")
+}
+
 fn mcp_tool_dirty_mask(tool: &str) -> Option<crate::metrics_summary::DirtyMask> {
     use crate::metrics_summary::DirtyMask;
     match tool {
@@ -254,38 +274,50 @@ pub async fn mcp_handler(
     let blocked_tool: Option<String> = if let Some(gid) = &auth.group_id {
         if let Some(tool) = tracked_tool.as_deref() {
             if GROUP_MAIN_WRITE_BLOCKED.contains(&tool) {
-                // ACTOR_USER_ID is already set by the global actor_scope_layer.
-                let maybe_blocked = state
-                    .service
-                    .user_sql_store(gid)
+                if mcp_tool_mutates_main_regardless_checkout(tool) {
+                    if crate::auth::group_main_write_allowed_for_solo_owner(
+                        &state,
+                        gid,
+                        &auth.user_id,
+                    )
                     .await
-                    .ok()
-                    .map(|sql| {
+                    {
+                        None
+                    } else {
+                        Some(tool.to_string())
+                    }
+                } else if mcp_tool_supports_explicit_branch(tool)
+                    && mcp_explicit_non_main_branch(params.as_ref())
+                {
+                    None
+                } else {
+                    // ACTOR_USER_ID is already set by the global actor_scope_layer.
+                    let maybe_blocked = state.service.user_sql_store(gid).await.ok().map(|sql| {
                         let gid_owned = gid.clone();
-                        memoria_storage::ACTOR_USER_ID
-                            .scope(auth.user_id.clone(), async move {
-                                sql.active_branch_name(&gid_owned).await
-                            })
+                        memoria_storage::ACTOR_USER_ID.scope(auth.user_id.clone(), async move {
+                            sql.active_branch_name(&gid_owned).await
+                        })
                     });
-                if let Some(fut) = maybe_blocked {
-                    if let Ok(branch) = fut.await {
-                        let is_solo_owner =
-                            crate::auth::group_main_write_allowed_for_solo_owner(
-                                &state,
-                                gid,
-                                &auth.user_id,
-                            )
-                            .await;
-                        if branch == "main" && !is_solo_owner {
-                            Some(tool.to_string())
+                    if let Some(fut) = maybe_blocked {
+                        if let Ok(branch) = fut.await {
+                            let is_solo_owner =
+                                crate::auth::group_main_write_allowed_for_solo_owner(
+                                    &state,
+                                    gid,
+                                    &auth.user_id,
+                                )
+                                .await;
+                            if branch == "main" && !is_solo_owner {
+                                Some(tool.to_string())
+                            } else {
+                                None
+                            }
                         } else {
                             None
                         }
                     } else {
                         None
                     }
-                } else {
-                    None
                 }
             } else {
                 None

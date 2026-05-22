@@ -6,7 +6,8 @@ use anyhow::Result;
 use memoria_core::{MemoryType, TrustTier};
 use memoria_git::GitForDataService;
 use memoria_service::{
-    ConsolidationInput, ConsolidationStrategy, DefaultConsolidationStrategy, MemoryService,
+    ConsolidationInput, ConsolidationStrategy, DefaultConsolidationStrategy, ListActiveOptions,
+    MemoryService,
 };
 use memoria_storage::SqlMemoryStore;
 use serde_json::{json, Value};
@@ -52,6 +53,13 @@ fn parse_retrieve_options_arg(args: &Value) -> Result<memoria_service::RetrieveO
         session_id,
         session_scope,
     ))
+}
+
+fn branch_arg(args: &Value) -> Option<&str> {
+    args.get("branch")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|branch| !branch.is_empty())
 }
 
 enum ToolCallName {
@@ -116,6 +124,7 @@ pub fn list() -> Value {
                     "content": {"type": "string"},
                     "memory_type": {"type": "string", "default": "semantic"},
                     "session_id": {"type": "string"},
+                    "branch": {"type": "string", "description": "Optional branch to read/write without changing the active checkout"},
                     "trust_tier": {
                         "type": "string",
                         "enum": ["T1", "T2", "T3", "T4"],
@@ -135,6 +144,7 @@ pub fn list() -> Value {
                     "top_k": {"type": "integer", "default": 5},
                     "session_id": {"type": "string"},
                     "session_scope": {"type": "string", "enum": ["prefer", "only"], "description": "How to use session_id: prefer=non-strict retrieval using the provided session_id as context; only=limit results to that session plus unscoped memories"},
+                    "branch": {"type": "string", "description": "Optional branch to read from without changing the active checkout"},
                     "explain": {"type": ["boolean", "string"], "default": false, "description": "Explain level: false/\"none\"=off, true/\"basic\"=timing+path, \"verbose\"=+per-candidate scores, \"analyze\"=full"}
                 },
                 "required": ["query"]
@@ -150,6 +160,7 @@ pub fn list() -> Value {
                     "top_k": {"type": "integer", "default": 10},
                     "session_id": {"type": "string"},
                     "session_scope": {"type": "string", "enum": ["prefer", "only"], "description": "How to use session_id: prefer=non-strict search using the provided session_id as context; only=limit results to that session plus unscoped memories"},
+                    "branch": {"type": "string", "description": "Optional branch to search without changing the active checkout"},
                     "explain": {"type": ["boolean", "string"], "default": false, "description": "Explain level: false/\"none\"=off, true/\"basic\"=timing+path, \"verbose\"=+per-candidate scores, \"analyze\"=full"}
                 },
                 "required": ["query"]
@@ -166,6 +177,7 @@ pub fn list() -> Value {
                     "new_content": {"type": "string"},
                     "session_id": {"type": "string", "description": "Optional session to use when resolving query-based correction"},
                     "session_scope": {"type": "string", "enum": ["prefer", "only"], "description": "Only used with query-based correction. prefer=non-strict lookup using the provided session_id as context; only=restrict lookup to the given session plus unscoped memories"},
+                    "branch": {"type": "string", "description": "Optional branch to correct without changing the active checkout"},
                     "reason": {"type": "string"}
                 },
                 "required": ["new_content"]
@@ -181,6 +193,7 @@ pub fn list() -> Value {
                     "topic": {"type": "string", "description": "Keyword — bulk-delete all matching memories"},
                     "session_id": {"type": "string", "description": "Exact session identifier — bulk-delete memories from that session"},
                     "memory_types": {"type": "array", "items": {"type": "string", "enum": ["semantic", "working", "episodic", "profile", "tool_result", "procedural"]}, "description": "Optional memory type filter. Only valid with session_id"},
+                    "branch": {"type": "string", "description": "Optional branch to purge from without changing the active checkout"},
                     "reason": {"type": "string"}
                 }
             }
@@ -203,7 +216,8 @@ pub fn list() -> Value {
                 "properties": {
                     "limit": {"type": "integer", "default": 20},
                     "memory_type": {"type": "string"},
-                    "session_id": {"type": "string", "description": "Exact session identifier — only list memories from that session"}
+                    "session_id": {"type": "string", "description": "Exact session identifier — only list memories from that session"},
+                    "branch": {"type": "string", "description": "Optional branch to list without changing the active checkout"}
                 }
             }
         },
@@ -294,8 +308,9 @@ pub async fn call(
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
             let mt = MemoryType::from_str(memory_type).unwrap_or(MemoryType::Semantic);
             let m = match service
-                .store_memory(
+                .store_memory_on_branch(
                     user_id,
+                    branch_arg(&args),
                     &content,
                     mt,
                     session_id.clone(),
@@ -383,8 +398,9 @@ pub async fn call(
 
             if level != memoria_service::ExplainLevel::None {
                 let (results, stats) = service
-                    .retrieve_explain_level_with_options(
+                    .retrieve_explain_level_with_options_on_branch(
                         user_id,
+                        branch_arg(&args),
                         &query,
                         top_k,
                         level,
@@ -408,7 +424,13 @@ pub async fn call(
                 )))
             } else {
                 let results = service
-                    .retrieve_with_options(user_id, &query, top_k, &retrieve_options)
+                    .retrieve_with_options_on_branch(
+                        user_id,
+                        branch_arg(&args),
+                        &query,
+                        top_k,
+                        &retrieve_options,
+                    )
                     .await?;
                 if results.is_empty() {
                     return Ok(mcp_text("No relevant memories found."));
@@ -436,7 +458,13 @@ pub async fn call(
             } else if !query.is_empty() {
                 let retrieve_options = parse_retrieve_options_arg(&args)?;
                 let results = service
-                    .retrieve_with_options(user_id, query, 1, &retrieve_options)
+                    .retrieve_with_options_on_branch(
+                        user_id,
+                        branch_arg(&args),
+                        query,
+                        1,
+                        &retrieve_options,
+                    )
                     .await?;
                 match results.into_iter().next() {
                     Some(found) => found.memory_id,
@@ -446,7 +474,9 @@ pub async fn call(
                 return Ok(mcp_text("Provide memory_id or query"));
             };
 
-            let m = service.correct(user_id, &old_mid, new_content).await?;
+            let m = service
+                .correct_on_branch(user_id, branch_arg(&args), &old_mid, new_content)
+                .await?;
 
             Ok(mcp_text(&format!(
                 "Corrected memory {}: {}",
@@ -463,21 +493,30 @@ pub async fn call(
                     .map(str::trim)
                     .filter(|s| !s.is_empty())
                     .collect();
-                let result = service.purge_batch(user_id, &ids).await?;
+                let result = service
+                    .purge_batch_on_branch(user_id, branch_arg(&args), &ids)
+                    .await?;
                 Ok(mcp_text(&format_purge_msg(
                     &format!("Purged {} memory(s)", result.purged),
                     &result,
                 )))
             } else if let Some(topic) = purge_args.topic {
                 // Bulk by keyword: exact text match then purge
-                let result = service.purge_by_topic(user_id, &topic).await?;
+                let result = service
+                    .purge_by_topic_on_branch(user_id, branch_arg(&args), &topic)
+                    .await?;
                 Ok(mcp_text(&format_purge_msg(
                     &format!("Purged {} memory(s) matching '{topic}'", result.purged),
                     &result,
                 )))
             } else if let Some(session_id) = purge_args.session_id {
                 let result = service
-                    .purge_by_session_id(user_id, &session_id, purge_args.memory_types.as_deref())
+                    .purge_by_session_id_on_branch(
+                        user_id,
+                        branch_arg(&args),
+                        &session_id,
+                        purge_args.memory_types.as_deref(),
+                    )
                     .await?;
                 Ok(mcp_text(&format_purge_msg(
                     &format!(
@@ -511,13 +550,16 @@ pub async fn call(
         ToolCallName::MemoryList => {
             let limit = args["limit"].as_i64().unwrap_or(20);
             let memories = service
-                .list_active_filtered(
+                .list_active_filtered_on_branch(
                     user_id,
-                    limit,
-                    args.get("memory_type").and_then(Value::as_str),
-                    args.get("session_id").and_then(Value::as_str),
-                    args.get("trust_tier").and_then(Value::as_str),
-                    None,
+                    branch_arg(&args),
+                    ListActiveOptions {
+                        limit,
+                        memory_type: args.get("memory_type").and_then(Value::as_str),
+                        session_id: args.get("session_id").and_then(Value::as_str),
+                        trust_tier: args.get("trust_tier").and_then(Value::as_str),
+                        cursor: None,
+                    },
                 )
                 .await?;
             if memories.is_empty() {
@@ -1026,7 +1068,7 @@ pub async fn call(
             let session_id = args["session_id"].as_str().map(String::from);
 
             let (memories, has_llm) = service
-                .observe_turn(user_id, &messages, session_id.clone())
+                .observe_turn_on_branch(user_id, branch_arg(&args), &messages, session_id.clone())
                 .await?;
 
             // Graph sync (best-effort) for each stored memory

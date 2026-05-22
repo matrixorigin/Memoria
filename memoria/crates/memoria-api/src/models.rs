@@ -17,6 +17,7 @@ pub struct StoreRequest {
     pub initial_confidence: Option<f64>,
     pub observed_at: Option<String>,
     pub source: Option<String>,
+    pub branch: Option<String>,
 }
 fn default_memory_type() -> String {
     "semantic".to_string()
@@ -25,6 +26,7 @@ fn default_memory_type() -> String {
 #[derive(Deserialize)]
 pub struct BatchStoreRequest {
     pub memories: Vec<StoreRequest>,
+    pub branch: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -34,6 +36,7 @@ pub struct RetrieveRequest {
     pub top_k: i64,
     pub session_id: Option<String>,
     pub session_scope: Option<String>,
+    pub branch: Option<String>,
     /// Explain level: false/"none" = off, true/"basic" = basic, "verbose" = per-candidate scores, "analyze" = full
     #[serde(default, deserialize_with = "deserialize_explain")]
     pub explain: String,
@@ -79,6 +82,7 @@ pub struct SearchRequest {
     pub top_k: i64,
     pub session_id: Option<String>,
     pub session_scope: Option<String>,
+    pub branch: Option<String>,
     #[serde(default, deserialize_with = "deserialize_explain")]
     pub explain: String,
 }
@@ -122,6 +126,7 @@ fn deserialize_explain<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String,
 pub struct CorrectRequest {
     pub new_content: String,
     pub reason: Option<String>,
+    pub branch: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -131,6 +136,7 @@ pub struct CorrectByQueryRequest {
     pub session_id: Option<String>,
     pub session_scope: Option<String>,
     pub reason: Option<String>,
+    pub branch: Option<String>,
 }
 
 impl CorrectByQueryRequest {
@@ -156,6 +162,7 @@ pub struct PurgeRequest {
     pub session_id: Option<String>,
     pub memory_types: Option<Vec<String>>,
     pub reason: Option<String>,
+    pub branch: Option<String>,
 }
 
 pub enum PurgeSelector {
@@ -448,6 +455,7 @@ mod tests {
             session_id: Some("sess-1".to_string()),
             memory_types: Some(vec![]),
             reason: None,
+            branch: None,
         };
 
         match request.selector().unwrap() {
@@ -470,6 +478,7 @@ mod tests {
             session_id: None,
             memory_types: Some(vec![]),
             reason: None,
+            branch: None,
         };
 
         assert!(matches!(request.selector().unwrap(), PurgeSelector::None));

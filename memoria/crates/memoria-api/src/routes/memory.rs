@@ -9,6 +9,7 @@ use sqlx::Row;
 use crate::{auth::AuthUser, models::*, state::AppState};
 
 use memoria_core::nullable_str_from_row;
+use memoria_service::ListActiveOptions;
 
 type ApiResult<T> = Result<Json<T>, (StatusCode, String)>;
 pub fn api_err(e: impl std::fmt::Display) -> (StatusCode, String) {
@@ -36,9 +37,13 @@ pub fn api_err_typed(e: memoria_core::MemoriaError) -> (StatusCode, String) {
 async fn find_memory_any_user(
     state: &AppState,
     memory_id: &str,
+    branch: Option<&str>,
 ) -> Result<Option<(String, memoria_core::Memory)>, (StatusCode, String)> {
     let shared = state.service.shared_sql_store().map_err(api_err_typed)?;
     let Some(router) = shared.db_router() else {
+        if branch.is_some() {
+            return Ok(None);
+        }
         let memory = state.service.get(memory_id).await.map_err(api_err_typed)?;
         return Ok(memory.map(|m| (m.user_id.clone(), m)));
     };
@@ -50,7 +55,11 @@ async fn find_memory_any_user(
             .user_sql_store(&candidate)
             .await
             .map_err(api_err_typed)?;
-        let table = sql.active_table(&candidate).await.map_err(api_err_typed)?;
+        let table = match sql.table_for_branch(&candidate, branch).await {
+            Ok(table) => table,
+            Err(memoria_core::MemoriaError::NotFound(_)) if branch.is_some() => continue,
+            Err(err) => return Err(api_err_typed(err)),
+        };
         if let Some(memory) = sql
             .get_from(&table, memory_id)
             .await
@@ -68,12 +77,28 @@ pub struct ListQuery {
     pub memory_type: Option<String>,
     pub session_id: Option<String>,
     pub trust_tier: Option<String>,
+    pub branch: Option<String>,
     #[serde(default = "default_limit")]
     pub limit: i64,
     pub cursor: Option<String>,
 }
 fn default_limit() -> i64 {
     100
+}
+
+#[derive(Deserialize, Default)]
+pub struct BranchQuery {
+    pub branch: Option<String>,
+}
+
+fn branch_param(branch: Option<&str>) -> Option<&str> {
+    branch.map(str::trim).filter(|branch| !branch.is_empty())
+}
+
+fn normalize_branch(branch: Option<String>) -> Option<String> {
+    branch
+        .map(|branch| branch.trim().to_string())
+        .filter(|branch| !branch.is_empty())
 }
 
 pub async fn health() -> &'static str {
@@ -121,13 +146,16 @@ pub async fn list_memories(
     let fetch_limit = limit + 1;
     let mut memories = state
         .service
-        .list_active_paged(
+        .list_active_paged_on_branch(
             auth.scope_id(),
-            fetch_limit,
-            q.memory_type.as_deref(),
-            q.session_id.as_deref(),
-            q.trust_tier.as_deref(),
-            cursor,
+            branch_param(q.branch.as_deref()),
+            ListActiveOptions {
+                limit: fetch_limit,
+                memory_type: q.memory_type.as_deref(),
+                session_id: q.session_id.as_deref(),
+                trust_tier: q.trust_tier.as_deref(),
+                cursor,
+            },
         )
         .await
         .map_err(api_err)?;
@@ -180,8 +208,9 @@ pub async fn store_memory(
     };
     let m = state
         .service
-        .store_memory(
+        .store_memory_on_branch(
             auth.scope_id(),
+            branch_param(req.branch.as_deref()),
             &req.content,
             mt,
             req.session_id,
@@ -219,10 +248,18 @@ pub async fn batch_store(
             ));
         }
     }
+    let top_branch = normalize_branch(req.branch);
     let items: Vec<_> = req
         .memories
         .into_iter()
         .map(|r| {
+            let item_branch = normalize_branch(r.branch);
+            if item_branch.is_some() && item_branch.as_deref() != top_branch.as_deref() {
+                return Err((
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "per-memory branch in batch must match the batch branch".to_string(),
+                ));
+            }
             let mt = parse_memory_type(&r.memory_type)
                 .map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e));
             let tier = r
@@ -231,16 +268,16 @@ pub async fn batch_store(
                 .map(parse_trust_tier)
                 .transpose()
                 .map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e));
-            (r.content, mt, tier, r.session_id)
+            Ok((r.content, mt, tier, r.session_id, top_branch.clone()))
         })
-        .collect();
+        .collect::<Result<Vec<_>, _>>()?;
 
     // Validate all types upfront
     let mut validated = Vec::with_capacity(items.len());
-    for (content, mt_result, tier_result, session_id) in items {
+    for (content, mt_result, tier_result, session_id, branch) in items {
         let mt = mt_result?;
         let tier = tier_result?;
-        validated.push((content, mt, session_id, tier));
+        validated.push((content, mt, session_id, tier, branch));
     }
 
     let author = if auth.group_id.is_some() {
@@ -248,9 +285,18 @@ pub async fn batch_store(
     } else {
         None
     };
+    let batch_items = validated
+        .into_iter()
+        .map(|(content, mt, session_id, tier, _branch)| (content, mt, session_id, tier))
+        .collect();
     let results = state
         .service
-        .store_batch(auth.scope_id(), validated, author)
+        .store_batch_on_branch(
+            auth.scope_id(),
+            branch_param(top_branch.as_deref()),
+            batch_items,
+            author,
+        )
         .await
         .map_err(api_err)?;
     Ok((
@@ -275,8 +321,9 @@ pub async fn retrieve(
     if level != memoria_service::ExplainLevel::None {
         let (results, explain) = state
             .service
-            .retrieve_explain_level_with_options(
+            .retrieve_explain_level_with_options_on_branch(
                 auth.scope_id(),
+                branch_param(req.branch.as_deref()),
                 &req.query,
                 top_k,
                 level,
@@ -291,7 +338,13 @@ pub async fn retrieve(
     } else {
         let results = state
             .service
-            .retrieve_with_options(auth.scope_id(), &req.query, top_k, &retrieve_options)
+            .retrieve_with_options_on_branch(
+                auth.scope_id(),
+                branch_param(req.branch.as_deref()),
+                &req.query,
+                top_k,
+                &retrieve_options,
+            )
             .await
             .map_err(api_err)?;
         let items: Vec<MemoryResponse> = results.into_iter().map(Into::into).collect();
@@ -314,8 +367,9 @@ pub async fn search(
     if level != memoria_service::ExplainLevel::None {
         let (results, explain) = state
             .service
-            .retrieve_explain_level_with_options(
+            .retrieve_explain_level_with_options_on_branch(
                 auth.scope_id(),
+                branch_param(req.branch.as_deref()),
                 &req.query,
                 top_k,
                 level,
@@ -330,7 +384,13 @@ pub async fn search(
     } else {
         let results = state
             .service
-            .retrieve_with_options(auth.scope_id(), &req.query, top_k, &retrieve_options)
+            .retrieve_with_options_on_branch(
+                auth.scope_id(),
+                branch_param(req.branch.as_deref()),
+                &req.query,
+                top_k,
+                &retrieve_options,
+            )
             .await
             .map_err(api_err)?;
         Ok(Json(serde_json::json!(results
@@ -344,12 +404,18 @@ pub async fn get_memory(
     State(state): State<AppState>,
     auth: AuthUser,
     Path(id): Path<String>,
+    Query(q): Query<BranchQuery>,
 ) -> ApiResult<Option<MemoryResponse>> {
-    let owned = state
+    let branch = branch_param(q.branch.as_deref());
+    let owned = match state
         .service
-        .get_for_user(auth.scope_id(), &id)
+        .get_for_user_on_branch(auth.scope_id(), branch, &id)
         .await
-        .map_err(api_err_typed)?;
+    {
+        Ok(memory) => memory,
+        Err(memoria_core::MemoriaError::NotFound(_)) if auth.is_master && branch.is_some() => None,
+        Err(err) => return Err(api_err_typed(err)),
+    };
     if let Some(memory) = owned {
         return Ok(Json(Some(memory.into())));
     }
@@ -358,7 +424,7 @@ pub async fn get_memory(
         return Ok(Json(None));
     }
 
-    if let Some((_, memory)) = find_memory_any_user(&state, &id).await? {
+    if let Some((_, memory)) = find_memory_any_user(&state, &id, branch).await? {
         return Ok(Json(Some(memory.into())));
     }
 
@@ -372,14 +438,14 @@ pub async fn correct_memory(
     Json(req): Json<CorrectRequest>,
 ) -> ApiResult<MemoryResponse> {
     let effective_user_id = if auth.is_master {
-        find_memory_any_user(&state, &id)
+        find_memory_any_user(&state, &id, branch_param(req.branch.as_deref()))
             .await?
             .map(|(owner_id, _)| owner_id)
             .unwrap_or_else(|| auth.scope_id().to_string())
     } else {
         if state
             .service
-            .get_for_user(auth.scope_id(), &id)
+            .get_for_user_on_branch(auth.scope_id(), branch_param(req.branch.as_deref()), &id)
             .await
             .map_err(api_err_typed)?
             .is_none()
@@ -390,7 +456,12 @@ pub async fn correct_memory(
     };
     let m = state
         .service
-        .correct(&effective_user_id, &id, &req.new_content)
+        .correct_on_branch(
+            &effective_user_id,
+            branch_param(req.branch.as_deref()),
+            &id,
+            &req.new_content,
+        )
         .await
         .map_err(api_err_typed)?;
     Ok(Json(m.into()))
@@ -408,7 +479,13 @@ pub async fn correct_by_query(
         .map_err(|err| (StatusCode::UNPROCESSABLE_ENTITY, err))?;
     let results = state
         .service
-        .retrieve_with_options(auth.scope_id(), &req.query, 1, &retrieve_options)
+        .retrieve_with_options_on_branch(
+            auth.scope_id(),
+            branch_param(req.branch.as_deref()),
+            &req.query,
+            1,
+            &retrieve_options,
+        )
         .await
         .map_err(api_err)?;
     let found = results.into_iter().next().ok_or_else(|| {
@@ -419,7 +496,12 @@ pub async fn correct_by_query(
     })?;
     let m = state
         .service
-        .correct(auth.scope_id(), &found.memory_id, &req.new_content)
+        .correct_on_branch(
+            auth.scope_id(),
+            branch_param(req.branch.as_deref()),
+            &found.memory_id,
+            &req.new_content,
+        )
         .await
         .map_err(api_err)?;
     Ok(Json(m.into()))
@@ -429,16 +511,17 @@ pub async fn delete_memory(
     State(state): State<AppState>,
     auth: AuthUser,
     Path(id): Path<String>,
+    Query(q): Query<BranchQuery>,
 ) -> Result<StatusCode, (StatusCode, String)> {
     let effective_user_id = if auth.is_master {
-        find_memory_any_user(&state, &id)
+        find_memory_any_user(&state, &id, branch_param(q.branch.as_deref()))
             .await?
             .map(|(owner_id, _)| owner_id)
             .unwrap_or_else(|| auth.scope_id().to_string())
     } else {
         if state
             .service
-            .get_for_user(auth.scope_id(), &id)
+            .get_for_user_on_branch(auth.scope_id(), branch_param(q.branch.as_deref()), &id)
             .await
             .map_err(api_err_typed)?
             .is_none()
@@ -449,7 +532,7 @@ pub async fn delete_memory(
     };
     let _ = state
         .service
-        .purge(&effective_user_id, &id)
+        .purge_on_branch(&effective_user_id, branch_param(q.branch.as_deref()), &id)
         .await
         .map_err(api_err_typed)?;
     Ok(StatusCode::NO_CONTENT)
@@ -463,13 +546,14 @@ pub async fn purge_memories(
     let selector = req
         .selector()
         .map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e))?;
+    let branch = branch_param(req.branch.as_deref());
     let result = match selector {
         PurgeSelector::MemoryIds(ids) => {
             if !auth.is_master {
                 for id in &ids {
                     let mem = state
                         .service
-                        .get_for_user(auth.scope_id(), id)
+                        .get_for_user_on_branch(auth.scope_id(), branch, id)
                         .await
                         .map_err(api_err)?
                         .ok_or_else(|| {
@@ -483,13 +567,13 @@ pub async fn purge_memories(
             let id_refs: Vec<&str> = ids.iter().map(|s| s.as_str()).collect();
             state
                 .service
-                .purge_batch(auth.scope_id(), &id_refs)
+                .purge_batch_on_branch(auth.scope_id(), branch, &id_refs)
                 .await
                 .map_err(api_err)?
         }
         PurgeSelector::Topic(topic) => state
             .service
-            .purge_by_topic(auth.scope_id(), &topic)
+            .purge_by_topic_on_branch(auth.scope_id(), branch, &topic)
             .await
             .map_err(api_err)?,
         PurgeSelector::Session {
@@ -497,7 +581,12 @@ pub async fn purge_memories(
             memory_types,
         } => state
             .service
-            .purge_by_session_id(auth.scope_id(), &session_id, memory_types.as_deref())
+            .purge_by_session_id_on_branch(
+                auth.scope_id(),
+                branch,
+                &session_id,
+                memory_types.as_deref(),
+            )
             .await
             .map_err(api_err)?,
         PurgeSelector::None => memoria_service::PurgeResult {
@@ -591,6 +680,7 @@ pub struct ObserveRequest {
     pub messages: Vec<serde_json::Value>,
     pub source_event_ids: Option<Vec<String>>,
     pub session_id: Option<String>,
+    pub branch: Option<String>,
 }
 
 /// Extract and store memories from a conversation turn.
@@ -603,7 +693,12 @@ pub async fn observe_turn(
 ) -> ApiResult<serde_json::Value> {
     let (memories, has_llm) = state
         .service
-        .observe_turn(auth.scope_id(), &req.messages, req.session_id)
+        .observe_turn_on_branch(
+            auth.scope_id(),
+            branch_param(req.branch.as_deref()),
+            &req.messages,
+            req.session_id,
+        )
         .await
         .map_err(api_err)?;
 
@@ -630,6 +725,7 @@ pub async fn get_memory_history(
     State(state): State<AppState>,
     auth: AuthUser,
     Path(id): Path<String>,
+    Query(q): Query<BranchQuery>,
 ) -> ApiResult<serde_json::Value> {
     use sqlx::Row;
 
@@ -638,7 +734,10 @@ pub async fn get_memory_history(
         .user_sql_store(auth.scope_id())
         .await
         .map_err(api_err)?;
-    let table = sql.active_table(auth.scope_id()).await.map_err(api_err)?;
+    let table = sql
+        .table_for_branch(auth.scope_id(), branch_param(q.branch.as_deref()))
+        .await
+        .map_err(api_err_typed)?;
 
     let mut chain = Vec::new();
     let mut visited = std::collections::HashSet::new();

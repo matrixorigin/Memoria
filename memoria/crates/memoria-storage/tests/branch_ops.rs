@@ -124,6 +124,45 @@ async fn test_set_active_branch_changes_table() {
     store.set_active_branch(&user, "main").await.ok();
 }
 
+#[tokio::test]
+async fn test_table_for_branch_bypasses_active_checkout() {
+    let store = setup().await;
+    let user = uid();
+    let branch_a = format!("br_a_{}", &uid()[5..]);
+    let branch_b = format!("br_b_{}", &uid()[5..]);
+    let table_a = format!("mem_br_a_{}", &uid()[5..]);
+    let table_b = format!("mem_br_b_{}", &uid()[5..]);
+
+    store
+        .register_branch(&user, &branch_a, &table_a)
+        .await
+        .expect("register a");
+    store
+        .register_branch(&user, &branch_b, &table_b)
+        .await
+        .expect("register b");
+    store
+        .set_active_branch(&user, &branch_b)
+        .await
+        .expect("set active b");
+
+    let explicit = store
+        .table_for_branch(&user, Some(&branch_a))
+        .await
+        .expect("explicit branch table");
+    let implicit = store
+        .table_for_branch(&user, None)
+        .await
+        .expect("implicit active table");
+
+    assert_eq!(explicit, table_a);
+    assert_eq!(implicit, table_b);
+
+    store.deregister_branch(&user, &branch_a).await.ok();
+    store.deregister_branch(&user, &branch_b).await.ok();
+    store.set_active_branch(&user, "main").await.ok();
+}
+
 // ── 3. active_table falls back to main if branch deleted ─────────────────────
 
 #[tokio::test]
