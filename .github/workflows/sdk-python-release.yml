@@ -1,0 +1,63 @@
+name: Python SDK Release
+
+on:
+  push:
+    tags:
+      - "python-sdk-v*"
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Verify tag matches package version
+        run: |
+          TAG="${GITHUB_REF_NAME#python-sdk-v}"
+          VERSION=$(python -c "import tomllib; print(tomllib.load(open('sdk/python/pyproject.toml','rb'))['project']['version'])")
+          echo "Tag version: $TAG"
+          echo "Package version: $VERSION"
+          if [ "$TAG" != "$VERSION" ]; then
+            echo "❌ Tag version ($TAG) does not match pyproject.toml version ($VERSION)"
+            exit 1
+          fi
+          echo "✅ Versions match: $VERSION"
+
+      - name: Install build tools
+        run: pip install build twine
+
+      - name: Build wheel and sdist
+        working-directory: sdk/python
+        run: python -m build
+
+      - name: Validate package metadata (PyPI compatibility check)
+        run: twine check sdk/python/dist/*
+
+      - name: Run unit tests
+        working-directory: sdk/python
+        run: |
+          pip install -e ".[dev]"
+          python -m pytest tests/unit/ -v
+
+      - name: Create GitHub Release and upload assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-rc') || contains(github.ref_name, '-beta') || contains(github.ref_name, '-alpha') }}
+          files: |
+            sdk/python/dist/*.whl
+            sdk/python/dist/*.tar.gz
+
+      # PyPI publishing — uncomment when ready for v1.x release to PyPI:
+      # - uses: pypa/gh-action-pypi-publish@release/v1
+      #   with:
+      #     packages-dir: sdk/python/dist/
+      #     password: ${{ secrets.PYPI_API_TOKEN }}

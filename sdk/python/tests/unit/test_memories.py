@@ -1,0 +1,244 @@
+"""Unit tests for MemoriesResource (sync)."""
+
+from __future__ import annotations
+
+import pytest
+from pytest_httpx import HTTPXMock
+
+from memoria import MemoriaClient, MemoriaAuthError, MemoriaForbiddenError, MemoriaNotFoundError
+from memoria import MemoriaUnprocessableError, MemoriaValidationError
+from memoria.models import Memory, MemoryPage, PurgeResult, RetrieveResult
+from tests.conftest import BASE_URL, API_KEY, MEMORY_STUB
+
+
+@pytest.fixture
+def client() -> MemoriaClient:
+    return MemoriaClient(base_url=BASE_URL, api_key=API_KEY, max_retries=0)
+
+
+# ---------------------------------------------------------------------------
+# store
+# ---------------------------------------------------------------------------
+
+
+def test_store_happy_path(httpx_mock: HTTPXMock, client: MemoriaClient) -> None:
+    httpx_mock.add_response(json=MEMORY_STUB)
+    mem = client.memories.store(content="test content")
+    assert isinstance(mem, Memory)
+    assert mem.memory_id == "mem_abc123"
+    assert mem.content == "test content"
+
+
+def test_store_with_all_params(httpx_mock: HTTPXMock, client: MemoriaClient) -> None:
+    httpx_mock.add_response(json=MEMORY_STUB)
+    mem = client.memories.store(
+        content="test",
+        memory_type="profile",
+        session_id="sess_1",
+        trust_tier="T1",
+        branch="my-branch",
+    )
+    assert mem.memory_id == "mem_abc123"
+    req = httpx_mock.get_request()
+    assert req is not None
+    import json
+    body = json.loads(req.content)
+    assert body["memory_type"] == "profile"
+    assert body["session_id"] == "sess_1"
+    assert body["trust_tier"] == "T1"
+    assert body["branch"] == "my-branch"
+
+
+def test_store_401_raises_auth_error(httpx_mock: HTTPXMock, client: MemoriaClient) -> None:
+    httpx_mock.add_response(status_code=401, json={"detail": "invalid key"})
+    with pytest.raises(MemoriaAuthError) as exc:
+        client.memories.store(content="x")
+    assert exc.value.status_code == 401
+
+
+def test_store_403_raises_forbidden(httpx_mock: HTTPXMock, client: MemoriaClient) -> None:
+    httpx_mock.add_response(
+        status_code=403, json={"detail": "main is read-only in group mode"}
+    )
+    with pytest.raises(MemoriaForbiddenError):
+        client.memories.store(content="x")
+
+
+def test_store_422_raises_unprocessable(httpx_mock: HTTPXMock, client: MemoriaClient) -> None:
+    httpx_mock.add_response(status_code=422, json={"detail": "content exceeds 32 KiB"})
+    with pytest.raises(MemoriaUnprocessableError) as exc:
+        client.memories.store(content="x")
+    assert "32 KiB" in exc.value.detail
+
+
+# ---------------------------------------------------------------------------
+# store_batch
+# ---------------------------------------------------------------------------
+
+
+def test_store_batch_happy_path(httpx_mock: HTTPXMock, client: MemoriaClient) -> None:
+    httpx_mock.add_response(json=[MEMORY_STUB, MEMORY_STUB])
+    mems = client.memories.store_batch(
+        [{"content": "a"}, {"content": "b"}]
+    )
+    assert len(mems) == 2
+    # Verify the request body uses "memories" (not "items") to match the server contract
+    import json as _json
+    req = httpx_mock.get_request()
+    assert req is not None
+    body = _json.loads(req.content)
+    assert "memories" in body
+    assert "items" not in body
+
+
+def test_store_batch_over_limit_raises_validation_error(client: MemoriaClient) -> None:
+    items = [{"content": f"item {i}"} for i in range(101)]
+    with pytest.raises(MemoriaValidationError, match="100"):
+        client.memories.store_batch(items)
+
+
+# ---------------------------------------------------------------------------
+# retrieve
+# ---------------------------------------------------------------------------
+
+
+def test_retrieve_happy_path(httpx_mock: HTTPXMock, client: MemoriaClient) -> None:
+    httpx_mock.add_response(json={"results": [MEMORY_STUB], "explain": None})
+    result = client.memories.retrieve(query="test")
+    assert isinstance(result, RetrieveResult)
+    assert len(result.items) == 1
+
+
+def test_retrieve_session_scope_without_session_id_raises(client: MemoriaClient) -> None:
+    with pytest.raises(MemoriaValidationError, match="session_id"):
+        client.memories.retrieve(query="x", session_scope="prefer")
+
+
+def test_retrieve_with_explain(httpx_mock: HTTPXMock, client: MemoriaClient) -> None:
+    httpx_mock.add_response(
+        json={"results": [MEMORY_STUB], "explain": {"path": "hybrid", "elapsed_ms": 12}}
+    )
+    result = client.memories.retrieve(query="test", explain=True)
+    assert result.explain is not None
+    assert result.explain["path"] == "hybrid"
+
+
+# ---------------------------------------------------------------------------
+# list
+# ---------------------------------------------------------------------------
+
+
+def test_list_happy_path(httpx_mock: HTTPXMock, client: MemoriaClient) -> None:
+    httpx_mock.add_response(json={"items": [MEMORY_STUB], "next_cursor": None})
+    page = client.memories.list()
+    assert isinstance(page, MemoryPage)
+    assert len(page.items) == 1
+    assert page.next_cursor is None
+
+
+def test_list_with_cursor(httpx_mock: HTTPXMock, client: MemoriaClient) -> None:
+    httpx_mock.add_response(json={"items": [], "next_cursor": None})
+    page = client.memories.list(limit=10, cursor="abc123", memory_type="semantic")
+    assert page.items == []
+
+
+def test_list_over_max_limit_raises(client: MemoriaClient) -> None:
+    with pytest.raises(MemoriaValidationError, match="500"):
+        client.memories.list(limit=501)
+
+
+# ---------------------------------------------------------------------------
+# correct / correct_by_query
+# ---------------------------------------------------------------------------
+
+
+def test_correct_happy_path(httpx_mock: HTTPXMock, client: MemoriaClient) -> None:
+    updated = {**MEMORY_STUB, "content": "updated content"}
+    httpx_mock.add_response(json=updated)
+    mem = client.memories.correct("mem_abc123", new_content="updated content", reason="fix")
+    assert mem.content == "updated content"
+
+
+def test_correct_404_raises_not_found(httpx_mock: HTTPXMock, client: MemoriaClient) -> None:
+    httpx_mock.add_response(status_code=404, json={"detail": "not found"})
+    with pytest.raises(MemoriaNotFoundError):
+        client.memories.correct("missing_id", new_content="x")
+
+
+def test_correct_by_query_happy_path(httpx_mock: HTTPXMock, client: MemoriaClient) -> None:
+    httpx_mock.add_response(json=MEMORY_STUB)
+    mem = client.memories.correct_by_query(
+        query="old content", new_content="new content", reason="user correction"
+    )
+    assert mem.memory_id == "mem_abc123"
+
+
+def test_correct_by_query_session_scope_without_id(client: MemoriaClient) -> None:
+    with pytest.raises(MemoriaValidationError, match="session_id"):
+        client.memories.correct_by_query(
+            query="x", new_content="y", session_scope="only"
+        )
+
+
+# ---------------------------------------------------------------------------
+# delete
+# ---------------------------------------------------------------------------
+
+
+def test_delete_happy_path(httpx_mock: HTTPXMock, client: MemoriaClient) -> None:
+    httpx_mock.add_response(status_code=204)
+    client.memories.delete("mem_abc123", reason="done")  # should not raise
+
+
+# ---------------------------------------------------------------------------
+# purge
+# ---------------------------------------------------------------------------
+
+
+def test_purge_by_ids(httpx_mock: HTTPXMock, client: MemoriaClient) -> None:
+    httpx_mock.add_response(
+        json={"purged": 2, "snapshot_name": "pre_auto_snap", "warning": None}
+    )
+    result = client.memories.purge(memory_ids=["id1", "id2"], reason="cleanup")
+    assert isinstance(result, PurgeResult)
+    assert result.purged == 2
+    assert result.snapshot_name == "pre_auto_snap"
+
+
+def test_purge_by_topic(httpx_mock: HTTPXMock, client: MemoriaClient) -> None:
+    httpx_mock.add_response(json={"purged": 5, "snapshot_name": None})
+    result = client.memories.purge(topic="debug session", reason="done")
+    assert result.purged == 5
+
+
+def test_purge_by_session_with_types(httpx_mock: HTTPXMock, client: MemoriaClient) -> None:
+    httpx_mock.add_response(json={"purged": 3})
+    result = client.memories.purge(
+        session_id="sess_abc", memory_types=["working"], reason="session ended"
+    )
+    assert result.purged == 3
+
+
+def test_purge_no_selector_raises(client: MemoriaClient) -> None:
+    with pytest.raises(MemoriaValidationError, match="must specify"):
+        client.memories.purge(reason="oops")
+
+
+def test_purge_multiple_selectors_raises(client: MemoriaClient) -> None:
+    with pytest.raises(MemoriaValidationError, match="mutually exclusive"):
+        client.memories.purge(memory_ids=["id1"], topic="foo")
+
+
+def test_purge_memory_types_without_session_id_raises(client: MemoriaClient) -> None:
+    with pytest.raises(MemoriaValidationError, match="session_id"):
+        client.memories.purge(topic="x", memory_types=["working"])
+
+
+# ---------------------------------------------------------------------------
+# feedback
+# ---------------------------------------------------------------------------
+
+
+def test_feedback_happy_path(httpx_mock: HTTPXMock, client: MemoriaClient) -> None:
+    httpx_mock.add_response(status_code=204)
+    client.memories.feedback("mem_abc123", signal="useful", context="helped answer")

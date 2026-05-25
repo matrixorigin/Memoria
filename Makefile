@@ -3,6 +3,7 @@
         dev build build-local check \
         test test-unit test-integration test-e2e test-e2e-mcp bench dev-bench \
         new-key list-keys revoke-keys \
+        python-sdk-test python-sdk-test-unit \
         clean reset
 
 # Load .env if present
@@ -339,6 +340,29 @@ revoke-keys: check-env
 		-X DELETE "http://localhost:$$API_PORT/admin/users/$$USER/keys" \
 		-H "Authorization: Bearer $$MASTER_KEY" && echo "" || \
 	echo "❌ Failed — is the API running?"
+
+# ── Python SDK Tests ────────────────────────────────────────────────
+
+SDK_PYTHON_DIR = sdk/python
+MEMORIA_BASE_URL ?= http://localhost:$${API_PORT:-8100}
+# Resolve Python interpreter: prefer .venv inside the SDK dir, fall back to python3
+SDK_PYTHON_ABS := $(abspath $(SDK_PYTHON_DIR))
+SDK_PYTHON := $(shell [ -f "$(SDK_PYTHON_ABS)/.venv/bin/python" ] && echo "$(SDK_PYTHON_ABS)/.venv/bin/python" || echo python3)
+
+# Integration tests: unit + integration (needs `make up` first)
+python-sdk-test: check-env
+	@API_PORT=$${API_PORT:-8100}; \
+	curl -sf --noproxy localhost http://localhost:$$API_PORT/health \
+		> /dev/null 2>&1 || \
+	(echo "❌ Memoria API not running — run: make up"; exit 1)
+	@cd $(SDK_PYTHON_DIR) && \
+		MEMORIA_BASE_URL=$(MEMORIA_BASE_URL) \
+		MEMORIA_MASTER_KEY=$${MEMORIA_MASTER_KEY} \
+		$(SDK_PYTHON) -m pytest tests/unit/ tests/integration/ -v
+
+# Unit tests only: no running API needed, uses mock HTTP
+python-sdk-test-unit:
+	@cd $(SDK_PYTHON_DIR) && $(SDK_PYTHON) -m pytest tests/unit/ -v
 
 # ── Clean ───────────────────────────────────────────────────────────
 
