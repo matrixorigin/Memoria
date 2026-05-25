@@ -44,7 +44,12 @@ from .models import (
     Snapshot,
 )
 
-__version__ = "1.0.0"
+try:
+    from importlib.metadata import version as _pkg_version
+
+    __version__: str = _pkg_version("memoria-client")
+except Exception:
+    __version__ = "dev"
 
 __all__ = [
     # clients

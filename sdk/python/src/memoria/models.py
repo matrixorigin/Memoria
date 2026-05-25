@@ -114,14 +114,14 @@ class Snapshot:
     """A named snapshot of memory state."""
 
     name: str
-    created_at: datetime
+    created_at: datetime | None = None
     description: str | None = None
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> Snapshot:
         return cls(
             name=d["name"],
-            created_at=_parse_dt(d.get("created_at")) or datetime.now(timezone.utc),
+            created_at=_parse_dt(d.get("created_at")),
             description=d.get("description"),
         )
 

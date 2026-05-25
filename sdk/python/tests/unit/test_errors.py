@@ -27,21 +27,33 @@ def test_500_raises_server_error(httpx_mock: HTTPXMock, client_no_retry: Memoria
     assert exc.value.status_code == 500
 
 
-def test_500_retried_then_succeeds(
+def test_500_on_post_not_retried(
     httpx_mock: HTTPXMock, client_with_retry: MemoriaClient
 ) -> None:
-    httpx_mock.add_response(status_code=500, json={"detail": "transient"})
-    httpx_mock.add_response(status_code=500, json={"detail": "transient"})
+    # POST is non-idempotent: 500 is NOT retried to avoid duplicate writes.
+    httpx_mock.add_response(status_code=500, json={"detail": "server error"})
+    with pytest.raises(MemoriaServerError):
+        client_with_retry.memories.store(content="x")
+    # Only one request should have been made (no retry).
+    assert len(httpx_mock.get_requests()) == 1
+
+
+def test_502_on_post_retried_then_succeeds(
+    httpx_mock: HTTPXMock, client_with_retry: MemoriaClient
+) -> None:
+    # 502/503/504 are gateway errors; POST is safe to retry (server did not process).
+    httpx_mock.add_response(status_code=502, json={"detail": "bad gateway"})
+    httpx_mock.add_response(status_code=502, json={"detail": "bad gateway"})
     httpx_mock.add_response(json=MEMORY_STUB)
     mem = client_with_retry.memories.store(content="x")
     assert mem.memory_id == "mem_abc123"
 
 
-def test_500_exhausted_retries_raises(
+def test_502_exhausted_retries_raises(
     httpx_mock: HTTPXMock, client_with_retry: MemoriaClient
 ) -> None:
     for _ in range(3):  # max_retries=2 → 3 total attempts
-        httpx_mock.add_response(status_code=500, json={"detail": "error"})
+        httpx_mock.add_response(status_code=502, json={"detail": "bad gateway"})
     with pytest.raises(MemoriaServerError):
         client_with_retry.memories.store(content="x")
 

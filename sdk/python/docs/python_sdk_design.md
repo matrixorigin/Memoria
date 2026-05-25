@@ -43,7 +43,7 @@ Memoria/
 │       ├── README.md         # Quick start for users
 │       ├── CHANGELOG.md      # Version history
 │       ├── docs/
-│       │   └── python_sdk_design.txt   # This document
+│       │   └── python_sdk_design.md    # This document
 │       ├── src/
 │       │   └── memoria/
 │       │       ├── __init__.py       # Exports MemoriaClient / AsyncMemoriaClient

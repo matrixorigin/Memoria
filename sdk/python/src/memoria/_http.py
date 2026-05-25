@@ -27,10 +27,44 @@ from .exceptions import (
     MemoriaUnprocessableError,
 )
 
-_VERSION = "1.0.0"
+try:
+    from importlib.metadata import version as _pkg_version
+
+    _VERSION: str = _pkg_version("memoria-client")
+except Exception:
+    _VERSION = "dev"
+
 _DEFAULT_TIMEOUT = 30.0
 _DEFAULT_MAX_RETRIES = 3
-_RETRY_STATUS = {500, 502, 503, 504}
+
+# 502/503/504 are gateway-level errors: the upstream server almost certainly
+# did not process the request, so retrying is safe for any HTTP method.
+# 500 is ambiguous for non-idempotent methods: the server may have processed
+# the request and written data before returning the error. Retrying a POST/PATCH
+# on 500 could produce duplicate writes (e.g. duplicate memories), so we exclude
+# it for non-safe methods.
+_RETRY_STATUS_SAFE = {500, 502, 503, 504}       # idempotent methods: GET/HEAD/PUT/DELETE
+_RETRY_STATUS_UNSAFE = {502, 503, 504}           # non-idempotent methods: POST/PATCH
+
+# HTTP methods where repeating the request is guaranteed not to cause side-effects.
+_IDEMPOTENT_METHODS = {"GET", "HEAD", "PUT", "DELETE", "OPTIONS", "TRACE"}
+
+
+def _should_retry(method: str, status_code: int) -> bool:
+    if method.upper() in _IDEMPOTENT_METHODS:
+        return status_code in _RETRY_STATUS_SAFE
+    return status_code in _RETRY_STATUS_UNSAFE
+
+
+def _should_retry_network_error(method: str, exc: Exception) -> bool:
+    """ConnectError is safe to retry for any method (server never received the request).
+    TimeoutException is only safe for idempotent methods — a read timeout on POST may
+    mean the server processed the request but the response was lost in transit."""
+    if isinstance(exc, httpx.ConnectError):
+        return True
+    if isinstance(exc, (httpx.TimeoutException, httpx.NetworkError)):
+        return method.upper() in _IDEMPOTENT_METHODS
+    return False
 
 
 def _build_headers(api_key: str) -> dict[str, str]:
@@ -60,9 +94,6 @@ def _map_error(resp: httpx.Response) -> MemoriaAPIError:
         return MemoriaServerError(sc, detail)
     return MemoriaAPIError(sc, detail)
 
-
-def _should_retry(status_code: int) -> bool:
-    return status_code in _RETRY_STATUS
 
 
 def _backoff(attempt: int) -> float:
@@ -101,7 +132,15 @@ class _HttpTransport:
         params: dict[str, Any] | None = None,
         json: Any = None,
     ) -> Any:
-        """Execute a synchronous HTTP request with retry logic."""
+        """Execute a synchronous HTTP request with retry logic.
+
+        Retry policy:
+          - 502/503/504: always retried (gateway errors; server did not process request)
+          - 500: only retried for idempotent methods (GET/HEAD/PUT/DELETE) to avoid
+            duplicate writes on non-idempotent endpoints like POST memories.store
+          - ConnectError: always retried (connection never reached server)
+          - TimeoutException/NetworkError: only retried for idempotent methods
+        """
         url = self._url(path)
         last_exc: Exception | None = None
         for attempt in range(self._max_retries + 1):
@@ -115,7 +154,7 @@ class _HttpTransport:
                 )
             except (httpx.ConnectError, httpx.TimeoutException, httpx.NetworkError) as exc:
                 last_exc = exc
-                if attempt < self._max_retries:
+                if attempt < self._max_retries and _should_retry_network_error(method, exc):
                     time.sleep(_backoff(attempt))
                     continue
                 raise MemoriaConnectionError(str(exc)) from exc
@@ -131,7 +170,7 @@ class _HttpTransport:
                 except Exception:
                     return resp.text
 
-            if _should_retry(resp.status_code) and attempt < self._max_retries:
+            if _should_retry(method, resp.status_code) and attempt < self._max_retries:
                 time.sleep(_backoff(attempt))
                 continue
 
@@ -154,7 +193,10 @@ class _HttpTransport:
         params: dict[str, Any] | None = None,
         json: Any = None,
     ) -> Any:
-        """Execute an asynchronous HTTP request with retry logic."""
+        """Execute an asynchronous HTTP request with retry logic.
+
+        Same retry policy as _request — see its docstring for details.
+        """
         import asyncio
 
         url = self._url(path)
@@ -170,7 +212,7 @@ class _HttpTransport:
                 )
             except (httpx.ConnectError, httpx.TimeoutException, httpx.NetworkError) as exc:
                 last_exc = exc
-                if attempt < self._max_retries:
+                if attempt < self._max_retries and _should_retry_network_error(method, exc):
                     await asyncio.sleep(_backoff(attempt))
                     continue
                 raise MemoriaConnectionError(str(exc)) from exc
@@ -186,7 +228,7 @@ class _HttpTransport:
                 except Exception:
                     return resp.text
 
-            if _should_retry(resp.status_code) and attempt < self._max_retries:
+            if _should_retry(method, resp.status_code) and attempt < self._max_retries:
                 await asyncio.sleep(_backoff(attempt))
                 continue
 

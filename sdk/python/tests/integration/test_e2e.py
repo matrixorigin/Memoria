@@ -58,9 +58,14 @@ def _create_api_key(base_url: str, master_key: str) -> str:
 
 
 def _embedding_available(client: MemoriaClient) -> bool:
-    """Probe whether the server has a working embedding backend by storing a test memory."""
+    """Probe whether the server has a working embedding backend.
+
+    Uses memory_type="semantic" because semantic memories always require
+    vectorization — the probe fails immediately if embedding is misconfigured.
+    memory_type="working" does NOT trigger embedding and would give a false positive.
+    """
     try:
-        mem = client.memories.store(content="__embedding_probe__", memory_type="working")
+        mem = client.memories.store(content="__embedding_probe__", memory_type="semantic")
         client.memories.delete(mem.memory_id, reason="probe cleanup")
         return True
     except MemoriaServerError as e:
@@ -161,9 +166,7 @@ def test_purge_by_session(client: MemoriaClient, has_embedding: bool) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_store_batch(client: MemoriaClient, has_embedding: bool) -> None:
-    if not has_embedding:
-        pytest.skip("embedding not configured on this server")
+def test_store_batch(client: MemoriaClient) -> None:
     session_id = f"batch_{uuid.uuid4().hex[:8]}"
     mems = client.memories.store_batch([
         {"content": "batch item 1", "memory_type": "working", "session_id": session_id},
