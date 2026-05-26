@@ -144,6 +144,7 @@ client.governance.run(force=True)
 ```python
 from memoria import (
     MemoriaConnectionError,   # network unreachable / timeout
+    MemoriaAPIError,          # base class for all HTTP error responses
     MemoriaAuthError,         # 401 — invalid key or rate-limit exceeded
     MemoriaForbiddenError,    # 403 — e.g. write to main in multi-member group mode
     MemoriaNotFoundError,     # 404
@@ -158,6 +159,20 @@ except MemoriaUnprocessableError as e:
     print(f"Validation failed: {e.detail}")
 except MemoriaAuthError:
     print("Check your API key, or you may have hit the rate limit")
+```
+
+`ping()` raises `MemoriaConnectionError` for network failures and `MemoriaAPIError` (or a
+subclass) for HTTP error responses — callers can distinguish the two:
+
+```python
+from memoria import MemoriaAPIError, MemoriaConnectionError
+
+try:
+    client.ping()
+except MemoriaConnectionError:
+    print("Cannot reach the server")
+except MemoriaAPIError as e:
+    print(f"Server returned HTTP {e.status_code}: {e.detail}")
 ```
 
 ## Compatibility Matrix

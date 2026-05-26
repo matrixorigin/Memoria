@@ -21,7 +21,7 @@ from typing import Any
 import httpx
 
 from ._http import _DEFAULT_MAX_RETRIES, _DEFAULT_TIMEOUT, _build_headers, _HttpTransport
-from .exceptions import MemoriaConnectionError
+from .exceptions import MemoriaAPIError, MemoriaConnectionError
 from .models import ObserveResult
 from .resources.branches import AsyncBranchesResource, BranchesResource
 from .resources.governance import AsyncGovernanceResource, GovernanceResource
@@ -87,11 +87,16 @@ class MemoriaClient(_HttpTransport):
     # ------------------------------------------------------------------
 
     def ping(self) -> bool:
-        """Return True if the Memoria API is reachable, else raise MemoriaConnectionError."""
+        """Return True if the Memoria API is reachable.
+
+        Raises:
+            MemoriaConnectionError: network unreachable or timeout.
+            MemoriaAPIError: server responded with an HTTP error (e.g. 401, 404).
+        """
         try:
             self._request("GET", "/health")
             return True
-        except MemoriaConnectionError:
+        except (MemoriaConnectionError, MemoriaAPIError):
             raise
         except Exception as exc:
             raise MemoriaConnectionError(str(exc)) from exc
@@ -161,11 +166,16 @@ class AsyncMemoriaClient(_HttpTransport):
     # ------------------------------------------------------------------
 
     async def ping(self) -> bool:
-        """Return True if the Memoria API is reachable, else raise MemoriaConnectionError."""
+        """Return True if the Memoria API is reachable.
+
+        Raises:
+            MemoriaConnectionError: network unreachable or timeout.
+            MemoriaAPIError: server responded with an HTTP error (e.g. 401, 404).
+        """
         try:
             await self._arequest("GET", "/health")
             return True
-        except MemoriaConnectionError:
+        except (MemoriaConnectionError, MemoriaAPIError):
             raise
         except Exception as exc:
             raise MemoriaConnectionError(str(exc)) from exc

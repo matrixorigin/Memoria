@@ -44,3 +44,5 @@ scripts/migrate_embedding_dim.sh
 dev-signing-key.b64
 .npmrc
 nohup.out
+sdk/python/.venv/
+sdk/python/uv.lock

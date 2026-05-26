@@ -75,12 +75,29 @@ def _build_headers(api_key: str) -> dict[str, str]:
     }
 
 
+_HTTP_STATUS_TEXTS: dict[int, str] = {
+    400: "Bad Request",
+    401: "Unauthorized",
+    403: "Forbidden",
+    404: "Not Found",
+    409: "Conflict",
+    422: "Unprocessable Entity",
+    429: "Too Many Requests",
+    500: "Internal Server Error",
+    502: "Bad Gateway",
+    503: "Service Unavailable",
+    504: "Gateway Timeout",
+}
+
+
 def _map_error(resp: httpx.Response) -> MemoriaAPIError:
     """Convert an error HTTP response to the appropriate exception subclass."""
     try:
-        detail = resp.json().get("detail", resp.text)
+        detail = resp.json().get("detail") or resp.text
     except Exception:
-        detail = resp.text or f"HTTP {resp.status_code}"
+        detail = resp.text
+    if not detail:
+        detail = _HTTP_STATUS_TEXTS.get(resp.status_code, f"HTTP {resp.status_code}")
     sc = resp.status_code
     if sc == 401:
         return MemoriaAuthError(sc, detail)

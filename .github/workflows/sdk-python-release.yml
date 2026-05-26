@@ -56,8 +56,7 @@ jobs:
             sdk/python/dist/*.whl
             sdk/python/dist/*.tar.gz
 
-      # PyPI publishing — uncomment when ready for v1.x release to PyPI:
-      # - uses: pypa/gh-action-pypi-publish@release/v1
-      #   with:
-      #     packages-dir: sdk/python/dist/
-      #     password: ${{ secrets.PYPI_API_TOKEN }}
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: sdk/python/dist/
+          password: ${{ secrets.PYPI_API_TOKEN }}

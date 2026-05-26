@@ -1,5 +1,13 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+- `ping()` no longer wraps `MemoriaAuthError` / `MemoriaNotFoundError` and other API errors
+  into `MemoriaConnectionError`; callers can now distinguish network failures from API errors.
+- `_map_error`: empty response body no longer produces duplicate status code in the error
+  message (e.g. `"HTTP 404: HTTP 404"` → `"HTTP 404: Not Found"`).
+
 ## [1.0.0] - 2026-05-25
 
 ### Added
