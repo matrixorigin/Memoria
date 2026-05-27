@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "memoria-client"
-version = "1.0.0"
+version = "0.0.1"
 description = "Official Python SDK for the Memoria memory engine REST API"
 readme = "README.md"
 requires-python = ">=3.10"

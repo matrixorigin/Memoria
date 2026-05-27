@@ -1,9 +1,7 @@
 name: Python SDK Release
 
 on:
-  push:
-    tags:
-      - "python-sdk-v*"
+  workflow_dispatch:
 
 jobs:
   release:
@@ -16,19 +14,16 @@ jobs:
 
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.10"
+          python-version: "3.11"
 
-      - name: Verify tag matches package version
+      - name: Read version from pyproject.toml
+        id: version
         run: |
-          TAG="${GITHUB_REF_NAME#python-sdk-v}"
-          VERSION=$(python -c "import tomllib; print(tomllib.load(open('sdk/python/pyproject.toml','rb'))['project']['version'])")
-          echo "Tag version: $TAG"
-          echo "Package version: $VERSION"
-          if [ "$TAG" != "$VERSION" ]; then
-            echo "❌ Tag version ($TAG) does not match pyproject.toml version ($VERSION)"
-            exit 1
-          fi
-          echo "✅ Versions match: $VERSION"
+          VERSION=$(grep '^version = ' sdk/python/pyproject.toml | sed 's/version = "\(.*\)"/\1/')
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=python-sdk-v$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Version: $VERSION"
+          echo "Tag: python-sdk-v$VERSION"
 
       - name: Install build tools
         run: pip install build twine
@@ -49,9 +44,9 @@ jobs:
       - name: Create GitHub Release and upload assets
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.ref_name }}
+          tag_name: ${{ steps.version.outputs.tag }}
           generate_release_notes: true
-          prerelease: ${{ contains(github.ref_name, '-rc') || contains(github.ref_name, '-beta') || contains(github.ref_name, '-alpha') }}
+          prerelease: ${{ contains(steps.version.outputs.version, 'rc') || contains(steps.version.outputs.version, 'beta') || contains(steps.version.outputs.version, 'alpha') }}
           files: |
             sdk/python/dist/*.whl
             sdk/python/dist/*.tar.gz
