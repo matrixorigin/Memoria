@@ -17,13 +17,9 @@ jobs:
           python-version: "3.11"
 
       - name: Read version from pyproject.toml
-        id: version
         run: |
           VERSION=$(grep '^version = ' sdk/python/pyproject.toml | sed 's/version = "\(.*\)"/\1/')
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "tag=python-sdk-v$VERSION" >> "$GITHUB_OUTPUT"
           echo "Version: $VERSION"
-          echo "Tag: python-sdk-v$VERSION"
 
       - name: Install build tools
         run: pip install build twine
@@ -40,16 +36,6 @@ jobs:
         run: |
           pip install -e ".[dev]"
           python -m pytest tests/unit/ -v
-
-      - name: Create GitHub Release and upload assets
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ steps.version.outputs.tag }}
-          generate_release_notes: true
-          prerelease: ${{ contains(steps.version.outputs.version, 'rc') || contains(steps.version.outputs.version, 'beta') || contains(steps.version.outputs.version, 'alpha') }}
-          files: |
-            sdk/python/dist/*.whl
-            sdk/python/dist/*.tar.gz
 
       - uses: pypa/gh-action-pypi-publish@release/v1
         with:
