@@ -25,6 +25,7 @@ pub struct SessionSummaryRequest {
     pub focus_topics: Option<Vec<String>>,
     #[serde(default = "default_true")]
     pub generate_embedding: bool,
+    pub subject_id: Option<String>,
 }
 fn default_mode() -> String {
     "full".to_string()
@@ -90,7 +91,12 @@ async fn generate_and_store(
     session_id: &str,
     mode: &str,
     focus_topics: Option<&[String]>,
+    subject_id: Option<&str>,
 ) -> Result<(String, String, bool, serde_json::Value), String> {
+    // Normalize subject_id so that a caller passing "  alice  " produces the
+    // same filter and stored value as one passing "alice".
+    let subject_id = subject_id.map(str::trim).filter(|s| !s.is_empty());
+
     let sql = state
         .service
         .user_sql_store(scope_id)
@@ -106,17 +112,35 @@ async fn generate_and_store(
         .as_ref()
         .ok_or("LLM not configured — set LLM_API_KEY")?;
 
-    let query = format!(
-        "SELECT memory_id, content, memory_type FROM {table} \
-         WHERE user_id = ? AND session_id = ? AND is_active = 1 \
-         ORDER BY created_at ASC"
-    );
-    let rows = sqlx::query(&query)
-        .bind(scope_id)
-        .bind(session_id)
-        .fetch_all(sql.pool())
-        .await
-        .map_err(|e| e.to_string())?;
+    let (query, rows) = if let Some(sid) = subject_id {
+        let q = format!(
+            "SELECT memory_id, content, memory_type FROM {table} \
+             WHERE user_id = ? AND session_id = ? AND subject_id = ? AND is_active = 1 \
+             ORDER BY created_at ASC"
+        );
+        let r = sqlx::query(&q)
+            .bind(scope_id)
+            .bind(session_id)
+            .bind(sid)
+            .fetch_all(sql.pool())
+            .await
+            .map_err(|e| e.to_string())?;
+        (q, r)
+    } else {
+        let q = format!(
+            "SELECT memory_id, content, memory_type FROM {table} \
+             WHERE user_id = ? AND session_id = ? AND is_active = 1 \
+             ORDER BY created_at ASC"
+        );
+        let r = sqlx::query(&q)
+            .bind(scope_id)
+            .bind(session_id)
+            .fetch_all(sql.pool())
+            .await
+            .map_err(|e| e.to_string())?;
+        (q, r)
+    };
+    let _ = query; // used above
 
     if rows.is_empty() {
         return Err(format!("No memories found for session {session_id}"));
@@ -169,11 +193,12 @@ async fn generate_and_store(
                 scope_id,
                 &content,
                 memoria_core::MemoryType::Episodic,
+                Some(session_id.to_string()),
                 None,
                 None,
                 None,
                 None,
-                None,
+                subject_id.map(String::from),
             )
             .await
             .map_err(|e| e.to_string())?;
@@ -216,11 +241,12 @@ async fn generate_and_store(
                 scope_id,
                 &content,
                 memoria_core::MemoryType::Episodic,
+                Some(session_id.to_string()),
                 None,
                 None,
                 None,
                 None,
-                None,
+                subject_id.map(String::from),
             )
             .await
             .map_err(|e| e.to_string())?;
@@ -250,6 +276,7 @@ pub async fn create_session_summary(
             &session_id,
             &req.mode,
             req.focus_topics.as_deref(),
+            req.subject_id.as_deref(),
         )
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
@@ -282,9 +309,18 @@ pub async fn create_session_summary(
     let sid = session_id.clone();
     let mode = req.mode.clone();
     let focus = req.focus_topics.clone();
+    let subject_id_async = req.subject_id.clone();
 
     tokio::spawn(async move {
-        let result = generate_and_store(&state_clone, &uid, &sid, &mode, focus.as_deref()).await;
+        let result = generate_and_store(
+            &state_clone,
+            &uid,
+            &sid,
+            &mode,
+            focus.as_deref(),
+            subject_id_async.as_deref(),
+        )
+        .await;
         if let Some(ts) = &state_clone.task_store {
             match result {
                 Ok((mid, content, truncated, metadata)) => {

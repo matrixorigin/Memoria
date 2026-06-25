@@ -473,6 +473,7 @@ async fn test_batch_entity_methods() {
         created_at: Some(chrono::Utc::now()),
         updated_at: None,
         author_id: None,
+        subject_id: None,
     };
     let memories_table = store.t("mem_memories");
     store
@@ -592,6 +593,7 @@ async fn test_find_near_duplicate_single_query_same_type_preference() {
         created_at: Some(chrono::Utc::now()),
         updated_at: None,
         author_id: None,
+        subject_id: None,
     };
     let memories_table = store.t("mem_memories");
     store
@@ -621,6 +623,7 @@ async fn test_find_near_duplicate_single_query_same_type_preference() {
         created_at: Some(chrono::Utc::now()),
         updated_at: None,
         author_id: None,
+        subject_id: None,
     };
     store
         .insert_into(&memories_table, &mem_b)
@@ -630,7 +633,7 @@ async fn test_find_near_duplicate_single_query_same_type_preference() {
     // Search for near duplicate of type "semantic" — should prefer A (same type)
     let exclude = format!("exclude_{}", Uuid::new_v4().simple());
     let result = store
-        .find_near_duplicate("mem_memories", &uid, &base_emb, "semantic", &exclude, 10.0)
+        .find_near_duplicate("mem_memories", &uid, &base_emb, "semantic", &exclude, 10.0, None)
         .await
         .expect("find_near_duplicate semantic");
     assert!(result.is_some(), "should find a duplicate");
@@ -647,6 +650,7 @@ async fn test_find_near_duplicate_single_query_same_type_preference() {
             "procedural",
             &exclude,
             10.0,
+            None,
         )
         .await
         .expect("find_near_duplicate procedural");
@@ -659,7 +663,7 @@ async fn test_find_near_duplicate_single_query_same_type_preference() {
 
     // Search for type "working" — no same-type match, should not cross-supersede another type
     let result3 = store
-        .find_near_duplicate("mem_memories", &uid, &base_emb, "working", &exclude, 10.0)
+        .find_near_duplicate("mem_memories", &uid, &base_emb, "working", &exclude, 10.0, None)
         .await
         .expect("find_near_duplicate working");
     assert!(result3.is_none(), "should not find cross-type duplicate");
@@ -673,6 +677,7 @@ async fn test_find_near_duplicate_single_query_same_type_preference() {
             "semantic",
             &mid_a,
             0.0000001,
+            None,
         )
         .await
         .expect("find_near_duplicate tight threshold");
@@ -686,6 +691,129 @@ async fn test_find_near_duplicate_single_query_same_type_preference() {
         .await;
 
     println!("✅ find_near_duplicate: single query with same-type preference");
+}
+
+#[tokio::test]
+async fn test_find_near_duplicate_scoped_by_subject_id() {
+    let (_svc, store, pool, uid, _ctx) = setup().await;
+    let dim = test_dim();
+    let base_emb: Vec<f32> = (0..dim).map(|i| (i as f32) / (dim as f32)).collect();
+    let memories_table = store.t("mem_memories");
+    let exclude = format!("exclude_{}", Uuid::new_v4().simple());
+
+    let mid_a = format!("subj_a_{}", &Uuid::new_v4().simple().to_string()[..8]);
+    let mem_a = memoria_core::Memory {
+        memory_id: mid_a.clone(),
+        user_id: uid.clone(),
+        memory_type: memoria_core::MemoryType::Semantic,
+        content: "subject partition test A".to_string(),
+        embedding: Some(base_emb.clone()),
+        session_id: None,
+        source_event_ids: vec![],
+        extra_metadata: None,
+        is_active: true,
+        superseded_by: None,
+        trust_tier: memoria_core::TrustTier::T3Inferred,
+        initial_confidence: 0.75,
+        retrieval_score: None,
+        access_count: 0,
+        observed_at: Some(chrono::Utc::now()),
+        created_at: Some(chrono::Utc::now()),
+        updated_at: None,
+        author_id: None,
+        subject_id: Some("subject-alpha".to_string()),
+    };
+    store
+        .insert_into(&memories_table, &mem_a)
+        .await
+        .expect("insert subject-alpha");
+
+    let mid_b = format!("subj_b_{}", &Uuid::new_v4().simple().to_string()[..8]);
+    let mem_b = memoria_core::Memory {
+        memory_id: mid_b.clone(),
+        user_id: uid.clone(),
+        memory_type: memoria_core::MemoryType::Semantic,
+        content: "subject partition test B".to_string(),
+        embedding: Some(base_emb.clone()),
+        session_id: None,
+        source_event_ids: vec![],
+        extra_metadata: None,
+        is_active: true,
+        superseded_by: None,
+        trust_tier: memoria_core::TrustTier::T3Inferred,
+        initial_confidence: 0.75,
+        retrieval_score: None,
+        access_count: 0,
+        observed_at: Some(chrono::Utc::now()),
+        created_at: Some(chrono::Utc::now()),
+        updated_at: None,
+        author_id: None,
+        subject_id: Some("subject-beta".to_string()),
+    };
+    store
+        .insert_into(&memories_table, &mem_b)
+        .await
+        .expect("insert subject-beta");
+
+    let found_a = store
+        .find_near_duplicate(
+            "mem_memories",
+            &uid,
+            &base_emb,
+            "semantic",
+            &exclude,
+            10.0,
+            Some("subject-alpha"),
+        )
+        .await
+        .expect("find subject-alpha");
+    assert_eq!(
+        found_a.map(|(id, _, _)| id),
+        Some(mid_a.clone()),
+        "subject-alpha query must not return subject-beta row"
+    );
+
+    let found_b = store
+        .find_near_duplicate(
+            "mem_memories",
+            &uid,
+            &base_emb,
+            "semantic",
+            &exclude,
+            10.0,
+            Some("subject-beta"),
+        )
+        .await
+        .expect("find subject-beta");
+    assert_eq!(
+        found_b.map(|(id, _, _)| id),
+        Some(mid_b.clone()),
+        "subject-beta query must not return subject-alpha row"
+    );
+
+    let found_unscoped = store
+        .find_near_duplicate(
+            "mem_memories",
+            &uid,
+            &base_emb,
+            "semantic",
+            &exclude,
+            10.0,
+            None,
+        )
+        .await
+        .expect("find unscoped");
+    assert!(
+        found_unscoped.is_none(),
+        "unscoped dedup must only match subject_id IS NULL rows"
+    );
+
+    let _ = sqlx::query("DELETE FROM mem_memories WHERE user_id = ?")
+        .bind(&uid)
+        .execute(&pool)
+        .await;
+
+    println!("✅ find_near_duplicate: scoped by subject_id partition");
 }
 
 // ── 7. idx_feedback_created_at migration ─────────────────────────────────────

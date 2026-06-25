@@ -122,16 +122,25 @@ impl RemoteClient {
     pub async fn call(&self, name: &str, args: Value) -> Result<Value> {
         match name {
             "memory_store" => {
+                let mut payload = json!({
+                    "content": args["content"],
+                    "memory_type": args["memory_type"].as_str().unwrap_or("semantic"),
+                    "session_id": args["session_id"],
+                    "trust_tier": args["trust_tier"],
+                    "branch": args["branch"],
+                });
+                if let Some(sid) = args
+                    .get("subject_id")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    payload["subject_id"] = json!(sid);
+                }
                 let r = self
                     .client
                     .post(self.url("/v1/memories"))
-                    .json(&json!({
-                        "content": args["content"],
-                        "memory_type": args["memory_type"].as_str().unwrap_or("semantic"),
-                        "session_id": args["session_id"],
-                        "trust_tier": args["trust_tier"],
-                        "branch": args["branch"],
-                    }))
+                    .json(&payload)
                     .send()
                     .await?;
                 let body = Self::parse_response(r).await?;
@@ -163,6 +172,19 @@ impl RemoteClient {
                     .and_then(serde_json::Value::as_str)
                 {
                     payload["session_scope"] = json!(session_scope);
+                }
+                if let Some(subject_id) = args
+                    .get("subject_id")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    payload["subject_id"] = json!(subject_id);
+                }
+                if let Some(memory_types) = args.get("memory_types").and_then(|v| v.as_array()) {
+                    if !memory_types.is_empty() {
+                        payload["memory_types"] = json!(memory_types);
+                    }
                 }
                 let r = self
                     .client
@@ -205,16 +227,32 @@ impl RemoteClient {
                         .send()
                         .await?
                 } else {
+                    let mut correct_payload = json!({
+                        "query": query,
+                        "new_content": new_content,
+                        "session_id": args["session_id"],
+                        "session_scope": args["session_scope"],
+                        "reason": args["reason"],
+                        "branch": args["branch"]
+                    });
+                    if let Some(sid) = args
+                        .get("subject_id")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                    {
+                        correct_payload["subject_id"] = json!(sid);
+                    }
+                    if let Some(memory_types) =
+                        args.get("memory_types").and_then(|v| v.as_array())
+                    {
+                        if !memory_types.is_empty() {
+                            correct_payload["memory_types"] = json!(memory_types);
+                        }
+                    }
                     self.client
                         .post(self.url("/v1/memories/correct"))
-                        .json(&json!({
-                            "query": query,
-                            "new_content": new_content,
-                            "session_id": args["session_id"],
-                            "session_scope": args["session_scope"],
-                            "reason": args["reason"],
-                            "branch": args["branch"]
-                        }))
+                        .json(&correct_payload)
                         .send()
                         .await?
                 };
@@ -291,7 +329,24 @@ impl RemoteClient {
             }
 
             "memory_profile" => {
-                let r = self.client.get(self.url("/v1/profiles/me")).send().await?;
+                let subject_id = args
+                    .get("subject_id")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty());
+                let branch = args
+                    .get("branch")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty());
+                let mut req = self.client.get(self.url("/v1/profiles/me"));
+                if let Some(sid) = subject_id {
+                    req = req.query(&[("subject_id", sid)]);
+                }
+                if let Some(b) = branch {
+                    req = req.query(&[("branch", b)]);
+                }
+                let r = req.send().await?;
                 let body = Self::parse_response(r).await?;
                 let profile = body["profile"].as_str().unwrap_or("");
                 if profile.is_empty() {
@@ -305,6 +360,11 @@ impl RemoteClient {
                 let limit = args["limit"].as_i64().unwrap_or(20);
                 let memory_type = args.get("memory_type").and_then(Value::as_str);
                 let session_id = args.get("session_id").and_then(Value::as_str);
+                let subject_id = args
+                    .get("subject_id")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty());
                 let mut req = self
                     .client
                     .get(self.url("/v1/memories"))
@@ -314,6 +374,9 @@ impl RemoteClient {
                 }
                 if let Some(session_id) = session_id {
                     req = req.query(&[("session_id", session_id)]);
+                }
+                if let Some(subject_id) = subject_id {
+                    req = req.query(&[("subject_id", subject_id)]);
                 }
                 if let Some(branch) = args.get("branch").and_then(Value::as_str) {
                     req = req.query(&[("branch", branch)]);
@@ -697,14 +760,18 @@ impl RemoteClient {
             }
 
             "memory_observe" => {
+                let mut payload = json!({
+                    "messages": args["messages"],
+                    "session_id": args["session_id"],
+                    "branch": args["branch"],
+                });
+                if let Some(sid) = args.get("subject_id").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty()) {
+                    payload["subject_id"] = json!(sid);
+                }
                 let r = self
                     .client
                     .post(self.url("/v1/observe"))
-                    .json(&json!({
-                        "messages": args["messages"],
-                        "session_id": args["session_id"],
-                        "branch": args["branch"],
-                    }))
+                    .json(&payload)
                     .send()
                     .await?;
                 let body = Self::parse_response(r).await?;

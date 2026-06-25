@@ -78,6 +78,7 @@ impl MemoryPipeline {
                 user_id: user_id.to_string(),
                 memory_type: mtype,
                 content,
+                subject_id: None,
                 initial_confidence: tier
                     .as_ref()
                     .map(|t| t.initial_confidence())

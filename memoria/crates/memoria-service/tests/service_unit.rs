@@ -125,6 +125,7 @@ async fn test_store_and_retrieve() {
             None,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -147,6 +148,7 @@ async fn test_correct() {
             "u1",
             "old content",
             MemoryType::Semantic,
+            None,
             None,
             None,
             None,
@@ -177,6 +179,7 @@ async fn test_purge() {
             None,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -198,6 +201,7 @@ async fn test_list_active_excludes_deleted() {
         None,
         None,
         None,
+        None,
     )
     .await
     .unwrap();
@@ -206,6 +210,7 @@ async fn test_list_active_excludes_deleted() {
             "u1",
             "delete this",
             MemoryType::Working,
+            None,
             None,
             None,
             None,
@@ -256,6 +261,7 @@ async fn test_purge_by_session_id_filters_memory_type() {
             None,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -290,6 +296,7 @@ async fn test_purge_by_session_id_fallback_is_not_capped() {
             None,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -299,6 +306,7 @@ async fn test_purge_by_session_id_fallback_is_not_capped() {
         "keep semantic",
         MemoryType::Semantic,
         Some("sess-target".to_string()),
+        None,
         None,
         None,
         None,
@@ -332,7 +340,7 @@ async fn test_memory_types() {
         MemoryType::Episodic,
     ] {
         let m = svc
-            .store_memory("u1", "content", mt.clone(), None, None, None, None, None)
+            .store_memory("u1", "content", mt.clone(), None, None, None, None, None, None)
             .await
             .unwrap();
         assert_eq!(m.memory_type, mt);
@@ -359,6 +367,7 @@ async fn test_trust_tiers() {
                 None,
                 None,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -375,6 +384,7 @@ async fn test_no_embedder_still_works() {
             "u1",
             "no embedding",
             MemoryType::Semantic,
+            None,
             None,
             None,
             None,

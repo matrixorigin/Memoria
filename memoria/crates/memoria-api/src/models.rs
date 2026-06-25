@@ -13,6 +13,7 @@ pub struct StoreRequest {
     #[serde(default = "default_memory_type")]
     pub memory_type: String,
     pub session_id: Option<String>,
+    pub subject_id: Option<String>,
     pub trust_tier: Option<String>,
     pub initial_confidence: Option<f64>,
     pub observed_at: Option<String>,
@@ -26,6 +27,8 @@ fn default_memory_type() -> String {
 #[derive(Deserialize)]
 pub struct BatchStoreRequest {
     pub memories: Vec<StoreRequest>,
+    /// Batch-level default subject_id; overridden by per-item subject_id.
+    pub subject_id: Option<String>,
     pub branch: Option<String>,
 }
 
@@ -36,6 +39,8 @@ pub struct RetrieveRequest {
     pub top_k: i64,
     pub session_id: Option<String>,
     pub session_scope: Option<String>,
+    pub subject_id: Option<String>,
+    pub memory_types: Option<Vec<String>>,
     pub branch: Option<String>,
     /// Explain level: false/"none" = off, true/"basic" = basic, "verbose" = per-candidate scores, "analyze" = full
     #[serde(default, deserialize_with = "deserialize_explain")]
@@ -55,6 +60,21 @@ fn parse_session_scope(
         .transpose()
 }
 
+fn parse_memory_types_opt(
+    types: Option<&Vec<String>>,
+) -> Result<Option<Vec<MemoryType>>, String> {
+    types
+        .map(|ts| {
+            ts.iter()
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .map(parse_memory_type)
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .transpose()
+        .map(|v| v.filter(|t| !t.is_empty()))
+}
+
 impl RetrieveRequest {
     pub fn session_scope(&self) -> Result<Option<memoria_service::SessionScope>, String> {
         parse_session_scope(self.session_scope.as_deref())
@@ -68,10 +88,15 @@ impl RetrieveRequest {
     }
 
     pub fn retrieve_options(&self) -> Result<memoria_service::RetrieveOptions, String> {
-        Ok(memoria_service::RetrieveOptions::from_session_scope(
-            self.session_id.as_deref(),
-            self.session_scope()?,
-        ))
+        let memory_types = parse_memory_types_opt(self.memory_types.as_ref())?;
+        Ok(
+            memoria_service::RetrieveOptions::from_session_scope(
+                self.session_id.as_deref(),
+                self.session_scope()?,
+            )
+            .with_subject_id(self.subject_id.clone())
+            .with_memory_types(memory_types),
+        )
     }
 }
 
@@ -82,6 +107,8 @@ pub struct SearchRequest {
     pub top_k: i64,
     pub session_id: Option<String>,
     pub session_scope: Option<String>,
+    pub subject_id: Option<String>,
+    pub memory_types: Option<Vec<String>>,
     pub branch: Option<String>,
     #[serde(default, deserialize_with = "deserialize_explain")]
     pub explain: String,
@@ -100,10 +127,15 @@ impl SearchRequest {
     }
 
     pub fn retrieve_options(&self) -> Result<memoria_service::RetrieveOptions, String> {
-        Ok(memoria_service::RetrieveOptions::from_session_scope(
-            self.session_id.as_deref(),
-            self.session_scope()?,
-        ))
+        let memory_types = parse_memory_types_opt(self.memory_types.as_ref())?;
+        Ok(
+            memoria_service::RetrieveOptions::from_session_scope(
+                self.session_id.as_deref(),
+                self.session_scope()?,
+            )
+            .with_subject_id(self.subject_id.clone())
+            .with_memory_types(memory_types),
+        )
     }
 }
 
@@ -135,6 +167,8 @@ pub struct CorrectByQueryRequest {
     pub new_content: String,
     pub session_id: Option<String>,
     pub session_scope: Option<String>,
+    pub subject_id: Option<String>,
+    pub memory_types: Option<Vec<String>>,
     pub reason: Option<String>,
     pub branch: Option<String>,
 }
@@ -148,10 +182,15 @@ impl CorrectByQueryRequest {
     }
 
     pub fn retrieve_options(&self) -> Result<memoria_service::RetrieveOptions, String> {
-        Ok(memoria_service::RetrieveOptions::from_session_scope(
-            self.session_id.as_deref(),
-            parse_session_scope(self.session_scope.as_deref())?,
-        ))
+        let memory_types = parse_memory_types_opt(self.memory_types.as_ref())?;
+        Ok(
+            memoria_service::RetrieveOptions::from_session_scope(
+                self.session_id.as_deref(),
+                parse_session_scope(self.session_scope.as_deref())?,
+            )
+            .with_subject_id(self.subject_id.clone())
+            .with_memory_types(memory_types),
+        )
     }
 }
 
@@ -231,6 +270,8 @@ pub struct MemoryResponse {
     pub user_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub author_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subject_id: Option<String>,
     pub memory_type: String,
     pub content: String,
     pub trust_tier: String,
@@ -248,6 +289,7 @@ impl From<Memory> for MemoryResponse {
             memory_id: m.memory_id,
             user_id: m.user_id,
             author_id: m.author_id,
+            subject_id: m.subject_id,
             memory_type: m.memory_type.to_string(),
             content: m.content,
             trust_tier: m.trust_tier.to_string(),

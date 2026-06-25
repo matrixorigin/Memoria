@@ -76,6 +76,7 @@ async fn find_memory_any_user(
 pub struct ListQuery {
     pub memory_type: Option<String>,
     pub session_id: Option<String>,
+    pub subject_id: Option<String>,
     pub trust_tier: Option<String>,
     pub branch: Option<String>,
     #[serde(default = "default_limit")]
@@ -91,8 +92,18 @@ pub struct BranchQuery {
     pub branch: Option<String>,
 }
 
+#[derive(Deserialize, Default)]
+pub struct ProfileQuery {
+    pub subject_id: Option<String>,
+    pub branch: Option<String>,
+}
+
 fn branch_param(branch: Option<&str>) -> Option<&str> {
     branch.map(str::trim).filter(|branch| !branch.is_empty())
+}
+
+fn nonempty_param(s: Option<&str>) -> Option<&str> {
+    s.map(str::trim).filter(|s| !s.is_empty())
 }
 
 fn normalize_branch(branch: Option<String>) -> Option<String> {
@@ -151,10 +162,11 @@ pub async fn list_memories(
             branch_param(q.branch.as_deref()),
             ListActiveOptions {
                 limit: fetch_limit,
-                memory_type: q.memory_type.as_deref(),
-                session_id: q.session_id.as_deref(),
-                trust_tier: q.trust_tier.as_deref(),
+                memory_type: nonempty_param(q.memory_type.as_deref()),
+                session_id: nonempty_param(q.session_id.as_deref()),
+                trust_tier: nonempty_param(q.trust_tier.as_deref()),
                 cursor,
+                subject_id: nonempty_param(q.subject_id.as_deref()),
             },
         )
         .await
@@ -218,6 +230,7 @@ pub async fn store_memory(
             observed_at,
             req.initial_confidence,
             author,
+            req.subject_id,
         )
         .await
         .map_err(|e| {
@@ -248,6 +261,7 @@ pub async fn batch_store(
             ));
         }
     }
+    let batch_subject_id = req.subject_id;
     let top_branch = normalize_branch(req.branch);
     let items: Vec<_> = req
         .memories
@@ -268,16 +282,18 @@ pub async fn batch_store(
                 .map(parse_trust_tier)
                 .transpose()
                 .map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e));
-            Ok((r.content, mt, tier, r.session_id, top_branch.clone()))
+            // item-level subject_id takes priority; fall back to batch-level
+            let subject_id = r.subject_id.or_else(|| batch_subject_id.clone());
+            Ok((r.content, mt, tier, r.session_id, top_branch.clone(), subject_id))
         })
         .collect::<Result<Vec<_>, _>>()?;
 
     // Validate all types upfront
     let mut validated = Vec::with_capacity(items.len());
-    for (content, mt_result, tier_result, session_id, branch) in items {
+    for (content, mt_result, tier_result, session_id, branch, subject_id) in items {
         let mt = mt_result?;
         let tier = tier_result?;
-        validated.push((content, mt, session_id, tier, branch));
+        validated.push((content, mt, session_id, tier, branch, subject_id));
     }
 
     let author = if auth.group_id.is_some() {
@@ -287,7 +303,9 @@ pub async fn batch_store(
     };
     let batch_items = validated
         .into_iter()
-        .map(|(content, mt, session_id, tier, _branch)| (content, mt, session_id, tier))
+        .map(|(content, mt, session_id, tier, _branch, subject_id)| {
+            (content, mt, session_id, tier, subject_id)
+        })
         .collect();
     let results = state
         .service
@@ -606,6 +624,7 @@ pub async fn get_profile(
     State(state): State<AppState>,
     auth: AuthUser,
     Path(target): Path<String>,
+    Query(q): Query<ProfileQuery>,
 ) -> ApiResult<serde_json::Value> {
     let resolved = if target == "me" || target == auth.user_id {
         auth.scope_id().to_string()
@@ -622,28 +641,58 @@ pub async fn get_profile(
         .user_sql_store(&resolved)
         .await
         .map_err(api_err)?;
-    let table = sql.active_table(&resolved).await.map_err(api_err)?;
+    let branch = branch_param(q.branch.as_deref());
+    // Use the same branch-resolved table for both the profile listing and the
+    // stats aggregation so that both halves of the response are consistent.
+    let table = sql
+        .table_for_branch(&resolved, branch)
+        .await
+        .map_err(api_err_typed)?;
+    let subject_id = q
+        .subject_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
     let memories = state
         .service
-        .list_active(&resolved, 50)
+        .list_active_paged_on_branch(
+            &resolved,
+            branch,
+            ListActiveOptions {
+                limit: 50,
+                memory_type: Some("profile"),
+                session_id: None,
+                trust_tier: None,
+                cursor: None,
+                subject_id,
+            },
+        )
         .await
         .map_err(api_err)?;
     let profile: Vec<_> = memories
         .iter()
-        .filter(|m| m.memory_type == memoria_core::MemoryType::Profile)
         .map(|m| m.content.as_str())
         .collect();
 
-    // Stats enrichment follows the user's active branch table.
-    let stats_query = format!(
-        "SELECT memory_type, COUNT(*) as cnt, \
-         ROUND(AVG(initial_confidence), 2) as avg_conf, \
-         MIN(observed_at) as oldest, MAX(observed_at) as newest \
-         FROM {table} WHERE user_id = ? AND is_active = 1 GROUP BY memory_type"
-    );
-    let stats: serde_json::Value = sqlx::query(&stats_query)
-    .bind(&resolved)
-    .fetch_all(sql.pool()).await
+    // Stats enrichment follows the same subject_id scope as the profile query.
+    let stats_rows = if let Some(sid) = subject_id {
+        let q = format!(
+            "SELECT memory_type, COUNT(*) as cnt, \
+             ROUND(AVG(initial_confidence), 2) as avg_conf, \
+             MIN(observed_at) as oldest, MAX(observed_at) as newest \
+             FROM {table} WHERE user_id = ? AND subject_id = ? AND is_active = 1 GROUP BY memory_type"
+        );
+        sqlx::query(&q).bind(&resolved).bind(sid).fetch_all(sql.pool()).await
+    } else {
+        let q = format!(
+            "SELECT memory_type, COUNT(*) as cnt, \
+             ROUND(AVG(initial_confidence), 2) as avg_conf, \
+             MIN(observed_at) as oldest, MAX(observed_at) as newest \
+             FROM {table} WHERE user_id = ? AND is_active = 1 GROUP BY memory_type"
+        );
+        sqlx::query(&q).bind(&resolved).fetch_all(sql.pool()).await
+    };
+    let stats: serde_json::Value = stats_rows
     .map(|rows| {
         let mut by_type = serde_json::Map::new();
         let mut total = 0i64;
@@ -680,6 +729,7 @@ pub struct ObserveRequest {
     pub messages: Vec<serde_json::Value>,
     pub source_event_ids: Option<Vec<String>>,
     pub session_id: Option<String>,
+    pub subject_id: Option<String>,
     pub branch: Option<String>,
 }
 
@@ -698,6 +748,7 @@ pub async fn observe_turn(
             branch_param(req.branch.as_deref()),
             &req.messages,
             req.session_id,
+            req.subject_id,
         )
         .await
         .map_err(api_err)?;

@@ -3123,8 +3123,10 @@ fn cmd_update(ghproxy: Option<&str>) {
             Ok(n) => {
                 buf.extend_from_slice(&tmp_read[..n]);
                 downloaded += n as u64;
-                if total > 0 {
-                    let pct = downloaded * 100 / total;
+                if let Some(pct) = downloaded
+                    .checked_mul(100)
+                    .and_then(|v| v.checked_div(total))
+                {
                     print!(
                         "\r  {:.1} MB / {:.1} MB  ({}%)",
                         downloaded as f64 / 1_048_576.0,

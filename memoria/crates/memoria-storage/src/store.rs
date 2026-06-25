@@ -46,6 +46,35 @@ fn is_duplicate_column(e: &sqlx::Error) -> bool {
         .unwrap_or(false)
 }
 
+/// Returns true for MySQL/MatrixOne error 1061 "duplicate key name" — the index
+/// already exists. Treat as non-fatal idempotency, log at DEBUG.
+fn is_duplicate_index(e: &sqlx::Error) -> bool {
+    use sqlx::mysql::MySqlDatabaseError;
+    e.as_database_error()
+        .and_then(|de| de.as_error().downcast_ref::<MySqlDatabaseError>())
+        .map(|me| me.number() == 1061)
+        .unwrap_or(false)
+}
+
+/// Returns true when MatrixOne returns error 1146 "no such table" for an internal
+/// secondary-index metadata table (e.g. `schema.__mo_index_secondary_<uuid>`).
+///
+/// This happens when multiple concurrent requests all try to `ALTER TABLE ADD COLUMN`
+/// on the same table at the same time. MatrixOne serialises DDL internally and the
+/// losing transactions observe a stale view of the internal index-metadata table
+/// (which was renamed / recreated by the winner). The net result is identical to
+/// "duplicate column" — the column is already present — so callers should treat
+/// this as non-fatal and log at WARN, not ERROR.
+fn is_mo_concurrent_ddl_race(e: &sqlx::Error) -> bool {
+    use sqlx::mysql::MySqlDatabaseError;
+    let is_1146 = e
+        .as_database_error()
+        .and_then(|de| de.as_error().downcast_ref::<MySqlDatabaseError>())
+        .map(|me| me.number() == 1146)
+        .unwrap_or(false);
+    is_1146 && e.to_string().contains("__mo_index_secondary_")
+}
+
 /// Returns true for MatrixOne's transient "txn need retry in rc mode, def changed"
 /// error (code 20631). This can occur when a DDL statement (e.g. ALTER TABLE on a
 /// branch table) races with a concurrent `data branch merge` that also modifies the
@@ -691,6 +720,35 @@ fn vec_to_mo(v: &[f32]) -> String {
     )
 }
 
+/// Build an SQL `AND memory_type IN (?, ?)` clause using bind parameter placeholders (`?`).
+/// Returns an empty string when `memory_types` is `None` or empty.
+fn build_memory_types_in_clause(memory_types: Option<&[MemoryType]>) -> String {
+    match memory_types {
+        Some(types) if !types.is_empty() => {
+            let placeholders = types.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+            format!(" AND memory_type IN ({placeholders})")
+        }
+        _ => String::new(),
+    }
+}
+
+/// Build an SQL `AND memory_type IN ('a', 'b')` clause with inlined literals.
+/// Used for vector search paths that cannot use bind parameters (MatrixOne bug workaround).
+/// Values are enum variants serialised via `Display` — no user-supplied input.
+fn build_memory_types_in_clause_inline(memory_types: Option<&[MemoryType]>) -> String {
+    match memory_types {
+        Some(types) if !types.is_empty() => {
+            let vals = types
+                .iter()
+                .map(|t| format!("'{}'", sanitize_sql_literal(&t.to_string())))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(" AND memory_type IN ({vals})")
+        }
+        _ => String::new(),
+    }
+}
+
 fn mo_to_vec(s: &str) -> Result<Vec<f32>, MemoriaError> {
     let inner = s.trim_matches(|c| c == '[' || c == ']');
     if inner.is_empty() {
@@ -1156,6 +1214,7 @@ impl SqlMemoryStore {
                 memory_id       VARCHAR(64)  PRIMARY KEY,
                 user_id         VARCHAR(64)  NOT NULL,
                 author_id       VARCHAR(64)  DEFAULT NULL,
+                subject_id      VARCHAR(128) DEFAULT NULL,
                 memory_type     VARCHAR(20)  NOT NULL,
                 content         TEXT         NOT NULL,
                 embedding       vecf32({dim}),
@@ -1173,6 +1232,7 @@ impl SqlMemoryStore {
                 INDEX idx_user_session (user_id, session_id),
                 INDEX idx_memories_user_observed (user_id, observed_at),
                 INDEX idx_author (author_id),
+                INDEX idx_scope_subject_active (user_id, subject_id, is_active, memory_type),
                 FULLTEXT INDEX ft_content (content) WITH PARSER ngram -- MO#23861: breaks on concurrent snapshot restore
             )"#,
             memories_table = memories_table,
@@ -1706,6 +1766,199 @@ impl SqlMemoryStore {
             }
         }
 
+        // subject_id migration is handled unconditionally by ensure_subject_id_column(),
+        // which is called before the schema-version short-circuit in migrate_user().
+        // Do NOT add subject_id DDL here — it would duplicate work and use an older,
+        // less robust implementation (no exec_ddl_with_retry / is_mo_concurrent_ddl_race).
+
+        Ok(())
+    }
+
+    /// Idempotent migration: add `subject_id` column + composite index to `mem_memories`
+    /// and any existing branch tables.
+    ///
+    /// Must run unconditionally on every `migrate_user` call (before the schema-version
+    /// short-circuit), because it was introduced after `CURRENT_USER_SCHEMA_VERSION` was
+    /// already set to 2 for all live deployments.
+    ///
+    /// Failure semantics:
+    /// - Unexpected failure adding the column to the **main table** → returns `Err` (fail-fast,
+    ///   because all subsequent SELECT/INSERT referencing `subject_id` would panic at the DB layer).
+    /// - Index failures → warn-logged only (performance degradation, not correctness).
+    /// - Branch-table column failures → error-logged only (branch operations degrade gracefully).
+    async fn ensure_subject_id_column(
+        &self,
+        pool: &MySqlPool,
+        schema_name: &str,
+    ) -> Result<(), MemoriaError> {
+        let memories_table = self.t("mem_memories");
+        let branches_table = self.t("mem_branches");
+
+        // ── main table ────────────────────────────────────────────────────────
+        // If mem_memories does not exist yet (non-fresh DB that hasn't been fully
+        // bootstrapped), skip the ALTER — bootstrap_user_schema() will create the
+        // table with subject_id already in the schema definition.
+        if !info_schema_table_exists(pool, schema_name, "mem_memories").await {
+            return Ok(());
+        }
+
+        let has_col =
+            info_schema_column_exists(pool, schema_name, "mem_memories", "subject_id").await;
+        if !has_col {
+            match exec_ddl_with_retry(
+                pool,
+                &format!(
+                    "ALTER TABLE {memories_table} ADD COLUMN subject_id VARCHAR(128) DEFAULT NULL"
+                ),
+            )
+            .await
+            {
+                Ok(_) => tracing::info!("migration: added subject_id column to {memories_table}"),
+                Err(e) if is_duplicate_column(&e) => tracing::debug!(
+                    "migration: subject_id column already exists in {memories_table}, skipping"
+                ),
+                Err(e) if is_mo_concurrent_ddl_race(&e) => tracing::warn!(
+                    "migration: concurrent DDL race for subject_id on {memories_table} \
+                     (column was added by a concurrent request): {e}"
+                ),
+                Err(e) => {
+                    tracing::error!(
+                        "migration: failed to add subject_id to {memories_table}: {e}"
+                    );
+                    return Err(db_err(e));
+                }
+            }
+        }
+
+        let has_idx = info_schema_index_exists(
+            pool,
+            schema_name,
+            "mem_memories",
+            "idx_scope_subject_active",
+        )
+        .await;
+        if !has_idx {
+            match exec_ddl_with_retry(
+                pool,
+                &format!(
+                    "ALTER TABLE {memories_table} ADD INDEX idx_scope_subject_active \
+                     (user_id, subject_id, is_active, memory_type)"
+                ),
+            )
+            .await
+            {
+                Ok(_) => tracing::info!(
+                    "migration: added idx_scope_subject_active on {memories_table}"
+                ),
+                Err(e) if is_duplicate_index(&e) => tracing::debug!(
+                    "migration: idx_scope_subject_active already exists on {memories_table}, skipping"
+                ),
+                Err(e) if is_mo_concurrent_ddl_race(&e) => tracing::warn!(
+                    "migration: concurrent DDL race for idx_scope_subject_active on \
+                     {memories_table}: {e}"
+                ),
+                Err(e) => tracing::warn!(
+                    "migration: failed to add idx_scope_subject_active on {memories_table}: {e}"
+                ),
+            }
+        }
+
+        // ── branch tables ─────────────────────────────────────────────────────
+        let branch_table_names: Vec<String> = match sqlx::query_scalar(&format!(
+            "SELECT table_name FROM {branches_table} WHERE status = 'active' AND table_name != ''"
+        ))
+        .fetch_all(pool)
+        .await
+        {
+            Ok(names) => names,
+            Err(e) => {
+                tracing::warn!(
+                    "migration: failed to load branch table names from {branches_table}, \
+                     skipping subject_id migration for branch tables: {e}"
+                );
+                vec![]
+            }
+        };
+
+        for bt_raw in &branch_table_names {
+            if !bt_raw
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_')
+            {
+                tracing::warn!(
+                    "migration: skipping branch table with invalid identifier '{bt_raw}'"
+                );
+                continue;
+            }
+            let bt_full = self.t(bt_raw);
+
+            let has_bt_col =
+                info_schema_column_exists(pool, schema_name, bt_raw, "subject_id").await;
+            if !has_bt_col {
+                match exec_ddl_with_retry(
+                    pool,
+                    &format!(
+                        "ALTER TABLE {bt_full} ADD COLUMN subject_id VARCHAR(128) DEFAULT NULL"
+                    ),
+                )
+                .await
+                {
+                    Ok(_) => {
+                        tracing::info!("migration: added subject_id to branch table {bt_full}")
+                    }
+                    Err(e) if is_duplicate_column(&e) => tracing::debug!(
+                        "migration: subject_id already exists in branch table {bt_full}, skipping"
+                    ),
+                    Err(e) if is_mo_concurrent_ddl_race(&e) => tracing::warn!(
+                        "migration: concurrent DDL race for subject_id on branch table {bt_full} \
+                         (column was added by a concurrent request): {e}"
+                    ),
+                    Err(e) => tracing::error!(
+                        // Non-fatal: startup continues, but any INSERT/SELECT that
+                        // references subject_id on this branch table will fail at
+                        // runtime with 'unknown column'.  Fix the DDL permission or
+                        // drop-and-recreate the branch, then restart.
+                        "migration: failed to add subject_id to branch table {bt_full}: {e}"
+                    ),
+                }
+            }
+
+            let has_bt_idx = info_schema_index_exists(
+                pool,
+                schema_name,
+                bt_raw,
+                "idx_scope_subject_active",
+            )
+            .await;
+            if !has_bt_idx {
+                match exec_ddl_with_retry(
+                    pool,
+                    &format!(
+                        "ALTER TABLE {bt_full} ADD INDEX idx_scope_subject_active \
+                         (user_id, subject_id, is_active, memory_type)"
+                    ),
+                )
+                .await
+                {
+                    Ok(_) => tracing::info!(
+                        "migration: added idx_scope_subject_active to branch table {bt_full}"
+                    ),
+                    Err(e) if is_duplicate_index(&e) => tracing::debug!(
+                        "migration: idx_scope_subject_active already exists on branch table \
+                         {bt_full}, skipping"
+                    ),
+                    Err(e) if is_mo_concurrent_ddl_race(&e) => tracing::warn!(
+                        "migration: concurrent DDL race for idx_scope_subject_active on \
+                         branch table {bt_full}: {e}"
+                    ),
+                    Err(e) => tracing::warn!(
+                        "migration: failed to add idx_scope_subject_active to branch table \
+                         {bt_full}: {e}"
+                    ),
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -1762,8 +2015,21 @@ impl SqlMemoryStore {
         }
 
         ensure_user_schema_meta_table(pool, &meta_table).await?;
-        self.ensure_snapshot_extra_column(pool, schema_name).await?;
-        if load_user_schema_version(pool, &meta_table).await? == Some(CURRENT_USER_SCHEMA_VERSION) {
+        // Non-fatal: snapshot extra column failure must not block subsequent migrations.
+        if let Err(e) = self.ensure_snapshot_extra_column(pool, schema_name).await {
+            tracing::warn!("migration: ensure_snapshot_extra_column failed (non-fatal): {e}");
+        }
+        // Always run subject_id migration regardless of schema version, because it was added
+        // after CURRENT_USER_SCHEMA_VERSION was already set to 2 for live deployments.
+        self.ensure_subject_id_column(pool, schema_name).await?;
+        // Short-circuit only when the schema version is current AND the main table
+        // actually exists. If mem_memories is somehow missing on a non-fresh database
+        // (e.g. a partial migration was interrupted), fall through to bootstrap so
+        // the table is recreated rather than letting the service start with a broken
+        // schema that would only surface as runtime 1146 errors.
+        if load_user_schema_version(pool, &meta_table).await? == Some(CURRENT_USER_SCHEMA_VERSION)
+            && info_schema_table_exists(pool, schema_name, "mem_memories").await
+        {
             return Ok(());
         }
 
@@ -3425,7 +3691,7 @@ impl SqlMemoryStore {
                     Some((snapshot_name, timestamp))
                 })
                 .collect();
-            snapshots.sort_by(|a, b| b.1.cmp(&a.1));
+            snapshots.sort_by_key(|b| std::cmp::Reverse(b.1));
             snapshots.into_iter().map(|(name, _)| (name,)).collect()
         } else {
             sqlx::query_as(
@@ -4563,7 +4829,7 @@ impl SqlMemoryStore {
         for chunk in ids.chunks(500) {
             let ph = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
             let sql = format!(
-                "SELECT memory_id, user_id, author_id, memory_type, content, \
+                "SELECT memory_id, user_id, author_id, subject_id, memory_type, content, \
                  embedding AS emb_str, session_id, \
                  CAST(source_event_ids AS CHAR) AS src_ids, \
                  CAST(extra_metadata AS CHAR) AS extra_meta, \
@@ -4592,6 +4858,7 @@ impl SqlMemoryStore {
     /// NOTE: l2_threshold assumes normalized embeddings (unit vectors).
     /// For normalized vectors: L2 = sqrt(2 * (1 - cosine_similarity)).
     /// The IVF index uses vector_l2_ops, so this query benefits from the index.
+    #[allow(clippy::too_many_arguments)]
     pub async fn find_near_duplicate(
         &self,
         table: &str,
@@ -4600,17 +4867,30 @@ impl SqlMemoryStore {
         memory_type: &str,
         exclude_id: &str,
         l2_threshold: f64,
+        subject_id: Option<&str>,
     ) -> Result<Option<(String, String, f64)>, MemoriaError> {
         let table = self.t(table);
         let vec_literal = vec_to_mo(embedding);
+        // Scope dedup to the same subject partition so that memories belonging
+        // to different subjects never supersede or deduplicate each other.
+        // None means the memory is not subject-scoped; only compare against
+        // other unscoped rows (subject_id IS NULL).
+        let subject_clause = match subject_id {
+            Some(sid) => format!(
+                " AND subject_id = '{}'",
+                sanitize_sql_literal(sid)
+            ),
+            None => " AND subject_id IS NULL".to_string(),
+        };
         let sql = format!(
             "SELECT memory_id, content, \
              l2_distance(embedding, '{vec_literal}') AS l2_dist \
              FROM {table} \
              WHERE user_id = ? AND is_active = 1 \
                AND memory_type = ? \
-                AND embedding IS NOT NULL AND vector_dims(embedding) > 0 \
-                AND memory_id != ? \
+               AND embedding IS NOT NULL AND vector_dims(embedding) > 0 \
+               AND memory_id != ? \
+               {subject_clause} \
               ORDER BY l2_dist ASC LIMIT 1 by rank with option 'mode=post'"
         );
         let rows = sqlx::query(&sql)
@@ -4741,7 +5021,7 @@ impl SqlMemoryStore {
         memory_id: &str,
     ) -> Result<Option<Memory>, MemoriaError> {
         let row = sqlx::query(&format!(
-            "SELECT memory_id, user_id, author_id, memory_type, content, \
+            "SELECT memory_id, user_id, author_id, subject_id, memory_type, content, \
              embedding AS emb_str, session_id, \
              CAST(source_event_ids AS CHAR) AS src_ids, \
              CAST(extra_metadata AS CHAR) AS extra_meta, \
@@ -4795,14 +5075,15 @@ impl SqlMemoryStore {
 
         sqlx::query(&format!(
             r#"INSERT INTO {table}
-               (memory_id, user_id, author_id, memory_type, content, embedding, session_id,
-                source_event_ids, extra_metadata, is_active, superseded_by,
+               (memory_id, user_id, author_id, subject_id, memory_type, content, embedding,
+                session_id, source_event_ids, extra_metadata, is_active, superseded_by,
                 trust_tier, initial_confidence, observed_at, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)"#
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)"#
         ))
         .bind(&memory.memory_id)
         .bind(&memory.user_id)
         .bind(memory.author_id.as_deref())
+        .bind(memory.subject_id.as_deref())
         .bind(memory.memory_type.to_string())
         .bind(&memory.content)
         .bind(embedding)
@@ -4835,13 +5116,13 @@ impl SqlMemoryStore {
         for chunk in memories.chunks(50) {
             let placeholders = chunk
                 .iter()
-                .map(|_| "(?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)")
+                .map(|_| "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)")
                 .collect::<Vec<_>>()
                 .join(", ");
             let sql = format!(
                 "INSERT INTO {table} \
-                 (memory_id, user_id, author_id, memory_type, content, embedding, session_id, \
-                  source_event_ids, extra_metadata, is_active, superseded_by, \
+                 (memory_id, user_id, author_id, subject_id, memory_type, content, embedding, \
+                  session_id, source_event_ids, extra_metadata, is_active, superseded_by, \
                   trust_tier, initial_confidence, observed_at, created_at, updated_at) \
                  VALUES {placeholders}"
             );
@@ -4866,6 +5147,7 @@ impl SqlMemoryStore {
                     .bind(m.memory_id.clone())
                     .bind(m.user_id.clone())
                     .bind(m.author_id.clone())
+                    .bind(m.subject_id.clone())
                     .bind(m.memory_type.to_string())
                     .bind(m.content.clone())
                     .bind(embedding)
@@ -4891,7 +5173,7 @@ impl SqlMemoryStore {
         limit: i64,
     ) -> Result<Vec<Memory>, MemoriaError> {
         let rows = sqlx::query(&format!(
-            "SELECT memory_id, user_id, author_id, memory_type, content, \
+            "SELECT memory_id, user_id, author_id, subject_id, memory_type, content, \
              embedding AS emb_str, session_id, \
              CAST(source_event_ids AS CHAR) AS src_ids, \
              CAST(extra_metadata AS CHAR) AS extra_meta, \
@@ -4927,6 +5209,7 @@ impl SqlMemoryStore {
         session_id: Option<&str>,
         trust_tier: Option<&str>,
         cursor: Option<&str>,
+        subject_id: Option<&str>,
     ) -> Result<Vec<Memory>, MemoriaError> {
         let table = self.t(table);
         // Cap at 501 (not 500) so the caller can request limit+1 for has_more detection.
@@ -4943,13 +5226,16 @@ impl SqlMemoryStore {
         if trust_tier.is_some() {
             inner.push_str(" AND trust_tier = ?");
         }
+        if subject_id.is_some() {
+            inner.push_str(" AND subject_id = ?");
+        }
         if cursor.is_some() {
             inner.push_str(" AND memory_id < ?");
         }
         inner.push_str(" ORDER BY memory_id DESC LIMIT ?");
 
         let sql = format!(
-            "SELECT memory_id, user_id, author_id, memory_type, content, \
+            "SELECT memory_id, user_id, author_id, subject_id, memory_type, content, \
              session_id, is_active, superseded_by, trust_tier, \
              initial_confidence, observed_at, created_at, updated_at \
              FROM {table} WHERE memory_id IN ({inner}) \
@@ -4965,6 +5251,9 @@ impl SqlMemoryStore {
         }
         if let Some(tt) = trust_tier {
             q = q.bind(tt);
+        }
+        if let Some(sid) = subject_id {
+            q = q.bind(sid);
         }
         if let Some(c) = cursor {
             q = q.bind(c);
@@ -5072,10 +5361,11 @@ impl SqlMemoryStore {
         query: &str,
         limit: i64,
     ) -> Result<Vec<Memory>, MemoriaError> {
-        self.search_fulltext_from_scoped(table, user_id, query, limit, None)
+        self.search_fulltext_from_scoped(table, user_id, query, limit, None, None, None)
             .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn search_fulltext_from_scoped(
         &self,
         table: &str,
@@ -5083,6 +5373,8 @@ impl SqlMemoryStore {
         query: &str,
         limit: i64,
         session_id: Option<&str>,
+        subject_id: Option<&str>,
+        memory_types: Option<&[MemoryType]>,
     ) -> Result<Vec<Memory>, MemoriaError> {
         let safe = sanitize_fulltext_query(query);
         if safe.is_empty() {
@@ -5093,10 +5385,16 @@ impl SqlMemoryStore {
         } else {
             ""
         };
+        let subject_clause = if subject_id.is_some() {
+            " AND subject_id = ?"
+        } else {
+            ""
+        };
+        let types_clause = build_memory_types_in_clause(memory_types);
         // Use OR semantics (no + prefix) — AND is too strict for natural language queries
         // because stopwords are removed from the index but +stopword still requires a match.
         let sql = format!(
-            "SELECT memory_id, user_id, author_id, memory_type, content, \
+            "SELECT memory_id, user_id, author_id, subject_id, memory_type, content, \
              embedding AS emb_str, session_id, \
              CAST(source_event_ids AS CHAR) AS src_ids, \
              CAST(extra_metadata AS CHAR) AS extra_meta, \
@@ -5104,13 +5402,22 @@ impl SqlMemoryStore {
              observed_at, created_at, updated_at, \
              MATCH(content) AGAINST('{safe}' IN BOOLEAN MODE) AS ft_score \
              FROM {table} \
-             WHERE user_id = ? AND is_active = 1{session_clause} \
+             WHERE user_id = ? AND is_active = 1{session_clause}{subject_clause}{types_clause} \
                AND MATCH(content) AGAINST('{safe}' IN BOOLEAN MODE) \
              ORDER BY ft_score DESC LIMIT ?"
         );
         let mut stmt = sqlx::query(&sql).bind(user_id);
         if let Some(session_id) = session_id {
             stmt = stmt.bind(session_id);
+        }
+        if let Some(sid) = subject_id {
+            stmt = stmt.bind(sid);
+        }
+        // Bind each memory_type for the IN clause generated by build_memory_types_in_clause.
+        if let Some(types) = memory_types.filter(|t| !t.is_empty()) {
+            for mt in types {
+                stmt = stmt.bind(mt.to_string());
+            }
         }
         let rows = match stmt.bind(limit).fetch_all(&self.pool).await {
             Ok(rows) => rows,
@@ -5156,8 +5463,10 @@ impl SqlMemoryStore {
         limit: i64,
         session_id: Option<&str>,
     ) -> Result<Vec<Memory>, MemoriaError> {
-        self.search_vector_from_filtered_scoped(table, user_id, embedding, limit, None, session_id)
-            .await
+        self.search_vector_from_filtered_scoped(
+            table, user_id, embedding, limit, None, session_id, None, None,
+        )
+        .await
     }
 
     /// Vector search with optional memory_type pre-filter to reduce scan set.
@@ -5169,11 +5478,13 @@ impl SqlMemoryStore {
         limit: i64,
         memory_type: Option<&str>,
     ) -> Result<Vec<Memory>, MemoriaError> {
-        self.search_vector_from_filtered_scoped(table, user_id, embedding, limit, memory_type, None)
-            .await
+        self.search_vector_from_filtered_scoped(
+            table, user_id, embedding, limit, memory_type, None, None, None,
+        )
+        .await
     }
 
-    /// Vector search with optional memory_type and strict session pre-filter.
+    /// Vector search with optional memory_type, strict session, subject_id, and memory_types pre-filters.
     /// When session_id is provided, the candidate set includes that session plus
     /// unscoped memories (session_id IS NULL).
     #[allow(clippy::too_many_arguments)]
@@ -5185,17 +5496,23 @@ impl SqlMemoryStore {
         limit: i64,
         memory_type: Option<&str>,
         session_id: Option<&str>,
+        subject_id: Option<&str>,
+        memory_types: Option<&[MemoryType]>,
     ) -> Result<Vec<Memory>, MemoriaError> {
         let vec_literal = vec_to_mo(embedding);
         let type_clause = match memory_type {
             Some(mt) => format!(" AND memory_type = '{}'", sanitize_sql_literal(mt)),
-            None => String::new(),
+            None => build_memory_types_in_clause_inline(memory_types),
         };
         let session_clause = match session_id {
             Some(session_id) => format!(
                 " AND (session_id = '{}' OR session_id IS NULL)",
                 sanitize_sql_literal(session_id)
             ),
+            None => String::new(),
+        };
+        let subject_clause = match subject_id {
+            Some(sid) => format!(" AND subject_id = '{}'", sanitize_sql_literal(sid)),
             None => String::new(),
         };
         let rank_mode = if session_id.is_some() { "pre" } else { "post" };
@@ -5205,7 +5522,7 @@ impl SqlMemoryStore {
                 None => format!("LIMIT {limit}"),
             };
             format!(
-                "SELECT memory_id, user_id, author_id, memory_type, content, \
+                "SELECT memory_id, user_id, author_id, subject_id, memory_type, content, \
                  session_id, \
                  CAST(source_event_ids AS CHAR) AS src_ids, \
                  CAST(extra_metadata AS CHAR) AS extra_meta, \
@@ -5213,7 +5530,7 @@ impl SqlMemoryStore {
                  observed_at, created_at, updated_at, \
                  l2_distance(embedding, '{vec_literal}') AS l2_dist \
                  FROM {table} \
-                 WHERE user_id = '{}' AND is_active = 1 AND embedding IS NOT NULL{type_clause}{session_clause} \
+                 WHERE user_id = '{}' AND is_active = 1 AND embedding IS NOT NULL{type_clause}{session_clause}{subject_clause} \
                  ORDER BY l2_distance(embedding, '{vec_literal}') ASC \
                  {limit_clause}",
                 sanitize_sql_literal(user_id),
@@ -5285,6 +5602,8 @@ impl SqlMemoryStore {
                 limit,
                 params.feedback_weight,
                 session_id,
+                None,
+                None,
             )
             .await?;
         Ok(mems)
@@ -5309,6 +5628,8 @@ impl SqlMemoryStore {
             limit,
             feedback_weight,
             None,
+            None,
+            None,
         )
         .await
     }
@@ -5323,11 +5644,17 @@ impl SqlMemoryStore {
         limit: i64,
         feedback_weight: f64,
         session_id: Option<&str>,
+        subject_id: Option<&str>,
+        memory_types: Option<&[MemoryType]>,
     ) -> Result<(Vec<Memory>, Vec<(String, f64, f64, f64, f64, f64)>), MemoriaError> {
         let fetch_k = (limit * 3).max(20);
         let (vec_results, ft_results) = tokio::join!(
-            self.search_vector_from_scoped(table, user_id, embedding, fetch_k, session_id),
-            self.search_fulltext_from_scoped(table, user_id, query, fetch_k, session_id)
+            self.search_vector_from_filtered_scoped(
+                table, user_id, embedding, fetch_k, None, session_id, subject_id, memory_types
+            ),
+            self.search_fulltext_from_scoped(
+                table, user_id, query, fetch_k, session_id, subject_id, memory_types
+            )
         );
         let vec_results = vec_results?;
         let ft_results = ft_results.unwrap_or_default();
@@ -5833,7 +6160,7 @@ impl MemoryStore for SqlMemoryStore {
     async fn get(&self, memory_id: &str) -> Result<Option<Memory>, MemoriaError> {
         let table = self.t("mem_memories");
         let row = sqlx::query(&format!(
-            "SELECT memory_id, user_id, author_id, memory_type, content, \
+            "SELECT memory_id, user_id, author_id, subject_id, memory_type, content, \
              embedding AS emb_str, session_id, \
              CAST(source_event_ids AS CHAR) AS src_ids, \
              CAST(extra_metadata AS CHAR) AS extra_meta, \
@@ -5943,6 +6270,9 @@ fn row_to_memory_base(row: &sqlx::mysql::MySqlRow) -> Result<Memory, MemoriaErro
         user_id: row.try_get("user_id").map_err(db_err)?,
         author_id: row
             .try_get::<Option<String>, _>("author_id")
+            .unwrap_or(None),
+        subject_id: row
+            .try_get::<Option<String>, _>("subject_id")
             .unwrap_or(None),
         memory_type: MemoryType::from_str(&memory_type_str)?,
         content: row.try_get("content").map_err(db_err)?,
