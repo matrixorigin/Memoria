@@ -173,7 +173,7 @@ fn text(v: &Value) -> &str {
 #[tokio::test]
 #[serial]
 async fn test_snapshot_rollback_restores_state() {
-    let (svc, git, uid, db_name, _ctx) = setup().await;
+    let (svc, git, uid, _db_name, _ctx) = setup().await;
     let snap_name = snap("basic");
 
     // Store 2 memories
@@ -241,7 +241,7 @@ async fn test_snapshot_rollback_restores_state() {
 #[tokio::test]
 #[serial]
 async fn test_rollback_nonexistent_snapshot_errors() {
-    let (svc, git, uid, db_name, _ctx) = setup().await;
+    let (svc, git, uid, _db_name, _ctx) = setup().await;
     let result = memoria_mcp::git_tools::call(
         "memory_rollback",
         json!({"name": "does_not_exist_xyz"}),
@@ -259,7 +259,7 @@ async fn test_rollback_nonexistent_snapshot_errors() {
 #[tokio::test]
 #[serial]
 async fn test_multiple_snapshots_rollback_to_earlier() {
-    let (svc, git, uid, db_name, _ctx) = setup().await;
+    let (svc, git, uid, _db_name, _ctx) = setup().await;
     let snap1 = snap("v1");
     let snap2 = snap("v2");
 
@@ -294,7 +294,7 @@ async fn test_multiple_snapshots_rollback_to_earlier() {
 #[tokio::test]
 #[serial]
 async fn test_snapshots_pagination() {
-    let (svc, git, uid, db_name, _ctx) = setup().await;
+    let (svc, git, uid, _db_name, _ctx) = setup().await;
     let names: Vec<String> = (0..5).map(|i| snap(&format!("pg{i}"))).collect();
 
     for n in &names {
@@ -457,7 +457,7 @@ async fn test_snapshot_delete_batch_names() {
 #[tokio::test]
 #[serial]
 async fn test_snapshot_and_branch_independent() {
-    let (svc, git, uid, db_name, _ctx) = setup().await;
+    let (svc, git, uid, _db_name, _ctx) = setup().await;
     let snap_name = snap("pre_branch");
     let branch = format!("br_{}", &uid[5..]);
 
@@ -530,7 +530,7 @@ async fn test_snapshot_and_branch_independent() {
 #[tokio::test]
 #[serial]
 async fn test_duplicate_snapshot_name_rejected() {
-    let (svc, git, uid, db_name, _ctx) = setup().await;
+    let (svc, git, uid, _db_name, _ctx) = setup().await;
     let snap_name = snap("dup");
 
     let first = git_call(
@@ -958,7 +958,7 @@ async fn test_snapshot_delete_older_than() {
 #[tokio::test]
 #[serial]
 async fn test_snapshot_list_filters_system_snapshots() {
-    let (svc, git, uid, db_name, _ctx) = setup().await;
+    let (svc, git, uid, _db_name, _ctx) = setup().await;
     let s1 = snap("mysnap");
     git_call("memory_snapshot", json!({"name": s1}), &git, &svc, &uid).await;
 
@@ -990,7 +990,7 @@ async fn test_snapshot_list_filters_system_snapshots() {
 #[tokio::test]
 #[serial]
 async fn test_chained_snapshot_rollback() {
-    let (svc, git, uid, db_name, _ctx) = setup().await;
+    let (svc, git, uid, _db_name, _ctx) = setup().await;
     let snap_v1 = snap("v1");
     let snap_v2 = snap("v2");
 
@@ -1059,7 +1059,7 @@ async fn test_chained_snapshot_rollback() {
 #[tokio::test]
 #[serial]
 async fn test_branch_limit_enforced() {
-    let (svc, git, uid, db_name, _ctx) = setup().await;
+    let (svc, git, uid, _db_name, _ctx) = setup().await;
 
     // Create branches up to limit (MAX_BRANCHES = 20)
     // We'll create a few and verify the limit message, not exhaust the full 20
@@ -1099,7 +1099,7 @@ async fn test_branch_limit_enforced() {
 #[tokio::test]
 #[serial]
 async fn test_branch_from_snapshot() {
-    let (svc, git, uid, db_name, _ctx) = setup().await;
+    let (svc, git, uid, _db_name, _ctx) = setup().await;
     let snap_name = snap("forsplit");
     let branch = format!("bfs_{}", &uid[5..]);
 

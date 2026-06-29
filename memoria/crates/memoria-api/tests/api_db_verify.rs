@@ -12,10 +12,6 @@ fn test_dim() -> usize {
         .and_then(|s| s.parse().ok())
         .unwrap_or(1024)
 }
-fn db_url() -> String {
-    std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "mysql://root:111@localhost:6001/memoria".to_string())
-}
 fn uid() -> String {
     format!("dbv_{}", uuid::Uuid::new_v4().simple())
 }

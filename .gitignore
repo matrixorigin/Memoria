@@ -13,6 +13,7 @@ scripts/.env
 # IDE
 .vscode/
 .idea/
+.DS_Store
 
 # Kiro local settings
 .kiro/settings/mcp.json

@@ -324,7 +324,7 @@ async fn test_node_count_cache_shared_across_graph_store_instances() {
 
 #[tokio::test]
 async fn test_get_stats_batch_returns_correct_values() {
-    let (svc, store, pool, uid, _ctx) = setup().await;
+    let (svc, store, _pool, uid, _ctx) = setup().await;
 
     // Store two memories
     let r1 = call(
@@ -692,7 +692,7 @@ async fn test_find_near_duplicate_single_query_same_type_preference() {
 
 #[tokio::test]
 async fn test_feedback_created_at_index_exists() {
-    let (_svc, store, pool, _uid, _ctx) = setup().await;
+    let (_svc, _store, pool, _uid, _ctx) = setup().await;
 
     let count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM information_schema.statistics \

@@ -12,6 +12,7 @@ pub struct McpTestContext {
     inner: MultiDbTestContext,
 }
 
+#[allow(dead_code)]
 impl McpTestContext {
     pub fn service(&self) -> Arc<MemoryService> {
         self.inner.service()
