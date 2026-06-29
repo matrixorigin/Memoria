@@ -1403,6 +1403,7 @@ async fn test_governance_cleans_orphan_graph_data() {
         access_count: 0,
         retrieval_score: None,
         author_id: None,
+        subject_id: None,
     };
     let memories_table = sql.t("mem_memories");
     sql.insert_into(&memories_table, &mem)

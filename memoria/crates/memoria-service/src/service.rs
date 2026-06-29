@@ -83,11 +83,23 @@ impl std::str::FromStr for SessionScope {
     }
 }
 
+/// Trims whitespace and converts blank strings to `None`.
+/// Used to normalise all `subject_id` inputs (store, retrieve, list) so that
+/// `""`, `"  "`, and `None` are all treated as "no subject filter / no subject set".
+#[inline]
+fn normalize_opt_string(s: Option<String>) -> Option<String> {
+    s.map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
+}
+
 /// Extra retrieval controls that must be threaded through the full retrieval pipeline.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RetrieveOptions {
     session_id: Option<String>,
     session_scope: SessionScope,
+    /// Filter results to memories belonging to this subject.
+    subject_id: Option<String>,
+    /// Restrict results to these memory types. Empty/None means no type filter.
+    memory_types: Option<Vec<MemoryType>>,
 }
 
 impl RetrieveOptions {
@@ -98,7 +110,19 @@ impl RetrieveOptions {
         Self {
             session_id: session_id.map(str::to_string),
             session_scope: session_scope.unwrap_or(SessionScope::Prefer),
+            subject_id: None,
+            memory_types: None,
         }
+    }
+
+    pub fn with_subject_id(mut self, subject_id: Option<String>) -> Self {
+        self.subject_id = normalize_opt_string(subject_id);
+        self
+    }
+
+    pub fn with_memory_types(mut self, memory_types: Option<Vec<MemoryType>>) -> Self {
+        self.memory_types = memory_types.filter(|v| !v.is_empty());
+        self
     }
 
     pub fn session_id(&self) -> Option<&str> {
@@ -118,6 +142,14 @@ impl RetrieveOptions {
     pub fn is_strict_session(&self) -> bool {
         self.strict_session_id().is_some()
     }
+
+    pub fn subject_id(&self) -> Option<&str> {
+        self.subject_id.as_deref()
+    }
+
+    pub fn memory_types(&self) -> Option<&[MemoryType]> {
+        self.memory_types.as_deref()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -127,6 +159,7 @@ pub struct ListActiveOptions<'a> {
     pub session_id: Option<&'a str>,
     pub trust_tier: Option<&'a str>,
     pub cursor: Option<&'a str>,
+    pub subject_id: Option<&'a str>,
 }
 
 impl ListActiveOptions<'_> {
@@ -137,6 +170,7 @@ impl ListActiveOptions<'_> {
             session_id: None,
             trust_tier: None,
             cursor: None,
+            subject_id: None,
         }
     }
 }
@@ -459,6 +493,16 @@ impl EditLogBuffer {
         self.tx.clone()
     }
 }
+
+/// Single item for batch memory storage.
+/// Tuple fields: `(content, memory_type, session_id, trust_tier, subject_id)`.
+pub type BatchStoreItem = (
+    String,
+    MemoryType,
+    Option<String>,
+    Option<TrustTier>,
+    Option<String>,
+);
 
 pub struct MemoryService {
     /// Trait-based store for generic ops (used by tests with MockStore)
@@ -1158,6 +1202,7 @@ impl MemoryService {
         observed_at: Option<DateTime<Utc>>,
         initial_confidence: Option<f64>,
         author_id: Option<String>,
+        subject_id: Option<String>,
     ) -> Result<Memory, MemoriaError> {
         self.store_memory_on_branch(
             user_id,
@@ -1169,6 +1214,7 @@ impl MemoryService {
             observed_at,
             initial_confidence,
             author_id,
+            subject_id,
         )
         .await
     }
@@ -1186,7 +1232,16 @@ impl MemoryService {
         observed_at: Option<DateTime<Utc>>,
         initial_confidence: Option<f64>,
         author_id: Option<String>,
+        subject_id: Option<String>,
     ) -> Result<Memory, MemoriaError> {
+        let subject_id = normalize_opt_string(subject_id);
+        if let Some(ref sid) = subject_id {
+            if sid.len() > 128 {
+                return Err(MemoriaError::Validation(
+                    "subject_id exceeds maximum length of 128 characters".into(),
+                ));
+            }
+        }
         let t0 = std::time::Instant::now();
         // Sensitivity check — block HIGH tier, redact MEDIUM tier
         let sensitivity = check_sensitivity(content);
@@ -1205,6 +1260,7 @@ impl MemoryService {
             memory_id: Uuid::now_v7().simple().to_string(),
             user_id: user_id.to_string(),
             author_id,
+            subject_id,
             memory_type,
             content: content.to_string(),
             initial_confidence: initial_confidence
@@ -1242,6 +1298,7 @@ impl MemoryService {
                         &mtype,
                         &memory.memory_id,
                         l2_threshold,
+                        memory.subject_id.as_deref(),
                     )
                     .await
                 {
@@ -1565,6 +1622,8 @@ impl MemoryService {
             let sql = self.user_sql_store(user_id).await?;
             let table = sql.table_for_branch(user_id, branch).await?;
             let strict_session_id = options.strict_session_id();
+            let subject_id = options.subject_id();
+            let memory_types = options.memory_types();
             // Load per-user feedback_weight lazily — only when needed for scoring
             // (avoids extra DB query when fulltext fallback has no feedback to apply)
 
@@ -1575,7 +1634,16 @@ impl MemoryService {
 
             // Phase 1: graph retrieval (activation-based)
             let main_table = sql.t("mem_memories");
-            if strict_session_id.is_none() && table == main_table {
+            // Skip graph when subject_id or memory_types filters are active: the graph
+            // retriever has no awareness of those constraints, so it would return top_k
+            // nodes spanning all subjects/types, almost all of which would be discarded
+            // by the post-filter.  This mirrors the existing strict_session_id skip and
+            // avoids wasted traversal work + spurious hybrid fallbacks.
+            if strict_session_id.is_none()
+                && subject_id.is_none()
+                && memory_types.is_none()
+                && table == main_table
+            {
                 if let Some(ref embedding) = emb {
                     explain.graph_attempted = true;
                     let g_start = std::time::Instant::now();
@@ -1613,6 +1681,18 @@ impl MemoryService {
                                 if let Some(ref mid) = node.memory_id {
                                     if seen.insert(mid.clone()) {
                                         if let Some(mut mem) = tabular.get(mid).cloned() {
+                                            // Post-filter: apply subject_id / memory_types
+                                            // constraints that the graph retriever doesn't know.
+                                            if let Some(sid) = subject_id {
+                                                if mem.subject_id.as_deref() != Some(sid) {
+                                                    continue;
+                                                }
+                                            }
+                                            if let Some(types) = memory_types {
+                                                if !types.contains(&mem.memory_type) {
+                                                    continue;
+                                                }
+                                            }
                                             mem.retrieval_score = Some(*score as f64);
                                             graph_memories.push(mem);
                                         }
@@ -1635,8 +1715,16 @@ impl MemoryService {
                             // to avoid redundant get_user_retrieval_params query
                             let fw = self.get_feedback_weight(user_id).await?;
                             let (vec_results, scores) = sql
-                                .search_hybrid_from_scored(
-                                    &table, user_id, embedding, query, top_k, fw,
+                                .search_hybrid_from_scored_scoped(
+                                    &table,
+                                    user_id,
+                                    embedding,
+                                    query,
+                                    top_k,
+                                    fw,
+                                    None,
+                                    subject_id,
+                                    memory_types,
                                 )
                                 .await?;
                             explain.vector_ms = vs_start.elapsed().as_secs_f64() * 1000.0;
@@ -1712,6 +1800,8 @@ impl MemoryService {
                         top_k,
                         fw,
                         strict_session_id,
+                        subject_id,
+                        memory_types,
                     )
                     .await?;
                 explain.vector_ms = vs_start.elapsed().as_secs_f64() * 1000.0;
@@ -1743,7 +1833,15 @@ impl MemoryService {
             explain.fulltext_attempted = true;
             let ft_start = std::time::Instant::now();
             let mut results = sql
-                .search_fulltext_from_scoped(&table, user_id, query, top_k, strict_session_id)
+                .search_fulltext_from_scoped(
+                    &table,
+                    user_id,
+                    query,
+                    top_k,
+                    strict_session_id,
+                    subject_id,
+                    memory_types,
+                )
                 .await?;
             explain.fulltext_ms = ft_start.elapsed().as_secs_f64() * 1000.0;
             explain.fulltext_hit = !results.is_empty();
@@ -1804,9 +1902,21 @@ impl MemoryService {
         }
 
         // Fallback for tests (no sql_store)
+        // Post-filter helper: apply subject_id / memory_types from options
+        let apply_filters = |mut mems: Vec<Memory>| -> Vec<Memory> {
+            if let Some(sid) = options.subject_id() {
+                mems.retain(|m| m.subject_id.as_deref() == Some(sid));
+            }
+            if let Some(types) = options.memory_types() {
+                mems.retain(|m| types.contains(&m.memory_type));
+            }
+            mems
+        };
+
         if let Some(emb) = self.embed(query).await.unwrap_or(None) {
             explain.vector_attempted = true;
-            let results = self.store.search_vector(user_id, &emb, top_k).await?;
+            let raw = self.store.search_vector(user_id, &emb, top_k).await?;
+            let results = apply_filters(raw);
             if !results.is_empty() {
                 explain.vector_hit = true;
                 explain.path = "vector";
@@ -1816,7 +1926,8 @@ impl MemoryService {
             }
         }
         explain.fulltext_attempted = true;
-        let results = self.store.search_fulltext(user_id, query, top_k).await?;
+        let raw = self.store.search_fulltext(user_id, query, top_k).await?;
+        let results = apply_filters(raw);
         explain.fulltext_hit = !results.is_empty();
         explain.path = if explain.fulltext_hit {
             "fulltext"
@@ -1933,6 +2044,7 @@ impl MemoryService {
                 access_count: 0,
                 retrieval_score: None,
                 author_id: old.author_id.clone(),
+                subject_id: old.subject_id.clone(),
             };
 
             sql.insert_into(&table, &new_mem).await?;
@@ -1998,6 +2110,7 @@ impl MemoryService {
                 access_count: 0,
                 retrieval_score: None,
                 author_id: old.author_id.clone(),
+                subject_id: old.subject_id.clone(),
             };
 
             self.store.insert(&new_mem).await?;
@@ -2303,6 +2416,7 @@ impl MemoryService {
                 session_id,
                 trust_tier,
                 cursor,
+                subject_id: None,
             },
         )
         .await
@@ -2314,6 +2428,14 @@ impl MemoryService {
         branch: Option<&str>,
         options: ListActiveOptions<'_>,
     ) -> Result<Vec<Memory>, MemoriaError> {
+        // Normalize all string filters once at the boundary so that both the SQL
+        // path and the fallback path treat "  alice  " and "" identically.
+        let memory_type = options.memory_type.map(str::trim).filter(|s| !s.is_empty());
+        let session_id  = options.session_id.map(str::trim).filter(|s| !s.is_empty());
+        let trust_tier  = options.trust_tier.map(str::trim).filter(|s| !s.is_empty());
+        let subject_id  = options.subject_id.map(str::trim).filter(|s| !s.is_empty());
+        let cursor      = options.cursor.map(str::trim).filter(|s| !s.is_empty());
+
         if self.sql_store.is_some() {
             let sql = self.user_sql_store(user_id).await?;
             let table = sql.table_for_branch(user_id, branch).await?;
@@ -2322,26 +2444,30 @@ impl MemoryService {
                     &table,
                     user_id,
                     options.limit,
-                    options.memory_type,
-                    options.session_id,
-                    options.trust_tier,
-                    options.cursor,
+                    memory_type,
+                    session_id,
+                    trust_tier,
+                    cursor,
+                    subject_id,
                 )
                 .await;
         }
         // Fallback: trait path — no SQL store means no server-side filter/cursor.
         // Production always uses SQL store; this path is for trait-only test doubles.
         let mut mems = self.store.list_active(user_id, options.limit).await?;
-        if let Some(mt) = options.memory_type {
+        if let Some(mt) = memory_type {
             mems.retain(|m| m.memory_type.to_string() == mt);
         }
-        if let Some(session_id) = options.session_id {
-            mems.retain(|m| m.session_id.as_deref() == Some(session_id));
+        if let Some(sid_val) = session_id {
+            mems.retain(|m| m.session_id.as_deref() == Some(sid_val));
         }
-        if let Some(tt) = options.trust_tier {
+        if let Some(tt) = trust_tier {
             mems.retain(|m| m.trust_tier.to_string() == tt);
         }
-        if let Some(cursor_id) = options.cursor {
+        if let Some(sid) = subject_id {
+            mems.retain(|m| m.subject_id.as_deref() == Some(sid));
+        }
+        if let Some(cursor_id) = cursor {
             mems.retain(|m| m.memory_id.as_str() < cursor_id);
         }
         Ok(mems)
@@ -2398,7 +2524,7 @@ impl MemoryService {
     pub async fn store_batch(
         &self,
         user_id: &str,
-        items: Vec<(String, MemoryType, Option<String>, Option<TrustTier>)>,
+        items: Vec<BatchStoreItem>,
         author_id: Option<String>,
     ) -> Result<Vec<Memory>, MemoriaError> {
         self.store_batch_on_branch(user_id, None, items, author_id)
@@ -2406,11 +2532,12 @@ impl MemoryService {
     }
 
     /// Batch store with a single embedding API call, targeting an optional branch.
+    /// Item tuple: (content, memory_type, session_id, trust_tier, subject_id)
     pub async fn store_batch_on_branch(
         &self,
         user_id: &str,
         branch: Option<&str>,
-        items: Vec<(String, MemoryType, Option<String>, Option<TrustTier>)>,
+        items: Vec<BatchStoreItem>,
         author_id: Option<String>,
     ) -> Result<Vec<Memory>, MemoriaError> {
         if items.is_empty() {
@@ -2420,7 +2547,15 @@ impl MemoryService {
         // Sensitivity check + collect contents
         let mut contents = Vec::with_capacity(items.len());
         let mut checked_items = Vec::with_capacity(items.len());
-        for (content, mt, session_id, tier) in items {
+        for (content, mt, session_id, tier, subject_id) in items {
+            let subject_id = normalize_opt_string(subject_id);
+            if let Some(ref sid) = subject_id {
+                if sid.len() > 128 {
+                    return Err(MemoriaError::Validation(
+                        "subject_id exceeds maximum length of 128 characters".into(),
+                    ));
+                }
+            }
             let sensitivity = check_sensitivity(&content);
             if sensitivity.blocked {
                 return Err(MemoriaError::Blocked(format!(
@@ -2430,20 +2565,23 @@ impl MemoryService {
             }
             let final_content = sensitivity.redacted_content.unwrap_or(content);
             contents.push(final_content.clone());
-            checked_items.push((final_content, mt, session_id, tier));
+            checked_items.push((final_content, mt, session_id, tier, subject_id));
         }
 
         // Batch embed
         let embeddings = self.embed_batch(&contents).await?;
 
         let mut results = Vec::with_capacity(checked_items.len());
-        for (i, (content, mt, session_id, tier)) in checked_items.into_iter().enumerate() {
+        for (i, (content, mt, session_id, tier, subject_id)) in
+            checked_items.into_iter().enumerate()
+        {
             let effective_tier = tier.unwrap_or(TrustTier::T1Verified);
             let embedding = embeddings.as_ref().map(|v| v[i].clone());
             let memory = Memory {
                 memory_id: Uuid::now_v7().simple().to_string(),
                 user_id: user_id.to_string(),
                 author_id: author_id.clone(),
+                subject_id,
                 memory_type: mt,
                 content,
                 initial_confidence: effective_tier.initial_confidence(),
@@ -2503,7 +2641,7 @@ impl MemoryService {
         messages: &[serde_json::Value],
         session_id: Option<String>,
     ) -> Result<(Vec<Memory>, bool), MemoriaError> {
-        self.observe_turn_on_branch(user_id, None, messages, session_id)
+        self.observe_turn_on_branch(user_id, None, messages, session_id, None)
             .await
     }
 
@@ -2513,24 +2651,28 @@ impl MemoryService {
         branch: Option<&str>,
         messages: &[serde_json::Value],
         session_id: Option<String>,
+        subject_id: Option<String>,
     ) -> Result<(Vec<Memory>, bool), MemoriaError> {
+        // Normalize early so that stored subject_id always matches what retrieve
+        // filters on (avoids trailing-space mismatches).
+        let subject_id = normalize_opt_string(subject_id);
         let has_llm = self.llm.is_some();
 
         let candidates = if let Some(llm) = &self.llm {
             match self.extract_via_llm(llm, messages).await {
                 Ok(ref items) if !items.is_empty() => {
                     info!(count = items.len(), "LLM extracted memory candidates");
-                    self.build_candidates(user_id, items, session_id.clone())
+                    self.build_candidates(user_id, items, session_id.clone(), subject_id.clone())
                         .await
                 }
                 Ok(_) => vec![],
                 Err(e) => {
                     warn!(error = %e, "LLM extraction failed, falling back to raw storage");
-                    self.raw_candidates(user_id, messages, session_id.clone())
+                    self.raw_candidates(user_id, messages, session_id.clone(), subject_id.clone())
                 }
             }
         } else {
-            self.raw_candidates(user_id, messages, session_id.clone())
+            self.raw_candidates(user_id, messages, session_id.clone(), subject_id.clone())
         };
 
         let mut stored = Vec::with_capacity(candidates.len());
@@ -2556,6 +2698,7 @@ impl MemoryService {
         user_id: &str,
         items: &[serde_json::Value],
         session_id: Option<String>,
+        subject_id: Option<String>,
     ) -> Vec<Memory> {
         let now = Utc::now();
         let mut result = Vec::new();
@@ -2603,6 +2746,7 @@ impl MemoryService {
                 trust_tier: TrustTier::T3Inferred,
                 retrieval_score: None,
                 author_id: None,
+                subject_id: subject_id.clone(),
             });
         }
         result
@@ -2614,6 +2758,7 @@ impl MemoryService {
         user_id: &str,
         messages: &[serde_json::Value],
         session_id: Option<String>,
+        subject_id: Option<String>,
     ) -> Vec<Memory> {
         let now = Utc::now();
         messages
@@ -2644,6 +2789,7 @@ impl MemoryService {
                     trust_tier: TrustTier::T1Verified,
                     retrieval_score: None,
                     author_id: None,
+                    subject_id: subject_id.clone(),
                 })
             })
             .collect()
@@ -2676,7 +2822,15 @@ impl MemoryService {
                 let l2_threshold = 0.3162;
                 let mtype = mem.memory_type.to_string();
                 if let Ok(Some((old_id, old_content, _))) = sql
-                    .find_near_duplicate(&table, user_id, emb, &mtype, &mem.memory_id, l2_threshold)
+                    .find_near_duplicate(
+                        &table,
+                        user_id,
+                        emb,
+                        &mtype,
+                        &mem.memory_id,
+                        l2_threshold,
+                        mem.subject_id.as_deref(),
+                    )
                     .await
                 {
                     if old_content.trim() != mem.content.trim() {
@@ -2773,6 +2927,62 @@ impl MemoryService {
 mod tests {
     use super::*;
     use sqlx::mysql::MySqlPoolOptions;
+
+    // ── normalize_opt_string ──────────────────────────────────────────────────
+
+    #[test]
+    fn normalize_opt_string_none_stays_none() {
+        assert_eq!(normalize_opt_string(None), None);
+    }
+
+    #[test]
+    fn normalize_opt_string_empty_becomes_none() {
+        assert_eq!(normalize_opt_string(Some(String::new())), None);
+    }
+
+    #[test]
+    fn normalize_opt_string_whitespace_only_becomes_none() {
+        assert_eq!(normalize_opt_string(Some("   ".to_string())), None);
+        assert_eq!(normalize_opt_string(Some("\t\n".to_string())), None);
+    }
+
+    #[test]
+    fn normalize_opt_string_trims_surrounding_whitespace() {
+        assert_eq!(
+            normalize_opt_string(Some("  user@example.com  ".to_string())),
+            Some("user@example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn normalize_opt_string_preserves_inner_content() {
+        let s = "patient-id-001".to_string();
+        assert_eq!(normalize_opt_string(Some(s.clone())), Some(s));
+    }
+
+    // ── RetrieveOptions::with_subject_id ─────────────────────────────────────
+
+    #[test]
+    fn retrieve_options_with_subject_id_normalises_whitespace() {
+        let opts = RetrieveOptions::from_session_scope(None, None)
+            .with_subject_id(Some("  alice  ".to_string()));
+        assert_eq!(opts.subject_id(), Some("alice"));
+    }
+
+    #[test]
+    fn retrieve_options_with_subject_id_empty_becomes_none() {
+        let opts = RetrieveOptions::from_session_scope(None, None)
+            .with_subject_id(Some("  ".to_string()));
+        assert_eq!(opts.subject_id(), None);
+    }
+
+    #[test]
+    fn retrieve_options_with_subject_id_none_stays_none() {
+        let opts = RetrieveOptions::from_session_scope(None, None).with_subject_id(None);
+        assert_eq!(opts.subject_id(), None);
+    }
+
+    // ── existing test ─────────────────────────────────────────────────────────
 
     #[tokio::test]
     async fn test_new_sql_with_llm_disables_background_workers_without_database_url() {

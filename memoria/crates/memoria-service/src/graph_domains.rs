@@ -614,23 +614,21 @@ impl TrustLifecycleStrategy for DefaultTrustLifecycleStrategy {
                         ));
                     }
                 }
-                "T2" => {
-                    if scene.confidence < T2_DEMOTION_CONFIDENCE {
-                        store
-                            .update_confidence_and_tier(&scene.node_id, scene.confidence, "T3")
-                            .await?;
-                        demoted += 1;
-                        decisions.push(trust_decision(
-                            "demote_trust_tier",
-                            &scene.node_id,
-                            scene.confidence,
-                            format!(
-                                "Scene confidence {:.2} fell below T2 guardrail; demoted to T3",
-                                scene.confidence
-                            ),
-                            "T3",
-                        ));
-                    }
+                "T2" if scene.confidence < T2_DEMOTION_CONFIDENCE => {
+                    store
+                        .update_confidence_and_tier(&scene.node_id, scene.confidence, "T3")
+                        .await?;
+                    demoted += 1;
+                    decisions.push(trust_decision(
+                        "demote_trust_tier",
+                        &scene.node_id,
+                        scene.confidence,
+                        format!(
+                            "Scene confidence {:.2} fell below T2 guardrail; demoted to T3",
+                            scene.confidence
+                        ),
+                        "T3",
+                    ));
                 }
                 _ => {}
             }

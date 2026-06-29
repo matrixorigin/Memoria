@@ -128,6 +128,9 @@ pub struct Memory {
     /// Real author in group mode (the human who created the memory).
     /// `None` in personal mode (user_id is already the author).
     pub author_id: Option<String>,
+    /// Stable business ID of the memory subject (e.g. end-user, patient).
+    /// Set by the MOI extraction worker; `None` for memories without subject binding.
+    pub subject_id: Option<String>,
     pub memory_type: MemoryType,
     pub content: String,
     pub initial_confidence: f64,

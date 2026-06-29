@@ -431,7 +431,7 @@ pub async fn visible_snapshots_for_user(
         }
     }
 
-    snapshots.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+    snapshots.sort_by_key(|b| std::cmp::Reverse(b.timestamp));
     let total_elapsed_ms = started.elapsed().as_millis();
     if total_elapsed_ms >= 100 {
         tracing::info!(
@@ -1050,7 +1050,9 @@ pub async fn call(
             let table_name = format!("br_{}_{}", &Uuid::new_v4().simple().to_string()[..8], safe);
 
             if let Some(snap) = from_snapshot {
-                // Create branch from snapshot: restore snapshot to temp, then branch
+                // Create branch from snapshot: restore snapshot to temp, then branch.
+                // Source is always mem_memories — new branch inherits its schema including
+                // subject_id, so no post-create column migration is needed.
                 let internal = resolve_snapshot_for_user(svc, user_id, snap)
                     .await?
                     .ok_or_else(|| MemoriaError::NotFound(format!("Snapshot '{snap}'")))?;
@@ -1058,6 +1060,9 @@ pub async fn call(
                     .await
                     .map_err(git_err)?;
             } else {
+                // Source is always mem_memories (never another branch table).
+                // schema.subject_id is guaranteed present after migrate_user(), so MO's
+                // zero-copy branch DDL will inherit the column automatically.
                 git.create_branch(&table_name, "mem_memories")
                     .await
                     .map_err(git_err)?;

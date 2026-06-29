@@ -268,6 +268,7 @@ pub async fn reflect(
                     None,
                     None,
                     None,
+                    None,
                 )
                 .await;
             scenes_created += 1;

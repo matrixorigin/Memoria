@@ -49,10 +49,42 @@ fn parse_retrieve_options_arg(args: &Value) -> Result<memoria_service::RetrieveO
     if session_scope.is_some() && session_id.is_none() {
         anyhow::bail!("session_id is required when session_scope is set");
     }
-    Ok(memoria_service::RetrieveOptions::from_session_scope(
-        session_id,
-        session_scope,
-    ))
+    let subject_id = args
+        .get("subject_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+    let memory_types: Option<Vec<memoria_core::MemoryType>> = match args.get("memory_types") {
+        None | Some(Value::Null) => None,
+        Some(v) => {
+            let arr = v
+                .as_array()
+                .ok_or_else(|| anyhow::anyhow!("memory_types must be an array, got: {v}"))?;
+            let types = arr
+                .iter()
+                .map(|v| {
+                    let s = v.as_str().ok_or_else(|| {
+                        anyhow::anyhow!("memory_types elements must be strings, got: {v}")
+                    })?;
+                    let trimmed = s.trim();
+                    if trimmed.is_empty() {
+                        return Ok(None);
+                    }
+                    memoria_core::MemoryType::from_str(trimmed)
+                        .map(Some)
+                        .map_err(|_| anyhow::anyhow!("unknown memory_type: '{trimmed}'"))
+                })
+                .filter_map(|r: Result<Option<_>, _>| r.transpose())
+                .collect::<Result<Vec<_>, _>>()?;
+            Some(types).filter(|v| !v.is_empty())
+        }
+    };
+    Ok(
+        memoria_service::RetrieveOptions::from_session_scope(session_id, session_scope)
+            .with_subject_id(subject_id)
+            .with_memory_types(memory_types),
+    )
 }
 
 fn branch_arg(args: &Value) -> Option<&str> {
@@ -124,6 +156,7 @@ pub fn list() -> Value {
                     "content": {"type": "string"},
                     "memory_type": {"type": "string", "default": "semantic"},
                     "session_id": {"type": "string"},
+                    "subject_id": {"type": "string", "description": "Stable business ID of the memory subject (e.g. end-user ID). Set by the integration layer; optional."},
                     "branch": {"type": "string", "description": "Optional branch to read/write without changing the active checkout"},
                     "trust_tier": {
                         "type": "string",
@@ -144,6 +177,8 @@ pub fn list() -> Value {
                     "top_k": {"type": "integer", "default": 5},
                     "session_id": {"type": "string"},
                     "session_scope": {"type": "string", "enum": ["prefer", "only"], "description": "How to use session_id: prefer=non-strict retrieval using the provided session_id as context; only=limit results to that session plus unscoped memories"},
+                    "subject_id": {"type": "string", "description": "Filter by memory subject ID. Only returns memories belonging to this subject."},
+                    "memory_types": {"type": "array", "items": {"type": "string", "enum": ["semantic", "working", "episodic", "profile", "tool_result", "procedural"]}, "description": "Optional memory type filter. Narrows results to the specified types."},
                     "branch": {"type": "string", "description": "Optional branch to read from without changing the active checkout"},
                     "explain": {"type": ["boolean", "string"], "default": false, "description": "Explain level: false/\"none\"=off, true/\"basic\"=timing+path, \"verbose\"=+per-candidate scores, \"analyze\"=full"}
                 },
@@ -160,6 +195,8 @@ pub fn list() -> Value {
                     "top_k": {"type": "integer", "default": 10},
                     "session_id": {"type": "string"},
                     "session_scope": {"type": "string", "enum": ["prefer", "only"], "description": "How to use session_id: prefer=non-strict search using the provided session_id as context; only=limit results to that session plus unscoped memories"},
+                    "subject_id": {"type": "string", "description": "Filter by memory subject ID. Only returns memories belonging to this subject."},
+                    "memory_types": {"type": "array", "items": {"type": "string", "enum": ["semantic", "working", "episodic", "profile", "tool_result", "procedural"]}, "description": "Optional memory type filter. Narrows results to the specified types."},
                     "branch": {"type": "string", "description": "Optional branch to search without changing the active checkout"},
                     "explain": {"type": ["boolean", "string"], "default": false, "description": "Explain level: false/\"none\"=off, true/\"basic\"=timing+path, \"verbose\"=+per-candidate scores, \"analyze\"=full"}
                 },
@@ -177,6 +214,8 @@ pub fn list() -> Value {
                     "new_content": {"type": "string"},
                     "session_id": {"type": "string", "description": "Optional session to use when resolving query-based correction"},
                     "session_scope": {"type": "string", "enum": ["prefer", "only"], "description": "Only used with query-based correction. prefer=non-strict lookup using the provided session_id as context; only=restrict lookup to the given session plus unscoped memories"},
+                    "subject_id": {"type": "string", "description": "Optional subject ID to scope query-based correction. Only memories belonging to this subject will be candidates."},
+                    "memory_types": {"type": "array", "items": {"type": "string", "enum": ["semantic", "working", "episodic", "profile", "tool_result", "procedural"]}, "description": "Optional memory type filter for query-based correction. Only memories of the specified types will be candidates."},
                     "branch": {"type": "string", "description": "Optional branch to correct without changing the active checkout"},
                     "reason": {"type": "string"}
                 },
@@ -201,7 +240,13 @@ pub fn list() -> Value {
         {
             "name": "memory_profile",
             "description": "Get user memory-derived profile summary",
-            "inputSchema": {"type": "object", "properties": {}}
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "subject_id": {"type": "string", "description": "Filter by memory subject ID. Only returns profile memories belonging to this subject."},
+                    "branch": {"type": "string", "description": "Optional branch to read without changing the active checkout"}
+                }
+            }
         },
         {
             "name": "memory_capabilities",
@@ -217,6 +262,7 @@ pub fn list() -> Value {
                     "limit": {"type": "integer", "default": 20},
                     "memory_type": {"type": "string"},
                     "session_id": {"type": "string", "description": "Exact session identifier — only list memories from that session"},
+                    "subject_id": {"type": "string", "description": "Filter by memory subject ID. Only returns memories belonging to this subject."},
                     "branch": {"type": "string", "description": "Optional branch to list without changing the active checkout"}
                 }
             }
@@ -264,6 +310,20 @@ pub fn list() -> Value {
                 },
                 "required": ["memory_id", "signal"]
             }
+        },
+        {
+            "name": "memory_observe",
+            "description": "Extract and store memories from a conversation turn. With LLM: uses structured extraction. Without LLM: stores each non-empty message as-is.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "messages": {"type": "array", "items": {"type": "object"}, "description": "Conversation messages (role + content)"},
+                    "session_id": {"type": "string", "description": "Optional session identifier to attach to stored memories"},
+                    "subject_id": {"type": "string", "description": "Stable business ID of the memory subject (e.g. end-user ID). Stored on each extracted memory for subject-scoped retrieval."},
+                    "branch": {"type": "string", "description": "Optional branch to write to without changing the active checkout"}
+                },
+                "required": ["messages"]
+            }
         }
     ])
 }
@@ -307,6 +367,11 @@ pub async fn call(
                 .transpose()
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
             let mt = MemoryType::from_str(memory_type).unwrap_or(MemoryType::Semantic);
+            let subject_id = args["subject_id"]
+                .as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(String::from);
             let m = match service
                 .store_memory_on_branch(
                     user_id,
@@ -318,6 +383,7 @@ pub async fn call(
                     None,
                     None,
                     None,
+                    subject_id,
                 )
                 .await
             {
@@ -531,15 +597,29 @@ pub async fn call(
         }
 
         ToolCallName::MemoryProfile => {
-            let memories = service.list_active(user_id, 50).await?;
-            let profile_mems: Vec<_> = memories
-                .iter()
-                .filter(|m| m.memory_type == MemoryType::Profile)
-                .collect();
-            if profile_mems.is_empty() {
+            let subject_id = args
+                .get("subject_id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let memories = service
+                .list_active_filtered_on_branch(
+                    user_id,
+                    branch_arg(&args),
+                    ListActiveOptions {
+                        limit: 50,
+                        memory_type: Some("profile"),
+                        session_id: None,
+                        trust_tier: None,
+                        cursor: None,
+                        subject_id,
+                    },
+                )
+                .await?;
+            if memories.is_empty() {
                 return Ok(mcp_text("No profile memories found."));
             }
-            let text = profile_mems
+            let text = memories
                 .iter()
                 .map(|m| m.content.as_str())
                 .collect::<Vec<_>>()
@@ -559,6 +639,11 @@ pub async fn call(
                         session_id: args.get("session_id").and_then(Value::as_str),
                         trust_tier: args.get("trust_tier").and_then(Value::as_str),
                         cursor: None,
+                        subject_id: args
+                            .get("subject_id")
+                            .and_then(Value::as_str)
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty()),
                     },
                 )
                 .await?;
@@ -827,6 +912,7 @@ pub async fn call(
                             None,
                             None,
                             None,
+                            None,
                         )
                         .await;
                     scenes_created += 1;
@@ -1066,9 +1152,21 @@ pub async fn call(
         ToolCallName::MemoryObserve => {
             let messages = args["messages"].as_array().cloned().unwrap_or_default();
             let session_id = args["session_id"].as_str().map(String::from);
+            let subject_id = args
+                .get("subject_id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(String::from);
 
             let (memories, has_llm) = service
-                .observe_turn_on_branch(user_id, branch_arg(&args), &messages, session_id.clone())
+                .observe_turn_on_branch(
+                    user_id,
+                    branch_arg(&args),
+                    &messages,
+                    session_id.clone(),
+                    subject_id,
+                )
                 .await?;
 
             // Graph sync (best-effort) for each stored memory

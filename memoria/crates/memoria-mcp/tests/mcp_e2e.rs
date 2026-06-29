@@ -162,10 +162,10 @@ async fn test_e2e_tools_list_has_8() {
     let tools = memoria_mcp::tools::list();
     assert_eq!(
         tools.as_array().unwrap().len(),
-        12,
-        "expected 12 agent-facing tools (6 hidden from MCP listing)"
+        13,
+        "expected 13 agent-facing tools (5 hidden from MCP listing)"
     );
-    println!("✅ tools_list: 12 tools (6 hidden)");
+    println!("✅ tools_list: 13 tools (5 hidden)");
 }
 
 // ── MCP branch → store → merge end-to-end ────────────────────────────────────

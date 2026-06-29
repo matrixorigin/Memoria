@@ -47,3 +47,4 @@ dev-signing-key.b64
 nohup.out
 sdk/python/.venv/
 sdk/python/uv.lock
+.DS_Store

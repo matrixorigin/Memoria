@@ -189,13 +189,11 @@ impl<'a> GraphConsolidator<'a> {
                         demoted += 1;
                     }
                 }
-                "T2" => {
-                    if scene.confidence < T2_DEMOTION_CONFIDENCE {
-                        self.store
-                            .update_confidence_and_tier(&scene.node_id, scene.confidence, "T3")
-                            .await?;
-                        demoted += 1;
-                    }
+                "T2" if scene.confidence < T2_DEMOTION_CONFIDENCE => {
+                    self.store
+                        .update_confidence_and_tier(&scene.node_id, scene.confidence, "T3")
+                        .await?;
+                    demoted += 1;
                 }
                 _ => {}
             }

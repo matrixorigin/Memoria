@@ -38,6 +38,7 @@ fn make_memory(user_id: &str, content: &str) -> Memory {
         created_at: None,
         updated_at: None,
         author_id: None,
+        subject_id: None,
     }
 }
 
@@ -67,6 +68,7 @@ async fn create_branch_table(pool: &sqlx::MySqlPool, table: &str, dim: usize) {
             created_at      DATETIME(6)  NOT NULL,
             updated_at      DATETIME(6),
             author_id       VARCHAR(64),
+            subject_id      VARCHAR(128) DEFAULT NULL,
             INDEX idx_user_active (user_id, is_active, memory_type)
         )"#
     );
@@ -335,12 +337,13 @@ async fn test_merge_branch_into_main() {
     // Merge: NOT EXISTS instead of INSERT IGNORE (MatrixOne bug: INSERT IGNORE SELECT * skips all rows with vecf32 column)
     let sql = format!(
         "INSERT INTO mem_memories \
-            (memory_id, user_id, memory_type, content, embedding, session_id, \
-             source_event_ids, extra_metadata, is_active, superseded_by, \
+            (memory_id, user_id, author_id, subject_id, memory_type, content, embedding, \
+             session_id, source_event_ids, extra_metadata, is_active, superseded_by, \
              trust_tier, initial_confidence, observed_at, created_at, updated_at) \
-         SELECT b.memory_id, b.user_id, b.memory_type, b.content, b.embedding, b.session_id, \
-             b.source_event_ids, b.extra_metadata, b.is_active, b.superseded_by, \
-             b.trust_tier, b.initial_confidence, b.observed_at, b.created_at, b.updated_at \
+         SELECT b.memory_id, b.user_id, b.author_id, b.subject_id, b.memory_type, b.content, \
+             b.embedding, b.session_id, b.source_event_ids, b.extra_metadata, b.is_active, \
+             b.superseded_by, b.trust_tier, b.initial_confidence, b.observed_at, b.created_at, \
+             b.updated_at \
          FROM {branch_table} b \
          WHERE b.user_id = ? \
            AND NOT EXISTS (SELECT 1 FROM mem_memories m WHERE m.memory_id = b.memory_id)"
@@ -443,12 +446,13 @@ async fn test_full_branch_workflow() {
     // 6. Merge branch into main
     let sql = format!(
         "INSERT INTO mem_memories \
-            (memory_id, user_id, memory_type, content, embedding, session_id, \
-             source_event_ids, extra_metadata, is_active, superseded_by, \
+            (memory_id, user_id, author_id, subject_id, memory_type, content, embedding, \
+             session_id, source_event_ids, extra_metadata, is_active, superseded_by, \
              trust_tier, initial_confidence, observed_at, created_at, updated_at) \
-         SELECT b.memory_id, b.user_id, b.memory_type, b.content, b.embedding, b.session_id, \
-             b.source_event_ids, b.extra_metadata, b.is_active, b.superseded_by, \
-             b.trust_tier, b.initial_confidence, b.observed_at, b.created_at, b.updated_at \
+         SELECT b.memory_id, b.user_id, b.author_id, b.subject_id, b.memory_type, b.content, \
+             b.embedding, b.session_id, b.source_event_ids, b.extra_metadata, b.is_active, \
+             b.superseded_by, b.trust_tier, b.initial_confidence, b.observed_at, b.created_at, \
+             b.updated_at \
          FROM {branch_table} b \
          WHERE b.user_id = ? \
            AND NOT EXISTS (SELECT 1 FROM mem_memories m WHERE m.memory_id = b.memory_id)"
@@ -516,12 +520,13 @@ async fn test_merge_not_insert_ignore_select_star() {
     // Correct merge SQL: explicit columns + NOT EXISTS
     let merge_sql = format!(
         "INSERT INTO mem_memories \
-            (memory_id, user_id, memory_type, content, embedding, session_id, \
-             source_event_ids, extra_metadata, is_active, superseded_by, \
+            (memory_id, user_id, author_id, subject_id, memory_type, content, embedding, \
+             session_id, source_event_ids, extra_metadata, is_active, superseded_by, \
              trust_tier, initial_confidence, observed_at, created_at, updated_at) \
-         SELECT b.memory_id, b.user_id, b.memory_type, b.content, b.embedding, b.session_id, \
-             b.source_event_ids, b.extra_metadata, b.is_active, b.superseded_by, \
-             b.trust_tier, b.initial_confidence, b.observed_at, b.created_at, b.updated_at \
+         SELECT b.memory_id, b.user_id, b.author_id, b.subject_id, b.memory_type, b.content, \
+             b.embedding, b.session_id, b.source_event_ids, b.extra_metadata, b.is_active, \
+             b.superseded_by, b.trust_tier, b.initial_confidence, b.observed_at, b.created_at, \
+             b.updated_at \
          FROM {branch_table} b \
          WHERE b.user_id = ? \
            AND NOT EXISTS (SELECT 1 FROM mem_memories m WHERE m.memory_id = b.memory_id)"
