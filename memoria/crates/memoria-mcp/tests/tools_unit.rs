@@ -195,14 +195,6 @@ async fn test_tool_memory_retrieve_empty() {
 #[tokio::test]
 async fn test_tool_memory_retrieve_rejects_missing_query() {
     let svc = make_service();
-    memoria_mcp::tools::call(
-        "memory_store",
-        json!({"content": "rust programming"}),
-        &svc,
-        "u1",
-    )
-    .await
-    .unwrap();
 
     for (tool, args) in [
         ("memory_retrieve", json!({})),

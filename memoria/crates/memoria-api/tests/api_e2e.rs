@@ -8765,14 +8765,6 @@ async fn test_mcp_memory_retrieve_and_search_reject_missing_query() {
     let (base, client, _server) = spawn_server().await;
     let uid = uid();
 
-    client
-        .post(format!("{base}/v1/memories"))
-        .header("X-User-Id", &uid)
-        .json(&json!({"content": "seed memory for query validation", "memory_type": "semantic"}))
-        .send()
-        .await
-        .unwrap();
-
     for (id, tool, args) in [
         (7, "memory_retrieve", json!({})),
         (8, "memory_retrieve", json!({"query": ""})),

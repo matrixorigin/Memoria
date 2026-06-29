@@ -195,13 +195,6 @@ async fn test_retrieve_empty() {
 #[tokio::test]
 async fn test_retrieve_and_search_reject_missing_query() {
     let (svc, uid, _ctx) = setup().await;
-    call(
-        "memory_store",
-        json!({"content": "rust ownership model"}),
-        &svc,
-        &uid,
-    )
-    .await;
 
     for (tool, args) in [
         ("memory_retrieve", json!({})),
