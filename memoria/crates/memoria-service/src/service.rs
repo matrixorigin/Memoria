@@ -2428,6 +2428,14 @@ impl MemoryService {
         branch: Option<&str>,
         options: ListActiveOptions<'_>,
     ) -> Result<Vec<Memory>, MemoriaError> {
+        // Normalize all string filters once at the boundary so that both the SQL
+        // path and the fallback path treat "  alice  " and "" identically.
+        let memory_type = options.memory_type.map(str::trim).filter(|s| !s.is_empty());
+        let session_id  = options.session_id.map(str::trim).filter(|s| !s.is_empty());
+        let trust_tier  = options.trust_tier.map(str::trim).filter(|s| !s.is_empty());
+        let subject_id  = options.subject_id.map(str::trim).filter(|s| !s.is_empty());
+        let cursor      = options.cursor.map(str::trim).filter(|s| !s.is_empty());
+
         if self.sql_store.is_some() {
             let sql = self.user_sql_store(user_id).await?;
             let table = sql.table_for_branch(user_id, branch).await?;
@@ -2436,30 +2444,30 @@ impl MemoryService {
                     &table,
                     user_id,
                     options.limit,
-                    options.memory_type,
-                    options.session_id,
-                    options.trust_tier,
-                    options.cursor,
-                    options.subject_id,
+                    memory_type,
+                    session_id,
+                    trust_tier,
+                    cursor,
+                    subject_id,
                 )
                 .await;
         }
         // Fallback: trait path — no SQL store means no server-side filter/cursor.
         // Production always uses SQL store; this path is for trait-only test doubles.
         let mut mems = self.store.list_active(user_id, options.limit).await?;
-        if let Some(mt) = options.memory_type.map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some(mt) = memory_type {
             mems.retain(|m| m.memory_type.to_string() == mt);
         }
-        if let Some(session_id) = options.session_id.map(str::trim).filter(|s| !s.is_empty()) {
-            mems.retain(|m| m.session_id.as_deref() == Some(session_id));
+        if let Some(sid_val) = session_id {
+            mems.retain(|m| m.session_id.as_deref() == Some(sid_val));
         }
-        if let Some(tt) = options.trust_tier.map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some(tt) = trust_tier {
             mems.retain(|m| m.trust_tier.to_string() == tt);
         }
-        if let Some(sid) = options.subject_id.map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some(sid) = subject_id {
             mems.retain(|m| m.subject_id.as_deref() == Some(sid));
         }
-        if let Some(cursor_id) = options.cursor {
+        if let Some(cursor_id) = cursor {
             mems.retain(|m| m.memory_id.as_str() < cursor_id);
         }
         Ok(mems)
