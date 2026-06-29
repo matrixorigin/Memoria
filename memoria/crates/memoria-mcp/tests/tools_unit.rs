@@ -157,6 +157,26 @@ async fn test_tool_memory_store() {
 }
 
 #[tokio::test]
+async fn test_tool_memory_store_rejects_empty_content() {
+    let svc = make_service();
+    for args in [json!({}), json!({"content": ""}), json!({"content": "   "})] {
+        let result = memoria_mcp::tools::call("memory_store", args, &svc, "u1")
+            .await
+            .unwrap();
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("content is required"),
+            "unexpected response: {text}"
+        );
+    }
+    assert!(
+        svc.list_active("u1", 10).await.unwrap().is_empty(),
+        "empty content must not create memories"
+    );
+    println!("✅ tool memory_store rejects empty content");
+}
+
+#[tokio::test]
 async fn test_tool_memory_retrieve_empty() {
     let svc = make_service();
     let result = memoria_mcp::tools::call(
@@ -170,6 +190,38 @@ async fn test_tool_memory_retrieve_empty() {
     let text = result["content"][0]["text"].as_str().unwrap();
     assert!(text.contains("No relevant memories"));
     println!("✅ tool memory_retrieve empty: {text}");
+}
+
+#[tokio::test]
+async fn test_tool_memory_retrieve_rejects_missing_query() {
+    let svc = make_service();
+    memoria_mcp::tools::call(
+        "memory_store",
+        json!({"content": "rust programming"}),
+        &svc,
+        "u1",
+    )
+    .await
+    .unwrap();
+
+    for (tool, args) in [
+        ("memory_retrieve", json!({})),
+        ("memory_retrieve", json!({"query": ""})),
+        ("memory_retrieve", json!({"query": "   "})),
+        ("memory_search", json!({})),
+        ("memory_search", json!({"query": ""})),
+        ("memory_search", json!({"query": "   "})),
+    ] {
+        let result = memoria_mcp::tools::call(tool, args, &svc, "u1")
+            .await
+            .unwrap();
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("query is required"),
+            "{tool} unexpected response: {text}"
+        );
+    }
+    println!("✅ tool memory_retrieve/search reject missing query");
 }
 
 #[tokio::test]

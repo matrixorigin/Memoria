@@ -94,6 +94,23 @@ fn branch_arg(args: &Value) -> Option<&str> {
         .filter(|branch| !branch.is_empty())
 }
 
+fn parse_required_str(args: &Value, key: &str, err: &'static str) -> Result<String, &'static str> {
+    let raw = args[key].as_str().unwrap_or("");
+    if raw.trim().is_empty() {
+        Err(err)
+    } else {
+        Ok(raw.to_string())
+    }
+}
+
+fn parse_store_content(args: &Value) -> Result<String, &'static str> {
+    parse_required_str(args, "content", "content is required")
+}
+
+fn parse_retrieve_query(args: &Value) -> Result<String, &'static str> {
+    parse_required_str(args, "query", "query is required")
+}
+
 enum ToolCallName {
     MemoryStore,
     MemoryRetrieve,
@@ -358,7 +375,10 @@ pub async fn call(
     };
     match tool {
         ToolCallName::MemoryStore => {
-            let content = args["content"].as_str().unwrap_or("").to_string();
+            let content = match parse_store_content(&args) {
+                Ok(content) => content,
+                Err(msg) => return Ok(mcp_text(msg)),
+            };
             let memory_type = args["memory_type"].as_str().unwrap_or("semantic");
             let session_id = args["session_id"].as_str().map(String::from);
             let trust_tier = args["trust_tier"]
@@ -447,7 +467,10 @@ pub async fn call(
         }
 
         ToolCallName::MemoryRetrieve | ToolCallName::MemorySearch => {
-            let query = args["query"].as_str().unwrap_or("").to_string();
+            let query = match parse_retrieve_query(&args) {
+                Ok(query) => query,
+                Err(msg) => return Ok(mcp_text(msg)),
+            };
             let top_k = if matches!(tool, ToolCallName::MemorySearch) {
                 args["top_k"].as_i64().unwrap_or(10)
             } else {
@@ -511,10 +534,10 @@ pub async fn call(
         }
 
         ToolCallName::MemoryCorrect => {
-            let new_content = args["new_content"].as_str().unwrap_or("");
-            if new_content.is_empty() {
-                return Ok(mcp_text("new_content is required"));
-            }
+            let new_content = match parse_required_str(&args, "new_content", "new_content is required") {
+                Ok(s) => s,
+                Err(msg) => return Ok(mcp_text(msg)),
+            };
             let memory_id = args["memory_id"].as_str().unwrap_or("");
             let query = args["query"].as_str().unwrap_or("");
 
@@ -541,7 +564,7 @@ pub async fn call(
             };
 
             let m = service
-                .correct_on_branch(user_id, branch_arg(&args), &old_mid, new_content)
+                .correct_on_branch(user_id, branch_arg(&args), &old_mid, &new_content)
                 .await?;
 
             Ok(mcp_text(&format!(
@@ -1435,6 +1458,64 @@ pub fn entity_extract_prompt(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_required_str_rejects_missing_and_blank() {
+        for val in [json!({}), json!({"k": ""}), json!({"k": "   \t\n"})] {
+            assert!(parse_required_str(&val, "k", "k is required").is_err());
+        }
+    }
+
+    #[test]
+    fn parse_required_str_preserves_whitespace_when_valid() {
+        assert_eq!(
+            parse_required_str(&json!({"k": "  hello  "}), "k", "k is required").unwrap(),
+            "  hello  "
+        );
+    }
+
+    #[test]
+    fn parse_store_content_rejects_missing_and_blank() {
+        assert_eq!(parse_store_content(&json!({})), Err("content is required"));
+        assert_eq!(
+            parse_store_content(&json!({"content": ""})),
+            Err("content is required")
+        );
+        assert_eq!(
+            parse_store_content(&json!({"content": "   \t\n"})),
+            Err("content is required")
+        );
+    }
+
+    #[test]
+    fn parse_retrieve_query_rejects_missing_and_blank() {
+        assert_eq!(parse_retrieve_query(&json!({})), Err("query is required"));
+        assert_eq!(
+            parse_retrieve_query(&json!({"query": ""})),
+            Err("query is required")
+        );
+        assert_eq!(
+            parse_retrieve_query(&json!({"query": "   \t\n"})),
+            Err("query is required")
+        );
+    }
+
+    #[test]
+    fn parse_correct_new_content_rejects_blank() {
+        // memory_correct now uses parse_required_str — verify whitespace is rejected
+        assert_eq!(
+            parse_required_str(&json!({"new_content": ""}), "new_content", "new_content is required"),
+            Err("new_content is required")
+        );
+        assert_eq!(
+            parse_required_str(&json!({"new_content": "   "}), "new_content", "new_content is required"),
+            Err("new_content is required")
+        );
+        assert_eq!(
+            parse_required_str(&json!({"new_content": "ok"}), "new_content", "new_content is required").unwrap(),
+            "ok"
+        );
+    }
 
     #[test]
     fn entity_extract_prompt_truncates_at_char_boundary() {

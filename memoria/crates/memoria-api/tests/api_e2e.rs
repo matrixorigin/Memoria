@@ -8704,6 +8704,116 @@ async fn test_mcp_tools_call_memory_store() {
 }
 
 #[tokio::test]
+async fn test_mcp_memory_store_rejects_empty_content() {
+    let (base, client, _server) = spawn_server().await;
+    let uid = uid();
+
+    for (id, args) in [
+        (4, json!({})),
+        (5, json!({"content": ""})),
+        (6, json!({"content": "   \t"})),
+    ] {
+        let resp = mcp_post_with_headers(
+            &client,
+            &base,
+            json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "tools/call",
+                "params": {
+                    "name": "memory_store",
+                    "arguments": args
+                }
+            }),
+            &[("X-User-Id", uid.as_str())],
+        )
+        .await;
+
+        assert_eq!(resp["jsonrpc"], "2.0");
+        assert_eq!(resp["id"], id);
+        assert!(
+            resp["error"].is_null(),
+            "validation should return tool text, not RPC error: {}",
+            resp["error"]
+        );
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap_or("");
+        assert!(
+            text.contains("content is required"),
+            "unexpected response for args={args}: {text}"
+        );
+    }
+
+    let list = client
+        .get(format!("{base}/v1/memories"))
+        .header("X-User-Id", &uid)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(list.status(), 200);
+    assert!(
+        list.json::<Value>().await.unwrap()["items"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "empty MCP store must not create memories"
+    );
+    println!("✅ POST /mcp memory_store rejects empty content");
+}
+
+#[tokio::test]
+async fn test_mcp_memory_retrieve_and_search_reject_missing_query() {
+    let (base, client, _server) = spawn_server().await;
+    let uid = uid();
+
+    client
+        .post(format!("{base}/v1/memories"))
+        .header("X-User-Id", &uid)
+        .json(&json!({"content": "seed memory for query validation", "memory_type": "semantic"}))
+        .send()
+        .await
+        .unwrap();
+
+    for (id, tool, args) in [
+        (7, "memory_retrieve", json!({})),
+        (8, "memory_retrieve", json!({"query": ""})),
+        (9, "memory_retrieve", json!({"query": "   \t"})),
+        (10, "memory_search", json!({})),
+        (11, "memory_search", json!({"query": ""})),
+        (12, "memory_search", json!({"query": "   \t"})),
+    ] {
+        let resp = mcp_post_with_headers(
+            &client,
+            &base,
+            json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "tools/call",
+                "params": {
+                    "name": tool,
+                    "arguments": args
+                }
+            }),
+            &[("X-User-Id", uid.as_str())],
+        )
+        .await;
+
+        assert_eq!(resp["jsonrpc"], "2.0");
+        assert_eq!(resp["id"], id);
+        assert!(
+            resp["error"].is_null(),
+            "validation should return tool text, not RPC error: {}",
+            resp["error"]
+        );
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap_or("");
+        assert!(
+            text.contains("query is required"),
+            "{tool} unexpected response for args={args}: {text}"
+        );
+    }
+    println!("✅ POST /mcp memory_retrieve/search reject missing query");
+}
+
+#[tokio::test]
 async fn test_mcp_memory_retrieve_session_scope_end_to_end() {
     let (base, client, _server) =
         spawn_server_with_custom_embedder_and_pool(Arc::new(SessionScopeTestEmbedder), test_dim())
