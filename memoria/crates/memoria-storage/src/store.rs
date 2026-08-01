@@ -5054,6 +5054,32 @@ impl SqlMemoryStore {
         Ok(())
     }
 
+    /// Refresh only the extra_metadata JSON of an existing memory. Used by the single-store
+    /// dedup path: when a same-content near-duplicate already exists, we update the survivor's
+    /// metadata (so the caller's newer scene/agent isn't silently dropped) instead of creating
+    /// a phantom, never-inserted record.
+    pub async fn update_extra_metadata(
+        &self,
+        table: &str,
+        memory_id: &str,
+        extra_metadata: &std::collections::HashMap<String, serde_json::Value>,
+    ) -> Result<(), MemoriaError> {
+        let table = self.t(table);
+        let json = serde_json::to_string(extra_metadata)?;
+        // is_active = 1：与读取侧（get_from）「幸存者必须 active」契约对齐——若该记忆在去重
+        // 检查与本次更新之间被竞态置为 inactive，则不改动已失效记录（UPDATE 命中 0 行，
+        // 上层 get_from 返回 None 后走 race-insert）。
+        sqlx::query(&format!(
+            "UPDATE {table} SET extra_metadata = ?, updated_at = NOW() WHERE memory_id = ? AND is_active = 1"
+        ))
+        .bind(json)
+        .bind(memory_id)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
     #[tracing::instrument(skip(self, memory), fields(memory_id = %memory.memory_id))]
     pub async fn insert_into(&self, table: &str, memory: &Memory) -> Result<(), MemoriaError> {
         let now = Utc::now().naive_utc();
@@ -5200,6 +5226,9 @@ impl SqlMemoryStore {
     /// Lightweight list for API responses — skips embedding, source_event_ids,
     /// extra_metadata to reduce I/O and deserialization cost.
     #[allow(clippy::too_many_arguments)]
+    /// "Lite" list: skips the heavy `embedding` and `source_event_ids` columns for performance,
+    /// but DOES select `extra_metadata` (small JSON — needed by callers for scene/agent display),
+    /// mapped via `row_to_memory_lite`. Do not assume extra_metadata is omitted here.
     pub async fn list_active_lite(
         &self,
         table: &str,
@@ -5237,7 +5266,8 @@ impl SqlMemoryStore {
         let sql = format!(
             "SELECT memory_id, user_id, author_id, subject_id, memory_type, content, \
              session_id, is_active, superseded_by, trust_tier, \
-             initial_confidence, observed_at, created_at, updated_at \
+             initial_confidence, observed_at, created_at, updated_at, \
+             CAST(extra_metadata AS CHAR) AS extra_meta \
              FROM {table} WHERE memory_id IN ({inner}) \
              ORDER BY memory_id DESC"
         );
@@ -6326,7 +6356,17 @@ fn row_to_memory(row: &sqlx::mysql::MySqlRow) -> Result<Memory, MemoriaError> {
     Ok(m)
 }
 
-/// Lightweight row mapper — skips embedding, source_event_ids, extra_metadata.
+/// Lightweight row mapper — skips embedding and source_event_ids, but DOES read
+/// extra_metadata (small JSON; needed by list callers for scene/agent display).
+/// Requires the query to SELECT `CAST(extra_metadata AS CHAR) AS extra_meta`.
 fn row_to_memory_lite(row: &sqlx::mysql::MySqlRow) -> Result<Memory, MemoriaError> {
-    row_to_memory_base(row)
+    let mut m = row_to_memory_base(row)?;
+    m.extra_metadata = {
+        let s: Option<String> = row.try_get("extra_meta").map_err(db_err)?;
+        // MO#23859: we store "{}" instead of NULL; treat empty object as None.
+        s.filter(|v| v != "{}")
+            .map(|v| serde_json::from_str(&v))
+            .transpose()?
+    };
+    Ok(m)
 }

@@ -94,6 +94,45 @@ fn branch_arg(args: &Value) -> Option<&str> {
         .filter(|branch| !branch.is_empty())
 }
 
+fn parse_required_str(args: &Value, key: &str, err: &'static str) -> Result<String, &'static str> {
+    let raw = args[key].as_str().unwrap_or("");
+    if raw.trim().is_empty() {
+        Err(err)
+    } else {
+        Ok(raw.to_string())
+    }
+}
+
+fn parse_store_content(args: &Value) -> Result<String, &'static str> {
+    parse_required_str(args, "content", "content is required")
+}
+
+/// 校验各工具的必填非空字符串参数。embedded 分发在各 handler 内部已隐式校验（parse_required_str），
+/// 但 remote 模式直接拼 REST payload 会绕过校验——remote::call 前置调用本函数以保持一致。
+pub fn validate_tool_args(name: &str, args: &Value) -> Result<(), &'static str> {
+    // extra_metadata 若存在必须是 object（与 REST StoreRequest 一致）；非 object 明确拒绝，
+    // 不能静默丢弃当作缺失。
+    if let Some(v) = args.get("extra_metadata") {
+        if !v.is_null() && !v.is_object() {
+            return Err("extra_metadata must be an object");
+        }
+    }
+    match name {
+        "memory_store" => parse_required_str(args, "content", "content is required").map(|_| ()),
+        "memory_retrieve" | "memory_search" => {
+            parse_required_str(args, "query", "query is required").map(|_| ())
+        }
+        "memory_correct" => {
+            parse_required_str(args, "new_content", "new_content is required").map(|_| ())
+        }
+        _ => Ok(()),
+    }
+}
+
+fn parse_retrieve_query(args: &Value) -> Result<String, &'static str> {
+    parse_required_str(args, "query", "query is required")
+}
+
 enum ToolCallName {
     MemoryStore,
     MemoryRetrieve,
@@ -156,6 +195,7 @@ pub fn list() -> Value {
                     "content": {"type": "string"},
                     "memory_type": {"type": "string", "default": "semantic"},
                     "session_id": {"type": "string"},
+                    "extra_metadata": {"type": "object", "description": "Optional business metadata (e.g. scene, agent). Persisted with the memory and returned verbatim on read. Memoria itself does not score by it; downstream consumers may use it for their own retrieval-time ranking."},
                     "subject_id": {"type": "string", "description": "Stable business ID of the memory subject (e.g. end-user ID). Set by the integration layer; optional."},
                     "branch": {"type": "string", "description": "Optional branch to read/write without changing the active checkout"},
                     "trust_tier": {
@@ -335,6 +375,11 @@ pub async fn call(
     user_id: &str,
 ) -> Result<Value> {
     tracing::debug!(tool = name, user_id, "MCP tool call");
+    // 与 remote 模式共享的参数校验（必填非空 + extra_metadata 类型）。失败返回软 tool result
+    // 文本（error=null），与既有 embedded 错误契约一致。
+    if let Err(e) = validate_tool_args(name, &args) {
+        return Ok(mcp_text(e));
+    }
     let tool = match name {
         "memory_store" => ToolCallName::MemoryStore,
         "memory_retrieve" => ToolCallName::MemoryRetrieve,
@@ -358,7 +403,10 @@ pub async fn call(
     };
     match tool {
         ToolCallName::MemoryStore => {
-            let content = args["content"].as_str().unwrap_or("").to_string();
+            let content = match parse_store_content(&args) {
+                Ok(content) => content,
+                Err(msg) => return Ok(mcp_text(msg)),
+            };
             let memory_type = args["memory_type"].as_str().unwrap_or("semantic");
             let session_id = args["session_id"].as_str().map(String::from);
             let trust_tier = args["trust_tier"]
@@ -372,6 +420,15 @@ pub async fn call(
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .map(String::from);
+            let extra_metadata = args
+                .get("extra_metadata")
+                .filter(|v| v.is_object())
+                .and_then(|v| {
+                    serde_json::from_value::<std::collections::HashMap<String, serde_json::Value>>(
+                        v.clone(),
+                    )
+                    .ok()
+                });
             let m = match service
                 .store_memory_on_branch(
                     user_id,
@@ -384,6 +441,7 @@ pub async fn call(
                     None,
                     None,
                     subject_id,
+                    extra_metadata,
                 )
                 .await
             {
@@ -447,7 +505,10 @@ pub async fn call(
         }
 
         ToolCallName::MemoryRetrieve | ToolCallName::MemorySearch => {
-            let query = args["query"].as_str().unwrap_or("").to_string();
+            let query = match parse_retrieve_query(&args) {
+                Ok(query) => query,
+                Err(msg) => return Ok(mcp_text(msg)),
+            };
             let top_k = if matches!(tool, ToolCallName::MemorySearch) {
                 args["top_k"].as_i64().unwrap_or(10)
             } else {
@@ -481,7 +542,7 @@ pub async fn call(
                 }
                 let text = results
                     .iter()
-                    .map(|m| format!("[{}] ({}) {}", m.memory_id, m.memory_type, m.content))
+                    .map(|m| format!("[{}] ({}) {}{}", m.memory_id, m.memory_type, m.content, m.extra_metadata.as_ref().filter(|md| !md.is_empty()).map(|md| format!(" | metadata: {}", serde_json::to_string(md).unwrap_or_default())).unwrap_or_default()))
                     .collect::<Vec<_>>()
                     .join("\n");
                 let explain_json = serde_json::to_string_pretty(&stats).unwrap_or_default();
@@ -503,7 +564,7 @@ pub async fn call(
                 }
                 let text = results
                     .iter()
-                    .map(|m| format!("[{}] ({}) {}", m.memory_id, m.memory_type, m.content))
+                    .map(|m| format!("[{}] ({}) {}{}", m.memory_id, m.memory_type, m.content, m.extra_metadata.as_ref().filter(|md| !md.is_empty()).map(|md| format!(" | metadata: {}", serde_json::to_string(md).unwrap_or_default())).unwrap_or_default()))
                     .collect::<Vec<_>>()
                     .join("\n");
                 Ok(mcp_text(&text))
@@ -511,10 +572,10 @@ pub async fn call(
         }
 
         ToolCallName::MemoryCorrect => {
-            let new_content = args["new_content"].as_str().unwrap_or("");
-            if new_content.is_empty() {
-                return Ok(mcp_text("new_content is required"));
-            }
+            let new_content = match parse_required_str(&args, "new_content", "new_content is required") {
+                Ok(s) => s,
+                Err(msg) => return Ok(mcp_text(msg)),
+            };
             let memory_id = args["memory_id"].as_str().unwrap_or("");
             let query = args["query"].as_str().unwrap_or("");
 
@@ -541,7 +602,7 @@ pub async fn call(
             };
 
             let m = service
-                .correct_on_branch(user_id, branch_arg(&args), &old_mid, new_content)
+                .correct_on_branch(user_id, branch_arg(&args), &old_mid, &new_content)
                 .await?;
 
             Ok(mcp_text(&format!(
@@ -652,7 +713,7 @@ pub async fn call(
             }
             let text = memories
                 .iter()
-                .map(|m| format!("[{}] ({}) {}", m.memory_id, m.memory_type, m.content))
+                .map(|m| format!("[{}] ({}) {}{}", m.memory_id, m.memory_type, m.content, m.extra_metadata.as_ref().filter(|md| !md.is_empty()).map(|md| format!(" | metadata: {}", serde_json::to_string(md).unwrap_or_default())).unwrap_or_default()))
                 .collect::<Vec<_>>()
                 .join("\n");
             Ok(mcp_text(&text))
@@ -1435,6 +1496,64 @@ pub fn entity_extract_prompt(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_required_str_rejects_missing_and_blank() {
+        for val in [json!({}), json!({"k": ""}), json!({"k": "   \t\n"})] {
+            assert!(parse_required_str(&val, "k", "k is required").is_err());
+        }
+    }
+
+    #[test]
+    fn parse_required_str_preserves_whitespace_when_valid() {
+        assert_eq!(
+            parse_required_str(&json!({"k": "  hello  "}), "k", "k is required").unwrap(),
+            "  hello  "
+        );
+    }
+
+    #[test]
+    fn parse_store_content_rejects_missing_and_blank() {
+        assert_eq!(parse_store_content(&json!({})), Err("content is required"));
+        assert_eq!(
+            parse_store_content(&json!({"content": ""})),
+            Err("content is required")
+        );
+        assert_eq!(
+            parse_store_content(&json!({"content": "   \t\n"})),
+            Err("content is required")
+        );
+    }
+
+    #[test]
+    fn parse_retrieve_query_rejects_missing_and_blank() {
+        assert_eq!(parse_retrieve_query(&json!({})), Err("query is required"));
+        assert_eq!(
+            parse_retrieve_query(&json!({"query": ""})),
+            Err("query is required")
+        );
+        assert_eq!(
+            parse_retrieve_query(&json!({"query": "   \t\n"})),
+            Err("query is required")
+        );
+    }
+
+    #[test]
+    fn parse_correct_new_content_rejects_blank() {
+        // memory_correct now uses parse_required_str — verify whitespace is rejected
+        assert_eq!(
+            parse_required_str(&json!({"new_content": ""}), "new_content", "new_content is required"),
+            Err("new_content is required")
+        );
+        assert_eq!(
+            parse_required_str(&json!({"new_content": "   "}), "new_content", "new_content is required"),
+            Err("new_content is required")
+        );
+        assert_eq!(
+            parse_required_str(&json!({"new_content": "ok"}), "new_content", "new_content is required").unwrap(),
+            "ok"
+        );
+    }
 
     #[test]
     fn entity_extract_prompt_truncates_at_char_boundary() {

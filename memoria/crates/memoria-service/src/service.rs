@@ -495,13 +495,14 @@ impl EditLogBuffer {
 }
 
 /// Single item for batch memory storage.
-/// Tuple fields: `(content, memory_type, session_id, trust_tier, subject_id)`.
+/// Tuple fields: `(content, memory_type, session_id, trust_tier, subject_id, extra_metadata)`.
 pub type BatchStoreItem = (
     String,
     MemoryType,
     Option<String>,
     Option<TrustTier>,
     Option<String>,
+    Option<std::collections::HashMap<String, serde_json::Value>>,
 );
 
 pub struct MemoryService {
@@ -1215,6 +1216,7 @@ impl MemoryService {
             initial_confidence,
             author_id,
             subject_id,
+            None,
         )
         .await
     }
@@ -1233,6 +1235,7 @@ impl MemoryService {
         initial_confidence: Option<f64>,
         author_id: Option<String>,
         subject_id: Option<String>,
+        extra_metadata: Option<std::collections::HashMap<String, serde_json::Value>>,
     ) -> Result<Memory, MemoriaError> {
         let subject_id = normalize_opt_string(subject_id);
         if let Some(ref sid) = subject_id {
@@ -1253,6 +1256,9 @@ impl MemoryService {
         }
         let content = sensitivity.redacted_content.as_deref().unwrap_or(content);
 
+        // 保留 extra_metadata 的三态语义（None=不更新 / 非空=替换 / {}=清空）。不在入口把 {}
+        // 归一为 None——否则去重同内容路径无法用 {} 清空旧 metadata。响应/读取一致性改由
+        // MemoryResponse 与读取侧的「"{}" → None」约定统一处理。
         let effective_tier = trust_tier.unwrap_or(TrustTier::T1Verified);
         let embedding = self.embed(content).await?;
         let t_embed = t0.elapsed();
@@ -1274,7 +1280,7 @@ impl MemoryService {
             observed_at: Some(observed_at.unwrap_or_else(Utc::now)),
             created_at: None,
             updated_at: None,
-            extra_metadata: None,
+            extra_metadata,
             trust_tier: effective_tier,
             retrieval_score: None,
         };
@@ -1347,7 +1353,15 @@ impl MemoryService {
                         };
                         return Ok(memory);
                     }
-                    // Same content — skip storing duplicate
+                    // Same content — a near-duplicate already exists. Do NOT create/return a
+                    // phantom, never-inserted record. Refresh the survivor's extra_metadata with
+                    // the caller's new metadata (so an updated scene/agent isn't silently dropped),
+                    // write an audit edit-log entry, then return the ACTUAL persisted record
+                    // (real id + real author/session/trust/timestamps), not the new in-memory object.
+                    if let Some(ref meta) = memory.extra_metadata {
+                        sql.update_extra_metadata(&table, &old_id, meta).await?;
+                    }
+                    let existing = sql.get_from(&table, &old_id).await?;
                     if t0.elapsed().as_secs() >= 1 {
                         tracing::warn!(
                             embed_ms = t_embed.as_millis() as u64,
@@ -1356,7 +1370,53 @@ impl MemoryService {
                             "store_memory slow (skip dup)"
                         );
                     };
-                    return Ok(memory);
+                    match existing {
+                        Some(m) => {
+                            // 只有确认幸存者仍 active 且是本次返回的记录时，才记 metadata 刷新审计。
+                            // 若竞态下幸存者已失效（update 命中 0 行、get_from 返回 None），会走下方
+                            // race-insert，此时记 update_metadata 会误导（那次更新并未生效/未返回）。
+                            if memory.extra_metadata.is_some() {
+                                // 用**实际读到的** m.extra_metadata（而非请求 meta）记审计：并发下
+                                // 若本请求的更新被他人覆盖，get_from 读到的才是返回值,审计与响应保持一致。
+                                // （完整的“每请求返回自己的更新”需 CAS/事务，属更大改动，此处先对齐审计与响应。）
+                                let payload = serde_json::json!({"memory_id": &old_id, "extra_metadata": m.extra_metadata}).to_string();
+                                self.send_edit_log(
+                                    user_id,
+                                    "update_metadata",
+                                    Some(&old_id),
+                                    Some(&payload),
+                                    "store_memory:dedup_metadata_refresh",
+                                    None,
+                                );
+                            }
+                            return Ok(m);
+                        }
+                        None => {
+                            // Race: the survivor was deactivated between the dedup check and the
+                            // fetch, so it is no longer a duplicate. Insert the new memory normally
+                            // and return the real, persisted record (never a phantom id).
+                            sql.insert_into(&table, &memory).await?;
+                            let payload = serde_json::json!({"content": &memory.content, "type": memory.memory_type.to_string()}).to_string();
+                            self.send_edit_log(
+                                user_id,
+                                "inject",
+                                Some(&memory.memory_id),
+                                Some(&payload),
+                                "store_memory:dedup_race_insert",
+                                None,
+                            );
+                            // 与正常插入路径一致的插入后副作用：统计事件 + 实体抽取入队，
+                            // 否则该记忆不进实体图、活跃记忆指标偏低。
+                            self.report(StatsEvent::MemoryStored {
+                                user_id: user_id.to_string(),
+                                memory_type: memory.memory_type.to_string(),
+                                trust_tier: memory.trust_tier.to_string(),
+                            });
+                            self.enqueue_entity_extraction(user_id, &memory.memory_id, &memory.content)
+                                .await;
+                            return Ok(memory);
+                        }
+                    }
                 }
                 let t_dedup = t1.elapsed();
                 let t2 = std::time::Instant::now();
@@ -2547,7 +2607,7 @@ impl MemoryService {
         // Sensitivity check + collect contents
         let mut contents = Vec::with_capacity(items.len());
         let mut checked_items = Vec::with_capacity(items.len());
-        for (content, mt, session_id, tier, subject_id) in items {
+        for (content, mt, session_id, tier, subject_id, extra_metadata) in items {
             let subject_id = normalize_opt_string(subject_id);
             if let Some(ref sid) = subject_id {
                 if sid.len() > 128 {
@@ -2565,14 +2625,14 @@ impl MemoryService {
             }
             let final_content = sensitivity.redacted_content.unwrap_or(content);
             contents.push(final_content.clone());
-            checked_items.push((final_content, mt, session_id, tier, subject_id));
+            checked_items.push((final_content, mt, session_id, tier, subject_id, extra_metadata));
         }
 
         // Batch embed
         let embeddings = self.embed_batch(&contents).await?;
 
         let mut results = Vec::with_capacity(checked_items.len());
-        for (i, (content, mt, session_id, tier, subject_id)) in
+        for (i, (content, mt, session_id, tier, subject_id, extra_metadata)) in
             checked_items.into_iter().enumerate()
         {
             let effective_tier = tier.unwrap_or(TrustTier::T1Verified);
@@ -2594,7 +2654,7 @@ impl MemoryService {
                 observed_at: Some(Utc::now()),
                 created_at: None,
                 updated_at: None,
-                extra_metadata: None,
+                extra_metadata,
                 trust_tier: effective_tier,
                 retrieval_score: None,
             };
