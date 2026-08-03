@@ -220,7 +220,7 @@ pub async fn store_memory(
     };
     let m = state
         .service
-        .store_memory_on_branch(
+        .store_memory_with_metadata_on_branch(
             auth.scope_id(),
             branch_param(req.branch.as_deref()),
             &req.content,
@@ -231,6 +231,7 @@ pub async fn store_memory(
             req.initial_confidence,
             author,
             req.subject_id,
+            req.extra_metadata,
         )
         .await
         .map_err(|e| {
@@ -284,16 +285,24 @@ pub async fn batch_store(
                 .map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e));
             // item-level subject_id takes priority; fall back to batch-level
             let subject_id = r.subject_id.or_else(|| batch_subject_id.clone());
-            Ok((r.content, mt, tier, r.session_id, top_branch.clone(), subject_id))
+            Ok((
+                r.content,
+                mt,
+                tier,
+                r.session_id,
+                top_branch.clone(),
+                subject_id,
+                r.extra_metadata,
+            ))
         })
         .collect::<Result<Vec<_>, _>>()?;
 
     // Validate all types upfront
     let mut validated = Vec::with_capacity(items.len());
-    for (content, mt_result, tier_result, session_id, branch, subject_id) in items {
+    for (content, mt_result, tier_result, session_id, branch, subject_id, extra_metadata) in items {
         let mt = mt_result?;
         let tier = tier_result?;
-        validated.push((content, mt, session_id, tier, branch, subject_id));
+        validated.push((content, mt, session_id, tier, branch, subject_id, extra_metadata));
     }
 
     let author = if auth.group_id.is_some() {
@@ -303,13 +312,13 @@ pub async fn batch_store(
     };
     let batch_items = validated
         .into_iter()
-        .map(|(content, mt, session_id, tier, _branch, subject_id)| {
-            (content, mt, session_id, tier, subject_id)
+        .map(|(content, mt, session_id, tier, _branch, subject_id, extra_metadata)| {
+            (content, mt, session_id, tier, subject_id, extra_metadata)
         })
         .collect();
     let results = state
         .service
-        .store_batch_on_branch(
+        .store_batch_with_metadata_on_branch(
             auth.scope_id(),
             branch_param(top_branch.as_deref()),
             batch_items,

@@ -120,6 +120,12 @@ impl RemoteClient {
     }
 
     pub async fn call(&self, name: &str, args: Value) -> Result<Value> {
+        // remote 模式直接拼 REST payload，会绕过 embedded handler 的必填校验；这里前置调用
+        // 与 embedded 共享的校验。失败返回**软** tool result 文本（error=null），与 embedded
+        // 契约一致（不再转成 JSON-RPC -32000）。
+        if let Err(e) = crate::tools::validate_tool_args(name, &args) {
+            return Ok(Self::mcp_text(e));
+        }
         match name {
             "memory_store" => {
                 let mut payload = json!({
@@ -136,6 +142,9 @@ impl RemoteClient {
                     .filter(|s| !s.is_empty())
                 {
                     payload["subject_id"] = json!(sid);
+                }
+                if args.get("extra_metadata").map(Value::is_object).unwrap_or(false) {
+                    payload["extra_metadata"] = args["extra_metadata"].clone();
                 }
                 let r = self
                     .client
@@ -200,11 +209,17 @@ impl RemoteClient {
                 let text = mems
                     .iter()
                     .map(|m| {
+                        let meta = m
+                            .get("extra_metadata")
+                            .filter(|v| v.is_object())
+                            .map(|v| format!(" | metadata: {v}"))
+                            .unwrap_or_default();
                         format!(
-                            "[{}] ({}) {}",
+                            "[{}] ({}) {}{}",
                             m["memory_id"].as_str().unwrap_or(""),
                             m["memory_type"].as_str().unwrap_or(""),
-                            m["content"].as_str().unwrap_or("")
+                            m["content"].as_str().unwrap_or(""),
+                            meta
                         )
                     })
                     .collect::<Vec<_>>()
@@ -389,11 +404,17 @@ impl RemoteClient {
                 let text = items
                     .iter()
                     .map(|m| {
+                        let meta = m
+                            .get("extra_metadata")
+                            .filter(|v| v.is_object())
+                            .map(|v| format!(" | metadata: {v}"))
+                            .unwrap_or_default();
                         format!(
-                            "[{}] ({}) {}",
+                            "[{}] ({}) {}{}",
                             m["memory_id"].as_str().unwrap_or(""),
                             m["memory_type"].as_str().unwrap_or(""),
-                            m["content"].as_str().unwrap_or("")
+                            m["content"].as_str().unwrap_or(""),
+                            meta
                         )
                     })
                     .collect::<Vec<_>>()

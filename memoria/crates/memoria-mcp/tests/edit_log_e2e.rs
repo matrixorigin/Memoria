@@ -491,6 +491,7 @@ async fn test_store_batch_all_fields() {
             None,
             None,
             None,
+            None,
         ),
         (
             "batch beta".to_string(),
@@ -498,9 +499,13 @@ async fn test_store_batch_all_fields() {
             None,
             None,
             None,
+            None,
         ),
     ];
-    let results = svc.store_batch(&uid, items, None).await.unwrap();
+    let results = svc
+        .store_batch_with_metadata_on_branch(&uid, None, items, None)
+        .await
+        .unwrap();
     assert_eq!(results.len(), 2);
     svc.flush_edit_log().await;
 
@@ -1058,8 +1063,9 @@ async fn test_edit_id_globally_unique() {
     )
     .await;
     // store_batch
-    svc.store_batch(
+    svc.store_batch_with_metadata_on_branch(
         &uid,
+        None,
         vec![
             (
                 "batch1".into(),
@@ -1067,10 +1073,12 @@ async fn test_edit_id_globally_unique() {
                 None,
                 None,
                 None,
+                None,
             ),
             (
                 "batch2".into(),
                 memoria_core::MemoryType::Semantic,
+                None,
                 None,
                 None,
                 None,

@@ -259,6 +259,141 @@ async fn test_api_store_and_list() {
     );
 }
 
+/// #224: metadata must survive every REST write/read path. This exercises the
+/// MatrixOne JSON binding and the lightweight list mapper as well as the full
+/// mappers used by get/retrieve/search.
+#[tokio::test]
+async fn test_api_extra_metadata_round_trip_and_dedup() {
+    let (base, client, _server) =
+        spawn_server_with_custom_embedder_and_pool(Arc::new(SessionScopeTestEmbedder), test_dim())
+            .await;
+    let user_id = uid();
+    let metadata = json!({"scene": "incident", "agent": "triage", "rank": 2});
+
+    let response = client
+        .post(format!("{base}/v1/memories"))
+        .header("X-User-Id", &user_id)
+        .json(&json!({
+            "content": "metadata round trip needle",
+            "memory_type": "semantic",
+            "extra_metadata": metadata,
+        }))
+        .send()
+        .await
+        .expect("store with metadata");
+    assert_eq!(response.status(), 201);
+    let stored: Value = response.json().await.unwrap();
+    let memory_id = stored["memory_id"].as_str().unwrap().to_string();
+    assert_eq!(stored["extra_metadata"], metadata);
+
+    // Same-content dedup returns the persisted survivor, not a phantom ID, and
+    // refreshes its metadata.
+    let updated_metadata = json!({"scene": "resolved", "agent": "review"});
+    let response = client
+        .post(format!("{base}/v1/memories"))
+        .header("X-User-Id", &user_id)
+        .json(&json!({
+            "content": "metadata round trip needle",
+            "memory_type": "semantic",
+            "extra_metadata": updated_metadata,
+        }))
+        .send()
+        .await
+        .expect("dedup metadata update");
+    assert_eq!(response.status(), 201);
+    let deduped: Value = response.json().await.unwrap();
+    assert_eq!(deduped["memory_id"], memory_id);
+    assert_eq!(deduped["extra_metadata"], updated_metadata);
+
+    let response = client
+        .post(format!("{base}/v1/memories/batch"))
+        .header("X-User-Id", &user_id)
+        .json(&json!({"memories": [{
+            "content": "batch metadata round trip",
+            "memory_type": "semantic",
+            "extra_metadata": {"source": "batch"}
+        }]}))
+        .send()
+        .await
+        .expect("batch store with metadata");
+    assert_eq!(response.status(), 201);
+    let batch: Value = response.json().await.unwrap();
+    assert_eq!(batch[0]["extra_metadata"], json!({"source": "batch"}));
+
+    let response = client
+        .get(format!("{base}/v1/memories"))
+        .header("X-User-Id", &user_id)
+        .send()
+        .await
+        .expect("list");
+    let list: Value = response.json().await.unwrap();
+    assert_eq!(
+        list["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["memory_id"] == memory_id)
+            .unwrap()["extra_metadata"],
+        updated_metadata
+    );
+
+    let response = client
+        .get(format!("{base}/v1/memories/{memory_id}"))
+        .header("X-User-Id", &user_id)
+        .send()
+        .await
+        .expect("get");
+    let got: Value = response.json().await.unwrap();
+    assert_eq!(got["extra_metadata"], updated_metadata);
+
+    for endpoint in ["retrieve", "search"] {
+        let response = client
+            .post(format!("{base}/v1/memories/{endpoint}"))
+            .header("X-User-Id", &user_id)
+            .json(&json!({"query": "metadata round trip needle", "top_k": 10}))
+            .send()
+            .await
+            .expect("retrieve/search");
+        assert_eq!(response.status(), 200);
+        let results: Value = response.json().await.unwrap();
+        assert_eq!(
+            results
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|item| item["memory_id"] == memory_id)
+                .unwrap()["extra_metadata"],
+            updated_metadata,
+            "{endpoint} must return metadata"
+        );
+    }
+
+    // `{}` is the explicit clear value but is normalized to an omitted response
+    // field, while scalars/arrays are rejected by StoreRequest deserialization.
+    let response = client
+        .post(format!("{base}/v1/memories"))
+        .header("X-User-Id", &user_id)
+        .json(&json!({"content": "empty metadata", "extra_metadata": {}}))
+        .send()
+        .await
+        .expect("store empty metadata");
+    assert_eq!(response.status(), 201);
+    assert!(response
+        .json::<Value>()
+        .await
+        .unwrap()
+        .get("extra_metadata")
+        .is_none());
+    let response = client
+        .post(format!("{base}/v1/memories"))
+        .header("X-User-Id", &user_id)
+        .json(&json!({"content": "bad metadata", "extra_metadata": ["not", "an", "object"]}))
+        .send()
+        .await
+        .expect("reject non-object metadata");
+    assert_eq!(response.status(), 422);
+}
+
 // ── 2b. list response is lightweight (no embedding) and respects limit ────────
 
 #[tokio::test]
@@ -313,7 +448,7 @@ async fn test_api_list_no_embedding_and_limit() {
         );
         assert!(
             item.get("extra_metadata").is_none(),
-            "must not contain extra_metadata"
+            "metadata is omitted when no metadata was stored"
         );
         // Must contain core fields
         assert!(item["memory_id"].as_str().is_some(), "memory_id required");
@@ -1893,6 +2028,39 @@ async fn test_remote_store_retrieve() {
         "got: {text}"
     );
     println!("✅ remote retrieve: {}", &text[..text.len().min(80)]);
+}
+
+#[tokio::test]
+async fn test_remote_store_metadata_round_trip() {
+    use memoria_mcp::remote::RemoteClient;
+
+    let (base, _, server) = spawn_api_for_remote().await;
+    let user_id = uid();
+    let remote = RemoteClient::new(&base, None, user_id.clone(), None);
+    remote
+        .call(
+            "memory_store",
+            json!({
+                "content": "remote metadata memory",
+                "extra_metadata": {"scene": "remote", "agent": "mcp"}
+            }),
+        )
+        .await
+        .expect("remote store");
+
+    let stored = server
+        .service()
+        .list_active(&user_id, 10)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|memory| memory.content == "remote metadata memory")
+        .expect("stored remote memory");
+    assert_eq!(
+        serde_json::to_value(stored.extra_metadata).unwrap(),
+        json!({"scene": "remote", "agent": "mcp"}),
+        "remote MCP must forward metadata to REST"
+    );
 }
 
 #[tokio::test]
@@ -8701,6 +8869,108 @@ async fn test_mcp_tools_call_memory_store() {
     let text = resp["result"]["content"][0]["text"].as_str().unwrap_or("");
     assert!(text.contains("Stored"), "expected 'Stored' in: {text}");
     println!("✅ POST /mcp tools/call memory_store: {text}");
+}
+
+#[tokio::test]
+async fn test_mcp_memory_store_rejects_empty_content() {
+    let (base, client, _server) = spawn_server().await;
+    let uid = uid();
+
+    for (id, args) in [
+        (4, json!({})),
+        (5, json!({"content": ""})),
+        (6, json!({"content": "   \t"})),
+    ] {
+        let resp = mcp_post_with_headers(
+            &client,
+            &base,
+            json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "tools/call",
+                "params": {
+                    "name": "memory_store",
+                    "arguments": args
+                }
+            }),
+            &[("X-User-Id", uid.as_str())],
+        )
+        .await;
+
+        assert_eq!(resp["jsonrpc"], "2.0");
+        assert_eq!(resp["id"], id);
+        assert!(
+            resp["error"].is_null(),
+            "validation should return tool text, not RPC error: {}",
+            resp["error"]
+        );
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap_or("");
+        assert!(
+            text.contains("content is required"),
+            "unexpected response for args={args}: {text}"
+        );
+    }
+
+    let list = client
+        .get(format!("{base}/v1/memories"))
+        .header("X-User-Id", &uid)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(list.status(), 200);
+    assert!(
+        list.json::<Value>().await.unwrap()["items"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "empty MCP store must not create memories"
+    );
+    println!("✅ POST /mcp memory_store rejects empty content");
+}
+
+#[tokio::test]
+async fn test_mcp_memory_retrieve_and_search_reject_missing_query() {
+    let (base, client, _server) = spawn_server().await;
+    let uid = uid();
+
+    for (id, tool, args) in [
+        (7, "memory_retrieve", json!({})),
+        (8, "memory_retrieve", json!({"query": ""})),
+        (9, "memory_retrieve", json!({"query": "   \t"})),
+        (10, "memory_search", json!({})),
+        (11, "memory_search", json!({"query": ""})),
+        (12, "memory_search", json!({"query": "   \t"})),
+    ] {
+        let resp = mcp_post_with_headers(
+            &client,
+            &base,
+            json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "tools/call",
+                "params": {
+                    "name": tool,
+                    "arguments": args
+                }
+            }),
+            &[("X-User-Id", uid.as_str())],
+        )
+        .await;
+
+        assert_eq!(resp["jsonrpc"], "2.0");
+        assert_eq!(resp["id"], id);
+        assert!(
+            resp["error"].is_null(),
+            "validation should return tool text, not RPC error: {}",
+            resp["error"]
+        );
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap_or("");
+        assert!(
+            text.contains("query is required"),
+            "{tool} unexpected response for args={args}: {text}"
+        );
+    }
+    println!("✅ POST /mcp memory_retrieve/search reject missing query");
 }
 
 #[tokio::test]

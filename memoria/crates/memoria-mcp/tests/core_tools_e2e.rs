@@ -123,6 +123,52 @@ async fn test_store_rejects_invalid_trust_tier() {
     println!("✅ invalid trust_tier rejected explicitly");
 }
 
+// ── 2b. memory_store: reject missing/blank content ───────────────────────────
+
+#[tokio::test]
+async fn test_store_rejects_empty_content() {
+    let (svc, uid, _ctx) = setup().await;
+    for args in [json!({}), json!({"content": ""}), json!({"content": "   \t"})] {
+        let r = call("memory_store", args, &svc, &uid).await;
+        assert!(
+            text(&r).contains("content is required"),
+            "unexpected response: {}",
+            text(&r)
+        );
+    }
+    assert!(
+        svc.list_active(&uid, 10).await.unwrap().is_empty(),
+        "empty content must not create memories"
+    );
+    println!("✅ store rejects empty content");
+}
+
+#[tokio::test]
+async fn test_embedded_store_metadata_round_trip() {
+    let (svc, uid, _ctx) = setup().await;
+    let metadata = json!({"scene": "embedded", "agent": "mcp"});
+    let result = call(
+        "memory_store",
+        json!({"content": "embedded metadata memory", "extra_metadata": metadata}),
+        &svc,
+        &uid,
+    )
+    .await;
+    let memory_id = text(&result)
+        .split_whitespace()
+        .nth(2)
+        .unwrap()
+        .trim_end_matches(':');
+    let stored = svc.get_for_user(&uid, memory_id).await.unwrap().unwrap();
+    assert_eq!(
+        serde_json::to_value(stored.extra_metadata).unwrap(),
+        metadata,
+        "embedded MCP must persist metadata"
+    );
+    let listed = call("memory_list", json!({}), &svc, &uid).await;
+    assert!(text(&listed).contains("\"scene\":\"embedded\""));
+}
+
 // ── 3. memory_retrieve: returns relevant memories ────────────────────────────
 
 #[tokio::test]
@@ -168,6 +214,30 @@ async fn test_retrieve_empty() {
     .await;
     assert!(text(&r).contains("No relevant memories"), "{}", text(&r));
     println!("✅ retrieve empty: {}", text(&r));
+}
+
+// ── 3b. memory_retrieve/search: reject missing/blank query ───────────────────
+
+#[tokio::test]
+async fn test_retrieve_and_search_reject_missing_query() {
+    let (svc, uid, _ctx) = setup().await;
+
+    for (tool, args) in [
+        ("memory_retrieve", json!({})),
+        ("memory_retrieve", json!({"query": ""})),
+        ("memory_retrieve", json!({"query": "   \t"})),
+        ("memory_search", json!({})),
+        ("memory_search", json!({"query": ""})),
+        ("memory_search", json!({"query": "   \t"})),
+    ] {
+        let r = call(tool, args, &svc, &uid).await;
+        assert!(
+            text(&r).contains("query is required"),
+            "{tool} unexpected response: {}",
+            text(&r)
+        );
+    }
+    println!("✅ retrieve/search reject missing query");
 }
 
 #[tokio::test]

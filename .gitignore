@@ -48,3 +48,4 @@ nohup.out
 sdk/python/.venv/
 sdk/python/uv.lock
 .DS_Store
+memoria/.DS_Store

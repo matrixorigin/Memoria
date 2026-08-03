@@ -19,6 +19,10 @@ pub struct StoreRequest {
     pub observed_at: Option<String>,
     pub source: Option<String>,
     pub branch: Option<String>,
+    /// 任意业务元数据（如 scene/agent）。透传落库到 memories.extra_metadata，并在读取时原样
+    /// 返回给调用方；Memoria 本身不对其做检索/打分逻辑（下游消费者如 matrixflow 的 decay 可自行使用）。
+    #[serde(default)]
+    pub extra_metadata: Option<std::collections::HashMap<String, serde_json::Value>>,
 }
 fn default_memory_type() -> String {
     "semantic".to_string()
@@ -281,6 +285,10 @@ pub struct MemoryResponse {
     pub observed_at: Option<String>,
     pub created_at: Option<String>,
     pub retrieval_score: Option<f64>,
+    /// 业务元数据（如 scene/agent）从 memories.extra_metadata 原样透传回给调用方；Memoria 本身
+    /// 不对其做检索/打分逻辑（下游消费者如 matrixflow 的 decay 可自行使用）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extra_metadata: Option<std::collections::HashMap<String, serde_json::Value>>,
 }
 
 impl From<Memory> for MemoryResponse {
@@ -299,6 +307,9 @@ impl From<Memory> for MemoryResponse {
             observed_at: m.observed_at.map(|dt| dt.to_rfc3339()),
             created_at: m.created_at.map(|dt| dt.to_rfc3339()),
             retrieval_score: m.retrieval_score,
+            // 空 map 在响应里归一为 None（省略），与读取侧「"{}" → None」一致：新写记录直接
+            // 返回内存对象时也不会出现「POST 带 {} 而后续 list/get 无该字段」的不一致。
+            extra_metadata: m.extra_metadata.filter(|md| !md.is_empty()),
         }
     }
 }
