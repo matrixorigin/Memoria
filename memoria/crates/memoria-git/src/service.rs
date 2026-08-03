@@ -1,7 +1,7 @@
 use chrono::NaiveDateTime;
 use memoria_core::MemoriaError;
 use serde::{Deserialize, Serialize};
-use sqlx::{mysql::MySqlPool, Row};
+use sqlx::{mysql::MySqlPool, Column, Row};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -9,6 +9,18 @@ use std::sync::{
 
 fn db_err(e: sqlx::Error) -> MemoriaError {
     MemoriaError::Database(e.to_string())
+}
+
+/// Look up a column index by name, case-insensitively.
+///
+/// `SHOW SNAPSHOTS WHERE ...` output column names differ in case across MatrixOne
+/// versions: v3.0.17 returns lower-case (`snapshot_name`), while v4.x returns
+/// upper-case (`SNAPSHOT_NAME`). sqlx's `try_get(name)` is case-sensitive, so a
+/// hard-coded name breaks on one of them. Resolve the index ourselves instead.
+fn ci_column_index(row: &sqlx::mysql::MySqlRow, name: &str) -> Option<usize> {
+    row.columns()
+        .iter()
+        .position(|c| c.name().eq_ignore_ascii_case(name))
 }
 
 /// Returns true when the error is MatrixOne's "txn need retry in rc mode, def changed"
@@ -557,22 +569,35 @@ impl GitForDataService {
         let snapshots: Vec<Snapshot> = rows
             .iter()
             .map(|r| {
-                // `SHOW SNAPSHOTS WHERE ...` is rewritten through a SELECT wrapper in
-                // MatrixOne and returns lower-case output column names.
-                let timestamp = r.try_get::<NaiveDateTime, _>("timestamp").ok().or_else(|| {
-                    r.try_get::<String, _>("timestamp").ok().and_then(|s| {
-                        NaiveDateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S%.f")
-                            .ok()
-                            .or_else(|| NaiveDateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S").ok())
+                // `SHOW SNAPSHOTS WHERE ...` output column-name case differs by
+                // MatrixOne version: v3.0.17 lower-cases them (`snapshot_name`),
+                // v4.x preserves upper-case (`SNAPSHOT_NAME`). Resolve indexes
+                // case-insensitively so both are handled.
+                let idx = |name: &str| ci_column_index(r, name);
+                let get_str = |name: &str| -> Result<String, MemoriaError> {
+                    match idx(name) {
+                        Some(i) => r.try_get::<String, _>(i).map_err(db_err),
+                        None => Err(db_err(sqlx::Error::ColumnNotFound(name.to_string()))),
+                    }
+                };
+                let timestamp = idx("timestamp").and_then(|i| {
+                    r.try_get::<NaiveDateTime, _>(i).ok().or_else(|| {
+                        r.try_get::<String, _>(i).ok().and_then(|s| {
+                            NaiveDateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S%.f")
+                                .ok()
+                                .or_else(|| {
+                                    NaiveDateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S").ok()
+                                })
+                        })
                     })
                 });
                 Ok(Snapshot {
-                    snapshot_name: r.try_get("snapshot_name").map_err(db_err)?,
+                    snapshot_name: get_str("snapshot_name")?,
                     timestamp,
-                    snapshot_level: r.try_get("snapshot_level").map_err(db_err)?,
-                    account_name: r.try_get("account_name").map_err(db_err)?,
-                    database_name: r.try_get("database_name").ok(),
-                    table_name: r.try_get("table_name").ok(),
+                    snapshot_level: get_str("snapshot_level")?,
+                    account_name: get_str("account_name")?,
+                    database_name: idx("database_name").and_then(|i| r.try_get(i).ok()),
+                    table_name: idx("table_name").and_then(|i| r.try_get(i).ok()),
                 })
             })
             .collect::<Result<Vec<Snapshot>, MemoriaError>>()?;
