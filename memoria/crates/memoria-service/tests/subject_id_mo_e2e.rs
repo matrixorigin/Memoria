@@ -321,7 +321,7 @@ async fn test_service_batch_store_subject_ids() {
     let subject_b = "batch-bob";
 
     let stored = svc
-        .store_batch_on_branch(
+        .store_batch_with_metadata_on_branch(
             &uid,
             None,
             vec![

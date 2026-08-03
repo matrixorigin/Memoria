@@ -430,7 +430,7 @@ pub async fn call(
                     .ok()
                 });
             let m = match service
-                .store_memory_on_branch(
+                .store_memory_with_metadata_on_branch(
                     user_id,
                     branch_arg(&args),
                     &content,

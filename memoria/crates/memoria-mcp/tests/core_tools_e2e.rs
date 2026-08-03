@@ -143,6 +143,32 @@ async fn test_store_rejects_empty_content() {
     println!("✅ store rejects empty content");
 }
 
+#[tokio::test]
+async fn test_embedded_store_metadata_round_trip() {
+    let (svc, uid, _ctx) = setup().await;
+    let metadata = json!({"scene": "embedded", "agent": "mcp"});
+    let result = call(
+        "memory_store",
+        json!({"content": "embedded metadata memory", "extra_metadata": metadata}),
+        &svc,
+        &uid,
+    )
+    .await;
+    let memory_id = text(&result)
+        .split_whitespace()
+        .nth(2)
+        .unwrap()
+        .trim_end_matches(':');
+    let stored = svc.get_for_user(&uid, memory_id).await.unwrap().unwrap();
+    assert_eq!(
+        serde_json::to_value(stored.extra_metadata).unwrap(),
+        metadata,
+        "embedded MCP must persist metadata"
+    );
+    let listed = call("memory_list", json!({}), &svc, &uid).await;
+    assert!(text(&listed).contains("\"scene\":\"embedded\""));
+}
+
 // ── 3. memory_retrieve: returns relevant memories ────────────────────────────
 
 #[tokio::test]

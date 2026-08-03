@@ -220,7 +220,7 @@ pub async fn store_memory(
     };
     let m = state
         .service
-        .store_memory_on_branch(
+        .store_memory_with_metadata_on_branch(
             auth.scope_id(),
             branch_param(req.branch.as_deref()),
             &req.content,
@@ -318,7 +318,7 @@ pub async fn batch_store(
         .collect();
     let results = state
         .service
-        .store_batch_on_branch(
+        .store_batch_with_metadata_on_branch(
             auth.scope_id(),
             branch_param(top_branch.as_deref()),
             batch_items,

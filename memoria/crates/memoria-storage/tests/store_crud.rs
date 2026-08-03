@@ -720,11 +720,17 @@ async fn test_list_active_lite() {
     let (store, uid) = setup().await;
     // Insert 3 memories with embeddings
     for i in 0..3 {
-        let m = make_memory(
+        let mut m = make_memory(
             &format!("lite-{i}-{uid}"),
             &format!("lite memory {i}"),
             &uid,
         );
+        if i == 0 {
+            m.extra_metadata = Some(std::collections::HashMap::from([(
+                "mapper".to_string(),
+                serde_json::json!("lite"),
+            )]));
+        }
         store.insert(&m).await.expect("insert");
     }
     store
@@ -744,12 +750,20 @@ async fn test_list_active_lite() {
             m.source_event_ids.is_empty(),
             "lite should skip source_event_ids"
         );
-        assert!(
-            m.extra_metadata.is_none(),
-            "lite should skip extra_metadata"
-        );
         assert!(!m.content.is_empty(), "content must be present");
     }
+    let metadata_memory = results
+        .iter()
+        .find(|m| m.memory_id == format!("lite-0-{uid}"))
+        .expect("metadata memory");
+    assert_eq!(
+        metadata_memory
+            .extra_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("mapper")),
+        Some(&serde_json::json!("lite")),
+        "lite mapper must preserve extra_metadata"
+    );
     // Verify ordering: newest first
     assert!(results[0].created_at >= results[1].created_at);
     println!(

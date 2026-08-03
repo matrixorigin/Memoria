@@ -495,8 +495,21 @@ impl EditLogBuffer {
 }
 
 /// Single item for batch memory storage.
-/// Tuple fields: `(content, memory_type, session_id, trust_tier, subject_id, extra_metadata)`.
+/// Tuple fields: `(content, memory_type, session_id, trust_tier, subject_id)`.
+///
+/// This alias is part of the public Rust API. Keep it stable; callers that need
+/// metadata should use [`MetadataBatchStoreItem`] with `store_batch_with_metadata`.
 pub type BatchStoreItem = (
+    String,
+    MemoryType,
+    Option<String>,
+    Option<TrustTier>,
+    Option<String>,
+);
+
+/// Metadata-aware item for batch memory storage.
+/// Tuple fields: `(content, memory_type, session_id, trust_tier, subject_id, extra_metadata)`.
+pub type MetadataBatchStoreItem = (
     String,
     MemoryType,
     Option<String>,
@@ -1216,7 +1229,6 @@ impl MemoryService {
             initial_confidence,
             author_id,
             subject_id,
-            None,
         )
         .await
     }
@@ -1224,6 +1236,38 @@ impl MemoryService {
     #[allow(clippy::too_many_arguments)]
     #[tracing::instrument(skip(self, content), fields(user_id, branch))]
     pub async fn store_memory_on_branch(
+        &self,
+        user_id: &str,
+        branch: Option<&str>,
+        content: &str,
+        memory_type: MemoryType,
+        session_id: Option<String>,
+        trust_tier: Option<TrustTier>,
+        observed_at: Option<DateTime<Utc>>,
+        initial_confidence: Option<f64>,
+        author_id: Option<String>,
+        subject_id: Option<String>,
+    ) -> Result<Memory, MemoriaError> {
+        self.store_memory_with_metadata_on_branch(
+            user_id,
+            branch,
+            content,
+            memory_type,
+            session_id,
+            trust_tier,
+            observed_at,
+            initial_confidence,
+            author_id,
+            subject_id,
+            None,
+        )
+        .await
+    }
+
+    /// Store a memory on an optional branch, including caller-owned metadata.
+    #[allow(clippy::too_many_arguments)]
+    #[tracing::instrument(skip(self, content), fields(user_id, branch))]
+    pub async fn store_memory_with_metadata_on_branch(
         &self,
         user_id: &str,
         branch: Option<&str>,
@@ -2591,6 +2635,17 @@ impl MemoryService {
             .await
     }
 
+    /// Batch store with caller-owned metadata.
+    pub async fn store_batch_with_metadata(
+        &self,
+        user_id: &str,
+        items: Vec<MetadataBatchStoreItem>,
+        author_id: Option<String>,
+    ) -> Result<Vec<Memory>, MemoriaError> {
+        self.store_batch_with_metadata_on_branch(user_id, None, items, author_id)
+            .await
+    }
+
     /// Batch store with a single embedding API call, targeting an optional branch.
     /// Item tuple: (content, memory_type, session_id, trust_tier, subject_id)
     pub async fn store_batch_on_branch(
@@ -2598,6 +2653,29 @@ impl MemoryService {
         user_id: &str,
         branch: Option<&str>,
         items: Vec<BatchStoreItem>,
+        author_id: Option<String>,
+    ) -> Result<Vec<Memory>, MemoriaError> {
+        self.store_batch_with_metadata_on_branch(
+            user_id,
+            branch,
+            items
+                .into_iter()
+                .map(|(content, mt, session_id, tier, subject_id)| {
+                    (content, mt, session_id, tier, subject_id, None)
+                })
+                .collect(),
+            author_id,
+        )
+        .await
+    }
+
+    /// Batch store with a single embedding API call and caller-owned metadata,
+    /// targeting an optional branch.
+    pub async fn store_batch_with_metadata_on_branch(
+        &self,
+        user_id: &str,
+        branch: Option<&str>,
+        items: Vec<MetadataBatchStoreItem>,
         author_id: Option<String>,
     ) -> Result<Vec<Memory>, MemoriaError> {
         if items.is_empty() {
@@ -2625,7 +2703,14 @@ impl MemoryService {
             }
             let final_content = sensitivity.redacted_content.unwrap_or(content);
             contents.push(final_content.clone());
-            checked_items.push((final_content, mt, session_id, tier, subject_id, extra_metadata));
+            checked_items.push((
+                final_content,
+                mt,
+                session_id,
+                tier,
+                subject_id,
+                extra_metadata,
+            ));
         }
 
         // Batch embed
