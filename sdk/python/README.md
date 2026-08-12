@@ -75,6 +75,13 @@ result = client.memories.search(query="...", top_k=10)
 page = client.memories.list(limit=100, cursor=None)
 # page.next_cursor — pass as cursor= to get the next page
 
+# Exact structured query (no vector/keyword retrieval)
+page = client.memories.query(
+    extra_metadata_filter={"scene": "incident", "rank": 2},
+    memory_types=["semantic"],
+    limit=100,
+)
+
 # Correct by ID
 mem = client.memories.correct("mem_id", new_content="...", reason="...")
 

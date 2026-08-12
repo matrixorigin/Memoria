@@ -8,6 +8,7 @@ use memoria_embedding::llm::ChatMessage;
 use memoria_embedding::LlmClient;
 use memoria_storage::{DbRouter, OwnedEditLogEntry, SqlMemoryStore};
 use moka::sync::Cache;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -160,6 +161,19 @@ pub struct ListActiveOptions<'a> {
     pub trust_tier: Option<&'a str>,
     pub cursor: Option<&'a str>,
     pub subject_id: Option<&'a str>,
+}
+
+/// Filters for a structured memory query. This path performs no embedding,
+/// keyword, graph, or relevance-scoring work.
+#[derive(Debug, Clone)]
+pub struct StructuredQueryOptions {
+    pub limit: i64,
+    pub memory_types: Option<Vec<MemoryType>>,
+    pub session_id: Option<String>,
+    pub trust_tier: Option<TrustTier>,
+    pub cursor: Option<String>,
+    pub subject_id: Option<String>,
+    pub extra_metadata_filter: HashMap<String, serde_json::Value>,
 }
 
 impl ListActiveOptions<'_> {
@@ -2575,6 +2589,65 @@ impl MemoryService {
             mems.retain(|m| m.memory_id.as_str() < cursor_id);
         }
         Ok(mems)
+    }
+
+    /// Query active memories using exact structured filters only.
+    pub async fn query_active_structured_on_branch(
+        &self,
+        user_id: &str,
+        branch: Option<&str>,
+        options: &StructuredQueryOptions,
+    ) -> Result<Vec<Memory>, MemoriaError> {
+        if self.sql_store.is_some() {
+            let sql = self.user_sql_store(user_id).await?;
+            let table = sql.table_for_branch(user_id, branch).await?;
+            return sql
+                .query_active_structured_lite(
+                    &table,
+                    user_id,
+                    options.limit,
+                    options.memory_types.as_deref(),
+                    options.session_id.as_deref(),
+                    options
+                        .trust_tier
+                        .as_ref()
+                        .map(ToString::to_string)
+                        .as_deref(),
+                    options.cursor.as_deref(),
+                    options.subject_id.as_deref(),
+                    &options.extra_metadata_filter,
+                )
+                .await;
+        }
+
+        // Trait-only fallback used by test doubles. Production uses the SQL path.
+        let mut memories = self.store.list_active(user_id, 501).await?;
+        if let Some(types) = options.memory_types.as_deref() {
+            memories.retain(|memory| types.contains(&memory.memory_type));
+        }
+        if let Some(session_id) = options.session_id.as_deref() {
+            memories.retain(|memory| memory.session_id.as_deref() == Some(session_id));
+        }
+        if let Some(trust_tier) = options.trust_tier.as_ref() {
+            memories.retain(|memory| &memory.trust_tier == trust_tier);
+        }
+        if let Some(subject_id) = options.subject_id.as_deref() {
+            memories.retain(|memory| memory.subject_id.as_deref() == Some(subject_id));
+        }
+        if let Some(cursor) = options.cursor.as_deref() {
+            memories.retain(|memory| memory.memory_id.as_str() < cursor);
+        }
+        memories.retain(|memory| {
+            options.extra_metadata_filter.iter().all(|(key, expected)| {
+                memory
+                    .extra_metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.get(key))
+                    == Some(expected)
+            })
+        });
+        memories.truncate(options.limit.clamp(1, 501) as usize);
+        Ok(memories)
     }
 
     pub async fn embed(&self, text: &str) -> Result<Option<Vec<f32>>, MemoriaError> {

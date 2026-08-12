@@ -5293,6 +5293,100 @@ impl SqlMemoryStore {
         rows.iter().map(row_to_memory_lite).collect()
     }
 
+    /// Exact structured query over ordinary columns and scalar extra_metadata fields.
+    /// This intentionally bypasses all vector/fulltext retrieval machinery.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn query_active_structured_lite(
+        &self,
+        table: &str,
+        user_id: &str,
+        limit: i64,
+        memory_types: Option<&[MemoryType]>,
+        session_id: Option<&str>,
+        trust_tier: Option<&str>,
+        cursor: Option<&str>,
+        subject_id: Option<&str>,
+        extra_metadata_filter: &std::collections::HashMap<String, serde_json::Value>,
+    ) -> Result<Vec<Memory>, MemoriaError> {
+        let table = self.t(table);
+        let safe_limit = limit.clamp(1, 501);
+        let mut metadata_filters: Vec<_> = extra_metadata_filter.iter().collect();
+        metadata_filters.sort_by(|(left, _), (right, _)| left.cmp(right));
+
+        for (key, _) in &metadata_filters {
+            if key.is_empty()
+                || key.len() > 64
+                || !key
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+            {
+                return Err(MemoriaError::Validation(format!(
+                    "extra_metadata_filter key '{key}' must contain only ASCII letters, digits, or underscore and be at most 64 characters"
+                )));
+            }
+        }
+
+        let mut inner =
+            format!("SELECT memory_id FROM {table} WHERE user_id = ? AND is_active = 1");
+        if let Some(types) = memory_types.filter(|types| !types.is_empty()) {
+            inner.push_str(" AND memory_type IN (");
+            inner.push_str(&vec!["?"; types.len()].join(", "));
+            inner.push(')');
+        }
+        if session_id.is_some() {
+            inner.push_str(" AND session_id = ?");
+        }
+        if trust_tier.is_some() {
+            inner.push_str(" AND trust_tier = ?");
+        }
+        if subject_id.is_some() {
+            inner.push_str(" AND subject_id = ?");
+        }
+        if cursor.is_some() {
+            inner.push_str(" AND memory_id < ?");
+        }
+        for (key, _) in &metadata_filters {
+            inner.push_str(&format!(
+                " AND json_extract(extra_metadata, '$.{key}') = CAST(? AS JSON)"
+            ));
+        }
+        inner.push_str(" ORDER BY memory_id DESC LIMIT ?");
+
+        let sql = format!(
+            "SELECT memory_id, user_id, author_id, subject_id, memory_type, content, \
+             session_id, is_active, superseded_by, trust_tier, \
+             initial_confidence, observed_at, created_at, updated_at, \
+             CAST(extra_metadata AS CHAR) AS extra_meta \
+             FROM {table} WHERE memory_id IN ({inner}) \
+             ORDER BY memory_id DESC"
+        );
+
+        let mut query = sqlx::query(&sql).bind(user_id);
+        if let Some(types) = memory_types.filter(|types| !types.is_empty()) {
+            for memory_type in types {
+                query = query.bind(memory_type.to_string());
+            }
+        }
+        if let Some(value) = session_id {
+            query = query.bind(value);
+        }
+        if let Some(value) = trust_tier {
+            query = query.bind(value);
+        }
+        if let Some(value) = subject_id {
+            query = query.bind(value);
+        }
+        if let Some(value) = cursor {
+            query = query.bind(value);
+        }
+        for (_, value) in metadata_filters {
+            query = query.bind(serde_json::to_string(value)?);
+        }
+        query = query.bind(safe_limit);
+        let rows = query.fetch_all(&self.pool).await.map_err(db_err)?;
+        rows.iter().map(row_to_memory_lite).collect()
+    }
+
     /// Find memory IDs whose content contains `topic` (exact substring match).
     /// Uses fulltext boolean MUST with LIKE refinement. Requires topic >= 3 chars.
     pub async fn find_ids_by_topic(

@@ -15,6 +15,45 @@ def _strip_none(d: dict[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in d.items() if v is not None}
 
 
+def _validate_structured_query(
+    *,
+    extra_metadata_filter: dict[str, Any] | None,
+    subject_id: str | None,
+    memory_types: list[str] | None,
+    session_id: str | None,
+    trust_tier: str | None,
+    limit: int,
+) -> None:
+    if limit < 1 or limit > 500:
+        raise MemoriaValidationError("query: limit must be between 1 and 500")
+    has_selector = any(
+        [
+            bool(extra_metadata_filter),
+            bool(subject_id and subject_id.strip()),
+            bool(memory_types and any(item.strip() for item in memory_types)),
+            bool(session_id and session_id.strip()),
+            bool(trust_tier and trust_tier.strip()),
+        ]
+    )
+    if not has_selector:
+        raise MemoriaValidationError("query: at least one filter selector is required")
+    if extra_metadata_filter is not None:
+        if len(extra_metadata_filter) > 16:
+            raise MemoriaValidationError(
+                "query: extra_metadata_filter must not contain more than 16 fields"
+            )
+        for key, value in extra_metadata_filter.items():
+            if not key or len(key) > 64 or not key.replace("_", "").isalnum() or not key.isascii():
+                raise MemoriaValidationError(
+                    "query: extra_metadata_filter keys may contain only ASCII letters, "
+                    "digits, or underscore"
+                )
+            if not isinstance(value, (str, int, float, bool)):
+                raise MemoriaValidationError(
+                    "query: extra_metadata_filter values must be strings, numbers, or booleans"
+                )
+
+
 class MemoriesResource:
     def __init__(self, client: _HttpTransport) -> None:
         self._client = client
@@ -128,6 +167,42 @@ class MemoriesResource:
             }
         )
         data = self._client._request("GET", "/v1/memories", params=params)
+        return MemoryPage.from_dict(data)
+
+    def query(
+        self,
+        *,
+        extra_metadata_filter: dict[str, Any] | None = None,
+        subject_id: str | None = None,
+        memory_types: list[str] | None = None,
+        session_id: str | None = None,
+        trust_tier: str | None = None,
+        branch: str | None = None,
+        limit: int = 100,
+        cursor: str | None = None,
+    ) -> MemoryPage:
+        """Run an exact structured query without vector or keyword retrieval."""
+        _validate_structured_query(
+            extra_metadata_filter=extra_metadata_filter,
+            subject_id=subject_id,
+            memory_types=memory_types,
+            session_id=session_id,
+            trust_tier=trust_tier,
+            limit=limit,
+        )
+        body = _strip_none(
+            {
+                "extra_metadata_filter": extra_metadata_filter,
+                "subject_id": subject_id,
+                "memory_types": memory_types,
+                "session_id": session_id,
+                "trust_tier": trust_tier,
+                "branch": branch,
+                "limit": limit,
+                "cursor": cursor,
+            }
+        )
+        data = self._client._request("POST", "/v1/memories/query", json=body)
         return MemoryPage.from_dict(data)
 
     def correct(
@@ -341,6 +416,42 @@ class AsyncMemoriesResource:
             }
         )
         data = await self._client._arequest("GET", "/v1/memories", params=params)
+        return MemoryPage.from_dict(data)
+
+    async def query(
+        self,
+        *,
+        extra_metadata_filter: dict[str, Any] | None = None,
+        subject_id: str | None = None,
+        memory_types: list[str] | None = None,
+        session_id: str | None = None,
+        trust_tier: str | None = None,
+        branch: str | None = None,
+        limit: int = 100,
+        cursor: str | None = None,
+    ) -> MemoryPage:
+        """Run an exact structured query without vector or keyword retrieval."""
+        _validate_structured_query(
+            extra_metadata_filter=extra_metadata_filter,
+            subject_id=subject_id,
+            memory_types=memory_types,
+            session_id=session_id,
+            trust_tier=trust_tier,
+            limit=limit,
+        )
+        body = _strip_none(
+            {
+                "extra_metadata_filter": extra_metadata_filter,
+                "subject_id": subject_id,
+                "memory_types": memory_types,
+                "session_id": session_id,
+                "trust_tier": trust_tier,
+                "branch": branch,
+                "limit": limit,
+                "cursor": cursor,
+            }
+        )
+        data = await self._client._arequest("POST", "/v1/memories/query", json=body)
         return MemoryPage.from_dict(data)
 
     async def correct(

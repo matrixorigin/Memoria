@@ -394,6 +394,72 @@ async fn test_api_extra_metadata_round_trip_and_dedup() {
     assert_eq!(response.status(), 422);
 }
 
+#[tokio::test]
+async fn test_api_structured_query_by_extra_metadata() {
+    let (base, client, _server) = spawn_server().await;
+    let user_id = uid();
+
+    for (content, metadata) in [
+        (
+            "structured incident",
+            json!({"scene": "incident", "rank": 2, "urgent": true}),
+        ),
+        (
+            "structured review",
+            json!({"scene": "review", "rank": 2, "urgent": true}),
+        ),
+        (
+            "structured string rank",
+            json!({"scene": "incident", "rank": "2", "urgent": true}),
+        ),
+    ] {
+        let response = client
+            .post(format!("{base}/v1/memories"))
+            .header("X-User-Id", &user_id)
+            .json(&json!({"content": content, "extra_metadata": metadata}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 201);
+    }
+
+    let response = client
+        .post(format!("{base}/v1/memories/query"))
+        .header("X-User-Id", &user_id)
+        .json(&json!({
+            "extra_metadata_filter": {"scene": "incident", "rank": 2, "urgent": true},
+            "memory_types": ["semantic"],
+            "limit": 10
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let body: Value = response.json().await.unwrap();
+    let items = body["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["content"], "structured incident");
+    assert_eq!(items[0]["retrieval_score"], Value::Null);
+
+    let response = client
+        .post(format!("{base}/v1/memories/query"))
+        .header("X-User-Id", &user_id)
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 422);
+
+    let response = client
+        .post(format!("{base}/v1/memories/query"))
+        .header("X-User-Id", &user_id)
+        .json(&json!({"extra_metadata_filter": {"nested": {"value": 1}}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 422);
+}
+
 // ── 2b. list response is lightweight (no embedding) and respects limit ────────
 
 #[tokio::test]

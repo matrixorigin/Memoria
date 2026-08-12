@@ -182,6 +182,32 @@ pub async fn list_memories(
     Ok(Json(ListResponse { items, next_cursor }))
 }
 
+pub async fn query_memories(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Json(req): Json<StructuredQueryRequest>,
+) -> ApiResult<ListResponse> {
+    let branch = normalize_branch(req.branch.clone());
+    let limit = req.limit.clamp(1, 500);
+    let mut options = req
+        .structured_options()
+        .map_err(|err| (StatusCode::UNPROCESSABLE_ENTITY, err))?;
+    options.limit = limit + 1;
+
+    let mut memories = state
+        .service
+        .query_active_structured_on_branch(auth.scope_id(), branch.as_deref(), &options)
+        .await
+        .map_err(api_err_typed)?;
+    let has_more = memories.len() > limit as usize;
+    memories.truncate(limit as usize);
+    let next_cursor = has_more
+        .then(|| memories.last().map(|memory| memory.memory_id.clone()))
+        .flatten();
+    let items = memories.into_iter().map(Into::into).collect();
+    Ok(Json(ListResponse { items, next_cursor }))
+}
+
 pub async fn store_memory(
     State(state): State<AppState>,
     auth: AuthUser,

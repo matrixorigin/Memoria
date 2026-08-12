@@ -37,10 +37,12 @@ class Memory:
     is_active: bool
     user_id: str
     author_id: str | None = None          # group mode only; None in personal mode
+    subject_id: str | None = None
     session_id: str | None = None
     observed_at: datetime | None = None
     created_at: datetime | None = None
     retrieval_score: float | None = None  # populated by retrieve/search, None from list
+    extra_metadata: dict[str, Any] | None = None
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> Memory:
@@ -53,10 +55,12 @@ class Memory:
             is_active=bool(d.get("is_active", True)),
             user_id=d.get("user_id", ""),
             author_id=d.get("author_id"),
+            subject_id=d.get("subject_id"),
             session_id=d.get("session_id"),
             observed_at=_parse_dt(d.get("observed_at")),
             created_at=_parse_dt(d.get("created_at")),
             retrieval_score=d.get("retrieval_score"),
+            extra_metadata=d.get("extra_metadata"),
         )
 
 

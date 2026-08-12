@@ -47,6 +47,19 @@ async def test_list_happy_path(httpx_mock: HTTPXMock, client: AsyncMemoriaClient
 
 
 @pytest.mark.asyncio
+async def test_structured_query(httpx_mock: HTTPXMock, client: AsyncMemoriaClient) -> None:
+    response = {**MEMORY_STUB, "extra_metadata": {"scene": "incident"}}
+    httpx_mock.add_response(json={"items": [response], "next_cursor": None})
+    page = await client.memories.query(
+        extra_metadata_filter={"scene": "incident"}, trust_tier="T2"
+    )
+    assert page.items[0].extra_metadata == {"scene": "incident"}
+    request = httpx_mock.get_request()
+    assert request is not None
+    assert request.url.path == "/v1/memories/query"
+
+
+@pytest.mark.asyncio
 async def test_purge_by_ids(httpx_mock: HTTPXMock, client: AsyncMemoriaClient) -> None:
     httpx_mock.add_response(json={"purged": 1, "snapshot_name": "snap_x"})
     result = await client.memories.purge(memory_ids=["id1"], reason="done")

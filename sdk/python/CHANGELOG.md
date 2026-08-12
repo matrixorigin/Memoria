@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+- Sync and async `memories.query()` for exact structured filtering through the REST API,
+  including scalar `extra_metadata`, subject, type, session, trust tier, branch, and pagination.
+
 ### Fixed
 - `ping()` no longer wraps `MemoriaAuthError` / `MemoriaNotFoundError` and other API errors
   into `MemoriaConnectionError`; callers can now distinguish network failures from API errors.

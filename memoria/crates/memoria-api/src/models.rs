@@ -3,6 +3,7 @@
 
 use memoria_core::{Memory, MemoryType, TrustTier};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::str::FromStr;
 
 // ── Memory ────────────────────────────────────────────────────────────────────
@@ -20,7 +21,7 @@ pub struct StoreRequest {
     pub source: Option<String>,
     pub branch: Option<String>,
     /// 任意业务元数据（如 scene/agent）。透传落库到 memories.extra_metadata，并在读取时原样
-    /// 返回给调用方；Memoria 本身不对其做检索/打分逻辑（下游消费者如 matrixflow 的 decay 可自行使用）。
+    /// 返回给调用方；结构化 query 可做精确过滤，但不参与相关性检索或打分。
     #[serde(default)]
     pub extra_metadata: Option<std::collections::HashMap<String, serde_json::Value>>,
 }
@@ -141,6 +142,101 @@ impl SearchRequest {
             .with_memory_types(memory_types),
         )
     }
+}
+
+fn default_structured_query_limit() -> i64 {
+    100
+}
+
+/// A pure structured query. All supplied selectors are combined with AND and
+/// extra_metadata values use exact, type-sensitive scalar equality.
+#[derive(Deserialize)]
+pub struct StructuredQueryRequest {
+    #[serde(default)]
+    pub extra_metadata_filter: HashMap<String, serde_json::Value>,
+    pub subject_id: Option<String>,
+    pub memory_types: Option<Vec<String>>,
+    pub session_id: Option<String>,
+    pub trust_tier: Option<String>,
+    pub branch: Option<String>,
+    #[serde(default = "default_structured_query_limit")]
+    pub limit: i64,
+    pub cursor: Option<String>,
+}
+
+impl StructuredQueryRequest {
+    pub fn structured_options(&self) -> Result<memoria_service::StructuredQueryOptions, String> {
+        if self.extra_metadata_filter.len() > 16 {
+            return Err("extra_metadata_filter must not contain more than 16 fields".to_string());
+        }
+        for (key, value) in &self.extra_metadata_filter {
+            if key.is_empty()
+                || key.len() > 64
+                || !key
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+            {
+                return Err(format!(
+                    "extra_metadata_filter key '{key}' must contain only ASCII letters, digits, or underscore and be at most 64 characters"
+                ));
+            }
+            if value.is_null() || value.is_array() || value.is_object() {
+                return Err(format!(
+                    "extra_metadata_filter value for '{key}' must be a string, number, or boolean"
+                ));
+            }
+            if serde_json::to_string(value)
+                .map_err(|err| err.to_string())?
+                .len()
+                > 1024
+            {
+                return Err(format!(
+                    "extra_metadata_filter value for '{key}' must not exceed 1024 bytes"
+                ));
+            }
+        }
+
+        let subject_id = normalized(self.subject_id.as_deref());
+        let session_id = normalized(self.session_id.as_deref());
+        let normalized_trust_tier = normalized(self.trust_tier.as_deref());
+        let trust_tier = normalized_trust_tier
+            .as_deref()
+            .map(parse_trust_tier)
+            .transpose()?;
+        let memory_types = parse_memory_types_opt(self.memory_types.as_ref())?;
+        if self.extra_metadata_filter.is_empty()
+            && subject_id.is_none()
+            && session_id.is_none()
+            && trust_tier.is_none()
+            && memory_types.is_none()
+        {
+            return Err("structured query requires at least one filter selector".to_string());
+        }
+
+        let cursor = normalized(self.cursor.as_deref());
+        if let Some(cursor) = cursor.as_deref() {
+            if cursor.len() != 32 || !cursor.chars().all(|ch| ch.is_ascii_hexdigit()) {
+                return Err("cursor must be a 32-character hexadecimal memory_id".to_string());
+            }
+        }
+
+        Ok(memoria_service::StructuredQueryOptions {
+            limit: self.limit.clamp(1, 500),
+            memory_types,
+            session_id,
+            trust_tier,
+            cursor,
+            subject_id,
+            extra_metadata_filter: self.extra_metadata_filter.clone(),
+        })
+    }
+}
+
+fn normalized(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
 }
 
 fn deserialize_explain<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
@@ -285,8 +381,8 @@ pub struct MemoryResponse {
     pub observed_at: Option<String>,
     pub created_at: Option<String>,
     pub retrieval_score: Option<f64>,
-    /// 业务元数据（如 scene/agent）从 memories.extra_metadata 原样透传回给调用方；Memoria 本身
-    /// 不对其做检索/打分逻辑（下游消费者如 matrixflow 的 decay 可自行使用）。
+    /// 业务元数据（如 scene/agent）从 memories.extra_metadata 原样透传回给调用方；结构化 query
+    /// 可做精确过滤，但不参与相关性检索或打分。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub extra_metadata: Option<std::collections::HashMap<String, serde_json::Value>>,
 }

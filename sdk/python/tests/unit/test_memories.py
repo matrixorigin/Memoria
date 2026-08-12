@@ -147,6 +147,43 @@ def test_list_over_max_limit_raises(client: MemoriaClient) -> None:
         client.memories.list(limit=501)
 
 
+def test_structured_query(httpx_mock: HTTPXMock, client: MemoriaClient) -> None:
+    response = {
+        **MEMORY_STUB,
+        "subject_id": "subject_1",
+        "extra_metadata": {"scene": "incident", "rank": 2},
+    }
+    httpx_mock.add_response(json={"items": [response], "next_cursor": "next_id"})
+
+    page = client.memories.query(
+        extra_metadata_filter={"scene": "incident", "rank": 2},
+        subject_id="subject_1",
+        memory_types=["semantic"],
+        limit=10,
+    )
+
+    assert page.items[0].subject_id == "subject_1"
+    assert page.items[0].extra_metadata == {"scene": "incident", "rank": 2}
+    assert page.next_cursor == "next_id"
+    request = httpx_mock.get_request()
+    assert request is not None
+    assert request.url.path == "/v1/memories/query"
+    import json
+    body = json.loads(request.content)
+    assert body["extra_metadata_filter"] == {"scene": "incident", "rank": 2}
+    assert "query" not in body
+
+
+def test_structured_query_requires_selector(client: MemoriaClient) -> None:
+    with pytest.raises(MemoriaValidationError, match="selector"):
+        client.memories.query()
+
+
+def test_structured_query_rejects_nested_metadata(client: MemoriaClient) -> None:
+    with pytest.raises(MemoriaValidationError, match="strings, numbers, or booleans"):
+        client.memories.query(extra_metadata_filter={"nested": {"key": "value"}})
+
+
 # ---------------------------------------------------------------------------
 # correct / correct_by_query
 # ---------------------------------------------------------------------------
