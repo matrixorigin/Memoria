@@ -238,6 +238,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/metrics", get(routes::metrics::prometheus_metrics))
         // Memory reads
         .route("/v1/memories", get(routes::memory::list_memories))
+        .route(
+            "/v1/memories/fulltext-search",
+            post(routes::memory::fulltext_search_memories),
+        )
         .route("/v1/memories/retrieve", post(routes::memory::retrieve))
         .route("/v1/memories/search", post(routes::memory::search))
         .route("/v1/memories/:id", get(routes::memory::get_memory))

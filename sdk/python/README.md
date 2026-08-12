@@ -71,6 +71,14 @@ result = client.memories.retrieve(query="...", top_k=5)
 # Search
 result = client.memories.search(query="...", top_k=10)
 
+# Pure MatrixOne full-text search with structured pre-filters (query max 4096 UTF-8 bytes)
+result = client.memories.fulltext_search(
+    "MatrixOne database",
+    extra_metadata_filter={"scene": "incident"},
+    subject_id="subject-123",
+    limit=20,
+)
+
 # List with pagination
 page = client.memories.list(limit=100, cursor=None)
 # page.next_cursor — pass as cursor= to get the next page

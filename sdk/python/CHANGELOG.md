@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+- Sync and async `memories.fulltext_search()` for pure MatrixOne full-text search with
+  scalar `extra_metadata` and fixed-field SQL pre-filters, without vector or graph retrieval.
+
 ### Fixed
 - `ping()` no longer wraps `MemoriaAuthError` / `MemoriaNotFoundError` and other API errors
   into `MemoriaConnectionError`; callers can now distinguish network failures from API errors.

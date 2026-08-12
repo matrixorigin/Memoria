@@ -7,7 +7,7 @@ from pytest_httpx import HTTPXMock
 
 from memoria import AsyncMemoriaClient, MemoriaAuthError, MemoriaValidationError
 from memoria.models import Memory, MemoryPage, PurgeResult, RetrieveResult
-from tests.conftest import BASE_URL, API_KEY, MEMORY_STUB
+from tests.conftest import API_KEY, BASE_URL, MEMORY_STUB
 
 
 @pytest.fixture
@@ -36,6 +36,36 @@ async def test_retrieve_happy_path(httpx_mock: HTTPXMock, client: AsyncMemoriaCl
     result = await client.memories.retrieve(query="hello")
     assert isinstance(result, RetrieveResult)
     assert len(result.items) == 1
+
+
+@pytest.mark.asyncio
+async def test_fulltext_search(
+    httpx_mock: HTTPXMock, client: AsyncMemoriaClient
+) -> None:
+    response = {**MEMORY_STUB, "retrieval_score": 0.75}
+    httpx_mock.add_response(json=[response])
+    result = await client.memories.fulltext_search(
+        "MatrixOne", extra_metadata_filter={"scene": "incident"}, limit=10
+    )
+    assert isinstance(result, RetrieveResult)
+    assert result.items[0].retrieval_score == 0.75
+    request = httpx_mock.get_request()
+    assert request is not None
+    assert request.url.path == "/v1/memories/fulltext-search"
+
+
+@pytest.mark.asyncio
+async def test_fulltext_search_rejects_invalid_runtime_types(
+    client: AsyncMemoriaClient,
+) -> None:
+    with pytest.raises(MemoriaValidationError, match="string"):
+        await client.memories.fulltext_search(123)  # type: ignore[arg-type]
+    with pytest.raises(MemoriaValidationError, match="limit"):
+        await client.memories.fulltext_search("valid", limit=True)
+    with pytest.raises(MemoriaValidationError, match="dictionary"):
+        await client.memories.fulltext_search(
+            "valid", extra_metadata_filter=[]  # type: ignore[arg-type]
+        )
 
 
 @pytest.mark.asyncio

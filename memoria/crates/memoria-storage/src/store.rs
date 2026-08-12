@@ -12,6 +12,46 @@ use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+pub const EXTRA_METADATA_FILTER_MAX_FIELDS: usize = 16;
+pub const EXTRA_METADATA_FILTER_MAX_KEY_BYTES: usize = 64;
+pub const EXTRA_METADATA_FILTER_MAX_VALUE_BYTES: usize = 1024;
+pub const FULLTEXT_QUERY_MAX_BYTES: usize = 4096;
+
+/// Validate exact metadata predicates at the storage boundary. Keys are used
+/// as JSON paths and values are bound as JSON scalars.
+pub fn validate_extra_metadata_filter(
+    filter: &std::collections::HashMap<String, serde_json::Value>,
+) -> Result<(), MemoriaError> {
+    if filter.len() > EXTRA_METADATA_FILTER_MAX_FIELDS {
+        return Err(MemoriaError::Validation(format!(
+            "extra_metadata_filter must not contain more than {EXTRA_METADATA_FILTER_MAX_FIELDS} fields"
+        )));
+    }
+    for (key, value) in filter {
+        let mut chars = key.chars();
+        let valid_first = chars
+            .next()
+            .is_some_and(|ch| ch.is_ascii_alphabetic() || ch == '_');
+        let valid_rest = chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_');
+        if key.len() > EXTRA_METADATA_FILTER_MAX_KEY_BYTES || !valid_first || !valid_rest {
+            return Err(MemoriaError::Validation(format!(
+                "extra_metadata_filter key '{key}' must start with an ASCII letter or underscore, contain only ASCII letters, digits, or underscore, and be at most {EXTRA_METADATA_FILTER_MAX_KEY_BYTES} bytes"
+            )));
+        }
+        if value.is_null() || value.is_array() || value.is_object() {
+            return Err(MemoriaError::Validation(format!(
+                "extra_metadata_filter value for '{key}' must be a string, number, or boolean"
+            )));
+        }
+        if serde_json::to_string(value)?.len() > EXTRA_METADATA_FILTER_MAX_VALUE_BYTES {
+            return Err(MemoriaError::Validation(format!(
+                "extra_metadata_filter value for '{key}' must not exceed {EXTRA_METADATA_FILTER_MAX_VALUE_BYTES} bytes"
+            )));
+        }
+    }
+    Ok(())
+}
+
 tokio::task_local! {
     /// Real user ID for per-user state (active branch).
     /// In group mode the "user_id" flowing through the service layer is the
@@ -696,6 +736,22 @@ fn sanitize_fulltext_query(s: &str) -> String {
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// Validate the public full-text query contract. Stopword-only queries remain
+/// valid and may return no rows after MatrixOne tokenization.
+pub fn validate_fulltext_query(query: &str) -> Result<(), MemoriaError> {
+    if query.len() > FULLTEXT_QUERY_MAX_BYTES {
+        return Err(MemoriaError::Validation(format!(
+            "fulltext query must not exceed {FULLTEXT_QUERY_MAX_BYTES} bytes"
+        )));
+    }
+    if sanitize_fulltext_query(query).is_empty() {
+        return Err(MemoriaError::Validation(
+            "fulltext query must contain at least one letter, number, or underscore".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// Sanitize a string for use in a LIKE pattern (escapes `%`).
@@ -5474,6 +5530,109 @@ impl SqlMemoryStore {
             .collect()
     }
 
+    /// Pure MatrixOne full-text search with exact structured SQL pre-filters.
+    /// This path performs no embedding, vector, graph, hybrid, temporal, or
+    /// confidence scoring. Metadata equality follows JSON type-family semantics.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn search_fulltext_structured_lite(
+        &self,
+        table: &str,
+        user_id: &str,
+        query: &str,
+        limit: i64,
+        memory_types: Option<&[MemoryType]>,
+        session_id: Option<&str>,
+        trust_tier: Option<&str>,
+        subject_id: Option<&str>,
+        extra_metadata_filter: &std::collections::HashMap<String, serde_json::Value>,
+    ) -> Result<Vec<Memory>, MemoriaError> {
+        if !(1..=100).contains(&limit) {
+            return Err(MemoriaError::Validation(
+                "fulltext search storage limit must be between 1 and 100".to_string(),
+            ));
+        }
+        validate_fulltext_query(query)?;
+        validate_extra_metadata_filter(extra_metadata_filter)?;
+
+        let safe_query = sanitize_fulltext_query(query);
+        let table = self.t(table);
+        let mut metadata_filters: Vec<_> = extra_metadata_filter.iter().collect();
+        metadata_filters.sort_by_key(|(key, _)| *key);
+
+        let mut sql = format!(
+            "SELECT memory_id, user_id, author_id, subject_id, memory_type, content, \
+             session_id, is_active, superseded_by, trust_tier, \
+             initial_confidence, observed_at, created_at, updated_at, \
+             CAST(extra_metadata AS CHAR) AS extra_meta, \
+             MATCH(content) AGAINST('{safe_query}' IN BOOLEAN MODE) AS ft_score \
+             FROM {table} WHERE user_id = ? AND is_active = 1"
+        );
+        if let Some(types) = memory_types.filter(|types| !types.is_empty()) {
+            sql.push_str(" AND memory_type IN (");
+            sql.push_str(&vec!["?"; types.len()].join(", "));
+            sql.push(')');
+        }
+        if session_id.is_some() {
+            sql.push_str(" AND session_id = ?");
+        }
+        if trust_tier.is_some() {
+            sql.push_str(" AND trust_tier = ?");
+        }
+        if subject_id.is_some() {
+            sql.push_str(" AND subject_id = ?");
+        }
+        for (key, _) in &metadata_filters {
+            sql.push_str(&format!(
+                " AND json_extract(extra_metadata, '$.{key}') = CAST(? AS JSON)"
+            ));
+        }
+        sql.push_str(&format!(
+            " AND MATCH(content) AGAINST('{safe_query}' IN BOOLEAN MODE) \
+             ORDER BY ft_score DESC, memory_id DESC LIMIT ?"
+        ));
+
+        let mut statement = sqlx::query(&sql).bind(user_id);
+        if let Some(types) = memory_types.filter(|types| !types.is_empty()) {
+            for memory_type in types {
+                statement = statement.bind(memory_type.to_string());
+            }
+        }
+        if let Some(value) = session_id {
+            statement = statement.bind(value);
+        }
+        if let Some(value) = trust_tier {
+            statement = statement.bind(value);
+        }
+        if let Some(value) = subject_id {
+            statement = statement.bind(value);
+        }
+        for (_, value) in metadata_filters {
+            statement = statement.bind(serde_json::to_string(value)?);
+        }
+
+        let rows = match statement.bind(limit).fetch_all(&self.pool).await {
+            Ok(rows) => rows,
+            Err(error) => {
+                let message = error.to_string();
+                if message.contains("20101") && message.contains("empty pattern") {
+                    return Ok(Vec::new());
+                }
+                return Err(db_err(error));
+            }
+        };
+        rows.iter()
+            .map(|row| {
+                let mut memory = row_to_memory_lite(row)?;
+                if let Ok(score) = row.try_get::<f64, _>("ft_score") {
+                    memory.retrieval_score = Some(score);
+                } else if let Ok(score) = row.try_get::<f32, _>("ft_score") {
+                    memory.retrieval_score = Some(score as f64);
+                }
+                Ok(memory)
+            })
+            .collect()
+    }
+
     pub async fn search_vector_from(
         &self,
         table: &str,
@@ -6008,14 +6167,45 @@ fn build_safety_snapshot_name(db_name: Option<&str>, operation: &str) -> String 
 mod tests {
     use super::{
         classify_pool_health, detect_connection_anomaly, should_emit_saturated_warning,
-        ConnectionAnomalyKind, OwnedEditLogEntry, PoolHealthLevel, PoolHealthSnapshot,
-        SqlMemoryStore,
+        validate_extra_metadata_filter, validate_fulltext_query, ConnectionAnomalyKind,
+        OwnedEditLogEntry, PoolHealthLevel, PoolHealthSnapshot, SqlMemoryStore,
+        FULLTEXT_QUERY_MAX_BYTES,
     };
     use sqlx::mysql::MySqlPoolOptions;
     use std::io::{self, Write};
     use std::sync::{Arc, Mutex, OnceLock};
 
     static LOG_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    #[test]
+    fn fulltext_filter_validation_is_enforced_at_storage_boundary() {
+        let valid = std::collections::HashMap::from([
+            ("_scene".to_string(), serde_json::json!("incident")),
+            ("rank2".to_string(), serde_json::json!(2)),
+        ]);
+        assert!(validate_extra_metadata_filter(&valid).is_ok());
+
+        for invalid in [
+            std::collections::HashMap::from([("1scene".to_string(), serde_json::json!(true))]),
+            std::collections::HashMap::from([("scene".to_string(), serde_json::json!([1]))]),
+            std::collections::HashMap::from([(
+                "scene".to_string(),
+                serde_json::json!("x".repeat(1025)),
+            )]),
+        ] {
+            assert!(validate_extra_metadata_filter(&invalid).is_err());
+        }
+
+        let too_many = (0..17)
+            .map(|index| (format!("key_{index}"), serde_json::json!(index)))
+            .collect();
+        assert!(validate_extra_metadata_filter(&too_many).is_err());
+        assert!(validate_fulltext_query("MatrixOne database").is_ok());
+        assert!(validate_fulltext_query(" !@#$ ").is_err());
+        assert!(validate_fulltext_query(&"a".repeat(FULLTEXT_QUERY_MAX_BYTES)).is_ok());
+        assert!(validate_fulltext_query(&"a".repeat(FULLTEXT_QUERY_MAX_BYTES + 1)).is_err());
+        assert!(validate_fulltext_query(&"界".repeat(FULLTEXT_QUERY_MAX_BYTES / 3 + 1)).is_err());
+    }
 
     #[test]
     fn saturated_warning_requires_full_delay_and_only_emits_once() {

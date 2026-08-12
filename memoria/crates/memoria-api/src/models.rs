@@ -3,6 +3,7 @@
 
 use memoria_core::{Memory, MemoryType, TrustTier};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::str::FromStr;
 
 // ── Memory ────────────────────────────────────────────────────────────────────
@@ -141,6 +142,59 @@ impl SearchRequest {
             .with_memory_types(memory_types),
         )
     }
+}
+
+fn default_fulltext_search_limit() -> i64 {
+    20
+}
+
+/// Pure MatrixOne full-text search with structured SQL pre-filters.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FulltextSearchRequest {
+    pub query: String,
+    #[serde(default)]
+    pub extra_metadata_filter: HashMap<String, serde_json::Value>,
+    pub subject_id: Option<String>,
+    pub memory_types: Option<Vec<String>>,
+    pub session_id: Option<String>,
+    pub trust_tier: Option<String>,
+    pub branch: Option<String>,
+    #[serde(default = "default_fulltext_search_limit")]
+    pub limit: i64,
+}
+
+impl FulltextSearchRequest {
+    pub fn fulltext_options(&self) -> Result<memoria_service::FulltextSearchOptions, String> {
+        if !(1..=100).contains(&self.limit) {
+            return Err("limit must be between 1 and 100".to_string());
+        }
+        memoria_storage::validate_fulltext_query(&self.query).map_err(|error| error.to_string())?;
+        memoria_storage::validate_extra_metadata_filter(&self.extra_metadata_filter)
+            .map_err(|error| error.to_string())?;
+
+        let session_id = normalized(self.session_id.as_deref());
+        let subject_id = normalized(self.subject_id.as_deref());
+        let trust_tier = normalized(self.trust_tier.as_deref())
+            .as_deref()
+            .map(parse_trust_tier)
+            .transpose()?;
+        Ok(memoria_service::FulltextSearchOptions {
+            limit: self.limit,
+            memory_types: parse_memory_types_opt(self.memory_types.as_ref())?,
+            session_id,
+            trust_tier,
+            subject_id,
+            extra_metadata_filter: self.extra_metadata_filter.clone(),
+        })
+    }
+}
+
+fn normalized(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
 }
 
 fn deserialize_explain<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {

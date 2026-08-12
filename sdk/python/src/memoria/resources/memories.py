@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import math
 from typing import TYPE_CHECKING, Any
 
 from ..exceptions import MemoriaValidationError
@@ -10,9 +12,77 @@ from ..models import Memory, MemoryPage, PurgeResult, RetrieveResult
 if TYPE_CHECKING:
     from .._http import _HttpTransport
 
+_FULLTEXT_QUERY_MAX_BYTES = 4096
+
 
 def _strip_none(d: dict[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in d.items() if v is not None}
+
+
+def _validate_fulltext_metadata_filter(
+    extra_metadata_filter: dict[str, Any] | None,
+) -> None:
+    if extra_metadata_filter is None:
+        return
+    if not isinstance(extra_metadata_filter, dict):
+        raise MemoriaValidationError("extra_metadata_filter must be a dictionary")
+    if len(extra_metadata_filter) > 16:
+        raise MemoriaValidationError(
+            "extra_metadata_filter must not contain more than 16 fields"
+        )
+    for key, value in extra_metadata_filter.items():
+        if not isinstance(key, str):
+            raise MemoriaValidationError("extra_metadata_filter keys must be strings")
+        valid_key = (
+            bool(key)
+            and len(key.encode()) <= 64
+            and (key[0].isascii() and (key[0].isalpha() or key[0] == "_"))
+            and all(
+                char.isascii() and (char.isalnum() or char == "_")
+                for char in key[1:]
+            )
+        )
+        if not valid_key:
+            raise MemoriaValidationError(
+                "extra_metadata_filter keys must start with an ASCII letter or underscore "
+                "and contain only ASCII letters, digits, or underscore"
+            )
+        if not isinstance(value, (str, int, float, bool)):
+            raise MemoriaValidationError(
+                "extra_metadata_filter values must be strings, numbers, or booleans"
+            )
+        if isinstance(value, float) and not math.isfinite(value):
+            raise MemoriaValidationError(
+                "extra_metadata_filter numeric values must be finite"
+            )
+        encoded_value = json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode()
+        if len(encoded_value) > 1024:
+            raise MemoriaValidationError(
+                "extra_metadata_filter values must not exceed 1024 bytes"
+            )
+
+
+def _validate_fulltext_search(
+    query: str,
+    extra_metadata_filter: dict[str, Any] | None,
+    limit: int,
+) -> None:
+    if type(limit) is not int or limit < 1 or limit > 100:
+        raise MemoriaValidationError("fulltext_search: limit must be between 1 and 100")
+    if not isinstance(query, str):
+        raise MemoriaValidationError("fulltext_search: query must be a string")
+    if len(query.encode()) > _FULLTEXT_QUERY_MAX_BYTES:
+        raise MemoriaValidationError(
+            f"fulltext_search: query must not exceed {_FULLTEXT_QUERY_MAX_BYTES} bytes"
+        )
+    if not query or not any(char.isalnum() or char == "_" for char in query):
+        raise MemoriaValidationError(
+            "fulltext_search: query must contain at least one letter, number, or underscore"
+        )
+    try:
+        _validate_fulltext_metadata_filter(extra_metadata_filter)
+    except MemoriaValidationError as error:
+        raise MemoriaValidationError(f"fulltext_search: {error}") from error
 
 
 class MemoriesResource:
@@ -103,6 +173,35 @@ class MemoriesResource:
             }
         )
         data = self._client._request("POST", "/v1/memories/search", json=body)
+        return RetrieveResult.from_dict(data)
+
+    def fulltext_search(
+        self,
+        query: str,
+        *,
+        extra_metadata_filter: dict[str, Any] | None = None,
+        subject_id: str | None = None,
+        memory_types: list[str] | None = None,
+        session_id: str | None = None,
+        trust_tier: str | None = None,
+        branch: str | None = None,
+        limit: int = 20,
+    ) -> RetrieveResult:
+        """Run pure MatrixOne full-text search with structured pre-filters."""
+        _validate_fulltext_search(query, extra_metadata_filter, limit)
+        body = _strip_none(
+            {
+                "query": query,
+                "extra_metadata_filter": extra_metadata_filter,
+                "subject_id": subject_id,
+                "memory_types": memory_types,
+                "session_id": session_id,
+                "trust_tier": trust_tier,
+                "branch": branch,
+                "limit": limit,
+            }
+        )
+        data = self._client._request("POST", "/v1/memories/fulltext-search", json=body)
         return RetrieveResult.from_dict(data)
 
     def list(
@@ -316,6 +415,37 @@ class AsyncMemoriesResource:
             }
         )
         data = await self._client._arequest("POST", "/v1/memories/search", json=body)
+        return RetrieveResult.from_dict(data)
+
+    async def fulltext_search(
+        self,
+        query: str,
+        *,
+        extra_metadata_filter: dict[str, Any] | None = None,
+        subject_id: str | None = None,
+        memory_types: list[str] | None = None,
+        session_id: str | None = None,
+        trust_tier: str | None = None,
+        branch: str | None = None,
+        limit: int = 20,
+    ) -> RetrieveResult:
+        """Run pure MatrixOne full-text search with structured pre-filters."""
+        _validate_fulltext_search(query, extra_metadata_filter, limit)
+        body = _strip_none(
+            {
+                "query": query,
+                "extra_metadata_filter": extra_metadata_filter,
+                "subject_id": subject_id,
+                "memory_types": memory_types,
+                "session_id": session_id,
+                "trust_tier": trust_tier,
+                "branch": branch,
+                "limit": limit,
+            }
+        )
+        data = await self._client._arequest(
+            "POST", "/v1/memories/fulltext-search", json=body
+        )
         return RetrieveResult.from_dict(data)
 
     async def list(
