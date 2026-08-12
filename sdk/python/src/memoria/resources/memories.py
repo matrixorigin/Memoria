@@ -70,6 +70,11 @@ def _validate_fulltext_search(
     query: str,
     extra_metadata_filter: dict[str, Any] | None,
     limit: int,
+    *,
+    subject_id: str | None,
+    session_id: str | None,
+    trust_tier: str | None,
+    branch: str | None,
 ) -> None:
     if type(limit) is not int or limit < 1 or limit > _FULLTEXT_SEARCH_MAX_LIMIT:
         raise MemoriaValidationError(
@@ -85,6 +90,16 @@ def _validate_fulltext_search(
         raise MemoriaValidationError(
             "fulltext_search: query must contain at least one Unicode letter, number, or underscore"
         )
+    for name, value in [
+        ("subject_id", subject_id),
+        ("session_id", session_id),
+        ("trust_tier", trust_tier),
+        ("branch", branch),
+    ]:
+        if value is not None and (not isinstance(value, str) or not value.strip()):
+            raise MemoriaValidationError(
+                f"fulltext_search: {name} must be a non-empty string when provided"
+            )
     try:
         _validate_fulltext_metadata_filter(extra_metadata_filter)
     except MemoriaValidationError as error:
@@ -199,7 +214,15 @@ class MemoriesResource:
         scoping, unscoped memories are not included. Metadata equality preserves
         JSON type families: number ``2`` may equal ``2.0`` but not string ``"2"``.
         """
-        _validate_fulltext_search(query, extra_metadata_filter, limit)
+        _validate_fulltext_search(
+            query,
+            extra_metadata_filter,
+            limit,
+            subject_id=subject_id,
+            session_id=session_id,
+            trust_tier=trust_tier,
+            branch=branch,
+        )
         body = _strip_none(
             {
                 "query": query,
@@ -446,7 +469,15 @@ class AsyncMemoriesResource:
         scoping, unscoped memories are not included. Metadata equality preserves
         JSON type families: number ``2`` may equal ``2.0`` but not string ``"2"``.
         """
-        _validate_fulltext_search(query, extra_metadata_filter, limit)
+        _validate_fulltext_search(
+            query,
+            extra_metadata_filter,
+            limit,
+            subject_id=subject_id,
+            session_id=session_id,
+            trust_tier=trust_tier,
+            branch=branch,
+        )
         body = _strip_none(
             {
                 "query": query,

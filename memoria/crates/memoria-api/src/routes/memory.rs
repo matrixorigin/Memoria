@@ -187,7 +187,9 @@ pub async fn fulltext_search_memories(
     auth: AuthUser,
     Json(req): Json<FulltextSearchRequest>,
 ) -> ApiResult<Vec<MemoryResponse>> {
-    let branch = normalize_branch(req.branch.clone());
+    let branch = req
+        .fulltext_branch()
+        .map_err(|error| (StatusCode::UNPROCESSABLE_ENTITY, error))?;
     let options = req
         .fulltext_options()
         .map_err(|error| (StatusCode::UNPROCESSABLE_ENTITY, error))?;

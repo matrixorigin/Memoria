@@ -66,6 +66,8 @@ async def test_fulltext_search_rejects_invalid_runtime_types(
         await client.memories.fulltext_search(
             "valid", extra_metadata_filter=[]  # type: ignore[arg-type]
         )
+    with pytest.raises(MemoriaValidationError, match="session_id"):
+        await client.memories.fulltext_search("valid", session_id="   ")
 
 
 @pytest.mark.asyncio

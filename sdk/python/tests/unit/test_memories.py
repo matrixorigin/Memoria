@@ -210,6 +210,22 @@ def test_fulltext_search_rejects_invalid_metadata_container_or_key(
         )
 
 
+@pytest.mark.parametrize(
+    ("field", "kwargs"),
+    [
+        ("subject_id", {"subject_id": "   "}),
+        ("session_id", {"session_id": "   "}),
+        ("trust_tier", {"trust_tier": "   "}),
+        ("branch", {"branch": "   "}),
+    ],
+)
+def test_fulltext_search_rejects_blank_structured_filter(
+    client: MemoriaClient, field: str, kwargs: dict[str, str]
+) -> None:
+    with pytest.raises(MemoriaValidationError, match=field):
+        client.memories.fulltext_search("valid", **kwargs)  # type: ignore[arg-type]
+
+
 # ---------------------------------------------------------------------------
 # list
 # ---------------------------------------------------------------------------

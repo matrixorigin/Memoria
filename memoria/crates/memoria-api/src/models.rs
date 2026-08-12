@@ -177,9 +177,9 @@ impl FulltextSearchRequest {
         memoria_storage::validate_extra_metadata_filter(&self.extra_metadata_filter)
             .map_err(|error| error.to_string())?;
 
-        let session_id = normalized(self.session_id.as_deref());
-        let subject_id = normalized(self.subject_id.as_deref());
-        let trust_tier = normalized(self.trust_tier.as_deref())
+        let session_id = normalized_filter("session_id", self.session_id.as_deref())?;
+        let subject_id = normalized_filter("subject_id", self.subject_id.as_deref())?;
+        let trust_tier = normalized_filter("trust_tier", self.trust_tier.as_deref())?
             .as_deref()
             .map(parse_trust_tier)
             .transpose()?;
@@ -192,13 +192,23 @@ impl FulltextSearchRequest {
             extra_metadata_filter: self.extra_metadata_filter.clone(),
         })
     }
+
+    pub fn fulltext_branch(&self) -> Result<Option<String>, String> {
+        normalized_filter("branch", self.branch.as_deref())
+    }
 }
 
-fn normalized(value: Option<&str>) -> Option<String> {
+fn normalized_filter(name: &str, value: Option<&str>) -> Result<Option<String>, String> {
     value
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
+        .map(|value| {
+            let value = value.trim();
+            if value.is_empty() {
+                Err(format!("{name} must not be empty when provided"))
+            } else {
+                Ok(value.to_string())
+            }
+        })
+        .transpose()
 }
 
 fn deserialize_explain<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
