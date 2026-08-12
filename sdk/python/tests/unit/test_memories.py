@@ -184,6 +184,17 @@ def test_structured_query_requires_selector(client: MemoriaClient) -> None:
         client.memories.query()
 
 
+def test_structured_query_accepts_branch_only(
+    httpx_mock: HTTPXMock, client: MemoriaClient
+) -> None:
+    httpx_mock.add_response(json={"items": [], "next_cursor": None})
+    page = client.memories.query(branch="experiment")
+    assert page.items == []
+    request = httpx_mock.get_request()
+    assert request is not None
+    assert json.loads(request.content)["branch"] == "experiment"
+
+
 def test_structured_query_rejects_nested_metadata(client: MemoriaClient) -> None:
     with pytest.raises(MemoriaValidationError, match="strings, numbers, or booleans"):
         client.memories.query(extra_metadata_filter={"nested": {"key": "value"}})
@@ -196,6 +207,14 @@ def test_structured_query_rejects_invalid_key_and_oversized_value(
         client.memories.query(extra_metadata_filter={"1scene": "incident"})
     with pytest.raises(MemoriaValidationError, match="1024"):
         client.memories.query(extra_metadata_filter={"scene": "x" * 1025})
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_structured_query_rejects_non_finite_metadata_number(
+    client: MemoriaClient, value: float
+) -> None:
+    with pytest.raises(MemoriaValidationError, match="finite"):
+        client.memories.query(extra_metadata_filter={"rank": value})
 
 
 # ---------------------------------------------------------------------------

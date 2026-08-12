@@ -177,6 +177,7 @@ impl StructuredQueryRequest {
         let subject_id = normalized(self.subject_id.as_deref());
         let session_id = normalized(self.session_id.as_deref());
         let normalized_trust_tier = normalized(self.trust_tier.as_deref());
+        let branch = normalized(self.branch.as_deref());
         let trust_tier = normalized_trust_tier
             .as_deref()
             .map(parse_trust_tier)
@@ -187,6 +188,7 @@ impl StructuredQueryRequest {
             && session_id.is_none()
             && trust_tier.is_none()
             && memory_types.is_none()
+            && branch.is_none()
         {
             return Err("structured query requires at least one filter selector".to_string());
         }

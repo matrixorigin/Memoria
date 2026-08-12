@@ -60,6 +60,15 @@ async def test_structured_query(httpx_mock: HTTPXMock, client: AsyncMemoriaClien
 
 
 @pytest.mark.asyncio
+async def test_structured_query_accepts_branch_only(
+    httpx_mock: HTTPXMock, client: AsyncMemoriaClient
+) -> None:
+    httpx_mock.add_response(json={"items": [], "next_cursor": None})
+    page = await client.memories.query(branch="experiment")
+    assert page.items == []
+
+
+@pytest.mark.asyncio
 async def test_purge_by_ids(httpx_mock: HTTPXMock, client: AsyncMemoriaClient) -> None:
     httpx_mock.add_response(json={"purged": 1, "snapshot_name": "snap_x"})
     result = await client.memories.purge(memory_ids=["id1"], reason="done")

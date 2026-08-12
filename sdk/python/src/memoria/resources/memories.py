@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 from typing import TYPE_CHECKING, Any
 
 from ..exceptions import MemoriaValidationError
@@ -23,6 +24,7 @@ def _validate_structured_query(
     memory_types: list[str] | None,
     session_id: str | None,
     trust_tier: str | None,
+    branch: str | None,
     limit: int,
 ) -> None:
     if limit < 1 or limit > 500:
@@ -34,6 +36,7 @@ def _validate_structured_query(
             bool(memory_types and any(item.strip() for item in memory_types)),
             bool(session_id and session_id.strip()),
             bool(trust_tier and trust_tier.strip()),
+            bool(branch and branch.strip()),
         ]
     )
     if not has_selector:
@@ -61,6 +64,10 @@ def _validate_structured_query(
             if not isinstance(value, (str, int, float, bool)):
                 raise MemoriaValidationError(
                     "query: extra_metadata_filter values must be strings, numbers, or booleans"
+                )
+            if isinstance(value, float) and not math.isfinite(value):
+                raise MemoriaValidationError(
+                    "query: extra_metadata_filter numeric values must be finite"
                 )
             encoded_value = json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode()
             if len(encoded_value) > 1024:
@@ -203,6 +210,7 @@ class MemoriesResource:
             memory_types=memory_types,
             session_id=session_id,
             trust_tier=trust_tier,
+            branch=branch,
             limit=limit,
         )
         body = _strip_none(
@@ -452,6 +460,7 @@ class AsyncMemoriesResource:
             memory_types=memory_types,
             session_id=session_id,
             trust_tier=trust_tier,
+            branch=branch,
             limit=limit,
         )
         body = _strip_none(

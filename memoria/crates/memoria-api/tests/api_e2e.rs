@@ -606,7 +606,7 @@ async fn test_api_structured_query_on_branch() {
     let branch_response = client
         .post(format!("{base}/v1/memories/query"))
         .header("X-User-Id", &user_id)
-        .json(&json!({"branch": branch, "extra_metadata_filter": {"marker": marker}}))
+        .json(&json!({"branch": branch}))
         .send()
         .await
         .unwrap();
