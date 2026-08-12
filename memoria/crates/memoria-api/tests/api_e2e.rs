@@ -423,10 +423,26 @@ async fn test_api_fulltext_search_with_structured_prefilters() {
             json!({"scene": "review", "rank": 2}),
         ),
         (
+            "wrong metadata type",
+            "semantic",
+            subject_id.as_str(),
+            Some(session_id.as_str()),
+            "T2",
+            json!({"scene": "incident", "rank": "2"}),
+        ),
+        (
             "wrong session",
             "semantic",
             subject_id.as_str(),
             Some("another_session"),
+            "T2",
+            json!({"scene": "incident", "rank": 2}),
+        ),
+        (
+            "unscoped session",
+            "semantic",
+            subject_id.as_str(),
+            None,
             "T2",
             json!({"scene": "incident", "rank": 2}),
         ),
@@ -528,6 +544,19 @@ async fn test_api_fulltext_search_with_structured_prefilters() {
             .unwrap();
         assert_eq!(response.status(), 422, "request: {invalid_request}");
     }
+
+    // MatrixOne tokenizes a single-character NGRAM query to an empty pattern.
+    // The public endpoint treats that database condition as a valid empty result.
+    let response = client
+        .post(format!("{base}/v1/memories/fulltext-search"))
+        .header("X-User-Id", &user_id)
+        .json(&json!({"query": "a"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let body: Value = response.json().await.unwrap();
+    assert!(body.as_array().unwrap().is_empty());
 }
 
 #[tokio::test]

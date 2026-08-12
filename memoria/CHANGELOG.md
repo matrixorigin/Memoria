@@ -4,6 +4,12 @@
 
 ### Added
 
+**Filtered Full-text Search** (`POST /v1/memories/fulltext-search`)
+- Pure MatrixOne lexical full-text search without embedding, vector, graph, or hybrid retrieval
+- Exact metadata, subject, memory type, session, trust tier, user/group, active-memory, and branch SQL pre-filters
+- Strict session equality (unscoped memories are excluded when `session_id` is supplied)
+- REST and sync/async Python SDK only; intentionally not added to the MCP tool surface
+
 **Admin API** (`GET/DELETE /admin/*`, `POST /admin/governance/:id/trigger`)
 - User listing, per-user stats, user deletion
 - Trigger governance/consolidate per user on demand

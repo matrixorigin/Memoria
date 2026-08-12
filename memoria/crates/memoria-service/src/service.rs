@@ -163,8 +163,9 @@ pub struct ListActiveOptions<'a> {
     pub subject_id: Option<&'a str>,
 }
 
-/// Filters for pure MatrixOne full-text search. Structured fields are applied
-/// in the SQL query before the Top-K limit.
+/// Filters for pure MatrixOne full-text search. Structured fields are exact SQL
+/// pre-filters applied before the Top-K limit; session filtering does not include
+/// unscoped memories.
 #[derive(Debug, Clone)]
 pub struct FulltextSearchOptions {
     pub limit: i64,

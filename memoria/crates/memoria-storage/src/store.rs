@@ -15,6 +15,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub const EXTRA_METADATA_FILTER_MAX_FIELDS: usize = 16;
 pub const EXTRA_METADATA_FILTER_MAX_KEY_BYTES: usize = 64;
 pub const EXTRA_METADATA_FILTER_MAX_VALUE_BYTES: usize = 1024;
+pub const FULLTEXT_SEARCH_DEFAULT_LIMIT: i64 = 20;
+pub const FULLTEXT_SEARCH_MAX_LIMIT: i64 = 100;
 pub const FULLTEXT_QUERY_MAX_BYTES: usize = 4096;
 
 /// Validate exact metadata predicates at the storage boundary. Keys are used
@@ -72,6 +74,44 @@ pub(crate) fn db_err(e: sqlx::Error) -> MemoriaError {
         );
     }
     MemoriaError::Database(e.to_string())
+}
+
+/// MatrixOne currently reports an empty tokenized full-text pattern as generic
+/// internal error 20101. The code is shared by many internal errors, so retain
+/// the specific message check in one place until MatrixOne exposes a dedicated
+/// error code. See MatrixOne `pkg/fulltext/fulltext.go`.
+fn is_empty_fulltext_pattern_error(error: &sqlx::Error) -> bool {
+    use sqlx::mysql::MySqlDatabaseError;
+
+    error
+        .as_database_error()
+        .and_then(|database_error| {
+            database_error
+                .as_error()
+                .downcast_ref::<MySqlDatabaseError>()
+        })
+        .is_some_and(|mysql_error| {
+            mysql_error.number() == 20101
+                && mysql_error.message().contains("empty pattern")
+        })
+}
+
+pub(crate) fn fulltext_rows_or_empty(
+    result: Result<Vec<sqlx::mysql::MySqlRow>, sqlx::Error>,
+) -> Result<Vec<sqlx::mysql::MySqlRow>, MemoriaError> {
+    match result {
+        Ok(rows) => Ok(rows),
+        Err(error) if is_empty_fulltext_pattern_error(&error) => Ok(Vec::new()),
+        Err(error) => Err(db_err(error)),
+    }
+}
+
+fn apply_fulltext_score(row: &sqlx::mysql::MySqlRow, memory: &mut Memory) {
+    if let Ok(score) = row.try_get::<f64, _>("ft_score") {
+        memory.retrieval_score = Some(score);
+    } else if let Ok(score) = row.try_get::<f32, _>("ft_score") {
+        memory.retrieval_score = Some(score as f64);
+    }
 }
 
 /// Returns true when a failed ALTER TABLE ADD COLUMN was rejected because
@@ -748,7 +788,8 @@ pub fn validate_fulltext_query(query: &str) -> Result<(), MemoriaError> {
     }
     if sanitize_fulltext_query(query).is_empty() {
         return Err(MemoriaError::Validation(
-            "fulltext query must contain at least one letter, number, or underscore".to_string(),
+            "fulltext query must contain at least one Unicode letter, number, or underscore"
+                .to_string(),
         ));
     }
     Ok(())
@@ -5505,26 +5546,11 @@ impl SqlMemoryStore {
                 stmt = stmt.bind(mt.to_string());
             }
         }
-        let rows = match stmt.bind(limit).fetch_all(&self.pool).await {
-            Ok(rows) => rows,
-            Err(e) => {
-                // MatrixOne returns 20101 when the search string tokenizes to an empty pattern
-                // (e.g. all stopwords, single chars, or unsupported Unicode). Treat as no results.
-                let msg = e.to_string();
-                if msg.contains("20101") && msg.contains("empty pattern") {
-                    return Ok(vec![]);
-                }
-                return Err(db_err(e));
-            }
-        };
+        let rows = fulltext_rows_or_empty(stmt.bind(limit).fetch_all(&self.pool).await)?;
         rows.iter()
             .map(|r| {
                 let mut m = row_to_memory(r)?;
-                if let Ok(ft) = r.try_get::<f64, _>("ft_score") {
-                    m.retrieval_score = Some(ft);
-                } else if let Ok(ft) = r.try_get::<f32, _>("ft_score") {
-                    m.retrieval_score = Some(ft as f64);
-                }
+                apply_fulltext_score(r, &mut m);
                 Ok(m)
             })
             .collect()
@@ -5532,7 +5558,9 @@ impl SqlMemoryStore {
 
     /// Pure MatrixOne full-text search with exact structured SQL pre-filters.
     /// This path performs no embedding, vector, graph, hybrid, temporal, or
-    /// confidence scoring. Metadata equality follows JSON type-family semantics.
+    /// confidence scoring. `session_id` is strict and does not include unscoped
+    /// rows. Metadata equality follows JSON type-family semantics: number `2`
+    /// may equal `2.0`, but does not equal string `"2"`.
     #[allow(clippy::too_many_arguments)]
     pub async fn search_fulltext_structured_lite(
         &self,
@@ -5546,9 +5574,11 @@ impl SqlMemoryStore {
         subject_id: Option<&str>,
         extra_metadata_filter: &std::collections::HashMap<String, serde_json::Value>,
     ) -> Result<Vec<Memory>, MemoriaError> {
-        if !(1..=100).contains(&limit) {
+        if !(1..=FULLTEXT_SEARCH_MAX_LIMIT).contains(&limit) {
             return Err(MemoriaError::Validation(
-                "fulltext search storage limit must be between 1 and 100".to_string(),
+                format!(
+                    "fulltext search storage limit must be between 1 and {FULLTEXT_SEARCH_MAX_LIMIT}"
+                ),
             ));
         }
         validate_fulltext_query(query)?;
@@ -5610,24 +5640,11 @@ impl SqlMemoryStore {
             statement = statement.bind(serde_json::to_string(value)?);
         }
 
-        let rows = match statement.bind(limit).fetch_all(&self.pool).await {
-            Ok(rows) => rows,
-            Err(error) => {
-                let message = error.to_string();
-                if message.contains("20101") && message.contains("empty pattern") {
-                    return Ok(Vec::new());
-                }
-                return Err(db_err(error));
-            }
-        };
+        let rows = fulltext_rows_or_empty(statement.bind(limit).fetch_all(&self.pool).await)?;
         rows.iter()
             .map(|row| {
                 let mut memory = row_to_memory_lite(row)?;
-                if let Ok(score) = row.try_get::<f64, _>("ft_score") {
-                    memory.retrieval_score = Some(score);
-                } else if let Ok(score) = row.try_get::<f32, _>("ft_score") {
-                    memory.retrieval_score = Some(score as f64);
-                }
+                apply_fulltext_score(row, &mut memory);
                 Ok(memory)
             })
             .collect()

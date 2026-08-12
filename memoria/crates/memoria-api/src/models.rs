@@ -145,10 +145,11 @@ impl SearchRequest {
 }
 
 fn default_fulltext_search_limit() -> i64 {
-    20
+    memoria_storage::FULLTEXT_SEARCH_DEFAULT_LIMIT
 }
 
-/// Pure MatrixOne full-text search with structured SQL pre-filters.
+/// Pure MatrixOne full-text search with exact structured SQL pre-filters.
+/// Session filtering is strict and does not include unscoped memories.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FulltextSearchRequest {
@@ -166,8 +167,11 @@ pub struct FulltextSearchRequest {
 
 impl FulltextSearchRequest {
     pub fn fulltext_options(&self) -> Result<memoria_service::FulltextSearchOptions, String> {
-        if !(1..=100).contains(&self.limit) {
-            return Err("limit must be between 1 and 100".to_string());
+        if !(1..=memoria_storage::FULLTEXT_SEARCH_MAX_LIMIT).contains(&self.limit) {
+            return Err(format!(
+                "limit must be between 1 and {}",
+                memoria_storage::FULLTEXT_SEARCH_MAX_LIMIT
+            ));
         }
         memoria_storage::validate_fulltext_query(&self.query).map_err(|error| error.to_string())?;
         memoria_storage::validate_extra_metadata_filter(&self.extra_metadata_filter)

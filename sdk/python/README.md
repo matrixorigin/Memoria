@@ -76,8 +76,11 @@ result = client.memories.fulltext_search(
     "MatrixOne database",
     extra_metadata_filter={"scene": "incident"},
     subject_id="subject-123",
+    session_id="session-123",
     limit=20,
 )
+# session_id is an exact filter: memories with session_id=None are excluded.
+# Metadata preserves JSON type families: 2 may match 2.0, but not the string "2".
 
 # List with pagination
 page = client.memories.list(limit=100, cursor=None)
