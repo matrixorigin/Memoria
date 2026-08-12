@@ -2,13 +2,21 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 from pytest_httpx import HTTPXMock
 
-from memoria import MemoriaClient, MemoriaAuthError, MemoriaForbiddenError, MemoriaNotFoundError
-from memoria import MemoriaUnprocessableError, MemoriaValidationError
+from memoria import (
+    MemoriaAuthError,
+    MemoriaClient,
+    MemoriaForbiddenError,
+    MemoriaNotFoundError,
+    MemoriaUnprocessableError,
+    MemoriaValidationError,
+)
 from memoria.models import Memory, MemoryPage, PurgeResult, RetrieveResult
-from tests.conftest import BASE_URL, API_KEY, MEMORY_STUB
+from tests.conftest import API_KEY, BASE_URL, MEMORY_STUB
 
 
 @pytest.fixture
@@ -41,7 +49,6 @@ def test_store_with_all_params(httpx_mock: HTTPXMock, client: MemoriaClient) -> 
     assert mem.memory_id == "mem_abc123"
     req = httpx_mock.get_request()
     assert req is not None
-    import json
     body = json.loads(req.content)
     assert body["memory_type"] == "profile"
     assert body["session_id"] == "sess_1"
@@ -83,10 +90,9 @@ def test_store_batch_happy_path(httpx_mock: HTTPXMock, client: MemoriaClient) ->
     )
     assert len(mems) == 2
     # Verify the request body uses "memories" (not "items") to match the server contract
-    import json as _json
     req = httpx_mock.get_request()
     assert req is not None
-    body = _json.loads(req.content)
+    body = json.loads(req.content)
     assert "memories" in body
     assert "items" not in body
 
@@ -168,7 +174,6 @@ def test_structured_query(httpx_mock: HTTPXMock, client: MemoriaClient) -> None:
     request = httpx_mock.get_request()
     assert request is not None
     assert request.url.path == "/v1/memories/query"
-    import json
     body = json.loads(request.content)
     assert body["extra_metadata_filter"] == {"scene": "incident", "rank": 2}
     assert "query" not in body
@@ -182,6 +187,15 @@ def test_structured_query_requires_selector(client: MemoriaClient) -> None:
 def test_structured_query_rejects_nested_metadata(client: MemoriaClient) -> None:
     with pytest.raises(MemoriaValidationError, match="strings, numbers, or booleans"):
         client.memories.query(extra_metadata_filter={"nested": {"key": "value"}})
+
+
+def test_structured_query_rejects_invalid_key_and_oversized_value(
+    client: MemoriaClient,
+) -> None:
+    with pytest.raises(MemoriaValidationError, match="must start"):
+        client.memories.query(extra_metadata_filter={"1scene": "incident"})
+    with pytest.raises(MemoriaValidationError, match="1024"):
+        client.memories.query(extra_metadata_filter={"scene": "x" * 1025})
 
 
 # ---------------------------------------------------------------------------

@@ -2620,34 +2620,12 @@ impl MemoryService {
                 .await;
         }
 
-        // Trait-only fallback used by test doubles. Production uses the SQL path.
-        let mut memories = self.store.list_active(user_id, 501).await?;
-        if let Some(types) = options.memory_types.as_deref() {
-            memories.retain(|memory| types.contains(&memory.memory_type));
-        }
-        if let Some(session_id) = options.session_id.as_deref() {
-            memories.retain(|memory| memory.session_id.as_deref() == Some(session_id));
-        }
-        if let Some(trust_tier) = options.trust_tier.as_ref() {
-            memories.retain(|memory| &memory.trust_tier == trust_tier);
-        }
-        if let Some(subject_id) = options.subject_id.as_deref() {
-            memories.retain(|memory| memory.subject_id.as_deref() == Some(subject_id));
-        }
-        if let Some(cursor) = options.cursor.as_deref() {
-            memories.retain(|memory| memory.memory_id.as_str() < cursor);
-        }
-        memories.retain(|memory| {
-            options.extra_metadata_filter.iter().all(|(key, expected)| {
-                memory
-                    .extra_metadata
-                    .as_ref()
-                    .and_then(|metadata| metadata.get(key))
-                    == Some(expected)
-            })
-        });
-        memories.truncate(options.limit.clamp(1, 501) as usize);
-        Ok(memories)
+        // A bounded trait-level list cannot implement complete filtering or
+        // cursor pagination. Fail explicitly instead of returning plausible but
+        // incomplete results. Production configurations always provide SQL.
+        Err(MemoriaError::Internal(
+            "structured queries require a SQL-backed memory store".to_string(),
+        ))
     }
 
     pub async fn embed(&self, text: &str) -> Result<Option<Vec<f32>>, MemoriaError> {

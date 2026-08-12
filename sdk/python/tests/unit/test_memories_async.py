@@ -7,7 +7,7 @@ from pytest_httpx import HTTPXMock
 
 from memoria import AsyncMemoriaClient, MemoriaAuthError, MemoriaValidationError
 from memoria.models import Memory, MemoryPage, PurgeResult, RetrieveResult
-from tests.conftest import BASE_URL, API_KEY, MEMORY_STUB
+from tests.conftest import API_KEY, BASE_URL, MEMORY_STUB
 
 
 @pytest.fixture

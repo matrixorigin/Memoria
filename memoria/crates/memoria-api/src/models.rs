@@ -148,9 +148,11 @@ fn default_structured_query_limit() -> i64 {
     100
 }
 
-/// A pure structured query. All supplied selectors are combined with AND and
-/// extra_metadata values use exact, type-sensitive scalar equality.
+/// A pure structured query. All supplied selectors are combined with AND.
+/// Metadata equality preserves JSON type families (for example, string `"2"`
+/// does not equal number `2`); JSON numbers `2` and `2.0` may compare equal.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StructuredQueryRequest {
     #[serde(default)]
     pub extra_metadata_filter: HashMap<String, serde_json::Value>,
@@ -166,35 +168,11 @@ pub struct StructuredQueryRequest {
 
 impl StructuredQueryRequest {
     pub fn structured_options(&self) -> Result<memoria_service::StructuredQueryOptions, String> {
-        if self.extra_metadata_filter.len() > 16 {
-            return Err("extra_metadata_filter must not contain more than 16 fields".to_string());
+        if !(1..=500).contains(&self.limit) {
+            return Err("limit must be between 1 and 500".to_string());
         }
-        for (key, value) in &self.extra_metadata_filter {
-            if key.is_empty()
-                || key.len() > 64
-                || !key
-                    .chars()
-                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
-            {
-                return Err(format!(
-                    "extra_metadata_filter key '{key}' must contain only ASCII letters, digits, or underscore and be at most 64 characters"
-                ));
-            }
-            if value.is_null() || value.is_array() || value.is_object() {
-                return Err(format!(
-                    "extra_metadata_filter value for '{key}' must be a string, number, or boolean"
-                ));
-            }
-            if serde_json::to_string(value)
-                .map_err(|err| err.to_string())?
-                .len()
-                > 1024
-            {
-                return Err(format!(
-                    "extra_metadata_filter value for '{key}' must not exceed 1024 bytes"
-                ));
-            }
-        }
+        memoria_storage::validate_extra_metadata_filter(&self.extra_metadata_filter)
+            .map_err(|err| err.to_string())?;
 
         let subject_id = normalized(self.subject_id.as_deref());
         let session_id = normalized(self.session_id.as_deref());
@@ -221,7 +199,7 @@ impl StructuredQueryRequest {
         }
 
         Ok(memoria_service::StructuredQueryOptions {
-            limit: self.limit.clamp(1, 500),
+            limit: self.limit,
             memory_types,
             session_id,
             trust_tier,

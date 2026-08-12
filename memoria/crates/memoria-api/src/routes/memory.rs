@@ -188,7 +188,7 @@ pub async fn query_memories(
     Json(req): Json<StructuredQueryRequest>,
 ) -> ApiResult<ListResponse> {
     let branch = normalize_branch(req.branch.clone());
-    let limit = req.limit.clamp(1, 500);
+    let limit = req.limit;
     let mut options = req
         .structured_options()
         .map_err(|err| (StatusCode::UNPROCESSABLE_ENTITY, err))?;

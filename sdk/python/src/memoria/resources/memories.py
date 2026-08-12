@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import TYPE_CHECKING, Any
 
 from ..exceptions import MemoriaValidationError
@@ -43,14 +44,28 @@ def _validate_structured_query(
                 "query: extra_metadata_filter must not contain more than 16 fields"
             )
         for key, value in extra_metadata_filter.items():
-            if not key or len(key) > 64 or not key.replace("_", "").isalnum() or not key.isascii():
+            valid_key = (
+                bool(key)
+                and len(key.encode()) <= 64
+                and (key[0].isascii() and (key[0].isalpha() or key[0] == "_"))
+                and all(
+                    char.isascii() and (char.isalnum() or char == "_")
+                    for char in key[1:]
+                )
+            )
+            if not valid_key:
                 raise MemoriaValidationError(
-                    "query: extra_metadata_filter keys may contain only ASCII letters, "
-                    "digits, or underscore"
+                    "query: extra_metadata_filter keys must start with an ASCII letter or "
+                    "underscore and contain only ASCII letters, digits, or underscore"
                 )
             if not isinstance(value, (str, int, float, bool)):
                 raise MemoriaValidationError(
                     "query: extra_metadata_filter values must be strings, numbers, or booleans"
+                )
+            encoded_value = json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode()
+            if len(encoded_value) > 1024:
+                raise MemoriaValidationError(
+                    "query: extra_metadata_filter values must not exceed 1024 bytes"
                 )
 
 

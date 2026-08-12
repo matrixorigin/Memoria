@@ -458,6 +458,172 @@ async fn test_api_structured_query_by_extra_metadata() {
         .await
         .unwrap();
     assert_eq!(response.status(), 422);
+
+    for invalid_request in [
+        json!({"subject_id": "subject", "limit": 0}),
+        json!({"subject_id": "subject", "limit": 501}),
+        json!({"subject_id": "subject", "extra_metadata_filters": {"scene": "incident"}}),
+        json!({"extra_metadata_filter": {"1scene": "incident"}}),
+        json!({"extra_metadata_filter": {"scene": "x".repeat(1025)}}),
+    ] {
+        let response = client
+            .post(format!("{base}/v1/memories/query"))
+            .header("X-User-Id", &user_id)
+            .json(&invalid_request)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 422, "request: {invalid_request}");
+    }
+}
+
+#[tokio::test]
+async fn test_api_structured_query_cursor_and_subject_isolation() {
+    let (base, client, _server) = spawn_server().await;
+    let user_id = uid();
+    let matching_subject = format!("subject_{}", uuid::Uuid::new_v4().simple());
+    let other_subject = format!("subject_{}", uuid::Uuid::new_v4().simple());
+    let marker = format!("marker_{}", uuid::Uuid::new_v4().simple());
+    let mut expected_ids = std::collections::HashSet::new();
+
+    for index in 0..3 {
+        let response = client
+            .post(format!("{base}/v1/memories"))
+            .header("X-User-Id", &user_id)
+            .json(&json!({
+                "content": format!("structured page {index}"),
+                "subject_id": matching_subject,
+                "extra_metadata": {"marker": marker}
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 201);
+        expected_ids.insert(
+            response.json::<Value>().await.unwrap()["memory_id"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+        );
+    }
+
+    let response = client
+        .post(format!("{base}/v1/memories"))
+        .header("X-User-Id", &user_id)
+        .json(&json!({
+            "content": "same marker, other subject",
+            "subject_id": other_subject,
+            "extra_metadata": {"marker": marker}
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 201);
+
+    let first = client
+        .post(format!("{base}/v1/memories/query"))
+        .header("X-User-Id", &user_id)
+        .json(&json!({
+            "extra_metadata_filter": {"marker": marker},
+            "subject_id": matching_subject,
+            "limit": 2
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(first.status(), 200);
+    let first: Value = first.json().await.unwrap();
+    let cursor = first["next_cursor"].as_str().expect("first page cursor");
+    let first_ids: std::collections::HashSet<String> = first["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item["memory_id"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(first_ids.len(), 2);
+
+    let second = client
+        .post(format!("{base}/v1/memories/query"))
+        .header("X-User-Id", &user_id)
+        .json(&json!({
+            "extra_metadata_filter": {"marker": marker},
+            "subject_id": matching_subject,
+            "limit": 2,
+            "cursor": cursor
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(second.status(), 200);
+    let second: Value = second.json().await.unwrap();
+    assert!(second["next_cursor"].is_null());
+    let second_ids: std::collections::HashSet<String> = second["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item["memory_id"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(second_ids.len(), 1);
+    assert!(first_ids.is_disjoint(&second_ids));
+    assert_eq!(
+        first_ids
+            .union(&second_ids)
+            .cloned()
+            .collect::<std::collections::HashSet<_>>(),
+        expected_ids
+    );
+}
+
+#[tokio::test]
+async fn test_api_structured_query_on_branch() {
+    let (base, client, _server) = spawn_server().await;
+    let user_id = uid();
+    let branch = format!("query_{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
+    let marker = format!("branch_{}", uuid::Uuid::new_v4().simple());
+
+    let response = client
+        .post(format!("{base}/v1/branches"))
+        .header("X-User-Id", &user_id)
+        .json(&json!({"name": branch}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 201);
+
+    let response = client
+        .post(format!("{base}/v1/memories"))
+        .header("X-User-Id", &user_id)
+        .json(&json!({
+            "content": "structured branch only",
+            "branch": branch,
+            "extra_metadata": {"marker": marker}
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 201);
+
+    let branch_response = client
+        .post(format!("{base}/v1/memories/query"))
+        .header("X-User-Id", &user_id)
+        .json(&json!({"branch": branch, "extra_metadata_filter": {"marker": marker}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(branch_response.status(), 200);
+    let branch_body: Value = branch_response.json().await.unwrap();
+    assert_eq!(branch_body["items"].as_array().unwrap().len(), 1);
+
+    let main_response = client
+        .post(format!("{base}/v1/memories/query"))
+        .header("X-User-Id", &user_id)
+        .json(&json!({"extra_metadata_filter": {"marker": marker}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(main_response.status(), 200);
+    let main_body: Value = main_response.json().await.unwrap();
+    assert!(main_body["items"].as_array().unwrap().is_empty());
 }
 
 // ── 2b. list response is lightweight (no embedding) and respects limit ────────

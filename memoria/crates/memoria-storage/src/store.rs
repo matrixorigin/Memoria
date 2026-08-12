@@ -12,6 +12,47 @@ use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+pub const EXTRA_METADATA_FILTER_MAX_FIELDS: usize = 16;
+pub const EXTRA_METADATA_FILTER_MAX_KEY_BYTES: usize = 64;
+pub const EXTRA_METADATA_FILTER_MAX_VALUE_BYTES: usize = 1024;
+
+/// Validate the public structured-query metadata contract at the storage boundary.
+/// Keys become JSON paths, so the first character must be an ASCII letter or
+/// underscore and remaining characters are limited to ASCII alphanumerics/underscore.
+pub fn validate_extra_metadata_filter(
+    filter: &std::collections::HashMap<String, serde_json::Value>,
+) -> Result<(), MemoriaError> {
+    if filter.len() > EXTRA_METADATA_FILTER_MAX_FIELDS {
+        return Err(MemoriaError::Validation(format!(
+            "extra_metadata_filter must not contain more than {EXTRA_METADATA_FILTER_MAX_FIELDS} fields"
+        )));
+    }
+
+    for (key, value) in filter {
+        let mut chars = key.chars();
+        let valid_first = chars
+            .next()
+            .is_some_and(|ch| ch.is_ascii_alphabetic() || ch == '_');
+        let valid_rest = chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_');
+        if key.len() > EXTRA_METADATA_FILTER_MAX_KEY_BYTES || !valid_first || !valid_rest {
+            return Err(MemoriaError::Validation(format!(
+                "extra_metadata_filter key '{key}' must start with an ASCII letter or underscore, contain only ASCII letters, digits, or underscore, and be at most {EXTRA_METADATA_FILTER_MAX_KEY_BYTES} bytes"
+            )));
+        }
+        if value.is_null() || value.is_array() || value.is_object() {
+            return Err(MemoriaError::Validation(format!(
+                "extra_metadata_filter value for '{key}' must be a string, number, or boolean"
+            )));
+        }
+        if serde_json::to_string(value)?.len() > EXTRA_METADATA_FILTER_MAX_VALUE_BYTES {
+            return Err(MemoriaError::Validation(format!(
+                "extra_metadata_filter value for '{key}' must not exceed {EXTRA_METADATA_FILTER_MAX_VALUE_BYTES} bytes"
+            )));
+        }
+    }
+    Ok(())
+}
+
 tokio::task_local! {
     /// Real user ID for per-user state (active branch).
     /// In group mode the "user_id" flowing through the service layer is the
@@ -5308,23 +5349,15 @@ impl SqlMemoryStore {
         subject_id: Option<&str>,
         extra_metadata_filter: &std::collections::HashMap<String, serde_json::Value>,
     ) -> Result<Vec<Memory>, MemoriaError> {
+        if !(1..=501).contains(&limit) {
+            return Err(MemoriaError::Validation(
+                "structured query storage limit must be between 1 and 501".to_string(),
+            ));
+        }
+        validate_extra_metadata_filter(extra_metadata_filter)?;
         let table = self.t(table);
-        let safe_limit = limit.clamp(1, 501);
         let mut metadata_filters: Vec<_> = extra_metadata_filter.iter().collect();
         metadata_filters.sort_by(|(left, _), (right, _)| left.cmp(right));
-
-        for (key, _) in &metadata_filters {
-            if key.is_empty()
-                || key.len() > 64
-                || !key
-                    .chars()
-                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
-            {
-                return Err(MemoriaError::Validation(format!(
-                    "extra_metadata_filter key '{key}' must contain only ASCII letters, digits, or underscore and be at most 64 characters"
-                )));
-            }
-        }
 
         let mut inner =
             format!("SELECT memory_id FROM {table} WHERE user_id = ? AND is_active = 1");
@@ -5382,7 +5415,7 @@ impl SqlMemoryStore {
         for (_, value) in metadata_filters {
             query = query.bind(serde_json::to_string(value)?);
         }
-        query = query.bind(safe_limit);
+        query = query.bind(limit);
         let rows = query.fetch_all(&self.pool).await.map_err(db_err)?;
         rows.iter().map(row_to_memory_lite).collect()
     }
@@ -6102,14 +6135,39 @@ fn build_safety_snapshot_name(db_name: Option<&str>, operation: &str) -> String 
 mod tests {
     use super::{
         classify_pool_health, detect_connection_anomaly, should_emit_saturated_warning,
-        ConnectionAnomalyKind, OwnedEditLogEntry, PoolHealthLevel, PoolHealthSnapshot,
-        SqlMemoryStore,
+        validate_extra_metadata_filter, ConnectionAnomalyKind, OwnedEditLogEntry, PoolHealthLevel,
+        PoolHealthSnapshot, SqlMemoryStore,
     };
     use sqlx::mysql::MySqlPoolOptions;
     use std::io::{self, Write};
     use std::sync::{Arc, Mutex, OnceLock};
 
     static LOG_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    #[test]
+    fn structured_metadata_filter_validation_is_enforced_at_storage_boundary() {
+        let valid = std::collections::HashMap::from([
+            ("_scene".to_string(), serde_json::json!("incident")),
+            ("rank2".to_string(), serde_json::json!(2)),
+        ]);
+        assert!(validate_extra_metadata_filter(&valid).is_ok());
+
+        for invalid in [
+            std::collections::HashMap::from([("1scene".to_string(), serde_json::json!(true))]),
+            std::collections::HashMap::from([("scene".to_string(), serde_json::json!([1]))]),
+            std::collections::HashMap::from([(
+                "scene".to_string(),
+                serde_json::json!("x".repeat(1025)),
+            )]),
+        ] {
+            assert!(validate_extra_metadata_filter(&invalid).is_err());
+        }
+
+        let too_many = (0..17)
+            .map(|index| (format!("key_{index}"), serde_json::json!(index)))
+            .collect();
+        assert!(validate_extra_metadata_filter(&too_many).is_err());
+    }
 
     #[test]
     fn saturated_warning_requires_full_delay_and_only_emits_once() {
