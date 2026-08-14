@@ -564,6 +564,47 @@ async fn test_api_fulltext_search_with_structured_prefilters() {
 }
 
 #[tokio::test]
+async fn test_api_fulltext_search_orders_by_score_then_memory_id() {
+    let (base, client, _server) = spawn_server().await;
+    let user_id = uid();
+    let primary = format!("primary{}", uuid::Uuid::new_v4().simple());
+    let secondary = format!("secondary{}", uuid::Uuid::new_v4().simple());
+
+    let high_id =
+        store_memory_unscoped(&client, &base, &user_id, &format!("{primary} {secondary}")).await;
+    let first_tie_id = store_memory_unscoped(&client, &base, &user_id, &primary).await;
+    let second_tie_id = store_memory_unscoped(&client, &base, &user_id, &primary).await;
+
+    let body = wait_for_api_payload_contains(
+        &client,
+        &base,
+        &user_id,
+        "/v1/memories/fulltext-search",
+        json!({"query": format!("{primary} {secondary}"), "limit": 10}),
+        &[&high_id, &first_tie_id, &second_tie_id],
+    )
+    .await;
+    let items = body.as_array().expect("fulltext response array");
+    assert_eq!(
+        items.len(),
+        3,
+        "all ranked fixtures must be returned: {body}"
+    );
+    assert_eq!(items[0]["memory_id"], high_id);
+
+    let high_score = items[0]["retrieval_score"].as_f64().unwrap();
+    let first_tie_score = items[1]["retrieval_score"].as_f64().unwrap();
+    let second_tie_score = items[2]["retrieval_score"].as_f64().unwrap();
+    assert!(high_score > first_tie_score);
+    assert_eq!(first_tie_score, second_tie_score);
+
+    let mut expected_tie_ids = [first_tie_id, second_tie_id];
+    expected_tie_ids.sort_by(|left, right| right.cmp(left));
+    assert_eq!(items[1]["memory_id"], expected_tie_ids[0]);
+    assert_eq!(items[2]["memory_id"], expected_tie_ids[1]);
+}
+
+#[tokio::test]
 async fn test_api_fulltext_search_on_branch_is_isolated_from_main() {
     let (base, client, _server) = spawn_server().await;
     let user_id = uid();

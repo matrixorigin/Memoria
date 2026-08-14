@@ -20,6 +20,14 @@ _EXTRA_METADATA_FILTER_MAX_VALUE_BYTES = 1024
 _FULLTEXT_QUERY_MAX_BYTES = 4096
 _FULLTEXT_SEARCH_DEFAULT_LIMIT = 20
 _FULLTEXT_SEARCH_MAX_LIMIT = 100
+_MEMORY_TYPE_NAMES = {
+    "semantic",
+    "working",
+    "episodic",
+    "profile",
+    "tool_result",
+    "procedural",
+}
 
 
 def _strip_none(d: dict[str, Any]) -> dict[str, Any]:
@@ -41,9 +49,15 @@ def _validate_fulltext_metadata_filter(
     for key, value in extra_metadata_filter.items():
         if not isinstance(key, str):
             raise MemoriaValidationError("extra_metadata_filter keys must be strings")
+        try:
+            key_bytes = len(key.encode("utf-8"))
+        except UnicodeEncodeError as error:
+            raise MemoriaValidationError(
+                "extra_metadata_filter keys must be valid UTF-8"
+            ) from error
         valid_key = (
             bool(key)
-            and len(key.encode()) <= _EXTRA_METADATA_FILTER_MAX_KEY_BYTES
+            and key_bytes <= _EXTRA_METADATA_FILTER_MAX_KEY_BYTES
             and (key[0].isascii() and (key[0].isalpha() or key[0] == "_"))
             and all(char.isascii() and (char.isalnum() or char == "_") for char in key[1:])
         )
@@ -58,12 +72,46 @@ def _validate_fulltext_metadata_filter(
             )
         if isinstance(value, float) and not math.isfinite(value):
             raise MemoriaValidationError("extra_metadata_filter numeric values must be finite")
-        encoded_value = json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode()
+        try:
+            encoded_value = json.dumps(
+                value, ensure_ascii=False, separators=(",", ":")
+            ).encode("utf-8")
+        except (ValueError, UnicodeEncodeError) as error:
+            raise MemoriaValidationError(
+                "extra_metadata_filter values must be valid JSON scalars encoded as UTF-8"
+            ) from error
         if len(encoded_value) > _EXTRA_METADATA_FILTER_MAX_VALUE_BYTES:
             raise MemoriaValidationError(
                 "extra_metadata_filter values must not exceed "
                 f"{_EXTRA_METADATA_FILTER_MAX_VALUE_BYTES} bytes"
             )
+
+
+def _normalize_fulltext_memory_types(
+    memory_types: list[str] | None,
+) -> list[str] | None:
+    if memory_types is None:
+        return None
+    if not isinstance(memory_types, list):
+        raise MemoriaValidationError("fulltext_search: memory_types must be a list")
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for value in memory_types:
+        if not isinstance(value, str):
+            raise MemoriaValidationError(
+                "fulltext_search: memory_types entries must be strings"
+            )
+        value = value.strip()
+        if not value:
+            continue
+        if value not in _MEMORY_TYPE_NAMES:
+            raise MemoriaValidationError(
+                f"fulltext_search: unknown memory type: {value}"
+            )
+        if value not in seen:
+            seen.add(value)
+            normalized.append(value)
+    return normalized or None
 
 
 def _validate_fulltext_search(
@@ -75,7 +123,8 @@ def _validate_fulltext_search(
     session_id: str | None,
     trust_tier: str | None,
     branch: str | None,
-) -> None:
+    memory_types: list[str] | None,
+) -> list[str] | None:
     if type(limit) is not int or limit < 1 or limit > _FULLTEXT_SEARCH_MAX_LIMIT:
         raise MemoriaValidationError(
             f"fulltext_search: limit must be between 1 and {_FULLTEXT_SEARCH_MAX_LIMIT}"
@@ -104,6 +153,7 @@ def _validate_fulltext_search(
         _validate_fulltext_metadata_filter(extra_metadata_filter)
     except MemoriaValidationError as error:
         raise MemoriaValidationError(f"fulltext_search: {error}") from error
+    return _normalize_fulltext_memory_types(memory_types)
 
 
 class MemoriesResource:
@@ -214,7 +264,7 @@ class MemoriesResource:
         scoping, unscoped memories are not included. Metadata equality preserves
         JSON type families: number ``2`` may equal ``2.0`` but not string ``"2"``.
         """
-        _validate_fulltext_search(
+        memory_types = _validate_fulltext_search(
             query,
             extra_metadata_filter,
             limit,
@@ -222,6 +272,7 @@ class MemoriesResource:
             session_id=session_id,
             trust_tier=trust_tier,
             branch=branch,
+            memory_types=memory_types,
         )
         body = _strip_none(
             {
@@ -469,7 +520,7 @@ class AsyncMemoriesResource:
         scoping, unscoped memories are not included. Metadata equality preserves
         JSON type families: number ``2`` may equal ``2.0`` but not string ``"2"``.
         """
-        _validate_fulltext_search(
+        memory_types = _validate_fulltext_search(
             query,
             extra_metadata_filter,
             limit,
@@ -477,6 +528,7 @@ class AsyncMemoriesResource:
             session_id=session_id,
             trust_tier=trust_tier,
             branch=branch,
+            memory_types=memory_types,
         )
         body = _strip_none(
             {

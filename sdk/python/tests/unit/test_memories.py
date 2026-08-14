@@ -145,7 +145,7 @@ def test_fulltext_search_with_structured_filters(
         "MatrixOne database",
         extra_metadata_filter={"scene": "incident", "rank": 2},
         subject_id="subject_1",
-        memory_types=["semantic"],
+        memory_types=["semantic", " semantic ", "semantic"],
         session_id="session_1",
         trust_tier="T2",
         branch="experiment",
@@ -160,6 +160,7 @@ def test_fulltext_search_with_structured_filters(
     assert request.url.path == "/v1/memories/fulltext-search"
     body = json.loads(request.content)
     assert body["extra_metadata_filter"] == {"scene": "incident", "rank": 2}
+    assert body["memory_types"] == ["semantic"]
     assert body["branch"] == "experiment"
 
 
@@ -210,6 +211,26 @@ def test_fulltext_search_rejects_invalid_metadata_container_or_key(
     with pytest.raises(MemoriaValidationError, match="dictionary|keys must be strings"):
         client.memories.fulltext_search(
             "valid", extra_metadata_filter=metadata  # type: ignore[arg-type]
+        )
+
+
+@pytest.mark.parametrize(
+    "value", [10**5000, "\ud800"], ids=["large-integer", "lone-surrogate"]
+)
+def test_fulltext_search_translates_metadata_serialization_errors(
+    client: MemoriaClient, value: object
+) -> None:
+    with pytest.raises(MemoriaValidationError, match="valid JSON scalars"):
+        client.memories.fulltext_search("valid", extra_metadata_filter={"value": value})
+
+
+@pytest.mark.parametrize("memory_types", [["unknown"], [1], "semantic"])
+def test_fulltext_search_rejects_invalid_memory_types(
+    client: MemoriaClient, memory_types: object
+) -> None:
+    with pytest.raises(MemoriaValidationError, match="memory_types|memory type"):
+        client.memories.fulltext_search(
+            "valid", memory_types=memory_types  # type: ignore[arg-type]
         )
 
 
