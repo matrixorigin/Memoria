@@ -7,7 +7,7 @@ from pytest_httpx import HTTPXMock
 
 from memoria import AsyncMemoriaClient, MemoriaAuthError, MemoriaValidationError
 from memoria.models import Memory, MemoryPage, PurgeResult, RetrieveResult
-from tests.conftest import BASE_URL, API_KEY, MEMORY_STUB
+from tests.conftest import API_KEY, BASE_URL, MEMORY_STUB
 
 
 @pytest.fixture
@@ -44,6 +44,54 @@ async def test_list_happy_path(httpx_mock: HTTPXMock, client: AsyncMemoriaClient
     page = await client.memories.list(limit=10)
     assert isinstance(page, MemoryPage)
     assert page.next_cursor == "cursor_xyz"
+
+
+@pytest.mark.asyncio
+async def test_structured_query(httpx_mock: HTTPXMock, client: AsyncMemoriaClient) -> None:
+    response = {**MEMORY_STUB, "extra_metadata": {"scene": "incident"}}
+    httpx_mock.add_response(json={"items": [response], "next_cursor": None})
+    page = await client.memories.query(
+        extra_metadata_filter={"scene": "incident"}, trust_tier="T2"
+    )
+    assert page.items[0].extra_metadata == {"scene": "incident"}
+    request = httpx_mock.get_request()
+    assert request is not None
+    assert request.url.path == "/v1/memories/query"
+
+
+@pytest.mark.asyncio
+async def test_structured_query_accepts_branch_only(
+    httpx_mock: HTTPXMock, client: AsyncMemoriaClient
+) -> None:
+    httpx_mock.add_response(json={"items": [], "next_cursor": None})
+    page = await client.memories.query(branch="experiment")
+    assert page.items == []
+
+
+@pytest.mark.asyncio
+async def test_structured_query_rejects_blank_supplied_selector(
+    client: AsyncMemoriaClient,
+) -> None:
+    with pytest.raises(MemoriaValidationError, match="subject_id"):
+        await client.memories.query(
+            extra_metadata_filter={"scene": "incident"}, subject_id="   "
+        )
+
+
+@pytest.mark.asyncio
+async def test_structured_query_rejects_invalid_runtime_types(
+    client: AsyncMemoriaClient,
+) -> None:
+    with pytest.raises(MemoriaValidationError, match="limit must be an integer"):
+        await client.memories.query(
+            subject_id="subject",
+            limit="1",  # type: ignore[arg-type]
+        )
+    with pytest.raises(MemoriaValidationError, match="must be a dictionary"):
+        await client.memories.query(
+            subject_id="subject",
+            extra_metadata_filter=[("scene", "incident")],  # type: ignore[arg-type]
+        )
 
 
 @pytest.mark.asyncio

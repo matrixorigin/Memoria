@@ -2,13 +2,21 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 from pytest_httpx import HTTPXMock
 
-from memoria import MemoriaClient, MemoriaAuthError, MemoriaForbiddenError, MemoriaNotFoundError
-from memoria import MemoriaUnprocessableError, MemoriaValidationError
+from memoria import (
+    MemoriaAuthError,
+    MemoriaClient,
+    MemoriaForbiddenError,
+    MemoriaNotFoundError,
+    MemoriaUnprocessableError,
+    MemoriaValidationError,
+)
 from memoria.models import Memory, MemoryPage, PurgeResult, RetrieveResult
-from tests.conftest import BASE_URL, API_KEY, MEMORY_STUB
+from tests.conftest import API_KEY, BASE_URL, MEMORY_STUB
 
 
 @pytest.fixture
@@ -29,6 +37,29 @@ def test_store_happy_path(httpx_mock: HTTPXMock, client: MemoriaClient) -> None:
     assert mem.content == "test content"
 
 
+def test_memory_preserves_legacy_positional_field_order() -> None:
+    memory = Memory(
+        "mem_legacy",
+        "legacy content",
+        "semantic",
+        "T3",
+        0.65,
+        True,
+        "user_1",
+        "author_1",
+        "session_1",
+        None,
+        None,
+        0.75,
+    )
+
+    assert memory.author_id == "author_1"
+    assert memory.session_id == "session_1"
+    assert memory.retrieval_score == 0.75
+    assert memory.subject_id is None
+    assert memory.extra_metadata is None
+
+
 def test_store_with_all_params(httpx_mock: HTTPXMock, client: MemoriaClient) -> None:
     httpx_mock.add_response(json=MEMORY_STUB)
     mem = client.memories.store(
@@ -41,7 +72,6 @@ def test_store_with_all_params(httpx_mock: HTTPXMock, client: MemoriaClient) -> 
     assert mem.memory_id == "mem_abc123"
     req = httpx_mock.get_request()
     assert req is not None
-    import json
     body = json.loads(req.content)
     assert body["memory_type"] == "profile"
     assert body["session_id"] == "sess_1"
@@ -83,10 +113,9 @@ def test_store_batch_happy_path(httpx_mock: HTTPXMock, client: MemoriaClient) ->
     )
     assert len(mems) == 2
     # Verify the request body uses "memories" (not "items") to match the server contract
-    import json as _json
     req = httpx_mock.get_request()
     assert req is not None
-    body = _json.loads(req.content)
+    body = json.loads(req.content)
     assert "memories" in body
     assert "items" not in body
 
@@ -145,6 +174,134 @@ def test_list_with_cursor(httpx_mock: HTTPXMock, client: MemoriaClient) -> None:
 def test_list_over_max_limit_raises(client: MemoriaClient) -> None:
     with pytest.raises(MemoriaValidationError, match="500"):
         client.memories.list(limit=501)
+
+
+def test_structured_query(httpx_mock: HTTPXMock, client: MemoriaClient) -> None:
+    response = {
+        **MEMORY_STUB,
+        "subject_id": "subject_1",
+        "extra_metadata": {"scene": "incident", "rank": 2},
+    }
+    httpx_mock.add_response(json={"items": [response], "next_cursor": "next_id"})
+
+    page = client.memories.query(
+        extra_metadata_filter={"scene": "incident", "rank": 2},
+        subject_id="subject_1",
+        memory_types=["semantic", " semantic ", "semantic"],
+        limit=10,
+    )
+
+    assert page.items[0].subject_id == "subject_1"
+    assert page.items[0].extra_metadata == {"scene": "incident", "rank": 2}
+    assert page.next_cursor == "next_id"
+    request = httpx_mock.get_request()
+    assert request is not None
+    assert request.url.path == "/v1/memories/query"
+    body = json.loads(request.content)
+    assert body["extra_metadata_filter"] == {"scene": "incident", "rank": 2}
+    assert body["memory_types"] == ["semantic"]
+    assert "query" not in body
+
+
+def test_structured_query_requires_selector(client: MemoriaClient) -> None:
+    with pytest.raises(MemoriaValidationError, match="selector"):
+        client.memories.query()
+
+
+@pytest.mark.parametrize("limit", ["1", 1.5, True, None])
+def test_structured_query_rejects_non_integer_limit(client: MemoriaClient, limit: object) -> None:
+    with pytest.raises(MemoriaValidationError, match="limit must be an integer"):
+        client.memories.query(subject_id="subject", limit=limit)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("extra_metadata_filter", [[("scene", "incident")], "scene=incident"])
+def test_structured_query_rejects_non_dictionary_metadata_filter(
+    client: MemoriaClient, extra_metadata_filter: object
+) -> None:
+    with pytest.raises(MemoriaValidationError, match="must be a dictionary"):
+        client.memories.query(
+            subject_id="subject",
+            extra_metadata_filter=extra_metadata_filter,  # type: ignore[arg-type]
+        )
+
+
+def test_structured_query_accepts_branch_only(
+    httpx_mock: HTTPXMock, client: MemoriaClient
+) -> None:
+    httpx_mock.add_response(json={"items": [], "next_cursor": None})
+    page = client.memories.query(branch="experiment")
+    assert page.items == []
+    request = httpx_mock.get_request()
+    assert request is not None
+    assert json.loads(request.content)["branch"] == "experiment"
+
+
+def test_structured_query_rejects_nested_metadata(client: MemoriaClient) -> None:
+    with pytest.raises(MemoriaValidationError, match="strings, numbers, or booleans"):
+        client.memories.query(extra_metadata_filter={"nested": {"key": "value"}})
+
+
+def test_structured_query_rejects_invalid_key_and_oversized_value(
+    client: MemoriaClient,
+) -> None:
+    with pytest.raises(MemoriaValidationError, match="must start"):
+        client.memories.query(extra_metadata_filter={"1scene": "incident"})
+    with pytest.raises(MemoriaValidationError, match="1024"):
+        client.memories.query(extra_metadata_filter={"scene": "x" * 1025})
+
+
+def test_structured_query_reports_metadata_key_byte_limit(
+    client: MemoriaClient,
+) -> None:
+    with pytest.raises(MemoriaValidationError, match="64 bytes"):
+        client.memories.query(extra_metadata_filter={"a" * 65: "incident"})
+
+
+@pytest.mark.parametrize("memory_types", [["unknown"], [1], "semantic"])
+def test_structured_query_rejects_invalid_memory_types(
+    client: MemoriaClient, memory_types: object
+) -> None:
+    with pytest.raises(MemoriaValidationError, match="memory_types|memory type"):
+        client.memories.query(memory_types=memory_types)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"subject_id": "   "},
+        {"session_id": "   "},
+        {"trust_tier": "   "},
+        {"branch": "   "},
+        {"memory_types": []},
+        {"memory_types": ["semantic", "   "]},
+    ],
+)
+def test_structured_query_rejects_blank_supplied_selector(
+    client: MemoriaClient, kwargs: dict[str, object]
+) -> None:
+    with pytest.raises(MemoriaValidationError, match="empty|at least one"):
+        client.memories.query(
+            extra_metadata_filter={"scene": "incident"},
+            **kwargs,  # type: ignore[arg-type]
+        )
+
+
+@pytest.mark.parametrize(
+    "value", [10**5000, "\ud800"], ids=["large-integer", "lone-surrogate"]
+)
+def test_structured_query_translates_metadata_serialization_errors(
+    client: MemoriaClient, value: object
+) -> None:
+    with pytest.raises(MemoriaValidationError, match="valid JSON scalars"):
+        client.memories.query(extra_metadata_filter={"value": value})
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_structured_query_rejects_non_finite_metadata_number(
+    client: MemoriaClient, value: float
+) -> None:
+    with pytest.raises(MemoriaValidationError, match="finite"):
+        client.memories.query(extra_metadata_filter={"rank": value})
 
 
 # ---------------------------------------------------------------------------

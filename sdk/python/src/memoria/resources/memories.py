@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import math
 from typing import TYPE_CHECKING, Any
 
 from ..exceptions import MemoriaValidationError
@@ -10,9 +12,142 @@ from ..models import Memory, MemoryPage, PurgeResult, RetrieveResult
 if TYPE_CHECKING:
     from .._http import _HttpTransport
 
+_MEMORY_TYPE_NAMES = {
+    "semantic",
+    "working",
+    "episodic",
+    "profile",
+    "tool_result",
+    "procedural",
+}
+
 
 def _strip_none(d: dict[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in d.items() if v is not None}
+
+
+def _normalize_query_memory_types(
+    memory_types: list[str] | None,
+) -> list[str] | None:
+    if memory_types is None:
+        return None
+    if not isinstance(memory_types, list):
+        raise MemoriaValidationError("query: memory_types must be a list")
+    if not memory_types:
+        raise MemoriaValidationError(
+            "query: memory_types must contain at least one value when provided"
+        )
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for value in memory_types:
+        if not isinstance(value, str):
+            raise MemoriaValidationError("query: memory_types entries must be strings")
+        value = value.strip()
+        if not value:
+            raise MemoriaValidationError("query: memory_types entries must not be empty")
+        if value not in _MEMORY_TYPE_NAMES:
+            raise MemoriaValidationError(f"query: unknown memory type: {value}")
+        if value not in seen:
+            seen.add(value)
+            normalized.append(value)
+    return normalized or None
+
+
+def _validate_structured_query(
+    *,
+    extra_metadata_filter: dict[str, Any] | None,
+    subject_id: str | None,
+    memory_types: list[str] | None,
+    session_id: str | None,
+    trust_tier: str | None,
+    branch: str | None,
+    limit: int,
+) -> tuple[
+    list[str] | None,
+    str | None,
+    str | None,
+    str | None,
+    str | None,
+]:
+    if type(limit) is not int:
+        raise MemoriaValidationError("query: limit must be an integer")
+    if limit < 1 or limit > 500:
+        raise MemoriaValidationError("query: limit must be between 1 and 500")
+    if extra_metadata_filter is not None and not isinstance(extra_metadata_filter, dict):
+        raise MemoriaValidationError("query: extra_metadata_filter must be a dictionary")
+    for name, value in [
+        ("subject_id", subject_id),
+        ("session_id", session_id),
+        ("trust_tier", trust_tier),
+        ("branch", branch),
+    ]:
+        if value is not None and (not isinstance(value, str) or not value.strip()):
+            raise MemoriaValidationError(f"query: {name} must be a non-empty string when provided")
+    subject_id = subject_id.strip() if subject_id is not None else None
+    session_id = session_id.strip() if session_id is not None else None
+    trust_tier = trust_tier.strip() if trust_tier is not None else None
+    branch = branch.strip() if branch is not None else None
+    memory_types = _normalize_query_memory_types(memory_types)
+    has_selector = any(
+        [
+            bool(extra_metadata_filter),
+            bool(subject_id and subject_id.strip()),
+            bool(memory_types),
+            bool(session_id and session_id.strip()),
+            bool(trust_tier and trust_tier.strip()),
+            bool(branch and branch.strip()),
+        ]
+    )
+    if not has_selector:
+        raise MemoriaValidationError("query: at least one filter selector is required")
+    if extra_metadata_filter is not None:
+        if len(extra_metadata_filter) > 16:
+            raise MemoriaValidationError(
+                "query: extra_metadata_filter must not contain more than 16 fields"
+            )
+        for key, value in extra_metadata_filter.items():
+            if not isinstance(key, str):
+                raise MemoriaValidationError("query: extra_metadata_filter keys must be strings")
+            try:
+                key_bytes = len(key.encode("utf-8"))
+            except UnicodeEncodeError as error:
+                raise MemoriaValidationError(
+                    "query: extra_metadata_filter keys must be valid UTF-8"
+                ) from error
+            valid_key = (
+                bool(key)
+                and key_bytes <= 64
+                and (key[0].isascii() and (key[0].isalpha() or key[0] == "_"))
+                and all(char.isascii() and (char.isalnum() or char == "_") for char in key[1:])
+            )
+            if not valid_key:
+                raise MemoriaValidationError(
+                    "query: extra_metadata_filter keys must start with an ASCII letter or "
+                    "underscore, contain only ASCII letters, digits, or underscore, and "
+                    "must not exceed 64 bytes"
+                )
+            if not isinstance(value, (str, int, float, bool)):
+                raise MemoriaValidationError(
+                    "query: extra_metadata_filter values must be strings, numbers, or booleans"
+                )
+            if isinstance(value, float) and not math.isfinite(value):
+                raise MemoriaValidationError(
+                    "query: extra_metadata_filter numeric values must be finite"
+                )
+            try:
+                encoded_value = json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode(
+                    "utf-8"
+                )
+            except (ValueError, UnicodeEncodeError) as error:
+                raise MemoriaValidationError(
+                    "query: extra_metadata_filter values must be valid JSON scalars "
+                    "encoded as UTF-8"
+                ) from error
+            if len(encoded_value) > 1024:
+                raise MemoriaValidationError(
+                    "query: extra_metadata_filter values must not exceed 1024 bytes"
+                )
+    return memory_types, subject_id, session_id, trust_tier, branch
 
 
 class MemoriesResource:
@@ -128,6 +263,43 @@ class MemoriesResource:
             }
         )
         data = self._client._request("GET", "/v1/memories", params=params)
+        return MemoryPage.from_dict(data)
+
+    def query(
+        self,
+        *,
+        extra_metadata_filter: dict[str, Any] | None = None,
+        subject_id: str | None = None,
+        memory_types: list[str] | None = None,
+        session_id: str | None = None,
+        trust_tier: str | None = None,
+        branch: str | None = None,
+        limit: int = 100,
+        cursor: str | None = None,
+    ) -> MemoryPage:
+        """Run an exact structured query without vector or keyword retrieval."""
+        memory_types, subject_id, session_id, trust_tier, branch = _validate_structured_query(
+            extra_metadata_filter=extra_metadata_filter,
+            subject_id=subject_id,
+            memory_types=memory_types,
+            session_id=session_id,
+            trust_tier=trust_tier,
+            branch=branch,
+            limit=limit,
+        )
+        body = _strip_none(
+            {
+                "extra_metadata_filter": extra_metadata_filter,
+                "subject_id": subject_id,
+                "memory_types": memory_types,
+                "session_id": session_id,
+                "trust_tier": trust_tier,
+                "branch": branch,
+                "limit": limit,
+                "cursor": cursor,
+            }
+        )
+        data = self._client._request("POST", "/v1/memories/query", json=body)
         return MemoryPage.from_dict(data)
 
     def correct(
@@ -341,6 +513,43 @@ class AsyncMemoriesResource:
             }
         )
         data = await self._client._arequest("GET", "/v1/memories", params=params)
+        return MemoryPage.from_dict(data)
+
+    async def query(
+        self,
+        *,
+        extra_metadata_filter: dict[str, Any] | None = None,
+        subject_id: str | None = None,
+        memory_types: list[str] | None = None,
+        session_id: str | None = None,
+        trust_tier: str | None = None,
+        branch: str | None = None,
+        limit: int = 100,
+        cursor: str | None = None,
+    ) -> MemoryPage:
+        """Run an exact structured query without vector or keyword retrieval."""
+        memory_types, subject_id, session_id, trust_tier, branch = _validate_structured_query(
+            extra_metadata_filter=extra_metadata_filter,
+            subject_id=subject_id,
+            memory_types=memory_types,
+            session_id=session_id,
+            trust_tier=trust_tier,
+            branch=branch,
+            limit=limit,
+        )
+        body = _strip_none(
+            {
+                "extra_metadata_filter": extra_metadata_filter,
+                "subject_id": subject_id,
+                "memory_types": memory_types,
+                "session_id": session_id,
+                "trust_tier": trust_tier,
+                "branch": branch,
+                "limit": limit,
+                "cursor": cursor,
+            }
+        )
+        data = await self._client._arequest("POST", "/v1/memories/query", json=body)
         return MemoryPage.from_dict(data)
 
     async def correct(

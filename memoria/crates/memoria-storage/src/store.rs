@@ -12,6 +12,47 @@ use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+pub const EXTRA_METADATA_FILTER_MAX_FIELDS: usize = 16;
+pub const EXTRA_METADATA_FILTER_MAX_KEY_BYTES: usize = 64;
+pub const EXTRA_METADATA_FILTER_MAX_VALUE_BYTES: usize = 1024;
+
+/// Validate the public structured-query metadata contract at the storage boundary.
+/// Keys become JSON paths, so the first character must be an ASCII letter or
+/// underscore and remaining characters are limited to ASCII alphanumerics/underscore.
+pub fn validate_extra_metadata_filter(
+    filter: &std::collections::HashMap<String, serde_json::Value>,
+) -> Result<(), MemoriaError> {
+    if filter.len() > EXTRA_METADATA_FILTER_MAX_FIELDS {
+        return Err(MemoriaError::Validation(format!(
+            "extra_metadata_filter must not contain more than {EXTRA_METADATA_FILTER_MAX_FIELDS} fields"
+        )));
+    }
+
+    for (key, value) in filter {
+        let mut chars = key.chars();
+        let valid_first = chars
+            .next()
+            .is_some_and(|ch| ch.is_ascii_alphabetic() || ch == '_');
+        let valid_rest = chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_');
+        if key.len() > EXTRA_METADATA_FILTER_MAX_KEY_BYTES || !valid_first || !valid_rest {
+            return Err(MemoriaError::Validation(format!(
+                "extra_metadata_filter key '{key}' must start with an ASCII letter or underscore, contain only ASCII letters, digits, or underscore, and be at most {EXTRA_METADATA_FILTER_MAX_KEY_BYTES} bytes"
+            )));
+        }
+        if value.is_null() || value.is_array() || value.is_object() {
+            return Err(MemoriaError::Validation(format!(
+                "extra_metadata_filter value for '{key}' must be a string, number, or boolean"
+            )));
+        }
+        if serde_json::to_string(value)?.len() > EXTRA_METADATA_FILTER_MAX_VALUE_BYTES {
+            return Err(MemoriaError::Validation(format!(
+                "extra_metadata_filter value for '{key}' must not exceed {EXTRA_METADATA_FILTER_MAX_VALUE_BYTES} bytes"
+            )));
+        }
+    }
+    Ok(())
+}
+
 tokio::task_local! {
     /// Real user ID for per-user state (active branch).
     /// In group mode the "user_id" flowing through the service layer is the
@@ -5293,6 +5334,92 @@ impl SqlMemoryStore {
         rows.iter().map(row_to_memory_lite).collect()
     }
 
+    /// Exact structured query over ordinary columns and scalar extra_metadata fields.
+    /// This intentionally bypasses all vector/fulltext retrieval machinery.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn query_active_structured_lite(
+        &self,
+        table: &str,
+        user_id: &str,
+        limit: i64,
+        memory_types: Option<&[MemoryType]>,
+        session_id: Option<&str>,
+        trust_tier: Option<&str>,
+        cursor: Option<&str>,
+        subject_id: Option<&str>,
+        extra_metadata_filter: &std::collections::HashMap<String, serde_json::Value>,
+    ) -> Result<Vec<Memory>, MemoriaError> {
+        if !(1..=501).contains(&limit) {
+            return Err(MemoriaError::Validation(
+                "structured query storage limit must be between 1 and 501".to_string(),
+            ));
+        }
+        validate_extra_metadata_filter(extra_metadata_filter)?;
+        let table = self.t(table);
+        let mut metadata_filters: Vec<_> = extra_metadata_filter.iter().collect();
+        metadata_filters.sort_by(|(left, _), (right, _)| left.cmp(right));
+
+        let mut inner =
+            format!("SELECT memory_id FROM {table} WHERE user_id = ? AND is_active = 1");
+        if let Some(types) = memory_types.filter(|types| !types.is_empty()) {
+            inner.push_str(" AND memory_type IN (");
+            inner.push_str(&vec!["?"; types.len()].join(", "));
+            inner.push(')');
+        }
+        if session_id.is_some() {
+            inner.push_str(" AND session_id = ?");
+        }
+        if trust_tier.is_some() {
+            inner.push_str(" AND trust_tier = ?");
+        }
+        if subject_id.is_some() {
+            inner.push_str(" AND subject_id = ?");
+        }
+        if cursor.is_some() {
+            inner.push_str(" AND memory_id < ?");
+        }
+        for (key, _) in &metadata_filters {
+            inner.push_str(&format!(
+                " AND json_extract(extra_metadata, '$.{key}') = CAST(? AS JSON)"
+            ));
+        }
+        inner.push_str(" ORDER BY memory_id DESC LIMIT ?");
+
+        let sql = format!(
+            "SELECT memory_id, user_id, author_id, subject_id, memory_type, content, \
+             session_id, is_active, superseded_by, trust_tier, \
+             initial_confidence, observed_at, created_at, updated_at, \
+             CAST(extra_metadata AS CHAR) AS extra_meta \
+             FROM {table} WHERE memory_id IN ({inner}) \
+             ORDER BY memory_id DESC"
+        );
+
+        let mut query = sqlx::query(&sql).bind(user_id);
+        if let Some(types) = memory_types.filter(|types| !types.is_empty()) {
+            for memory_type in types {
+                query = query.bind(memory_type.to_string());
+            }
+        }
+        if let Some(value) = session_id {
+            query = query.bind(value);
+        }
+        if let Some(value) = trust_tier {
+            query = query.bind(value);
+        }
+        if let Some(value) = subject_id {
+            query = query.bind(value);
+        }
+        if let Some(value) = cursor {
+            query = query.bind(value);
+        }
+        for (_, value) in metadata_filters {
+            query = query.bind(serde_json::to_string(value)?);
+        }
+        query = query.bind(limit);
+        let rows = query.fetch_all(&self.pool).await.map_err(db_err)?;
+        rows.iter().map(row_to_memory_lite).collect()
+    }
+
     /// Find memory IDs whose content contains `topic` (exact substring match).
     /// Uses fulltext boolean MUST with LIKE refinement. Requires topic >= 3 chars.
     pub async fn find_ids_by_topic(
@@ -6008,14 +6135,39 @@ fn build_safety_snapshot_name(db_name: Option<&str>, operation: &str) -> String 
 mod tests {
     use super::{
         classify_pool_health, detect_connection_anomaly, should_emit_saturated_warning,
-        ConnectionAnomalyKind, OwnedEditLogEntry, PoolHealthLevel, PoolHealthSnapshot,
-        SqlMemoryStore,
+        validate_extra_metadata_filter, ConnectionAnomalyKind, OwnedEditLogEntry, PoolHealthLevel,
+        PoolHealthSnapshot, SqlMemoryStore,
     };
     use sqlx::mysql::MySqlPoolOptions;
     use std::io::{self, Write};
     use std::sync::{Arc, Mutex, OnceLock};
 
     static LOG_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    #[test]
+    fn structured_metadata_filter_validation_is_enforced_at_storage_boundary() {
+        let valid = std::collections::HashMap::from([
+            ("_scene".to_string(), serde_json::json!("incident")),
+            ("rank2".to_string(), serde_json::json!(2)),
+        ]);
+        assert!(validate_extra_metadata_filter(&valid).is_ok());
+
+        for invalid in [
+            std::collections::HashMap::from([("1scene".to_string(), serde_json::json!(true))]),
+            std::collections::HashMap::from([("scene".to_string(), serde_json::json!([1]))]),
+            std::collections::HashMap::from([(
+                "scene".to_string(),
+                serde_json::json!("x".repeat(1025)),
+            )]),
+        ] {
+            assert!(validate_extra_metadata_filter(&invalid).is_err());
+        }
+
+        let too_many = (0..17)
+            .map(|index| (format!("key_{index}"), serde_json::json!(index)))
+            .collect();
+        assert!(validate_extra_metadata_filter(&too_many).is_err());
+    }
 
     #[test]
     fn saturated_warning_requires_full_delay_and_only_emits_once() {
