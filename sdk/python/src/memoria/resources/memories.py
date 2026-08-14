@@ -104,7 +104,9 @@ def _normalize_fulltext_memory_types(
             )
         value = value.strip()
         if not value:
-            continue
+            raise MemoriaValidationError(
+                "fulltext_search: memory_types entries must not be empty when provided"
+            )
         if value not in _MEMORY_TYPE_NAMES:
             raise MemoriaValidationError(
                 f"fulltext_search: unknown memory type: {value}"

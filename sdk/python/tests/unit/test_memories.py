@@ -240,7 +240,10 @@ def test_fulltext_search_translates_metadata_serialization_errors(
         client.memories.fulltext_search("valid", extra_metadata_filter={"value": value})
 
 
-@pytest.mark.parametrize("memory_types", [["unknown"], [1], "semantic"])
+@pytest.mark.parametrize(
+    "memory_types",
+    [["unknown"], [1], "semantic", ["   "], ["semantic", ""]],
+)
 def test_fulltext_search_rejects_invalid_memory_types(
     client: MemoriaClient, memory_types: object
 ) -> None:

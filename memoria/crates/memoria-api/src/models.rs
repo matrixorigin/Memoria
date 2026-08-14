@@ -83,6 +83,15 @@ fn parse_memory_types_opt(types: Option<&Vec<String>>) -> Result<Option<Vec<Memo
     Ok(parsed)
 }
 
+fn parse_fulltext_memory_types_opt(
+    types: Option<&Vec<String>>,
+) -> Result<Option<Vec<MemoryType>>, String> {
+    if types.is_some_and(|types| types.iter().any(|value| value.trim().is_empty())) {
+        return Err("memory_types entries must not be empty when provided".to_string());
+    }
+    parse_memory_types_opt(types)
+}
+
 impl RetrieveRequest {
     pub fn session_scope(&self) -> Result<Option<memoria_service::SessionScope>, String> {
         parse_session_scope(self.session_scope.as_deref())
@@ -188,7 +197,7 @@ impl FulltextSearchRequest {
             .transpose()?;
         Ok(memoria_service::FulltextSearchOptions {
             limit: self.limit,
-            memory_types: parse_memory_types_opt(self.memory_types.as_ref())?,
+            memory_types: parse_fulltext_memory_types_opt(self.memory_types.as_ref())?,
             session_id,
             trust_tier,
             subject_id,
@@ -569,7 +578,9 @@ pub fn parse_trust_tier(s: &str) -> Result<TrustTier, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_memory_types_opt, PurgeRequest, PurgeSelector};
+    use super::{
+        parse_fulltext_memory_types_opt, parse_memory_types_opt, PurgeRequest, PurgeSelector,
+    };
     use memoria_core::MemoryType;
 
     #[test]
@@ -585,6 +596,15 @@ mod tests {
             parse_memory_types_opt(Some(&raw)).unwrap(),
             Some(vec![MemoryType::Semantic, MemoryType::Profile])
         );
+    }
+
+    #[test]
+    fn fulltext_memory_type_parser_rejects_blank_entries_but_allows_empty_arrays() {
+        let blank = vec!["semantic".to_string(), "   ".to_string()];
+        assert!(parse_fulltext_memory_types_opt(Some(&blank)).is_err());
+
+        let empty = vec![];
+        assert_eq!(parse_fulltext_memory_types_opt(Some(&empty)).unwrap(), None);
     }
 
     #[test]

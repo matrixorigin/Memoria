@@ -535,6 +535,8 @@ async fn test_api_fulltext_search_with_structured_prefilters() {
         json!({"query": "valid", "subject_id": "   "}),
         json!({"query": "valid", "trust_tier": "   "}),
         json!({"query": "valid", "branch": "   "}),
+        json!({"query": "valid", "memory_types": ["   "]}),
+        json!({"query": "valid", "memory_types": ["semantic", ""]}),
         json!({"query": "a".repeat(memoria_storage::FULLTEXT_QUERY_MAX_BYTES + 1)}),
         json!({"query": "valid", "extra_metadata_filters": {"scene": "incident"}}),
         json!({"query": "valid", "extra_metadata_filter": {"nested": {"value": 1}}}),
