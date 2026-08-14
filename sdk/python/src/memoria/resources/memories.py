@@ -12,9 +12,41 @@ from ..models import Memory, MemoryPage, PurgeResult, RetrieveResult
 if TYPE_CHECKING:
     from .._http import _HttpTransport
 
+_MEMORY_TYPE_NAMES = {
+    "semantic",
+    "working",
+    "episodic",
+    "profile",
+    "tool_result",
+    "procedural",
+}
+
 
 def _strip_none(d: dict[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in d.items() if v is not None}
+
+
+def _normalize_query_memory_types(
+    memory_types: list[str] | None,
+) -> list[str] | None:
+    if memory_types is None:
+        return None
+    if not isinstance(memory_types, list):
+        raise MemoriaValidationError("query: memory_types must be a list")
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for value in memory_types:
+        if not isinstance(value, str):
+            raise MemoriaValidationError("query: memory_types entries must be strings")
+        value = value.strip()
+        if not value:
+            continue
+        if value not in _MEMORY_TYPE_NAMES:
+            raise MemoriaValidationError(f"query: unknown memory type: {value}")
+        if value not in seen:
+            seen.add(value)
+            normalized.append(value)
+    return normalized or None
 
 
 def _validate_structured_query(
@@ -26,14 +58,15 @@ def _validate_structured_query(
     trust_tier: str | None,
     branch: str | None,
     limit: int,
-) -> None:
+) -> list[str] | None:
     if limit < 1 or limit > 500:
         raise MemoriaValidationError("query: limit must be between 1 and 500")
+    memory_types = _normalize_query_memory_types(memory_types)
     has_selector = any(
         [
             bool(extra_metadata_filter),
             bool(subject_id and subject_id.strip()),
-            bool(memory_types and any(item.strip() for item in memory_types)),
+            bool(memory_types),
             bool(session_id and session_id.strip()),
             bool(trust_tier and trust_tier.strip()),
             bool(branch and branch.strip()),
@@ -75,6 +108,7 @@ def _validate_structured_query(
                 raise MemoriaValidationError(
                     "query: extra_metadata_filter values must not exceed 1024 bytes"
                 )
+    return memory_types
 
 
 class MemoriesResource:
@@ -205,7 +239,7 @@ class MemoriesResource:
         cursor: str | None = None,
     ) -> MemoryPage:
         """Run an exact structured query without vector or keyword retrieval."""
-        _validate_structured_query(
+        memory_types = _validate_structured_query(
             extra_metadata_filter=extra_metadata_filter,
             subject_id=subject_id,
             memory_types=memory_types,
@@ -455,7 +489,7 @@ class AsyncMemoriesResource:
         cursor: str | None = None,
     ) -> MemoryPage:
         """Run an exact structured query without vector or keyword retrieval."""
-        _validate_structured_query(
+        memory_types = _validate_structured_query(
             extra_metadata_filter=extra_metadata_filter,
             subject_id=subject_id,
             memory_types=memory_types,

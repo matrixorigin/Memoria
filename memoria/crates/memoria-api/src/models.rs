@@ -68,7 +68,7 @@ fn parse_session_scope(
 fn parse_memory_types_opt(
     types: Option<&Vec<String>>,
 ) -> Result<Option<Vec<MemoryType>>, String> {
-    types
+    let mut parsed = types
         .map(|ts| {
             ts.iter()
                 .map(|s| s.trim())
@@ -77,7 +77,12 @@ fn parse_memory_types_opt(
                 .collect::<Result<Vec<_>, _>>()
         })
         .transpose()
-        .map(|v| v.filter(|t| !t.is_empty()))
+        .map(|v| v.filter(|t| !t.is_empty()))?;
+    if let Some(types) = parsed.as_mut() {
+        let mut seen = std::collections::HashSet::new();
+        types.retain(|memory_type| seen.insert(memory_type.clone()));
+    }
+    Ok(parsed)
 }
 
 impl RetrieveRequest {
@@ -574,7 +579,23 @@ pub fn parse_trust_tier(s: &str) -> Result<TrustTier, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{PurgeRequest, PurgeSelector};
+    use super::{parse_memory_types_opt, PurgeRequest, PurgeSelector};
+    use memoria_core::MemoryType;
+
+    #[test]
+    fn memory_type_parser_deduplicates_before_sql_option_construction() {
+        let raw = vec![
+            "semantic".to_string(),
+            " semantic ".to_string(),
+            "profile".to_string(),
+            "semantic".to_string(),
+        ];
+
+        assert_eq!(
+            parse_memory_types_opt(Some(&raw)).unwrap(),
+            Some(vec![MemoryType::Semantic, MemoryType::Profile])
+        );
+    }
 
     #[test]
     fn purge_selector_ignores_empty_arrays() {

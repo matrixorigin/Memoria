@@ -187,7 +187,7 @@ def test_structured_query(httpx_mock: HTTPXMock, client: MemoriaClient) -> None:
     page = client.memories.query(
         extra_metadata_filter={"scene": "incident", "rank": 2},
         subject_id="subject_1",
-        memory_types=["semantic"],
+        memory_types=["semantic", " semantic ", "semantic"],
         limit=10,
     )
 
@@ -199,6 +199,7 @@ def test_structured_query(httpx_mock: HTTPXMock, client: MemoriaClient) -> None:
     assert request.url.path == "/v1/memories/query"
     body = json.loads(request.content)
     assert body["extra_metadata_filter"] == {"scene": "incident", "rank": 2}
+    assert body["memory_types"] == ["semantic"]
     assert "query" not in body
 
 
@@ -237,6 +238,14 @@ def test_structured_query_reports_metadata_key_byte_limit(
 ) -> None:
     with pytest.raises(MemoriaValidationError, match="64 bytes"):
         client.memories.query(extra_metadata_filter={"a" * 65: "incident"})
+
+
+@pytest.mark.parametrize("memory_types", [["unknown"], [1], "semantic"])
+def test_structured_query_rejects_invalid_memory_types(
+    client: MemoriaClient, memory_types: object
+) -> None:
+    with pytest.raises(MemoriaValidationError, match="memory_types|memory type"):
+        client.memories.query(memory_types=memory_types)  # type: ignore[arg-type]
 
 
 @pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
