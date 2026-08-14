@@ -15,6 +15,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub const EXTRA_METADATA_FILTER_MAX_FIELDS: usize = 16;
 pub const EXTRA_METADATA_FILTER_MAX_KEY_BYTES: usize = 64;
 pub const EXTRA_METADATA_FILTER_MAX_VALUE_BYTES: usize = 1024;
+pub const FULLTEXT_SEARCH_DEFAULT_LIMIT: i64 = 20;
+pub const FULLTEXT_SEARCH_MAX_LIMIT: i64 = 100;
+pub const FULLTEXT_QUERY_MAX_BYTES: usize = 4096;
 
 /// Validate the public structured-query metadata contract at the storage boundary.
 /// Keys become JSON paths, so the first character must be an ASCII letter or
@@ -27,7 +30,6 @@ pub fn validate_extra_metadata_filter(
             "extra_metadata_filter must not contain more than {EXTRA_METADATA_FILTER_MAX_FIELDS} fields"
         )));
     }
-
     for (key, value) in filter {
         let mut chars = key.chars();
         let valid_first = chars
@@ -73,6 +75,44 @@ pub(crate) fn db_err(e: sqlx::Error) -> MemoriaError {
         );
     }
     MemoriaError::Database(e.to_string())
+}
+
+/// MatrixOne currently reports an empty tokenized full-text pattern as generic
+/// internal error 20101. The code is shared by many internal errors, so retain
+/// the specific message check in one place until MatrixOne exposes a dedicated
+/// error code. See MatrixOne `pkg/fulltext/fulltext.go`.
+fn is_empty_fulltext_pattern_error(error: &sqlx::Error) -> bool {
+    use sqlx::mysql::MySqlDatabaseError;
+
+    error
+        .as_database_error()
+        .and_then(|database_error| {
+            database_error
+                .as_error()
+                .downcast_ref::<MySqlDatabaseError>()
+        })
+        .is_some_and(|mysql_error| {
+            mysql_error.number() == 20101
+                && mysql_error.message().contains("empty pattern")
+        })
+}
+
+pub(crate) fn fulltext_rows_or_empty(
+    result: Result<Vec<sqlx::mysql::MySqlRow>, sqlx::Error>,
+) -> Result<Vec<sqlx::mysql::MySqlRow>, MemoriaError> {
+    match result {
+        Ok(rows) => Ok(rows),
+        Err(error) if is_empty_fulltext_pattern_error(&error) => Ok(Vec::new()),
+        Err(error) => Err(db_err(error)),
+    }
+}
+
+fn apply_fulltext_score(row: &sqlx::mysql::MySqlRow, memory: &mut Memory) {
+    if let Ok(score) = row.try_get::<f64, _>("ft_score") {
+        memory.retrieval_score = Some(score);
+    } else if let Ok(score) = row.try_get::<f32, _>("ft_score") {
+        memory.retrieval_score = Some(score as f64);
+    }
 }
 
 /// Returns true when a failed ALTER TABLE ADD COLUMN was rejected because
@@ -737,6 +777,23 @@ fn sanitize_fulltext_query(s: &str) -> String {
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// Validate the public full-text query contract. Stopword-only queries remain
+/// valid and may return no rows after MatrixOne tokenization.
+pub fn validate_fulltext_query(query: &str) -> Result<(), MemoriaError> {
+    if query.len() > FULLTEXT_QUERY_MAX_BYTES {
+        return Err(MemoriaError::Validation(format!(
+            "fulltext query must not exceed {FULLTEXT_QUERY_MAX_BYTES} bytes"
+        )));
+    }
+    if sanitize_fulltext_query(query).is_empty() {
+        return Err(MemoriaError::Validation(
+            "fulltext query must contain at least one Unicode letter, number, or underscore"
+                .to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// Sanitize a string for use in a LIKE pattern (escapes `%`).
@@ -5357,7 +5414,7 @@ impl SqlMemoryStore {
         validate_extra_metadata_filter(extra_metadata_filter)?;
         let table = self.t(table);
         let mut metadata_filters: Vec<_> = extra_metadata_filter.iter().collect();
-        metadata_filters.sort_by(|(left, _), (right, _)| left.cmp(right));
+        metadata_filters.sort_by_key(|(key, _)| *key);
 
         let mut inner =
             format!("SELECT memory_id FROM {table} WHERE user_id = ? AND is_active = 1");
@@ -5576,27 +5633,106 @@ impl SqlMemoryStore {
                 stmt = stmt.bind(mt.to_string());
             }
         }
-        let rows = match stmt.bind(limit).fetch_all(&self.pool).await {
-            Ok(rows) => rows,
-            Err(e) => {
-                // MatrixOne returns 20101 when the search string tokenizes to an empty pattern
-                // (e.g. all stopwords, single chars, or unsupported Unicode). Treat as no results.
-                let msg = e.to_string();
-                if msg.contains("20101") && msg.contains("empty pattern") {
-                    return Ok(vec![]);
-                }
-                return Err(db_err(e));
-            }
-        };
+        let rows = fulltext_rows_or_empty(stmt.bind(limit).fetch_all(&self.pool).await)?;
         rows.iter()
             .map(|r| {
                 let mut m = row_to_memory(r)?;
-                if let Ok(ft) = r.try_get::<f64, _>("ft_score") {
-                    m.retrieval_score = Some(ft);
-                } else if let Ok(ft) = r.try_get::<f32, _>("ft_score") {
-                    m.retrieval_score = Some(ft as f64);
-                }
+                apply_fulltext_score(r, &mut m);
                 Ok(m)
+            })
+            .collect()
+    }
+
+    /// Pure MatrixOne full-text search with exact structured SQL pre-filters.
+    /// This path performs no embedding, vector, graph, hybrid, temporal, or
+    /// confidence scoring. `session_id` is strict and does not include unscoped
+    /// rows. Metadata equality follows JSON type-family semantics: number `2`
+    /// may equal `2.0`, but does not equal string `"2"`.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn search_fulltext_structured_lite(
+        &self,
+        table: &str,
+        user_id: &str,
+        query: &str,
+        limit: i64,
+        memory_types: Option<&[MemoryType]>,
+        session_id: Option<&str>,
+        trust_tier: Option<&str>,
+        subject_id: Option<&str>,
+        extra_metadata_filter: &std::collections::HashMap<String, serde_json::Value>,
+    ) -> Result<Vec<Memory>, MemoriaError> {
+        if !(1..=FULLTEXT_SEARCH_MAX_LIMIT).contains(&limit) {
+            return Err(MemoriaError::Validation(
+                format!(
+                    "fulltext search storage limit must be between 1 and {FULLTEXT_SEARCH_MAX_LIMIT}"
+                ),
+            ));
+        }
+        validate_fulltext_query(query)?;
+        validate_extra_metadata_filter(extra_metadata_filter)?;
+
+        let safe_query = sanitize_fulltext_query(query);
+        let table = self.t(table);
+        let mut metadata_filters: Vec<_> = extra_metadata_filter.iter().collect();
+        metadata_filters.sort_by_key(|(key, _)| *key);
+
+        let mut sql = format!(
+            "SELECT memory_id, user_id, author_id, subject_id, memory_type, content, \
+             session_id, is_active, superseded_by, trust_tier, \
+             initial_confidence, observed_at, created_at, updated_at, \
+             CAST(extra_metadata AS CHAR) AS extra_meta, \
+             MATCH(content) AGAINST('{safe_query}' IN BOOLEAN MODE) AS ft_score \
+             FROM {table} WHERE user_id = ? AND is_active = 1"
+        );
+        if let Some(types) = memory_types.filter(|types| !types.is_empty()) {
+            sql.push_str(" AND memory_type IN (");
+            sql.push_str(&vec!["?"; types.len()].join(", "));
+            sql.push(')');
+        }
+        if session_id.is_some() {
+            sql.push_str(" AND session_id = ?");
+        }
+        if trust_tier.is_some() {
+            sql.push_str(" AND trust_tier = ?");
+        }
+        if subject_id.is_some() {
+            sql.push_str(" AND subject_id = ?");
+        }
+        for (key, _) in &metadata_filters {
+            sql.push_str(&format!(
+                " AND json_extract(extra_metadata, '$.{key}') = CAST(? AS JSON)"
+            ));
+        }
+        sql.push_str(&format!(
+            " AND MATCH(content) AGAINST('{safe_query}' IN BOOLEAN MODE) \
+             ORDER BY ft_score DESC, memory_id DESC LIMIT ?"
+        ));
+
+        let mut statement = sqlx::query(&sql).bind(user_id);
+        if let Some(types) = memory_types.filter(|types| !types.is_empty()) {
+            for memory_type in types {
+                statement = statement.bind(memory_type.to_string());
+            }
+        }
+        if let Some(value) = session_id {
+            statement = statement.bind(value);
+        }
+        if let Some(value) = trust_tier {
+            statement = statement.bind(value);
+        }
+        if let Some(value) = subject_id {
+            statement = statement.bind(value);
+        }
+        for (_, value) in metadata_filters {
+            statement = statement.bind(serde_json::to_string(value)?);
+        }
+
+        let rows = fulltext_rows_or_empty(statement.bind(limit).fetch_all(&self.pool).await)?;
+        rows.iter()
+            .map(|row| {
+                let mut memory = row_to_memory_lite(row)?;
+                apply_fulltext_score(row, &mut memory);
+                Ok(memory)
             })
             .collect()
     }
@@ -6135,8 +6271,9 @@ fn build_safety_snapshot_name(db_name: Option<&str>, operation: &str) -> String 
 mod tests {
     use super::{
         classify_pool_health, detect_connection_anomaly, should_emit_saturated_warning,
-        validate_extra_metadata_filter, ConnectionAnomalyKind, OwnedEditLogEntry, PoolHealthLevel,
-        PoolHealthSnapshot, SqlMemoryStore,
+        validate_extra_metadata_filter, validate_fulltext_query, ConnectionAnomalyKind,
+        OwnedEditLogEntry, PoolHealthLevel, PoolHealthSnapshot, SqlMemoryStore,
+        FULLTEXT_QUERY_MAX_BYTES,
     };
     use sqlx::mysql::MySqlPoolOptions;
     use std::io::{self, Write};
@@ -6145,7 +6282,7 @@ mod tests {
     static LOG_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
     #[test]
-    fn structured_metadata_filter_validation_is_enforced_at_storage_boundary() {
+    fn metadata_and_fulltext_validation_are_enforced_at_storage_boundary() {
         let valid = std::collections::HashMap::from([
             ("_scene".to_string(), serde_json::json!("incident")),
             ("rank2".to_string(), serde_json::json!(2)),
@@ -6167,6 +6304,11 @@ mod tests {
             .map(|index| (format!("key_{index}"), serde_json::json!(index)))
             .collect();
         assert!(validate_extra_metadata_filter(&too_many).is_err());
+        assert!(validate_fulltext_query("MatrixOne database").is_ok());
+        assert!(validate_fulltext_query(" !@#$ ").is_err());
+        assert!(validate_fulltext_query(&"a".repeat(FULLTEXT_QUERY_MAX_BYTES)).is_ok());
+        assert!(validate_fulltext_query(&"a".repeat(FULLTEXT_QUERY_MAX_BYTES + 1)).is_err());
+        assert!(validate_fulltext_query(&"界".repeat(FULLTEXT_QUERY_MAX_BYTES / 3 + 1)).is_err());
     }
 
     #[test]

@@ -176,6 +176,19 @@ pub struct StructuredQueryOptions {
     pub extra_metadata_filter: HashMap<String, serde_json::Value>,
 }
 
+/// Filters for pure MatrixOne full-text search. Structured fields are exact SQL
+/// pre-filters applied before the Top-K limit; session filtering does not include
+/// unscoped memories.
+#[derive(Debug, Clone)]
+pub struct FulltextSearchOptions {
+    pub limit: i64,
+    pub memory_types: Option<Vec<MemoryType>>,
+    pub session_id: Option<String>,
+    pub trust_tier: Option<TrustTier>,
+    pub subject_id: Option<String>,
+    pub extra_metadata_filter: HashMap<String, serde_json::Value>,
+}
+
 impl ListActiveOptions<'_> {
     pub fn new(limit: i64) -> Self {
         Self {
@@ -2626,6 +2639,37 @@ impl MemoryService {
         Err(MemoriaError::Internal(
             "structured queries require a SQL-backed memory store".to_string(),
         ))
+    }
+
+    /// Run pure MatrixOne full-text search with structured SQL pre-filters.
+    pub async fn search_fulltext_structured_on_branch(
+        &self,
+        user_id: &str,
+        branch: Option<&str>,
+        query: &str,
+        options: &FulltextSearchOptions,
+    ) -> Result<Vec<Memory>, MemoriaError> {
+        if self.sql_store.is_none() {
+            return Err(MemoriaError::Internal(
+                "structured fulltext search requires a SQL-backed memory store".to_string(),
+            ));
+        }
+
+        let sql = self.user_sql_store(user_id).await?;
+        let table = sql.table_for_branch(user_id, branch).await?;
+        let trust_tier = options.trust_tier.as_ref().map(ToString::to_string);
+        sql.search_fulltext_structured_lite(
+            &table,
+            user_id,
+            query,
+            options.limit,
+            options.memory_types.as_deref(),
+            options.session_id.as_deref(),
+            trust_tier.as_deref(),
+            options.subject_id.as_deref(),
+            &options.extra_metadata_filter,
+        )
+        .await
     }
 
     pub async fn embed(&self, text: &str) -> Result<Option<Vec<f32>>, MemoriaError> {

@@ -42,6 +42,34 @@ Hybrid vector + fulltext search, ranked by relevance.
 
 Same as retrieve but without session prioritization.
 
+### Full-text Search: `POST /v1/memories/fulltext-search`
+
+Pure MatrixOne lexical full-text search with optional exact SQL pre-filters. It
+does not generate embeddings or run vector, graph, hybrid, temporal, or
+confidence scoring and is intentionally not exposed as an MCP tool.
+
+```json
+{
+  "query": "MatrixOne database",
+  "extra_metadata_filter": {"scene": "incident", "rank": 2},
+  "subject_id": "subject-123",
+  "memory_types": ["semantic"],
+  "session_id": "session-123",
+  "trust_tier": "T2",
+  "branch": "main",
+  "limit": 20
+}
+```
+
+All supplied filters use `AND`. `session_id` is strict: unscoped memories with
+`session_id: null` are not included. This differs from retrieve/search session
+scoping, which can include unscoped memories. Metadata equality preserves JSON
+type families: number `2` may equal `2.0`, while string `"2"` does not equal
+number `2`. Query length is limited to 4096 UTF-8 bytes and `limit` to 1–100.
+
+Returns a plain memory array ordered by MatrixOne full-text score and then
+`memory_id`; each result exposes the score as `retrieval_score`.
+
 ### Correct by ID: `PUT /v1/memories/{id}/correct`
 
 ```json

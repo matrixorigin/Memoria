@@ -740,6 +740,266 @@ async fn test_api_structured_query_on_branch() {
 // ── 2b. list response is lightweight (no embedding) and respects limit ────────
 
 #[tokio::test]
+async fn test_api_fulltext_search_with_structured_prefilters() {
+    let (base, client, _server) = spawn_server().await;
+    let user_id = uid();
+    let other_user_id = uid();
+    let token = format!("fulltext{}", uuid::Uuid::new_v4().simple());
+    let subject_id = format!("subject_{}", uuid::Uuid::new_v4().simple());
+    let session_id = format!("session_{}", uuid::Uuid::new_v4().simple());
+
+    for (suffix, memory_type, subject, session, tier, metadata) in [
+        (
+            "target",
+            "semantic",
+            subject_id.as_str(),
+            Some(session_id.as_str()),
+            "T2",
+            json!({"scene": "incident", "rank": 2}),
+        ),
+        (
+            "wrong metadata",
+            "semantic",
+            subject_id.as_str(),
+            Some(session_id.as_str()),
+            "T2",
+            json!({"scene": "review", "rank": 2}),
+        ),
+        (
+            "wrong metadata type",
+            "semantic",
+            subject_id.as_str(),
+            Some(session_id.as_str()),
+            "T2",
+            json!({"scene": "incident", "rank": "2"}),
+        ),
+        (
+            "wrong session",
+            "semantic",
+            subject_id.as_str(),
+            Some("another_session"),
+            "T2",
+            json!({"scene": "incident", "rank": 2}),
+        ),
+        (
+            "unscoped session",
+            "semantic",
+            subject_id.as_str(),
+            None,
+            "T2",
+            json!({"scene": "incident", "rank": 2}),
+        ),
+        (
+            "wrong subject",
+            "semantic",
+            "another_subject",
+            Some(session_id.as_str()),
+            "T2",
+            json!({"scene": "incident", "rank": 2}),
+        ),
+        (
+            "wrong trust tier",
+            "semantic",
+            subject_id.as_str(),
+            Some(session_id.as_str()),
+            "T3",
+            json!({"scene": "incident", "rank": 2}),
+        ),
+        (
+            "wrong memory type",
+            "profile",
+            subject_id.as_str(),
+            Some(session_id.as_str()),
+            "T2",
+            json!({"scene": "incident", "rank": 2}),
+        ),
+    ] {
+        let response = client
+            .post(format!("{base}/v1/memories"))
+            .header("X-User-Id", &user_id)
+            .json(&json!({
+                "content": format!("{token} {suffix}"),
+                "memory_type": memory_type,
+                "subject_id": subject,
+                "session_id": session,
+                "trust_tier": tier,
+                "extra_metadata": metadata
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 201);
+    }
+
+    let response = client
+        .post(format!("{base}/v1/memories"))
+        .header("X-User-Id", &other_user_id)
+        .json(&json!({
+            "content": format!("{token} wrong user"),
+            "memory_type": "semantic",
+            "subject_id": subject_id,
+            "session_id": session_id,
+            "trust_tier": "T2",
+            "extra_metadata": {"scene": "incident", "rank": 2}
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 201);
+
+    let body = wait_for_api_payload_contains(
+        &client,
+        &base,
+        &user_id,
+        "/v1/memories/fulltext-search",
+        json!({
+            "query": token,
+            "extra_metadata_filter": {"scene": "incident", "rank": 2},
+            "subject_id": subject_id,
+            "memory_types": ["semantic"],
+            "session_id": session_id,
+            "trust_tier": "T2",
+            "limit": 10
+        }),
+        &["target"],
+    )
+    .await;
+    let items = body.as_array().expect("fulltext response array");
+    assert_eq!(items.len(), 1, "all pre-filters must be applied: {body}");
+    assert_eq!(items[0]["content"], format!("{token} target"));
+    assert!(items[0]["retrieval_score"].is_number());
+
+    for invalid_request in [
+        json!({"query": ""}),
+        json!({"query": "!!!"}),
+        json!({"query": "valid", "limit": 0}),
+        json!({"query": "valid", "limit": 101}),
+        json!({"query": "valid", "session_id": "   "}),
+        json!({"query": "valid", "subject_id": "   "}),
+        json!({"query": "valid", "trust_tier": "   "}),
+        json!({"query": "valid", "branch": "   "}),
+        json!({"query": "valid", "memory_types": ["   "]}),
+        json!({"query": "valid", "memory_types": ["semantic", ""]}),
+        json!({"query": "a".repeat(memoria_storage::FULLTEXT_QUERY_MAX_BYTES + 1)}),
+        json!({"query": "valid", "extra_metadata_filters": {"scene": "incident"}}),
+        json!({"query": "valid", "extra_metadata_filter": {"nested": {"value": 1}}}),
+    ] {
+        let response = client
+            .post(format!("{base}/v1/memories/fulltext-search"))
+            .header("X-User-Id", &user_id)
+            .json(&invalid_request)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 422, "request: {invalid_request}");
+    }
+
+    // MatrixOne tokenizes a single-character NGRAM query to an empty pattern.
+    // The public endpoint treats that database condition as a valid empty result.
+    let response = client
+        .post(format!("{base}/v1/memories/fulltext-search"))
+        .header("X-User-Id", &user_id)
+        .json(&json!({"query": "a"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let body: Value = response.json().await.unwrap();
+    assert!(body.as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn test_api_fulltext_search_orders_by_score_then_memory_id() {
+    let (base, client, _server) = spawn_server().await;
+    let user_id = uid();
+    let primary = format!("primary{}", uuid::Uuid::new_v4().simple());
+    let secondary = format!("secondary{}", uuid::Uuid::new_v4().simple());
+
+    let high_id =
+        store_memory_unscoped(&client, &base, &user_id, &format!("{primary} {secondary}")).await;
+    let first_tie_id = store_memory_unscoped(&client, &base, &user_id, &primary).await;
+    let second_tie_id = store_memory_unscoped(&client, &base, &user_id, &primary).await;
+
+    let body = wait_for_api_payload_contains(
+        &client,
+        &base,
+        &user_id,
+        "/v1/memories/fulltext-search",
+        json!({"query": format!("{primary} {secondary}"), "limit": 10}),
+        &[&high_id, &first_tie_id, &second_tie_id],
+    )
+    .await;
+    let items = body.as_array().expect("fulltext response array");
+    assert_eq!(
+        items.len(),
+        3,
+        "all ranked fixtures must be returned: {body}"
+    );
+    assert_eq!(items[0]["memory_id"], high_id);
+
+    let high_score = items[0]["retrieval_score"].as_f64().unwrap();
+    let first_tie_score = items[1]["retrieval_score"].as_f64().unwrap();
+    let second_tie_score = items[2]["retrieval_score"].as_f64().unwrap();
+    assert!(high_score > first_tie_score);
+    assert_eq!(first_tie_score, second_tie_score);
+
+    let mut expected_tie_ids = [first_tie_id, second_tie_id];
+    expected_tie_ids.sort_by(|left, right| right.cmp(left));
+    assert_eq!(items[1]["memory_id"], expected_tie_ids[0]);
+    assert_eq!(items[2]["memory_id"], expected_tie_ids[1]);
+}
+
+#[tokio::test]
+async fn test_api_fulltext_search_on_branch_is_isolated_from_main() {
+    let (base, client, _server) = spawn_server().await;
+    let user_id = uid();
+    let branch = format!(
+        "fulltext_{}",
+        &uuid::Uuid::new_v4().simple().to_string()[..8]
+    );
+    let token = format!("branchfulltext{}", uuid::Uuid::new_v4().simple());
+
+    let response = client
+        .post(format!("{base}/v1/branches"))
+        .header("X-User-Id", &user_id)
+        .json(&json!({"name": branch}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 201);
+    let response = client
+        .post(format!("{base}/v1/memories"))
+        .header("X-User-Id", &user_id)
+        .json(&json!({"content": token, "branch": branch}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 201);
+
+    let branch_body = wait_for_api_payload_contains(
+        &client,
+        &base,
+        &user_id,
+        "/v1/memories/fulltext-search",
+        json!({"query": token, "branch": branch}),
+        &[&token],
+    )
+    .await;
+    assert_eq!(branch_body.as_array().unwrap().len(), 1);
+
+    let main_response = client
+        .post(format!("{base}/v1/memories/fulltext-search"))
+        .header("X-User-Id", &user_id)
+        .json(&json!({"query": token}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(main_response.status(), 200);
+    let main_body: Value = main_response.json().await.unwrap();
+    assert!(main_body.as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn test_api_list_no_embedding_and_limit() {
     let (base, client, _server) = spawn_server().await;
     let uid = uid();
