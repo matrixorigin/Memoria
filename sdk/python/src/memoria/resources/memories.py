@@ -64,7 +64,8 @@ def _validate_fulltext_metadata_filter(
         if not valid_key:
             raise MemoriaValidationError(
                 "extra_metadata_filter keys must start with an ASCII letter or underscore "
-                "and contain only ASCII letters, digits, or underscore"
+                "and contain only ASCII letters, digits, or underscore, and must not "
+                f"exceed {_EXTRA_METADATA_FILTER_MAX_KEY_BYTES} bytes"
             )
         if not isinstance(value, (str, int, float, bool)):
             raise MemoriaValidationError(

@@ -221,6 +221,15 @@ def test_fulltext_search_rejects_invalid_metadata_container_or_key(
         )
 
 
+def test_fulltext_search_reports_metadata_key_byte_limit(
+    client: MemoriaClient,
+) -> None:
+    with pytest.raises(MemoriaValidationError, match="64 bytes"):
+        client.memories.fulltext_search(
+            "valid", extra_metadata_filter={"a" * 65: "value"}
+        )
+
+
 @pytest.mark.parametrize(
     "value", [10**5000, "\ud800"], ids=["large-integer", "lone-surrogate"]
 )
