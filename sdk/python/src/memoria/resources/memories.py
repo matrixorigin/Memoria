@@ -59,7 +59,8 @@ def _validate_structured_query(
             if not valid_key:
                 raise MemoriaValidationError(
                     "query: extra_metadata_filter keys must start with an ASCII letter or "
-                    "underscore and contain only ASCII letters, digits, or underscore"
+                    "underscore, contain only ASCII letters, digits, or underscore, and "
+                    "must not exceed 64 bytes"
                 )
             if not isinstance(value, (str, int, float, bool)):
                 raise MemoriaValidationError(

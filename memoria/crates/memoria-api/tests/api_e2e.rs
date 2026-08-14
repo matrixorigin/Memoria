@@ -478,6 +478,111 @@ async fn test_api_structured_query_by_extra_metadata() {
 }
 
 #[tokio::test]
+async fn test_api_structured_query_enforces_scope_active_and_all_predicates() {
+    let (base, client, _server) = spawn_server().await;
+    let user_id = uid();
+    let other_user_id = uid();
+    let marker = format!("structured_filter_{}", uuid::Uuid::new_v4().simple());
+    let matching_metadata = json!({"marker": marker, "urgent": true});
+
+    async fn store(
+        client: &reqwest::Client,
+        base: &str,
+        user_id: &str,
+        content: &str,
+        memory_type: &str,
+        metadata: Value,
+    ) -> String {
+        let response = client
+            .post(format!("{base}/v1/memories"))
+            .header("X-User-Id", user_id)
+            .json(&json!({
+                "content": content,
+                "memory_type": memory_type,
+                "extra_metadata": metadata,
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 201);
+        response.json::<Value>().await.unwrap()["memory_id"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    let expected_id = store(
+        &client,
+        &base,
+        &user_id,
+        "only eligible structured result",
+        "semantic",
+        matching_metadata.clone(),
+    )
+    .await;
+    store(
+        &client,
+        &base,
+        &user_id,
+        "wrong metadata boolean",
+        "semantic",
+        json!({"marker": marker, "urgent": false}),
+    )
+    .await;
+    store(
+        &client,
+        &base,
+        &user_id,
+        "wrong memory type",
+        "profile",
+        matching_metadata.clone(),
+    )
+    .await;
+    store(
+        &client,
+        &base,
+        &other_user_id,
+        "other tenant",
+        "semantic",
+        matching_metadata.clone(),
+    )
+    .await;
+    let inactive_id = store(
+        &client,
+        &base,
+        &user_id,
+        "inactive match",
+        "semantic",
+        matching_metadata.clone(),
+    )
+    .await;
+    let response = client
+        .delete(format!("{base}/v1/memories/{inactive_id}"))
+        .header("X-User-Id", &user_id)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 204);
+
+    let response = client
+        .post(format!("{base}/v1/memories/query"))
+        .header("X-User-Id", &user_id)
+        .json(&json!({
+            "extra_metadata_filter": {"marker": marker, "urgent": true},
+            "memory_types": ["semantic"],
+            "limit": 10,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let body: Value = response.json().await.unwrap();
+    let items = body["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["memory_id"], expected_id);
+}
+
+#[tokio::test]
 async fn test_api_structured_query_cursor_and_subject_isolation() {
     let (base, client, _server) = spawn_server().await;
     let user_id = uid();
