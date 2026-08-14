@@ -152,6 +152,144 @@ def test_retrieve_with_explain(httpx_mock: HTTPXMock, client: MemoriaClient) -> 
     assert result.explain["path"] == "hybrid"
 
 
+def test_fulltext_search_with_structured_filters(
+    httpx_mock: HTTPXMock, client: MemoriaClient
+) -> None:
+    response = {
+        **MEMORY_STUB,
+        "retrieval_score": 1.25,
+        "subject_id": "subject_1",
+        "extra_metadata": {"scene": "incident", "rank": 2},
+    }
+    httpx_mock.add_response(json=[response])
+    result = client.memories.fulltext_search(
+        "MatrixOne database",
+        extra_metadata_filter={"scene": "incident", "rank": 2},
+        subject_id="subject_1",
+        memory_types=["semantic", " semantic ", "semantic"],
+        session_id="session_1",
+        trust_tier="T2",
+        branch="experiment",
+        limit=20,
+    )
+    assert isinstance(result, RetrieveResult)
+    assert result.items[0].retrieval_score == 1.25
+    assert result.items[0].subject_id == "subject_1"
+    assert result.items[0].extra_metadata == {"scene": "incident", "rank": 2}
+    request = httpx_mock.get_request()
+    assert request is not None
+    assert request.url.path == "/v1/memories/fulltext-search"
+    body = json.loads(request.content)
+    assert body["extra_metadata_filter"] == {"scene": "incident", "rank": 2}
+    assert body["memory_types"] == ["semantic"]
+    assert body["branch"] == "experiment"
+
+
+@pytest.mark.parametrize("query", ["", "!!!"])
+def test_fulltext_search_rejects_empty_token_query(
+    client: MemoriaClient, query: str
+) -> None:
+    with pytest.raises(MemoriaValidationError, match="query"):
+        client.memories.fulltext_search(query)
+
+
+def test_fulltext_search_rejects_invalid_limit_and_metadata(
+    client: MemoriaClient,
+) -> None:
+    with pytest.raises(MemoriaValidationError, match="100"):
+        client.memories.fulltext_search("valid", limit=101)
+    with pytest.raises(MemoriaValidationError, match="finite"):
+        client.memories.fulltext_search(
+            "valid", extra_metadata_filter={"rank": float("nan")}
+        )
+
+
+@pytest.mark.parametrize("query", [123, None])
+def test_fulltext_search_rejects_non_string_query(
+    client: MemoriaClient, query: object
+) -> None:
+    with pytest.raises(MemoriaValidationError, match="string"):
+        client.memories.fulltext_search(query)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("limit", [True, "10"])
+def test_fulltext_search_rejects_non_integer_limit(
+    client: MemoriaClient, limit: object
+) -> None:
+    with pytest.raises(MemoriaValidationError, match="limit"):
+        client.memories.fulltext_search("valid", limit=limit)  # type: ignore[arg-type]
+
+
+def test_fulltext_search_rejects_oversized_utf8_query(client: MemoriaClient) -> None:
+    with pytest.raises(MemoriaValidationError, match="4096 bytes"):
+        client.memories.fulltext_search("界" * 1366)
+
+
+def test_fulltext_search_translates_invalid_query_unicode(
+    client: MemoriaClient,
+) -> None:
+    with pytest.raises(MemoriaValidationError, match="valid UTF-8"):
+        client.memories.fulltext_search("\ud800valid")
+
+
+@pytest.mark.parametrize("metadata", [[], {1: "value"}])
+def test_fulltext_search_rejects_invalid_metadata_container_or_key(
+    client: MemoriaClient, metadata: object
+) -> None:
+    with pytest.raises(MemoriaValidationError, match="dictionary|keys must be strings"):
+        client.memories.fulltext_search(
+            "valid", extra_metadata_filter=metadata  # type: ignore[arg-type]
+        )
+
+
+def test_fulltext_search_reports_metadata_key_byte_limit(
+    client: MemoriaClient,
+) -> None:
+    with pytest.raises(MemoriaValidationError, match="64 bytes"):
+        client.memories.fulltext_search(
+            "valid", extra_metadata_filter={"a" * 65: "value"}
+        )
+
+
+@pytest.mark.parametrize(
+    "value", [10**5000, "\ud800"], ids=["large-integer", "lone-surrogate"]
+)
+def test_fulltext_search_translates_metadata_serialization_errors(
+    client: MemoriaClient, value: object
+) -> None:
+    with pytest.raises(MemoriaValidationError, match="valid JSON scalars"):
+        client.memories.fulltext_search("valid", extra_metadata_filter={"value": value})
+
+
+@pytest.mark.parametrize(
+    "memory_types",
+    [["unknown"], [1], "semantic", ["   "], ["semantic", ""]],
+)
+def test_fulltext_search_rejects_invalid_memory_types(
+    client: MemoriaClient, memory_types: object
+) -> None:
+    with pytest.raises(MemoriaValidationError, match="memory_types|memory type"):
+        client.memories.fulltext_search(
+            "valid", memory_types=memory_types  # type: ignore[arg-type]
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "kwargs"),
+    [
+        ("subject_id", {"subject_id": "   "}),
+        ("session_id", {"session_id": "   "}),
+        ("trust_tier", {"trust_tier": "   "}),
+        ("branch", {"branch": "   "}),
+    ],
+)
+def test_fulltext_search_rejects_blank_structured_filter(
+    client: MemoriaClient, field: str, kwargs: dict[str, str]
+) -> None:
+    with pytest.raises(MemoriaValidationError, match=field):
+        client.memories.fulltext_search("valid", **kwargs)  # type: ignore[arg-type]
+
+
 # ---------------------------------------------------------------------------
 # list
 # ---------------------------------------------------------------------------

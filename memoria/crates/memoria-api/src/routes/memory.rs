@@ -208,6 +208,30 @@ pub async fn query_memories(
     Ok(Json(ListResponse { items, next_cursor }))
 }
 
+pub async fn fulltext_search_memories(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Json(req): Json<FulltextSearchRequest>,
+) -> ApiResult<Vec<MemoryResponse>> {
+    let branch = req
+        .fulltext_branch()
+        .map_err(|error| (StatusCode::UNPROCESSABLE_ENTITY, error))?;
+    let options = req
+        .fulltext_options()
+        .map_err(|error| (StatusCode::UNPROCESSABLE_ENTITY, error))?;
+    let memories = state
+        .service
+        .search_fulltext_structured_on_branch(
+            auth.scope_id(),
+            branch.as_deref(),
+            &req.query,
+            &options,
+        )
+        .await
+        .map_err(api_err_typed)?;
+    Ok(Json(memories.into_iter().map(Into::into).collect()))
+}
+
 pub async fn store_memory(
     State(state): State<AppState>,
     auth: AuthUser,

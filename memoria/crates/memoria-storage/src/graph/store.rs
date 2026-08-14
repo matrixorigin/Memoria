@@ -2,7 +2,7 @@
 //! Mirrors Python's graph/graph_store.py core methods needed for consolidation.
 
 use crate::graph::types::{edge_type, GraphEdge, GraphNode, NodeType};
-use crate::store::db_err;
+use crate::store::{db_err, fulltext_rows_or_empty};
 use memoria_core::{nullable_str, nullable_str_from_row, MemoriaError};
 use sqlx::{MySqlPool, Row};
 use uuid::Uuid;
@@ -829,21 +829,13 @@ impl GraphStore {
              ORDER BY ft_score DESC LIMIT ?",
             self.t("memory_graph_nodes"),
         );
-        let rows = match sqlx::query(&sql)
-            .bind(user_id)
-            .bind(top_k)
-            .fetch_all(&self.pool)
-            .await
-        {
-            Ok(rows) => rows,
-            Err(e) => {
-                let msg = e.to_string();
-                if msg.contains("20101") && msg.contains("empty pattern") {
-                    return Ok(vec![]);
-                }
-                return Err(db_err(e));
-            }
-        };
+        let rows = fulltext_rows_or_empty(
+            sqlx::query(&sql)
+                .bind(user_id)
+                .bind(top_k)
+                .fetch_all(&self.pool)
+                .await,
+        )?;
         Ok(rows
             .iter()
             .map(|r| {

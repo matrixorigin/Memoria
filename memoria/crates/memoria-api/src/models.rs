@@ -85,6 +85,15 @@ fn parse_memory_types_opt(
     Ok(parsed)
 }
 
+fn parse_fulltext_memory_types_opt(
+    types: Option<&Vec<String>>,
+) -> Result<Option<Vec<MemoryType>>, String> {
+    if types.is_some_and(|types| types.iter().any(|value| value.trim().is_empty())) {
+        return Err("memory_types entries must not be empty when provided".to_string());
+    }
+    parse_memory_types_opt(types)
+}
+
 impl RetrieveRequest {
     pub fn session_scope(&self) -> Result<Option<memoria_service::SessionScope>, String> {
         parse_session_scope(self.session_scope.as_deref())
@@ -230,6 +239,60 @@ fn normalized(value: Option<&str>) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string)
+}
+
+fn default_fulltext_search_limit() -> i64 {
+    memoria_storage::FULLTEXT_SEARCH_DEFAULT_LIMIT
+}
+
+/// Pure MatrixOne full-text search with exact structured SQL pre-filters.
+/// Session filtering is strict and does not include unscoped memories.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FulltextSearchRequest {
+    pub query: String,
+    #[serde(default)]
+    pub extra_metadata_filter: HashMap<String, serde_json::Value>,
+    pub subject_id: Option<String>,
+    pub memory_types: Option<Vec<String>>,
+    pub session_id: Option<String>,
+    pub trust_tier: Option<String>,
+    pub branch: Option<String>,
+    #[serde(default = "default_fulltext_search_limit")]
+    pub limit: i64,
+}
+
+impl FulltextSearchRequest {
+    pub fn fulltext_options(&self) -> Result<memoria_service::FulltextSearchOptions, String> {
+        if !(1..=memoria_storage::FULLTEXT_SEARCH_MAX_LIMIT).contains(&self.limit) {
+            return Err(format!(
+                "limit must be between 1 and {}",
+                memoria_storage::FULLTEXT_SEARCH_MAX_LIMIT
+            ));
+        }
+        memoria_storage::validate_fulltext_query(&self.query).map_err(|error| error.to_string())?;
+        memoria_storage::validate_extra_metadata_filter(&self.extra_metadata_filter)
+            .map_err(|error| error.to_string())?;
+
+        let session_id = normalized_filter("session_id", self.session_id.as_deref())?;
+        let subject_id = normalized_filter("subject_id", self.subject_id.as_deref())?;
+        let trust_tier = normalized_filter("trust_tier", self.trust_tier.as_deref())?
+            .as_deref()
+            .map(parse_trust_tier)
+            .transpose()?;
+        Ok(memoria_service::FulltextSearchOptions {
+            limit: self.limit,
+            memory_types: parse_fulltext_memory_types_opt(self.memory_types.as_ref())?,
+            session_id,
+            trust_tier,
+            subject_id,
+            extra_metadata_filter: self.extra_metadata_filter.clone(),
+        })
+    }
+
+    pub fn fulltext_branch(&self) -> Result<Option<String>, String> {
+        normalized_filter("branch", self.branch.as_deref())
+    }
 }
 
 fn normalized_filter(name: &str, value: Option<&str>) -> Result<Option<String>, String> {
@@ -600,7 +663,9 @@ pub fn parse_trust_tier(s: &str) -> Result<TrustTier, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_memory_types_opt, PurgeRequest, PurgeSelector};
+    use super::{
+        parse_fulltext_memory_types_opt, parse_memory_types_opt, PurgeRequest, PurgeSelector,
+    };
     use memoria_core::MemoryType;
 
     #[test]
@@ -616,6 +681,14 @@ mod tests {
             parse_memory_types_opt(Some(&raw)).unwrap(),
             Some(vec![MemoryType::Semantic, MemoryType::Profile])
         );
+    }
+    #[test]
+    fn fulltext_memory_type_parser_rejects_blank_entries_but_allows_empty_arrays() {
+        let blank = vec!["semantic".to_string(), "   ".to_string()];
+        assert!(parse_fulltext_memory_types_opt(Some(&blank)).is_err());
+
+        let empty = vec![];
+        assert_eq!(parse_fulltext_memory_types_opt(Some(&empty)).unwrap(), None);
     }
 
     #[test]
