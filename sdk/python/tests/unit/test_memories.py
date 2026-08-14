@@ -208,6 +208,23 @@ def test_structured_query_requires_selector(client: MemoriaClient) -> None:
         client.memories.query()
 
 
+@pytest.mark.parametrize("limit", ["1", 1.5, True, None])
+def test_structured_query_rejects_non_integer_limit(client: MemoriaClient, limit: object) -> None:
+    with pytest.raises(MemoriaValidationError, match="limit must be an integer"):
+        client.memories.query(subject_id="subject", limit=limit)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("extra_metadata_filter", [[("scene", "incident")], "scene=incident"])
+def test_structured_query_rejects_non_dictionary_metadata_filter(
+    client: MemoriaClient, extra_metadata_filter: object
+) -> None:
+    with pytest.raises(MemoriaValidationError, match="must be a dictionary"):
+        client.memories.query(
+            subject_id="subject",
+            extra_metadata_filter=extra_metadata_filter,  # type: ignore[arg-type]
+        )
+
+
 def test_structured_query_accepts_branch_only(
     httpx_mock: HTTPXMock, client: MemoriaClient
 ) -> None:

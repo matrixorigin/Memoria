@@ -69,8 +69,12 @@ def _validate_structured_query(
     str | None,
     str | None,
 ]:
+    if type(limit) is not int:
+        raise MemoriaValidationError("query: limit must be an integer")
     if limit < 1 or limit > 500:
         raise MemoriaValidationError("query: limit must be between 1 and 500")
+    if extra_metadata_filter is not None and not isinstance(extra_metadata_filter, dict):
+        raise MemoriaValidationError("query: extra_metadata_filter must be a dictionary")
     for name, value in [
         ("subject_id", subject_id),
         ("session_id", session_id),

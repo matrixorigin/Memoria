@@ -79,6 +79,22 @@ async def test_structured_query_rejects_blank_supplied_selector(
 
 
 @pytest.mark.asyncio
+async def test_structured_query_rejects_invalid_runtime_types(
+    client: AsyncMemoriaClient,
+) -> None:
+    with pytest.raises(MemoriaValidationError, match="limit must be an integer"):
+        await client.memories.query(
+            subject_id="subject",
+            limit="1",  # type: ignore[arg-type]
+        )
+    with pytest.raises(MemoriaValidationError, match="must be a dictionary"):
+        await client.memories.query(
+            subject_id="subject",
+            extra_metadata_filter=[("scene", "incident")],  # type: ignore[arg-type]
+        )
+
+
+@pytest.mark.asyncio
 async def test_purge_by_ids(httpx_mock: HTTPXMock, client: AsyncMemoriaClient) -> None:
     httpx_mock.add_response(json={"purged": 1, "snapshot_name": "snap_x"})
     result = await client.memories.purge(memory_ids=["id1"], reason="done")
