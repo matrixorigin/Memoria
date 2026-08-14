@@ -179,14 +179,22 @@ impl StructuredQueryRequest {
         memoria_storage::validate_extra_metadata_filter(&self.extra_metadata_filter)
             .map_err(|err| err.to_string())?;
 
-        let subject_id = normalized(self.subject_id.as_deref());
-        let session_id = normalized(self.session_id.as_deref());
-        let normalized_trust_tier = normalized(self.trust_tier.as_deref());
-        let branch = normalized(self.branch.as_deref());
+        let subject_id = normalized_filter("subject_id", self.subject_id.as_deref())?;
+        let session_id = normalized_filter("session_id", self.session_id.as_deref())?;
+        let normalized_trust_tier =
+            normalized_filter("trust_tier", self.trust_tier.as_deref())?;
+        let branch = normalized_filter("branch", self.branch.as_deref())?;
         let trust_tier = normalized_trust_tier
             .as_deref()
             .map(parse_trust_tier)
             .transpose()?;
+        if let Some(memory_types) = self.memory_types.as_ref() {
+            if memory_types.is_empty() || memory_types.iter().any(|value| value.trim().is_empty()) {
+                return Err(
+                    "memory_types must contain only non-empty values when provided".to_string(),
+                );
+            }
+        }
         let memory_types = parse_memory_types_opt(self.memory_types.as_ref())?;
         if self.extra_metadata_filter.is_empty()
             && subject_id.is_none()
@@ -222,6 +230,19 @@ fn normalized(value: Option<&str>) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string)
+}
+
+fn normalized_filter(name: &str, value: Option<&str>) -> Result<Option<String>, String> {
+    value
+        .map(|value| {
+            let value = value.trim();
+            if value.is_empty() {
+                Err(format!("{name} must not be empty when provided"))
+            } else {
+                Ok(value.to_string())
+            }
+        })
+        .transpose()
 }
 
 fn deserialize_explain<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {

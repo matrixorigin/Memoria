@@ -463,6 +463,12 @@ async fn test_api_structured_query_by_extra_metadata() {
         json!({"subject_id": "subject", "limit": 0}),
         json!({"subject_id": "subject", "limit": 501}),
         json!({"subject_id": "subject", "extra_metadata_filters": {"scene": "incident"}}),
+        json!({"extra_metadata_filter": {"scene": "incident"}, "subject_id": "   "}),
+        json!({"extra_metadata_filter": {"scene": "incident"}, "session_id": "   "}),
+        json!({"extra_metadata_filter": {"scene": "incident"}, "trust_tier": "   "}),
+        json!({"extra_metadata_filter": {"scene": "incident"}, "branch": "   "}),
+        json!({"extra_metadata_filter": {"scene": "incident"}, "memory_types": []}),
+        json!({"extra_metadata_filter": {"scene": "incident"}, "memory_types": ["semantic", " "]}),
         json!({"extra_metadata_filter": {"1scene": "incident"}}),
         json!({"extra_metadata_filter": {"scene": "x".repeat(1025)}}),
     ] {

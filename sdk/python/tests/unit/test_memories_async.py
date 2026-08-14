@@ -69,6 +69,16 @@ async def test_structured_query_accepts_branch_only(
 
 
 @pytest.mark.asyncio
+async def test_structured_query_rejects_blank_supplied_selector(
+    client: AsyncMemoriaClient,
+) -> None:
+    with pytest.raises(MemoriaValidationError, match="subject_id"):
+        await client.memories.query(
+            extra_metadata_filter={"scene": "incident"}, subject_id="   "
+        )
+
+
+@pytest.mark.asyncio
 async def test_purge_by_ids(httpx_mock: HTTPXMock, client: AsyncMemoriaClient) -> None:
     httpx_mock.add_response(json={"purged": 1, "snapshot_name": "snap_x"})
     result = await client.memories.purge(memory_ids=["id1"], reason="done")

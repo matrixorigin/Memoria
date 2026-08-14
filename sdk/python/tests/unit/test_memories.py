@@ -248,6 +248,37 @@ def test_structured_query_rejects_invalid_memory_types(
         client.memories.query(memory_types=memory_types)  # type: ignore[arg-type]
 
 
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"subject_id": "   "},
+        {"session_id": "   "},
+        {"trust_tier": "   "},
+        {"branch": "   "},
+        {"memory_types": []},
+        {"memory_types": ["semantic", "   "]},
+    ],
+)
+def test_structured_query_rejects_blank_supplied_selector(
+    client: MemoriaClient, kwargs: dict[str, object]
+) -> None:
+    with pytest.raises(MemoriaValidationError, match="empty|at least one"):
+        client.memories.query(
+            extra_metadata_filter={"scene": "incident"},
+            **kwargs,  # type: ignore[arg-type]
+        )
+
+
+@pytest.mark.parametrize(
+    "value", [10**5000, "\ud800"], ids=["large-integer", "lone-surrogate"]
+)
+def test_structured_query_translates_metadata_serialization_errors(
+    client: MemoriaClient, value: object
+) -> None:
+    with pytest.raises(MemoriaValidationError, match="valid JSON scalars"):
+        client.memories.query(extra_metadata_filter={"value": value})
+
+
 @pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
 def test_structured_query_rejects_non_finite_metadata_number(
     client: MemoriaClient, value: float
