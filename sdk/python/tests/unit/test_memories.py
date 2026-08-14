@@ -204,6 +204,13 @@ def test_fulltext_search_rejects_oversized_utf8_query(client: MemoriaClient) -> 
         client.memories.fulltext_search("界" * 1366)
 
 
+def test_fulltext_search_translates_invalid_query_unicode(
+    client: MemoriaClient,
+) -> None:
+    with pytest.raises(MemoriaValidationError, match="valid UTF-8"):
+        client.memories.fulltext_search("\ud800valid")
+
+
 @pytest.mark.parametrize("metadata", [[], {1: "value"}])
 def test_fulltext_search_rejects_invalid_metadata_container_or_key(
     client: MemoriaClient, metadata: object

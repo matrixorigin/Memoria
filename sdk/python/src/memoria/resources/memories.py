@@ -131,7 +131,13 @@ def _validate_fulltext_search(
         )
     if not isinstance(query, str):
         raise MemoriaValidationError("fulltext_search: query must be a string")
-    if len(query.encode()) > _FULLTEXT_QUERY_MAX_BYTES:
+    try:
+        query_bytes = len(query.encode("utf-8"))
+    except UnicodeEncodeError as error:
+        raise MemoriaValidationError(
+            "fulltext_search: query must be valid UTF-8"
+        ) from error
+    if query_bytes > _FULLTEXT_QUERY_MAX_BYTES:
         raise MemoriaValidationError(
             f"fulltext_search: query must not exceed {_FULLTEXT_QUERY_MAX_BYTES} bytes"
         )
