@@ -137,6 +137,7 @@ def test_fulltext_search_with_structured_filters(
     response = {
         **MEMORY_STUB,
         "retrieval_score": 1.25,
+        "subject_id": "subject_1",
         "extra_metadata": {"scene": "incident", "rank": 2},
     }
     httpx_mock.add_response(json=[response])
@@ -152,6 +153,8 @@ def test_fulltext_search_with_structured_filters(
     )
     assert isinstance(result, RetrieveResult)
     assert result.items[0].retrieval_score == 1.25
+    assert result.items[0].subject_id == "subject_1"
+    assert result.items[0].extra_metadata == {"scene": "incident", "rank": 2}
     request = httpx_mock.get_request()
     assert request is not None
     assert request.url.path == "/v1/memories/fulltext-search"

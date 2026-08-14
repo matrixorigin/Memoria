@@ -41,6 +41,10 @@ class Memory:
     observed_at: datetime | None = None
     created_at: datetime | None = None
     retrieval_score: float | None = None  # populated by retrieve/search, None from list
+    # New response fields are appended so existing positional construction keeps
+    # the public dataclass field order released by earlier SDK versions.
+    subject_id: str | None = None
+    extra_metadata: dict[str, Any] | None = None
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> Memory:
@@ -57,6 +61,8 @@ class Memory:
             observed_at=_parse_dt(d.get("observed_at")),
             created_at=_parse_dt(d.get("created_at")),
             retrieval_score=d.get("retrieval_score"),
+            subject_id=d.get("subject_id"),
+            extra_metadata=d.get("extra_metadata"),
         )
 
 
