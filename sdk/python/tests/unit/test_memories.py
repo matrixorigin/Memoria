@@ -37,6 +37,29 @@ def test_store_happy_path(httpx_mock: HTTPXMock, client: MemoriaClient) -> None:
     assert mem.content == "test content"
 
 
+def test_memory_preserves_legacy_positional_field_order() -> None:
+    memory = Memory(
+        "mem_legacy",
+        "legacy content",
+        "semantic",
+        "T3",
+        0.65,
+        True,
+        "user_1",
+        "author_1",
+        "session_1",
+        None,
+        None,
+        0.75,
+    )
+
+    assert memory.author_id == "author_1"
+    assert memory.session_id == "session_1"
+    assert memory.retrieval_score == 0.75
+    assert memory.subject_id is None
+    assert memory.extra_metadata is None
+
+
 def test_store_with_all_params(httpx_mock: HTTPXMock, client: MemoriaClient) -> None:
     httpx_mock.add_response(json=MEMORY_STUB)
     mem = client.memories.store(

@@ -37,11 +37,13 @@ class Memory:
     is_active: bool
     user_id: str
     author_id: str | None = None          # group mode only; None in personal mode
-    subject_id: str | None = None
     session_id: str | None = None
     observed_at: datetime | None = None
     created_at: datetime | None = None
     retrieval_score: float | None = None  # populated by retrieve/search, None from list
+    # New response fields are appended so existing positional construction keeps
+    # the public dataclass field order released by earlier SDK versions.
+    subject_id: str | None = None
     extra_metadata: dict[str, Any] | None = None
 
     @classmethod
