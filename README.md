@@ -451,7 +451,7 @@ If you use Memoria in academic work, or refer to its Git-for-Data foundation for
 
 We'd love your support! If Memoria helps you, consider giving us a star.
 
-[![Star History Chart](https://api.star-history.com/svg?repos=matrixorigin/Memoria&type=Date)](https://star-history.com/#matrixorigin/Memoria&Date)
+[![Star History Chart](https://star-history.dera.page/svg?repos=matrixorigin/Memoria&type=Date)](https://star-history.dera.page/#matrixorigin/Memoria&type=Date)
 
 **Contributing** — See the [developer documentation](#-development) above and check out our [issue templates](https://github.com/matrixorigin/Memoria/issues/new/choose) for bug reports, feature requests, and more.
 
